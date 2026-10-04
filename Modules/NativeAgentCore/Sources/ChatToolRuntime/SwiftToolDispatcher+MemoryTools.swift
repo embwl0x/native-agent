@@ -3,6 +3,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+import ToolRegistry
 import MemoryV2
 import MCPDispatcher
 import Context
@@ -445,6 +446,17 @@ extension SwiftToolDispatcher {
         // "context_topics requires a correction"). Collect instead, and refuse
         // once with the whole list.
         var problems: [String] = []
+        var supersedes: [String] = []
+        if let supplied = input["supersedes"], supplied != .null {
+            if case .array(let ids) = supplied,
+               ids.allSatisfy({ if case .string(let id) = $0 { return !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }; return false }) {
+                supersedes = Array(Set(Self.stringArray(supplied).map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                })).sorted()
+            } else {
+                problems.append("'supersedes' must be an array of non-empty memory ids")
+            }
+        }
 
         // Schema defaults mirror the daemon: kind "note", confidence 0.8,
         // importance 0.5, tags [].
@@ -542,38 +554,21 @@ extension SwiftToolDispatcher {
         // Validated above alongside every other argument fault.
         if let validatedTopics {
             meta["context_topics"] = .array(validatedTopics)
-        } else if kind.lowercased() == "correction" {
-            // SCOPE AT INTAKE (A3 2026-09-11). An unscoped correction is
-            // MANDATORY on every turn, and 13 of the 31 live corrections were
-            // unscoped — task-specific lessons (an image-cache diagnosis, a git
-            // stash/reflog lesson) spending the relevance budget on turns about
-            // neither. A correction about a tool or topic now carries that
-            // topic; one about the people or about authority stays global,
-            // which is where it has to be. Fail-open: nothing derivable leaves
-            // the correction exactly as global as it is today.
-            //
-            // DISPATCH EVIDENCE, NOT THE OFFERED SET (GPT-5.6 review
-            // 2026-09-11): scoping is only allowed to narrow a correction when
-            // a tool ACTUALLY RAN this turn. Absent evidence the derivation
-            // fails open to global.
-            let derived = CorrectionScopeAtIntake.derivedTopics(
-                correctionText: text,
-                turnToolNames: try await dispatchedToolNamesThisTurn(
-                    sessionId: Self.extractSessionId(from: input)
-                )
-            )
-            if !derived.isEmpty {
-                meta["context_topics"] = .array(derived.map { .string($0) })
-                meta["context_topics_origin"] = .string("intake_derived")
-            }
         }
 
         let record: MemoryRecord
+        let mayReplace: [MemoryRecord]
         do {
+            // Suggestions are best effort: they never block saving the memory.
+            mayReplace = supersedes.isEmpty
+                ? ((try? await memoryV2.possibleReplacements(
+                    content: text, kind: kind, surface: ChatTurnRuntimeContext.current?.surface ?? "chat")) ?? [])
+                : []
             record = try await memoryV2.store(
                 content: text,
                 source: "chat.commit_memory",
-                metadata: .object(meta)
+                metadata: .object(meta),
+                supersedes: supersedes
             )
         } catch {
             // Tombstoned (denylist/paraphrase) or storage-unavailable: surface a
@@ -592,6 +587,9 @@ extension SwiftToolDispatcher {
             source: "chat.commit_memory",
             textLength: text.count
         )
+        for id in supersedes {
+            await FluidContextToolScope.current?.recordAppliedMemoryCorrection(recordID: id, replacementID: record.id)
+        }
 
         // R13: first-class correction lineage. When the model names the memory
         // this fact CORRECTS, mark the old row lifecycle=corrected with a
@@ -600,7 +598,7 @@ extension SwiftToolDispatcher {
         // already-terminal row) is not a silent no-op.
         var correctionField: JSONValue = .null
         if let corrects = optionalString(input, "corrects")?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !corrects.isEmpty {
+            .trimmingCharacters(in: .whitespacesAndNewlines), !corrects.isEmpty, !supersedes.contains(corrects) {
             let reason = optionalString(input, "correction_reason")?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if corrects == record.id {
@@ -652,6 +650,13 @@ extension SwiftToolDispatcher {
         ]
         if case .double(let valence)? = meta["valence"] { payload["valence"] = .double(valence) }
         if case .object = correctionField { payload["correction"] = correctionField }
+        if supersedes.isEmpty {
+            payload["may_replace"] = .array(mayReplace.map {
+                .object(["id": .string($0.id), "text-snippet": .string(String($0.text.prefix(200)))])
+            })
+        } else {
+            payload["superseded"] = .array(supersedes.map(JSONValue.string))
+        }
         return .object(payload)
     }
 
@@ -768,33 +773,4 @@ extension SwiftToolDispatcher {
         }
         return (rendered, false)
     }
-
-
-    /// Tool names ACTUALLY DISPATCHED on this turn, from the two records the
-    /// system already keeps: the active-tools store's dispatch-only stamps
-    /// (`dispatchedTurn`, written solely by the gated dispatch path's
-    /// `markUsed` — turn-start promotion stamps `lastUsedTurn`, which is a
-    /// PREDICTION and is deliberately not read here) and
-    /// `ChatTurnExecution`'s dispatch records (the choice/bot lane). Both
-    /// UNDER-report rather than over-report — always-on core names and
-    /// `mcp__*` tools carry no session stamp — which is the safe direction:
-    /// missing evidence leaves a correction global.
-    func dispatchedToolNamesThisTurn(sessionId: String) async throws -> Set<String> {
-        var names = Set(ChatTurnExecution.current?.toolRecords.map(\.name) ?? [])
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return names }
-        let state = try await activeToolsStore.load(sessionId: trimmed)
-        // Compare against the turn THIS process set at `beginTurn`, not the
-        // one reloaded from disk: a suppressed turn-start write failure leaves
-        // the previous turn's number sitting next to the previous turn's
-        // stamps, which match each other perfectly (GPT-5.6 round review r2,
-        // 2026-09-11). On a mismatch nothing matches and the correction stays
-        // global — the safe direction.
-        let currentTurn = await activeToolsStore.currentTurn(sessionId: trimmed) ?? state.turnCount
-        for (name, turn) in state.dispatchedTurn where turn == currentTurn {
-            names.insert(name)
-        }
-        return names
-    }
-
 }

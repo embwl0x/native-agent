@@ -14,9 +14,11 @@
 // ChatOrchestration+TurnEngine) is the only thing that rides every turn, and it
 // is one bounded line in the VOLATILE block, never the cached prefix.
 //
-// The review tools refuse any id whose lane is not "moment". These are not a
-// second door onto the fact-proposal queue — that queue has its own review
-// surface and its own approval semantics.
+// User, 2026-10-01: her memory reviews are hers. `lane: all` lists every
+// proposal the Memories page offers (the same awaitsReview rule) and the review
+// decides any of them with the page's own accept/reject; `status: rejected` is
+// the page's "things I let go" history. Rewording stays moments-only: a fact
+// proposal is kept as staged, then rewritten with the app door's memory.rewrite.
 
 import Foundation
 import NativeAgentCore
@@ -29,26 +31,61 @@ extension SwiftToolDispatcher {
     /// review she can actually finish, not an inbox.
     static let maxPendingMomentsListed = 10
 
-    func impl_memory_moments_pending() async throws -> JSONValue {
-        let pending: [ProposalRecord]
+    /// A pending proposal the Memories page offers for review: every moment,
+    /// and any other lane's row that passes the page's awaitsReview rule.
+    private static func awaitsReview(_ proposal: ProposalRecord) -> Bool {
+        MemoryMoments.isMoment(proposal.metadata)
+            || SwiftNativeMemoryV2.awaitsReview(content: proposal.content, source: proposal.source, metadata: proposal.metadata)
+    }
+
+    private static func permitsProposalDisclosure(_ proposal: ProposalRecord, surface: String, persona: String?) -> Bool {
+        MemoryRecordDisclosurePolicy.classify(
+            personaID: proposal.personaId, status: "active", lifecycle: nil,
+            tags: nil, metadata: proposal.metadata
+        )?.permits(surface: surface, personaID: persona) == true
+    }
+
+    func impl_memory_moments_pending(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let lane = (optionalString(input, "lane") ?? "moments").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let status = (optionalString(input, "status") ?? "pending").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard lane == "moments" || lane == "all" else {
+            return .object(["status": .string("refused"), "reason": .string("lane must be \"moments\" or \"all\".")])
+        }
+        guard status == "pending" || status == "rejected" else {
+            return .object(["status": .string("refused"), "reason": .string("status must be \"pending\" or \"rejected\".")])
+        }
+        let limit = min(50, max(1, optionalInt(input, "limit") ?? Self.maxPendingMomentsListed))
+        let listed: [ProposalRecord]
         do {
-            pending = try await memoryV2.listProposals(status: "pending")
+            listed = try await memoryV2.listProposals(status: status)
         } catch {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("\(error)"),
             ])
         }
-        let allMoments = pending.filter { MemoryMoments.isMoment($0.metadata) }
+        let persona = memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID)
+        let allMoments = listed.filter {
+            Self.permitsProposalDisclosure($0, surface: surface,
+                persona: persona) && (lane == "all"
+                ? (status == "rejected" || Self.awaitsReview($0))
+                : MemoryMoments.isMoment($0.metadata))
+        }
         let moments = allMoments
-            .sorted { $0.createdAt > $1.createdAt }
-            .prefix(Self.maxPendingMomentsListed)
+            .sorted { ($0.resolvedAt ?? $0.createdAt) > ($1.resolvedAt ?? $1.createdAt) }
+            .prefix(limit)
         let rows: [JSONValue] = moments.map { proposal in
             var row: [String: JSONValue] = [
                 "id": .string(proposal.id),
                 "staged_at": .string(proposal.createdAt),
                 "content": .string(proposal.content),
             ]
+            if let lane = MemoryMoments.laneName(proposal.metadata) { row["lane"] = .string(lane) }
+            if let kind = MemoryMoments.metadataString(proposal.metadata, "kind") { row["kind"] = .string(kind) }
+            if status == "rejected" {
+                if let at = proposal.resolvedAt { row["rejected_at"] = .string(at) }
+                if let why = proposal.rejectionReason { row["reason"] = .string(why) }
+            }
             if let valence = MemoryMoments.metadataNumber(proposal.metadata, "valence") {
                 row["valence"] = .double(valence)
             }
@@ -71,11 +108,11 @@ extension SwiftToolDispatcher {
             "status": .string("ok"),
             "moments": .array(rows),
             "count": .int(Int64(rows.count)),
-            "total_pending": .int(Int64(totalPendingMoments)),
+            status == "rejected" ? "total_rejected" : "total_pending": .int(Int64(totalPendingMoments)),
         ])
     }
 
-    func impl_memory_moment_review(input: [String: JSONValue]) async throws -> JSONValue {
+    func impl_memory_moment_review(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         // Bad input is REFUSED, not thrown. A strict provider schema routinely
         // materializes an omitted optional as "" or null, and a thrown
         // toolDenied reads to the model as a policy block rather than "you left
@@ -112,18 +149,20 @@ extension SwiftToolDispatcher {
         } catch {
             return .object(["status": .string("failed"), "reason": .string("\(error)")])
         }
-        guard let proposal = pending.first(where: { $0.id == id }) else {
+        guard let proposal = pending.first(where: { $0.id == id && Self.awaitsReview($0) }) else {
             return .object([
                 "status": .string("failed"),
-                "reason": .string("No pending proposal with that id. Pull memory_moments_pending for the current list."),
+                "reason": .string("No proposal with that id is waiting on review. Pull memory_moments_pending lane all for the current list."),
             ])
         }
-        guard MemoryMoments.isMoment(proposal.metadata) else {
+        guard Self.permitsProposalDisclosure(proposal, surface: surface,
+            persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID)) else {
             return .object([
                 "status": .string("refused"),
-                "reason": .string("That proposal is not in the moments lane (lane: \(MemoryMoments.laneName(proposal.metadata) ?? "none")). memory_moment_review only decides moments."),
+                "reason": .string("This proposal is not available on this surface; nothing changed."),
             ])
         }
+        let isMoment = MemoryMoments.isMoment(proposal.metadata)
 
         if decision == "reject" {
             do {
@@ -136,6 +175,27 @@ extension SwiftToolDispatcher {
                 "decision": .string("reject"),
                 "id": .string(id),
             ])
+        }
+
+        // Another lane accepts exactly as the Memories page's Keep does.
+        if !isMoment {
+            if let edited, !edited.isEmpty {
+                return .object([
+                    "status": .string("refused"),
+                    "reason": .string("content rewords moments only. Accept without content, then app memory.rewrite the id that comes back."),
+                ])
+            }
+            do {
+                let record = try await memoryV2.acceptProposal(id: id)
+                return .object([
+                    "status": .string("ok"),
+                    "decision": .string("accept"),
+                    "id": .string(record.id),
+                    "content": .string(record.text),
+                ])
+            } catch {
+                return .object(["status": .string("failed"), "reason": .string("\(error)")])
+            }
         }
 
         // Accept the final wording once. A failed edit must never publish the

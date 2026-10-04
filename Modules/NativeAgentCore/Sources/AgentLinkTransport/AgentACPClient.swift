@@ -73,6 +73,7 @@ public actor AgentACPClient {
     private var newSessionRequestID: Int64?
     private var failure: (any Error)?
     private var text = ""
+    private var peerCredential: String?
     private var receivedBytes = 0
     private var permission: Permission?
     private var update: Update?
@@ -99,7 +100,7 @@ public actor AgentACPClient {
     }
 
     package func turn(executable: String, arguments: [String], directory: URL,
-              environment: [String: String], message: String, mcpServers: [JSONValue] = [],
+              environment: [String: String], message: String, peerCredential: String, mcpServers: [JSONValue] = [],
               permissionMode: String? = nil,
               conversationID: String? = nil,
               approvedExecutable: AgentACPExecutable? = nil,
@@ -110,11 +111,12 @@ public actor AgentACPClient {
         guard !closing, failure == nil else { throw Failure.interrupted }
         if started { guard conversationID == sessionID else { throw Failure.sessionUnavailable } }
         active = true
-        defer { active = false; prompting = false; self.permission = nil; self.update = nil }
+        defer { active = false; prompting = false; self.permission = nil; self.update = nil; self.peerCredential = nil }
         text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false
         startupTimeout = .initializationTimedOut
         self.permission = permission
         self.update = update
+        self.peerCredential = peerCredential
         self.requiredMode = permissionMode
         do {
         let reply = try await withTaskCancellationHandler {
@@ -145,6 +147,7 @@ public actor AgentACPClient {
                     do {
                         var line = Data()
                         for try await chunk in pipeReader.chunks {
+                            pipeReader.consumed()
                             try Task.checkCancellation()
                             for byte in chunk {
                                 if byte == 10 {
@@ -338,7 +341,7 @@ public actor AgentACPClient {
                         guard text.utf8.count + chunk.utf8.count <= 1_048_576 else { throw Failure.tooLarge }
                         text += chunk
                     }
-                    await update?(event)
+                    await update?(liveEvent(event))
                 } else if let id = object["id"] {
                     guard case .string = id else {
                         if case .int = id { try handleRequest(method, id: id, params: params); return }
@@ -365,6 +368,28 @@ public actor AgentACPClient {
         } catch { fail(error) }
     }
 
+    private func liveEvent(_ event: JSONValue) -> JSONValue {
+        guard case .object(var event) = event else { return event }
+        func redacted(_ value: JSONValue) -> JSONValue {
+            guard case .string(let value) = value else { return value }
+            return .string(AgentPeerHTTP.redactLiveText(value, token: peerCredential))
+        }
+        if event["sessionUpdate"] == .string("agent_message_chunk"),
+           case .object(var content)? = event["content"], content["type"] == .string("text") {
+            content["text"] = .string(AgentPeerHTTP.redactLiveText(text, token: peerCredential))
+            event["content"] = .object(content)
+        } else if event["sessionUpdate"] == .string("tool_call"), let title = event["title"] {
+            event["title"] = redacted(title)
+        } else if event["sessionUpdate"] == .string("plan"), case .array(let entries)? = event["entries"] {
+            event["entries"] = .array(entries.map { entry in
+                guard case .object(var entry) = entry, let content = entry["content"] else { return entry }
+                entry["content"] = redacted(content)
+                return .object(entry)
+            })
+        }
+        return .object(event)
+    }
+
     private func handleRequest(_ method: String, id: JSONValue, params: [String: JSONValue]) throws {
         guard method == "session/request_permission" else {
             try write(.object(["jsonrpc": .string("2.0"), "id": id,
@@ -379,8 +404,15 @@ public actor AgentACPClient {
         // Never choose allow_always, even if it is the agent's only allow option.
         let allow = options.first { $0.objectValue?["kind"] == .string("allow_once") }?.objectValue?["optionId"]
         let deny = options.first { $0.objectValue?["kind"] == .string("reject_once") }?.objectValue?["optionId"]
+        var preview = params
+        if let peerCredential, !peerCredential.isEmpty, var call = params["toolCall"]?.objectValue,
+           case .string(let title)? = call["title"] {
+            call["title"] = .string(title.replacingOccurrences(of: peerCredential, with: "[redacted]"))
+            preview["toolCall"] = .object(call)
+        }
+        let request = JSONValue.object(preview)
         let task = Task { [weak self, permission] in
-            let approved = (try? await permission?(.object(params))) == true
+            let approved = (try? await permission?(request)) == true
             guard !Task.isCancelled else { return }
             await self?.permissionResult(key: key, selection: approved ? allow : deny, allowed: approved && allow != nil)
         }
@@ -474,6 +506,9 @@ private final class AgentACPPipeReader: @unchecked Sendable {
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
     private let source: any DispatchSourceRead
     private let fd: Int32
+    private let lock = NSLock()
+    private var bufferedChunks = 0
+    private var suspended = false
 
     init(handle: FileHandle) throws {
         let owned = dup(handle.fileDescriptor)
@@ -491,38 +526,58 @@ private final class AgentACPPipeReader: @unchecked Sendable {
             queue: DispatchQueue(label: "nativeagent.acp.pipe.\(owned)", qos: .userInitiated))
         source.setEventHandler { [weak self] in self?.drain() }
         source.setCancelHandler { Darwin.close(owned) }
-        continuation.onTermination = { [weak self] _ in self?.source.cancel() }
+        continuation.onTermination = { [weak self] _ in self?.cancel() }
         source.resume()
     }
 
+    func consumed() {
+        lock.lock()
+        bufferedChunks -= 1
+        if suspended { suspended = false; source.resume() }
+        lock.unlock()
+    }
+
     func cancel() {
-        continuation.finish()
+        lock.lock()
+        if suspended { suspended = false; source.resume() }
         source.cancel()
+        lock.unlock()
+        continuation.finish()
     }
 
     deinit { cancel() }
 
     private func drain() {
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-        while !source.isCancelled {
+        while true {
+            lock.lock()
+            guard !source.isCancelled else { lock.unlock(); return }
+            // Leave unread bytes in the pipe until the consumer makes room.
+            // Count before yielding, since consumption can begin immediately.
+            if bufferedChunks == 16 {
+                suspended = true; source.suspend()
+                lock.unlock(); return
+            }
+            lock.unlock()
             let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
             if count > 0 {
+                lock.lock(); bufferedChunks += 1; lock.unlock()
                 switch continuation.yield(Data(buffer.prefix(count))) {
                 case .enqueued: continue
                 case .dropped:
-                    continuation.finish(throwing: AgentACPClient.Failure.tooLarge)
-                    source.cancel(); return
-                case .terminated: source.cancel(); return
+                    continuation.finish(throwing: AgentACPClient.Failure.interrupted)
+                    cancel(); return
+                case .terminated: cancel(); return
                 @unknown default:
                     continuation.finish(throwing: AgentACPClient.Failure.interrupted)
-                    source.cancel(); return
+                    cancel(); return
                 }
             }
-            if count == 0 { continuation.finish(); source.cancel(); return }
+            if count == 0 { cancel(); return }
             if errno == EINTR { continue }
             if errno == EAGAIN || errno == EWOULDBLOCK { return }
             continuation.finish(throwing: AgentACPClient.Failure.interrupted)
-            source.cancel(); return
+            cancel(); return
         }
     }
 }

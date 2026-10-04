@@ -22,6 +22,7 @@ public enum WorkshopBackgroundWork {
         planner: SwiftNativeWorkshopPlannerLLM,
         chatClient: @escaping @Sendable (any ToolDispatchClient) -> SwiftNativeChatOrchestrationClient,
         gatedTools: any ToolDispatchClient,
+        approvedTools: @escaping @Sendable (ApprovedChatToolReplay) -> any ToolDispatchClient,
         notify: @escaping WorkshopInboxNotification
     ) -> WorkshopExecutorLoop {
         let usesLiveAppBody = dataRoot == PersistenceCore.defaultDataRoot()
@@ -64,6 +65,7 @@ public enum WorkshopBackgroundWork {
             let response = try await client.runEphemeralToolTurn(
                 message: prompt,
                 fileAccess: "read_only",
+                requireCompleted: true,
                 surface: WorkshopSurfaceVocabulary.canonical
             )
             guard let providerCallCount = response.providerCallCount else {
@@ -101,6 +103,9 @@ public enum WorkshopBackgroundWork {
                     NSLocalizedDescriptionKey: "step args must be a JSON object",
                 ])
             }
+            if let schema = try await gatedTools.listAvailableToolSchemas().first(where: { $0.name == tool }) {
+                try WorkshopArgumentValidation.validate(args, schema: JSONValue.parse(schema.parametersJSON))
+            }
             return try await gatedTools.dispatch(tool: tool, input: dict, surface: "mission")
         }
         return WorkshopExecutorLoop(
@@ -108,6 +113,29 @@ public enum WorkshopBackgroundWork {
             measuredLLMStep: measuredLLMStep,
             measuredTooledLLMStep: measuredTooledLLMStep,
             toolDispatch: toolStep,
+            approvedToolDispatch: { tool, args, approvalId in
+                guard case .object(let input) = args,
+                      let approval = try? await SwiftNativeApprovalInbox(root: dataRoot).get(approvalId),
+                      ExecutionEventVocabulary.matches(approval.action, WorkshopStepApprovalAction.canonical),
+                      case .object(let payload) = approval.payload,
+                      payload["tool"] == .string(tool), payload["args"] == args,
+                      approval.status == "resolved", approval.decision == "approved" else {
+                    throw WorkshopExecutionError.forbidden("Workshop approval arguments do not match")
+                }
+                let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+                guard await inbox.consumeApprovedEffect(
+                    id: approvalId, digest: ApprovalInboxApprovedReplayVerifier.effectDigest(approval.payload),
+                    action: tool, surface: "mission") == .spent else {
+                    throw WorkshopExecutionError.forbidden("Workshop approval was already spent or is unavailable")
+                }
+                let dispatcher = approvedTools(ApprovedChatToolReplay(
+                    approvalID: approvalId, tool: tool, surface: "mission", input: input,
+                    verifiedSessionID: nil, verifiedChatID: nil, verifiedUserID: nil))
+                if let schema = try await dispatcher.listAvailableToolSchemas().first(where: { $0.name == tool }) {
+                    try WorkshopArgumentValidation.validate(args, schema: JSONValue.parse(schema.parametersJSON))
+                }
+                return try await dispatcher.dispatch(tool: tool, input: input, surface: "mission")
+            },
             stageApproval: makeWorkshopStepApprovalStager(dataRoot: dataRoot, notify: notify),
             isEnabled: { await workshopExecutorGate(dataRoot: dataRoot) },
             // An admitted, active Full Mac grant flattens all Workshop
@@ -245,6 +273,7 @@ public enum WorkshopBackgroundWork {
                       }),
                       case .string(let sid)? = p["step_id"] else { return false }
                 return mid == req.executionId && sid == req.stepId
+                    && p["tool"] == .string(req.tool) && p["args"] == req.args
             }) {
                 do {
                     try await ensureWorkshopStepInboxCard(
@@ -304,13 +333,14 @@ public enum WorkshopBackgroundWork {
             .appendingPathComponent("inbox.jsonl")
         let fmt = ISO8601DateFormatter()
         fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let summary = "To continue \(req.taskTitle), approve: \(req.actionDescription)"
         let card: JSONValue = .object([
             "id": .string(approvalId),
             "created_at": .string(fmt.string(from: Date())),
             "source": .string("workshop"),
             "severity": .string("actionable"),
             "title": .string(req.title),
-            "summary": .string("Desk execution \(req.executionId) is blocked on step \(req.stepId) (\(req.tool))."),
+            "summary": .string(summary),
             "detail": .string(
                 "Approve to execute the blocked step and continue the Desk task; "
                 + "deny to reject the step and fail the Desk task.\n\n\(req.reason)"),
@@ -342,7 +372,7 @@ public enum WorkshopBackgroundWork {
                 dataRoot,
                 approvalId,
                 req.title,
-                "Desk execution \(req.executionId) is blocked on step \(req.stepId) (\(req.tool)).",
+                summary,
                 "workshop",
                 "actionable"
             )

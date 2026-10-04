@@ -53,14 +53,20 @@ public enum CapabilityTraceFeed {
             if droppedPrefix {
                 try handle.seek(toOffset: fileSize - bytesToRead)
             }
-            let data = handle.readData(ofLength: Int(bytesToRead))
+            var data = handle.readData(ofLength: Int(bytesToRead))
+            if droppedPrefix {
+                if let newline = data.firstIndex(of: 10) {
+                    data.removeSubrange(data.startIndex...newline)
+                } else {
+                    data.removeAll()
+                }
+            }
             guard let text = String(data: data, encoding: .utf8) else {
                 return .unavailable("trace feed is not valid UTF-8")
             }
 
             var lines = text.components(separatedBy: "\n")
             if lines.last == "" { lines.removeLast() }
-            if droppedPrefix, !lines.isEmpty { lines.removeFirst() }
 
             let decoder = JSONDecoder.nativeAgent
             var decoded: [(index: Int, trace: RuntimeTrace)] = []

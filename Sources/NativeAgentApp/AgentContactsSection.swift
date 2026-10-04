@@ -14,6 +14,9 @@ struct AgentContactRow: Identifiable {
     var peers: [AgentPeerContact] = []
     /// The newest retained exchange with this contact, from any chat.
     var lastExchange: String?
+    /// Home's own word for this contact (AgentContactHealth): one source, so
+    /// Agents, the Simple view and home never disagree.
+    var health: AgentLocalHealth?
     var readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }
 
     var credentialAvailable: Bool {
@@ -22,12 +25,17 @@ struct AgentContactRow: Identifiable {
 
     var state: AgentPeerContactState? { credentialAvailable ? contact?.state : .unavailable }
 
+    var repliesOnly: Bool {
+        let hostID = contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? id
+        return AgentHostDirectory.row(named: hostID)?.format == .shellEnvironment
+    }
+
     var displayName: String {
         builtIn ? name + " (built-in connection)" : sharesBuiltInName ? name + " (agent contact)" : name
     }
 
     var route: String {
-        if builtIn { return "Built-in connection · Available to send; no recent reply checked here." }
+        if builtIn { return "Built-in connection on this Mac" }
         if let contact, contact.transport == .acp {
             return "Route: ACP\nStarts in folder: \(contact.acpWorkingDirectory ?? "Not set")"
                 + "\nProgram: \(contact.approvedExecutablePath ?? "Not approved")"
@@ -36,6 +44,7 @@ struct AgentContactRow: Identifiable {
         let hostID = contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? id
         let host = AgentHostDirectory.rows.first { $0.id == hostID }
         if let host {
+            if repliesOnly { return host.description }
             if host.route == .grokBot {
                 return host.description + " Messages start a routine; its local reply returns here. Grok Bot may ask you to approve each reply command."
             }
@@ -78,6 +87,25 @@ struct AgentContactRow: Identifiable {
         return contacts + liveLanes.map { Self(id: "builtin:" + $0.0, name: $0.1, contact: nil, builtIn: true) }
     }
 
+    /// What every Agents list shows: Claude's doors (her lane, Claude Code
+    /// and Claude Desktop, saved or only installed) are one row, the lane's
+    /// when she has one, wearing home's health for her. Every other row is as
+    /// it was. A list read asks for a fresh health check.
+    static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>, dataRoot: URL) -> [Self] {
+        Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
+        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let all = rows(peers: peers, candidates: candidates, usable: usable)
+        func claude(_ row: Self) -> Bool {
+            identity.canonical(row.key) == "claude" || ["claude-code", "claude-desktop"].contains(row.id)
+        }
+        guard var her = all.first(where: { $0.builtIn && claude($0) }) ?? all.first(where: claude) else { return all }
+        her.health = AgentLocalHealth.read(dataRoot)["claude"]
+        return all.compactMap { !claude($0) ? $0 : $0.id == her.id ? her : nil }
+    }
+
+    /// The id home and the health file know it by: a lane's name, a contact's `peer:` id.
+    var key: String { builtIn ? String(id.dropFirst("builtin:".count)) : id }
+
     static func rows(peers: [AgentPeerContact], installed: [AgentHostRow]) -> [Self] {
         let configured = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
         return peers.map { Self(id: "peer:" + $0.id, name: $0.name, contact: $0, peers: peers) }
@@ -87,6 +115,10 @@ struct AgentContactRow: Identifiable {
 
     /// The one word the row's pill carries; the full status stays below it.
     var pillWord: String {
+        if let health, health.problem != nil {
+            let word = health.status.replacingOccurrences(of: "_", with: " ")
+            return word.prefix(1).uppercased() + word.dropFirst()
+        }
         if builtIn { return "Available" }
         guard contact != nil else { return "Not set up" }
         switch state {
@@ -99,8 +131,14 @@ struct AgentContactRow: Identifiable {
     }
 
     var status: String {
+        if let problem = health?.problem { return problem }
         if builtIn { return "Available · Reply not checked" }
         guard let contact else { return "On this Mac · Not set up" }
+        if repliesOnly {
+            return !credentialAvailable ? AgentPeerCredentials.unavailableDetail
+                : contact.provenInboundAt == nil ? "Replies only · No inbound message checked yet"
+                : "Replies only · An inbound message has arrived"
+        }
         if contact.transport == .grokBot {
             return contact.grokSetup == "set up" ? "Set up · \(contact.provenInboundAt == nil ? "No answer checked yet" : "A reply has arrived")"
                 : contact.grokSetup == "secure-paste" ? "Setup needs a secure credential import on the Connect card"
@@ -151,60 +189,6 @@ struct AgentContactRow: Identifiable {
         case .disconnect: return "Disconnect the \(name) agent contact."
         case .test: return "Send \(name) a short test message and tell me what it answers."
         }
-    }
-}
-
-enum AgentContactResult {
-    /// A bounded display result on the existing approval receipt, so a long
-    /// settings description cannot cut off the test answer's JSON mid-string.
-    static func receipt(_ result: JSONValue) -> JSONValue {
-        ApprovalTransactionCoordinator.agentContactReceipt(result)
-    }
-
-    static func text(_ result: JSONValue) -> String {
-        guard case .object(let value) = result else { return "The result could not be read. Nothing is confirmed." }
-        func string(_ key: String) -> String? {
-            guard case .string(let text)? = value[key], !text.isEmpty else { return nil }
-            return text
-        }
-        if ["pending_approval", "waiting_approval"].contains(string("status") ?? "") { return "Waiting for approval." }
-        if let probe = value["probe"] { return text(probe) }
-        if value["error"] != nil || ["failed", "rejected", "canceled", "cancelled", "unavailable", "error", "blocked", "refused"].contains(string("status") ?? "") {
-            switch string("reason") ?? string("error") ?? "" {
-            case "missing_session_id":
-                return "The request could not be started. Refresh Agents and try again."
-            default:
-                return "The action could not be completed. Check that the other app is available and signed in, then refresh Agents and try again."
-            }
-        }
-        let reply = string("reply")
-        if value["connection_check"] == .bool(true), value["connection_reply_received"] != .bool(true) {
-            return (string("detail") ?? "No new answer arrived through the connection.")
-                + (reply.map { "\nThe other app said: \($0)" } ?? "")
-        }
-        let status = string("status") ?? ""
-        let phase: String?
-        if value["needs_authentication"] == .bool(true) || status == "auth-required" { phase = "Needs sign-in" }
-        else if value["needs_input"] == .bool(true) || status == "input-required" { phase = "Needs input" }
-        else if ["failed", "rejected", "canceled", "unavailable", "error"].contains(status) { phase = "Failed" }
-        else if value["completed"] == .bool(true) || ["completed", "replied", "reply"].contains(status) { phase = "Completed" }
-        else if ["working", "running", "in_progress"].contains(status) { phase = "Working" }
-        else if ["accepted", "submitted", "enqueued", "queued"].contains(status) { phase = "Accepted" }
-        else { phase = nil }
-        let accepted = ["Accepted", "Working", "Needs input", "Needs sign-in", "Completed"].contains(phase ?? "")
-        var lines: [String] = []
-        if let phase {
-            lines.append("Delivery: \(accepted ? "accepted" : value["sent"] == .bool(true) ? "sent" : "not confirmed") · Result: \(phase)")
-        } else if value["completed"] == .bool(false) || value["sent"] != nil {
-            lines.append("Delivery: \(value["sent"] == .bool(true) ? "sent" : "not confirmed") · Completion: not confirmed")
-        }
-        if let detail = reply ?? string("detail"), !detail.isEmpty { lines.append(detail) }
-        for (key, label) in [("task_id", "Task"), ("message_id", "Message"), ("conversation_id", "Conversation"),
-                             ("run_id", "Attempt"), ("local_request_id", "Request")] {
-            if let locator = string(key) { lines.append("\(label): \(locator)") }
-        }
-        if let remote = value["remote_evidence"] { lines.append(text(remote)) }
-        return lines.isEmpty ? "No answer came back. Delivery has not been confirmed." : lines.joined(separator: "\n")
     }
 }
 
@@ -266,10 +250,12 @@ struct AgentContactsSection: View {
                                     .controlSize(.small)
                                     .accessibilityLabel("Connect \(row.displayName)")
                             } else {
+                                if !row.repliesOnly {
                                 Button("Send a test message") { perform(row, .test) }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
                                     .accessibilityLabel("Send a test message to \(row.displayName)")
+                                }
                                 if !row.builtIn {
                                 Button("Disconnect agent") { perform(row, .disconnect) }
                                     .buttonStyle(.bordered)
@@ -291,8 +277,11 @@ struct AgentContactsSection: View {
         .task(id: refresh + refreshGeneration) {
             guard fixtureRows == nil else { return }
             discovery = await AgentDiscoverySession.shared.candidates(refresh: true)
+            // Any chat append rewrites the chat index, so a contact's session moving shows here.
             let events = FileChangeEvents(paths: [root.appendingPathComponent("agents/peers.json"),
-                                                  root.appendingPathComponent("agents/conversations.json")], emitInitial: true)
+                                                  root.appendingPathComponent("agents/conversations.json"),
+                                                  AgentLocalHealth.url(root),
+                                                  root.appendingPathComponent("chat/sessions.json")], emitInitial: true)
             await withTaskCancellationHandler {
                 for await _ in events.stream {
                     guard !Task.isCancelled else { break }
@@ -308,13 +297,13 @@ struct AgentContactsSection: View {
             let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
             let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
             let peers = try AgentPeerStore(dataRoot: root).list()
-            // The conversations file can be large: read and summarise it off the main actor, once.
+            // The conversations file and the sessions can be large: read and summarise them off the main actor, once.
             let root = root
             let lasts = await Task.detached(priority: .utility) {
                 AgentConversationStore.lastExchanges(peers: peers,
-                    records: (try? AgentConversationStore(dataRoot: root).records()) ?? []).mapValues(\.summary)
+                    records: (try? AgentConversationStore(dataRoot: root).records()) ?? [], dataRoot: root).mapValues(\.summary)
             }.value
-            rows = AgentContactRow.rows(peers: peers, candidates: discovery, usable: usable).map { row in
+            rows = AgentContactRow.rows(peers: peers, candidates: discovery, usable: usable, dataRoot: root).map { row in
                 var row = row
                 row.lastExchange = row.contact.flatMap { lasts[$0.id] }
                 return row

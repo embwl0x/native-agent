@@ -440,7 +440,7 @@ public enum VisionColorRegionLayer {
         }
 
         return VisionColorRegionResult(
-            candidates: kept.sorted(by: readingOrder),
+            candidates: readingOrder(kept),
             backgroundLuminance: backgroundLuminance,
             capped: capped
         )
@@ -448,9 +448,38 @@ public enum VisionColorRegionLayer {
 
     /// Deterministic reading order. Two frames of the same scene must compile
     /// to the same rows in the same order or handles are not stable.
-    static func readingOrder(_ lhs: VisionCandidate, _ rhs: VisionCandidate) -> Bool {
-        if abs(lhs.rect.y - rhs.rect.y) > 2 { return lhs.rect.y < rhs.rect.y }
-        if abs(lhs.rect.x - rhs.rect.x) > 2 { return lhs.rect.x < rhs.rect.x }
-        return lhs.rect.area > rhs.rect.area
+    static func readingOrder(_ candidates: [VisionCandidate]) -> [VisionCandidate] {
+        let rows = toleranceGroups(candidates.sorted(by: geometryPrecedes), coordinate: { $0.rect.y })
+        return rows.flatMap { row in
+            let byX = row.sorted {
+                $0.rect.x == $1.rect.x ? geometryPrecedes($0, $1) : $0.rect.x < $1.rect.x
+            }
+            return toleranceGroups(byX, coordinate: { $0.rect.x }).flatMap { column in
+                column.sorted {
+                    $0.rect.area == $1.rect.area ? geometryPrecedes($0, $1) : $0.rect.area > $1.rect.area
+                }
+            }
+        }
+    }
+
+    private static func geometryPrecedes(_ lhs: VisionCandidate, _ rhs: VisionCandidate) -> Bool {
+        if lhs.rect.y != rhs.rect.y { return lhs.rect.y < rhs.rect.y }
+        if lhs.rect.x != rhs.rect.x { return lhs.rect.x < rhs.rect.x }
+        if lhs.rect.w != rhs.rect.w { return lhs.rect.w < rhs.rect.w }
+        return lhs.rect.h < rhs.rect.h
+    }
+
+    private static func toleranceGroups(
+        _ candidates: [VisionCandidate], coordinate: (VisionCandidate) -> Double
+    ) -> [[VisionCandidate]] {
+        var groups: [[VisionCandidate]] = []
+        for candidate in candidates {
+            if let anchor = groups.last?.first, coordinate(candidate) - coordinate(anchor) <= 2 {
+                groups[groups.count - 1].append(candidate)
+            } else {
+                groups.append([candidate])
+            }
+        }
+        return groups
     }
 }

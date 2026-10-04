@@ -171,41 +171,6 @@ struct ShellConversationRow: View {
     }
 }
 
-/// The bridge and agent sessions, folded into one line with a chevron. They are
-/// real conversations, so they expand in place rather than disappearing.
-struct ShellWorkingGroupRow: View {
-    var title: String = ChatShellCopy.workingRowTitle
-    var count: Int
-    var isExpanded: Bool
-    var onToggle: () -> Void
-
-    var body: some View {
-        Button(action: onToggle) {
-            HStack(spacing: 6) {
-                Text(title)
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                Text("\(count)")
-                    .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(ShellType.captionSemibold)
-                    .foregroundStyle(NativeAgentShell.secondary)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(title)
-        .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
-        .accessibilityIdentifier("chat.shell.working-group")
-    }
-}
-
 // MARK: - Tool traffic
 
 /// A worker's reply, folded: the headline row opens onto the words, and the

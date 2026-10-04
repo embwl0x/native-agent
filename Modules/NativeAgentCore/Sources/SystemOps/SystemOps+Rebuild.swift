@@ -16,11 +16,9 @@ public final class SwiftNativeSystemRebuildClient: SystemRebuildClient {
     ///   - repoRoot:        Local NativeAgent checkout root (contains
     ///                      `script/install_app.sh`).
     ///   - runner:          Test-injectable subprocess runner.
-    ///   - daemonAutonomy:  Static daemon-startup `enable_autonomy` flag.
-    ///                      Defaults to `false` (closed-fail). Production
-    ///                      callers MUST seed this from the daemon boot
-    ///                      configuration; tests can pass `true` + a stub
-    ///                      policy provider.
+    ///   - daemonAutonomy:  Runtime availability gate. Defaults to `false`
+    ///                      for direct construction; the production factory
+    ///                      enables the unconditional in-process runtime.
     ///   - policyProvider:  Async closure returning the current trust-policy
     ///                      view. Defaults to `readAutonomyTrustPolicy()`
     ///                      which reads `<dataRoot>/trust/policy.json` via
@@ -44,10 +42,8 @@ public final class SwiftNativeSystemRebuildClient: SystemRebuildClient {
     }
 
     public func systemRebuild() async throws -> SystemRebuildOpResult {
-        // Wave-8 gate: BOTH the daemon-startup master switch AND the
-        // user-set Trust Center toggle must be on; additionally the
-        // per-action `systemRebuild.enabled` flag must be true (default
-        // false). Mirrors Python L45110-L45125.
+        // Runtime availability, current Trust autonomy and the per-action
+        // rebuild authorization must all allow execution.
         let policy = try await policyProvider()
         switch try await autonomyApprovalGate(
             action: .systemRebuild,
@@ -60,12 +56,8 @@ public final class SwiftNativeSystemRebuildClient: SystemRebuildClient {
             throw SystemOpsError.autonomyDenied(reason)
         }
 
-        // Cross-process rebuild lock. The Python lock at L45168 is
-        // intentionally never released after Popen succeeds (the daemon
-        // dies in install_app.sh). The Swift mirror is the same: on the
-        // happy path we leak the fd so the kernel auto-releases on
-        // process exit; on the error path (script missing OR Popen
-        // throws) we release explicitly so a retry can proceed.
+        // Hold the cross-process lock until installation ends or the app exits.
+        // An installer that exits before restarting the app must allow a retry.
         if await !rebuildLock.acquire() {
             throw SystemOpsError.rebuildInProgress
         }
@@ -82,14 +74,15 @@ public final class SwiftNativeSystemRebuildClient: SystemRebuildClient {
                 arguments: [script.path],
                 cwd: repoRoot,
                 timeout: 5,
-                detached: true
+                detached: true,
+                onTermination: { [rebuildLock] _ in
+                    Task { await rebuildLock.release() }
+                }
             )
         } catch {
             await rebuildLock.release()
             throw error
         }
-        // Note: lock intentionally NOT released here — the app process is
-        // about to die mid-install.
         return SystemRebuildOpResult(
             ok: true,
             message: "Rebuild started — the app will reinstall and restart in ~10–60s",

@@ -43,10 +43,10 @@ enum GitHubCheckClassifier {
         if hasMaintainerGate { return .maintainerBlocked }
         if !failedRuns.isEmpty || !combinedRows.isEmpty { return .failed }
         if contextCount > 0 && combinedState == "pending" { return .pending }
-        if contextCount > 0 && combinedState == "success" { return .passing }
         if runRows.contains(where: { normalized($0["status"]) != "completed" || $0["conclusion"] == nil }) {
             return .pending
         }
+        if contextCount > 0 && combinedState == "success" { return .passing }
         return runRows.isEmpty ? .none : .passing
     }
 
@@ -193,14 +193,8 @@ enum GitHubCommandObservationBuilder {
         let reviewRows = reviews as? [[String: Any]] ?? []
         let commentRows = reviewComments as? [[String: Any]] ?? []
         let runRows = (checkRuns as? [String: Any])?["check_runs"] as? [[String: Any]] ?? []
-        let actionableReviewRows = reviewRows.filter { review in
-            guard reviewStateValue(review) == "CHANGES_REQUESTED",
-                  let reviewId = numericIdentifier(review),
-                  let reviewThreads else { return true }
-            let associated = reviewThreads.filter { $0.reviewId == reviewId }
-            return associated.isEmpty || associated.contains(where: \.isActionable)
-        }
-        let reviewState = latestReviewState(actionableReviewRows)
+        let effectiveReviews = latestEffectiveReviews(reviewRows)
+        let reviewState = latestReviewState(effectiveReviews)
         let checks = GitHubCheckClassifier.state(
             runRows: runRows,
             combinedStatus: combinedStatus
@@ -214,7 +208,7 @@ enum GitHubCommandObservationBuilder {
         var actionableEvidence: [GitHubCommandActionEvidence] = []
         if reviewState == "changes_requested" {
             signals.insert(.changesRequested)
-            if let row = latest(actionableReviewRows.filter { (($0["state"] as? String) ?? "").uppercased() == "CHANGES_REQUESTED" }) {
+            if let row = latest(effectiveReviews.filter { reviewStateValue($0) == "CHANGES_REQUESTED" }) {
                 markers.append("review:\(identifier(row)):\(timestamp(row))")
                 actionableEvidence.append(actionEvidence(
                     signal: .changesRequested,
@@ -372,21 +366,6 @@ enum GitHubCommandObservationBuilder {
         )
     }
 
-    static func reviewState(
-        _ reviews: Any,
-        reviewThreads: [GitHubCommandReviewThreadEvidence]?
-    ) -> String {
-        let rows = reviews as? [[String: Any]] ?? []
-        let actionable = rows.filter { review in
-            guard reviewStateValue(review) == "CHANGES_REQUESTED",
-                  let reviewId = numericIdentifier(review),
-                  let reviewThreads else { return true }
-            let associated = reviewThreads.filter { $0.reviewId == reviewId }
-            return associated.isEmpty || associated.contains(where: \.isActionable)
-        }
-        return latestReviewState(actionable)
-    }
-
     static func issue(
         repository: String,
         row: [String: Any],
@@ -422,18 +401,36 @@ enum GitHubCommandObservationBuilder {
         )
     }
 
-    private static func latestReviewState(_ rows: [[String: Any]]) -> String {
-        var latestByLogin: [String: [String: Any]] = [:]
-        for row in rows {
-            guard let login = (row["user"] as? [String: Any])?["login"] as? String else { continue }
-            if let existing = latestByLogin[login], timestamp(existing) >= timestamp(row) { continue }
-            latestByLogin[login] = row
-        }
-        let states = latestByLogin.values.compactMap { ($0["state"] as? String)?.uppercased() }
+    static func latestReviewState(_ rows: [[String: Any]]) -> String {
+        let states = latestEffectiveReviews(rows).compactMap(reviewStateValue)
         if states.contains("CHANGES_REQUESTED") { return "changes_requested" }
         if states.contains("APPROVED") { return "approved" }
         if states.contains("COMMENTED") { return "commented" }
         return "review_required"
+    }
+
+    private static func latestEffectiveReviews(_ rows: [[String: Any]]) -> [[String: Any]] {
+        var latestByLogin: [String: [String: Any]] = [:]
+        for row in rows {
+            guard let rawLogin = (row["user"] as? [String: Any])?["login"] as? String,
+                  let state = (row["state"] as? String)?.uppercased(),
+                  state != "PENDING" else { continue }
+            let login = rawLogin.lowercased()
+            // Comments do not supersede decisions, including a dismissal.
+            if let existing = latestByLogin[login] {
+                let existingIsComment = reviewStateValue(existing) == "COMMENTED"
+                if state == "COMMENTED", !existingIsComment { continue }
+                if state != "COMMENTED", existingIsComment {
+                    latestByLogin[login] = row
+                    continue
+                }
+                let existingOrder = (existing["submitted_at"] as? String ?? timestamp(existing), numericIdentifier(existing) ?? 0)
+                let rowOrder = (row["submitted_at"] as? String ?? timestamp(row), numericIdentifier(row) ?? 0)
+                if existingOrder >= rowOrder { continue }
+            }
+            latestByLogin[login] = row
+        }
+        return Array(latestByLogin.values)
     }
 
     private static func latest(_ rows: [[String: Any]]) -> [String: Any]? {
@@ -574,11 +571,10 @@ public extension GitHubConnectorActions {
         staleAfterHours: Int = 72,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> GitHubCommandObservation {
-        let actor: String?
-        if let user = try? await validateStoredToken(dataRoot: dataRoot) {
-            actor = user["login"] as? String
-        } else {
-            actor = nil
+        let user = try await validateStoredToken(dataRoot: dataRoot)
+        guard let actor = (user["login"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !actor.isEmpty else {
+            throw GitHubConnectorError.invalidResponse("Authenticated GitHub contributor could not be established.")
         }
         switch item.kind {
         case .issue:

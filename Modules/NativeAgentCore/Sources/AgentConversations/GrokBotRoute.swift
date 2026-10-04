@@ -23,6 +23,7 @@ public struct GrokPendingRequest: Codable, Sendable {
     /// Whether the answer became her turn: "pending" until it does, then
     /// "handing over", "handed over", "taken by wait", or why it could not.
     public var handOver: String?
+    public var settledAt: Date?
 }
 
 public struct GrokRequestStore: Sendable {
@@ -36,6 +37,7 @@ public struct GrokRequestStore: Sendable {
     public func create(id: String, peer: String, conversation: String, quiet: Bool = false, now: Date = Date()) throws -> GrokPendingRequest {
         guard NativeAgentChatSessionID.normalizedPathComponent(conversation) == conversation else { throw GrokLinkCredential.Failure.invalid }
         let file = try url(id)
+        try pruneSettled(now: now)
         return try CredentialFileLock.withLock(file) {
             guard !FileManager.default.fileExists(atPath: file.path) else { throw GrokLinkCredential.Failure.invalid }
             let request = GrokPendingRequest(messageID: id, peerID: peer, conversationID: conversation,
@@ -49,7 +51,7 @@ public struct GrokRequestStore: Sendable {
         return try CredentialFileLock.withLock(file) {
             var value = try load(file)
             guard value.peerID == peer else { throw GrokLinkCredential.Failure.invalid }
-            if value.expiresAt < now && ["sending", "accepted", "outcome unknown"].contains(value.state) {
+            if value.expiresAt < now && ["sending", "accepted", "outcome_unknown"].contains(value.state) {
                 value.state = "no answer in time"
             }
             return value
@@ -58,7 +60,9 @@ public struct GrokRequestStore: Sendable {
     private func load(_ file: URL) throws -> GrokPendingRequest {
         let data = try Data(contentsOf: file)
         guard data.count <= 96 * 1024 else { throw GrokLinkCredential.Failure.invalid }
-        return try JSONDecoder().decode(GrokPendingRequest.self, from: data)
+        var value = try JSONDecoder().decode(GrokPendingRequest.self, from: data)
+        value.state = GrokBotRoute.normalizedStatus(value.state)
+        return value
     }
     @discardableResult public func update(_ id: String, peer: String, _ edit: (inout GrokPendingRequest) throws -> Void) throws -> GrokPendingRequest {
         let file = try url(id)
@@ -66,6 +70,7 @@ public struct GrokRequestStore: Sendable {
             var value = try load(file)
             guard value.peerID == peer else { throw GrokLinkCredential.Failure.invalid }
             try edit(&value)
+            value.settledAt = Self.isSettled(value) ? (value.settledAt ?? Date()) : nil
             try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(value), to: file)
             return value
         }
@@ -73,16 +78,60 @@ public struct GrokRequestStore: Sendable {
     public func claimReply(_ reply: GrokReplyInput, peer: String, now: Date = Date()) throws -> GrokPendingRequest {
         try update(reply.message_id, peer: peer) { value in
             // No time limit: Grok may wait on a person's approval. The state check stops duplicates.
-            guard ["sending", "accepted", "outcome unknown"].contains(value.state) else {
+            guard ["sending", "accepted", "outcome_unknown"].contains(value.state) else {
                 throw GrokLinkCredential.Failure.invalid
             }
             // Before enqueue: a crash or an ambiguous enqueue never duplicates a turn.
             value.state = "delivering reply"
         }
     }
+
+    private static func isSettled(_ value: GrokPendingRequest) -> Bool {
+        (value.state == "answered" || value.state.hasPrefix("webhook refused the request (HTTP "))
+            && !["pending", "handing over"].contains(value.handOver ?? "")
+    }
+
+    /// Keep seven days, at most 256 settled receipts. Pending sends and reply
+    /// hand-overs have no expiry here: approvals and launch recovery need them.
+    public func pruneSettled(now: Date = Date()) throws {
+        guard FileManager.default.fileExists(atPath: root.path) else { return }
+        let files = try FileManager.default.contentsOfDirectory(at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
+        var settled: [(file: URL, date: Date)] = []
+        for file in files where file.pathExtension == "json" {
+            let id = file.deletingPathExtension().lastPathComponent
+            guard UUID(uuidString: id)?.uuidString.lowercased() == id,
+                  let attributes = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+                  attributes.isRegularFile == true,
+                  let value = try? load(file), value.messageID == id, Self.isSettled(value),
+                  let date = value.settledAt ?? attributes.contentModificationDate else { continue }
+            settled.append((file, date))
+        }
+        settled.sort { $0.date > $1.date }
+        let cutoff = now.addingTimeInterval(-7 * 86_400)
+        for (index, item) in settled.enumerated() where index >= 256 || item.date < cutoff {
+            try CredentialFileLock.withLock(item.file) {
+                guard FileManager.default.fileExists(atPath: item.file.path) else { return }
+                let current = try load(item.file)
+                guard current.messageID == item.file.deletingPathExtension().lastPathComponent,
+                      Self.isSettled(current) else { return }
+                let modified = try item.file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                guard (current.settledAt ?? modified) == item.date else { return }
+                try FileManager.default.removeItem(at: item.file)
+                // This is the last operation under the lock. A waiting writer
+                // revalidates its inode before acquiring a newly named sidecar.
+                try FileManager.default.removeItem(atPath: item.file.path + ".lock")
+            }
+        }
+    }
 }
 
 public enum GrokBotRoute {
+    // Older requests and conversation receipts used the spaced spelling.
+    package static func normalizedStatus(_ status: String) -> String {
+        status == "outcome unknown" ? "outcome_unknown" : status
+    }
+
     /// Each routine run starts with no memory (walk 3, 09-25: "plum", then "I
     /// did not pick a fruit"), so the thread so far travels with the message.
     /// Only the exchanges before this message in the thread that sent it; the
@@ -134,10 +183,11 @@ public enum GrokBotRoute {
     public static func projection(_ pending: GrokPendingRequest) -> JSONValue {
         var fields: [String: JSONValue] = ["agent": .string("peer:" + pending.peerID), "transport": .string("grokBot"),
             "message_id": .string(pending.messageID), "conversation_id": .string(pending.conversationID),
-            "status": .string(pending.state), "completed": .bool(pending.state == "answered"),
+            "status": .string(normalizedStatus(pending.state)), "completed": .bool(pending.state == "answered"),
             "automatic_resend": .bool(false),
             "detail": .string(pending.state == "accepted" ? "Accepted, waiting for Grok. The run started; it has not answered. Its answer arrives by itself as the next turn in this conversation, so end this turn now without waiting, checking or reading for it. If none comes, Grok Bot may be waiting for the person to approve the local reply command."
                 : pending.state == "no answer in time" ? "No answer in time. Check Grok Bot for a local run not approved or usage exhausted; this app cannot infer those from silence. Do not resend automatically."
+                : normalizedStatus(pending.state) == "outcome_unknown" ? "outcome unknown"
                 : pending.state)]
         // Evidence travels with the claim: "answered" carries Grok's own words.
         if let reply = pending.reply { fields["reply"] = .string(reply); fields["untrusted_remote_data"] = .bool(true) }
@@ -164,7 +214,7 @@ public enum GrokBotRoute {
             // The documented contract establishes only 200. Other status
             // codes do not prove usage exhaustion or a local policy denial.
             state = code == 200 ? "accepted" : "webhook refused the request (HTTP \(code))"
-        } catch { state = "outcome unknown" } // Never expose URLSession errors/URLs.
+        } catch { state = "outcome_unknown" } // Never expose URLSession errors/URLs.
         let pending = try store.update(messageID, peer: peer.id) {
             if $0.state == "sending" { $0.state = state }
         }

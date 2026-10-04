@@ -12,7 +12,6 @@ import os
 //   * `ScopedSlot`        — a handle whose `deinit` is the ONLY release path.
 //   * `ScopedSlotCounter` — bounded counter; the count is private to the type,
 //                           so nothing can increment without taking a handle.
-//   * `ScopedSlotSet`     — the same for membership registries.
 //   * `ScopedWaiter`      — a parked continuation that resumes EXACTLY once,
 //                           race-free against a resume that beats the park.
 //   * `OnceByKey`         — run-at-most-once-per-key that does not retain the
@@ -43,7 +42,7 @@ public final class ScopedSlot: @unchecked Sendable {
     private let releaseAction: @Sendable () -> Void
 
     /// A standalone handle whose only duty is to run `release` when it dies.
-    /// Prefer `ScopedSlotCounter`/`ScopedSlotSet`, which also own the state
+    /// Prefer `ScopedSlotCounter`, which also owns the state
     /// being guarded; this initializer is for adapting an existing pair.
     public init(release: @escaping @Sendable () -> Void) {
         self.releaseAction = release
@@ -103,48 +102,6 @@ public final class ScopedSlotCounter: @unchecked Sendable {
             return
         }
         active -= 1
-        lock.unlock()
-    }
-}
-
-// MARK: - ScopedSlotSet
-
-/// A membership registry with the same discipline: `acquire(key)` returns a
-/// handle (nil when the key is already registered) and the key is removed when
-/// that handle dies. No caller can insert without taking on the removal.
-public final class ScopedSlotSet<Key: Hashable & Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var members: Set<Key> = []
-    public let name: String
-
-    public init(name: String) { self.name = name }
-
-    public func acquire(_ key: Key) -> ScopedSlot? {
-        lock.lock()
-        guard !members.contains(key) else {
-            lock.unlock()
-            return nil
-        }
-        members.insert(key)
-        lock.unlock()
-        return ScopedSlot { [weak self] in self?.remove(key) }
-    }
-
-    public func contains(_ key: Key) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return members.contains(key)
-    }
-
-    public var count: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return members.count
-    }
-
-    private func remove(_ key: Key) {
-        lock.lock()
-        members.remove(key)
         lock.unlock()
     }
 }
@@ -466,8 +423,8 @@ public enum BoundedWait {
     /// externally visible side effects behind this deadline unless a late,
     /// unobserved completion is acceptable.
     ///
-    /// Cancellation of the calling task propagates into `operation` unchanged —
-    /// a `CancellationError` is never converted into a timeout.
+    /// Cancellation of the calling task settles the wait with
+    /// `CancellationError` and cancels `operation` without awaiting it.
     public static func run<T: Sendable>(
         seconds: TimeInterval,
         reason: String,
@@ -502,14 +459,13 @@ public enum BoundedWait {
                 box.attach(continuation)
             }
         } onCancel: {
-            // Propagate, don't launder: a cooperative operation surfaces its
-            // own CancellationError. A non-cooperative one is still bounded by
-            // the deadline below rather than by this handler.
+            box.settle(.failure(CancellationError()))
             work.cancel()
         }
         expiry.cancel()
         // Abandon the loser — requested to stop, never awaited.
         work.cancel()
+        try Task.checkCancellation()
         switch outcome {
         case .value(let value):
             return value

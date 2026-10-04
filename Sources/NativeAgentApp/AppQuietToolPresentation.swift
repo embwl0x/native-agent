@@ -10,9 +10,8 @@ import PersistenceCore
     }
     var pages: [QuietToolPage] { QuietPages.all.map(Self.pageValue) }
     var currentPage: QuietToolPage? { NativeAgentAppCoordinator.shared.currentPage.map(Self.pageValue) }
-    var composerVerbs: [String] { QuietComposerVerbs.names }
     func page(named raw: String) -> QuietToolPage? { QuietPages.page(named: raw).map(Self.pageValue) }
-    /// `app_page_read page=context [session_id]`: the composer's context
+    /// `app {page: "context", item: session_id}`: the composer's context
     /// receipt for a conversation, read from the turn traces by the same code
     /// the popover uses, line for line — the popover need not be open.
     /// Defaults to the conversation on screen.
@@ -34,7 +33,7 @@ import PersistenceCore
         ])
     }
 
-    /// `app_page_read page=agent [room] [session_id]`: one Agent-view tab's
+    /// `app {page: "agent_view", item: room}`: one Agent-view tab's
     /// text, from the pane's own render (read-only: nothing marked seen or
     /// written, no tool run); no room lists the tabs. Defaults to the
     /// conversation on screen, as the pane does.
@@ -44,7 +43,7 @@ import PersistenceCore
         let tabs = JSONValue.array(AgentScreenView.tabs.map { .string($0) })
         let room = Self.text(input["room"]).lowercased()
         guard !room.isEmpty else {
-            return AppToolExecutor.pageReadResult(page: "agent", fields: ["status": .string("ok"), "title": .string("Agent"), "tabs": tabs])
+            return AppToolExecutor.pageReadResult(page: "agent_view", fields: ["status": .string("ok"), "title": .string("Agent view"), "tabs": tabs])
         }
         guard AgentScreenView.tabs.contains(room) else {
             return AppToolExecutor.failure("unknown_room", "The Agent view has no tab called that.", extra: ["requested": .string(room), "tabs": tabs])
@@ -52,13 +51,13 @@ import PersistenceCore
         let named = Self.text(input["session_id"])
         let scope = named.isEmpty ? appModel.activeChatSessionId : named
         let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        return AppToolExecutor.pageReadResult(page: "agent", fields: [
-            "status": .string("ok"), "title": .string("Agent"), "room": .string(room), "session_id": .string(scope),
+        return AppToolExecutor.pageReadResult(page: "agent_view", fields: [
+            "status": .string("ok"), "title": .string("Agent view"), "room": .string(room), "session_id": .string(scope),
             "content": .string(await AgentScreenView.paneText(room, root: root, scope: scope)),
         ])
     }
 
-    // MARK: - app_page_screenshot
+    // MARK: - page.screenshot
 
     @MainActor
     func pageScreenshot(input: [String: JSONValue]) async -> JSONValue {

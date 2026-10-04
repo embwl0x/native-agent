@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Skills
 
 // MARK: - Skill pointer index (2026-07-03)
 //
@@ -128,48 +129,31 @@ extension SwiftNativeMemoryV2 {
     ) async throws -> SkillIndexSyncResult {
         // 1. Current skills on disk → pointer text.
         var current: [String: String] = [:]
-        let fm = FileManager.default
-        let runtimeAvailability = try Self.runtimeSkillAvailability(
-            registryURL: runtimeRegistryURL,
-            fileManager: fm
-        )
-        var explicitlyUnavailableRuntimeNames: Set<String> = []
-        for (directoryIndex, dir) in bodiesDirs.enumerated() {
-            guard let files = try? fm.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: nil
-            ) else { continue }
-            for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
-            where file.pathExtension.lowercased() == "md" {
-                let name = file.deletingPathExtension().lastPathComponent
-                let normalizedName = name.lowercased()
-                if directoryIndex == 0,
-                   runtimeAvailability?[normalizedName] == false {
-                    explicitlyUnavailableRuntimeNames.insert(normalizedName)
-                    continue
-                }
-                if directoryIndex > 0,
-                   explicitlyUnavailableRuntimeNames.contains(normalizedName) {
-                    continue
-                }
-                guard current[name] == nil else { continue }
-                guard let body = try? String(contentsOf: file, encoding: .utf8),
-                      !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                else { continue }
-                // Same hygiene gate the skill tools apply (gpt-5.5 review
-                // LOW): a body list_skills/read_skill would hide must not
-                // get a recall pointer promising a read that will refuse.
-                guard SkillBodyHygiene.violations(in: body).isEmpty else { continue }
-                current[name] = Self.skillPointerText(name: name, body: body)
-            }
+        let inventory = try InstalledSkillInventory.entries(registryURL: runtimeRegistryURL, bodiesDirs: bodiesDirs)
+        // An archived skill stays findable here, marked archived (`CapabilityLifecycle`).
+        for entry in inventory {
+            let archived = entry.row["status"] == .string(CapabilityLifecycle.archived)
+            guard entry.isAvailable || archived, let url = entry.bodyURL,
+                  let body = try? String(contentsOf: url, encoding: .utf8),
+                  !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            current[entry.id] = Self.skillPointerText(name: entry.id, body: body, archived: archived)
         }
 
+        return try await reconcileSkillPointers(current: current, prefix: Self.skillPointerIDPrefix)
+    }
+
+    private func reconcileSkillPointers(
+        current: [String: String], prefix: String
+    ) async throws -> SkillIndexSyncResult {
         // 2. Existing pointer rows. listMemory(kind:) includes status-deleted
         // rows (it filters only lifecycle-terminal), so a previously-removed
         // skill that reappears flips back to active under the same id.
         let all = try await listMemory(kind: "skill")
         var existing: [String: MemoryRecord] = [:]
-        for row in all where row.id.hasPrefix(Self.skillPointerIDPrefix) {
-            existing[String(row.id.dropFirst(Self.skillPointerIDPrefix.count))] = row
+        // A craft method's pointer (retired with craft.run) is none of these
+        // skills, so it retires here too.
+        for row in all where row.id.hasPrefix(prefix) {
+            existing[String(row.id.dropFirst(prefix.count))] = row
         }
 
         var added = 0, updated = 0, removed = 0, unchanged = 0
@@ -182,7 +166,7 @@ extension SwiftNativeMemoryV2 {
         // with embeddingEpochMismatch the moment any epoch is activated —
         // every skill-pointer sync threw post-activation.
         for (name, text) in current.sorted(by: { $0.key < $1.key }) {
-            let id = Self.skillPointerIDPrefix + name
+            let id = prefix + name
             if let row = existing[name] {
                 if row.text == text, row.status == "active" {
                     unchanged += 1
@@ -207,6 +191,7 @@ extension SwiftNativeMemoryV2 {
                     text: text,
                     layer: "semantic",
                     memoryKind: "skill",
+                    personaId: nil,
                     createdAt: now,
                     updatedAt: now,
                     sourceRunId: "skill-index",
@@ -244,46 +229,6 @@ extension SwiftNativeMemoryV2 {
         return SkillIndexSyncResult(
             added: added, updated: updated, removed: removed, unchanged: unchanged
         )
-    }
-
-    /// A missing registry means runtime body-only skills are valid legacy
-    /// inputs. Once a registry exists, an existing row with a non-active
-    /// status explicitly suppresses its body from automatic recall. Malformed
-    /// existing bytes fail loud rather than silently exposing or hiding
-    /// procedures.
-    private static func runtimeSkillAvailability(
-        registryURL: URL?,
-        fileManager: FileManager
-    ) throws -> [String: Bool]? {
-        guard let registryURL else { return nil }
-        guard fileManager.fileExists(atPath: registryURL.path) else { return nil }
-        let data = try Data(contentsOf: registryURL)
-        let decoded = try JSONSerialization.jsonObject(with: data)
-        let rows: [[String: Any]]
-        if let array = decoded as? [[String: Any]] {
-            rows = array
-        } else if let object = decoded as? [String: Any],
-                  let skills = object["skills"] as? [[String: Any]] {
-            rows = skills
-        } else {
-            throw MemoryV2Error.underlying(
-                "skill registry is not an array or {skills:[...]}"
-            )
-        }
-
-        let availableStatuses: Set<String> = ["active", "installed"]
-        var availability: [String: Bool] = [:]
-        for row in rows {
-            let status = (row["status"] as? String ?? "active").lowercased()
-            let available = availableStatuses.contains(status)
-            for raw in [row["id"] as? String, row["name"] as? String].compactMap({ $0 }) {
-                let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                if !key.isEmpty {
-                    availability[key] = available
-                }
-            }
-        }
-        return availability
     }
 
     private static func writeSkillPointerSyncReceipt(
@@ -343,7 +288,7 @@ extension SwiftNativeMemoryV2 {
     /// One-line pointer: name + the skill's own hook line. The hook is the
     /// first non-heading, non-empty line of the body — every body leads with
     /// its "Use when…" sentence. Bounded so a rogue body can't bloat recall.
-    static func skillPointerText(name: String, body: String) -> String {
+    static func skillPointerText(name: String, body: String, archived: Bool = false) -> String {
         var hook = ""
         for rawLine in body.split(separator: "\n", omittingEmptySubsequences: true) {
             var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -361,8 +306,8 @@ extension SwiftNativeMemoryV2 {
         if hook.count > 220 {
             hook = String(hook.prefix(220)) + "…"
         }
-        let base = "Skill available: \(name)"
-        let tail = "Load it with read_skill(\"\(name)\") when this comes up."
+        let base = "Skill \(archived ? "archived" : "available"): \(name)"
+        let tail = "Load it with app {action:\"skill.read\", args:{name:\"\(name)\"}} when this comes up."
         if hook.isEmpty { return "\(base). \(tail)" }
         return "\(base) — \(hook) \(tail)"
     }

@@ -1016,7 +1016,11 @@ public enum XConnectorActions {
         }
 
         func set(_ value: String, for key: String) {
+            values = values.filter { $0.value != value }
             values[key] = value
+            if values.count > 32, let evicted = values.keys.first(where: { $0 != key }) {
+                values.removeValue(forKey: evicted)
+            }
         }
     }
 }

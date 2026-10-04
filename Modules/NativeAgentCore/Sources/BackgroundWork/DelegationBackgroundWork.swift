@@ -76,8 +76,21 @@ public struct DelegationBackgroundWork: Sendable {
                             "DelegationOutcomeLoop: conversation reply projection failed: \(error.localizedDescription)\n".utf8))
                     }
                 }
+                // Her notice lands only on a matching open row she started
+                // (AgentConversationStore.noteDelegationEvent); anything else
+                // keeps the person's push. Unreadable rows count as none.
+                let rows = (try? AgentConversationStore(dataRoot: dataRoot).records()) ?? []
                 return DelegationJobsRead(
-                    jobs: read.jobs.map(Self.delegationJobSnapshot(from:)),
+                    jobs: read.jobs.map { row in
+                        var job = Self.delegationJobSnapshot(from: row)
+                        job.reachesHer = rows.contains { conversation in
+                            guard conversation.agent == job.agent, conversation.personInitiated != true,
+                                  ["waiting", "attention", "ready"].contains(conversation.phase),
+                                  case .string(let id)? = conversation.readInput?["message_id"] else { return false }
+                            return job.acceptedMessageIDs.contains(id)
+                        }
+                        return job
+                    },
                     allStoresReadable: read.allStoresReadable
                 )
             },
@@ -108,6 +121,21 @@ public struct DelegationBackgroundWork: Sendable {
                         + "for \(job.source):\(job.id): \(error.localizedDescription)\n").utf8))
                     return false
                 }
+                // A failed wake her notice will not carry (it went back down the
+                // channel that failed, or to the caller): an arrival in her own runtime.
+                if job.terminalOutcome == .failed,
+                   !job.reachesHer || DelegationOutcomeCard.residentNotice(from: job, conversation: "") == nil {
+                    let name = DelegationOutcomeCard.displayName(source: job.source, agent: job.agent)
+                    let head = (job.agentReplyTextHead ?? job.completionTextHead)?
+                        .split(whereSeparator: \.isNewline).first.map { String($0.prefix(140)) }
+                    let signIn = head.map { AgentLocalHealth.authenticationFailure(.string($0)) } == true
+                    let word = job.runStatus ?? job.status ?? "failed"
+                    var line = "\(name)'s wake failed" + (word == "failed" ? "" : " (\(word))")
+                    if signIn { line += ": its sign-in failed or expired" } else if let head { line += ": \"\(head)\"" }
+                    ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(
+                        id: "wake-failed:\(job.source):\(job.id)", line: line, thread: "wake:" + job.agent,
+                        agent: signIn || head == nil ? nil : job.agent, home: true)])
+                }
                 return await recordBoundDelegationSettlement(dataRoot: dataRoot, job: job)
             },
             reportDeferral: { deferred in await deferral.record(deferred) }
@@ -120,14 +148,18 @@ public struct DelegationBackgroundWork: Sendable {
             configRoot: root,
             deferral: deferral,
             watchedPaths: [
-                root.appendingPathComponent("claude-bridge/wake-jobs", isDirectory: true),
                 root.appendingPathComponent("codex-nativeagent-bridge/reply-jobs", isDirectory: true),
                 root.appendingPathComponent("codex-nativeagent-bridge/reply-jobs/undelivered", isDirectory: true),
                 root.appendingPathComponent("codex-nativeagent-bridge/reply-deliveries.jsonl"),
                 root.appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true),
                 AgentConversationStore(dataRoot: dataRoot).fileURL,
+                ChatGPTDotIPCTransport.recentSendFile(dataRoot),
                 dataRoot.appendingPathComponent("bots/run-queue.json"),
                 dataRoot.appendingPathComponent("bots/shelf-index.json"),
+                // A new arrival books her wake (ResidentWake.nextDeadline).
+                ResidentWake.url(dataRoot),
+                // A queued step or a met condition books the tick that offers it.
+                dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
             ]
         )
     }
@@ -242,6 +274,7 @@ public struct DelegationBackgroundWork: Sendable {
                         // and a genuinely new job still bumps the rollup.
                         occurrenceID: card.cardId
                     )
+                await port.retryRequestedResults(dataRoot: dataRoot)
                 return true
             } catch {
                 FileHandle.standardError.write(Data(
@@ -370,10 +403,17 @@ public struct DelegationBackgroundWork: Sendable {
                     return status != "archived" && status != "dismissed"
                 }
                 var existing: [String: JSONValue]?
+                var latest: [String: JSONValue]?
                 for line in lines {
-                    if case .object(let obj)? = line.row, case .string(rollupID)? = obj["id"], isActive(obj) {
-                        existing = obj
+                    if case .object(let obj)? = line.row, case .string(rollupID)? = obj["id"] {
+                        latest = obj
+                        if isActive(obj) { existing = obj }
                     }
+                }
+                // A job the summary already counted when it was settled stays
+                // settled: only a new job or a worse outcome raises it again.
+                if case .array(let settled)? = latest?["adverse_jobs"], settled.contains(.string(entry)) {
+                    return .some(nil)
                 }
                 var jobs: [String] = []
                 if case .array(let values)? = existing?["adverse_jobs"] {
@@ -390,9 +430,8 @@ public struct DelegationBackgroundWork: Sendable {
                     .compactMap { $0 }.joined(separator: ", ")
                 let title = "\(name): \(counts)"
                 // The push router dedupes on id + summary, and the id never
-                // changes: counts and the job's identity lead the summary so a
-                // newly counted job always reads as a new fact.
-                let summary = "\(counts). Latest (\(card.jobKey), \(card.createdAt)): \(card.summary)"
+                // changes: counts and the outcome time identify the new fact.
+                let summary = "\(counts). Latest (\(card.createdAt)): \(card.summary)"
 
                 guard case .object(var obj) = card.toJSON() else { return nil }
                 obj["id"] = .string(rollupID)

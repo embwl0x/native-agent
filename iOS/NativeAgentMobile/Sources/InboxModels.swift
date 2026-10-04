@@ -18,11 +18,13 @@ struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
     let actions: [InboxActionRecord]
     let status: String
     let read_at: String?
+    /// The conversation a card raised elsewhere was mirrored into for User.
+    var chat_session_id: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, created_at, source, severity, title, summary, detail
         case relatedWorkshopExecutionId = "related_mission_id" // compatibility wire ID
-        case related_approval_id, related_paths, related_groups, actions, status, read_at
+        case related_approval_id, related_paths, related_groups, actions, status, read_at, chat_session_id
     }
 
     /// Wave 4 (phase A) read-both: accept the FUTURE `related_execution_id`
@@ -65,6 +67,7 @@ extension InboxItemRecord {
         actions = try c.decode([InboxActionRecord].self, forKey: .actions)
         status = try c.decode(String.self, forKey: .status)
         read_at = try c.decodeIfPresent(String.self, forKey: .read_at)
+        chat_session_id = try c.decodeIfPresent(String.self, forKey: .chat_session_id)
     }
 
     var isUnread: Bool { status == "unread" }
@@ -151,7 +154,8 @@ extension InboxItemRecord {
             related_groups: related_groups,
             actions: actions,
             status: nextStatus,
-            read_at: readAt ?? read_at
+            read_at: readAt ?? read_at,
+            chat_session_id: chat_session_id
         )
     }
 }

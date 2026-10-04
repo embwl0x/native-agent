@@ -317,6 +317,14 @@ public struct TaskLedgerInvalidClaimEvent: Error, LocalizedError, Sendable {
     }
 }
 
+public struct TaskLedgerTaskDeleted: Error, LocalizedError, Sendable {
+    public let taskId: String
+
+    public var errorDescription: String? {
+        "task \(taskId) was deleted; further writes are refused"
+    }
+}
+
 // MARK: - Reader / writer
 
 /// Append-under-flock task-ledger store. Stateless — all state lives on disk.
@@ -415,8 +423,11 @@ public struct SwiftNativeTaskLedger: Sendable {
         guard event.kind == .deleted else { return false }
         return try await persistence.withFileLock(eventsPath) {
             let feed = try await readFeedUnlocked()
-            guard let current = Self.compact(base: feed.base, feed.events).first(where: { $0.taskId == event.taskId }),
-                  current.status != .deleted, current.title == expectedTitle else { return false }
+            guard let current = Self.compact(base: feed.base, feed.events).first(where: { $0.taskId == event.taskId }) else { return false }
+            guard current.status != .deleted else {
+                throw TaskLedgerTaskDeleted(taskId: event.taskId)
+            }
+            guard current.title == expectedTitle else { return false }
             try await appendAndRecompactUnlocked(event)
             return true
         }
@@ -452,6 +463,13 @@ public struct SwiftNativeTaskLedger: Sendable {
     }
 
     private func appendAndRecompactUnlocked(_ event: TaskLedgerEvent) async throws {
+        // The caller holds the flock: deletion cannot race this refusal.
+        let existing = try await readFeedUnlocked()
+        if Self.compact(base: existing.base, existing.events).contains(where: {
+            $0.taskId == event.taskId && $0.status == .deleted
+        }) {
+            throw TaskLedgerTaskDeleted(taskId: event.taskId)
+        }
         // Append UNCAPPED — snapshot+tail compaction (B4) replaces the old naive
         // newest-N line cap, which dropped a quiet task's founding events
         // outright. The caller already holds the flock.
@@ -494,8 +512,9 @@ public struct SwiftNativeTaskLedger: Sendable {
         // must never lose a row just because the clock is unreadable).
         let folded = Self.compact(base: feed.base, prefix)
         let feedNow = feed.events.compactMap { TaskLedgerClock.parseISO($0.ts) }.max()
+        let tailTaskIDs = Set(tail.map(\.taskId))
         let baseTasks = feedNow.map { now in
-            folded.filter { Self.retainInCompactionBase($0, now: now) }
+            folded.filter { tailTaskIDs.contains($0.taskId) || Self.retainInCompactionBase($0, now: now) }
         } ?? folded
         let newBase = TaskLedgerCompactionBase(
             tasks: baseTasks,

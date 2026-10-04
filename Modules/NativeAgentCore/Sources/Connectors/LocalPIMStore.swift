@@ -7,6 +7,7 @@ public enum LocalPIMCalendarAccess { case read, write }
 @MainActor public protocol LocalPIMCalendar {
     var title: String { get }
     var calendarIdentifier: String { get }
+    var sourceTitle: String { get }
     var allowsContentModifications: Bool { get }
 }
 
@@ -38,6 +39,9 @@ public protocol LocalPIMEventRead: SendableMetatype {
     var eventIdentifier: String? { get }
     var title: String? { get }
     var calendarTitle: String { get }
+    var calendarIdentifier: String { get }
+    var availability: String { get }
+    var isCancelled: Bool { get }
     var isAllDay: Bool { get }
     var startDate: Date? { get }
     var endDate: Date? { get }
@@ -85,7 +89,7 @@ public protocol LocalPIMReminderRead: SendableMetatype {
     func fetchReminders(in calendars: [Calendar]?, incompleteOnly: Bool,
                         completion: @escaping @Sendable ([ReminderRead]?) -> Void)
     nonisolated static func withEvents<Result: Sendable>(
-        start: Date, end: Date, calendarMatches: (@Sendable (String) -> Bool)?,
-        read: @Sendable ([EventRead]) -> Result
+        start: Date, end: Date, calendarIDs: [String]?, calendarMatches: (@Sendable (String) -> Bool)?,
+        read: @Sendable ([EventRead], [String]) -> Result
     ) -> Result
 }

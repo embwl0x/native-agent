@@ -1,6 +1,7 @@
 import Foundation
 @preconcurrency import EventKit
 import Connectors
+import PersistenceCore
 
 /// One EventKit session per action. Live objects never leave the main actor;
 /// enumeration uses its own store and callback queues render Core results
@@ -35,7 +36,7 @@ final class EventKitPIMStore: LocalPIMStore {
     func requestReminderAccess(allowPrompt: Bool) async throws -> Bool {
         let status = EKEventStore.authorizationStatus(for: .reminder)
         if MacPIMConnectorActions.authorizationAllowsRead(status) { return true }
-        guard status == .notDetermined, allowPrompt else { return false }
+        guard status == .notDetermined, allowPrompt, !SkillRunContext.handsBack else { return false }
         return try await store.requestFullAccessToReminders()
     }
 
@@ -81,15 +82,18 @@ final class EventKitPIMStore: LocalPIMStore {
     }
 
     nonisolated static func withEvents<Result: Sendable>(
-        start: Date, end: Date, calendarMatches: (@Sendable (String) -> Bool)?,
-        read: @Sendable ([EventRead]) -> Result
+        start: Date, end: Date, calendarIDs: [String]?, calendarMatches: (@Sendable (String) -> Bool)?,
+        read: @Sendable ([EventRead], [String]) -> Result
     ) -> Result {
         let store = EKEventStore()
         // Preserve enumeration even when no calendar filter was supplied.
         let available = store.calendars(for: .event)
-        let calendars = calendarMatches.map { matches in available.filter { matches($0.title) } }
+        let calendars = available.filter { calendar in
+            (calendarIDs == nil || calendarIDs!.contains(calendar.calendarIdentifier))
+                && (calendarMatches == nil || calendarMatches!(calendar.title))
+        }
         let predicate = store.predicateForEvents(withStart: start, end: end, calendars: calendars)
-        return read(store.events(matching: predicate).map(EventRead.init))
+        return read(store.events(matching: predicate).map(EventRead.init), calendars.map(\.calendarIdentifier))
     }
 }
 
@@ -99,6 +103,17 @@ struct EventKitPIMEventRead: LocalPIMEventRead {
     var eventIdentifier: String? { raw.eventIdentifier }
     var title: String? { raw.title }
     var calendarTitle: String { raw.calendar.title }
+    var calendarIdentifier: String { raw.calendar.calendarIdentifier }
+    var isCancelled: Bool { raw.status == .canceled }
+    var availability: String {
+        switch raw.availability {
+        case .free: "free"
+        case .busy: "busy"
+        case .tentative: "tentative"
+        case .unavailable: "unavailable"
+        default: "unknown"
+        }
+    }
     var isAllDay: Bool { raw.isAllDay }
     var startDate: Date? { raw.startDate }
     var endDate: Date? { raw.endDate }
@@ -126,6 +141,7 @@ struct EventKitPIMCalendar: LocalPIMCalendar {
     init(_ raw: EKCalendar) { self.raw = raw }
     var title: String { raw.title }
     var calendarIdentifier: String { raw.calendarIdentifier }
+    var sourceTitle: String { raw.source.title }
     var allowsContentModifications: Bool { raw.allowsContentModifications }
 }
 

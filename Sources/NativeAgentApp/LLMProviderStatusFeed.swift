@@ -1,5 +1,7 @@
+import CryptoKit
 import Foundation
 import PersistenceCore
+import ProviderRouting
 
 /// The durable, last-observed result of a user-initiated native provider
 /// reachability check. This is intentionally a single bounded record rather
@@ -74,21 +76,72 @@ enum LLMProviderStatusFeed {
         dataRoot: URL,
         checkedAt: Date = Date()
     ) async throws {
-        try await write(record(for: result, checkedAt: checkedAt), to: path(in: dataRoot))
+        try await write(record(for: result, checkedAt: checkedAt), to: path(in: dataRoot),
+                        credential: credentialFingerprint(providerID: result.provider_id, dataRoot: dataRoot))
     }
 
-    static func write(_ record: Record, to url: URL) async throws {
-        let iso = ISO8601DateFormatter()
-        let object: [String: JSONValue] = [
-            "schema": .string("llm.provider_status.v2"),
-            "status": .string(record.status.rawValue),
-            "checkedAt": .string(iso.string(from: record.checkedAt)),
-            "detail": .string(bounded(record.detail, maximum: 240) ?? "Provider check produced no detail."),
-            "providerId": record.providerID.map { .string($0) } ?? .null,
-            "model": record.model.map { .string($0) } ?? .null,
-            "tested": .bool(record.tested),
-        ]
-        try await SwiftNativePersistenceCore().writeJSON(.object(object), to: url)
+    /// A short hash of the key a test ran against, so only a new key clears
+    /// that test's failure, never another save of the account's file.
+    static func credentialFingerprint(providerID: String, dataRoot: URL) -> String? {
+        guard let key = LLMCredentialResolver.resolveAPIKey(providerConfigFile: "\(providerID).json", dataRoot: dataRoot),
+              !key.isEmpty else { return nil }
+        return SHA256.hash(data: Data(key.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func write(_ record: Record, to url: URL, credential: String? = nil) async throws {
+        let persistence = SwiftNativePersistenceCore()
+        try await persistence.withFileLock(url) {
+            let iso = ISO8601DateFormatter()
+            var object: [String: JSONValue] = [
+                "schema": .string("llm.provider_status.v2"),
+                "status": .string(record.status.rawValue),
+                "checkedAt": .string(iso.string(from: record.checkedAt)),
+                "detail": .string(bounded(record.detail, maximum: 240) ?? "Provider check produced no detail."),
+                "providerId": record.providerID.map { .string($0) } ?? .null,
+                "model": record.model.map { .string($0) } ?? .null,
+                "tested": .bool(record.tested),
+            ]
+            if let credential { object["credential"] = .string(credential) }
+            // Each provider's own last check too, so a failed one stays on its
+            // row after another provider is checked.
+            var byProvider: [String: JSONValue] = [:]
+            if case .object(let previous)? = (try? Data(contentsOf: url)).flatMap({ try? JSONValue.parse($0) }),
+               case .object(let rows)? = previous["byProvider"] {
+                byProvider = rows
+            }
+            if let id = record.providerID { byProvider[id] = .object(object.filter { $0.key != "schema" }) }
+            object["byProvider"] = .object(byProvider)
+            try await persistence.writeJSON(.object(object), to: url)
+        }
+    }
+
+    /// What this provider's own last test found, when the test ran and failed
+    /// ("key rejected", "HTTP 500"). Nil once a test passes, or once its key
+    /// is not the one that test ran against: a reconnect is a new key.
+    static func failedTest(providerID: String, dataRoot: URL) -> String? {
+        guard case .object(let file)? = (try? Data(contentsOf: path(in: dataRoot))).flatMap({ try? JSONValue.parse($0) })
+        else { return nil }
+        // Its own row, or the file's last check when that was this provider's
+        // and was written before rows were kept, so a launch keeps it.
+        let own: [String: JSONValue]? = if case .object(let rows)? = file["byProvider"], case .object(let row)? = rows[providerID] {
+            row
+        } else if file["providerId"] == .string(providerID) { file } else { nil }
+        guard let row = own,
+              row["status"] == .string(Status.error.rawValue), row["tested"] == .bool(true),
+              case .string(let detail)? = row["detail"],
+              case .string(let rawCheckedAt)? = row["checkedAt"], let checkedAt = parseTimestamp(rawCheckedAt)
+        else { return nil }
+        if case .string(let tested)? = row["credential"] {
+            return credentialFingerprint(providerID: providerID, dataRoot: dataRoot) == tested ? detail : nil
+        }
+        // A row from before the key's hash was kept: a save after it is a new key.
+        let credential = dataRoot.appendingPathComponent("providers", isDirectory: true)
+            .appendingPathComponent("\(providerID).json")
+        if let saved = (try? FileManager.default.attributesOfItem(atPath: credential.path))?[.modificationDate] as? Date,
+           saved > checkedAt {
+            return nil
+        }
+        return detail
     }
 
     static func read(dataRoot: URL, now: Date = Date()) -> Reading {
@@ -144,52 +197,5 @@ enum LLMProviderStatusFeed {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return String(trimmed.prefix(max(0, maximum)))
-    }
-}
-
-/// Fresh provider-path evidence already owned by the resident organism. This
-/// is stronger for runtime health than the user-initiated probe above, while
-/// the probe remains useful when the organism has no recent observation.
-enum ProviderRuntimeHealthFeed {
-    static let staleAfter: TimeInterval = 10 * 60
-    static let allowedClockSkew: TimeInterval = 5 * 60
-
-    enum Reading: Sendable, Equatable {
-        case healthy(savedAt: Date)
-        case unhealthy(savedAt: Date, detail: String)
-        case unavailable(String)
-    }
-
-    static func read(dataRoot: URL, now: Date = Date()) -> Reading {
-        let path = dataRoot
-            .appendingPathComponent("cognition", isDirectory: true)
-            .appendingPathComponent("organism_state.json")
-        guard let data = try? Data(contentsOf: path),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rawSavedAt = object["savedAt"] as? String,
-              let savedAt = parseTimestamp(rawSavedAt),
-              let body = object["bodySchema"] as? [String: Any],
-              let available = body["providersAvailable"] as? Bool,
-              let healthy = body["providersHealthy"] as? Bool
-        else {
-            return .unavailable("Recent organism provider health is unavailable.")
-        }
-        if savedAt.timeIntervalSince(now) > allowedClockSkew {
-            return .unavailable("Organism provider health is dated in the future.")
-        }
-        if now.timeIntervalSince(savedAt) > staleAfter {
-            return .unavailable("Organism provider health is stale.")
-        }
-        guard available else {
-            return .unhealthy(savedAt: savedAt, detail: "The organism reports no provider path available.")
-        }
-        guard healthy else {
-            return .unhealthy(savedAt: savedAt, detail: "The organism reports the live provider path needs attention.")
-        }
-        return .healthy(savedAt: savedAt)
-    }
-
-    private static func parseTimestamp(_ raw: String) -> Date? {
-        UserDisplayFormatters.parseFoundationISOTimestamp(raw)
     }
 }

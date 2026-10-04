@@ -155,6 +155,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     private var recentToolCalls: [BridgeEvent] = []
     private var eventSubscribers: [ObjectIdentifier: NWConnection] = [:]
     private var eventSeq: UInt64 = 0
+    private let eventDeliveryQueue = DispatchQueue(label: "com.nativeagent.bridge.events")
 
     /// Bridge activity event. Pushed into recentToolCalls (bounded) AND
     /// fanned out to /claude/events SSE subscribers. Payload values must
@@ -219,92 +220,6 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         ])
     }
 
-    /// The compact, auditable event emitted for every organism reflex review
-    /// request that reaches the runtime.  This deliberately excludes the
-    /// candidate pattern and operator note: the SSE ring is a diagnostic
-    /// surface, not another owner of reflex content.  A successful event names
-    /// the durable receipt so a reviewer can correlate it with
-    /// `organism_state.json`; an unsuccessful event is explicitly not a
-    /// mutation.
-    struct OrganismReflexReviewTelemetry: Sendable, Equatable {
-        static let source = "organism_debug_bridge"
-        static let maximumCandidateIDCharacters = 120
-        static let maximumFailureDetailCharacters = 240
-
-        let candidateID: String
-        let decision: String
-        let status: String
-        let mutationRecorded: Bool
-        let receiptID: String?
-        let reviewedAt: Date?
-        let failureDetail: String?
-
-        init(
-            candidateID: String,
-            decision: OrganismReflexReviewDecision,
-            status: OrganismReflexReviewApplyStatus,
-            receiptID: String? = nil,
-            reviewedAt: Date? = nil,
-            failureDetail: String? = nil
-        ) {
-            let boundedReceiptID = receiptID.map {
-                Self.bounded($0, maximum: Self.maximumCandidateIDCharacters)
-            }
-            self.candidateID = Self.bounded(candidateID, maximum: Self.maximumCandidateIDCharacters)
-            self.decision = decision.rawValue
-            self.status = status.rawValue
-            self.mutationRecorded = status == .applied
-                && boundedReceiptID?.isEmpty == false
-                && reviewedAt != nil
-            self.receiptID = self.mutationRecorded
-                ? boundedReceiptID
-                : nil
-            self.reviewedAt = self.mutationRecorded ? reviewedAt : nil
-            self.failureDetail = self.mutationRecorded
-                ? nil
-                : Self.boundedOptional(failureDetail, maximum: Self.maximumFailureDetailCharacters)
-        }
-
-        init(
-            candidateID: String,
-            decision: OrganismReflexReviewDecision,
-            outcome: OrganismReflexReviewApplyOutcome
-        ) {
-            self.init(
-                candidateID: candidateID,
-                decision: decision,
-                status: outcome.status,
-                receiptID: outcome.receipt?.id,
-                reviewedAt: outcome.receipt?.reviewedAt,
-                failureDetail: outcome.error
-            )
-        }
-
-        var payload: [String: Any] {
-            let iso = ISO8601DateFormatter()
-            return [
-                "candidateId": candidateID,
-                "decision": decision,
-                "status": status,
-                "mutationRecorded": mutationRecorded,
-                "receiptId": receiptID ?? NSNull(),
-                "reviewedAt": reviewedAt.map { iso.string(from: $0) } ?? NSNull(),
-                "failureDetail": failureDetail ?? NSNull(),
-                "source": Self.source,
-            ]
-        }
-
-        private static func bounded(_ value: String, maximum: Int) -> String {
-            String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(max(0, maximum)))
-        }
-
-        private static func boundedOptional(_ value: String?, maximum: Int) -> String? {
-            guard let value else { return nil }
-            let clipped = bounded(value, maximum: maximum)
-            return clipped.isEmpty ? nil : clipped
-        }
-    }
-
     /// Canonical organism-debug event seam shared by the HTTP endpoint and
     /// no-network eval harness. Optional fields are omitted rather than
     /// serialized as null so reset/settle/clear events stay minimal.
@@ -317,12 +232,6 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         if let scenario { payload["scenario"] = scenario }
         if let ttlSeconds { payload["ttlSeconds"] = ttlSeconds }
         publishEvent(kind: "organism_debug", payload: payload)
-    }
-
-    /// Canonical review event seam. The typed telemetry owns redaction and
-    /// mutation attribution; this method owns its bridge kind routing.
-    func publishOrganismReflexReviewEvent(_ telemetry: OrganismReflexReviewTelemetry) {
-        publishEvent(kind: "organism_reflex_review", payload: telemetry.payload)
     }
 
     var token: String { stateLock.lock(); defer { stateLock.unlock() }; return _token }
@@ -707,20 +616,41 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleTool(conn: conn, body: body, surface: BridgeLane.claudeSurfaceName)
+            handleTool(conn: conn, body: body, surface: BridgeLane.claudeSurfaceName, headers: headers)
         case "/codex/tool":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleTool(conn: conn, body: body, surface: BridgeLane.codexSurfaceName)
+            handleTool(conn: conn, body: body, surface: BridgeLane.codexSurfaceName, headers: headers)
+        case "/codex/reply", "/claude/reply":
+            guard method == "POST",
+                  let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let session = json["session_id"] as? String,
+                  let request = json["request_id"] as? String,
+                  let principal = toolCallerPrincipal(headers: headers) else {
+                writeJSON(conn, status: 400, obj: ["error": "invalid_caller_result_request"])
+                return
+            }
+            Task {
+                do {
+                    let task = try await NativeAgentEngine.live.agents.tasks.get("na3.\(session).\(request)", owner: principal.id)
+                    writeJSON(conn, status: 200, obj: Self.contactReply(task, requestID: request, sessionID: session,
+                                                                     offset: 0, maxChars: 8000), onSent: {
+                        if !task.replyText.isEmpty { Task { await NativeAgentEngine.live.agents.tasks.recordReplyFetch(task) } }
+                    })
+                } catch {
+                    writeJSON(conn, status: 404, obj: ["status": "unavailable",
+                        "detail": "No retained result is available for this caller and request. Absence does not authorize resending."])
+                }
+            }
         case "/claude/organism/debug", "/codex/organism/debug":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
             handleOrganismDebug(conn: conn, body: body)
-        case "/claude/live", "/codex/live", "/omp/live":
+        case "/codex/live", "/omp/live":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
@@ -760,10 +690,6 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             .lowercased() ?? ""
         let rawScenario = (json["scenario"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let candidateId = ((json["candidateId"] as? String) ?? (json["candidate_id"] as? String))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let reviewNote = (json["note"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         let shouldClear = action == "clear" || rawScenario.lowercased() == "clear"
         // Clamped here: Int(ttlSeconds) below traps on "inf" or 1e300.
         let ttlSeconds = Self.timeInterval(json["ttlSeconds"]).flatMap { $0.isFinite ? min(600, max(5, $0)) : nil } ?? 120
@@ -780,63 +706,30 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             }
             let runtime = NativeAgentEngine.liveCognition
             if action == "reset" || action == "reset_continuity" {
-                let snapshot = await runtime.resetOrganismContinuity()
+                let outcome = await runtime.resetOrganismContinuityChecked()
+                guard outcome.applied else {
+                    respond(409, ["status": outcome.status.rawValue, "error": outcome.error ?? outcome.status.rawValue,
+                                  "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(outcome.snapshot)])
+                    return
+                }
                 self.publishOrganismDebugEvent(status: "reset")
                 respond(200, [
                     "status": "reset",
-                    "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(snapshot),
+                    "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(outcome.snapshot),
                     "debug": NSNull(),
                 ])
                 return
             }
             if action == "settle" || action == "settle_continuity" {
-                let snapshot = await runtime.settleOrganismContinuity()
+                let outcome = await runtime.settleOrganismContinuityChecked()
+                guard outcome.applied else {
+                    respond(409, ["status": outcome.status.rawValue, "error": outcome.error ?? outcome.status.rawValue,
+                                  "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(outcome.snapshot)])
+                    return
+                }
                 self.publishOrganismDebugEvent(status: "settled")
                 respond(200, [
                     "status": "settled",
-                    "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(snapshot),
-                    "debug": NSNull(),
-                ])
-                return
-            }
-            if action == "approve_reflex" || action == "retire_reflex" {
-                guard !candidateId.isEmpty else {
-                    respond(400, ["error": "missing_candidate_id"])
-                    return
-                }
-                let decision: OrganismReflexReviewDecision = action == "approve_reflex" ? .approve : .retire
-                let outcome = await runtime.applyOrganismReflexReview(
-                    id: candidateId,
-                    decision: decision,
-                    note: reviewNote,
-                    reviewedBy: "bridge_operator",
-                    source: OrganismReflexReviewTelemetry.source
-                )
-                let telemetry = OrganismReflexReviewTelemetry(
-                    candidateID: candidateId,
-                    decision: decision,
-                    outcome: outcome
-                )
-                self.publishOrganismReflexReviewEvent(telemetry)
-
-                guard telemetry.mutationRecorded else {
-                    respond(ClaudeBridgeStateProjection.organismReflexReviewHTTPStatus(for: outcome.status), [
-                        "status": "not_reviewed",
-                        "reason": telemetry.status,
-                        "detail": telemetry.failureDetail ?? "The reflex review did not produce a durable receipt.",
-                        "candidateId": telemetry.candidateID,
-                        "decision": telemetry.decision,
-                        "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(outcome.snapshot),
-                        "debug": NSNull(),
-                    ])
-                    return
-                }
-                respond(200, [
-                    "status": "reviewed",
-                    "candidateId": telemetry.candidateID,
-                    "decision": telemetry.decision,
-                    "receiptId": telemetry.receiptID ?? NSNull(),
-                    "reviewedAt": telemetry.reviewedAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
                     "organism": ClaudeBridgeStateProjection.organismSnapshotJSON(outcome.snapshot),
                     "debug": NSNull(),
                 ])
@@ -928,30 +821,6 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return nil
     }
 
-    func handleAuthenticatedAgentMessage(conn: NWConnection, body: Data, headers: [String: String],
-                                         peer: PeerTurnContext,
-                                         responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil) {
-        stateLock.lock()
-        let liveToken = _token
-        stateLock.unlock()
-        switch BridgeCore.authorize(authorizationHeader: headers["authorization"], liveToken: liveToken) {
-        case .serverStopping:
-            writeJSON(conn, status: 503, obj: ["error": "server_stopping"])
-        case .unauthorized:
-            writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
-        case .authorized:
-            guard !AgentBridgePrincipal.rejectsIdentity(headers: headers, dataRoot: NativeAgentPaths.dataRoot) else {
-                writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
-                return
-            }
-            let authenticatedPeer = PeerTurnContext(
-                principal: AgentBridgePrincipal.resolve(headers: headers, dataRoot: NativeAgentPaths.dataRoot),
-                protocolName: peer.protocolName, messageID: peer.messageID, bodyDigest: peer.bodyDigest)
-            handleMessage(conn: conn, body: body, defaultSender: "agent", peer: authenticatedPeer,
-                          responseProjection: responseProjection)
-        }
-    }
-
     private var bridgeMessageRuntime: ClaudeBridgeMessageRuntime?
 
     func messageRuntime() -> ClaudeBridgeMessageRuntime {
@@ -962,12 +831,10 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return runtime
     }
 
-    private func handleMessage(conn: NWConnection, body: Data, defaultSender: String,
-                               peer: PeerTurnContext? = nil,
-                               responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil) {
+    private func handleMessage(conn: NWConnection, body: Data, defaultSender: String) {
         messageRuntime().handleMessage(response: { [weak self] status, object in
             self?.writeJSON(conn, status: status, obj: object)
-        }, body: body, defaultSender: defaultSender, peer: peer, responseProjection: responseProjection)
+        }, body: body, defaultSender: defaultSender)
     }
 
     private struct MessagePort: ClaudeBridgeMessagePort {
@@ -995,7 +862,16 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
 
     // MARK: - /claude/tool
 
-    private func handleTool(conn: NWConnection, body: Data, surface: String) {
+    private func toolCallerPrincipal(headers: [String: String]) -> AgentBridgePrincipal? {
+        let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: NativeAgentPaths.dataRoot)
+        guard !principal.replyOnly,
+              !AgentBridgePrincipal.claimsIdentity(headers: headers) || principal.peerID != nil else { return nil }
+        // The listener has already authenticated the shared bearer. Without a
+        // scoped credential it attests only this shared transport namespace.
+        return principal
+    }
+
+    private func handleTool(conn: NWConnection, body: Data, surface: String, headers: [String: String]) {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             writeJSON(conn, status: 400, obj: ["error": "invalid_json"])
             return
@@ -1003,6 +879,21 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         guard let name = json["name"] as? String, !name.isEmpty else {
             writeJSON(conn, status: 400, obj: ["error": "missing_name"])
             return
+        }
+        guard let principal = toolCallerPrincipal(headers: headers) else {
+            writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
+            return
+        }
+        let context = json["session_id"] as? String
+        let request = json["request_id"] as? String
+        if json["session_id"] != nil || json["request_id"] != nil {
+            guard let context, context.utf8.count <= 128,
+                  NativeAgentChatSessionID.normalizedPathComponent(context) == context,
+                  let request, request.count == 36, UUID(uuidString: request) != nil else {
+                writeJSON(conn, status: 400, obj: ["error": "invalid_caller_reply_route",
+                    "detail": "Supply a transport session_id and UUID request_id together; no work was queued."])
+                return
+            }
         }
         let inputRaw = (json["input"] as? [String: Any]) ?? [:]
         let inputJV: [String: JSONValue]
@@ -1013,14 +904,45 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             return
         }
 
-        let tools = sharedToolClient()
+        let tasks = NativeAgentEngine.live.agents.tasks
+        let session = context.map(principal.storedConversation)
+        let engine = NativeAgentEngine.live
+        let tools = session.map {
+            engine.bridgeToolDispatchClient(
+                approvalFiler: NativeAgentChatApprovalFiler(dataRoot: engine.dataRoot),
+                verifiedSessionId: $0)
+        } ?? sharedToolClient()
+        let replyRoute = context.flatMap { context in request.map { request in
+            ChatToolSessionContext.ReplyRoute(surface: "caller-result", destinationId: principal.id,
+                                              threadId: context, correlationId: request)
+        } }
+        let taskID = context.flatMap { context in request.map { "na3.\(context).\($0)" } }
+        let requestDigest = AgentPeerReplayClaimStore.digest(body)
         let started = Date()
         // U5 W-G: bound the work phase (same latch pattern as handleMessage).
         let workLatch = WorkLatch()
         let workTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
+            var admitted = false
             do {
-                let result = try await tools.dispatch(tool: name, input: inputJV, surface: surface)
+                if let context, let request {
+                    let retained = try await tasks.beginTool(context: context, request: request, principal: principal, digest: requestDigest)
+                    guard retained.execute else {
+                        guard workLatch.claim() else { return }
+                        self.writeJSON(conn, status: 200, obj: Self.contactReply(retained.task, requestID: request,
+                                                                              sessionID: context, offset: 0, maxChars: 8000), onSent: {
+                            if !retained.task.replyText.isEmpty { Task { await tasks.recordReplyFetch(retained.task) } }
+                        })
+                        return
+                    }
+                    admitted = true
+                }
+                let result = try await ChatToolSessionContext.$verifiedSessionId.withValue(session) {
+                    try await ChatToolSessionContext.$replyRoute.withValue(replyRoute) {
+                        try await tools.dispatch(tool: name, input: inputJV, surface: surface)
+                    }
+                }
+                if let taskID { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
                 let resultAny = jsonValueToAny(result)
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 self.publishToolResultEvent(name: name, surface: surface, result: result, durationMs: durationMs)
@@ -1031,6 +953,10 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     "durationMs": durationMs,
                 ])
             } catch {
+                if admitted, let taskID {
+                    try? await tasks.finishTool(taskID, owner: principal.id,
+                                               result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]))
+                }
                 self.publishEvent(kind: "tool_failed", payload: [
                     "name": name,
                     "ok": false,
@@ -1091,14 +1017,14 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     /// Defaults are conservative:
     ///   - `fileAccess: "read_only"` blocks `write_file`, `mac_*`, `shell_*`,
     ///     `persona_write`, etc. by name prefix/exact match.
-    ///   - `approvalFiler: nil` makes CONFIRM-tier tools throw
-    ///     `noApprovalInboxWired` instead of silently hanging.
+    ///   - The canonical nonblocking approval filer returns `waiting_approval`
+    ///     with the ordinary approval card's id when a gate requires consent.
     ///
     /// 2026-06-13 (the user, "the bridges should be open"): the bridge is Claude/
     /// codex/Agent working as a team, so NativeAgent-native write/send tools are
     /// no longer fenced here — they pass through to the gated chain above
     /// (`fileAccess:"read_only"` still blocks raw FS writes / `mac_*`, and
-    /// `approvalFiler:nil` still fails CONFIRM-tier tools closed, so this RPC
+    /// approval-required calls still wait for the person's decision, so this RPC
     /// path stays read-mostly without a bridge-specific NativeAgent deny-list).
     /// The remaining `ClaudeBridgeDenyDispatcher` wrap is now an mcp__-ONLY
     /// guard: the external MCP namespace (third-party connectors, incl. wired
@@ -1107,7 +1033,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     private func sharedToolClient() -> any ToolDispatchClient {
         clientLock.lock(); defer { clientLock.unlock() }
         if let t = toolClient { return t }
-        let tools = NativeAgentEngine.live.bridgeToolDispatchClient()
+        let engine = NativeAgentEngine.live
+        let tools = engine.bridgeToolDispatchClient(
+            approvalFiler: NativeAgentChatApprovalFiler(dataRoot: engine.dataRoot))
         toolClient = tools
         return tools
     }
@@ -1115,9 +1043,8 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     // MARK: - Activity event publisher
 
     /// Push an event into the ring buffer + fan out to SSE subscribers.
-    /// Thread-safe. Holds stateLock briefly to mutate buffer + snapshot
-    /// subscriber set; the actual writes to subscriber connections happen
-    /// OUTSIDE the lock so a slow consumer can't stall publishers.
+    /// stateLock orders sequence assignment and delivery enqueueing together.
+    /// Connection writes run on one serial queue, outside the state lock.
     /// `retain: false` fans out only: a live partial is stale the moment the
     /// next one lands and must not crowd real actions out of the backfill ring.
     func publishEvent(kind: String, payload: [String: Any], retain: Bool = true) {
@@ -1129,14 +1056,15 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             recentToolCalls.removeFirst(recentToolCalls.count - Self.recentToolCallsCap)
         }
         let subs = Array(eventSubscribers.values)
-        stateLock.unlock()
-
-        guard !subs.isEmpty else { return }
-        // SSE wire format: `data: <json>\n\n`. One push per subscriber.
-        let chunk = Self.eventStreamFrame(for: event)
-        for sub in subs {
-            sub.send(content: chunk, completion: .contentProcessed { _ in })
+        if !subs.isEmpty {
+            eventDeliveryQueue.async {
+                let chunk = Self.eventStreamFrame(for: event)
+                for sub in subs {
+                    sub.send(content: chunk, completion: .contentProcessed { _ in })
+                }
+            }
         }
+        stateLock.unlock()
     }
 
     private func handleEventsStream(conn: NWConnection) {
@@ -1144,23 +1072,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
         let hello = "event: hello\ndata: {\"connected\":true,\"recentToolCallsCap\":\(Self.recentToolCallsCap)}\n\n"
         let initial = Data((headers + hello).utf8)
-        conn.send(content: initial, completion: .contentProcessed { _ in })
-
-        // Backfill recent events on connect so a fresh subscriber gets
-        // the last ~50 actions immediately.
-        stateLock.lock()
-        let backfill = recentToolCalls
         let key = ObjectIdentifier(conn)
-        eventSubscribers[key] = conn
-        // The per-connection read deadline was already marked routed + cancelled
-        // in route() before this handler ran, so the SSE connection lives
-        // indefinitely; nothing to cancel here. The entry stays in `connections`
-        // so stop()/terminate cancels it.
-        stateLock.unlock()
-
-        for e in backfill {
-            conn.send(content: Self.eventStreamFrame(for: e), completion: .contentProcessed { _ in })
-        }
 
         // Drop on close. accept()'s stateUpdateHandler already removes
         // from `connections` + cancels the deadline; ALSO drop from
@@ -1176,12 +1088,29 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             default: break
             }
         }
+
+        // Register and enqueue the backfill under the same lock as live events.
+        // A publisher can only enqueue this subscriber's live sends after it.
+        stateLock.lock()
+        guard connections[key] != nil else {
+            stateLock.unlock()
+            return
+        }
+        let backfill = recentToolCalls
+        eventSubscribers[key] = conn
+        eventDeliveryQueue.async {
+            conn.send(content: initial, completion: .contentProcessed { _ in })
+            for event in backfill {
+                conn.send(content: Self.eventStreamFrame(for: event), completion: .contentProcessed { _ in })
+            }
+        }
+        stateLock.unlock()
     }
 
     // MARK: - HTTP response
 
-    func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any]) {
-        BridgeCore.writeJSON(conn, status: status, obj: obj)
+    func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any], onSent: (@Sendable () -> Void)? = nil) {
+        BridgeCore.writeJSON(conn, status: status, obj: obj, onSent: onSent)
     }
 }
 

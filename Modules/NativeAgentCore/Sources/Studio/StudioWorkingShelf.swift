@@ -112,8 +112,9 @@ public struct StudioWorkingShelf: Sendable {
     /// way `responseAsCorrected` and the amend write path resolve them.
     ///
     /// Only `response` is amendable, so a `stance.reason` quote never matches.
-    private func supersession(_ slot: Slot, entry: StudioJournalEntry) -> Supersession? {
-        guard slot.quoteField == "response",
+    private func supersession(_ slot: Slot, entry: StudioJournalEntry, source: QuoteSource) -> Supersession? {
+        guard case .original = source,
+              slot.quoteField == "response",
               let response = entry.response,
               let sentence = response.range(of: slot.sentence) else { return nil }
         var applied: [(range: Range<String.Index>, amendment: StudioAmendment)] = []
@@ -144,9 +145,25 @@ public struct StudioWorkingShelf: Sendable {
         return Supersession(amendments: applied.map(\.amendment), correctedSentence: rebuilt)
     }
 
-    private func validates(_ slot: Slot, entry: StudioJournalEntry) -> Bool {
+    private enum QuoteSource {
+        case original
+        case amendment(StudioAmendment)
+    }
+
+    /// Corrections remain in the amendment log; quote their exact words and
+    /// carry the source amendment on shelf reads instead of rewriting history.
+    private func quoteSource(_ slot: Slot, entry: StudioJournalEntry) -> QuoteSource? {
         let source = slot.quoteField == "response" ? entry.response : entry.stance.reason
-        guard let source else { return false }
+        let matchesOriginal = source.map { containsSentence(slot.sentence, in: $0) } ?? false
+        if matchesOriginal, supersession(slot, entry: entry, source: .original) == nil { return .original }
+        guard slot.quoteField == "response",
+              let amendment = entry.amendments.first(where: { containsSentence(slot.sentence, in: $0.correction) }) else {
+            return matchesOriginal ? .original : nil
+        }
+        return .amendment(amendment)
+    }
+
+    private func containsSentence(_ sentence: String, in source: String) -> Bool {
         // One complete sentence, as the platform sentence tokenizer sees it (so
         // "Dr. Smith arrived." is one sentence, not two). Compare bytes so even
         // canonically equivalent Unicode cannot rewrite a quotation.
@@ -154,7 +171,7 @@ public struct StudioWorkingShelf: Sendable {
         tokenizer.string = source
         var found = false
         tokenizer.enumerateTokens(in: source.startIndex..<source.endIndex) { range, _ in
-            if source[range].trimmingCharacters(in: .whitespacesAndNewlines).utf8.elementsEqual(slot.sentence.utf8) { found = true; return false }
+            if source[range].trimmingCharacters(in: .whitespacesAndNewlines).utf8.elementsEqual(sentence.utf8) { found = true; return false }
             return true
         }
         return found
@@ -170,11 +187,11 @@ public struct StudioWorkingShelf: Sendable {
             let store = SwiftNativeStudioStore(dataRoot: dataRoot)
             let entries = try await store.journalEntriesIncludingArchive()
             for slot in slots {
-                guard let entry = entry(slot.entryID, in: entries), validates(slot, entry: entry) else {
+                guard let entry = entry(slot.entryID, in: entries), let source = quoteSource(slot, entry: entry) else {
                     throw Refusal(message: "Entry \(slot.entryID) is unavailable or selected_sentence is not one complete sentence verbatim in \(slot.quoteField). Fragments and multiple sentences are not accepted. Choose a shorter existing sentence rather than clipping or rewriting it. The shelf is unchanged.")
                 }
                 // The journal line still says it; she no longer does.
-                if let superseded = supersession(slot, entry: entry) {
+                if let superseded = supersession(slot, entry: entry, source: source) {
                     let amendment = superseded.first
                     throw Refusal(message: "Entry \(slot.entryID): that sentence was corrected on \(amendment.amendedOn) (\(amendment.reason)) and now reads \"\(amendment.correction)\". Shelve the corrected sentence instead. The shelf is unchanged.")
                 }
@@ -202,7 +219,7 @@ public struct StudioWorkingShelf: Sendable {
         let entries = try await store.journalEntriesIncludingArchive()
         var cards: [JSONValue] = []
         for slot in slots {
-            guard let entry = entry(slot.entryID, in: entries), validates(slot, entry: entry) else {
+            guard let entry = entry(slot.entryID, in: entries), let source = quoteSource(slot, entry: entry) else {
                 cards.append(.object(["entry_id": .string(slot.entryID), "entry_availability": .string("entry unavailable")]))
                 continue
             }
@@ -221,11 +238,14 @@ public struct StudioWorkingShelf: Sendable {
             }
             guard case .object(var card) = slot.json else { continue }
             card["entry_availability"] = .string("available")
+            if case .amendment(let amendment) = source {
+                card["selected_sentence_amendment"] = amendment.toJSON()
+            }
             // A shelved sentence is served as CURRENT, so a correction filed
             // since has to travel with it — struck through, with the correction,
             // its date and its reason — or the shelf keeps a retracted claim in
             // circulation with none of that attached.
-            if let superseded = supersession(slot, entry: entry) {
+            if let superseded = supersession(slot, entry: entry, source: source) {
                 let amendment = superseded.first
                 card["selected_sentence_status"] = .string("superseded")
                 // The correction shown at the passage it actually covers, not
@@ -250,12 +270,5 @@ public struct StudioWorkingShelf: Sendable {
             cards.append(.object(card))
         }
         return .object(["status": .string("ok"), "slots": .array(cards)])
-    }
-
-    /// Titles only, for the existing Studio pointer. Never reads journal judgments or artifacts.
-    public func pointerLine() throws -> String? {
-        let slots = try selections()
-        guard !slots.isEmpty else { return nil }
-        return "Working shelf: " + slots.map(\.title).joined(separator: "; ") + "; open with studio_shelf_read"
     }
 }

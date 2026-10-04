@@ -42,8 +42,7 @@ import Transcripts
 // mean "no seed, carry on". Nothing here throws, and the one diagnostic is a
 // single stderr line per session.
 package enum CarriedAnchorRecollection {
-    /// Kill switch. Read exactly the way `chatConversationPrefixShape` and the
-    /// autocompactor's own switches are read: absent → on, explicit false →
+    /// Kill switch. Like the autocompactor's own switches: absent → on, explicit false →
     /// off. The defaults instance is injectable solely so a test can exercise
     /// the same reader against an isolated domain.
     static let defaultsKey = "chatCarryAnchorRecollection"
@@ -114,6 +113,9 @@ package enum CarriedAnchorRecollection {
             return nil
         }
         guard anchor != session else { return nil }
+        guard SessionDigestProvider.frozenPriorSessionId(
+            sessionId: session, dataRoot: dataRoot
+        ) == anchor else { return nil }
         // The window the reader returned is a TAIL: a long session's own
         // recollection can sit above it. Confirm against the transcript before
         // borrowing, or a session with its own would carry a second one.

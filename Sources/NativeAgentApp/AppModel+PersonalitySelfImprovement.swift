@@ -22,7 +22,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -40,6 +39,9 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+import Cognition
+import Context
+import ContextFlow
 
 /// The identity field is one of the few profile fields with immediate live UI
 /// effect.  Its save outcome must be derived from the persisted profile the
@@ -207,7 +209,8 @@ extension AppModel {
     // PATCH-2026-05-07: self-improvement-ui AppModel methods for B.1/B.3
 
     @MainActor
-    func loadAllSelfImprovement() async {
+    @discardableResult
+    func loadAllSelfImprovement() async -> [String] {
         let api = client
         let memory = engine.memory
         async let nextTrust = try? engine.trust.load()
@@ -234,13 +237,22 @@ extension AppModel {
             nextPromotionPending,
             nextMemoryProposals
         )
-        engine.trust.policy = trustRow ?? engine.trust.policy
-        improvementSummary = improvementRow ?? improvementSummary
-        trainingRuns = trainingRunRows ?? []
-        trainingProposals = trainingProposalRows ?? []
-        promotionCandidates = promotionRows ?? []
-        promotionPending = pendingRows ?? []
-        engine.memory.proposals = memoryProposalRows ?? []
+        var failedEndpoints: [String] = []
+        func fresh<T>(_ endpoint: String, _ value: T?) -> T? {
+            if value == nil { failedEndpoints.append(endpoint) }
+            return value
+        }
+        engine.trust.policy = fresh("trust policy", trustRow) ?? engine.trust.policy
+        improvementSummary = fresh("improvement summary", improvementRow) ?? improvementSummary
+        trainingRuns = fresh("training runs", trainingRunRows) ?? trainingRuns
+        trainingProposals = fresh("training proposals", trainingProposalRows) ?? trainingProposals
+        promotionCandidates = fresh("promotion candidates", promotionRows) ?? promotionCandidates
+        promotionPending = fresh("promotion pending", pendingRows) ?? promotionPending
+        engine.memory.proposals = fresh("memory proposals", memoryProposalRows) ?? engine.memory.proposals
+        if !failedEndpoints.isEmpty {
+            recordPanelRefresh(.autoImprovement, failedEndpoints: failedEndpoints)
+        }
+        return failedEndpoints
     }
 
     // PATCH-2026-05-07: living-memory AppModel methods for memory proposals
@@ -366,6 +378,55 @@ extension AppModel {
         }
     }
 
+    /// The Settings page's "An inner life" switch, one call for the page and
+    /// for app_setting_set: the master over every lane, the hour's cached
+    /// installation (the hour cannot outlive the master), and — turning on —
+    /// Fluid Context's Active default when no choice was ever made. Returns
+    /// the runtime's own state and, when it is not running as asked, the
+    /// sentence that says why.
+    @MainActor
+    func setInnerLifeEnabled(_ enabled: Bool) async -> (state: NativeSubconsciousRuntimeState, problem: String?) {
+        let budget = UserDefaults.standard.object(forKey: "cognitiveSubstrateDailyReflectionBudget") as? Int ?? 2
+        let state = await NativeAgentEngine.liveCognition.setSubconsciousMasterEnabled(
+            enabled,
+            reflectionBudget: enabled ? max(1, budget) : 0
+        )
+        engine.cognitionView.subconsciousRuntime = state
+        await NativeCognitionRuntime.reloadStudioWanderInstallation()
+        await engine.cognitionView.refreshVitals()
+
+        var problem: String?
+        if enabled {
+            // User, 2026-09-06: this used to force Fluid Context to Active on
+            // every enable, silently undoing an Off the user had
+            // chosen. The identical switch in Slim Settings leaves the mode
+            // alone, so the two disagreed. Only an UNSET preference gets the
+            // Active default; an existing choice stands, and the warning below
+            // now compares against what was actually asked for.
+            let stored = UserDefaults.standard.string(
+                forKey: NativeContextFlowConfiguration.modeDefaultsKey
+            ).flatMap(ContextFlowMode.init(rawValue:))
+            let preferred = stored ?? .active
+            let status: NativeContextFlowModeStatus
+            if stored == nil {
+                status = await NativeAgentEngine.live.contextFlow.setMode(.active)
+            } else {
+                status = await NativeAgentEngine.live.contextFlow.modeStatus()
+            }
+            if status.effectiveMode != preferred {
+                problem = "Some of my inner life is held off by setup, safety, or provider health."
+            }
+        }
+        if enabled && !state.enabled {
+            let voice = AgentVoice(name: agentDisplayName)
+            problem = "Connect a provider, or choose my reflection mind under Personality ▸ \(voice.possessive) minds, before turning this on."
+        }
+        statusText = state.enabled
+            ? "I have an inner life again"
+            : "My inner life is off"
+        return (state, problem)
+    }
+
     /// Dream-tab-scoped dream run: routes errors to `dreamError` (not the
     /// Self-Improvement banner) and skips the self-improvement reload.
     /// Returns true on success so
@@ -375,6 +436,13 @@ extension AppModel {
         dreamError = nil
         do {
             let result = try await client.runDream(trigger: .manual)
+            let errors = result["errors"] as? [String] ?? []
+            guard NativeClient.boolValue(result["ok"]) == true, errors.isEmpty else {
+                let detail = errors.isEmpty ? "The dream run did not complete successfully." : errors.joined(separator: "; ")
+                dreamError = "Dream cycle failed: \(detail)"
+                statusText = "Dream cycle failed"
+                return false
+            }
             statusText = Self.dreamRunStatusText(result)
             return true
         } catch {
@@ -388,7 +456,15 @@ extension AppModel {
         let entries = NativeClient.intValue(result["entriesWritten"]) ?? 0
         let disabled = NativeClient.boolValue(result["disabled"]) ?? false
         if disabled { return "Dream cycle disabled" }
-        if entries <= 0 { return "Dream already ran for the target night" }
+        if let reason = result["skipReason"] as? String {
+            switch reason {
+            case "already_dreamt": return "Dream already ran for the target night"
+            case "already_running": return "A dream cycle is already running"
+            case "no_new_material": return "No new material to dream about"
+            default: return "Dream cycle skipped: \(reason)"
+            }
+        }
+        if entries <= 0 { return "Dream cycle wrote no entries" }
         return entries == 1 ? "Dream cycle wrote 1 entry" : "Dream cycle wrote \(entries) entries"
     }
 
@@ -422,31 +498,15 @@ extension AppModel {
     }
 
     @MainActor
-    func saveTrustPolicyWithPromotion(
-        permissionLevel: String,
-        autonomyDefault: String,
-        requireBackups: Bool,
-        outsideDefault: String,
-        developerMode: Bool = false,
-        autonomousTraining: Bool? = nil,
-        dreamScheduler: Bool? = nil,
-        routeThroughPromotion: Bool? = nil,
-        promotionEnabled: Bool? = nil,
-        autoPromoteTierA: Bool? = nil
+    func patchTrainingAndPromotion(
+        training: [String: Bool] = [:],
+        promotion: [String: Bool] = [:]
     ) async {
         do {
-            let savedPolicy = try await client.saveTrustPolicyFull(
-                permissionLevel: permissionLevel,
-                autonomyDefault: autonomyDefault,
-                requireBackups: requireBackups,
-                outsideDefault: outsideDefault,
-                developerMode: developerMode,
-                autonomousTraining: autonomousTraining,
-                dreamScheduler: dreamScheduler,
-                routeThroughPromotion: routeThroughPromotion,
-                promotionEnabled: promotionEnabled,
-                autoPromoteTierA: autoPromoteTierA
-            )
+            var body: [String: Any] = [:]
+            if !training.isEmpty { body["trainingPolicy"] = training }
+            if !promotion.isEmpty { body["promotionPolicy"] = promotion }
+            let savedPolicy = try await client.postTrustWrite(body: body)
             applySavedTrustPolicy(savedPolicy, status: "Trust policy saved")
         } catch {
             statusText = "Trust save failed: \(error.localizedDescription)"

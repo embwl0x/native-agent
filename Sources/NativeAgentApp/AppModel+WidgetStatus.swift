@@ -2,11 +2,30 @@ import Foundation
 import OSLog
 import Desk
 import WidgetKit
+import NativeAgentShared
+import EngineRuntime
+import WorkshopExecution
 
 extension AppModel {
-    /// Existing refreshes and turn activity publish changes without polling.
+    /// One read of the overview sets the one "needs you" count, runs the
+    /// needs-you push and feeds the widget. Desk writes, refreshes and turn
+    /// activity publish changes without polling.
+    func publishWorkStatus() async {
+        guard !workStatusInFlight else { workStatusDirty = true; return }
+        workStatusInFlight = true
+        defer { workStatusInFlight = false }
+        repeat {
+            workStatusDirty = false
+            let board = await engine.desk.loadBoard(includeOverview: true)
+            let overview = board.overview!
+            setIfChanged(\.ownerWaitingCount, overview.unavailable.isEmpty ? overview.needsYouCount : nil)
+            if let items = board.deskState?.items { await engine.deviceSync?.evaluateNeedsUser(items: items) }
+            if #available(macOS 27, *) { await publishWidgetStatus(board) }
+        } while workStatusDirty
+    }
+
     @available(macOS 27, *)
-    func publishWidgetStatus() async {
+    private func publishWidgetStatus(_ board: DeskBoardRead) async {
         guard !widgetContainerUnavailableLogged else { return }
         let url: URL
         do {
@@ -17,38 +36,63 @@ extension AppModel {
             return
         }
         let status: String
-        let waiting: Int?
-        do {
-            let approvals = try await engine.approvals.list()
-            let memories = try await engine.memory.proposals(status: "pending")
-            let desk = try await SwiftNativeDeskStore(dataRoot: engine.dataRoot).liveState().items
-            let count = approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }.count
-                + memories.count + OwnerAttentionPolicy.ownerDecisionCount(in: desk)
-            waiting = count
-            let active = engine.turns.visiblyWorkingSessionIDs
-            if !active.subtracting(engine.turns.replyingSessions).isEmpty {
-                status = "Thinking…"
-            } else if !active.isEmpty {
-                status = "Replying…"
+        let waiting = ownerWaitingCount
+        var activityExpiresAt: Date?
+        if let count = waiting {
+            let desk = board.items
+            let executions = board.executions
+            let now = Date()
+            let busy = engine.turns.visiblyWorkingSessionIDs
+            let active = busy.filter { id in
+                guard let movement = engine.turns.lifecycle(for: id)?.presentation,
+                      [.working, .tool, .delegation, .retrying].contains(movement.phase) else { return false }
+                return movement.lastMovementAt <= now && now.timeIntervalSince(movement.lastMovementAt) < DeskActivityState.movementWindow
+            }
+            let evidence = DeskMovementPresentation.evidence(executions.items)
+            let work = executions.items.filter({
+                DeskActivityState.execution(.init(deskHandle: $0.deskHandle, status: $0.status, updatedAt: $0.updatedAt, lastMovementAt: $0.lastMovementAt), now: now) == .working
+            }).max(by: { ($0.lastMovementAt ?? "") < ($1.lastMovementAt ?? "") })
+            if let latest = active.compactMap({ id -> (id: String, movement: Date)? in
+                guard let movement = engine.turns.lifecycle(for: id)?.presentation.lastMovementAt else { return nil }
+                return (id, movement)
+            }).max(by: { $0.movement < $1.movement }),
+               latest.movement >= (DeskActivityState.movementDate(work?.lastMovementAt) ?? .distantPast) {
+                status = engine.turns.replyingSessions.contains(latest.id) ? "Replying…" : "Thinking…"
+                activityExpiresAt = latest.movement.addingTimeInterval(DeskActivityState.movementWindow)
             } else if count > 0 {
                 status = "Waiting on you"
-            } else if let work = desk.first(where: { $0.status == .now }) {
+            } else if let work {
                 status = "Working on \(work.title)"
+                activityExpiresAt = DeskActivityState.movementDate(work.lastMovementAt)?.addingTimeInterval(DeskActivityState.movementWindow)
+            } else if !busy.isEmpty {
+                status = "Activity unconfirmed"
+            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .stale }) {
+                status = "Stale work — activity unconfirmed"
+            } else if desk.contains(where: { !$0.status.isTerminal && DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .unknown }) {
+                status = "Activity unknown"
+            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .queued }) {
+                status = "Work queued"
+            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .watching }) {
+                status = "Watching"
+            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .deferred }) {
+                status = "Work deferred"
+            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .blocked }) {
+                status = "Work blocked"
             } else {
-                status = "Here"
+                status = "Activity unknown"
             }
-        } catch {
+        } else {
             status = "Status unavailable"
-            waiting = nil
         }
         do {
             let snapshot = NativeAgentWidgetSnapshot(
-                name: agentDisplayName, status: status, waitingCount: waiting, updatedAt: Date()
+                name: agentDisplayName, status: status, waitingCount: waiting, updatedAt: Date(), activityExpiresAt: activityExpiresAt
             )
             if FileManager.default.fileExists(atPath: url.path) {
                 do {
                     let previous = try NativeAgentWidgetSnapshot.read()
-                    if previous.name == snapshot.name, previous.status == status, previous.waitingCount == waiting {
+                    if previous.name == snapshot.name, previous.status == status, previous.waitingCount == waiting,
+                       previous.activityExpiresAt == activityExpiresAt {
                         return
                     }
                 } catch {

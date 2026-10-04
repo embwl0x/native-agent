@@ -1,6 +1,10 @@
 import Foundation
 import SwiftUI
 import NativeAgentShared
+import ChatOrchestration
+import PersistenceCore
+import Privacy
+import TurnTrace
 
 extension ChatView {
     func send() {
@@ -95,6 +99,9 @@ extension ChatView {
 
     // PATCH-2026-05-08: wave2-chat-ux — slash command handler
     func handleSlashCommand(_ raw: String) {
+        let commandDraft = text
+        let commandSessionId = appModel.activeChatSessionId
+        let commandEditedAt = draftEditedAt
         let parts = raw
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .components(separatedBy: .whitespacesAndNewlines)
@@ -116,7 +123,7 @@ extension ChatView {
             Task { await appModel.newChatSession() }
             return
         case .clear:
-            clearConfirmation.request()
+            clearConfirmation.request(sessionId: appModel.activeChatSessionId)
         case .compact:
             // Await and present the typed mutation result so a failed compact
             // is never reported as success on this surface.
@@ -131,6 +138,7 @@ extension ChatView {
         case .model:
             if !arg.isEmpty {
                 appModel.chatModel = arg
+                _ = appModel.enqueueChatBrainDefaultsSave()
                 Task { @MainActor in
                     let result = await appModel.saveChatBrainDefaults()
                     showToast(result.userMessage)
@@ -145,6 +153,8 @@ extension ChatView {
                 return
             }
             appModel.chatReasoningEffort = effort
+            // Queue the save now, so a provider refresh can't revert the choice first.
+            _ = appModel.enqueueChatBrainDefaultsSave()
             Task { @MainActor in
                 let result = await appModel.saveChatBrainDefaults()
                 showToast(result.userMessage)
@@ -161,6 +171,8 @@ extension ChatView {
                 showToast("Usage: /fast <on|off>")
                 return
             }
+            // Queue the save now, so a provider refresh can't revert the choice first.
+            _ = appModel.enqueueChatBrainDefaultsSave()
             Task { @MainActor in
                 let result = await appModel.saveChatBrainDefaults()
                 showToast(result.userMessage)
@@ -171,16 +183,28 @@ extension ChatView {
             guard !arg.isEmpty else { showToast("/remember requires a fact"); return }
             Task {
                 let result = await appModel.addMemoryFact(arg)
-                await MainActor.run { showToast(result.userMessage) }
+                await MainActor.run {
+                    showToast(result.userMessage)
+                    if result.succeeded {
+                        clearSuccessfulSlashCommandDraft(commandDraft, sessionId: commandSessionId, editedAt: commandEditedAt)
+                    }
+                }
             }
+            return
         case .note:
             // Manual /note is an intentional direct MemoryV2 lane. Provider
             // tool calls use commit_memory through the shared chat dispatcher.
             guard !arg.isEmpty else { showToast("/note requires some text"); return }
             Task {
                 let result = await appModel.addNote(arg)
-                await MainActor.run { showToast(result.userMessage) }
+                await MainActor.run {
+                    showToast(result.userMessage)
+                    if result.succeeded {
+                        clearSuccessfulSlashCommandDraft(commandDraft, sessionId: commandSessionId, editedAt: commandEditedAt)
+                    }
+                }
             }
+            return
         case .scratch:
             // PATCH-phase-3c: /scratch <key> <value...> — POST /v1/scratch → Dispatcher.run(scratchpad_write)
             // First whitespace-separated token is the key; everything after is the value string.
@@ -193,11 +217,15 @@ extension ChatView {
             let scratchValue = scratchParts[1]
             showToast("Writing scratch \(scratchKey)...")
             Task {
-                let result = await appModel.writeScratch(key: scratchKey, value: scratchValue)
+                let result = await appModel.writeScratch(key: scratchKey, value: scratchValue, sessionId: commandSessionId)
                 await MainActor.run {
                     showToast(result.userMessage)
+                    if result.succeeded {
+                        clearSuccessfulSlashCommandDraft(commandDraft, sessionId: commandSessionId, editedAt: commandEditedAt)
+                    }
                 }
             }
+            return
         case .help:
             let helpMsg = ChatMessage(role: "system", content:
                 ChatSlashCommandRegistry.helpText()
@@ -208,7 +236,7 @@ extension ChatView {
             NativeAgentAppCoordinator.shared.request(.skillsTools(.tools))
         // PATCH-2026-05-09: nextgen-surface — navigate sidebar to Capabilities (NextGen panel)
         case .nextgen:
-            NativeAgentAppCoordinator.shared.request(.sidebar(.capabilities))
+            NotificationCenter.default.post(name: .openNextGenRequest, object: nil)
             showToast("Navigating to NextGen in Capabilities\u{2026}")
         // PATCH-2026-06-06: chat-upgrades — /export dumps the current session
         // transcript as Markdown into ~/Downloads.
@@ -241,6 +269,15 @@ extension ChatView {
         // The command was taken. Only now does the composer lose its text.
         text = ""
         appModel.commitChatDraft("", sessionId: appModel.activeChatSessionId)
+        draftAdoptedText = ""
+    }
+
+    func clearSuccessfulSlashCommandDraft(_ command: String, sessionId: String, editedAt: Date) {
+        guard appModel.activeChatSessionId == sessionId,
+              draftSessionId == sessionId,
+              text == command else { return }
+        text = ""
+        appModel.clearChatDraftAfterSend(command, sessionId: sessionId, editedAt: editedAt)
         draftAdoptedText = ""
     }
 
@@ -294,7 +331,7 @@ extension ChatView {
         // Serialize the dict to Data here (on MainActor) so the nonisolated dispatchToolData
         // method receives Sendable types only.
         guard let bodyData = try? JSONSerialization.data(withJSONObject: inputSnapshot) else {
-            replaceDispatchPlaceholder(
+            await replaceDispatchPlaceholder(
                 pending.id,
                 with: ChatMessage(role: "system",
                     content: "❌ **\(tool)** could not run: the input could not be prepared"),
@@ -307,12 +344,12 @@ extension ChatView {
             let result = try await appModel.dispatchToolData(tool: tool, inputData: bodyData, sessionId: sessionId)
             // Render the receipt where the command was typed.
             let receipt = buildReceiptMessage(result: result, tool: tool, input: inputForDisplay)
-            replaceDispatchPlaceholder(pending.id, with: receipt, in: targetSessionId)
+            await replaceDispatchPlaceholder(pending.id, with: receipt, in: targetSessionId)
         } catch {
             let errMsg = ChatMessage(role: "system", content:
-                "❌ **\(tool)** could not run: \(error.localizedDescription)"
+                "❌ **\(tool)** could not run: \(ChatToolOutcome.errorMessage(error))"
             )
-            replaceDispatchPlaceholder(pending.id, with: errMsg, in: targetSessionId)
+            await replaceDispatchPlaceholder(pending.id, with: errMsg, in: targetSessionId)
         }
     }
 
@@ -333,9 +370,16 @@ extension ChatView {
         _ placeholderId: String,
         with message: ChatMessage,
         in sessionId: String
-    ) {
+    ) async {
+        var message = message
+        do {
+            try await appModel.engine.chatClient(profile: .mac).appendSystemReceipt(
+                sessionId: sessionId, messageId: message.id, content: message.content)
+        } catch {
+            message.content += "\n\nCould not confirm this receipt was saved: \(ChatToolOutcome.errorMessage(error))"
+        }
         var messages = appModel.engine.transcripts.messages(for: sessionId)
-        messages.removeAll { $0.id == placeholderId }
+        messages.removeAll { $0.id == placeholderId || $0.id == message.id }
         messages.append(message)
         appModel.engine.transcripts.setMessages(messages, for: sessionId)
     }
@@ -353,12 +397,12 @@ extension ChatView {
             // Re-hydrate for display only — failure is non-fatal (fall back to empty input).
             let inputForDisplay = (try? JSONSerialization.jsonObject(with: inputData) as? [String: Any]) ?? [:]
             let receipt = buildReceiptMessage(result: result, tool: tool, input: inputForDisplay)
-            replaceDispatchPlaceholder(pending.id, with: receipt, in: targetSessionId)
+            await replaceDispatchPlaceholder(pending.id, with: receipt, in: targetSessionId)
         } catch {
-            replaceDispatchPlaceholder(
+            await replaceDispatchPlaceholder(
                 pending.id,
                 with: ChatMessage(role: "system",
-                    content: "❌ **\(tool)** could not run: \(error.localizedDescription)"),
+                    content: "❌ **\(tool)** could not run: \(ChatToolOutcome.errorMessage(error))"),
                 in: targetSessionId
             )
         }
@@ -380,28 +424,44 @@ extension ChatView {
         // Arg summary (max 80 chars)
         var argSummary = ""
         if !input.isEmpty {
-            let parts = input.map { k, v in "\(k)=\(v)" }.joined(separator: " ")
-            argSummary = "(\(parts.truncated(to: 80, keeping: 77)))"
+            if let data = try? JSONSerialization.data(withJSONObject: input),
+               let value = try? JSONValue.parse(data),
+               let json = try? TurnTraceRedactor.redactValue(value).serialize(pretty: false) {
+                let safe = NativeAppSecretRedactor.redactText(
+                    SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(tool: tool, json: json))
+                argSummary = "(\(safe.truncated(to: 80, keeping: 77)))"
+            }
         }
 
         // Output preview (max 400 chars)
         var outputBlock = ""
         if result.ok, let out = result.output {
-            let preview = out.rawString.count > 400
-                ? String(out.rawString.prefix(400)) + "\n…(truncated)"
-                : out.rawString
+            let json: String
+            if let value = try? JSONValue.parse(Data(out.rawString.utf8)),
+               let encoded = try? TurnTraceRedactor.redactValue(value).serialize(pretty: false) {
+                json = encoded
+            } else {
+                json = TurnTraceRedactor.redactText(out.rawString)
+            }
+            let safe = NativeAppSecretRedactor.redactText(
+                SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(
+                    tool: tool, json: json))
+            let preview = safe.count > 400
+                ? String(safe.prefix(400)) + "\n…(truncated)"
+                : safe
             outputBlock = "\n```\n\(preview)\n```"
         }
 
         // Error detail
         var errorBlock = ""
         if let err = result.error {
-            errorBlock = "\n`\(err.code)` \(err.message)"
+            errorBlock = "\n`\(NativeAppSecretRedactor.redactText(err.code))` \(NativeAppSecretRedactor.redactText(err.message))"
         }
 
         let trace = "\n*\(result.durationMs)ms · autonomy: \(result.effectiveAutonomy)*"
 
-        let content = "\(badge) **\(tool)**\(argSummary)\(outputBlock)\(errorBlock)\(trace)"
+        let content = NativeAppSecretRedactor.redactText(
+            "\(badge) **\(tool)**\(argSummary)\(outputBlock)\(errorBlock)\(trace)")
         return ChatMessage(role: "system", content: content)
     }
 }

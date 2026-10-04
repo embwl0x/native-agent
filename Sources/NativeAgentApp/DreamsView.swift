@@ -691,8 +691,8 @@ struct DreamsView: View {
             let first = entries[0]
             selectedDate = first.date
             selectedEntry = first
-        } else if let current = selectedDate, selectedEntry?.date != current {
-            // Current selection still valid but its detail is stale — refresh it.
+        } else if let current = selectedDate {
+            // A force run can replace the content without changing its date.
             loadEntry(date: current)
         }
     }

@@ -8,17 +8,92 @@ public struct ToolRunSandbox: Sendable {
     public let entrypoint: String
     public let timeoutSeconds: Int
     public let executableCommand: String
+    public let dataRoot: URL?
+    public let permissions: Set<String>
 
     public init(
         toolRoot: URL,
         entrypoint: String = "tool.swift",
         timeoutSeconds: Int = 10,
-        executableCommand: String = "/usr/bin/swift"
+        executableCommand: String = "/usr/bin/swift",
+        dataRoot: URL? = nil,
+        permissions: Set<String> = []
     ) {
         self.toolRoot = toolRoot
         self.entrypoint = entrypoint
         self.timeoutSeconds = timeoutSeconds
         self.executableCommand = executableCommand
+        self.dataRoot = dataRoot
+        self.permissions = permissions
+    }
+
+    func profile(scratch: URL) throws -> String {
+        guard permissions.isSubset(of: SwiftToolValidator.knownToolPermissions) else {
+            throw ToolRunError.spawnFailed("Tool declares unknown permissions")
+        }
+        func quoted(_ url: URL) -> String {
+            let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+            return "\"" + path.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        let toolchainReads = ["/System", "/usr", "/Library/Developer", "/Applications/Xcode.app"]
+            .map { "(subpath \(quoted(URL(fileURLWithPath: $0))))" }.joined(separator: "\n")
+        var rules = [
+            "(version 1)", "(allow default)",
+            "(deny file-read-data)", "(deny file-write*)", "(deny network*)",
+            "(deny mach-lookup)", "(deny appleevent-send)", "(deny process-exec)",
+            "(allow file-read-data \(toolchainReads) (subpath \(quoted(toolRoot))) (subpath \(quoted(scratch))) (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))",
+            "(allow file-write* (subpath \(quoted(scratch))) (literal \"/dev/null\"))",
+            "(allow process-exec (literal \"/usr/bin/swift\") (literal \"/usr/bin/xcrun\") (subpath \"/Library/Developer\") (subpath \"/Applications/Xcode.app\"))",
+        ]
+        if permissions.contains("computer_files") { rules.append("(allow file-read-data)") }
+        if permissions.contains("arbitrary_file_write") { rules.append("(allow file-write*)") }
+        if permissions.contains("app_data_read") || permissions.contains("app_data_write") {
+            guard let dataRoot else { throw ToolRunError.spawnFailed("Tool app-data root is unavailable") }
+            rules.append("(allow file-read-data (subpath \(quoted(dataRoot))))")
+            if permissions.contains("app_data_write") {
+                rules.append("(allow file-write* (subpath \(quoted(dataRoot))))")
+            }
+        }
+        if permissions.contains("network") {
+            rules.append("(allow network*)")
+        } else {
+            if permissions.contains("network_public") {
+                rules.append("(allow network-outbound (require-all (remote ip \"*:*\") (require-not (remote ip \"localhost:*\"))))")
+            }
+            if permissions.contains("network_localhost") {
+                rules.append("(allow network-outbound (remote ip \"localhost:*\"))")
+                rules.append("(allow network-bind network-inbound (local ip \"localhost:*\"))")
+            }
+        }
+        if !permissions.isDisjoint(with: ["network", "network_public", "network_localhost"]) {
+            rules.append("(allow mach-lookup (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.mDNSResponder\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))")
+        }
+        if permissions.contains("shell") { rules.append("(allow process-exec)") }
+        if let dataRoot {
+            // General file grants cannot disclose credentials or rewrite the
+            // stores that own approvals, identity, and executable authority.
+            let privateStores = [
+                "secrets", "credentials", "oauth_tokens", "providers", "codex_home",
+                "connectors", "telegram/config.json", "slack/config.json",
+                "tools/.manifest_signing_key", "catalog/.pack_signing_key",
+                "icloud_pairing_secret.bin", "mobile", "mobile_push", "notifications/push_tokens.json",
+                "claude", "bridge-config",
+            ]
+            for path in privateStores {
+                rules.append("(deny file-read-data file-write* (subpath \(quoted(dataRoot.appendingPathComponent(path)))))")
+            }
+            for path in ["trust", "security", "catalog", "tools", "persona", "workflows/approvals", "approvals", "paired_phones.json", "telegram", "slack"] {
+                rules.append("(deny file-write* (subpath \(quoted(dataRoot.appendingPathComponent(path)))))")
+            }
+            let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
+            rules.append("(deny file-write* (subpath \(quoted(personaRoot))))")
+            rules.append("(deny file-write-unlink (literal \(quoted(dataRoot))))")
+            rules.append("(deny file-write-unlink (literal \(quoted(dataRoot.appendingPathComponent("workflows")))))")
+        }
+        // The executing artifact stays immutable, including for data writers.
+        rules.append("(deny file-write* (subpath \(quoted(toolRoot))))")
+        return rules.joined(separator: "\n")
     }
 }
 
@@ -162,13 +237,20 @@ public actor ToolRunSandboxRunner {
 
         let process = Process()
         let parts = sandbox.executableCommand.split(separator: " ").map(String.init)
-        if parts.first == "/usr/bin/env" && parts.count >= 2 {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = Array(parts.dropFirst()) + [entrypointURL.path]
-        } else {
-            process.executableURL = URL(fileURLWithPath: parts.first ?? "/usr/bin/env")
-            process.arguments = Array(parts.dropFirst()) + [entrypointURL.path]
-        }
+        guard let executable = parts.first else { throw ToolRunError.spawnFailed("Tool executable is missing") }
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("nativeagent-tool-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let profile = try sandbox.profile(scratch: scratch)
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+        let compilerArguments = executable == "/usr/bin/swift" ? ["-module-cache-path", scratch.path] : []
+        process.arguments = ["-p", profile, executable] + Array(parts.dropFirst()) + compilerArguments + [entrypointURL.path]
+        process.environment = [
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": scratch.path, "TMPDIR": scratch.path,
+            "CLANG_MODULE_CACHE_PATH": scratch.path,
+        ]
         process.currentDirectoryURL = sandbox.toolRoot
 
         let stdinPipe = Pipe()
@@ -248,13 +330,7 @@ public actor ToolRunSandboxRunner {
         }
         let childPid = process.processIdentifier
         ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(childPid)
-        defer {
-            if process.isRunning {
-                ProcessTreeReaper.quiesceAndKill(
-                    ProcessTreeReaper.snapshot(rootPID: childPid)
-                )
-            }
-        }
+        let launchedTree = Self.captureOwnedTree(rootPID: childPid)
 
         // Feed stdin off-thread without a blocking write. A descendant may
         // retain the read end after the direct child exits, so child exit alone
@@ -303,12 +379,13 @@ public actor ToolRunSandboxRunner {
                         timedOut: !didExit && !wasCancelled && !exceededOutputLimit
                     ))
 
+                    var ownedTree = Self.captureOwnedTree(rootPID: childPid, retaining: launchedTree)
                     if !didExit {
                         // Timeout or cancel — escalate to reap the child.
                         // Cancellation takes priority over timeout for the
                         // surfaced error; only stamp timedOut when NOT cancelled.
                         if !wasCancelled && !exceededOutputLimit { timedOutBox.set(true) }
-                        let terminationTree = ProcessTreeReaper.snapshot(rootPID: childPid)
+                        let terminationTree = ownedTree
                         ProcessTreeReaper.signal(terminationTree, signal: SIGTERM)
                         observer?(.sigterm)
                         // Grace-wait consults `terminationSignal` ALONE. It can
@@ -321,10 +398,11 @@ public actor ToolRunSandboxRunner {
                         let graceExpired = terminationSignal.wait(
                             timeout: .now() + .milliseconds(graceMillis)
                         ) == .timedOut
-                        let killTree = ProcessTreeReaper.snapshot(
+                        let killTree = Self.captureOwnedTree(
                             rootPID: childPid,
                             retaining: terminationTree
                         )
+                        ownedTree = killTree
                         if (graceExpired && !terminatedBox.get())
                             || ProcessTreeReaper.hasLiveDescendant(in: killTree) {
                             // Freeze the verified tree, rescan it, then kill.
@@ -332,7 +410,7 @@ public actor ToolRunSandboxRunner {
                             // scan-vs-fork race where the tool can create a new
                             // child after the snapshot and orphan it as the
                             // parent dies.
-                            ProcessTreeReaper.quiesceAndKill(killTree)
+                            ownedTree = Self.quiesceAndKillOwnedTree(killTree)
                             observer?(.sigkill)
                         }
                         // Do not make prompt cancellation depend on the
@@ -342,6 +420,12 @@ public actor ToolRunSandboxRunner {
                         // received an unignorable SIGKILL when needed.
                         if pidRef.isRunning { pidRef.waitUntilExit() }
                         observer?(.reaped)
+                    }
+                    // A successful direct-child exit does not end ownership:
+                    // background children can still hold pipes or do work.
+                    let survivors = Self.captureOwnedTree(rootPID: childPid, retaining: ownedTree)
+                    if ProcessTreeReaper.hasLiveDescendant(in: survivors) {
+                        Self.quiesceAndKillOwnedTree(survivors)
                     }
                     cont.resume()
                 }
@@ -371,8 +455,8 @@ public actor ToolRunSandboxRunner {
         try? stderrPipe.fileHandleForReading.close()
 
         // Cancellation is loud and takes priority: the child was reaped by the
-        // escalation above (the function-scope `defer` is a final SIGKILL
-        // backstop), the drain threads are joined, so surface CancellationError
+        // escalation above, surviving descendants are killed, and the drain
+        // threads are joined, so surface CancellationError
         // rather than a silent partial result. Checked before `timedOut`
         // because a cancel never stamps `timedOutBox`.
         if cancelledBox.get() {
@@ -412,6 +496,66 @@ public actor ToolRunSandboxRunner {
             timedOut: false,
             parsedOutput: parsed
         )
+    }
+
+    private nonisolated static func captureOwnedTree(
+        rootPID: Int32,
+        retaining prior: ProcessTreeSnapshot? = nil
+    ) -> ProcessTreeSnapshot {
+        let current = ProcessTreeReaper.snapshot(rootPID: rootPID, retaining: prior)
+        let ownerIdentity = prior?.rootIdentity ?? current.rootIdentity
+        let tree = ProcessTreeSnapshot(rootPID: rootPID, rootIdentity: ownerIdentity,
+                                       descendants: current.descendants)
+        guard rootPID > 0 else { return tree }
+        // Group members survive reparenting when the direct child exits.
+        // Retain their start identities, and never adopt a reused root PID.
+        if let prior {
+            if let liveRoot = ProcessTreeReaper.snapshot(rootPID: rootPID).rootIdentity,
+               liveRoot != prior.rootIdentity { return tree }
+            guard prior.rootIdentity != nil || !prior.descendants.isEmpty else { return tree }
+        }
+        let bytes = proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(rootPID), nil, 0)
+        guard bytes > 0 else { return tree }
+        var pids = [Int32](repeating: 0, count: Int(bytes) / MemoryLayout<Int32>.stride + 16)
+        let used = proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(rootPID), &pids,
+                                Int32(pids.count * MemoryLayout<Int32>.stride))
+        var identities = tree.descendants
+        for pid in pids.prefix(max(0, Int(used)) / MemoryLayout<Int32>.stride)
+        where pid > 0 && pid != rootPID {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
+                  info.pbi_pgid == UInt32(rootPID) else { continue }
+            let identity = ProcessTreeIdentity(pid: pid, startSeconds: info.pbi_start_tvsec,
+                                               startMicroseconds: info.pbi_start_tvusec)
+            if !identities.contains(identity) { identities.append(identity) }
+        }
+        let groupTree = ProcessTreeSnapshot(rootPID: tree.rootPID, rootIdentity: ownerIdentity,
+                                           descendants: identities)
+        let refreshed = ProcessTreeReaper.snapshot(rootPID: rootPID, retaining: groupTree)
+        // Ownership outlives the leader; signal() still verifies its identity
+        // before signaling that PID, even when this retained identity is stale.
+        return ProcessTreeSnapshot(rootPID: rootPID, rootIdentity: ownerIdentity,
+                                   descendants: refreshed.descendants)
+    }
+
+    @discardableResult
+    private nonisolated static func quiesceAndKillOwnedTree(
+        _ tree: ProcessTreeSnapshot
+    ) -> ProcessTreeSnapshot {
+        // Freeze the whole owned group before enumeration, including when its
+        // leader has exited. A verified member proves the group still belongs
+        // to this invocation; a naked group ID could belong to a reused PID.
+        for identity in [tree.rootIdentity].compactMap({ $0 }) + tree.descendants {
+            guard ProcessTreeReaper.snapshot(rootPID: identity.pid).rootIdentity == identity,
+                  getpgid(identity.pid) == tree.rootPID else { continue }
+            _ = killpg(tree.rootPID, SIGSTOP)
+            break
+        }
+        let frozen = Self.captureOwnedTree(rootPID: tree.rootPID, retaining: tree)
+        let killed = ProcessTreeReaper.quiesceAndKill(frozen)
+        return ProcessTreeSnapshot(rootPID: tree.rootPID, rootIdentity: tree.rootIdentity,
+                                   descendants: killed.descendants)
     }
 }
 

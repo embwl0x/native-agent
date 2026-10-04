@@ -344,7 +344,7 @@ public enum OpenRouterModelCatalog {
     /// key keeps every caller's fail-closed semantics — a rewritten or removed
     /// file is visible on the very next read — while the unchanged case costs
     /// one stat.
-    private static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
+    static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
         readDecodedCache(dataRoot: dataRoot)?.models
     }
 

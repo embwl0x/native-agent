@@ -1,30 +1,8 @@
-// SwiftNative read-only port of the daemon KnowledgeGraph query surface.
-//
-// Source of truth: the retired daemon (class KnowledgeGraph) +
-// the retired daemon route handlers:
-//   GET  /v1/knowledge_graph                  -> all_entities(page=)
-//   GET  /v1/knowledge_graph/search?q=        -> {"results": search_entities(q)}
-//   GET  /v1/knowledge_graph/entity/{id}      -> neighbors(entity_id) (404 if missing)
-//
-// This module ports ONLY the read path: it reads
-// `<dataRoot>/memory/knowledge_graph.json`, applies the SAME load-time
-// normalization the Python `_load()` does (entity kind→type, edge kind→type,
-// orphan-edge drop, default-concept / default-mentions provenance), and runs
-// the SAME pure scoring (`search_entities`) + pagination (`all_entities`) +
-// adjacency (`neighbors`) logic. Entity / edge dictionaries are returned as
-// the raw stored JSONValue objects (passthrough, no field reshaping), so the
-// Mac KnowledgeGraphView decode models (KGEntity / KGEntityResponse /
-// KGSearchResponse / KGNeighborsResponse) decode them identically. (The
-// re-serialized bytes are not byte-for-byte identical to the daemon's
-// json.dumps — key order differs — but Decodable ignores key order.)
-//
-// WRITE paths (forget_entity, merge_two_entities, add_edge, extract_*) and the
-// batched flush/timer persistence machinery are deliberately NOT ported here —
-// they require the cross-process file lock and stay
-// HTTP-backed.
-//
-// The `/v1/graph/*` family is a SEPARATE subsystem (Runtime.build_graph_index
-// over executions + memories + embeddings) and is NOT in scope for this module.
+// KnowledgeGraph query normalization, ranking, pagination and adjacency.
+// MemoryStorage owns memory.sqlite and its schema; the checked SQLite reader
+// uses that owner's pool. Legacy JSON is available only before SQLite exists.
+// SwiftNativeKnowledgeGraphIndexer and KnowledgeGraphStore own Swift writes
+// through the shared pool, including memory and studio projections.
 
 import Foundation
 import PersistenceCore
@@ -622,7 +600,11 @@ public struct KnowledgeGraphStore: Sendable {
             if a.score != b.score { return a.score > b.score }
             return a.index < b.index
         }
-        return scored.map { $0.ent }
+        return scored.map { result in
+            guard case .object(var entity) = result.ent else { return result.ent }
+            entity["score"] = .double(result.score)
+            return .object(entity)
+        }
     }
 
     /// Mirrors `neighbors(entity_id)` in knowledge_graph.py (L867-884).

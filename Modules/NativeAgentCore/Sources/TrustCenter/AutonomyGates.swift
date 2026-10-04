@@ -269,10 +269,8 @@ public func autonomyApprovalGate(
 /// Semantics:
 ///   • `acquire()` returns `true` on first acquire, `false` if another
 ///     process already holds the lock. Non-blocking (LOCK_EX | LOCK_NB).
-///   • `release()` releases the flock and closes the fd. Called only in
-///     the error path inside SwiftNativeSystemRebuildClient — the happy
-///     path intentionally leaks the fd so the lock stays held until
-///     install_app.sh kills the daemon (matches Python L45185 comment).
+///   • `release()` releases the flock and closes the fd when installer
+///     launch fails or the installer exits while the app is still running.
 ///   • The lock auto-releases on process exit (the kernel drops the fd),
 ///     so a daemon crash mid-rebuild does not leave a permanent block —
 ///     same recovery story as the Python lock.
@@ -309,9 +307,7 @@ public actor RebuildLock {
         return true
     }
 
-    /// Release the lock if held. Called only in the rebuild error path —
-    /// the happy path lets the fd leak (daemon is about to be killed by
-    /// install_app.sh).
+    /// Release the lock if held after installer launch failure or termination.
     public func release() {
         if fd < 0 { return }
         _ = flock(fd, LOCK_UN)
@@ -327,17 +323,14 @@ public actor RebuildLock {
 
 // MARK: - Default trust-policy reader
 
-/// Helper that reads the on-disk trust policy at `<dataRoot>/trust/policy.json`
-/// via PersistenceCore. Mirrors the path convention pinned in Python at
-/// L2297: `self.trust_path = root / "trust" / "policy.json"`. Returns
-/// `AutonomyTrustPolicyView.denyAll` if the file is missing or unreadable
-/// — matches Python's `read_json(self.trust_path, {})` default behavior.
+/// Reads the canonical checked trust policy. Damaged saved authority throws
+/// before the autonomy gates can authorize an effect.
 public func readAutonomyTrustPolicy(
     dataRoot: URL? = nil,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
 ) async throws -> AutonomyTrustPolicyView {
     let root = dataRoot ?? PersistenceCore.defaultDataRoot()
-    let path = root.appendingPathComponent("trust").appendingPathComponent("policy.json")
-    let value = try await persistence.readJSON(path, ifMissing: .object([:]))
-    return AutonomyTrustPolicyView.parse(value)
+    let policy = try await SwiftNativeTrustCenter(dataRoot: root, persistence: persistence)
+        .loadTrustPolicyChecked()
+    return AutonomyTrustPolicyView.parse(.object(policy))
 }

@@ -212,7 +212,9 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     public var fingerprintFamily: String?
     public var fingerprintCount: Int
     public var fingerprintLastSurfacedAt: Date?
-    public var lastLiveCapsuleAt: Date?
+    /// The opening of a gap whose Since line lost the one slot: still owed
+    /// on User's next turn (Phase 5A), whatever his turns since.
+    public var owedSinceGap: Date?
     public var lastSessionBridgeAt: Date?
     public var negativeSoundEchoRun: Int
     /// Consecutive accepted turns the "- Settling:" line was presented. Capped
@@ -259,15 +261,39 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// second unbidden recall, it is a loop. Bounded by
     /// `remindedOfLedgerCapacity`; ids only, never text.
     public var remindedOfSurfaced: [String: Date]
+    /// INNER EXPIRES AS TEXT (Phase 5A, 2026-10-03). Per Inner/Thread line
+    /// key: when it was first shown and on how many turns. Past
+    /// `innerTextMaxShows` or `innerTextMaxAge` the line stops rendering; the
+    /// seed or view behind it is untouched. Bounded, keys only, never text.
+    public var innerTextShown: [String: InnerTextExposure]
+    /// Phase 5 B1: dream residue phrase id → when it surfaced. The newest
+    /// stamp is the line's cooldown; a phrase never surfaces twice in a
+    /// diary's life. Ids only, never text.
+    public var dreamThemeSurfaced: [String: Date]
+
+    public struct InnerTextExposure: Sendable, Equatable {
+        public var firstShownAt: Date
+        public var shows: Int
+        public init(firstShownAt: Date, shows: Int) {
+            self.firstShownAt = firstShownAt
+            self.shows = shows
+        }
+    }
 
     public static let innerLineLedgerCapacity = 24
+    public static let innerTextLedgerCapacity = 48
+    public static let innerTextMaxShows = 6
+    public static let innerTextMaxAge: TimeInterval = 4 * 3_600
+    /// A record older than this is forgotten, so a durable view can be said
+    /// again another week; a stale takeaway has decayed out long before.
+    public static let innerTextForgetAfter: TimeInterval = 72 * 3_600
     public static let remindedOfLedgerCapacity = 16
 
     public init(
         fingerprintFamily: String? = nil,
         fingerprintCount: Int = 0,
         fingerprintLastSurfacedAt: Date? = nil,
-        lastLiveCapsuleAt: Date? = nil,
+        owedSinceGap: Date? = nil,
         lastSessionBridgeAt: Date? = nil,
         negativeSoundEchoRun: Int = 0,
         settlingRun: Int = 0,
@@ -281,12 +307,14 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         lastAmbivalenceAt: Date? = nil,
         remindedOfLastSurfacedAt: Date? = nil,
         remindedOfTurnsSinceSurfaced: Int = 0,
-        remindedOfSurfaced: [String: Date] = [:]
+        remindedOfSurfaced: [String: Date] = [:],
+        innerTextShown: [String: InnerTextExposure] = [:],
+        dreamThemeSurfaced: [String: Date] = [:]
     ) {
         self.fingerprintFamily = fingerprintFamily
         self.fingerprintCount = max(0, fingerprintCount)
         self.fingerprintLastSurfacedAt = fingerprintLastSurfacedAt
-        self.lastLiveCapsuleAt = lastLiveCapsuleAt
+        self.owedSinceGap = owedSinceGap
         self.lastSessionBridgeAt = lastSessionBridgeAt
         self.negativeSoundEchoRun = max(0, negativeSoundEchoRun)
         self.settlingRun = max(0, settlingRun)
@@ -301,6 +329,8 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.remindedOfLastSurfacedAt = remindedOfLastSurfacedAt
         self.remindedOfTurnsSinceSurfaced = max(0, remindedOfTurnsSinceSurfaced)
         self.remindedOfSurfaced = remindedOfSurfaced
+        self.innerTextShown = innerTextShown
+        self.dreamThemeSurfaced = dreamThemeSurfaced
     }
 }
 
@@ -317,19 +347,24 @@ public struct CognitiveStandingViewCapsuleCandidate: Sendable, Equatable {
     /// active view rather than competing with them on relevance score, so the
     /// tier has to survive the freeze into the frozen read.
     public let isHeld: Bool
+    /// Phase 5 D: an opinion or an interest. It surfaces only on a turn it is
+    /// relevant to — never on the relevance-off path.
+    public let onlyWhenRelevant: Bool
 
     public init(
         id: UUID,
         line: String,
         concernKeywords: [String],
         updatedAt: Date,
-        isHeld: Bool = false
+        isHeld: Bool = false,
+        onlyWhenRelevant: Bool = false
     ) {
         self.id = id
         self.line = line
         self.concernKeywords = concernKeywords
         self.updatedAt = updatedAt
         self.isHeld = isHeld
+        self.onlyWhenRelevant = onlyWhenRelevant
     }
 }
 
@@ -351,6 +386,8 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     public let soundLandingScores: [UUID: Double]
     public let capsulePresentationState: CognitiveCapsulePresentationState
     public let pendingCompletionOpen: Bool
+    public let associationSuppressions: [CognitiveAssociationSuppression]
+    public let trustedPeerIds: Set<String>
 
     public init(
         fixedAt: Date,
@@ -369,7 +406,9 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         standingViewCapsuleCandidates: [CognitiveStandingViewCapsuleCandidate] = [],
         soundLandingScores: [UUID: Double] = [:],
         capsulePresentationState: CognitiveCapsulePresentationState = CognitiveCapsulePresentationState(),
-        pendingCompletionOpen: Bool = false
+        pendingCompletionOpen: Bool = false,
+        associationSuppressions: [CognitiveAssociationSuppression] = [],
+        trustedPeerIds: Set<String> = []
     ) {
         self.fixedAt = fixedAt
         self.stateRevision = stateRevision
@@ -388,6 +427,8 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         self.soundLandingScores = soundLandingScores
         self.capsulePresentationState = capsulePresentationState
         self.pendingCompletionOpen = pendingCompletionOpen
+        self.associationSuppressions = associationSuppressions
+        self.trustedPeerIds = trustedPeerIds
     }
 }
 

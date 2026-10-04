@@ -11,42 +11,12 @@ import CoreGraphics
 #if canImport(AppKit)
 import AppKit
 #endif
+#if canImport(ApplicationServices)
+import ApplicationServices
+#endif
 #if canImport(UserNotifications)
 import UserNotifications
 #endif
-
-// MARK: - Legacy HTTP seam
-
-/// Retained temporarily for older constructor call sites. SwiftNativeMacControl
-/// does not call this in the zero-daemon runtime.
-public protocol HTTPClient: Sendable {
-    func postJSON(
-        url: URL,
-        body: Data,
-        timeout: TimeInterval
-    ) async throws -> (status: Int, data: Data)
-}
-
-public final class URLSessionHTTPClient: HTTPClient {
-    private let session: URLSession
-    public init(session: URLSession = .shared) {
-        self.session = session
-    }
-    public func postJSON(
-        url: URL,
-        body: Data,
-        timeout: TimeInterval
-    ) async throws -> (status: Int, data: Data) {
-        var req = URLRequest(url: url, timeoutInterval: timeout)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.httpBody = body
-        let (data, resp) = try await session.data(for: req)
-        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        return (status, data)
-    }
-}
 
 // MARK: - Result type
 
@@ -258,6 +228,8 @@ public let macControlAllActions: Set<String> =
 /// attribute writes. Gate category is `accessibility` (same category as
 /// keystroke/click) but they are READ tier — no approval, mirroring how
 /// `spotlight` reads are gated but unapproved.
+/// The client may first clear a covering saver with the shared inert wake;
+/// the read handlers themselves still emit no input or app mutation.
 public let macControlAccessibilityReadActions: Set<String> = [
     "ax_status",
     "ax_tree",
@@ -683,17 +655,17 @@ public enum MacWakeGuard {
     }
 }
 
-/// Her-screen — the ONE lock answer the reads, the acts and home's MAC line
-/// share: the login session's `CGSSessionScreenIsLocked`. While it is set, AX
-/// publishes no app windows at all, so "no window" means "locked", not
-/// "minimized". (It is also set under a plain screensaver, which hides windows
-/// just the same.)
+/// Shared screen readiness for reads, acts, desktop sends and home's MAC line.
+/// `CGSSessionScreenIsLocked` also covers a passwordless saver, hiding app
+/// windows in both cases. The bounded wake names the remaining obstruction;
+/// the session flag alone never proves a password lock.
 public enum MacScreenLock {
-    public static let reply = "The screen is asleep or locked and I couldn't wake it; nothing was touched."
+    public static let reply = "The screen is still covered, so I can't see or use the apps underneath."
 
     /// User (09-24): "the Mac is never locked, it's just a screen saver." The
     /// flag is set under both, so the reads first try the wake nudge; this
-    /// records whether the LAST try failed, so home says "locked" only then.
+    /// records whether the last wake found a focused login password field, so home
+    /// never calls another obstruction (or human input) a password lock.
     nonisolated(unsafe) public static var wakeFailed = false
 
     public static func isLocked() -> Bool {
@@ -707,7 +679,14 @@ public enum MacScreenLock {
     }
 
     /// What still covers the screen after `wakeIfCovered` gave up.
-    public struct Covered: Error, Sendable { public let detail: String }
+    public struct Covered: Error, Sendable {
+        public let detail: String
+        public let code: String
+        public init(detail: String, code: String = "display_obstructed") {
+            self.detail = detail
+            self.code = code
+        }
+    }
 
     /// Before anything that needs the screen. User's Mac is never
     /// password-locked, but the flag above is set under its screensaver too,
@@ -721,7 +700,9 @@ public enum MacScreenLock {
     /// from the window list, not NSWorkspace, whose frontmost app only updates
     /// on the main run loop (a background poll saw loginwindow for 3 s after
     /// the saver was gone).
-    public static func wakeIfCovered() async throws {
+    public static func wakeIfCovered(
+        beforeInput: @Sendable () async throws -> Void = {}
+    ) async throws {
         #if canImport(CoreGraphics) && canImport(AppKit) && os(macOS)
         func loginWindowUp() -> Bool {
             let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -731,25 +712,62 @@ public enum MacScreenLock {
             }
         }
         func covered() -> Bool { isLocked() || loginWindowUp() }
-        guard covered() else { return }
+        func loginPasswordFocused() -> Bool {
+            let system = AXUIElementCreateSystemWide()
+            AXUIElementSetMessagingTimeout(system, 0.2)
+            guard let app = MacAXAttributeRead.copyElement(system, kAXFocusedApplicationAttribute) else { return false }
+            var pid: pid_t = 0
+            guard AXUIElementGetPid(app, &pid) == .success,
+                  NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == MacWakeGuard.loginWindowBundleID else { return false }
+            AXUIElementSetMessagingTimeout(app, 0.2)
+            guard let field = MacAXAttributeRead.copyElement(app, kAXFocusedUIElementAttribute) else { return false }
+            return MacAXAttributeRead.copyString(field, kAXRoleAttribute) == kAXSecureTextFieldSubrole
+                || MacAXAttributeRead.copyString(field, kAXSubroleAttribute) == kAXSecureTextFieldSubrole
+        }
+        guard covered() else { wakeFailed = false; return }
+        wakeFailed = false
         guard (CGSessionCopyCurrentDictionary() as? [String: Any])?["kCGSSessionOnConsoleKey"] as? Bool == true else {
             throw Covered(detail: "Another user's login session owns the screen.")
         }
+        guard AXIsProcessTrusted() else {
+            throw Covered(detail: "Accessibility permission is required to wake the screensaver; no input was sent.")
+        }
+        let driver: MacDriverBinding
+        if let binding = MacDriverContext.binding { driver = binding }
+        else { driver = await MacAttentionSessionStore.shared.bindDriver() }
         // Checked again right before each key, so a keystroke already under
         // way never gets our Shift folded into it.
-        let personActive = Covered(detail: "Someone is using the Mac right now, so I didn't nudge the screen.")
+        let personActive = Covered(detail: "Someone is using the Mac right now, so I stopped the wake nudge.")
+        let inputUnavailable = Covered(detail: "I couldn't create the safe screensaver wake input.")
         for _ in 0..<2 {
+            try Task.checkCancellation()
+            if !covered() { return }
             guard MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
-            if let origin = CGEvent(source: nil)?.location {
-                for point in [CGPoint(x: origin.x + 1, y: origin.y), origin] {
-                    guard let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else { continue }
-                    NativeAgentMotorEpoch.notePostedHIDEvent()
-                    move.post(tap: .cghidEventTap)
-                }
+            guard let origin = CGEvent(source: nil)?.location else { throw inputUnavailable }
+            guard let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: origin.x + 1, y: origin.y), mouseButton: .left),
+                  let back = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: origin, mouseButton: .left),
+                  let shiftDown = CGEvent(keyboardEventSource: nil, virtualKey: 56, keyDown: true),
+                  let shiftUp = CGEvent(keyboardEventSource: nil, virtualKey: 56, keyDown: false) else { throw inputUnavailable }
+            for event in [move, back, shiftDown, shiftUp] {
+                event.setIntegerValueField(.eventSourceUserData, value: NativeAgentMacEventIdentity.sourceUserData)
             }
+            for move in [move, back] {
+                try await beforeInput()
+                try Task.checkCancellation()
+                guard driver.allowsEmission, MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
+                NativeAgentMotorEpoch.notePostedHIDEvent()
+                move.post(tap: .cghidEventTap)
+            }
+            try await beforeInput()
+            try Task.checkCancellation()
             guard MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
-            for down in [true, false] {
-                guard let key = CGEvent(keyboardEventSource: nil, virtualKey: 56, keyDown: down) else { continue }
+            for (key, down) in [(shiftDown, true), (shiftUp, false)] {
+                // The release belongs to the Shift this wake just pressed.
+                if down {
+                    try await beforeInput()
+                    try Task.checkCancellation()
+                    guard driver.allowsEmission else { throw personActive }
+                }
                 key.flags = down ? .maskShift : []
                 NativeAgentMotorEpoch.notePostedHIDEvent()
                 key.post(tap: .cghidEventTap)
@@ -759,12 +777,19 @@ public enum MacScreenLock {
                 if !covered() { wakeFailed = false; return }
             }
         }
-        wakeFailed = true
+        let loginWindow = loginWindowUp()
+        // loginwindow also draws passwordless savers; only a focused secure
+        // field is positive authentication evidence. Unreadable AX stays unknown.
+        let locked = loginWindow && CGDisplayIsAsleep(CGMainDisplayID()) == 0 && loginPasswordFocused()
+        wakeFailed = locked
         throw Covered(detail: CGDisplayIsAsleep(CGMainDisplayID()) != 0
             ? "The display stayed asleep after two wake nudges."
-            : loginWindowUp()
-            ? "The login window is still in front after two wake nudges, so the Mac is asking for its password."
-            : "The screen is still covered after two wake nudges (macOS still reports the saver/login layer up, with no login window showing).")
+            : locked
+            ? "The login window has a focused password field after two wake nudges, so the Mac is locked. A person must sign in; I won't try to unlock it."
+            : loginWindow
+            ? "The loginwindow layer is still in front after two wake nudges; I couldn't confirm a password prompt."
+            : "The screen is still covered after two wake nudges (macOS still reports the saver/login layer up, with no login window showing).",
+            code: locked ? "mac_locked" : "display_obstructed")
         #endif
     }
 }
@@ -1184,6 +1209,13 @@ public enum MacControlSensitivePathFence {
         return nil
     }
 
+    /// Moving or trashing a parent also mutates every protected path beneath it.
+    public static func mutationReason(forPath rawPath: String) -> String? {
+        if let reason = reason(forPath: rawPath) { return reason }
+        let expanded = (rawPath as NSString).expandingTildeInPath
+        return checkSingle(path: expanded, includingProtectedDescendants: true)
+    }
+
     public static func protectedSystemMutationReason(forPath rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "protected_system_path_denied: empty path" }
@@ -1193,7 +1225,9 @@ public enum MacControlSensitivePathFence {
             URL(fileURLWithPath: expanded).standardizedFileURL.resolvingSymlinksInPath().path,
         ]
         for path in candidates {
-            if let prefix = protectedSystemMutationPrefixes.first(where: { isSelfOrAncestor(root: $0, path: path) }) {
+            if let prefix = protectedSystemMutationPrefixes.first(where: {
+                isSelfOrAncestor(root: $0, path: path) || isSelfOrAncestor(root: path, path: $0)
+            }) {
                 return "protected_system_path_denied: \(prefix)"
             }
         }
@@ -1203,18 +1237,22 @@ public enum MacControlSensitivePathFence {
     private static func isSelfOrAncestor(root: String, path: String) -> Bool {
         let normalizedRoot = normalizedPath(root)
         let normalizedPath = normalizedPath(path)
-        return normalizedPath == normalizedRoot || normalizedPath.hasPrefix(normalizedRoot + "/")
+        return normalizedPath == normalizedRoot || normalizedPath.hasPrefix(normalizedRoot == "/" ? "/" : normalizedRoot + "/")
     }
 
     private static func normalizedPath(_ path: String) -> String {
         URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
     }
 
-    private static func checkSingle(path: String) -> String? {
+    private static func checkSingle(path: String, includingProtectedDescendants: Bool = false) -> String? {
+        func protected(_ full: String) -> Bool {
+            isSelfOrAncestor(root: full, path: path)
+                || (includingProtectedDescendants && isSelfOrAncestor(root: path, path: full))
+        }
         let home = (NSHomeDirectory() as NSString).expandingTildeInPath
         for prefix in bannedHomePrefixes + bannedDataRootPrefixes {
             let fullPrefix = (home as NSString).appendingPathComponent(prefix)
-            if isSelfOrAncestor(root: fullPrefix, path: path) {
+            if protected(fullPrefix) {
                 return "sensitive_path_denied: \(prefix)"
             }
         }
@@ -1237,7 +1275,8 @@ public enum MacControlSensitivePathFence {
         for rootRaw in dataRootCandidates {
             for file in bannedDataRootFiles {
                 let full = (rootRaw as NSString).appendingPathComponent(file)
-                if normalizedPath(path) == normalizedPath(full) {
+                if normalizedPath(path) == normalizedPath(full)
+                    || (includingProtectedDescendants && isSelfOrAncestor(root: path, path: full)) {
                     return "sensitive_path_denied: data/\(file)"
                 }
             }
@@ -1245,13 +1284,15 @@ public enum MacControlSensitivePathFence {
             let target = normalizedPath(path)
             if target.hasPrefix(root + "/") {
                 let relative = String(target.dropFirst(root.count + 1))
-                if isConnectorCredential(relative) {
+                let parts = relative.split(separator: "/")
+                if isConnectorCredential(relative)
+                    || (includingProtectedDescendants && parts.first == "connectors" && parts.count <= 2) {
                     return "sensitive_path_denied: data/\(relative)"
                 }
             }
             for segs in bannedDataRootSegments {
                 let full = (rootRaw as NSString).appendingPathComponent(segs.joined(separator: "/"))
-                if isSelfOrAncestor(root: full, path: path) {
+                if protected(full) {
                     return "sensitive_path_denied: data/\(segs.joined(separator: "/"))"
                 }
             }

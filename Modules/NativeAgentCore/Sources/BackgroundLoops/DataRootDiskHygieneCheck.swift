@@ -294,15 +294,9 @@ public enum DataRootDiskHygiene {
         public var freedBytes: Int64 { trashed.reduce(0) { $0 + $1.sizeBytes } }
     }
 
-    /// Move the given dataRoot-relative files to the Trash (reversible — never a
-    /// hard delete). ONLY ever called from an explicit user action (the inbox
-    /// card's "Clean Up" button); no background loop invokes this. Guards:
-    /// a path that resolves outside `dataRoot`, a missing file, or anything
-    /// that isn't a regular file is skipped with a reason, never trashed.
-    /// There is no protected-store guard: the one prefix that ever had one
-    /// (`extras/hf_cache`) held it on a rationale the CoreML cutover made
-    /// false, and it is now listed as residue instead.
-    /// `trash` is injectable for tests; the default is `FileManager.trashItem`.
+    /// User-initiated, reversible cleanup of explicitly disposable residue
+    /// roots only. Size never authorizes removing a store. Both lexical and
+    /// resolved paths must name a residue root inside `dataRoot`.
     public static func cleanup(
         dataRoot: URL,
         relativePaths: [String],
@@ -318,9 +312,9 @@ public enum DataRootDiskHygiene {
         let resolvedRootParts = dataRoot.standardizedFileURL
             .resolvingSymlinksInPath().pathComponents
         var outcomes: [CleanupOutcome] = []
-        for rel in relativePaths {
+        for rel in Set(relativePaths).sorted() {
             let candidate = dataRoot.appendingPathComponent(rel).standardizedFileURL
-            let size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+            var size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]).fileSize)
                 .map(Int64.init) ?? 0
             func skip(_ reason: String) {
                 outcomes.append(CleanupOutcome(
@@ -338,9 +332,14 @@ public enum DataRootDiskHygiene {
             // there already owns the data outright.
             let parts = candidate.pathComponents
             guard !rel.hasPrefix("/"),
+                  !rel.split(separator: "/").contains(".."),
                   parts.count > rootParts.count,
                   Array(parts.prefix(rootParts.count)) == rootParts else {
                 skip("outside the data directory")
+                continue
+            }
+            guard isResidue(relativePath: relativePath(of: candidate, under: dataRoot)) else {
+                skip("not disposable residue; kept")
                 continue
             }
             // Leaf symlink check on the UNRESOLVED path — after resolution the
@@ -348,21 +347,25 @@ public enum DataRootDiskHygiene {
             // target is not what "skip symlinks" means.
             if (try? candidate.resourceValues(forKeys: [.isSymbolicLinkKey]))?
                 .isSymbolicLink == true {
-                skip("not a regular file")
+                skip("symbolic link; kept")
                 continue
             }
             let resolved = candidate.resolvingSymlinksInPath()
             let resolvedParts = resolved.pathComponents
             guard resolvedParts.count > resolvedRootParts.count,
-                  Array(resolvedParts.prefix(resolvedRootParts.count)) == resolvedRootParts else {
+                  Array(resolvedParts.prefix(resolvedRootParts.count)) == resolvedRootParts,
+                  isResidue(relativePath: resolvedParts.dropFirst(resolvedRootParts.count).joined(separator: "/")) else {
                 skip("outside the data directory")
                 continue
             }
-            let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey])
-            guard values?.isRegularFile == true else {
+            let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
+            guard values?.isRegularFile == true || values?.isDirectory == true else {
                 skip(fm.fileExists(atPath: resolved.path)
-                    ? "not a regular file" : "already gone")
+                    ? "not a regular file or directory" : "already gone")
                 continue
+            }
+            if values?.isDirectory == true {
+                size = scan(dataRoot: resolved).totalBytes
             }
             do {
                 try trash(resolved)

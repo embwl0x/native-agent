@@ -24,7 +24,6 @@ import ChromeControl
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -224,18 +223,12 @@ extension AppModel {
     }
 
     @MainActor
-    func saveWorkshopPolicyToggle(enabled: Bool, showTimeline: Bool) async {
-        guard let policy = engine.trust.policy else { return }
+    func saveWorkshopPolicyToggle(enabled: Bool? = nil, showTimeline: Bool? = nil) async {
+        var patch: [String: Any] = [:]
+        if let enabled { patch["enabled"] = enabled }
+        if let showTimeline { patch["showTimeline"] = showTimeline }
         do {
-            let savedPolicy = try await client.saveTrustPolicy(
-                permissionLevel: policy.permissionLevel,
-                autonomyDefault: policy.autonomyDefault ?? "supervised",
-                requireBackups: policy.filePolicy?.requireBackupBeforeWrite ?? true,
-                outsideDefault: policy.filePolicy?.outsideWorkspaceDefault ?? "deny",
-                developerMode: policy.developerMode,
-                workshopExecutionEnabled: enabled,
-                workshopExecutionShowTimeline: showTimeline
-            )
+            let savedPolicy = try await client.postTrustWrite(body: [WorkshopPolicyBlockVocabulary.wireKey: patch])
             applySavedTrustPolicy(savedPolicy, status: "Desk execution policy saved")
         } catch {
             statusText = "Desk execution policy save failed: \(error.localizedDescription)"
@@ -292,25 +285,6 @@ extension AppModel {
             // leave a stale OpenAI-voice grant available to playback.
             engine.trust.policy = nil
             recordTrustActionFailure("Multimodal policy save failed: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    /// Reads the canonical policy directly for the mounted voice-output
-    /// controls.  The card must never treat a failed refresh as the ordinary
-    /// local-voice setting, because playback uses the same policy to decide
-    /// whether a remote synthesis request is permitted.
-    @MainActor
-    @discardableResult
-    func refreshVoiceOutputPolicy() async -> Bool {
-        do {
-            engine.trust.policy = try await engine.trust.load()
-            return true
-        } catch {
-            // Trust policy is a hard output-route authority. Its previous
-            // snapshot cannot stand in for a failed canonical reload.
-            engine.trust.policy = nil
-            statusText = "Voice output policy unavailable: \(error.localizedDescription)"
             return false
         }
     }
@@ -483,16 +457,21 @@ extension AppModel {
         }
     }
 
+    /// The backup, or nil; either way `statusText` carries the receipt.
     @MainActor
-    func createBackup(reason: String) async {
+    @discardableResult
+    func createBackup(reason: String) async -> BackupRecord? {
         let receipt: String
+        var created: BackupRecord?
         do {
             let backup = try await client.createBackup(reason: reason)
+            created = backup
             receipt = "Backup created at \(backup.createdAt): \(backup.reason)"
         } catch {
             receipt = "Backup failed: \(error.localizedDescription)"
         }
         await refreshBackupList(preserving: receipt)
+        return created
     }
 
     @MainActor

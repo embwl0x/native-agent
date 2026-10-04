@@ -22,7 +22,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -42,27 +41,8 @@ import Connectors
 import Browser
 import DeviceSync
 
-/// Result of asking the Swift-owned device-login manager to start OAuth.
-/// `started` does not, by itself, claim that macOS opened a browser or that
-/// authorization has completed.
-enum CodexOAuthLoginLaunchOutcome: Equatable {
-    case started(CodexDeviceLogin)
-    case failed(String)
-}
-
 @MainActor
 extension AppModel {
-    @MainActor
-    func verifyCodex() async {
-        do {
-            let result = try await client.verifyCodex()
-            engine.providers.codexAuth = try? await engine.providers.codexAuthStatus()
-            statusText = result.ok ? "Codex ready: \(result.model)" : "Codex check failed"
-        } catch {
-            statusText = "Codex check failed: \(error.localizedDescription)"
-        }
-    }
-
     @MainActor
     @discardableResult
     func refreshToolsFromToolbar() async -> ToolsRefreshPresentation.State {
@@ -86,52 +66,16 @@ extension AppModel {
         return result
     }
 
+    /// Claim the edit synchronously so a refresh cannot land before its save
+    /// is queued. Nil means the selection is already canonical.
     @MainActor
     @discardableResult
-    func refreshModelCatalog() async -> Bool {
-        do {
-            let catalog = try await engine.providers.modelCatalog(refresh: true)
-            engine.providers.catalog = catalog
-            // User, 2026-09-06: a refresh that never reached the provider used
-            // to report success — the catalog read now says where its rows came
-            // from, and this says the same thing out loud instead of claiming a
-            // network round trip that did not happen. The RETURN VALUE means
-            // the same thing: true only for a live read, because the callers
-            // that render "refreshed" have nothing else to go on. A catalog
-            // that reports no freshness at all is not a failure signal, so it
-            // keeps the old answer. User, 2026-09-06: "live" here means the read
-            // REACHED the provider — a partial page did, and calling it a
-            // failed refresh was a lie; only pruning needs a complete list.
-            let freshness = catalog.catalogFreshness
-                .flatMap(ModelCatalogFreshness.init(rawValue:))
-            switch freshness {
-            case .staleAfterFailedRefresh, .unavailable:
-                statusText = catalog.catalogNote ?? "Couldn't load models."
-            case .cached:
-                statusText = "Model catalog unchanged (cached)"
-            case .liveIncomplete:
-                // User, 2026-09-06: a partial page used to be labelled `cached`
-                // and reported as a refresh that could not reach the provider.
-                // It did reach it; what it cannot claim is the whole list.
-                statusText = "Model catalog refreshed; the provider's list may be partial"
-            case .live, .none:
-                statusText = "Model catalog refreshed"
-            }
-            return freshness?.reachedProvider ?? true
-        } catch {
-            statusText = "Model refresh failed: \(error.localizedDescription)"
-            return false
-        }
-    }
-
-    @MainActor
-    @discardableResult
-    func saveChatBrainDefaults() async -> ChatBrainSaveResult {
+    func enqueueChatBrainDefaultsSave() -> UInt64? {
         let requested = currentChatBrainSelection
         if chatBrainSaveTask == nil, requested == chatBrainCanonicalSelection {
             let result = ChatBrainSaveResult.unchanged(requested)
             statusText = result.userMessage
-            return result
+            return nil
         }
 
         chatBrainSaveGeneration &+= 1
@@ -142,6 +86,15 @@ extension AppModel {
             chatBrainSaveTask = Task { @MainActor [weak self] in
                 await self?.drainChatBrainSaves()
             }
+        }
+        return requestedGeneration
+    }
+
+    @MainActor
+    @discardableResult
+    func saveChatBrainDefaults() async -> ChatBrainSaveResult {
+        guard let requestedGeneration = enqueueChatBrainDefaultsSave() else {
+            return .unchanged(currentChatBrainSelection)
         }
 
         // The one writer drains every value that arrived before it quiesces.
@@ -276,11 +229,8 @@ extension AppModel {
     }
 
     private func publishProviderCatalogStatusAfterBrainSave() {
-        let providerSnapshot = engine.providers.connections
         Task {
-            _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus(
-                providers: providerSnapshot.map(NAProviderCatalogProvider.init)
-            )
+            _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
         }
     }
 
@@ -293,24 +243,20 @@ extension AppModel {
     @MainActor
     @discardableResult
     func loadProvidersForChat() async -> Bool {
+        defer { engine.providers.refreshAccountModelsInBackground() }
+        let saveGeneration = chatBrainSaveGeneration
+        let chatWasSaving = isSavingChatBrain
         var providersFresh = true
         do {
-            engine.providers.connections = try await engine.providers.list()
-            let providerSnapshot = engine.providers.connections
+            let snapshot = try await engine.providers.routing.checkedProviderSnapshot()
+            engine.providers.connections = try ProvidersFacade.connections(from: snapshot)
+            applySurfacePickerSnapshot(snapshot.routing, applyChat: !chatWasSaving
+                && !isSavingChatBrain && saveGeneration == chatBrainSaveGeneration)
             Task {
-                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus(
-                    providers: providerSnapshot.map(NAProviderCatalogProvider.init)
-                )
+                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
             }
         } catch {
             // keep prior list on screen, but say so
-            providersFresh = false
-        }
-        do {
-            if let pid = try await engine.providers.activeProviders()["chat"] {
-                chatProvider = pid
-            }
-        } catch {
             providersFresh = false
         }
         return providersFresh
@@ -324,11 +270,8 @@ extension AppModel {
         do {
             _ = try await client.setActiveProvider(surface: "chat", providerId: providerId)
             chatProvider = providerId
-            let providerSnapshot = engine.providers.connections
             Task {
-                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus(
-                    providers: providerSnapshot.map(NAProviderCatalogProvider.init)
-                )
+                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus()
             }
             statusText = "Chat provider → \(providerId)"
             return true
@@ -432,52 +375,4 @@ extension AppModel {
         }
         await loadProvidersForChat()
     }
-
-    @MainActor
-    func openCodexLoginInBrowser() async -> CodexOAuthLoginLaunchOutcome {
-        do {
-            let login = try await client.openCodexLoginInBrowser()
-            codexDeviceLogin = login
-            if login.openedBrowser == true {
-                statusText = "Codex OAuth login started and opened its browser page."
-            } else {
-                statusText = "Codex OAuth login started. Waiting for device-login instructions."
-            }
-            return .started(login)
-        } catch {
-            let detail = error.localizedDescription
-            statusText = "Could not start Codex OAuth login: \(detail)"
-            return .failed(detail)
-        }
-    }
-
-    // Cancel the app-visible Codex device-auth login state through the Swift
-    // subprocess owner, then clear the panel when there is no actionable code.
-    @MainActor
-    func cancelCodexDeviceLogin() async {
-        do {
-            codexDeviceLogin = try await client.cancelCodexDeviceLogin()
-            statusText = "Cancelled Codex OAuth browser login."
-        } catch {
-            statusText = "Could not cancel browser login: \(error.localizedDescription)"
-        }
-        await clearCodexDeviceLogin()
-    }
-
-    // Clear the app-side Codex device-login state. The Swift subprocess owner
-    // terminates any in-flight `codex login --device-auth` process before the
-    // UI drops its published model.
-    // Idempotent and safe to call when nil.
-    @MainActor
-    func clearCodexDeviceLogin() async {
-        do {
-            _ = try await client.codexDeviceLoginClear()
-        } catch {
-            // Best-effort: the Swift local clear failed. Still drop the local
-            // model so the panel collapses, but surface the failure.
-            statusText = "Cleared local Codex login, but Swift clear failed: \(error.localizedDescription)"
-        }
-        codexDeviceLogin = nil
-    }
-
 }

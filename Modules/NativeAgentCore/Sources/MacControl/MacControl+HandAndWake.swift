@@ -11,7 +11,7 @@ extension SwiftNativeMacControl {
     func waitForTextInput(
         pid: Int32, target: MacAXActTarget? = nil, clickPoint: CGPoint? = nil,
         selectedAll: Bool = false, value: String? = nil,
-        changedFrom before: MacAXTextInput? = nil
+        changedFrom before: MacAXTextInput? = nil, requiresFrontmost: Bool = true
     ) async -> MacAXTextInput? {
         func containsClick(_ element: MacAXActTarget, point: CGPoint) -> Bool {
             guard let frame = element.frame, frame.w > 0, frame.h > 0 else { return false }
@@ -31,7 +31,7 @@ extension SwiftNativeMacControl {
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
         repeat {
             guard !Task.isCancelled,
-                  accessibilitySource.frontmostApp()?.processIdentifier == pid else { return nil }
+                  !requiresFrontmost || accessibilitySource.frontmostApp()?.processIdentifier == pid else { return nil }
             if let focused = accessibilityActSource.focusedElement(pid: pid),
                target.map({ accessibilityActSource.matchesTextInputTarget(focused, target: $0) }) ?? true,
                matchesClick(focused),
@@ -188,6 +188,14 @@ extension SwiftNativeMacControl {
         guard !plan.isEmpty, MacHandRepertoire.isBalanced(plan) else {
             return injectionRefusal(action: "hand", error: "gesture plan was empty or unbalanced", status: 400)
         }
+        if plan.contains(where: { $0.keyEvent != nil }),
+           let refusal = MacActClosedLoop.secureInputRefusal(active: eventSink.secureKeyboardEntryActive) {
+            return injectionRefusal(
+                action: "hand",
+                error: refusal.reason,
+                extra: ["note": .string(refusal.note), "key_events": .int(0)]
+            )
+        }
 
         // A composed four-verb physical act may own both fresh observations.
         // In that lane this hand reports emission only, never verification;
@@ -213,6 +221,12 @@ extension SwiftNativeMacControl {
         var emittedEvents = 0
         @discardableResult func recoverNeutral() -> Int {
             let released = heldKeys.count + heldButtons.count
+            if MacDriverContext.binding?.allowsEmission != true {
+                MacDriverContext.binding?.releaseHeldInputs()
+                heldKeys.removeAll()
+                heldButtons.removeAll()
+                return released
+            }
             for key in heldKeys.reversed() {
                 eventSink.post(key: MacKeyEvent(keyCode: key, down: false))
             }
@@ -224,6 +238,18 @@ extension SwiftNativeMacControl {
             heldKeys.removeAll()
             heldButtons.removeAll()
             return released
+        }
+        func handback(_ refusal: MacControlResult) -> MacControlResult {
+            let released = recoverNeutral()
+            var output: [String: JSONValue] = [:]
+            if case .object(let existing) = refusal.output { output = existing }
+            output["gesture"] = .string(gesture)
+            output["requested_events_emitted"] = .int(Int64(emittedEvents))
+            output["recovery_events_emitted"] = .int(Int64(released))
+            output["effects_may_have_occurred"] = .bool(emittedEvents > 0)
+            return MacControlResult(ok: false, action: "hand", output: .object(output),
+                                    error: refusal.error, durationMs: Int(now().timeIntervalSince(started) * 1000),
+                                    viaSwift: true, httpStatus: 409, verification: .unverified)
         }
         func interruptedResult() -> MacControlResult {
             let recoveryEvents = recoverNeutral()
@@ -282,8 +308,7 @@ extension SwiftNativeMacControl {
         for step in executionPlan {
             if Task.isCancelled { return interruptedResult() }
             if let refusal = await attentionActionRefusal(action: "hand", body: body) {
-                recoverNeutral()
-                return refusal
+                return handback(refusal)
             }
             let posts: Bool = if case .wait = step { false } else { true }
             if let requiredFront, posts, accessibilitySource.frontmostApp()?.processIdentifier != requiredFront {
@@ -325,8 +350,7 @@ extension SwiftNativeMacControl {
                     }
                     if Task.isCancelled { return interruptedResult() }
                     if let refusal = await attentionActionRefusal(action: "hand", body: body) {
-                        recoverNeutral()
-                        return refusal
+                        return handback(refusal)
                     }
                     guard accessibilitySource.frontmostApp()?.processIdentifier == pid else {
                         recoverNeutral()
@@ -370,7 +394,23 @@ extension SwiftNativeMacControl {
                 emittedEvents += 1
             case .wait(let milliseconds):
                 if milliseconds > 0 {
-                    try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+                    let binding = MacDriverContext.binding
+                    let store = attentionStore
+                    do {
+                        try await withThrowingTaskGroup(of: Void.self) { group in
+                            group.addTask { try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000) }
+                            group.addTask {
+                                for await _ in await store.driverChanges() {
+                                    if binding?.allowsEmission != true { return }
+                                }
+                            }
+                            _ = try await group.next()
+                            group.cancelAll()
+                        }
+                    } catch { return interruptedResult() }
+                    if let refusal = await attentionActionRefusal(action: "hand", body: body) {
+                        return handback(refusal)
+                    }
                 }
             }
         }

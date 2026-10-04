@@ -9,6 +9,7 @@ import WorkshopExecution
 import TrustCenter
 import SelfImprovement
 import NotificationInbox
+import Privacy
 
 // MARK: - Heartbeat and Self-Healing
 
@@ -81,6 +82,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             interval: 24 * 60 * 60,
             llm: llm,
             dataRoot: dataRoot,
+            isEnabled: { await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot) },
             fileProposal: { title, evidence in
                 // Rethrow: the hook stamps its cooldown + consumes the doctor
                 // transition only on durable success. Swallowing a store-write
@@ -626,25 +628,24 @@ public struct HeartbeatBackgroundWork: Sendable {
         let statuses = SelfHealingHook.scanErrorFeeds(dataRoot: dataRoot, now: now)
         let windowMinutes = Int(SelfHealingHook.errorBurstWindow / 60)
         let perFeed = statuses
-            .map { "\($0.feed.label) \($0.summary(now: now))" }
+            .map { "\($0.feed.label) \($0.recentCount) row(s)" }
             .joined(separator: ", ")
         let total = statuses.reduce(0) { $0 + $1.recentCount }
-        let line = "Errors (last \(windowMinutes)m): \(perFeed)."
+        let line = "Errors observed (last \(windowMinutes)m): \(perFeed)."
 
-        // A feed nobody has written in a week proves nothing. When EVERY
-        // watched sink is silent the heartbeat is blind, and reporting that as
-        // "0 recent errors … ok" is the lie this guard exists to stop — for
-        // three months `logs/errors.jsonl` was the only watched feed and it had
-        // no writer at all.
-        guard statuses.contains(where: { !$0.silent }) else {
-            let days = Int(SelfHealingHook.feedSilentAfter / 86_400)
+        // Error-only sinks can be absent or quiet during healthy operation.
+        // Availability is a file-access fact, not time since the last error.
+        let unreadable = statuses.filter {
+            let path = $0.feed.url(dataRoot: dataRoot).path
+            return FileManager.default.fileExists(atPath: path)
+                && !FileManager.default.isReadableFile(atPath: path)
+        }
+        if !unreadable.isEmpty {
             return (line, HeartbeatIssue(
-                id: "error-feeds-silent",
-                summary: "No error feed has been written in \(days)d — error signal is dark.",
-                detail: "Heartbeat watches "
-                    + SelfHealingHook.errorFeeds.map { $0.relativePath }.joined(separator: ", ")
-                    + ". Every one of them is silent, so \"no recent errors\" means "
-                    + "\"nothing is reporting\", not \"nothing is wrong\".\n\(perFeed)",
+                id: "error-feeds-unreadable",
+                summary: "Some error logs could not be read.",
+                detail: "Unreadable error logs: "
+                    + unreadable.map { $0.feed.relativePath }.joined(separator: ", "),
                 priority: 30,
                 actions: []
             ))
@@ -654,6 +655,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         let samples = statuses
             .flatMap { status in status.recentLines.map { "[\(status.feed.label)] \($0)" } }
             .suffix(3)
+            .map(NativeAgentSecretRedactor.redactText)
             .joined(separator: "\n")
         return (line, HeartbeatIssue(
             id: "error-burst",
@@ -1017,7 +1019,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         let cardId = heartbeatCardID(conditionId: notice.conditionId)
         let now = heartbeatISO(Date())
         let actions = try HeartbeatCardAction.cardActions(authored: notice.actions)
-        let card: JSONValue = .object([
+        let card: [String: JSONValue] = [
             "id": .string(cardId),
             "created_at": .string(now),
             "source": .string("heartbeat"),
@@ -1026,6 +1028,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             "summary": .string(String(body.prefix(500))),
             "detail": .string(body),
             "condition_id": .string(notice.conditionId),
+            "condition_active": .bool(true),
             "related_mission_id": .null,
             "related_approval_id": .null,
             "related_paths": .array([]),
@@ -1033,16 +1036,26 @@ public struct HeartbeatBackgroundWork: Sendable {
             "actions": .array(actions.map(heartbeatActionJSON)),
             "status": .string("unread"),
             "read_at": .null,
-        ])
+        ]
         do {
-            let inserted = try await LiveNotificationInbox(path: inboxPath)
-                .upsert(card, id: cardId)
-            if inserted {
+            let isNewOccurrence = try await LiveNotificationInbox(path: inboxPath)
+                .upsert(id: cardId) { existing in
+                    var updated = card
+                    if case .object(let previous)? = existing,
+                       previous["condition_active"] != .bool(false) {
+                        for key in ["status", "read_at", "created_at"] {
+                            if let value = previous[key] { updated[key] = value }
+                        }
+                        return (.object(updated), false)
+                    }
+                    return (.object(updated), true)
+                }
+            if isNewOccurrence {
                 await port.notifyIfAttentionWorthy(
                     dataRoot: dataRoot,
                     itemId: cardId,
                     title: "Heartbeat flagged something",
-                    summary: String(body.prefix(500)),
+                    summary: String(body.prefix(420)) + "\nFlagged at \(now)",
                     source: "heartbeat",
                     severity: "actionable"
                 )
@@ -1094,12 +1107,16 @@ public struct HeartbeatBackgroundWork: Sendable {
                     } else {
                         status = "unread"
                     }
-                    if status == "archived" || status == "dismissed" {
+                    if (status == "archived" || status == "dismissed"),
+                       obj["condition_active"] == .bool(false) {
                         mutated.append(line.raw)
                         continue
                     }
-                    obj["status"] = .string("archived")
-                    obj["read_at"] = .string(now)
+                    obj["condition_active"] = .bool(false)
+                    if status != "archived" && status != "dismissed" {
+                        obj["status"] = .string("archived")
+                        obj["read_at"] = .string(now)
+                    }
                     mutated.append(Data(try JSONValue.object(obj).serialize(pretty: false).utf8))
                     changed = true
                 }
@@ -1164,8 +1181,8 @@ public struct HeartbeatBackgroundWork: Sendable {
 
     // MARK: - U2b wave 2: evolution approval staging glue
 
-    /// Turns GREEN evolution candidates into explicit-human-only approval
-    /// cards (plan wave 2). For every proposal at candidate_green/staged:
+    /// Applies GREEN evolution candidates under admitted Full Mac authority;
+    /// otherwise stages human approval cards. For every proposal at candidate_green/staged:
     ///   • a pending self_evolution.apply approval already exists → ensure
     ///     the visible card + heal the staged status (crash retry path);
     ///   • the newest matching approval was approved/denied → the executor's
@@ -1175,9 +1192,9 @@ public struct HeartbeatBackgroundWork: Sendable {
     /// CLOSED (an unreadable inbox stages nothing rather than risking a
     /// duplicate), and card id == approval id so resolve retires the card.
     ///
-    /// SAFETY (plan design #7): risk is pinned "critical", the record is
-    /// created PENDING and never resolved here, and no auto-approve path
-    /// exists for this action — evolution installs always cross a human.
+    /// SAFETY: admitted Full Mac authority permits automatic promotion and
+    /// installation, subject to the rebuild gate. Outside that authority,
+    /// risk is pinned "critical" and a PENDING card requires human approval.
     /// `onlyProposalId` (U4 Wave D, gpt-5.5 review SHOULD-FIX): when set, stage
     /// ONLY that proposal (the `self_install` chat trigger names one explicit
     /// id — staging unrelated green candidates B/C because the caller asked for

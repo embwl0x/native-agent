@@ -20,7 +20,6 @@ public final class CognitionViewFacade {
     public var detail: CognitiveObservatoryDetail?
     public var detailEvidenceStatus: CognitiveObservatoryDetailRead.EvidenceStatus?
     public var contextFlowHealth: ContextFlowObservatoryHealthState = .unavailable
-    public var contextFlowFallback: ContextFlowFallbackState?
     public var workshop: WorkshopObservatorySnapshot?
     public var enabled = false
     public var capsuleEnabled = false
@@ -131,23 +130,16 @@ public final class CognitionViewFacade {
         if FileManager.default.fileExists(atPath: diary.path, isDirectory: &isDirectory), !isDirectory.boolValue {
             throw DreamREMCycleError.underlying("dream_diary is not a directory")
         }
-        let entries = try await makeDreamREMCycle(root: dataRoot).listDreamDiary(limit: limit)
-        // Same file set the listing reads (top level + archive/<year>), so the
-        // header's count and the list agree after REM archives older nights.
-        let diaryNames = FileBackedDreamDiary(dataRoot: dataRoot).entryFileNames()
-        // FileBackedDreamDiary intentionally skips individual unreadable files
-        // so one damaged entry does not hide readable ones. Carry that evidence
-        // forward: an all-unreadable window must not become "No dreams yet."
-        let boundedCount = min(max(1, limit), diaryNames.count)
-        let visibleNames = Set(entries.compactMap(\.filename))
-        let unreadableEntries = diaryNames.prefix(boundedCount).count {
-            !visibleNames.contains($0)
+        let reader = FileBackedDreamDiary(dataRoot: dataRoot)
+        let listing = reader.listEntriesChecked(limit: limit)
+        guard !listing.storageUnreadable else {
+            throw DreamREMCycleError.underlying("The dream diary or an archive directory could not be read.")
         }
         return DreamDiary(
-            entries: entries,
+            entries: listing.entries,
             enabled: await dreamEnabled(),
-            totalEntries: diaryNames.count,
-            unreadableEntries: unreadableEntries
+            totalEntries: listing.totalEntries,
+            unreadableEntries: listing.unreadableEntries
         )
     }
 

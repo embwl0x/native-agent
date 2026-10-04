@@ -155,7 +155,7 @@ public struct ResearchFetchRecord: Sendable, Equatable {
 public struct ResearchLabRun: Identifiable, Sendable, Hashable {
     public let id: String
     public let objective: String
-    public let status: String      // "completed" | "needs_connector"
+    public let status: String      // "completed" | "needs_connector" | "failed"
     public let query: String
     public let sources: [ResearchSearchResult]
     public let brief: String

@@ -63,7 +63,7 @@ extension TelegramPollLoop {
         .joined(separator: " ")
         .lowercased()
         if description.contains("siri and dictation") || description.contains("dictation") {
-            return "The voice note arrived, but macOS Siri/Dictation is blocking Apple Speech. Transcription was retried without on-device recognition; if this keeps happening, enable Dictation in System Settings."
+            return "The voice note arrived, but macOS Siri/Dictation is blocking Apple Speech. Enable Dictation in System Settings."
         }
         if description.contains("speech recognition permission denied") {
             return "The voice note arrived, but macOS Speech Recognition permission is not approved for NativeAgent yet."

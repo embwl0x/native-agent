@@ -155,7 +155,7 @@ it could ever want on every turn is not more connected — it is buried.
   In-front-of needs a reason this exact turn could not do without it.
 - Canonical: the resident packet — twelve selected atoms and eight lazy
   pointers instead of every memory on every turn — is the shape. Skills as
-  recall pointers, `context_expand`, the studio's own "my first contact
+  recall pointers, `app {action:"context.expand"}`, the studio's own "my first contact
   should be with the work, not a prediction of my reaction": all reach,
   no weight.
 - Review axis: "more connected" proposals that add always-on context rank

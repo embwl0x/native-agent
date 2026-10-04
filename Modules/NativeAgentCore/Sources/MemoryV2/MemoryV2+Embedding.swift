@@ -168,22 +168,11 @@ public struct FailClosedEmbeddingProvider: EmbeddingProvider {
 
 // MARK: - CoreMLEmbeddingProvider
 //
-// Loads a .mlpackage from a known on-disk URL. This is the WIRING SPOT for the
-// future MiniLM → Core ML drop:
-//   1. Run script/convert_minilm_to_coreml.py (to be shipped) to produce
-//      MiniLM_L6_v2.mlpackage.
-//   2. Bundle the .mlpackage with the app (or stash it in Application Support).
-//   3. Construct CoreMLEmbeddingProvider(modelURL: <bundle URL>).
-//
-// Today the init() throws cleanly if the URL is malformed, has the wrong
-// extension, or doesn't exist, and embed() throws .modelNotLoaded if anyone
-// reaches it. This is intentional: we'd rather fail loudly than emit silently-
-// wrong vectors from a placeholder tokenizer.
-//
-// Full validity (whether the .mlpackage actually loads under MLModel) is
-// DEFERRED until the real MiniLM .mlpackage drops — attempting MLModel.load
-// today would be a no-op without a real artifact, so we only validate shape:
-// file URL, known extension, exists on disk.
+// Validates the on-disk model URL, compiles source models when needed, and
+// loads the Core ML model and WordPiece vocabulary. Initialization throws if
+// either cannot load. embed() tokenizes text, runs inference, and normalizes
+// sentence vectors; unavailable inference or unusable output throws rather
+// than returning placeholder vectors.
 public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
     public static let allowedModelExtensions: Set<String> = ["mlpackage", "mlmodelc", "mlmodel"]
     private static let bundledEpochLock = NSLock()
@@ -233,17 +222,16 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     private let mlModel: MLModel?
     #endif
 
-    /// A5.4 escape hatch: which `MLModelConfiguration` (if any) the model load
-    /// should use. `nil` means "hand `MLModel(contentsOf:)` no configuration at
-    /// all" — byte-for-byte the pre-A5.4 load, so nothing changes when
-    /// low-memory mode is off. Low-memory mode pins `.cpuOnly`, keeping MiniLM
-    /// off the GPU/ANE residency pools; 8 GB Macs previously had no way to cap
-    /// that footprint. Pure function so the selection itself is pinned by tests.
+    /// Which compute units the model load uses: CPU + Neural Engine, never the
+    /// GPU. Low-memory mode pins `.cpuOnly`, keeping MiniLM off the ANE
+    /// residency pool too; 8 GB Macs previously had no way to cap that footprint.
     #if canImport(CoreML) && !os(Linux)
     public static func modelConfiguration(lowMemory: Bool) -> MLModelConfiguration? {
-        guard lowMemory else { return nil }
         let configuration = MLModelConfiguration()
-        configuration.computeUnits = .cpuOnly
+        // 2026-10-01: off the GPU. MiniLM compiling GPU pipelines at launch
+        // was caught alongside SwiftUI's RenderBox aborting on its own Metal
+        // library load; the Neural Engine runs this model just as well.
+        configuration.computeUnits = lowMemory ? .cpuOnly : .cpuAndNeuralEngine
         return configuration
     }
 
@@ -364,11 +352,8 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         self.modelLoaded = false
         #endif
         if !modelLoaded {
-            // Init succeeded as a shape check (file exists, valid extension)
-            // but inference will throw. Under the current fail-closed
-            // contract this surfaces as a runtime embed() failure unless the
-            // caller has explicitly opted into mock vectors via config or
-            // NATIVE_AGENT_EMBEDDING_MOCK=1.
+            // Refuse a provider without both model and tokenizer; callers
+            // cannot mistake a valid file path for usable inference.
             let underlying = loadFailure.map { " Underlying: \(String(describing: $0))" } ?? ""
             let missing = (mlModel == nil ? "MLModel" : "WordPiece vocab")
             throw EmbeddingError.modelNotLoaded(
@@ -396,7 +381,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             modelID: modelID,
             modelArtifactDigest: modelArtifactDigest,
             tokenizerArtifactDigest: tokenizerDigest,
-            preprocessing: "wordpiece-v1;lowercase=true;unicode=nfc;controls=strip;punctuation=split",
+            preprocessing: "wordpiece-v3;lowercase=true;unicode=nfc;accents=nfd-strip-mn;whitespace=space;controls=strip;punctuation=split;cjk=split",
             pooling: "attention-mask-mean-or-model-pooled",
             normalization: "l2",
             dimensions: dimensions,

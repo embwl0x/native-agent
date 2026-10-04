@@ -77,8 +77,7 @@ public enum AgentConversationRouting {
             args["conversation_mode"] = .string(conversation == nil ? "new" : "resume")
             if let conversation { args["conversation_id"] = .string(conversation) }
             if let message { args["message_id"] = .string(message) }
-            // Claude's wake decides from this whether an FYI may wait in an
-            // open session's inbox; the other lanes do not read it.
+            // Claude's inbox row records it; the other lanes do not read it.
             if agent == "claude", let expects = input["expects_reply"], case .bool = expects { args["expects_reply"] = expects }
             return Route(tool: agent + "_message", input: args, agent: canonical)
         }
@@ -157,7 +156,7 @@ public enum AgentConversationRouting {
 
     private static func validate(options: [String: JSONValue], agent: String, continuing: Bool) throws {
         var allowed: Set<String> = ["working_directory", "topic"]
-        if agent != "codex" { allowed.insert("timeout_seconds") }
+        if agent == "omp" { allowed.insert("timeout_seconds") }
         if agent == "codex" { allowed.formUnion(["model", "reasoning_effort", "fast", "pair_reviewer"]) }
         if agent == "claude" { allowed.insert("pair_reviewer") }
         try keys(options, allowed: allowed)

@@ -19,7 +19,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -27,7 +26,6 @@ import TriggerScheduler
 import WorkshopExecution
 import NotificationInbox
 import SystemOps
-import ScreenVision
 import TelegramBot
 import Dispatcher
 import MacControl
@@ -64,37 +62,6 @@ extension NativeClient {
             messageID: messageId,
             rating: rating
         )
-    }
-
-    // --- Screen vision (v1, 2026-06-06) ------------------------------------
-    // Swift-native one-shot screen capture. Two-layer fail-closed contract:
-    //
-    //   Layer 1 (ScreenVision module): SwiftNativeScreenVision.captureScreen()
-    //     THROWS on permission denial, missing display, or capture failure.
-    //     There is no mock fallback, no empty-Data return, no daemon HTTP
-    //     path — that's where the fail-closed rule lives.
-    //
-    //   Layer 2 (this seam): preserves that typed failure for chat callers.
-    //     Returning nil/empty data here is not a benign convenience: it lets
-    //     a turn proceed as though it has a screen attachment when capture was
-    //     denied or produced no image bytes.
-    //
-    // v1 callers: none yet — this is a public seam for future
-    // vision-decision-loop work (e.g. /show slash command, autonomous
-    // execution step). The composer button still goes through
-    // ContentView.NativeScreenCapture.captureImageBase64() which delegates
-    // to the SAME ScreenVision module under the hood.
-    @MainActor
-    func captureScreenForChat(
-        capture: @escaping @Sendable () async throws -> Data = {
-            try await SwiftNativeScreenVision().captureScreen()
-        }
-    ) async throws -> Data {
-        let image = try await capture()
-        guard !image.isEmpty else {
-            throw ScreenVisionError.captureFailed("capture returned no image bytes")
-        }
-        return image
     }
 
     // --- Mac control --------------------------------------------------------

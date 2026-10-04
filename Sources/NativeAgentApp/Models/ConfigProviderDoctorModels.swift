@@ -35,8 +35,10 @@ struct TelegramTestResponse: Codable, Hashable {
     init(result: TelegramTestResult) throws {
         let row = try TelegramReplyFields(result.rawResponse)
         ok = try row.required("ok") { if case .bool(let b) = $0 { return b }; return nil }
-        chatId = try row.required("chatId", TelegramReplyFields.string)
-        messageId = try row.optional("messageId", TelegramReplyFields.integer)
+        let message = try TelegramReplyFields(row.required("result", { $0 }))
+        let chat = try TelegramReplyFields(message.required("chat", { $0 }))
+        chatId = String(try chat.required("id", TelegramReplyFields.integer))
+        messageId = try message.required("message_id", TelegramReplyFields.integer)
         tokenConfigured = try row.optional("tokenConfigured", TelegramReplyFields.boolean)
         pollerRegistered = try row.optional("pollerRegistered", TelegramReplyFields.boolean)
         pollerTicking = try row.optional("pollerTicking", TelegramReplyFields.boolean)
@@ -172,6 +174,8 @@ struct SkillInfo: Identifiable {
     let manifest: SkillManifest
     let registry: SkillRegistryEntry
     let readme: String?    // optional, loaded on demand
+    /// The digest of the script `readme` shows, the one Install admits.
+    var scriptDigest: String? = nil
 
     static func learnedSkill(_ skill: SkillRecord) -> SkillInfo {
         let skillId = skill.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? skill.name : skill.id
@@ -205,7 +209,10 @@ struct SkillInfo: Identifiable {
             installedAt: skill.createdAt,
             path: skill.bodyPath ?? ""
         )
-        return SkillInfo(id: skillId, manifest: manifest, registry: registry, readme: nil)
+        // The script shows where User reviews it before Install admits it.
+        return SkillInfo(id: skillId, manifest: manifest, registry: registry,
+                         readme: skill.script.map { "\(skill.signature ?? "script")\n\n\($0.source)" },
+                         scriptDigest: skill.script == nil ? nil : skill.scriptDigest)
     }
 }
 

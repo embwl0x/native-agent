@@ -19,15 +19,19 @@ public struct TelegramApprovalCommand: Sendable, Equatable {
     /// the command named no bot, or did not arrive as text at all (a callback
     /// button is delivered only to the bot that sent it).
     public let addressedBot: String?
+    /// A mirrored inline card's option, by index (`na_approval:c<n>:<id>`).
+    public let choice: Int?
 
     public init(
         id: String,
         decision: TelegramApprovalDecision,
-        addressedBot: String? = nil
+        addressedBot: String? = nil,
+        choice: Int? = nil
     ) {
         self.id = id
         self.decision = decision
         self.addressedBot = addressedBot
+        self.choice = choice
     }
 
     public static func parse(text raw: String) -> TelegramApprovalCommand? {
@@ -63,17 +67,21 @@ public struct TelegramApprovalCommand: Sendable, Equatable {
         let parts = raw.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 3, parts[0] == "na_approval" else { return nil }
         let decision: TelegramApprovalDecision
+        var choice: Int?
         switch parts[1] {
         case "approve", "approved":
             decision = .approved
         case "deny", "denied", "reject", "rejected":
             decision = .denied
+        case let verb where verb.hasPrefix("c") && Int(verb.dropFirst()).map({ $0 >= 0 }) == true:
+            decision = .approved
+            choice = Int(verb.dropFirst())
         default:
             return nil
         }
         let id = parts[2].trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return nil }
-        return TelegramApprovalCommand(id: id, decision: decision)
+        return TelegramApprovalCommand(id: id, decision: decision, choice: choice)
     }
 }
 
@@ -84,6 +92,22 @@ public protocol TelegramApprovalHandling: Sendable {
         chatId: Int,
         fromUserId: Int?
     ) async throws -> TelegramApprovalResolution
+    /// The same, carrying a mirrored card's picked option.
+    func resolveTelegramApproval(
+        id: String,
+        decision: TelegramApprovalDecision,
+        choice: Int?,
+        chatId: Int,
+        fromUserId: Int?
+    ) async throws -> TelegramApprovalResolution
+}
+
+extension TelegramApprovalHandling {
+    public func resolveTelegramApproval(
+        id: String, decision: TelegramApprovalDecision, choice: Int?, chatId: Int, fromUserId: Int?
+    ) async throws -> TelegramApprovalResolution {
+        try await resolveTelegramApproval(id: id, decision: decision, chatId: chatId, fromUserId: fromUserId)
+    }
 }
 
 /// The canonical approval result plus an optional internal continuation turn.

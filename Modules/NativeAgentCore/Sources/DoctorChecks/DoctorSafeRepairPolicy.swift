@@ -28,11 +28,13 @@ public enum DoctorSafeRepairPolicy {
             let scopeAllowsRepair = switch scope {
             case .automatic, .onboarding:
                 automaticCoreIDs.contains(check.id)
+                    || (scope == .automatic && check.id.hasPrefix("live.background_loop.")
+                        && executableLiveIDs.contains(check.id))
                     || (check.id == "live.embedding_download"
                         && check.detail.hasPrefix("A resumable memory model transfer"))
             case .button: true
             }
-            guard isAdverse(check.status),
+            guard isAdverse(check.status) || isOAuthRefresh(check),
                   liveRepair || isSafeCoreRepair(check),
                   check.id != "persona_engine" || scope == .button,
                   scopeAllowsRepair else { return nil }
@@ -56,9 +58,11 @@ public enum DoctorSafeRepairPolicy {
     }
 
     private static func isSafeCoreRepair(_ check: CheckResult) -> Bool {
-        let oauthRetry = check.id == "oauth_token_expiry"
-            && check.repair?.contains(oauthRefreshInstruction) == true
-        return oauthRetry || normalized(check.repair).hasPrefix("run repair safe issues")
+        isOAuthRefresh(check) || normalized(check.repair).hasPrefix("run repair safe issues")
+    }
+
+    private static func isOAuthRefresh(_ check: CheckResult) -> Bool {
+        check.id == "oauth_token_expiry" && check.repair == oauthRefreshInstruction
     }
 
     private static func normalized(_ value: String?) -> String {

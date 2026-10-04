@@ -7,31 +7,11 @@ import PersistenceCore
 import Darwin
 #endif
 
-// MARK: - Wave 29 W3: Native Swift connector actions (DORMANT — no production wiring)
+// MARK: - Native file/system connector actions
 //
-// Ports 5 SMALL, SELF-CONTAINED file/system connector action handlers from the
-// retired runtime into Swift, so the SwiftNativeDispatcher can execute them
-// natively. The five:
-//
-//   read_file     ← the retired daemon:_exec_read_file    (751)
-//   file_excerpt  ← the retired daemon:_exec_file_excerpt (806)
-//   write_file    ← the retired daemon:_exec_write_file   (859)
-//   list_dir      ← the retired daemon:_exec_list_dir     (1622)
-//   system_info   ← the retired daemon:_exec_system_info (3306)
-//
-// Each handler takes the same shape as the Python executor — `(input, context)`
-// → result dict — and returns a `JSONValue` whose keys/values are byte-shape
-// equivalent to the Python return dict (same keys, same defaults, same
-// error_code strings). NOTHING here is wired into a production caller yet:
-// `SwiftNativeDispatcher.dispatch` only consults this registry when explicitly
-// enabled (see `LocalConnectorActions`), and the production factory leaves it
-// off. Flipping callers through SwiftNative is a separate wave.
-//
-// Sandbox parity: the Python handlers gate on `_allowed_roots(context)` +
-// `_is_sensitive_data_path(path, context)`. We reproduce both — driven entirely
-// by the `repo_root`, `file_access`, and `_na_data_root` fields the caller
-// puts in the action context — so the security posture is identical and the
-// check is fully testable without touching global root resolution.
+// Registered file and repository handlers run in-process. File access follows
+// the caller's allowed roots and the sensitive-path fence; verified descriptors
+// keep reads and mutations bound to the checked paths.
 
 // MARK: - Constants
 
@@ -310,12 +290,12 @@ enum FileSystemActions {
     /// exposing file paths/content or adding process-wide instrumentation.
     @TaskLocal static var regularFileReadObserver: (@Sendable (Int) -> Void)?
 
-    private struct FileReadFailure: Error {
+    struct FileReadFailure: Error {
         let message: String
         let code: String
     }
 
-    private static func openRegularReadHandle(_ path: URL) throws -> FileHandle {
+    static func openRegularReadHandle(_ path: URL) throws -> FileHandle {
         #if canImport(Darwin)
         // Descriptor-relative walk from the verified root: each parent is
         // opened O_DIRECTORY|O_NOFOLLOW and the final component O_NOFOLLOW, so
@@ -477,7 +457,7 @@ enum FileSystemActions {
             return errResult(
                 "Path '\(resolved.path)' is under a sensitive data sub-tree (OAuth tokens, "
                 + "pairing secrets, provider credentials, trust policy). "
-                + "Use dedicated Swift runtime tools such as agent_introspect or recall_search instead.",
+                + "Use dedicated Swift runtime tools such as app agent.introspect or memory.recall instead.",
                 code: "path_not_allowed"
             )
         }
@@ -500,7 +480,7 @@ enum FileSystemActions {
         catch { return errResult("could not open file", code: "read_failed") }
         defer { try? handle.close() }
         // Decode from the bytes THIS verified descriptor produces. Reopening the
-        // path to decode (LocalToolImage.readAuthorizedFile) would validate one
+        // path to decode would validate one
         // file and render another after a swap.
         if VerifiedImageRead.isImagePath(resolved) {
             let bytes = ((try? handle.read(upToCount: LocalToolImage.maximumBytes + 1)) ?? nil) ?? Data()
@@ -534,10 +514,6 @@ enum FileSystemActions {
             "has_more": .bool(hasMore),
             "content": .string(decodeUTF8Replacing(window.data)),
         ]
-        if FileReadEvidence.required {
-            result["utf8_valid"] = .bool(String(data: window.data, encoding: .utf8) != nil)
-            result["content_sha256"] = .string(SHA256.hash(data: window.data).map { String(format: "%02x", $0) }.joined())
-        }
         if let version = window.version {
             result["version"] = .string(version)
             if hasMore {
@@ -560,7 +536,13 @@ enum FileSystemActions {
     private static func readMatching(
         in folder: URL, pattern: String, input: [String: JSONValue], _ ctx: ConnectorActionContext
     ) -> JSONValue {
-        let names = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+        let entries: [String]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        } catch {
+            return errResult("Could not list folder: \(error.localizedDescription)", code: "read_failed")
+        }
+        let names = entries
             .filter { name in
                 var isDir: ObjCBool = false
                 return (!name.hasPrefix(".") || pattern.hasPrefix("."))
@@ -959,9 +941,6 @@ enum FileSystemActions {
                 code: "path_not_allowed"
             )
         }
-        if let names = FileReadEvidence.directoryNames {
-            return craftDirectoryEvidence(resolved, names: names)
-        }
         let fm = FileManager.default
         var isDir: ObjCBool = false
         let exists = fm.fileExists(atPath: resolved.path, isDirectory: &isDir)
@@ -1086,47 +1065,6 @@ enum FileSystemActions {
         return .object(result)
     }
 
-    /// Exact entries, including absence, from the authorized directory. This
-    /// is owner evidence for craft, not a paginated presentation listing.
-    private static func craftDirectoryEvidence(_ path: URL, names: [String]) -> JSONValue {
-        #if canImport(Darwin)
-        guard names.count <= 17, names.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0") }) else {
-            return errResult("Invalid craft file names")
-        }
-        do {
-            let fd = try VerifiedPath.open(path, flags: O_RDONLY | O_DIRECTORY)
-            defer { close(fd) }
-            var parent = stat()
-            var volume = statfs()
-            guard fstat(fd, &parent) == 0, fstatfs(fd, &volume) == 0,
-                  volume.f_flags & UInt32(MNT_LOCAL) != 0 else { return errResult("Local directory evidence unavailable") }
-            var entries: [String: JSONValue] = [:]
-            for name in names {
-                var entry = stat()
-                if fstatat(fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 {
-                    guard errno == ENOENT else { return errResult("Entry evidence unavailable") }
-                    entries[name] = .null
-                    continue
-                }
-                let kind = entry.st_mode & mode_t(S_IFMT)
-                guard (kind == mode_t(S_IFREG) || kind == mode_t(S_IFDIR)), entry.st_dev == parent.st_dev else {
-                    return errResult("Craft supports regular files and directories without symlinks")
-                }
-                entries[name] = .object([
-                    "kind": .string(kind == mode_t(S_IFDIR) ? "directory" : "file"),
-                    "identity": .string("\(entry.st_dev):\(entry.st_ino)"),
-                    "version": .string("\(entry.st_dev):\(entry.st_ino):\(entry.st_size):\(entry.st_mtimespec.tv_sec)"),
-                    "modified_ns": .string(String(entry.st_mtimespec.tv_nsec)),
-                ])
-            }
-            return .object(["ok": .bool(true), "path": .string(path.path),
-                "identity": .string("\(parent.st_dev):\(parent.st_ino)"), "entries": .object(entries)])
-        } catch { return errResult("Directory evidence unavailable: \(error)") }
-        #else
-        return errResult("Craft file evidence requires macOS")
-        #endif
-    }
-
     // MARK: - system_info
 
     static func systemInfo(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
@@ -1197,16 +1135,7 @@ enum FileSystemActions {
             failures.append("network: ping failed")
         }
 
-        // Screen lock: pmset -g → CGSSessionScreenIsLocked = 0/1.
-        if let pm = runCommand("/usr/bin/pmset", ["-g"]), pm.status == 0 {
-            if let m = firstCapturedString(in: pm.stdout, pattern: #"CGSSessionScreenIsLocked\s*=\s*(\d)"#) {
-                fields["screen_lock"] = .object(["locked": .bool(m == "1")])
-            } else {
-                fields["screen_lock"] = .object(["locked": .bool(false)])
-            }
-        } else {
-            failures.append("screen_lock: pmset failed")
-        }
+        fields["screen_lock"] = .object(["locked": .bool(MacScreenLock.isLocked())])
 
         // Battery: pmset -g batt → percent/charging/source.
         if let batt = runCommand("/usr/bin/pmset", ["-g", "batt"]), batt.status == 0 {
@@ -1514,7 +1443,7 @@ enum FileSystemActions {
         guard let cwd = gitResolveCwd(input, ctx, tool: "git_status") else {
             return gitCwdBlocked(input, ctx, tool: "git_status")
         }
-        let run = runGit(["status", "--short", "--branch"], cwd: cwd, timeout: 15, label: "git status")
+        let run = runGit(["status", "--short", "--branch"], cwd: cwd, timeout: 15, label: "git status", context: ctx)
         if case .failure(let f) = run { return f }
         guard case .success(let result) = run else { return errResult("git status failed", code: "git_unavailable") }
 
@@ -1586,7 +1515,7 @@ enum FileSystemActions {
         if staged { args.append("--staged") }
         if !pathFilter.isEmpty { args.append(contentsOf: ["--", pathFilter]) }
 
-        let run = runGit(args, cwd: cwd, timeout: 30, label: "git diff", okStatuses: [0, 1])
+        let run = runGit(args, cwd: cwd, timeout: 30, label: "git diff", context: ctx, okStatuses: [0, 1])
         if case .failure(let f) = run { return f }
         guard case .success(let result) = run else { return errResult("git diff failed", code: "git_unavailable") }
         return .object([
@@ -1618,7 +1547,7 @@ enum FileSystemActions {
         let parsed = safeInt(input["limit"], default: 10)
         let limit = min((parsed == nil || parsed == 0) ? 10 : parsed!, 100)
 
-        let run = runGit(["log", "-n\(limit)", "--format=%h|%an|%ai|%s"], cwd: cwd, timeout: 15, label: "git log")
+        let run = runGit(["log", "-n\(limit)", "--format=%h|%an|%ai|%s"], cwd: cwd, timeout: 15, label: "git log", context: ctx)
         if case .failure(let f) = run { return f }
         guard case .success(let result) = run else { return errResult("git log failed", code: "git_unavailable") }
 
@@ -1661,12 +1590,12 @@ enum FileSystemActions {
         // git_unavailable. Run status first (its non-zero is a hard error), then
         // log (best-effort: a non-zero log just yields an empty commit list).
         let statusRun = runGit(["status", "--short", "--branch"], cwd: cwd, timeout: 15,
-                               label: "git status", treatNotAGitRepoSpecially: false)
+                               label: "git status", context: ctx, treatNotAGitRepoSpecially: false)
         switch statusRun {
         case .failure(let f): return f
         case .success(let status):
             let logRun = runGit(["log", "-n\(logLimit)", "--format=%h|%s"], cwd: cwd, timeout: 15,
-                                label: "git log", treatNotAGitRepoSpecially: false)
+                                label: "git log", context: ctx, treatNotAGitRepoSpecially: false)
             // A FileNotFound/timeout on the log sub-command is a hard failure in
             // Python (same outer try). A non-zero exit is NOT (commits stays []).
             if case .failure(let lf) = logRun, isProcessLevelFailure(logRun) { return lf }
@@ -1780,9 +1709,8 @@ enum FileSystemActions {
         // commands the repository (or the inherited environment) names —
         // `GIT_EXTERNAL_DIFF`, a pager, an SSH command, a system-config hook.
         // A cloned or attacker-supplied checkout could therefore execute
-        // arbitrary code from `git_diff` / `git_status`, OUTSIDE the builder
-        // sandbox (runProcess applies none). Pin the environment closed;
-        // `gitReadOnlyConfigOverrideArgs` closes the config-file half.
+        // arbitrary code from `git_diff` / `git_status`. Pin the environment
+        // closed as well as confining Git and its children to read authority.
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
         // 2026-09-06: git shells out (aliases, `git status` sub-processes) and
@@ -1797,7 +1725,7 @@ enum FileSystemActions {
 
     /// Resolve `git` WITHOUT consulting the inherited PATH (2026-09-06): a
     /// PATH the app inherited from a launching shell could name any binary
-    /// `git`, and these four tools run it unsandboxed. Fixed location first,
+    /// `git`. Fixed location first,
     /// then the Xcode toolchain via `xcrun`, which is itself at a fixed path.
     static func gitExecutablePath() -> String? {
         if FileManager.default.isExecutableFile(atPath: "/usr/bin/git") {
@@ -1808,7 +1736,7 @@ enum FileSystemActions {
         // 2026-09-06: xcrun picks its toolchain from the environment it is
         // handed — DEVELOPER_DIR and TOOLCHAINS name the directory it searches
         // — so inheriting the app's environment let whatever launched the app
-        // choose the `git` these unsandboxed read tools execute, and any
+        // choose the `git` these read tools execute, and any
         // absolute path xcrun printed was accepted. Hand it PATH alone, and
         // take the answer only when it lands in a developer-tools install.
         let run = runProcess(
@@ -1875,11 +1803,66 @@ enum FileSystemActions {
         return env
     }
 
+    /// Conversion filters and submodule children inherit the caller's read
+    /// authority. Confinement applies at execution, including config changes.
+    static func gitReadOnlySandboxProfile(_ ctx: ConnectorActionContext) -> String {
+        func quoted(_ path: String) -> String {
+            "\"" + path.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        // Use explicit alternatives: Seatbelt regexes must match the same
+        // case-folded sensitive paths as isSensitiveDataPath.
+        func foldedPattern(_ path: String) -> String {
+            path.map { character in
+                let value = String(character)
+                let forms = Set([value, value.lowercased(), value.uppercased()]).sorted()
+                    .map { NSRegularExpression.escapedPattern(for: $0) }
+                return forms.count == 1 ? forms[0] : "(" + forms.joined(separator: "|") + ")"
+            }.joined()
+        }
+        var rules = [
+            "(version 1)", "(allow default)",
+            "(deny file-write*)", "(allow file-write* (literal \"/dev/null\"))",
+            "(deny network*)", "(deny appleevent-send)", "(deny mach-lookup)",
+            "(deny process-signal)",
+        ]
+        let roots = allowedRoots(ctx)
+        if !roots.isEmpty {
+            let runtimeRoots = ["/System/Library", "/usr/lib", "/usr/libexec", "/usr/bin", "/bin", "/sbin", "/Library/Developer", "/Applications/Xcode.app/Contents/Developer"]
+            let reads = (runtimeRoots + roots.map(\.path))
+                .map { "(subpath \(quoted($0)))" }.joined(separator: " ")
+            let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
+            rules += [
+                "(deny file-read-data)",
+                "(allow file-read-data \(reads) (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \(quoted(home + "/.gitconfig"))) (literal \(quoted(home + "/.config/git/config"))))",
+            ]
+        }
+        let dataRoot = resolvePath(ctx.dataRoot.flatMap { $0.isEmpty ? nil : $0 }
+            ?? PersistenceCore.defaultDataRoot().path, repoRoot: ctx.repoRoot)
+        let dataPattern = foldedPattern(dataRoot.path)
+        for path in connectorSensitiveDataSubpaths.sorted() + [
+            "jev/credential.json", "agents/peers.json", "agents/peer-claims",
+            "workflows/approvals", "memory/vault", "nextgen/remote",
+        ] {
+            rules.append("(deny file-read-data (regex \(quoted("^" + dataPattern + "/" + foldedPattern(path) + "(/|$)"))))")
+        }
+        for suffix in [
+            "/[^/]+" + foldedPattern(".bin") + "$",
+            "/" + foldedPattern("connectors") + "/(.*/)?("
+                + ["auth.json", "credential.json", "credentials.json"].map(foldedPattern).joined(separator: "|") + ")(/|$)",
+            "/" + foldedPattern("tools/.manifest_signing_key") + "[^/]*(/|$)",
+        ] {
+            rules.append("(deny file-read-data (regex \(quoted("^" + dataPattern + suffix))))")
+        }
+        return rules.joined(separator: "\n")
+    }
+
     static func runGit(
         _ args: [String],
         cwd: URL,
         timeout: TimeInterval,
         label: String,
+        context: ConnectorActionContext,
         okStatuses: [Int32] = [0],
         treatNotAGitRepoSpecially: Bool = true
     ) -> GitRun {
@@ -1892,15 +1875,18 @@ enum FileSystemActions {
             return .failure(errResult("The authorized Git directory could not be verified.", code: "path_not_allowed"))
         }
         defer { _ = Darwin.close(directoryFD) }
-        let run = runProcess(git, gitReadOnlyConfigOverrideArgs + args,
+        let sandbox = "/usr/bin/sandbox-exec"
+        guard FileManager.default.isExecutableFile(atPath: sandbox) else {
+            return .failure(errResult("Git read-only protection is unavailable.", code: "git_unavailable"))
+        }
+        let run = runProcess(sandbox, ["-p", gitReadOnlySandboxProfile(context), git] + gitReadOnlyConfigOverrideArgs + args,
                              cwdDescriptor: directoryFD, timeout: timeout,
                              environment: gitReadOnlyEnvironment)
         if run.timedOut {
             return .failure(errResult("\(label) timed out", code: "git_unavailable"))
         }
         if !run.launched {
-            // FileNotFoundError parity (git vanished between which() and run).
-            return .failure(errResult("git not found", code: "git_unavailable"))
+            return .failure(errResult("Git could not be started with read-only access.", code: "git_unavailable"))
         }
         if !okStatuses.contains(run.status) {
             let err = (run.stderr.isEmpty ? run.stdout : run.stderr)
@@ -1917,10 +1903,11 @@ enum FileSystemActions {
     /// (process-level: yes; non-zero: no, commits just stays []).
     static func isProcessLevelFailure(_ run: GitRun) -> Bool {
         guard case .failure(let v) = run, case .object(let o) = v else { return false }
-        // Process-level failures carry the "git not found" / "...timed out"
-        // messages; a non-zero exit carries an "exited N" / stderr message.
+        // Launch/protection failures and timeouts abort the whole summary.
         if case .string(let msg)? = o["error"] {
             return msg == "git not found" || msg.hasSuffix("timed out")
+                || msg == "Git read-only protection is unavailable."
+                || msg == "Git could not be started with read-only access."
         }
         return false
     }
@@ -2065,27 +2052,27 @@ func which(_ name: String) -> String? {
 /// (`timedOut == true`, ~ TimeoutExpired) from a clean run (status + captured
 /// stdout/stderr, both decoded UTF-8-with-replacement to mirror Python's
 /// `text=True, errors="replace"`). Also backs system_info's `runCommand`.
-struct ProcessRunResult {
-    var launched: Bool
-    var timedOut: Bool
-    var status: Int32
-    var stdout: String
+package struct FileSystemProcessRunResult {
+    package var launched: Bool
+    package var timedOut: Bool
+    package var status: Int32
+    package var stdout: String
     var stderr: String
     var stdoutTruncated: Bool = false
     var stderrTruncated: Bool = false
-    var captureReadFailed: Bool = false
+    package var captureReadFailed: Bool = false
 }
 
-func runProcess(
+package func runProcess(
     _ launchPath: String,
     _ args: [String],
     cwd: URL? = nil,
     timeout: TimeInterval,
     environment: [String: String]? = nil,
     captureByteLimit: Int? = nil
-) -> ProcessRunResult {
+) -> FileSystemProcessRunResult {
     guard FileManager.default.isExecutableFile(atPath: launchPath) else {
-        return ProcessRunResult(launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
+        return FileSystemProcessRunResult(launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
     }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: launchPath)
@@ -2103,7 +2090,7 @@ func runProcess(
     do {
         try proc.run()
     } catch {
-        return ProcessRunResult(launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
+        return FileSystemProcessRunResult(launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
     }
     // Drain BOTH pipes to EOF on DEDICATED THREADS — NOT DispatchQueue.global().
     // CONCURRENCY (deadlock fix, found empirically when 13 parallel tests hung at
@@ -2187,7 +2174,7 @@ func runProcess(
     let to = timedOut.get()
     let capturedOut = box.stdout()
     let capturedErr = box.stderr()
-    return ProcessRunResult(
+    return FileSystemProcessRunResult(
         launched: true,
         timedOut: to,
         status: proc.terminationStatus,
@@ -2218,8 +2205,8 @@ func runProcess(
     timeout: TimeInterval,
     environment: [String: String]? = nil,
     captureByteLimit: Int? = nil
-) -> ProcessRunResult {
-    let failed = ProcessRunResult(
+) -> FileSystemProcessRunResult {
+    let failed = FileSystemProcessRunResult(
         launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
     guard cwdDescriptor >= 0, FileManager.default.isExecutableFile(atPath: launchPath) else {
         return failed
@@ -2334,7 +2321,7 @@ func runProcess(
     let status: Int32 = (waitStatus & 0x7f) == 0 ? (waitStatus >> 8) & 0xff : -1
     let capturedOut = box.stdout()
     let capturedErr = box.stderr()
-    return ProcessRunResult(
+    return FileSystemProcessRunResult(
         launched: true,
         timedOut: timedOut.get(),
         status: status,

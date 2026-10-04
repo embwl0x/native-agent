@@ -504,11 +504,6 @@ private struct SkillRow: View {
     let onReview: () -> Void
 
     private var isDraft: Bool { info.registry.state == "drafted" }
-    private var sourceLabel: String {
-        if isDraft { return "draft" }
-        if info.registry.path.contains("/persona/") { return "persona" }
-        return "installed"
-    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -522,7 +517,7 @@ private struct SkillRow: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 8)
-            Text(sourceLabel)
+            Text(info.registry.state)
                 .font(ShellType.captionSemibold)
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(

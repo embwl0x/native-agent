@@ -2,6 +2,9 @@ import Foundation
 import os
 import PersistenceCore
 import NativeAgentCore
+import Desk
+import ApprovalInbox
+import TrustCenter
 
 // MISSIONS EXECUTOR PORT (2026-06-10) — docs/build_plans/missions-executor-port.md
 //
@@ -87,6 +90,7 @@ public actor WorkshopExecutorLoop {
     /// wait on the memory store. See ``WorkshopExecutionMemoryQueue``.
     private var executionMemoryQueue: WorkshopExecutionMemoryQueue?
     private let now: @Sendable () -> Date
+    private let approvedToolDispatch: WorkshopStepApprovedToolDispatch?
     private var beforeApprovalTimeoutClaimForTesting: (@Sendable () async -> Void)?
 
     func _setBeforeApprovalTimeoutClaimForTesting(_ hook: @escaping @Sendable () async -> Void) {
@@ -144,6 +148,7 @@ public actor WorkshopExecutorLoop {
         measuredLLMStep: WorkshopStepMeasuredLLM? = nil,
         measuredTooledLLMStep: WorkshopStepMeasuredLLM? = nil,
         toolDispatch: WorkshopStepToolDispatch? = nil,
+        approvedToolDispatch: WorkshopStepApprovedToolDispatch? = nil,
         stageApproval: WorkshopStepApprovalStager? = nil,
         isEnabled: @escaping @Sendable () async -> Bool = { true },
         maxActive: Int? = nil,
@@ -194,6 +199,7 @@ public actor WorkshopExecutorLoop {
         let safeApprovalSecs = (rawApprovalSecs.isFinite && rawApprovalSecs > 0)
             ? min(rawApprovalSecs, approvalCap) : 0
         self.approvalTimeoutNanos = UInt64(safeApprovalSecs * 1_000_000_000)
+        self.approvedToolDispatch = approvedToolDispatch
         self.stepApprovalEnforced = stepApprovalEnforced
         self.terminalEventSink = terminalEventSink
         self.executionMemoryProvider = Self.executionMemoryProvider(
@@ -316,7 +322,7 @@ public actor WorkshopExecutorLoop {
 
     // MARK: drain
 
-    /// One drain pass: claim + run queued Workshop executions, oldest first, one at a
+    /// One drain pass: claim + run queued or approved Workshop executions, oldest first, one at a
     /// time. Per-Workshop execution failures are contained (logged + that Workshop execution goes
     /// `failed`); the pass moves on. Safe to call from a LoopRunner tick.
     ///
@@ -344,15 +350,26 @@ public actor WorkshopExecutorLoop {
         // approval wait.
         await reconcileTimedOutApprovals()
         let queued = await scanQueue()
-            .filter { $0.status == "queued" }
+            .filter { $0.status == "queued" || $0.status == "blocked_on_approval" }
             .sorted { $0.createdAt < $1.createdAt }   // submit order
         var ran = 0
         for record in queued {
             if Task.isCancelled { return ran }
             do {
+                if record.status == "blocked_on_approval" {
+                    guard let approval = try await resolvedStepApproval(record) else { continue }
+                    _ = try await resumeAfterApproval(
+                        executionId: record.id, stepId: record.currentStepId,
+                        approved: true, approvalId: approval.id)
+                    ran += 1
+                    continue
+                }
                 guard let claimed = try await claim(record.id) else { continue }
                 await runClaimedWorkshopExecution(claimed)
                 ran += 1
+            } catch WorkshopExecutionError.approvalDeferred {
+                // The approval and blocked step remain intact for the next capacity edge.
+                continue
             } catch is CancellationError {
                 return ran
             } catch {
@@ -362,10 +379,24 @@ public actor WorkshopExecutorLoop {
         return ran
     }
 
+    private func resolvedStepApproval(_ execution: WorkshopExecutionRecord) async throws -> ApprovalRecord? {
+        guard case .object(let step)? = Self.lastStepRecord(execution, stepId: execution.currentStepId),
+              case .string(let id)? = step["approval_id"], !id.isEmpty else { return nil }
+        let approval = try await SwiftNativeApprovalInbox(root: root).get(id)
+        guard approval.status == "resolved", approval.decision == "approved",
+              ExecutionEventVocabulary.matches(approval.action, WorkshopStepApprovalAction.canonical),
+              case .object(let payload) = approval.payload,
+              WorkshopStepApprovalPayload.executionId({ key in
+                  if case .string(let value)? = payload[key] { return value }; return nil
+              }) == execution.id,
+              payload["step_id"] == .string(execution.currentStepId) else { return nil }
+        return approval
+    }
+
     private func reconcileTerminalDeskSettlements() async {
         for record in await scanQueue()
         where ["completed", "failed", "cancelled", "canceled"].contains(record.status.lowercased()) {
-            await WorkshopDeskReceiptBridge.recordTerminal(record, reason: nil, dataRoot: root)
+            await WorkshopDeskReceiptBridge.recordTerminal(record, reason: record.terminalReason, dataRoot: root)
         }
     }
 
@@ -400,20 +431,59 @@ public actor WorkshopExecutorLoop {
         await Self.orphanReclaimOnce.run(root.path) { await self.reconcileOrphanedRunning() }
     }
 
-    /// One-time startup reconcile (crash/restart orphan recovery). An execution
-    /// left "running" by a crash is never re-claimed yet still counts against
-    /// maxActive: a silent slot leak that degrades throughput across restarts.
-    /// Parent/pass cancellation is recovered in-process at the claim boundary;
-    /// fail only true startup orphans HONESTLY (not requeue: a
-    /// partially-run execution may have side-effecting steps, and silently
-    /// re-running them is the fabricated-state shape the W6 audit closed) so
-    /// the slot frees and the user sees it did not finish. CAS require:running
-    /// → never clobbers an execution that has since moved on.
+    /// One-time startup reconcile (crash/restart orphan recovery). An orphan
+    /// is failed HONESTLY (not requeued: a partially-run execution may have
+    /// side-effecting steps, and silently re-running them is the
+    /// fabricated-state shape the W6 audit closed) — unless a live Desk
+    /// continuation owns it and every recorded step succeeded with a settled
+    /// receipt at a step boundary; that one resumes from its next step.
+    /// CAS require:running → never clobbers an execution that has moved on.
     private func reconcileOrphanedRunning() async {
         let orphans = await scanQueue().filter { $0.status == "running" }
         for orphan in orphans {
+            do {
+                if let handle = orphan.deskHandle {
+                    let task = try await SwiftNativeDeskStore(dataRoot: root).liveState().items.first { $0.handle == handle }
+                    let linked = task?.continuation?.pending.contains {
+                        $0.owner == "workshop" && $0.ownerID == orphan.id
+                    } == true
+                    let completed = orphan.stepsCompleted.filter { value in
+                        guard case .object(let fields) = value else { return false }
+                        return fields["status"] == .string(WorkshopStepOutcome.successStatus)
+                            && !DeskContinuation.receiptIsUnresolved(value)
+                    }
+                    let safeBoundary = orphan.currentStepId.isEmpty || completed.contains { value in
+                        guard case .object(let fields) = value else { return false }
+                        return fields["step_id"] == .string(orphan.currentStepId)
+                    }
+                    if linked, task?.status.isTerminal == false,
+                       task?.continuation?.state != .canceled, safeBoundary,
+                       completed.count == orphan.stepsCompleted.count {
+                        let resumed = try await casMutateWorkshopExecution(orphan.id, require: ["running"]) { rec in
+                            rec.status = "queued"
+                            rec.currentStepId = ""
+                        }
+                        if resumed.applied {
+                            try await appendTimelineLocked(.object([
+                                "event": .string("continued_after_restart"),
+                                "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
+                            ]), executionId: orphan.id)
+                            continue
+                        }
+                    }
+                }
+            } catch {
+                Self.logger.error("Workshop continuation reconciliation failed: \(error.localizedDescription, privacy: .public)")
+                continue
+            }
             let failed = try? await casMutateWorkshopExecution(orphan.id, require: ["running"]) { rec in
                 rec.status = "failed"
+                rec.terminalReason = "interrupted_by_restart"
+                rec.result = .object([
+                    "error": .string("interrupted_by_restart"),
+                    "pending_step_id": .string(rec.currentStepId),
+                    "effects": .string("unknown"),
+                ])
                 rec.currentStepId = ""
             }
             guard failed?.applied == true else { continue }
@@ -458,6 +528,12 @@ public actor WorkshopExecutorLoop {
         let nowDate = now()
         let blocked = await scanQueue().filter { $0.status == "blocked_on_approval" }
         for execution in blocked {
+            // An answered approval waiting for capacity is no longer an approval wait.
+            do {
+                if try await resolvedStepApproval(execution) != nil { continue }
+            } catch {
+                continue // Unavailable authority cannot justify expiring this approval.
+            }
             let blockedSinceRaw = Self.latestBlockedStepExecutedAt(execution) ?? execution.updatedAt
             guard let blockedAt = WorkshopOutcomeScoreboard.parseTimestamp(blockedSinceRaw) else {
                 // Unparseable timestamp: do NOT fail a Workshop execution we can't age —
@@ -483,6 +559,7 @@ public actor WorkshopExecutorLoop {
                 }
             ) { rec in
                 rec.status = "failed"
+                rec.terminalReason = "approval_timeout_exceeded_\(label)"
                 rec.currentStepId = ""   // terminal — clear the step pointer
             }
             guard failed?.applied == true else { continue }   // lost CAS → resume/cancel won
@@ -551,7 +628,7 @@ public actor WorkshopExecutorLoop {
         executionRecordsRoot.appendingPathComponent(".claim")
     }
 
-    /// Atomically transition queued→running.
+    /// Atomically transition queued or approved work to running.
     ///
     /// gpt-5.5 executor-port blocker #4 (2026-06-10): the slot-cap re-check
     /// used to live inside the PER-EXECUTION lock only — two claimers working
@@ -571,8 +648,8 @@ public actor WorkshopExecutorLoop {
     ///     section (the W6 check-then-act flag: the daemon checked capacity
     ///     outside the claim).
     /// Returns nil when the execution was not claimable (already claimed, not
-    /// queued, or no slot free).
-    private func claim(_ executionId: String) async throws -> WorkshopExecutionRecord? {
+    /// in the expected status, or no slot free).
+    private func claim(_ executionId: String, from status: String = "queued", stepId: String? = nil) async throws -> WorkshopExecutionRecord? {
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else { return nil }
         // Uniform locking (L7, 2026-08-01): `withFileLock` is a
         // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
@@ -584,14 +661,17 @@ public actor WorkshopExecutorLoop {
         try? FileManager.default.createDirectory(
             at: executionRecordsRoot, withIntermediateDirectories: true)
         return try await persistence.withFileLock(queueClaimLockTarget) {
-            try await self.claimUnderQueueLock(executionId)
+            try await self.claimUnderQueueLock(executionId, from: status, stepId: stepId)
         }
     }
 
     /// The scan + per-Workshop execution RMW half of claim(). MUST only be called while
     /// holding the queue-level claim flock (or with mock persistence, where
     /// there is no cross-process writer to race).
-    private func claimUnderQueueLock(_ executionId: String) async throws -> WorkshopExecutionRecord? {
+    private func claimUnderQueueLock(_ executionId: String, from status: String, stepId: String?) async throws -> WorkshopExecutionRecord? {
+        guard await executionAllowed() else {
+            throw WorkshopExecutionError.forbidden("Workshop execution is disabled by trust policy")
+        }
         _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let executionRecordJSON = executionRecordPath(executionId)
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
@@ -605,12 +685,13 @@ public actor WorkshopExecutorLoop {
                 return nil
             }
             var record = SwiftNativeWorkshopRunner.recordFromJSON(obj)
-            guard record.status == "queued" else { return nil }
+            guard record.status == status else { return nil }
+            if let stepId, record.currentStepId != stepId { return nil }
             // Slot-cap re-check INSIDE the claim critical section. The
             // enclosing queue-level flock serializes claimers across
             // Workshop executions (blocker #4), so this count cannot be concurrently
             // stale-read by another claimer.
-            let queue = await self.scanQueue()
+            let queue = try await self.scanQueueChecked()
             if let corrupt = queue.first(where: { $0.status == "corrupt" }) {
                 throw WorkshopExecutionError.persistenceFailure(String(describing: corrupt.result))
             }
@@ -619,7 +700,9 @@ public actor WorkshopExecutorLoop {
                 .count
             guard runningCount < self.maxActive else { return nil }
             record.status = "running"
+            if let stepId { record.currentStepId = stepId }
             record.updatedAt = nowStr
+            record.lastMovementAt = nowStr
             try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
             return record
         }
@@ -632,6 +715,14 @@ public actor WorkshopExecutorLoop {
     }
 
     // MARK: execution run loop (port of _run_mission_locked, the retired daemon)
+
+    private func executionAllowed() async -> Bool {
+        guard await isEnabled(),
+              let policy = try? await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicyChecked() else {
+            return false
+        }
+        return SwiftNativeWorkshopRunner.workshopPolicyAllows(policy)
+    }
 
     private func runClaimedWorkshopExecution(_ claimed: WorkshopExecutionRecord) async {
         let executionId = claimed.id
@@ -661,6 +752,7 @@ public actor WorkshopExecutorLoop {
             Self.logger.error("Workshop execution error \(executionId, privacy: .public): \(String(describing: error), privacy: .public)")
             let failedWrite = try? await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
                 rec.status = "failed"
+                rec.terminalReason = String(describing: error)
                 rec.currentStepId = ""
             }
             guard failedWrite?.applied == true else { return }
@@ -678,20 +770,24 @@ public actor WorkshopExecutorLoop {
 
     private func releaseClaimAfterParentCancellation(_ executionId: String) async {
         let released = try? await casMutateWorkshopExecution(executionId, require: ["running"]) { record in
-            record.status = "queued"
-            record.currentStepId = ""
+            if record.currentStepId.isEmpty {
+                record.status = "queued"
+            } else {
+                record.status = "blocked_on_reconciliation"
+                record.result = .object(["error": .string("interrupted_step_outcome_unknown")])
+            }
         }
         guard released?.applied == true else { return }
         try? await appendTimelineLocked(
             .object([
                 "event": .string("execution_interrupted"),
                 "reason": .string("parent_task_cancelled"),
-                "status": .string("queued"),
+                "status": .string(released?.record?.status ?? "blocked_on_reconciliation"),
                 "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
             ]),
             executionId: executionId
         )
-        Self.logger.notice("released cancelled execution claim for \(executionId, privacy: .public) -> queued")
+        Self.logger.notice("interrupted execution claim for \(executionId, privacy: .public): \(released?.record?.status ?? "unknown", privacy: .public)")
     }
 
     /// Execute plan steps in order. `afterStepId == nil` runs the whole plan
@@ -703,6 +799,7 @@ public actor WorkshopExecutorLoop {
     private func runSteps(executionId: String, afterStepId: String?) async throws {
         var skipping = (afterStepId != nil)
         guard let planSource = try await getRecord(executionId) else { return }
+        try SwiftNativeWorkshopRunner.validateStepIDs(planSource.plan)
         // A parent/pass cancellation may requeue after earlier steps committed.
         // Their outcomes and receipts are durable, so a later claim skips them
         // instead of replaying side effects or double-counting completion.
@@ -790,6 +887,7 @@ public actor WorkshopExecutorLoop {
             case "cancelled":
                 let cancelledWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
                     rec.status = "cancelled"
+                    rec.terminalReason = outcome.error.isEmpty ? nil : outcome.error
                     rec.currentStepId = ""   // terminal — clear the step pointer
                 }
                 if cancelledWrite.applied {
@@ -799,6 +897,7 @@ public actor WorkshopExecutorLoop {
             case "failed":
                 let failedWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
                     rec.status = "failed"
+                    rec.terminalReason = outcome.error
                     rec.currentStepId = ""   // terminal — clear the step pointer
                 }
                 // CAS lost (cancel landed in the window) → the cancel wins;
@@ -820,6 +919,9 @@ public actor WorkshopExecutorLoop {
                 // parent/pass cancellation before another step (or terminal
                 // completion) so releaseClaimAfterParentCancellation requeues
                 // the Workshop execution. The next drain skips this durable step.
+                _ = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
+                    rec.currentStepId = ""
+                }
                 try Task.checkCancellation()
                 continue  // succeeded / stubbed
             }
@@ -846,12 +948,14 @@ public actor WorkshopExecutorLoop {
             rec.verification = verification
             if verification.status == .failed {
                 rec.status = "failed"
+                rec.terminalReason = "verification_failed: \(verification.detail)"
                 rec.result = .object([
                     "error": .string("verification_failed"),
                     "detail": .string(verification.detail),
                 ])
             } else {
                 rec.status = "completed"
+                rec.terminalReason = nil
                 if !rec.stepsCompleted.isEmpty {
                     let snapshot = rec
                     rec.result = Self.extractWorkshopExecutionResult(snapshot)
@@ -932,10 +1036,12 @@ public actor WorkshopExecutorLoop {
             let request = WorkshopStepApprovalRequest(
                 executionId: execution.id,
                 stepId: step.id,
+                taskTitle: execution.title,
+                actionDescription: step.description,
                 title: "Workshop step approval: \(step.description)",
                 tool: step.toolOrAction,
                 reason: "Workshop trust=\(execution.trustRequired); step autonomy=\(step.autonomy); tool=\(step.toolOrAction)",
-                args: step.args
+                args: Self.resolveStepReferences(in: step.args, execution: execution)
             )
             guard let approvalId = await stageApproval(request) else {
                 return WorkshopStepOutcome(
@@ -958,8 +1064,12 @@ public actor WorkshopExecutorLoop {
         return await dispatchStep(execution: execution, step: step)
     }
 
-    private func dispatchStep(execution: WorkshopExecutionRecord, step: WorkshopExecutionStep) async -> WorkshopStepOutcome {
+    private func dispatchStep(execution: WorkshopExecutionRecord, step: WorkshopExecutionStep, approvalId: String? = nil) async -> WorkshopStepOutcome {
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
+        guard await executionAllowed() else {
+            return WorkshopStepOutcome(stepId: step.id, status: "failed",
+                                       error: "Workshop execution is disabled by trust policy", executedAt: nowStr)
+        }
         let tool = step.toolOrAction
         if tool.isEmpty {
             // daemon L1130-L1131
@@ -973,9 +1083,35 @@ public actor WorkshopExecutorLoop {
         let measuredLLMStep = self.measuredLLMStep
         let measuredTooledLLMStep = self.measuredTooledLLMStep
         let toolDispatch = self.toolDispatch
+        let approvedToolDispatch = self.approvedToolDispatch
+        let executionRoot = self.root
+        let permissionAllowed: @Sendable () async -> Bool = { await self.executionAllowed() }
         let nowFn = self.now
         do {
             let outcome: WorkshopStepOutcome = try await raceWithCancellationWatch(executionId: execution.id) {
+                guard await permissionAllowed() else {
+                    throw WorkshopExecutionError.forbidden("Workshop execution is disabled by trust policy")
+                }
+                let resolvedArgs = approvalId == nil
+                    ? Self.resolveStepReferences(in: step.args, execution: execution) : step.args
+                if let schema = step.argumentSchema {
+                    try WorkshopArgumentValidation.validate(resolvedArgs, schema: schema)
+                }
+                let binding: WorkshopCompiledFileCopyBinding?
+                if let rawBinding = execution.compiledOperationBinding {
+                    binding = try JSONDecoder().decode(WorkshopCompiledFileCopyBinding.self, from: rawBinding.serializedData(pretty: false))
+                    guard binding?.workspaceRootURL == NativeAgentWorkspaceRoot.resolve(dataRoot: executionRoot).standardizedFileURL.resolvingSymlinksInPath(),
+                          case .object(let arguments) = resolvedArgs else {
+                        throw WorkshopCompiledProcedureRuntimeError.invalidToolArguments
+                    }
+                    try binding?.validateBeforeDispatch(tool: tool, arguments: arguments)
+                } else {
+                    if execution.planningProviderCallCount == 0,
+                       execution.plan.map(\.toolOrAction) == ["read_file", "write_file"] {
+                        throw WorkshopExecutionError.invalidRequest("compiled operation binding is missing")
+                    }
+                    binding = nil
+                }
                 switch tool {
                 case "chat.synthesize", "llm", "report":
                     // Synthesize-quality fix (2026-06-11): prefer the
@@ -1017,21 +1153,20 @@ public actor WorkshopExecutorLoop {
                     }
                     let model = completion.model
                     let text = completion.text
-                    let trimmedText = String(text.prefix(4000))  // daemon L1356
                     // OUTPUT VALIDATION before scoring (2026-06-11). A bare
                     // completion (or even a tooled one) can return a refusal or
                     // empty body; scoring that `succeeded` is the
                     // fabricated-success disease Agent caught on 752636c5.
-                    let verdict = Self.validateSynthesizeOutput(trimmedText)
+                    let verdict = Self.validateSynthesizeOutput(text)
                     let baseOutput: [String: JSONValue] = [
                         "model": .string(model),
-                        "text": .string(trimmedText),
+                        "text": .string(text),
                         "tooled": .bool(usedTooled),
                     ]
                     switch verdict {
                     case .ok:
                         return WorkshopStepOutcome(
-                            stepId: step.id, status: "succeeded",
+                            stepId: step.id, status: WorkshopStepOutcome.successStatus,
                             output: .object(baseOutput),
                             executedAt: SwiftNativeWorkshopRunner.isoTimestamp(nowFn()),
                             providerCallCount: providerCallCount,
@@ -1073,8 +1208,16 @@ public actor WorkshopExecutorLoop {
                     // earlier chat.synthesize/data step — without it the token
                     // (or a literal "<...>" placeholder) lands in the file
                     // verbatim (2026-06-15). Pure on the no-token path.
-                    let resolvedArgs = Self.resolveStepReferences(in: step.args, execution: execution)
-                    let result = try await toolDispatch(tool, resolvedArgs)
+                    let result: JSONValue
+                    if let approvalId {
+                        guard let approvedToolDispatch else {
+                            throw WorkshopExecutionError.forbidden("approved tool dispatcher unavailable")
+                        }
+                        result = try await approvedToolDispatch(tool, resolvedArgs, approvalId)
+                    } else {
+                        result = try await toolDispatch(tool, resolvedArgs)
+                    }
+                    try binding?.validateAfterDispatch(tool: tool, result: result)
                     let resultState = Self.toolStepResultState(result)
                     let output: JSONValue = {
                         if case .object = result { return result }
@@ -1127,15 +1270,16 @@ public actor WorkshopExecutorLoop {
     /// "denied" or "error" status into it previously fell through to the
     /// success branch, ran later steps, and fabricated a completed execution.
     /// Keep the original envelope in output while normalizing only explicit
-    /// failure/cancellation evidence at this boundary.
+    /// statuses at this boundary.
     static func toolStepResultState(_ result: JSONValue) -> (status: String, error: String) {
-        guard case .object(let object) = result else { return ("succeeded", "") }
+        guard case .object(let object) = result else { return (WorkshopStepOutcome.successStatus, "") }
         let rawStatus: String = {
             guard case .string(let value)? = object["status"] else { return "" }
             return value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }()
         let failureStatuses: Set<String> = [
-            "failed", "failure", "error", "denied", "rejected", "timeout", "timed_out",
+            "failed", "failure", "error", "denied", "refused", "rejected", "timeout", "timed_out",
+            "outcome_unknown", "partial",
         ]
         let cancelled = rawStatus == "cancelled" || rawStatus == "canceled"
         var failed = failureStatuses.contains(rawStatus)
@@ -1146,9 +1290,9 @@ public actor WorkshopExecutorLoop {
         if case .int(let code)? = object["exit_code"], code != 0 { failed = true }
         if case .double(let code)? = object["exit_code"], code != 0 { failed = true }
         guard failed || cancelled else {
-            return (rawStatus.isEmpty ? "succeeded" : rawStatus, "")
+            return (WorkshopStepOutcome.successStatus, "")
         }
-        let detail = ["error", "reason", "message"].compactMap { key -> String? in
+        let detail = ["error", "reason", "message", "detail"].compactMap { key -> String? in
             guard case .string(let value)? = object[key], !value.isEmpty else { return nil }
             return value
         }.first ?? (rawStatus.isEmpty ? "tool reported failure" : "tool returned status=\(rawStatus)")
@@ -1360,6 +1504,7 @@ public actor WorkshopExecutorLoop {
         guard let execution = try await getRecord(executionId) else {
             throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(executionId)")
         }
+        try SwiftNativeWorkshopRunner.validateStepIDs(execution.plan)
         let existing = Self.lastStepRecord(execution, stepId: stepId)
         let existingStatus: String = {
             if case .object(let o)? = existing, case .string(let s)? = o["status"] { return s }
@@ -1375,7 +1520,10 @@ public actor WorkshopExecutorLoop {
         if existing == nil && execution.status != "blocked_on_approval" {
             throw WorkshopExecutionError.invalidRequest("mission_step_not_waiting_on_approval")
         }
-        if existingStatus == "succeeded" || existingStatus == "stubbed" {
+        if existingStatus == WorkshopStepOutcome.successStatus || existingStatus == "stubbed" {
+            if approved {
+                await annotateApprovedStep(execution, stepId: stepId, approvalId: approvalId)
+            }
             try await appendTimelineLocked(
                 .object([
                     "event": .string("approval_decision_ignored"),
@@ -1412,17 +1560,16 @@ public actor WorkshopExecutorLoop {
                 "Workshop execution no longer blocked (status=\(lockedStatus.isEmpty ? "missing" : lockedStatus)) — not executed")
         }
 
-        try await appendTimelineLocked(
-            .object([
-                "event": .string("approval_decision"),
-                "step_id": .string(stepId),
-                "approved": .bool(approved),
-                "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
-            ]),
-            executionId: executionId
-        )
-
         if !approved {
+            try await appendTimelineLocked(
+                .object([
+                    "event": .string("approval_decision"),
+                    "step_id": .string(stepId),
+                    "approved": .bool(false),
+                    "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
+                ]),
+                executionId: executionId
+            )
             // CAS from blocked_on_approval (blocker #2): a cancel that
             // landed since the precondition above wins — the cancelled
             // Workshop execution must not be flipped to failed, and the `failed` event
@@ -1434,6 +1581,7 @@ public actor WorkshopExecutorLoop {
                     return .object(o)
                 }
                 rec.status = "failed"
+                rec.terminalReason = "Step rejected by user"
                 rec.currentStepId = ""   // terminal — clear the step pointer
             }
             guard denyWrite.applied, let updated = denyWrite.record else {
@@ -1467,19 +1615,56 @@ public actor WorkshopExecutorLoop {
         // flock; the loser aborts cleanly. A crash after this claim leaves the
         // execution "running" → the startup orphan-reclaim fails it honestly,
         // instead of a half-run blocked step that re-executes on re-approval.
-        let claimWrite = try await casMutateWorkshopExecution(executionId, require: ["blocked_on_approval"]) { rec in
-            rec.status = "running"
+        guard let approvalId, !approvalId.isEmpty,
+              let approval = try? await SwiftNativeApprovalInbox(root: root).get(approvalId),
+              ExecutionEventVocabulary.matches(approval.action, WorkshopStepApprovalAction.canonical),
+              approval.status == "resolved", approval.decision == "approved",
+              case .object(let payload) = approval.payload,
+              WorkshopStepApprovalPayload.executionId({ key in
+                  if case .string(let value)? = payload[key] { return value }; return nil
+              }) == executionId,
+              payload["step_id"] == .string(stepId),
+              payload["tool"] == .string(planStep.toolOrAction),
+              case .object? = payload["args"] else {
+            throw WorkshopExecutionError.forbidden("Workshop step approval evidence does not match")
         }
-        guard claimWrite.applied else {
-            return claimWrite.record ?? execution
+        let approvedStep = WorkshopExecutionStep(
+            id: planStep.id, description: planStep.description, toolOrAction: planStep.toolOrAction,
+            args: payload["args"]!, autonomy: planStep.autonomy, argumentSchema: planStep.argumentSchema)
+        guard await executionAllowed() else {
+            throw WorkshopExecutionError.forbidden("Workshop execution is disabled by trust policy")
         }
-        let result = await dispatchStep(execution: execution, step: planStep)
+        guard let resumed = try await claim(executionId, from: "blocked_on_approval", stepId: stepId) else {
+            let current = try await getRecord(executionId)
+            guard current?.status == "blocked_on_approval", current?.currentStepId == stepId else {
+                throw WorkshopExecutionError.staleApproval("Workshop execution no longer blocked on this step — not executed")
+            }
+            throw WorkshopExecutionError.approvalDeferred
+        }
+        // A capacity deferral must not write timeline events and wake its own drain.
+        try await appendTimelineLocked(
+            .object([
+                "event": .string("approval_decision"),
+                "step_id": .string(stepId),
+                "approved": .bool(true),
+                "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
+            ]),
+            executionId: executionId
+        )
+        let result = await dispatchStep(execution: resumed, step: approvedStep, approvalId: approvalId)
+        if Task.isCancelled && result.status == "cancelled" {
+            await releaseClaimAfterParentCancellation(executionId)
+            return try await getRecord(executionId) ?? execution
+        }
         // Update (or append) the step record with the replay result —
         // daemon updates the existing dict in place (L1545-L1551). CAS from
         // running (blocker #2, post-claim): a cancel that landed while the
         // resumed step ran flips running→cancelled and wins this CAS — skip the
         // record update, the receipt, and every status write below.
         let updateWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
+            if let index = rec.plan.firstIndex(where: { $0.id == stepId }) {
+                rec.plan[index].args = approvedStep.args
+            }
             var replaced = false
             rec.stepsCompleted = rec.stepsCompleted.map { sr in
                 guard !replaced, case .object(var o) = sr, case .string(let sid)? = o["step_id"], sid == stepId else { return sr }
@@ -1506,6 +1691,7 @@ public actor WorkshopExecutorLoop {
             let terminalWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
                 rec.status = terminal
                 if terminal == "failed" || terminal == "cancelled" {
+                    rec.terminalReason = result.error.isEmpty ? nil : result.error
                     rec.currentStepId = ""   // terminal — clear the step pointer
                 }
             }
@@ -1523,6 +1709,7 @@ public actor WorkshopExecutorLoop {
             if terminalWrite.applied && (terminal == "failed" || terminal == "cancelled") {
                 await emitTerminalEvent(terminalWrite.record, reason: result.error.isEmpty ? nil : result.error)
             }
+            await annotateApprovedStep(terminalWrite.record ?? execution, stepId: stepId, approvalId: approvalId)
             return terminalWrite.record ?? execution
         }
 
@@ -1534,8 +1721,10 @@ public actor WorkshopExecutorLoop {
         // pre-claim; the claim moved that earlier — blocker #2/#3 preserved.)
         let runWrite = try await casMutateWorkshopExecution(executionId, require: ["running"]) { rec in
             rec.status = "running"
+            rec.currentStepId = ""
         }
         guard runWrite.applied else {
+            await annotateApprovedStep(runWrite.record ?? execution, stepId: stepId, approvalId: approvalId)
             return runWrite.record ?? execution
         }
         do {
@@ -1546,12 +1735,28 @@ public actor WorkshopExecutorLoop {
             // a later pass can continue, while its durable-step set prevents
             // the approved side effect from replaying or asking again.
             await releaseClaimAfterParentCancellation(executionId)
+            await annotateApprovedStep((try? await getRecord(executionId)) ?? execution, stepId: stepId, approvalId: approvalId)
             throw CancellationError()
         }
-        return try await getRecord(executionId) ?? execution
+        let final = try await getRecord(executionId) ?? execution
+        await annotateApprovedStep(final, stepId: stepId, approvalId: approvalId)
+        return final
     }
 
     // MARK: helpers
+
+    private func annotateApprovedStep(_ record: WorkshopExecutionRecord, stepId: String, approvalId: String?) async {
+        guard let approvalId, !approvalId.isEmpty else { return }
+        try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
+            id: approvalId,
+            executedAction: .object([
+                "op": .string("mission_step_resume"),
+                "missionId": .string(record.id),
+                "stepId": .string(stepId),
+                "missionStatus": .string(record.status),
+            ]),
+            detail: "Desk step approved — executed; Desk execution now \(record.status)", root: root)
+    }
 
     private func getRecord(_ executionId: String) async throws -> WorkshopExecutionRecord? {
         guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
@@ -1564,6 +1769,7 @@ public actor WorkshopExecutorLoop {
 
     private func emitTerminalEvent(_ record: WorkshopExecutionRecord?, reason: String?) async {
         guard let record, ["completed", "failed", "cancelled"].contains(record.status) else { return }
+        let reason = record.terminalReason ?? reason
         await terminalEventSink?(record, reason)
         // Receipts first, memory second — and the memory write is HANDED OFF,
         // never awaited (gpt-5.5 review A1, BLOCKING). `recorder.record` embeds,
@@ -1693,7 +1899,7 @@ public actor WorkshopExecutorLoop {
         // the 200-row cap — i.e. 200+ executions in a week. Widening the read to
         // archived rows would trade that for re-reading retired history on
         // every launch, which is the cost this window exists to avoid.
-        let known = await queue.recordedSources()
+        guard let known = await queue.recordedSources() else { return 0 }
         var reconciled = 0
         for entry in recent {
             // A corrupt record is logged and quarantined by readJSON; the scan skips it.
@@ -1713,7 +1919,7 @@ public actor WorkshopExecutorLoop {
                 that a crash or a killed shutdown lost.
                 """
             )
-            await queue.enqueue(record, reason: nil)
+            await queue.enqueue(record, reason: record.terminalReason)
             reconciled += 1
         }
         if reconciled > 0 {
@@ -1725,14 +1931,33 @@ public actor WorkshopExecutorLoop {
     }
 
     private func scanQueue() async -> [WorkshopExecutionRecord] {
-        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return [] }
+        do {
+            return try await scanQueueChecked()
+        } catch {
+            Self.logger.error("Workshop queue unavailable: \(error.localizedDescription, privacy: .public)")
+            return [SwiftNativeWorkshopRunner.recordFromJSON([
+                "id": .string("queue-unavailable"),
+                "title": .string("Workshop queue unavailable"),
+                "status": .string("unavailable"),
+                "result": .object(["error": .string(error.localizedDescription)]),
+            ])]
+        }
+    }
+
+    private func scanQueueChecked() async throws -> [WorkshopExecutionRecord] {
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(
-            at: executionRecordsRoot, includingPropertiesForKeys: [.isDirectoryKey], options: []
-        ) else { return [] }
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(
+                at: executionRecordsRoot, includingPropertiesForKeys: [.isDirectoryKey], options: []
+            )
+        } catch CocoaError.fileReadNoSuchFile {
+            return []
+        }
         var out: [WorkshopExecutionRecord] = []
         for sub in entries {
-            let isDir = (try? sub.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            let isDir = try sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false
             guard isDir else { continue }
             let raw = await SwiftNativeWorkshopRunner.readQueueRecord(
                 ExecutionRecordFile.resolve(in: sub, fileManager: fm),
@@ -1784,6 +2009,7 @@ public actor WorkshopExecutorLoop {
             }
             mutate(&record)
             record.updatedAt = nowStr
+            record.lastMovementAt = nowStr
             try await persistence.writeJSON(record.toJSON(), to: executionRecordJSON)
             return (record, true)
         }
@@ -2022,13 +2248,12 @@ public actor WorkshopExecutorLoop {
     /// tokens (see planWorkshopExecution) so a tool step — typically write_file — can
     /// consume a PRIOR step's output. chat.synthesize steps don't need it
     /// (buildLLMPrompt already threads prior outputs into their prompt); this is
-    /// the tool-arg equivalent. Contract is a flat string-valued args object
-    /// (planner rule), so only top-level string values are scanned. An id with
+    /// the tool-arg equivalent. String leaves in structured arguments are
+    /// scanned without changing any other value's type. An id with
     /// no matching completed step is left VERBATIM — honest (the unresolved
     /// token is visible) rather than silently blanking. Pure when no token is
     /// present, preserving prior behaviour for every existing plan. (2026-06-15)
     static func resolveStepReferences(in args: JSONValue, execution: WorkshopExecutionRecord) -> JSONValue {
-        guard case .object(let obj) = args else { return args }
         // id -> full output text for every completed step (last write wins, so a
         // re-run step resolves to its latest output).
         var outputs: [String: String] = [:]
@@ -2065,15 +2290,15 @@ public actor WorkshopExecutorLoop {
             result += rest
             return result
         }
-        var newObj: [String: JSONValue] = [:]
-        for (k, v) in obj {
-            if case .string(let s) = v {
-                newObj[k] = .string(substitute(s))
-            } else {
-                newObj[k] = v
+        func resolve(_ value: JSONValue) -> JSONValue {
+            switch value {
+            case .string(let text): return .string(substitute(text))
+            case .array(let values): return .array(values.map(resolve))
+            case .object(let fields): return .object(fields.mapValues(resolve))
+            default: return value
             }
         }
-        return .object(newObj)
+        return resolve(args)
     }
 
     /// Full (untruncated) text of a step output, for `{{step:id}}` substitution.

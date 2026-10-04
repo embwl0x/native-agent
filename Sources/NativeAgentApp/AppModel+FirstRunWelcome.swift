@@ -10,7 +10,6 @@ extension AppModel: FirstRunWelcomePort {
     var firstRunDataRoot: URL { dataRootOverride ?? NativeAgentPaths.dataRoot }
     var firstRunIsPublicRelease: Bool { NativeAgentPaths.isPublicReleaseBundle }
     var firstRunSessionIsBusy: Bool { engine.turns.busySessions.contains(activeChatSessionId) }
-    var firstRunGreetingSendIsOverridden: Bool { firstRunGreetingSendOverride != nil }
     var firstRunSyntheticErrorIDPrefix: String { Self.syntheticErrorIDPrefix }
 
     func firstRunMessages(for sessionID: String) -> [ChatMessage] {

@@ -2,7 +2,6 @@ import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import TriggerScheduler
 
 private struct AnyKey: CodingKey, Hashable {
     var stringValue: String
@@ -34,8 +33,8 @@ private extension KeyedDecodingContainer where Key == AnyKey {
 // MARK: - Background loop inspection and control
 //
 // BackgroundLoopsManager owns live workers and watchdog state in NativeAgent.app.
-// Scheduler jobs use TriggerScheduler's native writer. The Codable models retain
-// their existing wire keys for persisted and surface-facing compatibility.
+// The watchdog model retains its existing wire keys for persisted and
+// surface-facing compatibility.
 
 // MARK: - WatchdogStatus
 
@@ -124,219 +123,6 @@ public struct WatchdogStatus: Sendable, Codable, Equatable {
             }
         }
     }
-}
-
-// MARK: - SchedulerJob
-
-public struct SchedulerJob: Sendable, Codable, Equatable {
-    public var id: String
-    public var kind: String?
-    public var name: String?
-    public var intervalSeconds: Double?
-    public var enabled: Bool?
-    public var payload: JSONValue?
-    public var nextRunAt: String?
-    public var lastRunAt: String?
-    public var createdAt: String?
-    public var createdBy: String?
-    public var cancelledAt: String?
-    public var oneShot: Bool?
-    public var extras: JSONValue?
-
-    public init(
-        id: String,
-        kind: String? = nil,
-        name: String? = nil,
-        intervalSeconds: Double? = nil,
-        enabled: Bool? = nil,
-        payload: JSONValue? = nil,
-        nextRunAt: String? = nil,
-        lastRunAt: String? = nil,
-        createdAt: String? = nil,
-        createdBy: String? = nil,
-        cancelledAt: String? = nil,
-        oneShot: Bool? = nil,
-        extras: JSONValue? = nil
-    ) {
-        self.id = id
-        self.kind = kind
-        self.name = name
-        self.intervalSeconds = intervalSeconds
-        self.enabled = enabled
-        self.payload = payload
-        self.nextRunAt = nextRunAt
-        self.lastRunAt = lastRunAt
-        self.createdAt = createdAt
-        self.createdBy = createdBy
-        self.cancelledAt = cancelledAt
-        self.oneShot = oneShot
-        self.extras = extras
-    }
-
-    private static let knownKeys: Set<String> = [
-        "id", "kind", "name",
-        "intervalSeconds",
-        "enabled",
-        "payload",
-        "nextRunAt", "lastRunAt", "createdAt",
-        "createdBy",
-        "cancelledAt",
-        "oneShot",
-        "extras",
-    ]
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: AnyKey.self)
-
-        self.id = c.optional("id") ?? ""
-        self.kind = c.optional("kind")
-        self.name = c.optional("name")
-        self.intervalSeconds = c.optional("intervalSeconds")
-        self.enabled = c.optional("enabled")
-        self.payload = c.optional("payload")
-        self.nextRunAt = c.optional("nextRunAt")
-        self.lastRunAt = c.optional("lastRunAt")
-        self.createdAt = c.optional("createdAt")
-        self.createdBy = c.optional("createdBy")
-        self.cancelledAt = c.optional("cancelledAt")
-        self.oneShot = c.optional("oneShot")
-
-        self.extras = c.extras(excluding: Self.knownKeys)
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: AnyKey.self)
-        try c.encode(id, forKey: AnyKey("id"))
-        try c.encodeIfPresent(kind, forKey: AnyKey("kind"))
-        try c.encodeIfPresent(name, forKey: AnyKey("name"))
-        try c.encodeIfPresent(intervalSeconds, forKey: AnyKey("intervalSeconds"))
-        try c.encodeIfPresent(enabled, forKey: AnyKey("enabled"))
-        try c.encodeIfPresent(payload, forKey: AnyKey("payload"))
-        try c.encodeIfPresent(nextRunAt, forKey: AnyKey("nextRunAt"))
-        try c.encodeIfPresent(lastRunAt, forKey: AnyKey("lastRunAt"))
-        try c.encodeIfPresent(createdAt, forKey: AnyKey("createdAt"))
-        try c.encodeIfPresent(createdBy, forKey: AnyKey("createdBy"))
-        try c.encodeIfPresent(cancelledAt, forKey: AnyKey("cancelledAt"))
-        try c.encodeIfPresent(oneShot, forKey: AnyKey("oneShot"))
-        if case .object(let obj)? = extras {
-            for (k, v) in obj where !Self.knownKeys.contains(k) {
-                try c.encode(v, forKey: AnyKey(k))
-            }
-        }
-    }
-}
-
-// MARK: - SchedulerJobCreateResult
-
-public struct SchedulerJobCreateResult: Sendable, Codable, Equatable {
-    public var rawResponse: JSONValue
-    public init(rawResponse: JSONValue) { self.rawResponse = rawResponse }
-    enum CodingKeys: String, CodingKey { case rawResponse = "raw_response" }
-}
-
-// MARK: - Protocol
-
-public protocol BackgroundLoopsProtocol: Sendable {
-    func getWatchdog() async throws -> WatchdogStatus
-    func listSchedulerJobs() async throws -> [SchedulerJob]
-    func createSchedulerJob(_ body: JSONValue) async throws -> SchedulerJobCreateResult
-}
-
-// MARK: - SwiftNative impl
-
-/// SwiftNative background-loop surface. Default construction is fully native:
-/// watchdog state comes from BackgroundLoopsManager, and scheduler jobs flow
-/// through TriggerScheduler's Swift-native job writer.
-public actor SwiftNativeBackgroundLoops: BackgroundLoopsProtocol {
-    private let jobWriter: any SchedulerJobWriter
-    private let manager: BackgroundLoopsManager
-    private let now: @Sendable () -> Date
-
-    public init(
-        jobWriter: (any SchedulerJobWriter)? = nil,
-        manager: BackgroundLoopsManager = BackgroundLoopsManager.shared,
-        // Retained as a source-compatible label for callers compiled against
-        // the prior facade-owned uptime. Runtime uptime is now read from the
-        // lifecycle owner below; construction time is not liveness evidence.
-        startedAt _: Date = Date(),
-        now: @escaping @Sendable () -> Date = { Date() }
-    ) {
-        self.jobWriter = jobWriter ?? makeSchedulerJobWriter()
-        self.manager = manager
-        self.now = now
-    }
-
-    public func getWatchdog() async throws -> WatchdogStatus {
-        let running = await manager.isRunning()
-        let statuses = await manager.status()
-        let uptime = await manager.uptimeSeconds(now: now())
-        let newest = statuses.compactMap(\.lastRun).max()
-        let lastActivity: JSONValue? = newest.map { lastRun in
-            .object([
-                "id": .string("background-loops-watchdog-\(Int64(lastRun.timeIntervalSince1970))"),
-                "kind": .string("background_loops"),
-                "title": .string("Swift background loop tick"),
-                "detail": .string("Latest registered loop tick."),
-                "status": .string(running ? "ok" : "stopped"),
-                "executionId": .null,
-                "createdAt": .string(Self.isoTimestamp(lastRun)),
-            ])
-        }
-        let loopStatus: JSONValue = .array(statuses.map { status in
-            .object([
-                "name": .string(status.name),
-                "lastRunAt": status.lastRun.map { .string(Self.isoTimestamp($0)) } ?? .null,
-                "nextRunAt": status.nextRun.map { .string(Self.isoTimestamp($0)) } ?? .null,
-                "runCount": .int(Int64(status.runCount)),
-                "lastError": status.lastError.map { .string($0) } ?? .null,
-            ])
-        })
-        return WatchdogStatus(
-            daemon: "swift",
-            uptimeSeconds: uptime,
-            daemonLifecycleStatus: running ? "ok" : "stopped",
-            daemonLifecycleDetail: running
-                ? "Swift background loops are running in NativeAgent.app."
-                : "Swift background loops are not running.",
-            launchAgentStatus: "not_applicable",
-            launchAgentDetail: "NativeAgent.app owns background loops; legacy daemon launch agents are retired.",
-            runningImprovements: 0,
-            runningExecutions: 0,
-            lastActivity: lastActivity,
-            repairAvailable: false,
-            extras: .object([
-                "backend": .string("swift"),
-                "loopCount": .int(Int64(statuses.count)),
-                "running": .bool(running),
-                "loops": loopStatus,
-            ])
-        )
-    }
-
-    public func listSchedulerJobs() async throws -> [SchedulerJob] {
-        let jobs = try await jobWriter.listJobs()
-        return try jobs.map { try Self.decode($0, as: SchedulerJob.self) }
-    }
-
-    public func createSchedulerJob(_ body: JSONValue) async throws -> SchedulerJobCreateResult {
-        let response = try await jobWriter.createJob(body: body)
-        return SchedulerJobCreateResult(rawResponse: response)
-    }
-
-    private nonisolated static func decode<T: Decodable>(_ value: JSONValue, as type: T.Type) throws -> T {
-        let data = try JSONEncoder().encode(value)
-        return try JSONDecoder().decode(T.self, from: data)
-    }
-
-    private nonisolated static func isoTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalUTCOffset(date)
-    }
-}
-
-// MARK: - Factory
-
-public func makeBackgroundLoops() -> any BackgroundLoopsProtocol {
-    return SwiftNativeBackgroundLoops()
 }
 
 // MARK: - Phase B: Swift periodic-tick framework
@@ -719,6 +505,29 @@ public struct LoopState: Sendable, Equatable {
         self.tickCount = tickCount
         self.lastCompletedAt = lastCompletedAt
         self.firstSeenAt = firstSeenAt
+    }
+}
+
+/// An execution releases ownership only after both its body and the caller's
+/// cadence/backoff accounting have finished, in either order.
+actor LoopTickAccounting {
+    @TaskLocal static var current: LoopTickAccounting?
+    private var recorded = false
+    private var release: (@Sendable () async -> Void)?
+
+    func releaseAfterRecording(_ action: @escaping @Sendable () async -> Void) async {
+        if recorded {
+            await action()
+        } else {
+            release = action
+        }
+    }
+
+    func didRecord() async {
+        recorded = true
+        let action = release
+        release = nil
+        await action?()
     }
 }
 
@@ -1428,6 +1237,14 @@ public actor SwiftNativeLoopScheduler {
     }
 
     private func runOneTick(loop: any LoopRunner, registrationId: UUID) async {
+        let accounting = LoopTickAccounting()
+        await LoopTickAccounting.$current.withValue(accounting) {
+            await runAndRecordTick(loop: loop, registrationId: registrationId)
+        }
+        await accounting.didRecord()
+    }
+
+    private func runAndRecordTick(loop: any LoopRunner, registrationId: UUID) async {
         let id = loop.loopId
         let effectiveTimeout = loop.tickTimeoutOverride ?? tickTimeout
         do {

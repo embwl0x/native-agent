@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+import ToolRegistry
+import AgentConversations
 
 /// Enforces `PeerDataTaint` inside the per-turn chat dispatch chain.
 ///
@@ -52,10 +54,60 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         // Latch on the RESULT's own provenance label rather than on a list of
         // tool names, so a transport added later is covered the day it starts
         // labelling its output honestly.
-        if let peer = Self.remoteProvenance(in: result, depth: 0), !isElevated(peer) {
-            PeerDataTaint.markConsumed(peer: peer)
+        if let peer = Self.remoteProvenance(in: result, depth: 0) {
+            // The app's own agent transport read from the contact it routed
+            // to: that route is attested, so an elevated one is the person's
+            // own (PeerTrust). A label inside the result never is.
+            if let route = Self.routedContact(tool: tool, input: input), PeerDataTaint.ownerTrusts(route) { return result }
+            let line = Self.peerLine(in: result, depth: 0) ?? ""
+            // The result's own label: never the person's trust (`attested: false`).
+            if isElevated(peer) { PeerDataTaint.markElevated(peer: peer, line: line, attested: false) }
+            else { PeerDataTaint.markConsumed(peer: peer, line: line, attested: false) }
         }
         return result
+    }
+
+    /// The contact the app's own agent tools routed this call to: the
+    /// `agent` an agent message or read was sent to, a lane's own tool, or a
+    /// home `<name>.say`. From the call's routing, never from its result.
+    static func routedContact(tool: String, input: [String: JSONValue]) -> String? {
+        switch ToolNameAliases.ranTool(tool, input: input) {
+        case "agent_message", "agent_read":
+            if case .string(let agent)? = ToolNameAliases.ranInput(tool, input: input)["agent"] { return agent }
+            guard tool == "app", case .string(let item)? = input["item"], item.lowercased().hasSuffix(".say") else { return nil }
+            return String(item.dropLast(4))
+        case "claude_message", "invoke_claude": return "claude"
+        case "codex_message", "invoke_codex": return "codex"
+        default: return nil
+        }
+    }
+
+    /// The peer's own words in a labelled result, for the person's card.
+    static func peerLine(in value: JSONValue, depth: Int) -> String? {
+        guard depth < 6 else { return nil }
+        switch value {
+        case .object(let fields):
+            for key in ["reply", "agent_reply_text", "agent_reply_text_head", "completion_text_head", "partial_reply", "partial_text", "text"] {
+                if case .string(let text)? = fields[key],
+                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
+            }
+            return fields.values.lazy.compactMap { peerLine(in: $0, depth: depth + 1) }.first
+        case .array(let items): return items.reversed().lazy.compactMap { peerLine(in: $0, depth: depth + 1) }.first
+        default: return nil
+        }
+    }
+
+    /// Live and retained bridge replies use the identity of their local route
+    /// or store, with the person's current trust applied before returning text.
+    static func labelled(_ result: JSONValue, agent: String, dataRoot: URL) -> JSONValue {
+        guard case .object(var fields) = result,
+              ["reply", "agent_reply_text", "agent_reply_text_head", "completion_text_head"].contains(where: {
+                  guard case .string(let reply)? = fields[$0] else { return false }
+                  return !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              }) else { return result }
+        fields["agent"] = .string(agent)
+        fields["untrusted_remote_data"] = .bool(!PeerTrust.ownerTrusts(agent, dataRoot: dataRoot))
+        return .object(fields)
     }
 
     /// Agent, 2026-09-15: peer text cannot grant authority, but the person's
@@ -147,6 +199,10 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
 
     public func listAvailableTools() async throws -> [String] {
         try await inner.listAvailableTools()
+    }
+
+    public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(named: names)
     }
 
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {

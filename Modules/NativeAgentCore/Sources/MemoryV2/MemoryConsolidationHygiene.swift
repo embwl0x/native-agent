@@ -99,23 +99,33 @@ public enum MemoryConsolidationHygiene {
         // 2026-09-22 (User: "run hygiene weekly on its own"): the weekly tick
         // approves its own swap card and applies it through the gate's
         // reconcile, which still stale-refuses, backs up, and only archives.
-        func autoApply(_ approvalId: String) async -> (applied: Bool, detail: String)? {
+        func autoApply(_ approvalId: String) async -> (applied: Bool, projectionFailed: Bool, detail: String)? {
             guard autoApproveSwap else { return nil }
+            let runId: String
             do {
-                _ = try await SwiftNativeApprovalInbox(root: dataRoot).resolve(
+                let approval = try await SwiftNativeApprovalInbox(root: dataRoot).resolve(
                     approvalId, decision: .approved,
                     provenance: .local(decidedBy: "weekly_memory_hygiene"))
+                guard let approvedRunId = MemoryConsolidationGate.runId(of: approval.payload) else {
+                    return (false, false, "auto-approved swap card has no run ID")
+                }
+                runId = approvedRunId
             } catch {
-                return (false, "auto-approve of swap card \(approvalId.prefix(8)) failed: \(error)")
+                return (false, false, "auto-approve of swap card \(approvalId.prefix(8)) failed: \(error)")
             }
             let outcomes = await MemoryConsolidationGate.reconcile(dataRoot: dataRoot)
             let applied = outcomes.contains {
                 switch $0 {
-                case .applied, .alreadyApplied: return true
+                case .applied(let id, _), .alreadyApplied(let id), .projectionFailed(let id, _):
+                    return id == runId
                 default: return false
                 }
             }
-            return (applied, "weekly swap auto-approved: "
+            let projectionFailed = outcomes.contains {
+                if case .projectionFailed(let id, _) = $0 { return id == runId }
+                return false
+            }
+            return (applied, projectionFailed, "weekly swap auto-approved: "
                 + (outcomes.isEmpty ? "no outcome" : outcomes.map { "\($0)" }.joined(separator: "; ")))
         }
         // gpt-5.5 review (2026-07-24 MED): candidate-run errors must survive
@@ -134,11 +144,12 @@ public enum MemoryConsolidationHygiene {
                 consolidationRunId = MemoryConsolidationGate.runId(of: approval.payload)
             }
             if let auto = await autoApply(approvalId) {
-                status = auto.applied ? (plan.errors.isEmpty ? "ok" : "partial") : "failed"
+                status = auto.projectionFailed ? "projection_failed"
+                    : auto.applied ? (plan.errors.isEmpty ? "ok" : "partial") : "failed"
                 reason = withPlanErrors(auto.detail, plan)
             } else {
                 reason = withPlanErrors(
-                    "changes staged for approval (card \(approvalId.prefix(8))) — nothing applied until approved in Activity",
+                    "Changes are ready for review. Approve the card in chat to apply them.",
                     plan)
             }
         case .alreadyStaged(let approvalId):
@@ -151,7 +162,7 @@ public enum MemoryConsolidationHygiene {
             }
             // Never auto-approve a card this run did not stage: it may be a
             // manual run's card waiting on User.
-            reason = "a consolidation card is already pending approval (card \(approvalId.prefix(8))) — no new run"
+            reason = "A consolidation approval card is already waiting in chat. No new run was started."
         case .refusedRegression(let scores, let plan):
             result = plan
             status = "refused"
@@ -234,9 +245,11 @@ public enum MemoryConsolidationHygiene {
             beforeCount: before,
             afterCount: after,
             normalized: result.processed,
-            archivedDuplicates: result.duplicatesMerged,
-            archivedReflections: result.staleArchived,
-            distilledFactsAdded: result.autoAccepted,
+            // Only an uncommitted failure zeros applied counts; projection
+            // failure leaves the canonical swap's completed work intact.
+            archivedDuplicates: status == "failed" ? 0 : result.duplicatesMerged,
+            archivedReflections: status == "failed" ? 0 : result.staleArchived,
+            distilledFactsAdded: status == "failed" ? 0 : result.autoAccepted,
             decayedMemories: nil,
             proposalHygiene: MemoryProposalHygiene(
                 rejectedLowValue: nil,

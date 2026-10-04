@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import TrustCenter
 import PersistenceCore
 #if canImport(AppKit)
 import AppKit
@@ -185,6 +186,15 @@ extension SwiftNativeMacControl {
                 ]
             )
         }
+        if let continuation = MacWorkContinuation.current, continuation.isPending,
+           let captured = continuation.window {
+            guard framePid == captured.pid, let observed = frame.windowIdentity,
+                  observed.role == captured.role, observed.subrole == captured.subrole,
+                  observed.title == captured.title, observed.frame == captured.frame else {
+                return injectionRefusal(action: "act", error: "continuation_target_mismatch", status: 409,
+                    extra: ["guidance": .string(continuation.modelContext)])
+            }
+        }
         // 4a½. A frame that names OUR OWN process (only possible from a store
         //      populated before the self-inspection fence shipped) must refuse
         //      BEFORE `windows(pid:)` or any other actuator call starts an AX
@@ -218,7 +228,7 @@ extension SwiftNativeMacControl {
         if actWindows.isEmpty, MacScreenLock.isLocked() {
             return injectionRefusal(
                 action: "act",
-                error: "mac_locked",
+                error: "display_obstructed",
                 status: 409,
                 extra: ["guidance": .string(MacScreenLock.reply)]
             )
@@ -371,14 +381,12 @@ extension SwiftNativeMacControl {
                     "drifted_on": .string(reason),
                     "expected": .object([
                         "role": .string(entry.role),
-                        "label": entry.label.map {
-                            MacScreenViewTextRedaction.redactedLegendString($0, valueChars: MacAXLimits.hardValueChars)
-                        } ?? .null,
+                        "label": entry.labelJSON ?? .null,
                     ]),
                     "found": .object([
                         "role": .string(target.role),
                         "label": (target.title ?? target.value).map {
-                            MacScreenViewTextRedaction.redactedLegendString($0, valueChars: MacAXLimits.hardValueChars)
+                            MacInjectionResultRedaction.redactedSecret($0)
                         } ?? .null,
                     ]),
                     "guidance": .string(
@@ -657,7 +665,7 @@ extension SwiftNativeMacControl {
 var effect: [String: JSONValue] = [
             "observed": .bool(wait.observed),
             "observer_installed": .bool(observerInstalled),
-            "wait_ms": .int(Int64(waitMs)),
+            "wait_ms": .int(Int64(effectWaitMs)),
             "notifications": .array(wait.notifications.map { .string($0) }),
             "notification_count": .int(Int64(wait.notificationCount)),
             "acted_element": .object([
@@ -672,7 +680,7 @@ var effect: [String: JSONValue] = [
                 // verdict stays the conservative one either way.
                 "before": MacActReceiptRendering.actedElementJSON(
                     performed.target,
-                    redactingValue: redactValue || (actRedirected && entry.secret),
+                    redactingValue: redactValue || entry.secret,
                     labelJSON: actRedirected ? nil : entry.labelJSON,
                     valueJSON: actRedirected ? nil : entry.valueJSON
                 ),
@@ -867,6 +875,8 @@ var effect: [String: JSONValue] = [
             // The label she NAMED — Finder retitles to the opened folder, so
             // this is what the destination is checked against.
             intendedTarget: entry.label,
+            intendedTargetJSON: entry.labelJSON ?? .null,
+            windowTitleJSON: effect["window_title"],
             // VERB-SEMANTIC for `type`: the text we tried to land, the acted
             // element's value BEFORE (from the pre-act resolve — without it, a
             // pre-existing substring reads as a landed edit), and what the
@@ -1082,6 +1092,14 @@ var effect: [String: JSONValue] = [
             noteActuation("AXFocused")
             return accessibilityActSource.setFocused(actTarget)
         }
+        func ledgeredSetSelectedText(_ actTarget: MacAXActTarget, text: String) -> MacAXActOutcome {
+            noteActuation("AXSelectedText")
+            return accessibilityActSource.setSelectedText(actTarget, text: text)
+        }
+        func ledgeredSetSelectedTextRange(_ actTarget: MacAXActTarget, range: NSRange) -> MacAXActOutcome {
+            noteActuation("AXSelectedTextRange")
+            return accessibilityActSource.setSelectedTextRange(actTarget, range: range)
+        }
         func ledgeredActuatorAct(
             action: String?,
             value: String?,
@@ -1127,6 +1145,11 @@ var effect: [String: JSONValue] = [
         }
 
         func refuseInput(_ requestedAction: String) -> MacActPerformed? {
+            if let refusal = MacWorkContinuation.current?.refusal() {
+                return MacActPerformed(ok: false, method: "none", requestedAction: requestedAction,
+                    fallbackReason: nil, error: "continuation_unavailable", target: target,
+                    postState: nil, actedHandle: handle, extra: ["guidance": .string(refusal)])
+            }
             // RE-READ at the emission boundary, never trust the entry-time
             // verdict alone (gpt-5.5 round-7 BLOCKING). Between the gate in
             // `handleAct` and this line the verb has done real AX work — an
@@ -1368,9 +1391,6 @@ var effect: [String: JSONValue] = [
                     ]
                 )
             }
-            guard !MacCraftReplacement.required else {
-                return result("append_conflicts_with_required_replacement")
-            }
             guard let before = accessibilityActSource.textInput(target) else {
                 return result("append_text_or_selection_unreadable")
             }
@@ -1392,8 +1412,7 @@ var effect: [String: JSONValue] = [
                 return input.value == before.value && input.selection == end
             }
             guard !Task.isCancelled else { return result("cancelled") }
-            noteActuation("AXSelectedTextRange")
-            let positioned = accessibilityActSource.setSelectedTextRange(target, range: end)
+            let positioned = ledgeredSetSelectedTextRange(target, range: end)
             switch positioned {
             case .performed:
                 guard await waitForValue(before.value, selection: end) else {
@@ -1401,9 +1420,8 @@ var effect: [String: JSONValue] = [
                 }
                 if !keystrokes {
                     guard !Task.isCancelled, atUnchangedEnd() else { return result("append_target_changed") }
-                    noteActuation("AXSelectedText")
                     method = "ax_selected_text"
-                    switch accessibilityActSource.setSelectedText(target, text: text) {
+                    switch ledgeredSetSelectedText(target, text: text) {
                     case .performed:
                         return await waitForValue(expected) ? result() : result("append_value_mismatch")
                     case .unsupported:
@@ -1461,30 +1479,12 @@ var effect: [String: JSONValue] = [
         }
 
         /// Her-screen Phase 4 — typing into an app that stays in the back.
-        /// Insert at the field's own insertion point (AXSelectedText), else
-        /// replace its value (AXValue), else focus it inside its app and send
+        /// Replace single-line fields through AXValue with a readback. For
+        /// other editors, insert at the field's own insertion point
+        /// (AXSelectedText), else replace its value (AXValue), else focus it and send
         /// keys addressed to THAT pid — only while the act window is the app's
         /// own focused window. Never a keystroke into whatever is key.
         func typeInBackground(_ text: String) -> MacActPerformed {
-            // A single-line field is replaced, as a person retyping it would.
-            if ["AXTextField", "AXComboBox"].contains(target.role),
-               case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target), result.ok {
-                return summarize(result, target: target, actedHandle: handle,
-                                 extra: ["background_route": .string("ax_value_replace")])
-            }
-            noteActuation("AXSelectedText")
-            if accessibilityActSource.setSelectedText(target, text: text) == .performed {
-                return MacActPerformed(
-                    ok: true, method: "ax_selected_text", requestedAction: "type",
-                    fallbackReason: nil, error: nil, target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle
-                )
-            }
-            if case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target),
-               result.ok {
-                return summarize(result, target: target, actedHandle: handle,
-                                 extra: ["background_route": .string("ax_value_replace")])
-            }
             func needsFront() -> MacActPerformed {
                 MacActPerformed(
                     ok: false, method: "none", requestedAction: "type",
@@ -1495,6 +1495,25 @@ var effect: [String: JSONValue] = [
                         "needs_front_reason": .string(MacActClosedLoop.needsFrontReason("type")),
                     ]
                 )
+            }
+            // A single-line field is replaced, as a person retyping it would.
+            if ["AXTextField", "AXComboBox", "AXSearchField"].contains(target.role) {
+                guard case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target),
+                      result.ok, result.postState?.value == text else { return needsFront() }
+                return summarize(result, target: target, actedHandle: handle,
+                                 extra: ["background_route": .string("ax_value_replace")])
+            }
+            if ledgeredSetSelectedText(target, text: text) == .performed {
+                return MacActPerformed(
+                    ok: true, method: "ax_selected_text", requestedAction: "type",
+                    fallbackReason: nil, error: nil, target: target,
+                    postState: accessibilityActSource.reread(target), actedHandle: handle
+                )
+            }
+            if case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target),
+               result.ok {
+                return summarize(result, target: target, actedHandle: handle,
+                                 extra: ["background_route": .string("ax_value_replace")])
             }
             if let refusal = MacActClosedLoop.secureInputRefusal(active: eventSink.secureKeyboardEntryActive) {
                 return MacActPerformed(
@@ -1508,6 +1527,7 @@ var effect: [String: JSONValue] = [
             /// so the act window must be the app's focused window AND the
             /// target field its focused element — re-asked before every chunk.
             func focusHolds() -> Bool {
+                guard !Task.isCancelled, MacDriverContext.binding?.allowsEmission == true else { return false }
                 guard let focused = accessibilityActSource.focusedWindow(pid: framePid),
                       focused.handle == actWindow.handle else { return false }
                 return accessibilityActSource.isFocusedElement(target, pid: framePid)
@@ -1540,10 +1560,11 @@ var effect: [String: JSONValue] = [
                 }
                 let slice = String(characters[charactersSent..<min(characters.count, charactersSent + chunk)])
                 for event in MacEventPlanner.typeText(slice) {
+                    guard !Task.isCancelled, MacDriverContext.binding?.allowsEmission == true else { break sending }
                     guard eventSink.post(key: event, toPid: framePid) else { break sending }
                     posted += 1
+                    if event.down { charactersSent += 1 }
                 }
-                charactersSent += slice.count
             }
             guard posted > 0 else { return needsFront() }
             if charactersSent < characters.count {
@@ -1562,6 +1583,11 @@ var effect: [String: JSONValue] = [
             )
         }
 
+        if let refusal = MacWorkContinuation.current?.refusal() {
+            return MacActPerformed(ok: false, method: "none", requestedAction: verb.rawValue,
+                fallbackReason: nil, error: "continuation_unavailable", target: target,
+                postState: nil, actedHandle: handle, extra: ["guidance": .string(refusal)])
+        }
         switch verb {
         case .click, .select, .toggle:
             // Background: pressing something whose job is to open a menu would
@@ -1897,11 +1923,84 @@ var effect: [String: JSONValue] = [
             if typeMode == .append {
                 return await appendText(text)
             }
-            if MacCraftReplacement.required {
-                guard craftDocumentMatches(pid: framePid),
-                      accessibilityActSource.focusedWindow(pid: framePid)?.handle == actWindow.handle else { return nil }
-                guard case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target) else { return nil }
-                return summarize(result, target: target, actedHandle: handle)
+            if let continuation = MacWorkContinuation.current, continuation.isPending {
+                var typingMethod = "ax_selected_text"
+                let inputStartCount = MacDriverContext.binding?.inputCount ?? 0
+                func continuationResult(_ error: String?, delivered: Bool = false, verified: Bool = false) -> MacActPerformed {
+                    let posted = (MacDriverContext.binding?.inputCount ?? inputStartCount) - inputStartCount
+                    return MacActPerformed(ok: error == nil, method: delivered || posted > 0 ? typingMethod : "none",
+                        requestedAction: "type", fallbackReason: nil, error: error, target: target,
+                        postState: delivered || posted > 0 ? accessibilityActSource.reread(target) : nil, actedHandle: handle,
+                        extra: ["text_value_verified": .bool(verified), "ax_delivered": .bool(delivered),
+                                "posted_events": .int(Int64(posted))])
+                }
+                guard continuation.app?.processIdentifier == framePid,
+                      continuation.focusPath == entry.path,
+                      let before = accessibilityActSource.textInput(target),
+                      before.selection == continuation.selectionRange,
+                      continuation.refusal() == nil else {
+                    return continuationResult("stale_continuation_target")
+                }
+                let expected = before.inserting(text)
+                guard !Task.isCancelled else { return continuationResult("cancelled") }
+                if keystrokes {
+                    typingMethod = background ? "keystroke_to_pid" : "keystroke_injection"
+                    guard eventSink.isAvailable else { return continuationResult("event_injection_unavailable") }
+                    if let refusal = MacActClosedLoop.secureInputRefusal(active: eventSink.secureKeyboardEntryActive) {
+                        return continuationResult(refusal.reason)
+                    }
+                    if !background, let refusal = refuseInput("type") {
+                        return continuationResult(refusal.error ?? refusal.fallbackReason ?? "focus_moved")
+                    }
+                    for event in MacEventPlanner.typeText(text) {
+                        if event.down {
+                            guard !Task.isCancelled,
+                                  MacDriverContext.binding?.allowsEmission == true,
+                                  !eventSink.secureKeyboardEntryActive,
+                                  accessibilityActSource.focusedWindow(pid: framePid)?.handle == actWindow.handle,
+                                  accessibilityActSource.isFocusedElement(target, pid: framePid) else {
+                                return continuationResult("focus_moved")
+                            }
+                            if continuation.isPending {
+                                guard continuation.refusal() == nil,
+                                      let current = accessibilityActSource.textInput(target),
+                                      current.value == before.value, current.selection == before.selection else {
+                                    return continuationResult("stale_continuation_target")
+                                }
+                            }
+                            if !background, let refusal = refuseInput("type") {
+                                return continuationResult(refusal.error ?? refusal.fallbackReason ?? "focus_moved")
+                            }
+                        }
+                        if background {
+                            guard eventSink.post(key: event, toPid: framePid) else {
+                                return continuationResult("needs_front")
+                            }
+                        } else {
+                            eventSink.post(key: event)
+                        }
+                        if (MacDriverContext.binding?.inputCount ?? inputStartCount) > inputStartCount {
+                            noteActuation("type")
+                        }
+                    }
+                    let verified = await waitForTextInput(
+                        pid: framePid, target: target, value: expected, changedFrom: before,
+                        requiresFrontmost: !background
+                    ) != nil
+                    return continuationResult(verified ? nil : "typed_value_mismatch", verified: verified)
+                }
+                let outcome = ledgeredSetSelectedText(target, text: text)
+                switch outcome {
+                case .performed:
+                    let verified = accessibilityActSource.textInput(target)?.value == expected
+                    return continuationResult(verified ? nil : "continuation_insertion_unverified", delivered: true, verified: verified)
+                case .unsupported:
+                    return continuationResult("selection_insertion_unsupported")
+                case .invalidTarget:
+                    return continuationResult("stale_continuation_target")
+                case .failed:
+                    return continuationResult("continuation_insertion_outcome_unknown")
+                }
             }
             if background {
                 return typeInBackground(text)

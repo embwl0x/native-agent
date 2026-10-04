@@ -301,13 +301,14 @@ final class WorkshopStore: ObservableObject {
         title: String, objective: String,
         submission: InboxAction? = nil,
         intentionalNewRequest: Bool = false,
-        onReplacement: ((InboxAction) -> Void)? = nil
+        onReplacement: ((InboxAction) -> Void)? = nil,
+        onRefusal: (() -> Void)? = nil
     ) async -> Bool {
         do {
             try await iCloudSyncEngine.shared.submitWorkshopTask(
                 title: title, objective: objective, submission: submission,
                 intentionalNewRequest: intentionalNewRequest,
-                onReplacement: onReplacement
+                onReplacement: onReplacement, onRefusal: onRefusal
             )
             await refresh()
             return true
@@ -588,7 +589,8 @@ struct NewWorkshopTaskSheet: View {
                         if await store.submitWorkshopTask(
                             title: title, objective: objective, submission: submission,
                             intentionalNewRequest: intentionalNewRequest,
-                            onReplacement: { submission = $0 }
+                            onReplacement: { submission = $0 },
+                            onRefusal: { submission = nil }
                         ) { dismiss() }
                         isSubmitting = false
                     }

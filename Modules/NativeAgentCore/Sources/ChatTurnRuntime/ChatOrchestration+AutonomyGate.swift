@@ -96,11 +96,6 @@ public actor AutonomyGate {
         self.filer = approvalFiler
     }
 
-    public func decide(toolName: String, surface: String) async throws -> AutonomyDecision {
-        let level = try await trust.autonomyLevel(forTool: toolName, surface: surface)
-        return Self.map(level: level, toolName: toolName)
-    }
-
     public func autonomyLevel(toolName: String, surface: String) async throws -> String {
         try await trust.autonomyLevel(forTool: toolName, surface: surface)
     }
@@ -122,30 +117,11 @@ public actor AutonomyGate {
 
     /// File an approval request and await its resolution. Returns the final
     /// decision (allow on approved, deny on denied/canceled). On timeout,
-    /// returns .deny (NOT throws) — matches spec.
-    public func resolveWithApproval(
-        toolName: String,
-        surface: String,
-        requestPayload: JSONValue,
-        timeoutSeconds: Double = 300,
-        reason: String? = nil
-    ) async throws -> AutonomyDecision {
-        try await resolveWithApprovalDetailed(
-            toolName: toolName,
-            surface: surface,
-            requestPayload: requestPayload,
-            timeoutSeconds: timeoutSeconds,
-            reason: reason
-        ).decision
-    }
-
-    /// Same flow, but also hands back the APPROVAL RECORD ID.
+    /// returns .deny (NOT throws). Also returns the approval record ID.
     ///
     /// W2/W3-FIX 1/2 need it: a `MacInjectionCapability` is minted from a
     /// specific resolved approval, and "which approval authorized this
     /// keystroke" has to be answerable from the capability itself, not inferred.
-    /// `resolveWithApproval` above keeps its original signature so no existing
-    /// caller changes.
     public func resolveWithApprovalDetailed(
         toolName: String,
         surface: String,
@@ -205,7 +181,7 @@ public actor AutonomyGate {
 
     // MARK: - level mapping
 
-    nonisolated static func map(level: String, toolName: String = "this action") -> AutonomyDecision {
+    package nonisolated static func map(level: String, toolName: String = "this action") -> AutonomyDecision {
         let allowed: Set<String> = ["auto", "app_data_autonomous", "workspace_autonomous"]
         let approval: Set<String> = ["supervised", "confirm", "send_approval", "destructive_strong"]
         let denied: Set<String> = ["deny", "blocked"]
@@ -213,44 +189,5 @@ public actor AutonomyGate {
         if approval.contains(level) { return .requireApproval(reason: ApprovalActionText.sentence(tool: toolName)) }
         if denied.contains(level) { return .deny(reason: "autonomy=\(level)") }
         return .requireApproval(reason: ApprovalActionText.sentence(tool: toolName))
-    }
-}
-
-// MARK: - SwiftNativeTurnEngine extension
-//
-// The engine stores its ToolDispatchClient privately. To avoid touching
-// ChatOrchestration+TurnEngine.swift we expose a variant that accepts the
-// dispatch client explicitly — callers construct the gate, pass both, and
-// the engine routes through the gate's decision.
-
-extension SwiftNativeTurnEngine {
-    public func dispatchToolWithAutonomyGate(
-        toolName: String,
-        toolInput: [String: JSONValue],
-        surface: String,
-        tools: any ToolDispatchClient,
-        gate: AutonomyGate
-    ) async throws -> JSONValue {
-        let decision = try await gate.decide(toolName: toolName, surface: surface)
-        switch decision {
-        case .allow:
-            return try await tools.dispatch(tool: toolName, input: toolInput, surface: surface)
-        case .deny(let reason):
-            throw AutonomyGateError.toolDenied(reason: reason)
-        case .requireApproval:
-            let resolved = try await gate.resolveWithApprovalDetailed(
-                toolName: toolName,
-                surface: surface,
-                requestPayload: .object(toolInput)
-            )
-            switch resolved.decision {
-            case .allow:
-                return try await tools.dispatch(tool: toolName, input: toolInput, surface: surface)
-            case .deny:
-                throw AutonomyGateError.notRun(resolved.notRunStatus ?? .blocked)
-            case .requireApproval(let reason):
-                throw AutonomyGateError.toolDenied(reason: reason)
-            }
-        }
     }
 }

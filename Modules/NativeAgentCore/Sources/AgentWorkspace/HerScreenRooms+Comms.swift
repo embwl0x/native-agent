@@ -29,9 +29,9 @@ extension HerScreen {
     static let commsReadTools: Set<String> = ["gmail_search", "gmail_read", "gmail_status", "agentmail_list", "agentmail_read", "notes_search", "contacts_search"]
 
     /// Item verbs a list room names under its DO line.
-    static let commsItemVerbs: [String: [(String, String)]] = [
-        "mail": [("mail.N.reply", "reply (text)"), ("mail.N.archive", "archive it"), ("mail.N.mark-read", "mark it read")],
-        "notes": [("notes.N.append", "add to it (text)")],
+    static let commsItemVerbs: [String: [(name: String, about: String, tool: String)]] = [
+        "mail": [("mail.N.reply", "reply (text)", "mail_reply"), ("mail.N.archive", "archive it", "mail_archive"), ("mail.N.mark-read", "mark it read", "mail_mark_read")],
+        "notes": [("notes.N.append", "add to it (text)", "notes_update")],
     ]
     static var commsRooms: Set<String> { Set(commsFamily.values) }
     /// Rooms whose numbers stay with each item (by its message or contact
@@ -54,9 +54,12 @@ extension HerScreen {
         }
         var chats: [BridgeChat]?
         var out: [String: String] = [:]
+        let health = AgentLocalHealth.read(dataRoot)
         for agent in Set(agents.map { $0.lowercased() }) {
+            if let problem = health[agent]?.problem { out[agent] = problem; continue }
             guard let record = records.filter({ $0.agent.lowercased() == agent }).max(by: { $0.updatedAt < $1.updatedAt }),
                   record.phase == "attention" else { continue }
+            if health[agent]?.resolves(record) == true { continue }
             let what: String? = HerMemo.shared.cached(root + record.id, stamp: [String(record.updatedAt.timeIntervalSince1970)]) {
                 let receipt = unwrap(record.receipt)
                 if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true) { return nil }
@@ -89,7 +92,7 @@ extension HerScreen {
         return parts
     }
 
-    static let notConnectedLine = "Not connected — request_interaction (kind connector) puts the connect card in this chat; or he opens Settings (the gear, bottom-left), then Connectors."
+    static let notConnectedLine = "Not connected — app card.request (kind connector) puts the connect card in this chat; or he opens Settings (the gear, bottom-left), then Connectors."
 
     /// A service that is not connected reads the same everywhere, whatever
     /// its owner called it (a connect card, "failed", "not set up").
@@ -112,6 +115,9 @@ extension HerScreen {
         let content: JSONValue = if case .object(let root) = result {
             .object(root.filter { !["messages", "notes", "contacts"].contains($0.key) })
         } else { result }
+        let more: [AgentWorkspaceButton] = if case .object(let root) = result, case .object(let next)? = root["next"] {
+            [.init(label: "More results", action: .open(.record(tool: tool, input: next, title: "Gmail")))]
+        } else { [] }
         switch tool {
         case "gmail_search":
             return .init(title: "Gmail", content: content, items: rows("messages").compactMap { row in
@@ -125,7 +131,7 @@ extension HerScreen {
                 .init(label: "Unread", action: .open(.record(tool: "gmail_search", input: ["query": .string("in:inbox is:unread"), "limit": .int(12)], title: "Gmail unread"))),
                 // Beside home, not under whatever room was open before.
                 .init(label: "Status", action: .window(.open(.record(tool: "gmail_status", input: [:], title: "Gmail status")))),
-            ])
+            ] + more)
         case "agentmail_list":
             return .init(title: "AgentMail", content: content, items: rows("messages").compactMap { row in
                 guard let id = text(row["message_id"]) else { return nil }
@@ -172,6 +178,7 @@ extension HerScreen {
     /// A comms record as text: one item's room, or a list read (a search, a
     /// next page) laid out like its place. Nil leaves the old view.
     static func commsRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL, issue: String?) -> String? {
+        if let batch = mailBatchRoom(location, value: value, dataRoot: dataRoot) { return batch }
         guard case .record(let tool, let input, let title) = location, let value else { return nil }
         let now = Date()
         guard let family = commsFamily[tool] else { return nil }
@@ -200,7 +207,7 @@ extension HerScreen {
         }
         // The item's name is the one its list row minted: a next page of the
         // same message or thread keeps it.
-        let identity = input.filter { !["body_offset", "before_message_id", "limit", "position"].contains($0.key) }
+        let identity = input.filter { !["body_offset", "text_offset", "before_message_id", "limit", "position"].contains($0.key) }
         let itemKey = key(.record(tool: tool, input: identity, title: title)) ?? title
         let name = family + ".\(withNames(dataRoot) { book in book.number("item." + family, id: itemKey) { [itemKey] } })"
         func rowsOf(_ key: String) -> [[String: JSONValue]] {
@@ -209,13 +216,14 @@ extension HerScreen {
         }
         var verbs: [(String, String)] = [], keep: [String: AgentWorkspaceAction] = [:]
         func verb(_ word: String, _ about: String, _ action: AgentWorkspaceAction) {
+            guard AgentWorkspaceReadiness.allows(action) else { return }
             verbs.append((name + "." + word, about)); keep[name + "." + word] = action
         }
         var header: [String] = [name], sections: [[String]] = []
         switch tool {
         case "mail_list_recent":
             guard let row = rowsOf("messages").first else { return nil }
-            let bound = input.filter { ["message_id", "expected_message_id", "expected_account", "position"].contains($0.key) }
+            let bound = input.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope", "mailbox"].contains($0.key) }
             header += [who(text(row["sender"])), when(text(row["date"]), now: now)] + (row["unread"] == .bool(true) ? ["unread"] : [])
             let (lines, used) = bodyLines(text(row["body"]) ?? "")
             let start = int(row["body_offset"]) ?? 0, total = int(row["body_total"]) ?? 0
@@ -226,11 +234,13 @@ extension HerScreen {
                 keep[name + ".more"] = .open(.record(tool: "mail_list_recent", input: bound.merging(["body_offset": .int(Int64(start + used))]) { _, new in new }, title: title))
             }
             if case .string(let expectedID)? = bound["expected_message_id"], !expectedID.isEmpty {
-                verb("reply", "reply to the sender (text)", .perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true))
-                verb("reply-all", "reply to everyone (text)", .perform(tool: "mail_reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new },
-                                                                      title: "Reply all: " + title, textField: "body", isEffect: true))
-                verb("archive", "archive it", .perform(tool: "mail_archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true))
-                verb("mark-read", "mark it read", .perform(tool: "mail_mark_read", input: bound, title: "Mark read: " + title, textField: nil, isEffect: true))
+                if (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) == .string("inbox") {
+                    verb("reply", "reply to the sender (text)", .perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true))
+                    verb("reply-all", "reply to everyone (text)", .perform(tool: "mail_reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new },
+                                                                          title: "Reply all: " + title, textField: "body", isEffect: true))
+                    verb("archive", "archive it", .perform(tool: "mail_archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true))
+                    verb("mark-read", "mark it read", .perform(tool: "mail_mark_read", input: bound, title: "Mark read: " + title, textField: nil, isEffect: true))
+                }
                 verb("delete", "move it to Trash", .perform(tool: "mail_delete", input: bound, title: "Delete " + title, textField: nil, isEffect: true))
             }
         case "messages_recent_threads":
@@ -257,8 +267,21 @@ extension HerScreen {
         case "gmail_read", "agentmail_read":
             let sender = text(object["from"]) ?? text(object["sender"])
             header += [who(sender), tool == "gmail_read" ? when(rfc822(text(object["date"])), now: now) : when(text(object["date"]), now: now)]
+            let retrievedBody = text(object["body"])
+            let preview = retrievedBody == nil && text(object["snippet"]) != nil
+            let body = retrievedBody ?? text(object["snippet"]) ?? ""
+            let (lines, used) = bodyLines(body)
             sections = [section("SUBJECT", [clip(text(object["subject"]) ?? "(no subject)", 100)]),
-                        section("BODY", bodyLines(text(object["body"]) ?? text(object["snippet"]) ?? "").lines)]
+                        section(preview ? "PREVIEW" : "BODY", lines)]
+            if let note = text(object["bodyRetrievalNote"]) { sections.append([note]) }
+            if tool == "gmail_read", let id = text(object["id"]), let total = int(object["totalCharacters"]) {
+                let progress = if preview, case .string(let chunk)? = object["body"] { chunk.count } else { preview ? 0 : used }
+                let nextOffset = (int(object["textOffset"]) ?? 0) + progress
+                if progress > 0, nextOffset < total {
+                    verb("more", "continue the body", .open(.record(tool: tool,
+                        input: ["id": .string(id), "text_offset": .int(Int64(nextOffset))], title: title)))
+                }
+            }
             if tool == "agentmail_read", let sender, let address = sender.split(whereSeparator: { "<> ".contains($0) }).first(where: { $0.contains("@") }) {
                 let subject = text(object["subject"]) ?? ""
                 verb("reply", "reply from my inbox (text; the person approves the send)", .perform(tool: "agentmail_send",
@@ -269,14 +292,21 @@ extension HerScreen {
             guard let note = rowsOf("notes").first else { return nil }
             header += [text(note["folder"]), when(text(note["modified_at"]), now: now)].compactMap { $0 }.filter { !$0.isEmpty }
             // A note's text starts with its title; the room shows what comes after it.
-            var (lines, _) = bodyLines(text(note["body"]) ?? text(note["body_preview"]) ?? "")
-            if let first = lines.first, first == clip(text(note["name"]) ?? "", 110) { lines.removeFirst() }
-            sections = [section("TITLE", [clip(text(note["name"]) ?? title, 100)]), section("TEXT", lines.isEmpty ? ["(empty: the note has only its title)"] : lines)]
+            let body = if case .string(let value)? = note["body"] ?? note["body_preview"] { value } else { "" }
+            var (lines, used) = bodyLines(body)
+            let start = int(note["body_offset"]) ?? 0
+            if start == 0, let first = lines.first, first == clip(text(note["name"]) ?? "", 110) { lines.removeFirst() }
+            sections = [section("TITLE", [clip(text(note["name"]) ?? title, 100)]), section("TEXT", lines.isEmpty ? ["(no text on this page)"] : lines)]
             if let total = int(object["total"]), total > 1 {
                 sections.append(["\(total) notes have this title; this is one · notes.find (text) to pick another"])
             }
             // Only by the note's id: a title can belong to two notes.
             if let id = text(note["id"]) {
+                let next = start + body.prefix(used).utf16.count
+                if let total = int(note["body_total"]), next < total {
+                    sections.append(["more text · \(name).more"])
+                    keep[name + ".more"] = .open(.record(tool: "notes_search", input: ["id": .string(id), "body_offset": .int(Int64(next))], title: title))
+                }
                 verb("append", "add a line to it (text)", .perform(tool: "notes_update", input: ["id": .string(id)], title: "Add to " + title, textField: "append", isEffect: true))
             }
         case "contacts_search":
@@ -285,11 +315,11 @@ extension HerScreen {
             header += [clip(text(card["name"]) ?? title, 40)] + (text(card["organizationName"]).map { [$0] } ?? [])
             sections = [section("PHONES", phones.isEmpty ? ["none"] : phones.prefix(4).map { clip($0, 40) }),
                         section("EMAILS", emails.isEmpty ? ["none"] : emails.prefix(4).map { clip($0, 60) })]
-            if let phone = phones.first {
+            if let phone = values(card["phones"], labels: false).first {
                 verb("text", "text \(phones.count > 1 ? "the first number" : "them") (text)", .perform(tool: "messages_send", input: ["to": .string(phone)],
                     title: "Text " + title, textField: "body", isEffect: true))
             }
-            if let email = emails.first {
+            if let email = values(card["emails"], labels: false).first {
                 verb("email", "write them an email (form)", .configure(tool: "mail_send", input: ["to": .string(email)], title: "Email " + title))
             }
             if let id = text(card["identifier"]) {
@@ -297,7 +327,7 @@ extension HerScreen {
             }
         default: return nil
         }
-        HerNamed.shared.keep(dataRoot, keep)
+        HerNamed.shared.keep(dataRoot, keep.filter { AgentWorkspaceReadiness.allows($0.value) }, room: name)
         return commsScreen(header, sections, verbs: verbs, back: "Back: home · \(family).")
     }
 
@@ -305,12 +335,31 @@ extension HerScreen {
     /// before a restart: mail verbs rebuild from the item's own read; the
     /// others reopen the item, which names its verbs again.
     static func commsTarget(_ raw: String, dataRoot: URL) -> Target? {
+        let selection = raw.split(whereSeparator: { $0.isWhitespace || $0 == "," }).map(String.init)
+        if let verb = selection.first, ["mail.read-batch", "mail.mark-read-batch", "mail.flag-batch", "mail.unflag-batch", "mail.archive-batch"].contains(verb),
+           (1...10).contains(selection.count - 1) {
+            let items: [JSONValue] = selection.dropFirst().map { name in
+                var row: [String: JSONValue] = ["name": .string(name)]
+                switch verb {
+                case "mail.mark-read-batch": row["mark_read"] = .bool(true)
+                case "mail.flag-batch": row["flagged"] = .bool(true)
+                case "mail.unflag-batch": row["flagged"] = .bool(false)
+                case "mail.archive-batch": row["archive"] = .bool(true)
+                default: break
+                }
+                return .object(row)
+            }
+            let input: [String: JSONValue] = ["items": .array(items)]
+            if verb == "mail.read-batch" { return .action(.open(.record(tool: "mail_read_batch", input: input, title: "Selected email"))) }
+            return .action(.perform(tool: "mail_triage_batch", input: input, title: "Triage selected email", textField: nil, isEffect: true))
+        }
         let parts = raw.split(separator: ".").map(String.init)
         guard parts.count == 3, let n = Int(parts[1]), commsItemVerbs.keys.contains(parts[0]) || ["messages", "gmail", "agentmail"].contains(parts[0]),
               let place = itemPlace(parts[0], n, dataRoot: dataRoot), case .record(let tool, let input, let title) = place else { return nil }
-        let bound = input.filter { ["message_id", "expected_message_id", "expected_account", "position"].contains($0.key) }
+        let bound = input.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope", "mailbox"].contains($0.key) }
         if tool == "mail_list_recent", bound["message_id"] != nil,
            case .string(let expectedID)? = bound["expected_message_id"], !expectedID.isEmpty {
+            if parts[2] != "delete", (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) != .string("inbox") { return nil }
             switch parts[2] {
             case "reply": return .action(.perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true))
             case "archive": return .action(.perform(tool: "mail_archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true))
@@ -323,6 +372,50 @@ extension HerScreen {
             return .action(.perform(tool: "notes_update", input: ["id": .string(id)], title: "Add to " + title, textField: "append", isEffect: true))
         }
         return .action(.window(AgentWorkspaceNavigation.windowAction(place)))
+    }
+
+    private static func mailBatchRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL) -> String? {
+        let tool: String, result: JSONValue
+        switch location {
+        case .record(let name, _, _):
+            guard let value else { return nil }
+            tool = name; result = value
+        case .receipt(let name, _, let receipt, _): tool = name; result = receipt
+        default: return nil
+        }
+        guard ["mail_read_batch", "mail_triage_batch"].contains(tool), case .object(let root) = result,
+              case .array(let items)? = root["items"] else { return nil }
+        var keep: [String: AgentWorkspaceAction] = [:], verbs: [(String, String)] = []
+        let sections: [[String]] = items.compactMap { item in
+            guard case .object(let row) = item else { return nil }
+            let name = text(row["name"]) ?? "message " + (text(row["message_id"]) ?? "?")
+            var lines = [name + " · " + (text(row["status"]) ?? "unknown")]
+            for key in ["subject", "sender", "reason", "error"] { if let value = text(row[key]), !value.isEmpty { lines.append(value) } }
+            if case .object(let actions)? = row["actions"] {
+                for action in ["mark_read", "flagged", "archive"] {
+                    if case .object(let outcome)? = actions[action] {
+                        let label: String
+                        if action == "flagged", case .object(let requested)? = row["requested"] {
+                            label = action + "=" + (requested[action] == .bool(false) ? "false" : "true")
+                        } else { label = action }
+                        lines.append(label + ": " + (text(outcome["status"]) ?? "unknown")
+                            + (text(outcome["message"] ?? outcome["error"] ?? outcome["reason"]).map { " · " + $0 } ?? ""))
+                    }
+                }
+            }
+            if let body = text(row["body"]) { lines += tabled(wrap(body, width: 100), row["body_tables"]) }
+            if row["truncated"] == .bool(true), let end = row["body_end"], AgentWorkspaceReadiness.allows(tool: "mail_list_recent") {
+                lines.append("Body continues at " + (text(end) ?? "?"))
+                let bound = row.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope"].contains($0.key) }
+                    .merging(["body_offset": end]) { _, new in new }
+                let more = name + ".more"
+                keep[more] = .open(.record(tool: "mail_list_recent", input: bound, title: text(row["subject"]) ?? "Email"))
+                verbs.append((more, "read next body part"))
+            }
+            return lines.map { UntrustedText.neutralized($0) }
+        }
+        HerNamed.shared.keep(dataRoot, keep, room: "mail-batch")
+        return commsScreen(["MAIL BATCH", text(root["status"]) ?? "unknown"], sections, verbs: verbs, back: "Back: mail.")
     }
 
     // MARK: Home's mail line
@@ -356,7 +449,11 @@ extension HerScreen {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || (line.hasPrefix(">") && lines.last?.hasPrefix(">") == true) { used += raw.count + 1; continue }
             if shown + line.count > cap {
-                if lines.isEmpty { lines.append(clip(String(line.prefix(cap)), cap + 1)); used += min(raw.count, cap) }
+                if lines.isEmpty {
+                    lines.append(clip(String(line.prefix(cap)), cap + 1))
+                    let leading = raw.prefix { $0.unicodeScalars.allSatisfy(CharacterSet.whitespaces.contains) }.count
+                    used += leading + cap
+                }
                 break
             }
             lines.append(clip(line, cap + 1)); shown += line.count; used += raw.count + 1
@@ -440,10 +537,11 @@ extension HerScreen {
     private static func int(_ value: JSONValue?) -> Int? { if case .int(let n)? = value { Int(n) } else { nil } }
 
     /// Contact phones/emails: `[{label, value}]` as "value (label)".
-    private static func values(_ value: JSONValue?) -> [String] {
+    private static func values(_ value: JSONValue?, labels: Bool = true) -> [String] {
         guard case .array(let list)? = value else { return [] }
         return list.compactMap { entry in
             guard case .object(let row) = entry, let value = text(row["value"]) else { return nil }
+            if !labels { return value }
             return text(row["label"]).map { $0 == "other" ? value : value + " (" + $0 + ")" } ?? value
         }
     }

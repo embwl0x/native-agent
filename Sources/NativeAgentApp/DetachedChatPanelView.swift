@@ -157,10 +157,6 @@ struct DetachedChatPanelView: View {
         appModel.detachedChatRefreshStatus[sessionId]
     }
 
-    private var contextReceiptStatus: AppModel.PanelRefreshStatus? {
-        appModel.detachedChatContextReceiptRefreshStatus[sessionId]
-    }
-
     private var loadPresentation: AppModel.CompactReadPresentationState {
         AppModel.compactReadPresentationState(hasContent: !messages.isEmpty, status: loadStatus)
     }
@@ -367,14 +363,6 @@ struct DetachedChatPanelView: View {
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.yellow)
                     }
-                    if let receiptWarning = AppModel.detachedContextReceiptWarning(
-                        history: loadPresentation,
-                        receiptStatus: contextReceiptStatus
-                    ) {
-                        Label(receiptWarning, systemImage: "exclamationmark.triangle.fill")
-                            .font(NativeAgentFont.tag)
-                            .foregroundStyle(.yellow)
-                    }
                     if !sessionIsAvailable {
                         detachedSessionUnavailableState
                             .frame(maxWidth: .infinity, minHeight: 220)
@@ -551,6 +539,7 @@ struct DetachedChatPanelView: View {
             // transcript's own mutation counter catches every such write.
             .onChange(of: appModel.engine.transcripts.structureVersion) {
                 refreshTranscriptSearchIfPresented()
+                inlineCards.refreshSoon(sessionID: sessionId)
             }
             .onChange(of: transcriptSearch.selectionRevision) { _, _ in
                 guard showTranscriptSearch,
@@ -1022,7 +1011,7 @@ struct DetachedChatPanelView: View {
             url,
             to: appModel,
             sessionId: sessionId,
-            resolveType: detachedChatAttachmentTypeAndMime,
+            resolveType: ChatAttachmentTypeResolver.typeAndMime,
             canAttach: ensureSessionIsAvailable,
             showToast: showToast
         )
@@ -1117,20 +1106,6 @@ private struct DetachedScrollAnchorModifier: ViewModifier {
             content
                 .defaultScrollAnchor(anchor)
         }
-    }
-}
-
-private func detachedChatAttachmentTypeAndMime(forExtension ext: String) -> (type: String, mime: String)? {
-    switch ext {
-    case "png": return ("image", "image/png")
-    case "jpg", "jpeg": return ("image", "image/jpeg")
-    case "heic": return ("image", "image/heic")
-    case "webp": return ("image", "image/webp")
-    case "gif": return ("image", "image/gif")
-    case "pdf": return ("file", "application/pdf")
-    case "docx": return ("file", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    case "txt", "md": return ("file", "text/plain")
-    default: return nil
     }
 }
 

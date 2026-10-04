@@ -332,50 +332,62 @@ public struct OutcomeDimensionStateAudit: Sendable, Equatable {
         _ observations: [ResponseOutcomeObservationV2?],
         sourceStatus: String = "measured"
     ) -> OutcomeDimensionStateAudit {
+        var population = Population()
+        for observation in observations { population.add(observation) }
+        return population.audit(sourceStatus: sourceStatus)
+    }
+
+    fileprivate struct Population {
+        var total = 0
+        var present = 0
         var distributions = Dictionary(
             uniqueKeysWithValues: ResponseOutcomeObservationV2.requiredDimensionKeys.map {
                 ($0, [OutcomeEvidenceState: Int]())
             }
         )
-        var present = 0
-        for observation in observations {
-            guard let observation else { continue }
+        mutating func add(_ observation: ResponseOutcomeObservationV2?) {
+            total += 1
+            guard let observation else { return }
             present += 1
             for dimension in ResponseOutcomeObservationV2.requiredDimensionKeys {
                 guard let state = observation.dimensionStates[dimension] else { continue }
                 distributions[dimension, default: [:]][state, default: 0] += 1
             }
         }
-        let dark = distributions.compactMap { dimension, counts -> String? in
-            guard present > 0 else { return nil }
-            let dominant = max(counts[.unknown, default: 0], counts[.censored, default: 0])
-            return dominant == present ? dimension : nil
-        }.sorted()
-        let absent = observations.count - present
-        var leads = dark.map { "\($0): this dimension has no promoter wired" }
-        for (dimension, counts) in distributions where !dark.contains(dimension) && present > 0 {
-            let terminal = counts[.observed, default: 0]
-                + counts[.verified, default: 0]
-                + counts[.notApplicable, default: 0]
-            if Double(terminal) / Double(present) < 0.05 {
-                leads.append("\(dimension): terminal evidence is sparse (\(terminal)/\(present))")
+
+        func audit(sourceStatus: String, populationNote: String? = nil) -> OutcomeDimensionStateAudit {
+            let dark = distributions.compactMap { dimension, counts -> String? in
+                guard present > 0 else { return nil }
+                let dominant = max(counts[.unknown, default: 0], counts[.censored, default: 0])
+                return dominant == present ? dimension : nil
+            }.sorted()
+            let absent = total - present
+            var leads = dark.map { "\($0): this dimension has no promoter wired" }
+            for (dimension, counts) in distributions where !dark.contains(dimension) && present > 0 {
+                let terminal = counts[.observed, default: 0]
+                    + counts[.verified, default: 0]
+                    + counts[.notApplicable, default: 0]
+                if Double(terminal) / Double(present) < 0.05 {
+                    leads.append("\(dimension): terminal evidence is sparse (\(terminal)/\(present))")
+                }
             }
-        }
-        leads.sort()
-        if absent > 0 {
-            leads.insert(
-                "outcome observation absent on \(absent) of \(observations.count) assistant rows",
-                at: 0
+            leads.sort()
+            if absent > 0 {
+                leads.insert(
+                    "outcome observation absent on \(absent) of \(total) assistant rows",
+                    at: 0
+                )
+            }
+            if let populationNote { leads.insert(populationNote, at: 0) }
+            return OutcomeDimensionStateAudit(
+                sourceStatus: sourceStatus,
+                totalRows: total,
+                absentObservations: absent,
+                distributions: distributions,
+                permanentlyNonterminalDimensions: dark,
+                rankedLeads: leads
             )
         }
-        return OutcomeDimensionStateAudit(
-            sourceStatus: sourceStatus,
-            totalRows: observations.count,
-            absentObservations: absent,
-            distributions: distributions,
-            permanentlyNonterminalDimensions: dark,
-            rankedLeads: leads
-        )
     }
 }
 
@@ -385,6 +397,10 @@ public struct OutcomeDimensionStateAudit: Sendable, Equatable {
 /// assistant rows with no decodable outcome become explicit absent
 /// observations in the audit rather than disappearing from its denominator.
 public struct OutcomeDimensionStatePopulationReader: Sendable {
+    private static let maximumCandidateFiles = 128
+    private static let maximumTranscriptBytes = 1_024 * 1_024
+    private static let maximumPopulationBytes = 16 * 1_024 * 1_024
+    private static let maximumTranscriptRows = 10_000
     private let dataRoot: URL
     private let since: Date?
 
@@ -394,6 +410,41 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
     ) {
         self.dataRoot = dataRoot
         self.since = since
+    }
+
+    private func candidateFiles(in directory: URL) throws -> (files: [(URL, Date)], count: Int) {
+        var enumerationError: Error?
+        guard let entries = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+            errorHandler: { _, error in
+                enumerationError = error
+                return false
+            }
+        ) else {
+            throw PersistenceCoreError.ioFailure("chat messages population could not be enumerated")
+        }
+        var candidates: [(URL, Date)] = []
+        var candidateCount = 0
+        for case let url as URL in entries {
+            guard url.pathExtension == "jsonl",
+                  let values = try? url.resourceValues(
+                    forKeys: [.isRegularFileKey, .contentModificationDateKey]
+                  ),
+                  values.isRegularFile == true else { continue }
+            let modified = values.contentModificationDate ?? .distantPast
+            if let since, modified < since { continue }
+            candidateCount += 1
+            candidates.append((url, modified))
+            candidates.sort { lhs, rhs in
+                if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+                return lhs.0.lastPathComponent < rhs.0.lastPathComponent
+            }
+            if candidates.count > Self.maximumCandidateFiles { candidates.removeLast() }
+        }
+        if let enumerationError { throw enumerationError }
+        return (candidates, candidateCount)
     }
 
     public func read() async throws -> OutcomeDimensionStateAudit {
@@ -409,44 +460,47 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
                 "chat messages population path is not a directory: \(directory.path)"
             )
         }
-
-        let candidates = try FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ).compactMap { url -> (URL, Date)? in
-            guard url.pathExtension == "jsonl",
-                  let values = try? url.resourceValues(
-                    forKeys: [.isRegularFileKey, .contentModificationDateKey]
-                  ),
-                  values.isRegularFile == true else { return nil }
-            return (url, values.contentModificationDate ?? .distantPast)
-        }.sorted { lhs, rhs in
-            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
-            return lhs.0.lastPathComponent < rhs.0.lastPathComponent
-        }
+        let (candidates, candidateCount) = try candidateFiles(in: directory)
 
         let history = SessionHistoryReader(dataRoot: dataRoot)
         let reactionKeys = try await OutcomeFeedbackStore(dataRoot: dataRoot)
             .reactionEvidenceKeys()
-        var observations: [ResponseOutcomeObservationV2?] = []
+        var population = OutcomeDimensionStateAudit.Population()
+        var bytesRead = 0
+        var filesRead = 0
+        var truncated = candidateCount > candidates.count
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let whole = ISO8601DateFormatter()
         for (url, _) in candidates {
+            guard bytesRead < Self.maximumPopulationBytes else {
+                truncated = true
+                break
+            }
             let sessionID = url.deletingPathExtension().lastPathComponent
-            let messages = try await history.messages(
-                forSessionId: sessionID
+            let result = try await history.messagesWithStats(
+                forSessionId: sessionID,
+                limit: Self.maximumTranscriptRows,
+                maximumBytes: min(Self.maximumTranscriptBytes, Self.maximumPopulationBytes - bytesRead)
             )
+            filesRead += 1
+            bytesRead += Int(result.stats.bytesRead)
+            let sourceSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            truncated = truncated || result.stats.truncated
+                || result.stats.malformedRowCount > 0 || result.stats.invalidShapeRowCount > 0
+                || result.stats.mode == "missing" || result.stats.mode == "read_failed"
+                || (result.stats.bytesRead == 0 && sourceSize != 0)
+            let messages = result.messages
             for (index, message) in messages.enumerated() where message.role == "assistant" {
                 if let since {
-                    let formatter = ISO8601DateFormatter()
-                    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    let timestamp = formatter.date(from: message.timestamp)
-                        ?? ISO8601DateFormatter().date(from: message.timestamp)
+                    let timestamp = fractional.date(from: message.timestamp)
+                        ?? whole.date(from: message.timestamp)
                     guard let timestamp, timestamp >= since else { continue }
                 }
                 guard case .object(let row)? = message.extras,
                       case .object(let metadata)? = row["metadata"],
                       let raw = metadata["outcomeObservation"] else {
-                    observations.append(nil)
+                    population.add(nil)
                     continue
                 }
                 let observation = ResponseOutcomeObservationV2(jsonValue: raw)
@@ -460,13 +514,18 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
                     in: messages,
                     anchoredTo: observation
                    ) {
-                    observations.append(observation.promotingReactionEvidence())
+                    population.add(observation.promotingReactionEvidence())
                 } else {
-                    observations.append(observation)
+                    population.add(observation)
                 }
             }
         }
-        return .make(observations)
+        return population.audit(
+            sourceStatus: truncated ? "truncated" : "measured",
+            populationNote: truncated
+                ? "Outcome population is incomplete: read \(filesRead) of \(candidateCount) candidate transcripts within file, row and byte limits; unreadable or malformed rows are excluded."
+                : nil
+        )
     }
 
     /// Read-side migration for outcomes written before continuation receipts
@@ -481,21 +540,17 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
         anchoredTo observation: ResponseOutcomeObservationV2
     ) -> Bool {
         let nextIndex = assistantIndex + 1
-        let requestIndex = assistantIndex - 1
-        guard messages.indices.contains(requestIndex),
+        guard messages.indices.contains(assistantIndex),
               messages.indices.contains(nextIndex) else { return false }
-        let request = messages[requestIndex]
         let next = messages[nextIndex]
-        guard request.role == "user",
-              next.role == "user",
-              case .object(let requestRow)? = request.extras,
-              requestRow["role"] == .string("user"),
-              requestRow["sessionId"] == .string(observation.sessionID),
-              case .string(let requestRunID)? = requestRow["runId"],
+        guard next.role == "user",
               case .object(let assistantRow)? = messages[assistantIndex].extras,
               assistantRow["role"] == .string("assistant"),
               assistantRow["sessionId"] == .string(observation.sessionID),
-              assistantRow["runId"] == .string(requestRunID),
+              case .string(let assistantRunID)? = assistantRow["runId"],
+              OutcomeFeedbackStore.hasOriginatingRequest(
+                in: messages[..<assistantIndex].reversed().lazy.map { $0.extras ?? .null },
+                sessionID: observation.sessionID, runID: assistantRunID),
               case .object(let row)? = next.extras,
               row["role"] == .string("user"),
               row["sessionId"] == .string(observation.sessionID),

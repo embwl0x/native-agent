@@ -168,16 +168,8 @@ public protocol CreateMissingDoctorCheck: RepairingDoctorCheck {
 
 /// SwiftNative impl never throws (the actor catches everything and reflects
 /// it as `status: "fail"`).
-///
-/// FIX-5b (2026-09-01): `checkLLM` BUYS NOTHING. No implementation has ever
-/// read it — this module deliberately makes no provider call (see the file
-/// header), so there is no LLM check for the flag to switch on. It survives
-/// only as an argument label on nine existing call sites; the user-facing
-/// claim it used to back (`chat-drive doctor --check-llm true`) is gone.
-/// Passing `true` does not probe a provider. Do not add new callers that
-/// pass it, and do not read it as permission to make a network call.
 public protocol DoctorChecksProtocol: Sendable {
-    func runAll(repair: Bool, checkLLM: Bool) async throws -> [CheckResult]
+    func runAll(repair: Bool) async throws -> [CheckResult]
     func runCheck(id: String, repair: Bool, scope: DoctorRepairScope) async throws -> CheckResult?
 }
 
@@ -919,10 +911,21 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
             )
         }
 
-        let files = ((try? FileManager.default.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: nil
-        )) ?? []).filter { $0.pathExtension == "jsonl" }
+        let files: [URL]
+        do {
+            files = try FileManager.default.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: nil
+            ).filter { $0.pathExtension == "jsonl" }
+        } catch {
+            return CheckResult(
+                id: id,
+                title: title,
+                status: "fail",
+                detail: "Could not list chat message directory: \(error.localizedDescription)",
+                repair: nil
+            )
+        }
 
         var totalLines = 0
         var malformedLines = 0
@@ -959,16 +962,13 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                 }
                 continue
             }
-            var validLines: [String] = []
             var fileMalformed = 0
             var fileTotal = 0
             for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
                 let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
                 if line.isEmpty { continue }
                 fileTotal += 1
-                if let data = line.data(using: .utf8), (try? JSONValue.parse(data)) != nil {
-                    validLines.append(line)
-                } else {
+                if (try? JSONValue.parse(Data(line.utf8))) == nil {
                     fileMalformed += 1
                 }
             }
@@ -987,9 +987,17 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                 malformedFiles.append(file)
                 if replaceExisting {
                     do {
-                        _ = try DoctorFileRepair.backupExistingFile(file)
-                        let repairedText = validLines.isEmpty ? "" : validLines.joined(separator: "\n") + "\n"
-                        try Data(repairedText.utf8).write(to: file, options: [.atomic])
+                        try await SwiftNativePersistenceCore().withFileLock(file) {
+                            // Re-read under the same lock as message appenders;
+                            // the diagnostic scan may predate a committed reply.
+                            let current = try String(contentsOf: file, encoding: .utf8)
+                            let validLines = current.split(separator: "\n").map {
+                                String($0).trimmingCharacters(in: .whitespacesAndNewlines)
+                            }.filter { !$0.isEmpty && (try? JSONValue.parse(Data($0.utf8))) != nil }
+                            _ = try DoctorFileRepair.backupExistingFile(file)
+                            let repairedText = validLines.isEmpty ? "" : validLines.joined(separator: "\n") + "\n"
+                            try Data(repairedText.utf8).write(to: file, options: [.atomic])
+                        }
                         repairedFiles.append(file.lastPathComponent)
                     } catch {
                         return CheckResult(
@@ -1169,9 +1177,14 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
            let skips = try? JSONDecoder().decode([String: String].self, from: data) {
             let groups = skips.keys.filter { !$0.hasPrefix("_") }.sorted()
             if !groups.isEmpty {
+                // Named with why, so a group that never reached the phone says
+                // so instead of only that it is old.
+                let byReason = Dictionary(grouping: groups) { String(skips[$0, default: ""].prefix(160)) }
                 warnings.append(
                     "iPhone is showing stale \(groups.joined(separator: ", ")) — the last snapshot pass could not "
-                    + "build \(groups.count == 1 ? "that group" : "those groups")."
+                    + "build or publish \(groups.count == 1 ? "that group" : "those groups"): "
+                    + byReason.keys.sorted().map { "\(byReason[$0, default: []].joined(separator: ", ")) (\($0))" }
+                        .joined(separator: "; ") + "."
                 )
             }
         }
@@ -1352,9 +1365,6 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
 /// needing provider access or an LLM. Repair mode is intentionally conservative:
 /// it creates missing app-owned directories/default JSON, backs up malformed
 /// files before rewriting, and stops only the retired external-runtime process.
-/// `checkLLM` is accepted for source compatibility with existing call sites
-/// and is IGNORED — it has never selected any behavior (see FIX-5b on
-/// `DoctorChecksProtocol`).
 /// 2026-07-12 (User's broken-panel incident): the memory stack panel showed
 /// "Core ML MiniLM BROKEN" while Doctor reported all-green — Doctor never
 /// probed the embedder. This check ACTUALLY LOADS the bundled MiniLM through
@@ -1433,7 +1443,7 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
             return CheckResult(
                 id: id, title: title, status: "fail",
                 detail: "\(Self.resolvedModelID) failed to load: \(String(describing: error)). Semantic recall is degraded until this is repaired. \(floor)",
-                repair: nil
+                repair: "Run Repair Safe Issues to clear the Core ML compile cache and retry loading the model."
             )
         }
     }
@@ -1670,8 +1680,9 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
                     asks.append(credential.signIn)
                     continue
                 }
+                // Refreshable is normal (it renews on next use): not a finding, or
+                // she reads it as signed out and asks User to sign in again.
                 guard repair else {
-                    findings.append("\(credential.name) \(reason); its credential owner can attempt a refresh.")
                     refreshable = true
                     continue
                 }
@@ -1781,9 +1792,7 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         self.checks = checks
     }
 
-    public func runAll(repair: Bool, checkLLM: Bool) async throws -> [CheckResult] {
-        // Note: checkLLM intentionally unused — see class docstring.
-        //
+    public func runAll(repair: Bool) async throws -> [CheckResult] {
         // Bulk repairs have no button authority: only create missing files
         // or refresh OAuth through its owner, sequentially. File replacement
         // requires runCheck with explicit button scope.

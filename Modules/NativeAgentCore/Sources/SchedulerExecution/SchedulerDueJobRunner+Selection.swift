@@ -40,14 +40,6 @@ extension SchedulerDueJobRunner {
         return earliestFuture.map { Date(timeIntervalSince1970: $0) }
     }
 
-    func selectDueJobs(now: Date, maxJobs: Int) async throws -> [DueJob] {
-        let nowEpoch = now.timeIntervalSince1970
-        let rows = try await persistence.withFileLock(jobsPath) {
-            try Self.readJobRowsChecked(at: jobsPath)
-        }
-        return Self.dueJobs(in: rows, nowEpoch: nowEpoch, maxJobs: maxJobs)
-    }
-
     /// Atomically selects and claims scheduled occurrences before any effect
     /// executes. A claim surviving process restart is an ambiguous outcome,
     /// not permission to repeat a notification, connector action, Desk task,
@@ -133,7 +125,7 @@ extension SchedulerDueJobRunner {
             // canonical state for nothing and gave a read-only pass a write's
             // failure surface.
             if !claimed.isEmpty {
-                try await persistence.writeJSON(.array(rows), to: jobsPath)
+                try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
             }
             return ClaimedDueJobs(jobs: claimed, recoveredUnknown: recovered)
         }
@@ -178,7 +170,7 @@ extension SchedulerDueJobRunner {
             // the same occurrence through catch-up logic.
             Self.clearRetryState(&object)
             rows[index] = .object(object)
-            try await persistence.writeJSON(.array(rows), to: jobsPath)
+            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
         }
     }
 
@@ -224,9 +216,10 @@ extension SchedulerDueJobRunner {
         return due.prefix(max(0, maxJobs)).map(\.job)
     }
 
-    /// - Parameter reactivateCancelled: when true, a user-cancelled default
-    ///   cycle job (enabled=false + cancelledAt tombstone) is re-enabled and
-    ///   the tombstone stripped. Only the EXPLICIT user re-enable action
+    /// - Parameter reactivateCancelled: when true, a user-cancelled nightly
+    ///   dream job (enabled=false + cancelledAt tombstone) is re-enabled and
+    ///   the tombstone stripped. Dream only: re-adding the nightly reflection
+    ///   says nothing about a weekly REM job someone cancelled. Only the EXPLICIT user re-enable action
     ///   (AppModel.createDreamJob) passes true; the passive due-job bootstrap
     ///   pass keeps false so a cancelled job is not silently resurrected.
     public func ensureDefaultCycleJobs(now: Date, reactivateCancelled: Bool = false) async throws -> [String] {
@@ -249,13 +242,11 @@ extension SchedulerDueJobRunner {
             var rows = try Self.readJobRowsChecked(at: jobsPath)
             var repaired: [String] = []
 
-            let dreamRanToday = Self.containsLastRunToday(rows: rows, kind: "dream", dateKey: runDateKey)
+            // Failed dream attempts settle this day's catch-up too. Only the
+            // retry policy may schedule another attempt after a failure.
+            let dreamRanToday = Self.containsLastRunToday(rows: rows, kind: "dream", dateKey: runDateKey, includingFailed: true)
             let remRanToday = Self.containsLastRunToday(rows: rows, kind: "rem", dateKey: runDateKey)
-            // FIX 2 (A4.4): once the dream job is PARKED for the day (retry cap
-            // reached), catch-up must stay disarmed even though a failed run
-            // does not count as "ran today" — otherwise the park would re-arm
-            // the ≈now catch-up stamp and revive the storm the park exists to
-            // stop. The park self-clears when the day rolls over.
+            // The daily retry cap also disarms catch-up until the day rolls over.
             let dreamParkedToday = Self.containsRetryParkedToday(rows: rows, kind: "dream", dateKey: runDateKey)
             let dreamCatchUp = scheduledDreamTimePassed && !dreamAlreadyHasEntry && !dreamRanToday && !dreamParkedToday
             let remCatchUp = scheduledREMTimePassed && !remRanToday
@@ -302,14 +293,13 @@ extension SchedulerDueJobRunner {
                 objective: "Scheduled REM consolidation",
                 extraPayload: [:],
                 nextRunEpoch: remNext,
-                now: now,
-                reactivateCancelled: reactivateCancelled
+                now: now
             ) {
                 repaired.append(remCatchUp ? "\(remJobName) (catch-up due now)" : remJobName)
             }
 
             if !repaired.isEmpty {
-                try await persistence.writeJSON(.array(rows), to: jobsPath)
+                try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
             }
             return repaired
         }

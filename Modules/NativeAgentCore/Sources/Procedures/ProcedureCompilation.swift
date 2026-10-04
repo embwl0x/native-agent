@@ -869,10 +869,11 @@ public struct ProcedureTransitionRule: Codable, Sendable, Equatable {
 }
 
 public struct DeclarativeProcedureArtifact: Codable, Sendable, Equatable, Identifiable {
-    public static let schema = "declarative-procedure-transition-table.v1"
+    public static let schema = "declarative-procedure-transition-table.v2"
+    static let legacySchema = "declarative-procedure-transition-table.v1"
 
-    public let schema: String
-    public let id: String
+    public private(set) var schema: String
+    public private(set) var id: String
     public let interpretation: String
     public let sourceTrajectoryIdentities: [String]
     public let domain: String
@@ -890,6 +891,56 @@ public struct DeclarativeProcedureArtifact: Codable, Sendable, Equatable, Identi
     public let canaryEligible: Bool
     public let automaticSelectionEligible: Bool
     public let generatedExecutableCode: Bool
+
+    /// Bind all semantic and approval fields using the same encoding on both paths.
+    func canonicalIdentity() throws -> String {
+        var unsigned = self
+        unsigned.id = ""
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return CausalTransitionEvidence.opaqueIdentity(
+            String(decoding: try encoder.encode(unsigned), as: UTF8.self)
+        )
+    }
+
+    func withCanonicalIdentity() throws -> Self {
+        var artifact = self
+        artifact.id = try canonicalIdentity()
+        return artifact
+    }
+
+    /// The original v1 fingerprint omitted some semantic and approval fields.
+    /// Recognition alone never admits it for execution.
+    func legacyIdentity() -> String {
+        let fingerprint = [
+            procedureShapeIdentity,
+            domain,
+            inputContract.taskFamily,
+            inputContract.inputClass,
+            authorityClass,
+            inputContract.acceptedParameterSchemaIdentities.joined(separator: ","),
+            transitionTable.map {
+                "\($0.sequence)|\($0.beforeState ?? "nil")|\($0.onTransitionKind)|"
+                    + "\($0.actionKind ?? "nil")|\($0.requiredEvidenceKind ?? "nil")|"
+                    + "\($0.externalEffectClass)|\($0.afterState ?? "nil")|"
+                    + "\($0.terminalClass?.rawValue ?? "nil")"
+            }.joined(separator: ">"),
+            reviewerDecision.reviewerIdentity,
+            reviewerDecision.decidedAt,
+        ].joined(separator: "||")
+        return CausalTransitionEvidence.opaqueIdentity(fingerprint)
+    }
+
+    var requiresLegacyRevalidation: Bool {
+        schema == Self.legacySchema && id != (try? canonicalIdentity())
+    }
+
+    func withLegacyIdentity() -> Self {
+        var artifact = self
+        artifact.schema = Self.legacySchema
+        artifact.id = artifact.legacyIdentity()
+        return artifact
+    }
 }
 
 public enum ProcedureCompilationError: Error, Equatable {
@@ -953,22 +1004,9 @@ public enum DeclarativeProcedureCompiler {
             permissionAuthority: false,
             automaticActivationAllowed: false
         )
-        let fingerprint = [
-            trajectory.procedureShapeIdentity,
-            trajectory.domain,
-            trajectory.taskFamily,
-            trajectory.inputClass,
-            trajectory.authorityClass,
-            schemas.joined(separator: ","),
-            table.map {
-                "\($0.sequence)|\($0.beforeState ?? "nil")|\($0.onTransitionKind)|\($0.actionKind ?? "nil")|\($0.requiredEvidenceKind ?? "nil")|\($0.externalEffectClass)|\($0.afterState ?? "nil")|\($0.terminalClass?.rawValue ?? "nil")"
-            }.joined(separator: ">"),
-            review.reviewerIdentity,
-            review.decidedAt,
-        ].joined(separator: "||")
-        return DeclarativeProcedureArtifact(
+        return try DeclarativeProcedureArtifact(
             schema: DeclarativeProcedureArtifact.schema,
-            id: CausalTransitionEvidence.opaqueIdentity(fingerprint),
+            id: "",
             interpretation: "trusted_declarative_transition_table_v1",
             sourceTrajectoryIdentities: Array(candidate.sourceTrajectories.map(\.id).sorted().prefix(64)),
             domain: trajectory.domain,
@@ -992,6 +1030,6 @@ public enum DeclarativeProcedureCompiler {
             canaryEligible: candidate.canaryEligible,
             automaticSelectionEligible: false,
             generatedExecutableCode: false
-        )
+        ).withCanonicalIdentity()
     }
 }

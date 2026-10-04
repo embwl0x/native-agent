@@ -182,10 +182,9 @@ final class DelegationFileCache: @unchecked Sendable {
 //   shape: id, phase, createdAt, threadId, turnId, clientUserMessageId,
 //          entries[].payload.topic, boundAt, lastWait.observedAt,
 //          completedExecution.turnResult{status, completedAt, message, ...}.
-//   MISSING vs claude: no startedAt, no deadlineAt, no stallSeconds, no
-//          heartbeat. So `stalled` is NOT COMPUTABLE for codex jobs — we say
-//          so via `stall_basis: "none"` rather than reporting a confident
-//          `false` that reads like "verified healthy".
+//   stallProbe carries measured rollout mtime, idleThresholdMs and activity.
+//   lastWait.observedAt proves watcher activity only, never execution progress.
+//   Legacy jobs without measured evidence retain stall_basis: "none".
 //
 // OMP — script/omp_thread_wakeup.js
 //   dir:   ~/.config/omp-bridge/wake-jobs/*.json
@@ -215,6 +214,8 @@ public struct DelegationJobProjection: Sendable, Equatable {
         /// BEFORE it awaits the bridge POST, so a worker that dies there leaves
         /// a record that says the run is over and never settles.
         case deliveryStall = "delivery_stall"
+        case rolloutIdle = "rollout_idle"
+        case recordedStall = "recorded_stall"
     }
 
     public var id: String
@@ -251,8 +252,12 @@ public struct DelegationJobProjection: Sendable, Equatable {
     public var createdAt: String?
     public var claimedAt: String?
     public var startedAt: String?
-    /// max(heartbeatAt, progressAt) for claude; lastWait.observedAt for codex.
+    /// max(heartbeatAt, progressAt) for claude; measured rollout write for codex.
     public var lastLiveness: String?
+    public var watcherObservedAt: String? = nil
+    public var toolActivityCount: Int? = nil
+    public var noWorkObserved: Bool? = nil
+    public var recoveryStatus: String? = nil
     public var completedAt: String?
     /// Wall-clock seconds from the earliest known start (startedAt ?? claimedAt
     /// ?? createdAt) to completedAt, or to `now` while the job is still open.
@@ -326,6 +331,10 @@ public struct DelegationJobProjection: Sendable, Equatable {
         put("claimed_at", claimedAt)
         put("started_at", startedAt)
         put("last_liveness", lastLiveness)
+        put("watcher_observed_at", watcherObservedAt)
+        put("recovery_status", recoveryStatus)
+        if let toolActivityCount { obj["tool_activity_count"] = .int(Int64(toolActivityCount)) }
+        if let noWorkObserved { obj["no_work_observed"] = .bool(noWorkObserved) }
         put("completed_at", completedAt)
         put("completion_text_head", completionTextHead)
         put("request_text_head", requestTextHead)
@@ -372,6 +381,9 @@ public struct DelegationJobProjection: Sendable, Equatable {
         put("status", status)
         put("run_status", runStatus)
         put("last_liveness", lastLiveness)
+        put("recovery_status", recoveryStatus)
+        if let toolActivityCount { obj["tool_activity_count"] = .int(Int64(toolActivityCount)) }
+        if let noWorkObserved { obj["no_work_observed"] = .bool(noWorkObserved) }
         put("completed_at", completedAt)
         put("completion_text_head", completionTextHead)
         put("execution_error", executionError)
@@ -556,9 +568,14 @@ public struct DelegationStatusProjector: Sendable {
             codexRows[key] = retained
         }
         for key in Array(codexRows.keys) {
-            guard let receipt = deliveries.byID[key] else { continue }
-            if codexRows[key]?.deliveryOutcome != "unknown" || receipt.deliveryOutcome == "delivered"
-                || deliveries.deliveredIDs.contains(key) {
+            guard let job = codexRows[key], !job.acceptedMessageIDs.isEmpty,
+                  let thread = job.recordedThreadID, let turn = job.recordedTurnID else { continue }
+            let reconciled = job.acceptedMessageIDs.allSatisfy { id in
+                guard let receipt = deliveries.byID[id], receipt.recordedThreadID == thread,
+                      receipt.recordedTurnID == turn else { return false }
+                return job.deliveryOutcome != "unknown" || receipt.deliveryOutcome == "delivered"
+            }
+            if reconciled {
                 codexRows.removeValue(forKey: key)
             }
         }
@@ -578,14 +595,14 @@ public struct DelegationStatusProjector: Sendable {
         let capacity = limit.map { offset > Int.max - $0 ? Int.max : offset + $0 } ?? Int.max
         if agent == nil || agent == "codex" {
             if let messageID {
-                if let row = deliveries.byID[messageID], codexRows[row.id] == nil, matches(row) {
+                if let row = deliveries.byID[messageID], matches(row) {
                     matchedCount += 1
                     rows.append(row)
                 }
             } else {
-                matchedCount += deliveries.byID.count - codexRows.keys.filter { deliveries.byID[$0] != nil }.count
+                matchedCount += deliveries.byID.count
                 var selected = 0
-                for row in deliveries.ordered where codexRows[row.id] == nil {
+                for row in deliveries.ordered {
                     if selected >= capacity { break }
                     rows.append(row)
                     selected += 1
@@ -853,21 +870,30 @@ public struct DelegationStatusProjector: Sendable {
         let completedAt = string(turnResult, "completedAt")
         let runStatus = string(turnResult, "status")
 
-        // lastWait is rewritten on every bounded wait interval that did NOT
-        // observe a terminal turn — i.e. it is exactly a liveness beacon.
+        var probe: [String: JSONValue] = [:]
+        if case .object(let value)? = job["stallProbe"] { probe = value }
+        var watcherObservedAt: String?
+        if case .object(let wait)? = job["lastWait"] { watcherObservedAt = string(wait, "observedAt") }
         var liveness: String?
-        if case .object(let wait)? = job["lastWait"] { liveness = string(wait, "observedAt") }
+        if case .object(let snapshot)? = probe["rolloutSnapshot"],
+           let mtime = number(snapshot, "mtimeMs"), mtime.isFinite {
+            liveness = withFraction.string(from: Date(timeIntervalSince1970: mtime / 1000))
+        }
 
         let start = firstDate(claimedAt, createdAt)
         let end = date(completedAt) ?? now
         let elapsed = start.map { Int(max(0, end.timeIntervalSince($0)).rounded()) }
 
-        // The codex record carries NO deadline and NO stall threshold, so a
-        // stall verdict here would be invented. Terminal jobs still resolve.
         let terminal = completedAt != nil || !turnResult.isEmpty
-        let (stalled, basis, stallDeadline) = stallVerdict(
-            terminal: terminal, deadlineAt: nil, stallSeconds: nil, lastLiveness: liveness, now: now
+        let (idleStalled, idleBasis, stallDeadline) = stallVerdict(
+            terminal: terminal, deadlineAt: nil,
+            stallSeconds: number(probe, "idleThresholdMs").map { $0 / 1000 },
+            lastLiveness: liveness, now: now
         )
+        let recordedStall = runStatus == "stalled" || runStatus == "failed_hung"
+        let stalled = recordedStall || idleStalled
+        let basis: DelegationJobProjection.StallBasis = recordedStall ? .recordedStall
+            : idleBasis == .stallSeconds ? .rolloutIdle : idleBasis
         var recordedDeliveryStatus: String?
         var recordedDeliveryOutcome: String?
         if case .object(let delivery)? = job["delivery"] {
@@ -918,7 +944,12 @@ public struct DelegationStatusProjector: Sendable {
             producerSourceRevision: codexProducerSourceRevision(job),
             stallDeadline: stallDeadline
         )
-        row.recencyKey = firstDate(completedAt, liveness, claimedAt, createdAt)
+        row.recencyKey = firstDate(completedAt, watcherObservedAt, liveness, claimedAt, createdAt)
+        row.watcherObservedAt = watcherObservedAt
+        let evidence = terminal ? turnResult : probe
+        row.toolActivityCount = int(evidence, "toolActivityCount")
+        row.noWorkObserved = bool(evidence, "noWorkObserved")
+        if case .object(let recovery)? = turnResult["hangRecovery"] { row.recoveryStatus = string(recovery, "status") }
         row.executionError = Self.codexExecutionError(turnResult)
         row.recordKind = undelivered ? "retained_reply_job" : "reply_job"
         Self.retainReply(string(turnResult, "message") ?? string(turnResult, "lastAgentMessage"), truncated: false, in: &row)
@@ -988,8 +1019,8 @@ public struct DelegationStatusProjector: Sendable {
                     lastLiveness: nil,
                     completedAt: completedAt,
                     elapsedSeconds: nil,
-                    stalled: false,
-                    stallBasis: .terminal,
+                    stalled: runStatus == "stalled" || runStatus == "failed_hung",
+                    stallBasis: runStatus == "stalled" || runStatus == "failed_hung" ? .recordedStall : .terminal,
                     deliveryLost: outcome == "lost" ? true : nil,
                     deliveryOutcome: outcome,
                     completionTextHead: head(completion),
@@ -999,6 +1030,9 @@ public struct DelegationStatusProjector: Sendable {
                 )
                 row.recencyKey = date(completedAt)
                 row.executionError = Self.codexExecutionError(turnResult)
+                row.toolActivityCount = int(turnResult, "toolActivityCount")
+                row.noWorkObserved = bool(turnResult, "noWorkObserved")
+                if case .object(let recovery)? = turnResult["hangRecovery"] { row.recoveryStatus = string(recovery, "status") }
                 row.recordKind = "delivery_receipt"
                 row.agentReplyTextHead = head(string(turnResult, "messagePreview"))
                 Self.retainReply(string(turnResult, "agentReplyText") ?? string(turnResult, "messagePreview"),

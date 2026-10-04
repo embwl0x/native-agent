@@ -675,6 +675,10 @@ public actor ContextPrewarmPlanner {
         )
     }
 
+    public func validPlanIDs(_ plans: [ContextPrewarmPlan]) -> Set<String> {
+        Set(plans.filter { !validate($0).validItems.isEmpty }.map(\.id))
+    }
+
     @discardableResult
     public func recordUsefulness(
         for plan: ContextPrewarmPlan,

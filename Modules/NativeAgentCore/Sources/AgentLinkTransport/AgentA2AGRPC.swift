@@ -9,14 +9,15 @@ import PersistenceCore
 /// receipts. Task ownership, continuation and stream recovery stay with A2A.
 enum AgentA2AGRPC {
     static func send(_ request: AgentA2AWire.Request, bearerToken: String?,
-                     timeout: TimeInterval) async throws -> AgentPeerHTTP.Response {
+                     timeout: TimeInterval, liveUpdate: AgentPeerHTTP.LiveUpdateHandler?) async throws -> AgentPeerHTTP.Response {
         try AgentPeerHTTP.validateURL(request.url)
         guard let method = request.grpcMethod, let host = request.url.host,
               request.url.query == nil, ["", "/"].contains(request.url.path),
               timeout.isFinite, timeout > 0, timeout <= 600 else {
             throw AgentPeerHTTP.TransportError.invalidRequest
         }
-        let port = request.url.port ?? (request.url.scheme == "https" ? 443 : 80)
+        let scheme = request.url.scheme?.lowercased()
+        let port = request.url.port ?? (scheme == "https" ? 443 : 80)
         guard (1...65535).contains(port) else { throw AgentPeerHTTP.TransportError.invalidURL }
         var metadata: Metadata = ["a2a-version": "1.0"]
         if let bearerToken {
@@ -33,7 +34,7 @@ enum AgentA2AGRPC {
         // No retry policy: a lost reply must never replay an accepted send.
         let transport = try HTTP2ClientTransport.TransportServices(
             target: .dns(host: host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")), port: port),
-            transportSecurity: request.url.scheme == "https" ? .tls : .plaintext)
+            transportSecurity: scheme == "https" ? .tls : .plaintext)
         let callMetadata = metadata
         let callOptions = options
         do {
@@ -42,7 +43,7 @@ enum AgentA2AGRPC {
                 case "SendMessage":
                     return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SendMessageRequest.self, Lf_A2a_V1_SendMessageResponse.self)
                 case "SendStreamingMessage":
-                    return try await stream(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SendMessageRequest.self)
+                    return try await stream(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SendMessageRequest.self, request, bearerToken, liveUpdate)
                 case "GetTask":
                     return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_GetTaskRequest.self, Lf_A2a_V1_Task.self)
                 case "ListTasks":
@@ -50,7 +51,7 @@ enum AgentA2AGRPC {
                 case "CancelTask":
                     return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_CancelTaskRequest.self, Lf_A2a_V1_Task.self)
                 case "SubscribeToTask":
-                    return try await stream(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SubscribeToTaskRequest.self)
+                    return try await stream(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SubscribeToTaskRequest.self, request, bearerToken, liveUpdate)
                 case "CreateTaskPushNotificationConfig":
                     return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_TaskPushNotificationConfig.self, Lf_A2a_V1_TaskPushNotificationConfig.self)
                 case "GetTaskPushNotificationConfig":
@@ -92,13 +93,27 @@ enum AgentA2AGRPC {
 
     private static func stream<Input: SwiftProtobuf.Message>(
         _ client: GRPCClient<HTTP2ClientTransport.TransportServices>, _ method: String,
-        _ json: String, _ metadata: Metadata, _ options: CallOptions, _ input: Input.Type
+        _ json: String, _ metadata: Metadata, _ options: CallOptions, _ input: Input.Type,
+        _ request: AgentA2AWire.Request, _ bearerToken: String?,
+        _ liveUpdate: AgentPeerHTTP.LiveUpdateHandler?
     ) async throws -> AgentPeerHTTP.Response {
-        try await client.serverStreaming(request: ClientRequest(message: Input(jsonString: json), metadata: metadata),
+        guard let interface = request.streamInterface else { throw AgentPeerHTTP.TransportError.invalidRequest }
+        let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
+        if let liveUpdate {
+            let (updates, feed) = AsyncStream.makeStream(of: AgentA2AStream.LiveUpdate.self, bufferingPolicy: .bufferingNewest(1))
+            liveFeed = feed
+            Task {
+                for await update in updates { await liveUpdate(update) }
+            }
+        } else { liveFeed = nil }
+        defer { liveFeed?.finish() }
+        return try await client.serverStreaming(request: ClientRequest(message: Input(jsonString: json), metadata: metadata),
             descriptor: descriptor(method), serializer: ProtobufSerializer<Input>(),
             deserializer: ProtobufDeserializer<Lf_A2a_V1_StreamResponse>(), options: options) { response in
                 var events: [JSONValue] = []
                 var bytes = 0
+                var accumulator = AgentA2AStream.Accumulator(interface: interface, requestID: request.requestID,
+                    expectedTaskID: request.expectedTaskID, bearerToken: bearerToken)
                 do {
                     // Pull one event at a time; HTTP/2 applies receive backpressure.
                     for try await message in response.messages {
@@ -106,7 +121,10 @@ enum AgentA2AGRPC {
                         let data = try message.jsonUTF8Data()
                         guard data.count <= AgentPeerHTTP.maximumResponseBytes - bytes else { throw AgentPeerHTTP.TransportError.tooLarge }
                         bytes += data.count
-                        events.append(try JSONValue.parse(data))
+                        let event = try JSONValue.parse(data)
+                        events.append(event)
+                        let update = try accumulator.receive(event)
+                        liveFeed?.yield(update)
                     }
                 } catch let error as RPCError where !events.isEmpty && !Task.isCancelled &&
                     (error.code == .unavailable || error.code == .deadlineExceeded || error.code == .cancelled) {

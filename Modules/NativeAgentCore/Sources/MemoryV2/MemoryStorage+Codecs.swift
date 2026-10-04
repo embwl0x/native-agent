@@ -23,6 +23,10 @@ extension MemoryStorage {
 
     // MARK: - Helpers
 
+    static func contentFingerprint(_ content: String) -> String {
+        SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     public static func contentHash(_ s: String) -> String {
         let normalized = s.lowercased()
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -83,9 +87,9 @@ extension MemoryStorage {
         return s
     }
 
-    private static func decodeMetadata(_ s: String?) -> JSONValue? {
-        guard let s, let data = s.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(JSONValue.self, from: data)
+    private static func decodeMetadata(_ s: String?) throws -> JSONValue? {
+        guard let s else { return nil }
+        return try JSONDecoder().decode(JSONValue.self, from: Data(s.utf8))
     }
 
     static func decodeMemory(_ row: Row) throws -> StoredMemory {

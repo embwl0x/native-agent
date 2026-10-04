@@ -182,8 +182,10 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         }
         let coverageDetail = coverageParts.isEmpty ? "" : " " + coverageParts.joined(separator: "; ") + "."
 
+        // No graded turns yet: a fresh mind at rest is not a stuck rail, so only a fail shows.
+        let ungradedChemLevel = chemistryLine(chemistry).level.flatMap { $0 == "fail" ? $0 : nil }
         if summary.isEmptyFeed {
-            let level = chemistryLine(chemistry).level
+            let level = ungradedChemLevel
             return CheckResult(
                 id: id, title: title, status: level ?? "ok",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
@@ -195,7 +197,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             )
         }
         guard !eligibleTurns.isEmpty else {
-            let level = chemistryLine(chemistry).level ?? (summary.malformedLines > 0 ? "warn" : "ok")
+            let level = ungradedChemLevel ?? (summary.malformedLines > 0 ? "warn" : "ok")
             return CheckResult(
                 id: id, title: title,
                 // Keep actual observation faults visible; tailing alone is not one yet.
@@ -285,7 +287,6 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             }
         } else {
             parts.append("felt vocabulary UNMEASURED — no turn yielded a readable feeling line")
-            if eligibleTurns.count >= minimumRateTurns { raise("warn") }
         }
 
         // 3. The Sound rut line.
@@ -311,7 +312,6 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             }
         } else {
             parts.append("Sound line UNMEASURED — no turn yielded a readable Sound line")
-            if eligibleTurns.count >= minimumRateTurns { raise("warn") }
         }
 
         // 4. Inner-line variety.
@@ -332,10 +332,11 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             )
         }
 
-        // 5. Organism chemistry.
+        // 5. Organism chemistry. A fresh mind starts at rest (0 is where it begins, not a
+        // stuck rail), so like the rates above it is graded only past the turn floor.
         let chemLine = chemistryLine(chemistry)
         parts.append(chemLine.sentence)
-        if let level = chemLine.level {
+        if let level = chemLine.level, level == "fail" || eligibleTurns.count >= minimumRateTurns {
             raise(level)
             if let repair = chemLine.repair { repairs.append(repair) }
         }

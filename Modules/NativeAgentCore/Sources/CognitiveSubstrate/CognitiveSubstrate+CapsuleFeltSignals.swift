@@ -16,6 +16,9 @@ extension CognitiveSubstrate {
         var family: String
         var carriedObject: Bool
         var carriedAmbivalence: Bool
+        /// The line as the capsule SPEAKS it (Phase 5A): no "— <object>". The
+        /// object stays in `text` because Reminded-of queries with it.
+        var bareText: String = ""
     }
 
     /// The nodes that TINT the fingerprint: the top of the capsule-eligible
@@ -367,7 +370,8 @@ extension CognitiveSubstrate {
             text: CognitiveSubstrate.feltLineText(parts: rendered, object: object, second: second),
             family: parts.family,
             carriedObject: object != nil,
-            carriedAmbivalence: second != nil)
+            carriedAmbivalence: second != nil,
+            bareText: CognitiveSubstrate.feltLineText(parts: rendered, object: nil, second: second))
     }
 
     /// The live FeltSignals the fingerprint is built from — extracted so tests can read
@@ -598,29 +602,34 @@ extension CognitiveSubstrate {
     /// (a snapshot would ADVANCE decay, and a felt read must never age her
     /// memory — the same rule `derivedMood` and `feltDaySummary` follow).
     ///
-    /// Returns nil when the workspace is empty: nothing held means no honest
-    /// read on novelty, not "incurious".
+    /// Returns nil when no held node has an identifiable topic: no topic means
+    /// no honest read on novelty, not "incurious".
     func substrateCuriosityProxy(from workspaceItems: [CognitiveWorkspaceItem], at now: Date) -> Double? {
         let held = workspaceItems.prefix(6).map(\.node)
-        guard !held.isEmpty else { return nil }
+        let heldTopics = held.compactMap { node -> String? in
+            let key = Self.feltAboutnessKey(for: node)
+            return key.hasPrefix("topic|") ? key : nil
+        }
+        guard !heldTopics.isEmpty else { return nil }
 
-        // Everything the field has seen, keyed the way the workspace keys it.
+        // Use the same topic identity across turns; message IDs are unique even
+        // when ordinary chat returns to something familiar.
         let heldIds = Set(held.map(\.id))
         var seenSubjects: [String: Double] = [:]
         for node in field.peekDecayedNodes(at: now) where !heldIds.contains(node.id) {
-            let key = "\(node.subjectReference.type)|\(node.subjectReference.id)"
+            let key = Self.feltAboutnessKey(for: node)
+            guard key.hasPrefix("topic|") else { continue }
             seenSubjects[key] = max(seenSubjects[key] ?? 0, node.activation)
         }
 
         var novelty = 0.0
-        for node in held {
-            let key = "\(node.subjectReference.type)|\(node.subjectReference.id)"
+        for key in heldTopics {
             // A familiar subject that is strongly activated is the LEAST novel;
             // a familiar-but-cold one is partway back to new.
             let familiarity = seenSubjects[key] ?? 0
             novelty += (1 - familiarity.clamped01())
         }
-        return (novelty / Double(held.count)).clamped01()
+        return (novelty / Double(heldTopics.count)).clamped01()
     }
 
     /// CLARITY ← the inverse of uncertainty, docked for an unresolved question.

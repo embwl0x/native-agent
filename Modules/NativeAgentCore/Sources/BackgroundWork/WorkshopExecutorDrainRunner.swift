@@ -23,6 +23,7 @@ public struct WorkshopExecutorDrainRunner: EventDeadlineLoopRunner {
     public func physiologyEvents() -> AsyncStream<Void> {
         EventDeadlinePhysiology.storeAndFileEvents(paths: [
             dataRoot.appendingPathComponent("workshop/executions", isDirectory: true),
+            dataRoot.appendingPathComponent("trust/policy.json"),
         ], loopId: loopId)
     }
 

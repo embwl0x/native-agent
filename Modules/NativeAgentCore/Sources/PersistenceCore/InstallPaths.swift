@@ -100,7 +100,6 @@ public struct InstallPaths: Sendable {
     public func bridgeEnvironment(configRoot: URL) -> [String: String] {
         let claude = configRoot.appendingPathComponent("claude-bridge")
         return [
-            "NATIVE_AGENT_CLAUDE_BRIDGE_DIR": claude.path,
             "NATIVE_AGENT_RETURN_BRIDGE_DIR": claude.path,
             "NATIVE_AGENT_CODEX_BRIDGE_DESCRIPTOR_PATH": claude.appendingPathComponent("bridge.json").path,
             "NATIVE_AGENT_CODEX_BRIDGE_TOKEN_PATH": claude.appendingPathComponent("token").path,

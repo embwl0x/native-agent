@@ -8,7 +8,10 @@ enum SlackInboundDeliveryPhase: String, Codable, Sendable {
     case prepared
     case dispatching
     case delivered
+    case interrupted
     case outcomeUnknown = "outcome_unknown"
+
+    var isTerminal: Bool { self == .delivered || self == .interrupted }
 }
 
 struct SlackPreparedUpload: Codable, Equatable, Sendable {
@@ -206,7 +209,7 @@ public actor SlackInboundDeliveryJournal {
         let quarantined = quarantinedEvidencePaths(dataRoot: dataRoot).count
         guard existed || quarantined > 0 else { return nil }
         return RecoverySummary(
-            pendingCount: file.records.filter { $0.phase != .delivered }.count,
+            pendingCount: file.records.filter { !$0.phase.isTerminal }.count,
             unknownCount: file.records.filter { $0.phase == .outcomeUnknown }.count,
             pendingLimit: max(1, file.pendingLimit ?? 100),
             quarantinedCount: quarantined
@@ -232,9 +235,9 @@ public actor SlackInboundDeliveryJournal {
         try CredentialFileLock.withLock(path) {
             var file = try load()
             if let existing = file.records.first(where: { $0.inbound.eventId == inbound.eventId }) {
-                return existing.phase == .delivered ? .alreadyDelivered : .claimed(existing)
+                return existing.phase.isTerminal ? .alreadyDelivered : .claimed(existing)
             }
-            let pending = file.records.filter { $0.phase != .delivered }.count
+            let pending = file.records.filter { !$0.phase.isTerminal }.count
             guard pending < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
             let record = SlackInboundDeliveryRecord(
                 inbound: SlackDurableInboundPayload(inbound),
@@ -266,7 +269,7 @@ public actor SlackInboundDeliveryJournal {
             guard !file.botEventClaims.contains(eventId) else { return false }
             file.botEventClaims.append(eventId)
             if file.botEventClaims.count > Self.botEventClaimCap {
-                let unresolved = Set(file.records.filter { $0.phase != .delivered }
+                let unresolved = Set(file.records.filter { !$0.phase.isTerminal }
                     .map { $0.inbound.eventId })
                 var drops = file.botEventClaims.count - Self.botEventClaimCap
                 file.botEventClaims = file.botEventClaims.filter { id in
@@ -338,9 +341,17 @@ public actor SlackInboundDeliveryJournal {
         }
     }
 
+    func markInterrupted(eventId: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
+        try mutate(eventId: eventId) { record in
+            record.phase = .interrupted
+            record.updatedAt = now
+            record.outcomeDetail = "Reply generation was interrupted; prior chat/tool effects require recovery before rerunning the turn"
+        }
+    }
+
     func unresolved() throws -> [SlackInboundDeliveryRecord] {
         try load().records
-            .filter { $0.phase != .delivered }
+            .filter { !$0.phase.isTerminal }
             .sorted { $0.updatedAt < $1.updatedAt }
     }
 
@@ -381,7 +392,7 @@ public actor SlackInboundDeliveryJournal {
                   Set(file.records.map { $0.inbound.eventId }).count == file.records.count,
                   file.records.allSatisfy({
                       !$0.inbound.eventId.isEmpty
-                        && ($0.phase == .claimed || $0.phase == .generating
+                        && ($0.phase == .claimed || $0.phase == .generating || $0.phase == .interrupted
                             || $0.phase == .outcomeUnknown || $0.prepared != nil)
                   }) else { throw SlackInboundJournalError.malformed }
             return file
@@ -416,11 +427,11 @@ public actor SlackInboundDeliveryJournal {
 
     private func save(_ source: File) throws {
         var file = source
-        let delivered = file.records
-            .filter { $0.phase == .delivered }
+        let terminal = file.records
+            .filter { $0.phase.isTerminal }
             .sorted { $0.updatedAt > $1.updatedAt }
-        let unresolved = file.records.filter { $0.phase != .delivered }
-        file.records = unresolved + delivered.prefix(terminalCap)
+        let unresolved = file.records.filter { !$0.phase.isTerminal }
+        file.records = unresolved + terminal.prefix(terminalCap)
         file.pendingLimit = pendingCap
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         // Creation-time 0600, not chmod after publication: the existing slack

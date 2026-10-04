@@ -291,9 +291,9 @@ public struct ChatSessionAgingConsolidation: Sendable {
             )
         } catch {
             // FAIL LOUD, off the critical path. The autocompactor refuses to
-            // rewrite anything without a verified backup and refuses to compact
-            // a corrupt transcript, so a throw here means NOTHING was replaced —
-            // the transcript is exactly as the turn left it.
+            // replace conversation content without a verified backup and refuses
+            // to compact a corrupt transcript. Recovery may already have settled
+            // an orphaned pending marker without changing its summary text.
             let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             await emitAgingTrace(
                 sessionId: sessionId,
@@ -311,8 +311,11 @@ public struct ChatSessionAgingConsolidation: Sendable {
             )
             return
         }
-        guard outcome.compacted,
-              config.distillEnabled,
+        guard outcome.compacted else { return }
+        await ChatCompactionDistiller.publishTranscriptChange(
+            sessionId: sessionId, dataRoot: dataRoot, persistence: compactor.persistence
+        )
+        guard config.distillEnabled,
               let summaryRowId = outcome.summaryRowId,
               let backupPath = outcome.backupPath
         else { return }
@@ -334,13 +337,8 @@ public struct ChatSessionAgingConsolidation: Sendable {
         )
     }
 
-    /// SEAM (2026-09-01): the pre-turn backstop builds its own identical
-    /// distiller inline in `ChatOrchestrationClient+MessagePersistence.swift`
-    /// (`compactSession`), which is owned by another builder this wave. The two
-    /// constructions must stay identical; when that file is next touched, both
-    /// should call THIS one. Pinned by
-    /// `ChatSessionAgingConsolidationTests.agingDistillerMatchesBackstopConstruction`.
-    static func makeAgingDistiller(
+    /// Shared distiller construction for background aging and foreground compaction.
+    package static func makeAgingDistiller(
         dataRoot: URL,
         llm: any LLMClient,
         now: @escaping @Sendable () -> Date

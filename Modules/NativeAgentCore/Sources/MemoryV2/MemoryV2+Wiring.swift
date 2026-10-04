@@ -121,7 +121,9 @@ extension SwiftNativeMemoryV2 {
     public func store(
         content: String,
         source: String? = nil,
-        metadata: JSONValue? = nil
+        metadata: JSONValue? = nil,
+        supersedes: [String] = [],
+        id: String? = nil
     ) async throws -> MemoryRecord {
         let content = MemoryTextClip.memoryDisplayText(
             content,
@@ -138,78 +140,6 @@ extension SwiftNativeMemoryV2 {
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         if try await storage.isTombstoned(content: content) {
             throw MemoryV2Error.underlying("tombstoned: content matches a rejection denylist entry")
-        }
-        // Taste pass 2026-07-24: write-time exact-duplicate guard. A repeated
-        // commit_memory (retry loop, re-asserted fact) used to insert a fresh
-        // identical active row each time — 4 copies of one fact landed in 49s
-        // on 2026-07-22 and sat visible until the weekly hygiene pass. Same
-        // normalization as hygiene's exact-dup collapse, so "duplicate" means
-        // one thing. Idempotent: return the existing record and count the
-        // re-assertion as corroborating evidence (metadata.recall_count, the
-        // same bump mergeProposal applies — a merge is evidence, not access).
-        // Checked BEFORE embedding: a duplicate never pays the embed cost.
-        func reassert(_ existing: MemoryRecord) async throws -> MemoryRecord {
-            var currentCount: Int64 = 0
-            if case .object(let m)? = existing.extras {
-                if case .int(let n)? = m["recall_count"] { currentCount = n }
-                if case .double(let d)? = m["recall_count"] {
-                    guard let count = Int64(exactly: d.rounded(.towardZero)) else {
-                        throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count is outside Int64 range")
-                    }
-                    currentCount = count
-                }
-            }
-            // 2026-09-06: match the merge counter's checked failure path;
-            // malformed evidence must not trap or overwrite the saved row.
-            let (nextCount, overflow) = currentCount.addingReportingOverflow(1)
-            guard !overflow else {
-                throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count overflow")
-            }
-            // Unknown patch keys merge into metadata_json (bridge contract).
-            var patch: [String: JSONValue] = ["recall_count": .int(nextCount)]
-            // gpt-5.5 review A3 (2026-08-02): the collapse itself is deliberate
-            // and stays — repetition should be evidence, not clutter. What was
-            // WRONG is that the later occurrence lost its identity: two
-            // genuinely different events producing the same prose left the row
-            // pointing only at the first one, so the second was unrecoverable.
-            // The provenance of every occurrence now accumulates alongside the
-            // count, bounded, in metadata.
-            for (key, value) in Self.duplicateProvenancePatch(
-                existing: existing,
-                newSource: source,
-                newMetadata: metadata
-            ) {
-                patch[key] = value
-            }
-            let updated = try await storage.updateMemory(
-                id: existing.id,
-                patch: .object(patch),
-                newEmbedding: nil
-            )
-            // Reassertions can advance observed dates and provenance even
-            // when prose/identity stay unchanged. Match new-record completion
-            // so the next prepared context sees the committed evidence.
-            await flushDerivedMemoryChanges()
-            return updated
-        }
-        let contentKey = MemoryConsolidator.normalizedContentKey(content)
-        let existingRows = try await storage.listMemory(kind: nil)
-        if let existing = existingRows.first(where: {
-            ($0.status ?? "active") == "active"
-                && MemoryConsolidator.normalizedContentKey($0.text) == contentKey
-        }) {
-            return try await reassert(existing)
-        }
-        // Embed ONCE; the same vector serves the semantic tombstone gate and
-        // the insert. Wave1 T3: a paraphrase of a deleted claim blocks here at
-        // write time (the read path never pays); contradictions score below the
-        // high threshold and are admitted as new information.
-        let embedded = try await embedOneWithEpoch(content)
-        if try await storage.matchesTombstone(
-            embedding: embedded.vector,
-            embeddingEpoch: embedded.epoch
-        ) {
-            throw MemoryV2Error.underlying("tombstoned: content is a paraphrase of a rejected claim")
         }
         let now = Self.iso8601Now()
         // commit_memory review fix (2026-06-11): lift confidence/importance/
@@ -242,7 +172,9 @@ extension SwiftNativeMemoryV2 {
             liftedEvidence = metaObj["evidence"]
         }
         let record = MemoryRecord(
-            id: UUID().uuidString,
+            // A caller-owned id (Phase 5 C1: one lesson origin per proposal)
+            // makes a racing second insert fail on the primary key.
+            id: id ?? UUID().uuidString,
             text: content,
             layer: "semantic",
             memoryKind: nil,
@@ -275,34 +207,114 @@ extension SwiftNativeMemoryV2 {
                 text: content
             )
         )
-        // 2026-09-22: near-duplicates slipped past the exact guard (three
-        // rephrasings of one fact in a day). A paraphrase of an ACTIVE,
-        // non-correction row in the same disclosure scope written in the last
-        // 24h re-asserts that row instead. Older rows, other scopes and
-        // corrections (either side) still get their own row.
-        if Self.metadataKind(metadata) != "correction",
-           let near = try await storage.nearestNeighbor(
-               embedding: embedded.vector,
-               embeddingEpoch: embedded.epoch,
-               excluding: nil
-           ),
-           near.cosine >= MemoryManagerLane.duplicateSimilarity,
-           (near.record.status ?? "active") == "active",
-           MemoryRecallScoring.kind(of: near.record.extras) != "correction",
-           let scope = MemoryRecordDisclosurePolicy.classify(record),
-           MemoryRecordDisclosurePolicy.classify(near.record) == scope,
-           MemorySemanticDuplicateGuard.sameQuantityAndNegation(near.record.text, content),
-           let created = MemoryRecallScoring.parseTimestamp(near.record.createdAt),
-           Date().timeIntervalSince(created) < 24 * 3600 {
-            return try await reassert(near.record)
+        let existingRows: [MemoryRecord]
+        if supersedes.isEmpty { existingRows = [] }
+        else { existingRows = try await storage.listMemory(kind: nil) }
+        let superseding = try Set(supersedes).sorted().map { id in
+            guard let row = existingRows.first(where: {
+                $0.id == id && ($0.status ?? "active") == "active"
+                    && MemoryLifecycle.isRecallEligible($0.lifecycle)
+            }) else {
+                throw MemoryV2Error.underlying("memory to supersede is missing or no longer active: \(id)")
+            }
+            return SupersedingAcceptance(
+                targetId: id, expectedContentHash: MemoryStorage.contentHash(row.text),
+                reason: "explicit supersession")
         }
-        let inserted = try await storage.insert(
-            record: record,
+        if !superseding.isEmpty, !(storage is any AtomicSupersedingMemoryStorage) {
+            throw MemoryV2Error.underlying("storage does not support atomic memory supersession")
+        }
+        let admission = storage as? any AtomicMemoryAdmissionStorage
+        if superseding.isEmpty {
+            guard let admission else { throw MemoryV2Error.storageUnavailable }
+            // Reassert exact duplicates before paying for an embedding. The
+            // final admission repeats matching under its insertion transaction.
+            if let existing = try await admission.admit(
+                record: record, embedding: nil, embeddingEpoch: nil,
+                insertIfMissing: false, preserveID: id != nil
+            ) {
+                await flushDerivedMemoryChanges()
+                return existing
+            }
+        }
+        // Embed ONCE; the same vector serves the semantic tombstone gate and
+        // the insert. Wave1 T3: a paraphrase of a deleted claim blocks here at
+        // write time (the read path never pays); contradictions score below the
+        // high threshold and are admitted as new information.
+        let embedded = try await embedOneWithEpoch(content)
+        if try await storage.matchesTombstone(
             embedding: embedded.vector,
             embeddingEpoch: embedded.epoch
-        )
+        ) {
+            throw MemoryV2Error.underlying("tombstoned: content is a paraphrase of a rejected claim")
+        }
+        let inserted: MemoryRecord
+        if !superseding.isEmpty, let atomic = storage as? any AtomicSupersedingMemoryStorage {
+            inserted = try await atomic.insert(record: record, embedding: embedded.vector,
+                                              embeddingEpoch: embedded.epoch, superseding: superseding)
+        } else {
+            guard let admission,
+                  let admitted = try await admission.admit(
+                    record: record, embedding: embedded.vector, embeddingEpoch: embedded.epoch,
+                    insertIfMissing: true, preserveID: id != nil) else { throw MemoryV2Error.storageUnavailable }
+            inserted = admitted
+        }
         await flushDerivedMemoryChanges()
         return inserted
+    }
+
+    /// Suggestions only: semantic proximity never retires another memory.
+    public func possibleReplacements(content: String, kind: String, surface: String?) async throws -> [MemoryRecord] {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        try Task.checkCancellation()
+        var embedded: (vector: [Float], epoch: MemoryEmbeddingEpoch)?
+        if embedder != nil {
+            do {
+                embedded = try await embedOneWithEpoch(content)
+            } catch let error where memoryV2IsColdEmbedderFailure(error) {
+                // Match recall's cold-embedder handling; broken models still throw.
+                embedded = nil
+            }
+        }
+        try Task.checkCancellation()
+        var semantic: [ScoredMemoryRecord]?
+        if let embedded, embedded.vector.contains(where: { $0 != 0 && $0.isFinite }) {
+            if let hybrid = storage as? any HybridMemoryStorageProtocol {
+                // Empty query text disables BM25: this is a meaning threshold,
+                // not a keyword score. The existing recall recency factor can
+                // only make admission more conservative.
+                let result = try await hybrid.recallReportingKeywordFallback(
+                    embedding: embedded.vector, embeddingEpoch: embedded.epoch,
+                    queryText: "", topK: memoryStoredRowCap, persona: nil)
+                if !result.usedKeywordFallback { semantic = result.hits }
+            } else {
+                semantic = try await storage.recall(
+                    embedding: embedded.vector, embeddingEpoch: embedded.epoch,
+                    topK: memoryStoredRowCap, persona: nil)
+            }
+        }
+        try Task.checkCancellation()
+        let candidates: [ScoredMemoryRecord]
+        if let semantic {
+            candidates = semantic
+        } else {
+            // Only unavailable embeddings (including epoch mismatch) use the
+            // former lexical gate; an empty semantic answer stays empty.
+            candidates = try await storage.listMemory(kind: kind).map {
+                ScoredMemoryRecord(record: $0, score: MemoryConsolidator.lexicalJaccard(content, $0.text))
+            }
+        }
+        let threshold = semantic == nil ? 0.8 : memorySupersessionCosineFloor
+        return candidates.filter { hit in
+            let row = hit.record
+            guard (row.status ?? "active") == "active",
+                  MemoryLifecycle.isRecallEligible(row.lifecycle),
+                  (row.memoryKind ?? MemoryRecallScoring.kind(of: row.extras)) == kind,
+                  let disclosure = MemoryRecordDisclosurePolicy.classify(row),
+                  disclosure.permits(surface: surface, personaID: nil) else { return false }
+            return hit.score >= threshold
+        }.sorted { $0.score == $1.score ? $0.record.id < $1.record.id : $0.score > $1.score }
+            .prefix(3).map(\.record)
     }
 
     /// Convenience tombstone check used by upstream filters (e.g. the chat-fact

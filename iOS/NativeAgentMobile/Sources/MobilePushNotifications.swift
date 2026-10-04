@@ -224,7 +224,7 @@ enum NativeAgentRemotePushProcessor {
     }
 
     static func isChatReplyNudge(_ userInfo: [AnyHashable: Any]) -> Bool {
-        (userInfo["source"] as? String) == "icloud_chat_reply"
+        ["icloud_chat_reply", "requested_result"].contains(userInfo["source"] as? String ?? "")
             && (userInfo["screen"] as? String) == "chat"
     }
 }
@@ -482,6 +482,7 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
                 screen: screen,
                 taskID: taskID
             )
+            MobileDeskItemNotificationIntent.stage(screen: screen, handle: taskID)
             NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: screen)
             NotificationCenter.default.post(
                 name: .nativeagentOpenActivity,
@@ -490,6 +491,23 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
             )
             done()
         }
+    }
+}
+
+enum MobileDeskItemNotificationIntent {
+    private static let key = "NativeAgentMobile.pendingDeskItemNotification"
+
+    static func stage(screen: String?, handle: String?) {
+        guard screen?.lowercased() == "desk", let handle, !handle.isEmpty else {
+            UserDefaults.standard.removeObject(forKey: key)
+            return
+        }
+        UserDefaults.standard.set(handle, forKey: key)
+    }
+
+    static func consume() -> String? {
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+        return UserDefaults.standard.string(forKey: key)
     }
 }
 
@@ -571,74 +589,74 @@ enum NativeAgentNotificationEventGate {
 }
 
 enum NativeAgentBridgeNotificationScheduler {
-    static func schedule(_ msg: BridgeMessage) {
-        Task {
-            let metadata = msg.metadata ?? [:]
-            let deviceID = await MainActor.run {
-                UIDevice.current.identifierForVendor?.uuidString ?? UIDevice.current.name
-            }
-            let acceptedDeviceIDs = metadata["directAlertDeviceIDs"].flatMap {
-                try? JSONDecoder().decode([String].self, from: Data($0.utf8))
-            } ?? []
-            guard !acceptedDeviceIDs.contains(deviceID) else { return }
-            let agentName = await MainActor.run { iCloudSyncEngine.shared.agentDisplayName }
-            let title = nonEmpty(metadata["title"]) ?? agentName
-            let body = nonEmpty(metadata["body"])
-                ?? nonEmpty(msg.text)
-                ?? "New activity from Mac."
-            var userInfo: [String: Any] = [:]
-            for (key, value) in metadata where key.hasPrefix("userInfo.") {
-                let cleanKey = String(key.dropFirst("userInfo.".count))
-                guard !cleanKey.isEmpty else { continue }
-                userInfo[cleanKey] = value
-            }
-            if userInfo["screen"] == nil {
-                userInfo["screen"] = "activity"
-            }
-            let eventInfo = userInfo.compactMapValues { $0 as? String }
-            let eventID = NativeAgentDeviceEventIdentity.notification(
-                userInfo: eventInfo,
-                fallback: msg.id
+    static func schedule(_ msg: BridgeMessage) async -> Bool {
+        let metadata = msg.metadata ?? [:]
+        let deviceID = await MainActor.run {
+            UIDevice.current.identifierForVendor?.uuidString ?? UIDevice.current.name
+        }
+        let acceptedDeviceIDs = metadata["directAlertDeviceIDs"].flatMap {
+            try? JSONDecoder().decode([String].self, from: Data($0.utf8))
+        } ?? []
+        guard !acceptedDeviceIDs.contains(deviceID) else { return true }
+        let agentName = await MainActor.run { iCloudSyncEngine.shared.agentDisplayName }
+        let title = nonEmpty(metadata["title"]) ?? agentName
+        let body = nonEmpty(metadata["body"])
+            ?? nonEmpty(msg.text)
+            ?? "New activity from Mac."
+        var userInfo: [String: Any] = [:]
+        for (key, value) in metadata where key.hasPrefix("userInfo.") {
+            let cleanKey = String(key.dropFirst("userInfo.".count))
+            guard !cleanKey.isEmpty else { continue }
+            userInfo[cleanKey] = value
+        }
+        if userInfo["screen"] == nil {
+            userInfo["screen"] = "activity"
+        }
+        let eventInfo = userInfo.compactMapValues { $0 as? String }
+        let eventID = NativeAgentDeviceEventIdentity.notification(
+            userInfo: eventInfo,
+            fallback: msg.id
+        )
+        userInfo["eventId"] = eventID
+        userInfo["messageId"] = msg.id
+        userInfo["source"] = userInfo["source"] ?? "mac_icloud_bridge"
+
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+            _ = try? await center.requestAuthorization(options: [.alert, .badge, .sound])
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = userInfo
+        // 2026-07-04 (review): the iCloud-bridge fallback lane must match the
+        // APNS lane — urgent pushes are time-sensitive so Focus (e.g. Sleep at
+        // 3:30am dream time) shows them on the lock screen instead of
+        // silencing them into Notification Center.
+        if (metadata["urgency"] ?? (userInfo["urgency"] as? String))?.lowercased() == "urgent" {
+            content.interruptionLevel = .timeSensitive
+        }
+
+        do {
+            let added = try await NativeAgentNotificationEventGate.add(
+                content: content,
+                eventID: eventID,
+                trigger: nil,
+                center: center
             )
-            userInfo["eventId"] = eventID
-            userInfo["messageId"] = msg.id
-            userInfo["source"] = userInfo["source"] ?? "mac_icloud_bridge"
-
-            let center = UNUserNotificationCenter.current()
-            let settings = await center.notificationSettings()
-            if settings.authorizationStatus == .notDetermined {
-                _ = try? await center.requestAuthorization(options: [.alert, .badge, .sound])
-            }
-
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
-            content.sound = .default
-            content.userInfo = userInfo
-            // 2026-07-04 (review): the iCloud-bridge fallback lane must match the
-            // APNS lane — urgent pushes are time-sensitive so Focus (e.g. Sleep at
-            // 3:30am dream time) shows them on the lock screen instead of
-            // silencing them into Notification Center.
-            if (metadata["urgency"] ?? (userInfo["urgency"] as? String))?.lowercased() == "urgent" {
-                content.interruptionLevel = .timeSensitive
-            }
-
-            do {
-                let added = try await NativeAgentNotificationEventGate.add(
-                    content: content,
-                    eventID: eventID,
-                    trigger: nil,
-                    center: center
-                )
-                NSLog("[NativeAgentMobile] bridge notification %@ event=%@ msg=%@",
-                      added ? "scheduled" : "deduplicated", eventID, msg.id)
-                await iCloudSyncEngine.shared.sendNotificationReceipt(
-                    eventID: eventID,
-                    channel: "icloud_bridge"
-                )
-            } catch {
-                NSLog("[NativeAgentMobile] bridge notification failed id=%@: %@", msg.id, error.localizedDescription)
-            }
+            NSLog("[NativeAgentMobile] bridge notification %@ event=%@ msg=%@",
+                  added ? "scheduled" : "deduplicated", eventID, msg.id)
+            await iCloudSyncEngine.shared.sendNotificationReceipt(
+                eventID: eventID,
+                channel: "icloud_bridge"
+            )
+            return true
+        } catch {
+            NSLog("[NativeAgentMobile] bridge notification failed id=%@: %@", msg.id, error.localizedDescription)
+            return false
         }
     }
 

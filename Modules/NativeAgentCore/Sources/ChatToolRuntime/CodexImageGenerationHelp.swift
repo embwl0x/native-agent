@@ -1,4 +1,4 @@
-/// Lazy tool help: discoverable through tool_catalog/tool_load, never global prompt context.
+/// Tool help for app image.generate: read with the action, never global prompt context.
 package enum CodexImageGenerationHelp {
     package static let usage = """
     Use the real Codex built-in image_gen.imagegen tool through a bounded Codex run. This default route does not make a NativeAgent HTTP image request or use a platform API key. No automatic API fallback. Generate from a prompt; for edits, inspect the reference pixels and supply referenced_image_paths. References are authorized, copied into this run and attached to Codex. Say exactly what changes and what must remain. For iteration, reuse the latest returned image path. With multiple references, assign their ordered roles.

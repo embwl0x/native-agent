@@ -3,7 +3,7 @@ import PersistenceCore
 
 // MARK: - The catalog as the Tools page reads it (S10, 2026-09-26)
 
-/// One row of the full `tool_catalog` envelope: what the tool is (Core's row)
+/// One row of the full tool manifest (`SwiftToolDispatcher.toolManifest`): what the tool is (Core's row)
 /// and whether it may run here right now (the Security gate's decision the app
 /// wrapper stamps on each row).
 public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
@@ -46,7 +46,7 @@ public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-/// The full `tool_catalog` envelope, typed: every row, what is loaded, and the
+/// The full tool manifest, typed: every row, what is loaded, and the
 /// Full Mac lanes the Trust Center has open or locked.
 public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
     public var tools: [ChatCatalogTool]
@@ -62,7 +62,7 @@ public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
     public var builderModeDetail: String
     public var permissionLevel: String
 
-    /// Reads a full `tool_catalog` envelope; nil when it is not an object.
+    /// Reads a full manifest; nil when it is not an object.
     public init?(envelope value: JSONValue) {
         guard case .object(let obj) = value else { return nil }
 

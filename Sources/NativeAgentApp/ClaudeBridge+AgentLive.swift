@@ -7,8 +7,8 @@ import PersistenceCore
 
 /// The live half of an agent conversation. In-process lanes (ACP, A2A SSE)
 /// feed `AgentConversationLiveHub` directly; the built-in lanes' wake helpers
-/// run out of process and POST here (`/claude/live`, `/codex/live`,
-/// `/omp/live`) keyed by the accepted message id. Every coalesced change goes
+/// run out of process and POST here (`/codex/live`, `/omp/live`) keyed by
+/// the accepted message id. Every coalesced change goes
 /// out on `/claude/events` as `kind: "agent_live"` (not kept in the backfill
 /// ring) and is persisted to `agents/conversation-live.json`.
 extension ClaudeBridge {

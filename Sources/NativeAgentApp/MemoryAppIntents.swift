@@ -81,10 +81,7 @@ struct StoreMemoryIntent: AppIntent {
                 metadata: nil
             )
             let msg = "Stored memory \(record.id)."
-            if #available(macOS 27, *), systemContext.isVoiceOnly {
-                return .result(value: msg, dialog: "I'll remember that.")
-            }
-            return .result(value: msg, dialog: IntentDialog(stringLiteral: msg))
+            return .result(value: msg, dialog: "I'll remember that.")
         } catch {
             let msg = formatMemoryUnavailable(error)
             return .result(value: msg, dialog: IntentDialog(stringLiteral: msg))

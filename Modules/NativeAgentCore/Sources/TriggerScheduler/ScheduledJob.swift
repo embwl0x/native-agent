@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// One row of `scheduler/jobs.json` as the Schedule and the Desk show it
@@ -8,21 +9,37 @@ public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
     public var name: String
     public var kind: String
     public var intervalSeconds: Int?
+    public var oneShot: Bool?
     public var enabled: Bool
     public var nextRunAt: String?
     public var lastRunAt: String?
 
     public init(
         id: String, name: String, kind: String, intervalSeconds: Int? = nil,
-        enabled: Bool, nextRunAt: String? = nil, lastRunAt: String? = nil
+        enabled: Bool, nextRunAt: String? = nil, lastRunAt: String? = nil,
+        oneShot: Bool? = nil
     ) {
         self.id = id
         self.name = name
         self.kind = kind
-        self.intervalSeconds = intervalSeconds
+        self.intervalSeconds = oneShot == true ? nil : intervalSeconds
+        self.oneShot = oneShot
         self.enabled = enabled
         self.nextRunAt = nextRunAt
         self.lastRunAt = lastRunAt
+    }
+
+    public var onceScheduleDescription: String? {
+        guard oneShot == true else { return nil }
+        guard let nextRunAt else { return "Once." }
+        guard let date = SwiftNativeTriggerScheduler.parseISOTimestamp(nextRunAt) else {
+            return "Once — scheduled time unavailable."
+        }
+        let formatter = DateFormatter()
+        formatter.timeZone = DisplayTimeZone.current
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return "Once at \(formatter.string(from: date))."
     }
 
     public enum RowError: Error, LocalizedError {
@@ -41,7 +58,9 @@ public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
     /// a present field of the wrong type makes the row malformed, never
     /// silently absent.
     public init(row: JSONValue) throws {
-        guard case .object(let obj) = row else { throw RowError.notAnObject }
+        guard case .object(let obj) = SchedulerJobNormalizer.decorateNextRunAt(row) else {
+            throw RowError.notAnObject
+        }
         func string(_ key: String) throws -> String {
             guard case .string(let value)? = obj[key] else { throw RowError.field(key) }
             return value
@@ -56,6 +75,11 @@ public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
         self.id = try string("id")
         self.name = try string("name")
         self.kind = try string("kind")
+        switch obj["oneShot"] {
+        case nil, .null?: self.oneShot = nil
+        case .bool(let value)?: self.oneShot = value
+        default: throw RowError.field("oneShot")
+        }
         switch obj["intervalSeconds"] {
         case nil, .null?:
             self.intervalSeconds = nil

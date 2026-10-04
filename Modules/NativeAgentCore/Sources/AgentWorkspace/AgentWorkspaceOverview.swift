@@ -45,6 +45,13 @@ extension AgentWorkspaceNavigation {
         if let place = places.first { return .window(Self.windowAction(place)) }
         return AgentWorkspaceEnvironment.destinations.first { $0.title.lowercased() == name }.map { .open(.area($0.id)) }
     }
+    /// The windows this chat holds (drafts, the work she returns to, pages
+    /// she acted in), unfinished first: home's OPEN line.
+    func openWindowTitles(key: String) -> [String] {
+        guard let session = sessions[key] else { return [] }
+        return Self.recognizedPlaces(session).map { Self.windowTitle($0, session: session) }
+    }
+
     /// Recognition uses only this chat's bounded resident references. Listing
     /// does not read transcripts, acknowledge arrivals, or refresh owner state.
     func recognizedOpenPlaces(key: String) -> AgentWorkspaceProjection {
@@ -175,7 +182,7 @@ extension AgentWorkspaceNavigation {
             case "bot_list": return "Helper"
             case "screen": return "App window"
             case "mac_calendar_list_upcoming": return "Calendar"
-            case "mac_reminders_list_due_today": return "Reminders"
+            case "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read": return "Reminders"
             default: return "Reference"
             }
         default: return "Workspace"

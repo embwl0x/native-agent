@@ -22,7 +22,7 @@ extension MacFourVerbs {
             guard reply.detail["status"] == .string("in_process_route") else { return reply }
             return MacFourVerbsReply(
                 ok: false,
-                text: "wait watches the frontmost external Mac app until its screen settles or the requested text appears; it is not a general sleep. NativeAgent is in front, and screen waiting cannot observe its own app. Use app_page_read(page: current) to inspect NativeAgent, or wait(agent: name) for a contact's in-flight reply.",
+                text: "wait watches the frontmost external Mac app until its screen settles or the requested text appears; it is not a general sleep. NativeAgent is in front, and screen waiting cannot observe its own app. Use app {page:\"current\"} to inspect NativeAgent, or pass agent: name to wait for a contact's in-flight reply.",
                 detail: reply.detail
             )
         }
@@ -43,8 +43,8 @@ extension MacFourVerbs {
                     "outcome": .string("settled"),
                     "seconds": .double(elapsed),
                     // How the settle was DECIDED. `quiet` means the
-                    // subscription went silent; `compared` means there was no
-                    // subscription and two renders matched.
+                    // subscription went silent; `compared` means two renders
+                    // matched.
                     "settled_by": .string(quiet ? "quiet" : "compared"),
                 ]
             )
@@ -72,6 +72,10 @@ extension MacFourVerbs {
             pid: first.pid
         )
         defer { signals.stop() }
+        // The pre-subscription render may have missed the final change. A
+        // paced fresh read must reconcile each new subscription before quiet
+        // can settle its baseline, including after an app switch.
+        var needsReconciliation = true
 
         while true {
             guard !Task.isCancelled else { return cancelled() }
@@ -95,16 +99,16 @@ extension MacFourVerbs {
             )
             guard !Task.isCancelled else { return cancelled() }
             if !fired, signals.isObserving, !waitingForText {
+                // The budget ran out inside a short final window.
+                if window < Self.settleQuietSeconds { break }
                 // Nothing fired for a full quiet window: the screen has stopped
-                // changing, and the render in hand already describes it.
-                if window >= Self.settleQuietSeconds {
+                // changing. Only a reconciled render can already describe it.
+                if !needsReconciliation {
                     return settled(last, elapsedNow(), quiet: true)
                 }
-                // The budget ran out inside a short final window.
-                break
             }
-            // 3 — render ONCE, because something happened (or, with no
-            // subscription, because the coarse fallback said to look again).
+            // 3 — render ONCE to reconcile a new subscription, because a
+            // signal fired, or because the coarse fallback said to look again.
             switch await sight(part: nil) {
             case .blind(let reply): return refusal(reply)
             case .seen(let seen): last = seen
@@ -115,12 +119,13 @@ extension MacFourVerbs {
             if let needle, !needle.isEmpty, last.render.lowercased().contains(needle) {
                 return matched(last, elapsed)
             }
-            if last.pid != observedPID {
+            needsReconciliation = last.pid != observedPID
+            if needsReconciliation {
                 signals.stop()
                 observedPID = last.pid
                 signals = MacWaitSignals(effects: effectObserverSource, activation: appActivationSource, pid: last.pid)
             }
-            if !waitingForText, previous == last.render {
+            if !waitingForText, !needsReconciliation, previous == last.render {
                 // A signal that changed nothing visible, or the fallback's two
                 // identical renders. Either way the screen has settled.
                 return settled(last, elapsed, quiet: false)

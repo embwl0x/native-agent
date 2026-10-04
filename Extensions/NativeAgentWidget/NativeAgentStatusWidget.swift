@@ -19,7 +19,11 @@ private struct StatusProvider: TimelineProvider {
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<StatusEntry>) -> Void) {
         let entry = StatusEntry(date: .now, snapshot: try? NativeAgentWidgetSnapshot.read())
-        completion(Timeline(entries: [entry], policy: .never))
+        var entries = [entry]
+        if let expiry = entry.snapshot?.activityExpiresAt, expiry > entry.date {
+            entries.append(StatusEntry(date: expiry, snapshot: entry.snapshot))
+        }
+        completion(Timeline(entries: entries, policy: .never))
     }
 }
 
@@ -34,7 +38,7 @@ private struct StatusView: View {
                 .foregroundStyle(NativeAgentBrand.accentDeep)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
-            Text(entry.snapshot?.status ?? "Status unavailable. Open NativeAgent.")
+            Text(entry.snapshot?.status(at: entry.date) ?? "Status unavailable. Open NativeAgent.")
                 .font(NativeAgentFont.body)
                 .lineLimit(3)
             if let count = entry.snapshot?.waitingCount {

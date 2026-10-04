@@ -20,7 +20,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -105,9 +104,7 @@ extension NativeClient {
     }
 
     func updateTool(id: String, autoRun: Bool) async throws -> ToolRecord {
-        // DAEMON-DEAD PORT P4: read tools/registry.json under flock, merge
-        // {autoRun} into the matching tool by id, write back, return the
-        // merged record. Mirrors the daemon's POST /v1/tools/update row patch.
+        // Legacy callers get an explicit refusal: autoRun has no execution consumer.
         return try await Self.updateTool(
             id: id,
             autoRun: autoRun,
@@ -115,11 +112,7 @@ extension NativeClient {
         )
     }
 
-    /// Root-injectable form of the canonical Tools-page auto-run mutation.
-    /// An absent registry is empty, but existing malformed or wrongly-shaped
-    /// bytes are authority state and must not be silently replaced by a UI
-    /// toggle. Keeping this next to the production entry point makes the
-    /// temp-root evaluation exercise the same flocked read-modify-write path.
+    /// Compatibility entry point; the owner refuses the unsupported setting.
     static func updateTool(id: String, autoRun: Bool, dataRoot root: URL) async throws -> ToolRecord {
         try await ToolRegistryActions.updateTool(id: id, autoRun: autoRun, dataRoot: root, validate: ToolsFacade.checkAuthored)
     }
@@ -130,17 +123,6 @@ extension NativeClient {
 
     func quarantineTool(id: String, reason: String) async throws -> ToolRecord {
         return try await swiftQuarantineTool(id: id, reason: reason)
-    }
-
-    func runEval(name: String) async throws -> EvalRun {
-        let row = try await NativeRegistryEvaluation.runEval(name: name) { executable, arguments, directory, timeout in
-            let result = try await Self.runProcess(
-                executable: executable, arguments: arguments, currentDirectory: directory, timeout: timeout
-            )
-            return (result.status, Self.processDetail(result))
-        }
-        let data = try row.serializedData(pretty: false)
-        return try JSONDecoder.nativeAgent.decode(EvalRun.self, from: data)
     }
 
     static func appendBoundedRun(_ row: JSONValue, to path: URL) async throws {

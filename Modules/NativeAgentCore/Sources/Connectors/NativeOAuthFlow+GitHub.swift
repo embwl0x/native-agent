@@ -68,11 +68,12 @@ extension NativeOAuthFlow {
         )
 
         do {
-            try await credentialStore.saveToken(token, metadata: metadata, dataRoot: dataRoot)
             try await markGitHubConnected(
                 description: "GitHub REST API connector using a local Personal Access Token.",
                 at: now, dataRoot: dataRoot
-            )
+            ) { commit in
+                try await credentialStore.saveToken(token, metadata: metadata, dataRoot: dataRoot, persistConnection: commit)
+            }
         } catch {
             return OAuthFlowResult(ok: false,
                 error: "Could not save GitHub token: \(NativeOAuthSupport.redact(error.localizedDescription))")
@@ -93,14 +94,16 @@ extension NativeOAuthFlow {
             let token = try await GitHubOAuthDeviceFlow.pollForToken(code)
             let user = GitHubSavedUserFields(try await GitHubConnectorActions.validateToken(token.accessToken))
             let now = NativeOAuthSupport.isoBasic(Date())
-            try await credentialStore.saveOAuthToken(token, metadata: GitHubCredentialMetadata(
+            let metadata = GitHubCredentialMetadata(
                 savedAt: now, validatedAt: now, login: user.login, name: user.name,
                 htmlURL: user.htmlURL, type: user.type, userID: user.userID
-            ), dataRoot: dataRoot)
+            )
             try await markGitHubConnected(
                 description: "GitHub connector signed in with GitHub (OAuth device flow).",
                 at: now, dataRoot: dataRoot
-            )
+            ) { commit in
+                try await credentialStore.saveOAuthToken(token, metadata: metadata, dataRoot: dataRoot, persistConnection: commit)
+            }
             return (OAuthFlowResult(ok: true, error: nil), user.login)
         } catch is CancellationError {
             return (OAuthFlowResult(ok: false, error: nil), nil)
@@ -109,11 +112,20 @@ extension NativeOAuthFlow {
         }
     }
 
-    private static func markGitHubConnected(description: String, at now: String, dataRoot: URL) async throws {
+    private static func markGitHubConnected(
+        description: String, at now: String, dataRoot: URL,
+        publish: @escaping @Sendable (@Sendable () async throws -> Void) async throws -> Void
+    ) async throws {
         _ = try await ConnectorOAuthRegistry.mutateConnectorRegistryEntry(
             root: dataRoot,
             provider: "github",
-            createIfMissing: true
+            createIfMissing: true,
+            prepare: {
+                for path in GitHubCredentialStore.metadataPaths(dataRoot: dataRoot) {
+                    _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path)
+                }
+            },
+            publish: publish
         ) { entry in
             entry["id"] = .string("github")
             entry["name"] = .string("GitHub")

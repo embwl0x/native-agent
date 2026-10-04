@@ -56,6 +56,8 @@ public enum REMConstants {
     // declarative sentences in her voice), not scene recaps or SOUL essays.
     // Anything over this gets clamped to the last lesson-bearing sentence.
     public static let _REM_PROPOSAL_TEXT_CAP: Int = 180
+    /// Phase 5 C1: a lesson's "what surprised me / what changed" line.
+    public static let whatChangedCap: Int = 200
 
     /// Canonical persona-doc targets REM is allowed to draft approval
     /// proposals against. REM may read SOUL/VOICE/USER/AGENTS as context,
@@ -229,8 +231,8 @@ public actor REMConsolidator {
         // LLM distillation over the same dreams and appended duplicate
         // pending proposals (audit 2026-06-09). Check-and-stamp runs under
         // the cross-process file lock so two drivers can't both pass the
-        // guard; the stamp lands BEFORE the LLM pass and is restored on
-        // failure so a failed run doesn't suppress the retry. `force`
+        // guard; the stamp lands BEFORE the LLM pass and is restored only on
+        // failure before proposal persistence. `force`
         // (manual /v1/rem/run) bypasses the freshness check but still
         // stamps, so a forced run resets the weekly window.
             let markerURL = dataRoot
@@ -272,7 +274,8 @@ public actor REMConsolidator {
             let report = REMReport(
                 proposalsGenerated: 0,
                 evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
-                tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0
+                tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0,
+                skipReason: "already_ran_within_weekly_window"
             )
             await persistRunReport(
                 outcome: .skipped,
@@ -305,7 +308,9 @@ public actor REMConsolidator {
         // `DreamDiaryReader.startOfLocalDay(_:daysBefore:)`.
         let since = DreamDiaryReader.startOfLocalDay(now, daysBefore: 7)
         let personaDocs = try readPersonaDocs()
-        let contextDocs = try readContextDocs()
+        let contextDocs = try await readDreamPersonaDocs(
+            dataRoot: dataRoot, personaRoot: personaRoot, surface: "rem"
+        )
         let pickedModel = await router.modelStringForSurface("rem")
         let bypassSystem = Self.remBypassSystemPrompt(contextDocs: contextDocs)
         var rawProposals: [REMProposal] = []
@@ -411,10 +416,9 @@ public actor REMConsolidator {
         // A timed-out scheduler body is cancel()ed and abandoned; the LLM
         // distillation above honors cancellation, but a body that already got
         // its response could still fall through to commit these persona-mutating
-        // artifacts. Guard every irreversible commit point below so a cancelled
-        // REM pass exits WITHOUT staging proposals, approvals, pins, GROWTH
-        // eviction, or archival. A throw here unwinds to the marker-restore
-        // `catch` so the weekly window reopens and the pass retries cleanly.
+        // artifacts. Check cancellation before each commit. Only failures before
+        // proposal persistence release the weekly reservation; later ticks stage
+        // any remaining approval cards from the existing proposal rows.
 
         // (7) Append to rem_proposals.jsonl as status='pending' through the
         // shared canonical appender (flock'd, id-deduped).
@@ -423,22 +427,21 @@ public actor REMConsolidator {
         // Its receipt carries what it refused, by doc name, so the drop reaches
         // the run report instead of dying inside the store (fable51 #11).
         let appendReceipt = try await store.appendPendingWithReceipt(kept)
+        // Once proposals are durable, retries must use their existing IDs.
+        if appendReceipt.appended > 0 { rollback = nil }
 
         // (7b) Stage ONE approval record per newly-appended pending proposal.
         // Staging stamps each row with the approval id, so a re-run can't
-        // double-stage. Failures are non-fatal — throwing here after the
-        // append would restore the weekly marker and a retried LLM pass
-        // would mint duplicate-content proposals under fresh ids.
+        // double-stage. Failures are non-fatal; later ticks catch up existing rows.
         try Task.checkCancellation()
         await stagePendingUnstagedRows(store)
 
-        // (8) Emit rem_pins.json (latest-3-approved per persona doc).
-        try Task.checkCancellation()
-        try emitREMPinsIndex()
-
-        // (9) GROWTH.md size-cap eviction → KG.
+        // (8) GROWTH.md size-cap eviction → KG.
         try Task.checkCancellation()
         let evicted = try await runGrowthEviction(proposalRows: growthProposalRows)
+
+        // (9) Publish only the approved passages that survived eviction.
+        try emitREMPinsIndex()
 
         // (10) 14-day disk archival.
         try Task.checkCancellation()
@@ -477,7 +480,7 @@ public actor REMConsolidator {
             if let rollback {
                 await rollback()
             }
-            FileHandle.standardError.write(Data("REMConsolidator: run failed; will retry: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("REMConsolidator: run failed: \(error)\n".utf8))
             await persistRunReport(
                 outcome: .failed,
                 reason: Self.runFailureReason(error),
@@ -621,27 +624,8 @@ public actor REMConsolidator {
         var out: [String: String] = [:]
         for name in REMConstants.personaTargets {
             let url = personaRoot.appendingPathComponent(name)
-            let raw = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-            out[name] = (name == "GROWTH.md")
-                ? DreamREMGrowthHygiene.stripEpisodicLines(raw)
-                : raw
-        }
-        return out
-    }
-
-    /// Load the full Agent persona (SOUL/VOICE/GROWTH/USER/AGENTS) untruncated
-    /// for the REM-bypass system prompt. REM proposals only target GROWTH.md;
-    /// the extra context here is read-only background so REM reflects on the whole
-    /// entity instead of a target-doc stub. GROWTH.md gets the same
-    /// episodic-line strip PersonaEngine applies for chat retrieval, so a
-    /// stale `- <ts> · feedback · ...` line can't leak into REM context.
-    /// Missing files → empty strings.
-    private func readContextDocs() throws -> [String: String] {
-        let ids = ["SOUL.md", "VOICE.md", "GROWTH.md", "USER.md", "AGENTS.md"]
-        var out: [String: String] = [:]
-        for name in ids {
-            let url = personaRoot.appendingPathComponent(name)
-            let raw = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let raw = FileManager.default.fileExists(atPath: url.path)
+                ? try String(contentsOf: url, encoding: .utf8) : ""
             out[name] = (name == "GROWTH.md")
                 ? DreamREMGrowthHygiene.stripEpisodicLines(raw)
                 : raw
@@ -746,7 +730,7 @@ public actor REMConsolidator {
     /// `<dataRoot>/rem_proposals.jsonl` log. Used by REMCycleLoop's legacy
     /// (non-full-pipeline) path so the chat-turn injector always sees a
     /// fresh pins index after a tick — the full pipeline path already runs
-    /// this internally via runWeeklyREM step (8).
+    /// this internally after GROWTH eviction.
     public static func emitREMPinsIndex(dataRoot: URL) throws {
         let pinsURL = dataRoot.appendingPathComponent("rem_pins.json")
         // P-L3: read through the store so APPROVED rows folded into the

@@ -1,4 +1,5 @@
 import Foundation
+import Transcripts
 
 /// A message the person sent while a turn was already working (third
 /// conversation pass, item 5).
@@ -27,6 +28,9 @@ public actor ChatTurnSteering {
         /// queue entry once the running turn has taken it.
         public let id: String
         public let text: String
+        /// Attempt identity, retained even when commitment is still unresolved.
+        /// The queue reconciles it before deciding whether to append on replay.
+        public internal(set) var enqueuedRunID: String?
 
         public init(id: String, text: String) {
             self.id = id
@@ -39,8 +43,9 @@ public actor ChatTurnSteering {
     static let maxPending = 8
 
     private var pending: [String: [Offer]] = [:]
+    private var reserved: [String: [Offer]] = [:]
     private var stranded: [String: [Offer]] = [:]
-    public typealias Persister = @Sendable (String, String) async -> Bool
+    public typealias Persister = @Sendable (String, String, String) async -> Bool
 
     struct OpenTurn {
         let token: UUID
@@ -66,9 +71,8 @@ public actor ChatTurnSteering {
     /// session that was already narrating (2026-09-14, session 644D65F1).
     ///
     /// `persist` is how THIS turn writes a delivered message to the transcript.
-    /// `false` from it means the row is NOT on disk, and an unwritten message
-    /// must not be delivered — it would steer the turn and then be absent after
-    /// reload, having already left the queue.
+    /// True proves the row is on disk; false leaves the attempt unresolved and
+    /// must not deliver it — the queue reconciles its identity before replay.
     @discardableResult
     public func openTurn(
         sessionId: String, persist: Persister? = nil
@@ -84,8 +88,12 @@ public actor ChatTurnSteering {
     public func closeTurn(sessionId: String, token: UUID?) {
         guard let token, open[sessionId]?.token == token else { return }
         open.removeValue(forKey: sessionId)
-        guard let left = pending.removeValue(forKey: sessionId), !left.isEmpty else { return }
-        stranded[sessionId, default: []].append(contentsOf: left)
+        if let left = reserved.removeValue(forKey: sessionId) {
+            stranded[sessionId, default: []].append(contentsOf: left)
+        }
+        if let left = pending.removeValue(forKey: sessionId) {
+            stranded[sessionId, default: []].append(contentsOf: left)
+        }
     }
 
     /// The single drain point once a turn is over: everything it never took —
@@ -99,6 +107,9 @@ public actor ChatTurnSteering {
     public func takeStranded(sessionId: String) -> [Offer] {
         open.removeValue(forKey: sessionId)
         var out = stranded.removeValue(forKey: sessionId) ?? []
+        if let left = reserved.removeValue(forKey: sessionId) {
+            out.append(contentsOf: left)
+        }
         if let left = pending.removeValue(forKey: sessionId) {
             out.append(contentsOf: left)
         }
@@ -115,6 +126,12 @@ public actor ChatTurnSteering {
         open[sessionId] != nil
     }
 
+    /// Whether any session not starting with `prefix` is running a turn: her
+    /// resident wake waits for a live one rather than starting a second.
+    public func hasOpenTurn(excludingPrefix prefix: String) -> Bool {
+        open.keys.contains { !$0.hasPrefix(prefix) }
+    }
+
     /// Offer a message to the session's running turn. `false` means it was not
     /// taken (no open turn, or the pending bound is reached) and the caller
     /// keeps it queued.
@@ -127,10 +144,14 @@ public actor ChatTurnSteering {
         return true
     }
 
-    /// Take everything offered so far. Called at a tool boundary, so the common
-    /// case is an empty array and one actor hop.
-    public func drain(sessionId: String) async -> [Offer] {
-        guard let queue = pending.removeValue(forKey: sessionId), !queue.isEmpty else {
+    /// Called only after the next provider round is admitted. Keep offers
+    /// reserved through persistence so a Stop returns even committed rows to
+    /// the ordinary queue with their enqueue identity intact.
+    public func drain(sessionId: String, cancelFlagPath: URL? = nil) async -> [Offer] {
+        guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath),
+              reserved[sessionId] == nil,
+              let turn = open[sessionId],
+              let queue = pending.removeValue(forKey: sessionId), !queue.isEmpty else {
             return []
         }
         // The person really did send this message, so the transcript records it
@@ -139,21 +160,32 @@ public actor ChatTurnSteering {
         // answers but the transcript never got is gone from the queue AND
         // absent after reload, so a failed write un-delivers the offer — it is
         // stranded instead, and its owner re-queues it as an ordinary turn.
-        guard let persist = open[sessionId]?.persist else {
+        guard let persist = turn.persist else {
             stranded[sessionId, default: []].append(contentsOf: queue)
             return []
         }
-        var delivered: [Offer] = []
+        reserved[sessionId] = queue
         for (index, offer) in queue.enumerated() {
-            guard await persist(sessionId, offer.text) else {
-                // Their order is their order: once one is held back, the ones
-                // behind it go with it rather than arriving ahead of it.
-                stranded[sessionId, default: []].append(contentsOf: queue[index...])
-                break
+            if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { return [] }
+            let runID = UUID().uuidString
+            reserved[sessionId]?[index].enqueuedRunID = runID
+            let committed = await persist(sessionId, offer.text, runID)
+            guard open[sessionId]?.token == turn.token else { return [] }
+            guard committed else {
+                // Keep their order, including rows saved before this failure.
+                stranded[sessionId, default: []].append(
+                    contentsOf: reserved.removeValue(forKey: sessionId) ?? [])
+                return []
             }
-            delivered.append(offer)
         }
-        return delivered
+        guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath) else { return [] }
+        return reserved.removeValue(forKey: sessionId) ?? []
+    }
+
+    /// A Stop after the actor hop can still prevent provider construction.
+    /// The rows are already saved, so retain their run IDs for queue replay.
+    public func returnUndelivered(_ offers: [Offer], sessionId: String) {
+        stranded[sessionId, default: []].append(contentsOf: offers)
     }
 
     /// How a delivered message announces itself in the round. One line, only

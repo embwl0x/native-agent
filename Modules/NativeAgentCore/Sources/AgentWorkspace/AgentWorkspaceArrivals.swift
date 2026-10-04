@@ -68,7 +68,7 @@ package enum AgentWorkspaceArrivals {
             }
             var result: [String: JSONValue] = ["title": .string(String(title.prefix(120))),
                 "kind": .string(kind.rawValue), "attention_needed": .bool(kind.priority == 0),
-                "detail": .string(kind.detail), "open": .object(["tool": .string("workspace"), "action": .string(id)])]
+                "detail": .string(kind.detail), "open": .object(["tool": .string("app"), "input": .object(["item": .string(id)])])]
             if let preview { result["preview"] = preview.value }
             if let from { result["from"] = .string(String(from.prefix(120))) }
             if let status { result["recorded_status"] = .string(String(status.prefix(80))) }

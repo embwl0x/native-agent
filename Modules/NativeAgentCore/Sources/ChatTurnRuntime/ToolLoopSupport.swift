@@ -3,6 +3,79 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import ProviderRouting
+import ToolRegistry
+
+/// Retains loop evidence across a throw without changing the public error carriers.
+final class ToolLoopTraceObservation: @unchecked Sendable {
+    @TaskLocal static var current: ToolLoopTraceObservation?
+    private let lock = NSLock()
+    private var payload: [String: JSONValue] = [:]
+    private var dispatches: [TurnEngineResult.ToolDispatchRecord] = []
+
+    func record(_ counters: TurnEngineResult.LoopCounters, dispatches: [TurnEngineResult.ToolDispatchRecord]) {
+        lock.lock()
+        defer { lock.unlock() }
+        payload = counters.tracePayload
+        payload.merge(Self.toolCounts(dispatches), uniquingKeysWith: { _, new in new })
+        self.dispatches = dispatches
+    }
+
+    var toolDispatches: [TurnEngineResult.ToolDispatchRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        return dispatches
+    }
+
+    var tracePayload: [String: JSONValue] {
+        lock.lock()
+        defer { lock.unlock() }
+        return payload
+    }
+
+    static func toolCounts(_ dispatches: [TurnEngineResult.ToolDispatchRecord]) -> [String: JSONValue] {
+        let attempts = dispatches.filter {
+            !ChatToolOutcome.neverRan($0.result)
+                && (!wasStopped($0.result) || ChatToolOutcome.effectsUnknown($0.result))
+                && !ChatToolOutcome.isWaitingOnPerson($0.result)
+        }
+        return [
+            "toolAttemptCount": .int(Int64(attempts.count)),
+            "failedToolAttemptCount": .int(Int64(attempts.filter {
+                !ChatToolOutcome.outputLooksSuccessful($0.result)
+                    && !wasStopped($0.result) && !ChatToolOutcome.wasCancelled($0.result)
+            }.count)),
+            "skippedToolSlotCount": .int(Int64(dispatches.filter {
+                ChatToolOutcome.neverRan($0.result)
+                    || (wasStopped($0.result) && !ChatToolOutcome.effectsUnknown($0.result))
+            }.count)),
+        ]
+    }
+
+    /// The loop's Stop envelopes include an error sentence, which outranks status in the shared classifier.
+    static func wasStopped(_ output: JSONValue) -> Bool {
+        guard case .object(let object) = output else { return false }
+        return object["cancelled"] == .bool(true) && object["status"] == .string("cancelled")
+    }
+}
+
+extension TurnEngineResult.LoopCounters {
+    var tracePayload: [String: JSONValue] {
+        [
+            "providerAttemptCount": .int(Int64(providerAttemptCount)),
+            "failedProviderAttemptCount": .int(Int64(failedProviderAttemptCount)),
+            "providerRoundCount": .int(Int64(providerRoundCount)),
+            "providerRecoveryCount": .int(Int64(providerRecoveryCount)),
+            "providerReplayCount": .int(Int64(providerReplayCount)),
+            "providerContinuationCount": .int(Int64(providerContinuationCount)),
+            "contextOverflowRecoveryCount": .int(Int64(contextOverflowRecoveryCount)),
+            "toolRoundCount": .int(Int64(toolRoundCount)),
+            "roundsAfterToolFailureCount": .int(Int64(roundsAfterToolFailureCount)),
+            "protocolViolationRoundCount": .int(Int64(protocolViolationRoundCount)),
+            "emptyReplyRoundCount": .int(Int64(emptyReplyRoundCount)),
+            "unfulfilledPromiseRoundCount": .int(Int64(unfulfilledPromiseRoundCount)),
+        ]
+    }
+}
 
 // MARK: - Error extension
 
@@ -23,10 +96,7 @@ extension TurnEngineError {
 
 /// The single wording for a tool loop that stopped without a final reply.
 /// The tool loop builds its best-effort fallback reply from this so the
-/// phrasing can't drift again. The message names the actual
-/// rounds run and WHY the loop stopped — the old wording printed the LIMIT
-/// unconditionally, so a wall-clock-cut turn (188s, ~10 rounds, 2026-08-27)
-/// reported "exhausted after 180 iterations" and misled diagnosis.
+/// phrasing can't drift again. Execution counters stay in diagnostic receipts.
 enum ToolLoopExhaustion {
     static func fallbackReply(
         iterationLimit: Int,
@@ -34,19 +104,15 @@ enum ToolLoopExhaustion {
         providerRounds: Int,
         wallClockElapsedSeconds: Int? = nil
     ) -> String {
-        if let seconds = wallClockElapsedSeconds {
-            return "(turn stopped by wall-clock budget after \(seconds)s / \(providerRounds) provider rounds — dispatched \(dispatchCount) tool calls, no final reply)"
-        }
-        return "(tool loop exhausted after \(providerRounds)/\(iterationLimit) iterations — dispatched \(dispatchCount) tool calls, no final reply)"
+        "I stopped before I could finish my reply."
     }
 
     /// A turn that COMPLETED with no text at all. An assistant row is never
     /// blank: an empty final reply used to persist an empty bubble under the
     /// receipts — the "Looked something up · 8 of 12 failed" card with nothing
-    /// said beside it. Same shape as `fallbackReply`: name what ran, and that
-    /// nothing came back.
+    /// said beside it. Say plainly that no answer came back.
     static func emptyReply(dispatchCount: Int, providerRounds: Int) -> String {
-        "(the model returned no reply text after \(providerRounds) provider round(s) and \(dispatchCount) tool call(s) — nothing was said back)"
+        "I did not receive an answer to share."
     }
 }
 
@@ -301,7 +367,7 @@ struct WholeTurnWallClockBudget: Sendable {
 // shortening intentionally long work.
 //
 // The unattended default (3900s) sits ABOVE the longest self-bounding tool
-// (`invoke_claude` clamps its subprocess to <=3600s and self-terminates),
+// (an explicit timeout_seconds clamps to <=3600s),
 // so it NEVER clips a legitimately long tool — it only ever fires for a
 // genuinely UNBOUNDED wedge (shell / network / MCP with no internal timeout,
 // all of which complete in seconds-to-minutes normally). It is a backstop
@@ -319,7 +385,7 @@ public enum ToolDispatchDeadline {
     static let envVar = "NATIVE_AGENT_TOOL_DISPATCH_TIMEOUT_SECONDS"
 
     /// Default backstop for an unattended surface. Above the longest
-    /// self-bounding tool (`invoke_claude` <=3600s) so it never clips legit
+    /// self-bounding tool (timeout_seconds <=3600s) so it never clips legit
     /// work; only an unbounded wedge ever reaches it.
     static let defaultUnattendedSeconds: TimeInterval = 3900
     /// Interactive calls should never hang forever either. Fifteen minutes is
@@ -369,8 +435,6 @@ public enum ToolDispatchDeadline {
             let seconds: Int64
             if case .int(let value)? = input["wait_seconds"] { seconds = value } else { seconds = 60 }
             raw = TimeInterval(max(1, min(120, seconds))) + cleanupMarginSeconds
-        } else if toolName == "invoke_claude" {
-            raw = 180 + cleanupMarginSeconds
         } else if toolName == "invoke_codex" || toolName == "image_generate" {
             raw = 600 + cleanupMarginSeconds
         } else if ["screen", "menu", "mac_look", "mac_view"].contains(toolName) {
@@ -407,7 +471,7 @@ public enum ToolDispatchDeadline {
 //
 // The stub `IntraTurnContextCompaction` puts in place of an older tool-result
 // body under window pressure: a 180-char head plus a marker telling the model
-// it can re-run the tool if it needs the full body again. Disk persistence,
+// to recover the existing output without repeating effects. Disk persistence,
 // transcripts and traces keep full bodies — session history is written from
 // TurnEngineResult.toolDispatches + progress events, never from the in-flight
 // conversation.
@@ -422,7 +486,7 @@ enum IntraTurnToolResultClearing {
     static let clearedMarkerPrefix = "[cleared: full result was "
 
     /// Suffix of OUR stub's terminal marker line.
-    static let clearedMarkerSuffix = " chars; re-run the tool if needed]"
+    static let clearedMarkerSuffix = " chars; recover the existing output from its receipt or saved result; do not repeat mutations or external sends merely to recover output]"
 
     /// Idempotence sentinel (tightened 2026-06-10 review fix): a body counts
     /// as already-stubbed only when it ENDS with our exact terminal marker
@@ -464,20 +528,9 @@ enum ProviderToolResultProjection {
     static let defaultMaxUTF8Bytes = 48_000
     static let compactMaxUTF8Bytes = 12_000
 
-    /// tool_load carries schemas_added — with the text-compat catalog pinned
-    /// per turn (turn-context-iteration-cache, 2026-08-13) this result is the
-    /// model's ONLY in-turn source of a just-loaded tool's parameters, so it
-    /// must survive projection whole. Budget sized above the full eager
-    /// catalog (~73KB) so no category load can truncate; still a ceiling.
-    static let toolLoadMaxUTF8Bytes = 96_000
-
     static func maxUTF8Bytes(for toolName: String) -> Int {
-        if toolName == "tool_load" {
-            return toolLoadMaxUTF8Bytes
-        }
         if toolName.hasPrefix("github_")
-            || toolName == "invoke_codex"
-            || toolName == "invoke_claude" {
+            || toolName == "invoke_codex" {
             return compactMaxUTF8Bytes
         }
         return defaultMaxUTF8Bytes
@@ -489,7 +542,8 @@ enum ProviderToolResultProjection {
         sessionId: String? = nil,
         turnId: String? = nil,
         originalResultClass: ChatToolOutcome.ExactResultClass? = nil,
-        query: String? = nil
+        query: String? = nil,
+        appDoor: Bool = false
     ) async -> String {
         let limit = maxUTF8Bytes(for: toolName)
         guard content.utf8.count > limit else { return content }
@@ -513,29 +567,35 @@ enum ProviderToolResultProjection {
             query: query
         ) {
             fields = page
-            fields["recovery_tool"] = .string("tool_result_page")
+            // Through the door the page is app's result.page.
+            fields["recovery_tool"] = .string(appDoor ? "app result.page" : "tool_result_page")
+            if appDoor, case .string(let detail)? = fields["detail"] {
+                fields["detail"] = .string(ToolNameAliases.foldedProse(detail))
+            }
             fields["retained_bytes"] = .int(Int64(recovery.bytes))
         } else {
             fields = ["sections": .array(ToolResultSections.pages(content: content, query: query, budget: budget)[0]),
                 "detail": .string("Only the displayed whole sections are included. The original could not be retained. Inspect an existing saved result; missing output does not establish failure.")]
         }
         fields["provider_projection"] = .string("bounded_tool_result")
-        fields["tool"] = .string(toolName)
+        fields["tool"] = .string(appDoor ? ToolNameAliases.appAction(toolName) ?? toolName : toolName)
         fields["original_result_class"] = .string(originalResultClass.rawValue)
         fields["verification_scope"] = .string("tool_response_not_external_outcome")
         fields["original_characters"] = .int(Int64(content.count))
         fields["original_bytes"] = .int(Int64(content.utf8.count))
         fields["full_result_retained"] = .bool(recovery != nil)
-        // Workspace controls must remain usable even when a page's reading
+        // Home's controls must remain usable even when a page's reading
         // evidence is paged. Preserve the exact live controls, never reconstruct
         // or replay them from retained content. The full result remains paged.
-        if toolName == "workspace", let data = content.data(using: .utf8),
+        if toolName == "app", let data = content.data(using: .utf8),
            let value = try? JSONDecoder().decode(JSONValue.self, from: data),
-           case .object(let frame) = value {
+           case .object(var frame) = value {
+            // A home-item send puts its receipt on top and the room under view.
+            if case .object(let view)? = frame["view"] { frame.merge(view) { top, _ in top } }
             let keys: Set<String> = ["status", "workspace", "path", "actions", "windows", "places", "desktop"]
             let navigation = JSONValue.object(frame.filter { keys.contains($0.key) })
             var candidate = fields
-            candidate["workspace_navigation"] = navigation
+            candidate["navigation"] = navigation
             if let encoded = try? JSONValue.object(candidate).serialize(pretty: false), encoded.utf8.count <= limit {
                 fields = candidate
             }
@@ -684,7 +744,9 @@ struct ToolLoopNoProgressGuard {
             case .succeeded:
                 continue
             case .failed, .timeout:
-                let current = (name: record.name, error: failureText(record.result))
+                // An app call is named by its action: two actions are two tools.
+                let action: String? = if record.name == "app", case .string(let id)? = record.input["action"] { id } else { nil }
+                let current = (name: action.map { "app " + $0 } ?? record.name, error: failureText(record.result))
                 if let seen, seen != current { return nil }
                 seen = current
             case .cancelled, .unknown:
@@ -712,7 +774,7 @@ struct ToolLoopNoProgressGuard {
             return trimmed.isEmpty ? nil : trimmed
         }
         guard !parts.isEmpty else { return "failed" }
-        return String(parts.joined(separator: " — ").prefix(200))
+        return String(ChatSecretRedactor.redactText(parts.joined(separator: " — ")).prefix(200))
     }
 
     private static func equal(

@@ -201,14 +201,18 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         public let evidenceCount: Int
         /// How many times she has come back to it. A view that held up.
         public let revisitCount: Int
+        /// Phase 5 D: an opinion's why, what would change it, what it used to
+        /// be and what changed it; an interest's earlier questions. Her words.
+        public let reasons: [String]
 
         public init(id: UUID, status: String, text: String,
-                    evidenceCount: Int = 0, revisitCount: Int = 0) {
+                    evidenceCount: Int = 0, revisitCount: Int = 0, reasons: [String] = []) {
             self.id = id
             self.status = status
             self.text = String(text.prefix(CognitiveInnerStateReading.standingViewCharacters))
             self.evidenceCount = max(0, evidenceCount)
             self.revisitCount = max(0, revisitCount)
+            self.reasons = Array(reasons.prefix(6).map { String($0.prefix(200)) })
         }
     }
 
@@ -431,6 +435,7 @@ extension CognitiveSubstrate {
         windowHours: Double = CognitiveInnerStateReading.defaultWindowHours,
         detail: CognitiveInnerStateReading.Detail = .compact,
         organism: CognitiveInnerStateOrganismReads = .none,
+        surface: String? = nil,
         at explicitNow: Date? = nil
     ) async -> CognitiveInnerStateReading {
         let now = explicitNow ?? dependencies.now()
@@ -617,6 +622,11 @@ extension CognitiveSubstrate {
 
         let seeds = projectedThoughtSeeds(at: now)
             .filter(isUsefulThoughtSeed)
+            .filter { seed in
+                guard seed.kind == .reflectionTakeaway else { return true }
+                guard let peers = seed.sourcePeerIds else { return false }
+                return peers.allSatisfy { dependencies.peerTrusted($0) }
+            }
             .sorted(by: thoughtSeedPrioritySort)
             .prefix(CognitiveInnerStateReading.maximumSeeds)
             .map {
@@ -627,8 +637,10 @@ extension CognitiveSubstrate {
         // Views she can NAME: active first (those are the ones that steer),
         // then proposals still waiting on User. Retired views are gone, not
         // hidden — they do not appear at all.
+        let experiment = configuration.viewsExperimentEnabled
         let views = standingViews.values
-            .filter { $0.status != .retired }
+            .filter { $0.status != .retired
+                && (experiment || ($0.status != .opinion && $0.status != .interest)) }
             .sorted { lhs, rhs in
                 if (lhs.status == .active) != (rhs.status == .active) {
                     return lhs.status == .active
@@ -640,8 +652,11 @@ extension CognitiveSubstrate {
             .map {
                 CognitiveInnerStateReading.StandingView(
                     id: $0.id, status: $0.status.rawValue, text: $0.body,
-                    evidenceCount: max($0.evidenceExcerpts.count, $0.evidenceNodeIds.count),
-                    revisitCount: $0.revisitCount)
+                    // Phase 5 D (Agent): independent occurrences, not how many
+                    // nodes re-reading the same material dragged along.
+                    evidenceCount: $0.independentOccurrenceCount,
+                    revisitCount: $0.revisitCount,
+                    reasons: Self.innerStateReasons($0, at: now))
             }
 
         return CognitiveInnerStateReading(
@@ -660,7 +675,7 @@ extension CognitiveSubstrate {
             chemistryWords: Self.innerStateChemistryWords(organism.projection),
             fatigue: organism.fatigue,
             timeOfDayPhase: Self.innerStateTimeOfDayWord(organism.diurnal),
-            ruminationCandidate: innerStateRumination(at: now),
+            ruminationCandidate: innerStateRumination(at: now, surface: surface),
             seeds: Array(seeds),
             expectations: organism.expectations,
             toward: organism.toward.map {
@@ -680,108 +695,21 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// D-2's gate 2, exposed as a pure read — and narrowed to SIGNED views.
-    ///
-    /// The shoulder-tap route (item 12) needs the same stake test the felt lane
-    /// uses: does one of the concerns SHE formed actually name this thing? Floor
-    /// concerns deliberately do not open it, for exactly the reason D-2 gives: a
-    /// shipped keyword tripping on a machine token is a coincidence, not
-    /// evidence, and a coincidence must never buzz User's phone.
-    ///
-    /// 2026-09-02, reviewer call — HELD VIEWS NEVER AUTHORIZE A TAP. The held
-    /// tier is a view she adopted on her own, at half stake, with no signature
-    /// on it; `livedConcernHit` admits it because the felt lane is allowed to be
-    /// moved by something she merely believes. Interrupting User is not the felt
-    /// lane. The authority to put a notification on his phone comes from a view
-    /// HE approved, so this reads `.active` only. Held views still LIST in
-    /// `inner_state` — she can see and name what she is holding; it just cannot
-    /// speak on her behalf to him.
-    ///
-    /// Fails closed the whole way down: no views, no terms, or cognition off ⇒
-    /// false.
-    public func passesStakesGate(_ text: String) async -> Bool {
-        guard configuration.enabled else { return false }
-        let lowered = text.lowercased()
-        guard !lowered.isEmpty else { return false }
-        return standingViews.values
-            .filter { $0.status == .active }
-            .contains { view in
-                let terms = Self.appraisalConcernTerms(in: "\(view.title) \(view.body)")
-                guard !terms.isEmpty else { return false }
-                return terms.contains { lowered.contains($0) }
-            }
+    static func innerStateReasons(_ view: CognitiveStandingView, at now: Date) -> [String] {
+        switch view.status {
+        case .opinion:
+            var lines = ["because: \(view.because)", "would change if: \(view.wouldChangeMind)"]
+            lines += view.revisions.reversed().map { "used to think: \($0.priorStance) — changed by: \($0.evidence)" }
+            if view.dueForReconsideration(at: now) { lines.append("held a while: due for your reconsideration") }
+            return lines
+        case .interest:
+            return view.evidenceExcerpts.reversed().map { "earlier question: \($0)" }
+        default:
+            return []
+        }
     }
 
-    // MARK: - A PURE suggestion read (2026-09-02, reviewer HIGH)
-
-    /// `thoughtSuggestionSnapshot` routes through `workspaceSnapshot()`, which
-    /// routes through the field's MUTATING `snapshot` — decay writes, anchor
-    /// advances, capacity eviction. That is tolerable for a panel a human opened
-    /// on purpose; it is NOT tolerable for the shoulder tap, which runs on every
-    /// residual-repair reschedule (many times a minute under load) and would
-    /// therefore be aging and evicting her memory as a side effect of asking
-    /// "is anything worth mentioning". Reading her mind must never change it.
-    ///
-    /// This is the same selection and the same ranking against a PURE hot-set
-    /// peek: identical eligibility, identical scoring, identical interruption
-    /// model (`interruptionScore` / `thoughtSuggestionReason` are the one
-    /// producer, shared with the snapshot above — nothing is reimplemented
-    /// here), identical sort and cap. The single difference is that the field is
-    /// left exactly as it was found.
-    public func pureThoughtSuggestions(
-        surface: String = "push",
-        limit: Int = 1,
-        minimumInterruptionScore: Double,
-        at explicitNow: Date? = nil
-    ) async -> [CognitiveThoughtSuggestion] {
-        guard configuration.enabled, configuration.thoughtSeedsEnabled, limit > 0 else { return [] }
-        let now = explicitNow ?? dependencies.now()
-        let boundedSurface = bounded(
-            surface.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 80)
-        let currentAffect = projectedAffect(at: now)
-        let activeWorkspaceNodeIds = Set(pureHotSet(at: now).map(\.node.id))
-
-        return projectedThoughtSeeds(at: now).compactMap { seed in
-            let workspaceNodeIds = seed.sourceNodeIds.filter { activeWorkspaceNodeIds.contains($0) }
-            let score = interruptionScore(
-                for: seed,
-                workspaceNodeIds: workspaceNodeIds,
-                affect: currentAffect,
-                at: now
-            )
-            guard score >= minimumInterruptionScore.clamped01() else { return nil }
-            return CognitiveThoughtSuggestion(
-                id: stableArtifactID("thought_suggestion|\(seed.id.uuidString)|\(boundedSurface)"),
-                seedId: seed.id,
-                kind: seed.kind,
-                text: seed.text,
-                interruptionScore: score,
-                priority: seed.priority,
-                createdAt: now,
-                surface: boundedSurface.isEmpty ? "push" : boundedSurface,
-                reason: thoughtSuggestionReason(
-                    for: seed,
-                    workspaceNodeIds: workspaceNodeIds,
-                    affect: currentAffect
-                ),
-                sourceNodeIds: seed.sourceNodeIds,
-                workspaceNodeIds: workspaceNodeIds
-            )
-        }
-        .sorted { lhs, rhs in
-            if lhs.interruptionScore != rhs.interruptionScore {
-                return lhs.interruptionScore > rhs.interruptionScore
-            }
-            if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
-            return lhs.seedId.uuidString < rhs.seedId.uuidString
-        }
-        .prefix(limit)
-        .map { $0 }
-    }
-
-    /// The hot set, decayed on COPIES. One producer for both the inner-state
-    /// read and the pure suggestion read, so the two can never disagree about
-    /// what she is currently holding.
+    /// The hot set, decayed on COPIES: reading her mind never changes it.
     func pureHotSet(at now: Date) -> [(node: CognitiveNode, score: Double)] {
         guard configuration.enabled, configuration.workspaceEnabled else { return [] }
         let mood = derivedMood(at: now)
@@ -873,8 +801,12 @@ extension CognitiveSubstrate {
     /// label from the seed's own evidence instead. She already holds the seed —
     /// its id is a complete pointer — so there is no reason for the nag to have
     /// a second, prose-shaped way out of the machine.
-    func innerStateRumination(at now: Date) -> CognitiveInnerStateReading.RuminationCandidate? {
-        guard let heaviest = ruminationCandidates(at: now).first else { return nil }
+    func innerStateRumination(at now: Date, surface: String?) -> CognitiveInnerStateReading.RuminationCandidate? {
+        guard let heaviest = ruminationCandidates(at: now).first(where: { candidate in
+            guard let id = candidate.externalId,
+                  let permitted = externalRuminations[id]?.permittedSurfaces else { return true }
+            return surface.map { permitted.contains($0) } ?? false
+        }) else { return nil }
         // The subject is the first LIVED source node the seed still has in the
         // field. A nag whose evidence has been evicted keeps its pointer and
         // loses its label — honest, and the same bound the rumination read

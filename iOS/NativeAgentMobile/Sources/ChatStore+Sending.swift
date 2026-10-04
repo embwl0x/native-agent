@@ -55,6 +55,7 @@ extension ChatStore {
         appendUser: Bool = true,
         attachments: [MultimodalAttachment] = [],
         reusePlaceholderId: UUID? = nil,
+        retainedUserMessageID: UUID? = nil,
         suppressRemoteUserAppend: Bool = false,
         replacementAssistantMessageID: UUID? = nil,
         onFailure: (() -> Void)? = nil,
@@ -64,7 +65,8 @@ extension ChatStore {
         if !MobileChatSelectionIntent.userChoseThisLaunch {
             // The composer may retain the adopted main while a newer Mac
             // anchor waits for its draft to be sent or cleared.
-            guard let mainSessionID, mainSessionID == selectedSessionID else {
+            // With neither identity bound yet, the Mac creates the first session.
+            guard mainSessionID == selectedSessionID else {
                 errorBanner = "Waiting for the Mac's current chat to sync."
                 return .rejected
             }
@@ -103,7 +105,7 @@ extension ChatStore {
         if appendUser && emitHaptic {
             Haptics.send()
         }
-        var appendedUserId: UUID?
+        var appendedUserId = retainedUserMessageID
         if appendUser {
             let summaries = attachments.map {
                 ChatAttachmentSummary(
@@ -126,7 +128,6 @@ extension ChatStore {
             }
             appendedUserId = userMsg.id
         }
-        isLoading = true
         let placeholderId: UUID
         if let reuse = reusePlaceholderId,
            let idx = messages.firstIndex(where: { $0.id == reuse }) {
@@ -147,6 +148,8 @@ extension ChatStore {
             }
             placeholderId = placeholder.id
         }
+        loadingPlaceholderID = placeholderId
+        isLoading = true
         // 2026-09-13: say what is true of THIS phone — it is waiting for the
         // Mac to receive the request — instead of narrating the Mac's side.
         streamingHintsByMessageId[placeholderId] = ChatWaitStatusPresentation.unacknowledged
@@ -238,24 +241,9 @@ extension ChatStore {
                     pendingSendArgs[messageId] = pendingArgs
                     armTimeout(for: messageId, placeholderId: placeholderId)
                     armReplyPoll(for: messageId, client: client)
-                case .reply(let reply, let responseSessionID):
-                    pendingICloudPlaceholders.removeValue(forKey: correlationID)
-                    pendingSendArgs.removeValue(forKey: correlationID)
-                    closePendingExchange(correlationID)
-                    if let responseSessionID, !responseSessionID.isEmpty {
-                        if targetSessionID == nil {
-                            migrateQueuedSends(from: nil, to: responseSessionID)
-                        }
-                        setSelectedSessionID(responseSessionID)
-                        if targetSessionID == nil {
-                            rememberMainSessionIDIfNeeded(responseSessionID)
-                        }
-                    }
-                    finishPlaceholder(id: placeholderId, text: reply)
-                    isLoading = false
-                    onReply?(reply)
                 }
             } catch {
+                guard !Task.isCancelled else { return }
                 guard sendCompletionOwnsReply(correlationID, placeholderId: placeholderId) else { return }
                 pendingICloudPlaceholders.removeValue(forKey: correlationID)
                 pendingSendArgs.removeValue(forKey: correlationID)
@@ -273,7 +261,7 @@ extension ChatStore {
                     if queuedSendID != nil {
                         // 2026-09-06: keep the transcript and full attachment
                         // payload; Retry reuses this retained signed handoff.
-                        pausedQueueSessionKeys.insert(queueSessionKey(targetSessionID))
+                        transportPausedQueueSessionKeys.insert(queueSessionKey(targetSessionID))
                         finishPlaceholder(id: placeholderId, text: "Send failed — retry when ready.", success: false)
                     } else if reusePlaceholderId == nil {
                         messages.remove(at: idx)
@@ -284,7 +272,7 @@ extension ChatStore {
                     errorBanner = "Send failed: \(error.localizedDescription)"
                     onFailure?()
                 }
-                isLoading = false
+                releaseLoading(for: placeholderId)
             }
         }
         return .started
@@ -294,7 +282,6 @@ extension ChatStore {
     /// a replacement run. Timeout keeps the original arguments for observation.
     func sendCompletionOwnsReply(_ correlationID: String, placeholderId: UUID) -> Bool {
         if resolvedICloudReplyIds.contains(correlationID) {
-            queuedSends.removeAll { $0.id.uuidString == correlationID }
             return false
         }
         return pendingSendArgs[correlationID] != nil
@@ -364,7 +351,10 @@ extension ChatStore {
     func removeQueuedSend(_ id: UUID) {
         queuedSends.removeAll { $0.id == id }
         let key = queueSessionKey(selectedSessionID)
-        if queuedSendsForSelectedSession.isEmpty { pausedQueueSessionKeys.remove(key) }
+        if queuedSendsForSelectedSession.isEmpty {
+            pausedQueueSessionKeys.remove(key)
+            transportPausedQueueSessionKeys.remove(key)
+        }
     }
 
     func sendQueuedNow(_ id: UUID, client: MacBridgeClient) {
@@ -372,6 +362,7 @@ extension ChatStore {
         let key = queueSessionKey(selectedSessionID)
         if !isLoading {
             pausedQueueSessionKeys.remove(key)
+            transportPausedQueueSessionKeys.remove(key)
             scheduleQueuedSendDrain()
             return
         }
@@ -381,6 +372,7 @@ extension ChatStore {
         // provider turn through the independent iCloud chat data plane.
         pausedQueueSessionKeys.insert(key)
         let steeredSessionID = selectedSessionID
+        let steeredPlaceholderID = loadingPlaceholderID
         // Same window as Stop: a send still crossing to the Mac is a run this
         // steer is replacing, so it belongs in the scope.
         let steeredRunIDs = Array(Set(pendingICloudPlaceholders.keys).union(inFlightSendIDs))
@@ -390,10 +382,17 @@ extension ChatStore {
             do {
                 try await client.cancelChat(sessionID: steeredSessionID, runIDs: steeredRunIDs)
                 pausedQueueSessionKeys.remove(key)
-                isLoading = false
+                transportPausedQueueSessionKeys.remove(key)
+                guard selectedSessionID == steeredSessionID,
+                      let steeredPlaceholderID,
+                      loadingPlaceholderID == steeredPlaceholderID else { return }
+                releaseLoading(for: steeredPlaceholderID)
                 scheduleQueuedSendDrain()
             } catch {
-                isLoading = false
+                guard selectedSessionID == steeredSessionID,
+                      let steeredPlaceholderID,
+                      loadingPlaceholderID == steeredPlaceholderID else { return }
+                releaseLoading(for: steeredPlaceholderID)
                 errorBanner = "Could not steer because the Mac did not confirm cancellation: \(error.localizedDescription)"
             }
         }
@@ -402,6 +401,12 @@ extension ChatStore {
     func resumeQueuedSends(startingWith id: UUID? = nil) {
         if let id { _ = promoteQueuedSend(id) }
         pausedQueueSessionKeys.remove(queueSessionKey(selectedSessionID))
+        transportPausedQueueSessionKeys.remove(queueSessionKey(selectedSessionID))
+        scheduleQueuedSendDrain()
+    }
+
+    func recoverQueuedSendTransport() {
+        transportPausedQueueSessionKeys.removeAll()
         scheduleQueuedSendDrain()
     }
 
@@ -425,6 +430,9 @@ extension ChatStore {
         if pausedQueueSessionKeys.remove(oldKey) != nil {
             pausedQueueSessionKeys.insert(newKey)
         }
+        if transportPausedQueueSessionKeys.remove(oldKey) != nil {
+            transportPausedQueueSessionKeys.insert(newKey)
+        }
     }
 
     func scheduleQueuedSendDrain() {
@@ -447,12 +455,13 @@ extension ChatStore {
             text: next.text,
             client: client,
             controls: next.controls,
-            appendUser: true,
+            appendUser: next.userMessageID == nil,
             attachments: next.attachments,
             reusePlaceholderId: next.placeholderID,
+            retainedUserMessageID: next.userMessageID,
             onFailure: { [weak self] in
                 guard let self else { return }
-                self.pausedQueueSessionKeys.insert(self.queueSessionKey(next.sessionID))
+                self.transportPausedQueueSessionKeys.insert(self.queueSessionKey(next.sessionID))
             },
             emitHaptic: false,
             queuedSendID: next.id
@@ -487,7 +496,7 @@ extension ChatStore {
         let replaced = messages.remove(at: assistantIndex)
         // 2026-09-06: this answer is deliberately absent locally until the
         // Mac's replacement lands, which is exactly what
-        // newestMacAssistantReply's fallback reads as "the reply we are
+        // Snapshot reply selection reads as "the reply we are
         // waiting for". Without naming it, a snapshot built before the
         // regeneration completed the turn with the answer being replaced and
         // the real one was dropped as a straggler. One regenerate can be in
@@ -563,7 +572,9 @@ extension ChatStore {
             text: args.text,
             controls: args.controls,
             attachments: args.attachments,
-            createdAt: Date()
+            createdAt: Date(),
+            placeholderID: placeholderId,
+            userMessageID: args.appendedUserId
         )
         guard enqueueSend(retained) else { return }
         let retainedID = retained.id
@@ -583,6 +594,7 @@ extension ChatStore {
             appendUser: false,
             attachments: args.attachments,
             reusePlaceholderId: placeholderId,
+            retainedUserMessageID: args.appendedUserId,
             queuedSendID: retainedID
         )
     }
@@ -608,6 +620,7 @@ extension ChatStore {
         showWaitStatus(correlationID: pendingId)
 
         errorBanner = nil
+        loadingPlaceholderID = placeholderId
         isLoading = true
         return pendingId
     }

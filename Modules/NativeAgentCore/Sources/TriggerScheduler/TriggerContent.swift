@@ -4,6 +4,7 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import Desk
+import WorkshopExecution
 
 // MARK: - TriggerContentBuilder
 //
@@ -14,9 +15,9 @@ import Desk
 // NO LLM. Every section is an independent, FAIL-OPEN read of a state source
 // that already exists under the data root (or, for the worklog, under
 // ~/.claude/state). A missing / truncated / malformed source contributes
-// NOTHING and never throws — a brief that is missing one section is still a
-// true statement about the sections that resolved. A brief that crashes the
-// 60s scheduler tick is not.
+// no facts and is reported as unavailable, except an absent optional worklog,
+// which is unconfigured. Successfully read empty sources
+// can support a quiet brief; failed reads cannot.
 //
 // DEPENDENCY NOTE: this deliberately does NOT reach for
 // `ChatOrchestration.SessionDigestProvider`. That module drags in MemoryV2,
@@ -80,7 +81,7 @@ public struct TriggerContentBuilder: Sendable {
 
         let desk = await deskSection()
         let worklog = worklogSection(reference: current)
-        let executions = workshopExecutionsSection(reference: current)
+        let executions = await workshopExecutionsSection(reference: current)
         let unread = unreadInboxCount()
         let session = lastSessionSection()
 
@@ -104,10 +105,13 @@ public struct TriggerContentBuilder: Sendable {
         }
 
         let summary: String
+        let evidenceUnavailable = !desk.available || worklog.available == false || !executions.available || unread == nil
         if facts.isEmpty {
-            summary = "Morning brief for \(label) — nothing new since yesterday."
+            summary = evidenceUnavailable
+                ? "Morning brief for \(label) — some sources are unavailable, so I can't confirm whether anything changed."
+                : "Morning brief for \(label) — no new activity found in the available sources."
         } else {
-            summary = "\(label) — \(facts.joined(separator: ", "))."
+            summary = "\(label) — \(facts.joined(separator: ", "))." + (evidenceUnavailable ? " Some sources are unavailable." : "")
         }
 
         // Detail: one markdown section per source that resolved.
@@ -184,7 +188,7 @@ public struct TriggerContentBuilder: Sendable {
 
     // MARK: - Sources (each fail-open)
 
-    struct DeskSection { var openCount: Int; var body: String? }
+    struct DeskSection { var openCount: Int; var body: String?; var available: Bool = true }
 
     /// `<root>/desk/desk_ops.jsonl` → live materialized state. Non-terminal
     /// statuses only (`done` / `canceled` are not "open").
@@ -196,11 +200,11 @@ public struct TriggerContentBuilder: Sendable {
         // follow-up, 2026-08-01). A non-SwiftNative persistence cannot drive
         // the desk store, so the section is honestly unavailable instead.
         guard let native = persistence as? SwiftNativePersistenceCore else {
-            return DeskSection(openCount: 0, body: nil)
+            return DeskSection(openCount: 0, body: nil, available: false)
         }
         let store = SwiftNativeDeskStore(dataRoot: root, persistence: native)
-        guard let state = try? await store.liveState(), !state.items.isEmpty else {
-            return DeskSection(openCount: 0, body: nil)
+        guard let state = try? await store.liveState() else {
+            return DeskSection(openCount: 0, body: nil, available: false)
         }
         let open: Set<DeskStatus> = [.now, .next, .blocked, .todo, .flag, .watch]
         let count = state.items.filter { open.contains($0.status) }.count
@@ -208,62 +212,70 @@ public struct TriggerContentBuilder: Sendable {
         return DeskSection(openCount: count, body: DeskProjection.render(state, now: now()))
     }
 
-    struct WorklogSection { var summaries: [String] }
+    // nil availability means the optional worklog is unconfigured.
+    struct WorklogSection { var summaries: [String]; var available: Bool? = true }
 
     /// Bounded tail of `~/.claude/state/claude-worklog.jsonl`, filtered to
     /// entries stamped at or after YESTERDAY 00:00 local.
     func worklogSection(reference: Date) -> WorklogSection {
-        guard let cutoff = Self.startOfYesterday(reference) else { return WorklogSection(summaries: []) }
-        guard let text = Self.tailText(worklogPath, maxBytes: Self.worklogTailBytes) else {
-            return WorklogSection(summaries: [])
+        guard let cutoff = Self.startOfYesterday(reference) else { return WorklogSection(summaries: [], available: false) }
+        let text: String
+        do {
+            text = try Self.tailText(worklogPath, maxBytes: Self.worklogTailBytes)
+        } catch CocoaError.fileReadNoSuchFile {
+            return WorklogSection(summaries: [], available: nil)
+        } catch {
+            return WorklogSection(summaries: [], available: false)
         }
         var out: [String] = []
+        var available = true
         for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
             let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty, let data = line.data(using: .utf8),
+            if line.isEmpty { continue }
+            guard let data = line.data(using: .utf8),
                   case .object(let o)? = try? JSONValue.parse(data),
                   case .string(let ts)? = o["ts"],
                   let stamp = SwiftNativeTriggerScheduler.parseISOTimestamp(ts),
-                  stamp >= cutoff, stamp <= reference,
-                  case .string(let summary)? = o["summary"] else { continue }
+                  case .string(let summary)? = o["summary"] else { available = false; continue }
+            guard stamp >= cutoff, stamp <= reference else { continue }
             let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { out.append(trimmed) }
         }
         // Newest N, in chronological order.
-        return WorklogSection(summaries: Array(out.suffix(Self.worklogMaxEntries)))
+        return WorklogSection(summaries: Array(out.suffix(Self.worklogMaxEntries)), available: available)
     }
 
-    struct WorkshopExecutionsSection { var activeCount: Int; var movedCount: Int }
+    struct WorkshopExecutionsSection { var activeCount: Int; var movedCount: Int; var available: Bool = true }
 
-    /// `<root>/workshop/legacy_executions.json` — compatibility execution rows.
+    /// Canonical merged queue and legacy Workshop execution projection.
     /// active  = status not terminal.
     /// moved   = `completedAt` or `updatedAt` within the last 24h.
-    func workshopExecutionsSection(reference: Date) -> WorkshopExecutionsSection {
-        guard case .array(let rows)? = Self.readJSONFile(
-            root.appendingPathComponent("workshop", isDirectory: true)
-                .appendingPathComponent("legacy_executions.json")
-        ) else {
-            return WorkshopExecutionsSection(activeCount: 0, movedCount: 0)
+    func workshopExecutionsSection(reference: Date) async -> WorkshopExecutionsSection {
+        let runner = SwiftNativeWorkshopRunner(root: root, persistence: persistence, now: now)
+        guard let rows = try? await runner.listWorkshopExecutionsMerged() else {
+            return WorkshopExecutionsSection(activeCount: 0, movedCount: 0, available: false)
         }
-        let terminal: Set<String> = ["done", "failed", "canceled", "cancelled"]
+        let terminal: Set<String> = ["done", "completed", "failed", "canceled", "cancelled"]
         let window = reference.addingTimeInterval(-24 * 60 * 60)
         var active = 0
         var moved = 0
+        var available = true
         for row in rows {
-            guard case .object(let o) = row else { continue }
+            guard case .object(let o) = row else { available = false; continue }
             let status: String = {
                 if case .string(let s)? = o["status"] { return s.lowercased() }
                 return ""
             }()
+            if status.isEmpty || status == "corrupt" { available = false; continue }
             if !terminal.contains(status) { active += 1 }
-            let stampKeys = ["completedAt", "updatedAt"]
+            let stampKeys = ["completedAt", "completed_at", "updatedAt", "updated_at"]
             for key in stampKeys {
                 guard case .string(let s)? = o[key],
                       let d = SwiftNativeTriggerScheduler.parseISOTimestamp(s) else { continue }
                 if d >= window && d <= reference { moved += 1; break }
             }
         }
-        return WorkshopExecutionsSection(activeCount: active, movedCount: moved)
+        return WorkshopExecutionsSection(activeCount: active, movedCount: moved, available: available)
     }
 
     /// `<root>/notifications/inbox.jsonl` — the LIVE inbox (A5.2 cutover
@@ -281,7 +293,7 @@ public struct TriggerContentBuilder: Sendable {
         for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let data = String(raw).data(using: .utf8),
                   case .object(let o)? = try? JSONValue.parse(data),
-                  case .string(let id)? = o["id"] else { continue }
+                  case .string(let id)? = o["id"] else { return nil }
             let status: String = {
                 if case .string(let s)? = o["status"] { return s.lowercased() }
                 return "unread"
@@ -362,15 +374,18 @@ public struct TriggerContentBuilder: Sendable {
     }
 
     /// Read at most the last `maxBytes` of a file as UTF-8, dropping a leading
-    /// partial line. nil when the file is missing/empty/undecodable.
-    nonisolated static func tailText(_ url: URL, maxBytes: Int) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    /// partial line. Throws when the file is missing, unreadable or undecodable.
+    nonisolated static func tailText(_ url: URL, maxBytes: Int) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        guard let end = try? handle.seekToEnd() else { return nil }
+        let end = try handle.seekToEnd()
         let start = end > UInt64(maxBytes) ? end - UInt64(maxBytes) : 0
-        try? handle.seek(toOffset: start)
-        guard let data = try? handle.readToEnd(), !data.isEmpty,
-              let text = String(data: data, encoding: .utf8) else { return nil }
+        try handle.seek(toOffset: start)
+        if end == 0 { return "" }
+        guard let data = try handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileReadInapplicableStringEncoding)
+        }
         // A non-zero start almost certainly landed mid-line: drop the fragment.
         if start > 0, let nl = text.firstIndex(of: "\n") {
             return String(text[text.index(after: nl)...])

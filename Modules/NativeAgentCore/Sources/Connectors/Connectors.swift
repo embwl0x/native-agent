@@ -4,89 +4,20 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - Subsystem #24 wave 31 (2026-06-01) — Connectors READ-SIDE port
-//                wave 32 W20 (2026-06-01) — FLIP-PREREQ CLOSED (activity append)
-//
-// PORTED-DORMANT (default OFF). This module natively serves the two SIDE-EFFECT
-// -free / side-effect-bounded connector READ routes that are LIVE in the Mac UI
-// via NativeClient and whose backing daemon methods touch ONLY local files the
-// co-located Mac app process can read directly:
-//
-//   • GET  /v1/connectors/workspaces      → NativeClient.getWorkspaces()  (~L4111)
-//        backing: Runtime.list_workspaces —
-//        pure read of <root>/connectors/workspaces.json, default []. ZERO
-//        write-back, ZERO secrets, ZERO activity append. Fully ported.
-//
-//   • POST /v1/connectors/local_files/search → NativeClient.searchWorkspaces() (~L5115)
-//        backing: Runtime.search_workspaces —
-//        reads workspaces.json, walks each workspace dir (skipping
-//        .git/.build/node_modules/__pycache__), matches the query against
-//        filename / relative-path / file content (<=512 KB text files), caps
-//        at 50 results / 2000 scanned files. The directory-walk + matching is
-//        ported faithfully. The daemon ALSO appends a redacted activity event
-//        (record_activity → events.jsonl). As of wave 32 W20 that append IS
-//        now reproduced natively (see FLIP PREREQ below — CLOSED).
-//
-// The OTHER seven /v1/connectors/* routes are NOT in this module — they are
-// KEPT, for these reasons:
-//   - GET /v1/connectors, GET /v1/connectors/proof, GET /v1/connectors/actions:
-//       list_connectors() does a read-merge-write-back of connectors/registry.json
-//       AND derives enabled/authState/healthStatus from the daemon OAuth token
-//       store (<root>/oauth_tokens/*.json) + proofs.json + telegram/agentmail
-//       secrets. A naive registry-only read would be WRONG (stale readiness).
-//       wave 42 W11 (§6.260) RE-AUDITED these: the write-back is NO LONGER
-//       unlocked — wave-34 W18 (§6.97) wrapped list_connectors' R-M-W in
-//       `with file_lock(self.connectors_path)` and flock'd every Python writer,
-//       so the write-back race blocker is CLOSED. The SOLE remaining blocker is
-//       the readiness DERIVATION (default_connectors → OAuth token presence +
-//       proofs.json TTL/state + public_telegram_config + AgentMail secret +
-//       searxng config). Porting `listConnectors()` here (read-merge-write-back
-//       under withFileLock + a native readiness layer reusing the wave-37 W02
-//       oauth_tokens reader, gated on the EXISTING `.connectors` flag) is the
-//       retirement_path; it stays KEPT_DAEMON_INTERNAL until that layer exists.
-//   - POST /v1/connectors/update, POST /v1/connectors/workspaces (add):
-//       both MUTATE registry.json / workspaces.json; need the cross-process
-//       flock on both sides before a native write is safe.
-//   - POST /v1/connectors/actions/run: dispatches to external provider APIs
-//       (GitHub/Gmail/Calendar/Notion/Slack/X) + mac control + approval gate +
-//       receipts. Daemon-internal; PERMANENT-HTTP-ish (multi-subsystem port).
-//   - GET /v1/connectors/github/manifest_form: external GitHub App manifest
-//       OAuth registration HTML flow; PERMANENT-HTTP (browser-facing redirect).
-//
-// FLIP PREREQ (.connectors) — CLOSED (wave 32 W20, 2026-06-01):
-// `search_workspaces` ends with
-//     self.record_activity("connector", "Workspace search", query, "ok",
-//                          payload={"resultCount": len(results)})
-//. The native search path now appends the SAME
-// redacted activity row to <root>/activity/events.jsonl via the ported
-// `recordSearchActivity` below, which mirrors `Daemon.record_activity`
-// and `redact_secret_text` / `redact_secret_value`
-//. The secret-redaction contract is single-owned by NativeAgentCore (same
-// patterns, same order, same `[REDACTED_<KIND>:<sha256[:12]>]` replacement)
-// and exposed here through the historical `SecretRedactor` spelling.
-//
-// The append is wrapped in a one-sided Swift `<path>.lock` flock (same
-// precaution as Research.appendEnvelope / DispatchLedger.append). The daemon's
-// `append_jsonl` is UNLOCKED and relies on POSIX
-// O_APPEND atomicity, so the flock is Swift-side-only and does NOT block the
-// daemon — both writers can append concurrently without corruption because
-// each line is a single O_APPEND write below PIPE_BUF.
-//
-// With the prereq closed, `.connectors` is now PORT-COMPLETE for its two routes
-// (read-side parity + activity-event parity) and is a flip CANDIDATE pending the
-// orchestrator's cutover decision. It stays default-OFF until then.
+// Connectors runs in the app process. Swift owners manage the registry,
+// credentials, provider actions and receipts. This client reads saved workspaces,
+// searches their local files and records redacted search activity under the
+// configured data root.
 
 // MARK: - Client protocol
 
 public protocol ConnectorsClient: Sendable {
-    /// GET /v1/connectors/workspaces — the saved workspace rows (default []).
+    /// The saved workspace rows (default []).
     /// Returns the array as-stored (passthrough, no field reshaping).
     func listWorkspaces() async throws -> [JSONValue]
 
-    /// POST /v1/connectors/local_files/search — {"query": str} →
-    /// {"query": <normalized>, "results": [...]}. Returns nil to fall through
-    /// to HTTP (empty query → the daemon raises ValueError; we let HTTP produce
-    /// that error path rather than fabricating one).
+    /// Returns {"query": <normalized>, "results": [...]} for a local search,
+    /// or nil when the query is empty.
     func searchWorkspaces(query: String) async throws -> JSONValue?
 }
 

@@ -28,7 +28,8 @@ public enum BotEventIntake {
             source: .slack,
             target: channelId,
             summary: summary,
-            detail: "From \(userId) in \(channelId):\n" + trimmed
+            detail: "From \(userId) in \(channelId):\n" + trimmed,
+            verifiedUserID: userId
         )
         _ = await router(dataRoot: dataRoot, isAutonomyEnabled: isAutonomyEnabled).deliver(event)
     }
@@ -113,7 +114,8 @@ public actor BotGitHubEventWatcher {
                 source: .github,
                 target: repo,
                 summary: summary,
-                detail: [summary, url].filter { !$0.isEmpty }.joined(separator: "\n")
+                detail: [summary, url].filter { !$0.isEmpty }.joined(separator: "\n"),
+                verifiedUserID: entity["author"] as? String
             )
             _ = await BotEventIntake.router(dataRoot: dataRoot, isAutonomyEnabled: { [isAutonomyEnabled] in
                 await isAutonomyEnabled(dataRoot)

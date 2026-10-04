@@ -17,6 +17,7 @@ public enum GitHubCredentialVaultError: Error, Sendable, LocalizedError {
     case verificationFailed
     case malformedMetadata
     case accountChanged
+    case replacementRollbackFailed
 
     public var errorDescription: String? {
         switch self {
@@ -31,6 +32,8 @@ public enum GitHubCredentialVaultError: Error, Sendable, LocalizedError {
             return "GitHub credential metadata is malformed."
         case .accountChanged:
             return "GitHub account changed — retry the request."
+        case .replacementRollbackFailed:
+            return "GitHub connection failed, and the prior credentials could not be restored."
         }
     }
 }
@@ -181,36 +184,104 @@ public actor GitHubCredentialStore {
     public func saveToken(
         _ rawToken: String,
         metadata: GitHubCredentialMetadata,
-        dataRoot: URL
+        dataRoot: URL,
+        persistConnection: @Sendable () async throws -> Void = {}
     ) async throws {
         let token = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { throw GitHubCredentialVaultError.invalidStoredValue }
         let account = Self.credentialAccount(dataRoot: dataRoot)
+        let prior = try replacementSnapshot(dataRoot: dataRoot, account: account)
         generation[account, default: 0] += 1
+        let started = generation[account, default: 0]
         lastRefresh[account] = nil
-        try writeAndVerify(token, account: account)
-        // A token pasted now is the person's choice; a stored sign-in would
-        // otherwise keep winning over it.
-        try vault.delete(service: Self.oauthKeychainService, account: account)
-        try await rewriteMetadata(dataRoot: dataRoot, metadata: metadata, createMissing: true,
-                                  authMode: "personal_access_token")
+        do {
+            try writeAndVerify(token, account: account)
+            // A pasted token replaces the sign-in that would otherwise win.
+            try vault.delete(service: Self.oauthKeychainService, account: account)
+            try await rewriteMetadata(dataRoot: dataRoot, metadata: metadata, createMissing: true,
+                                      authMode: "personal_access_token")
+            guard generation[account] == started else { throw GitHubCredentialVaultError.accountChanged }
+            try await persistConnection()
+        } catch {
+            try rollbackReplacement(prior, account: account, generation: started)
+            throw error
+        }
     }
 
     /// Saves a device-flow sign-in. Any saved PAT stays as the fallback.
     public func saveOAuthToken(
         _ token: GitHubOAuthDeviceFlow.Token,
         metadata: GitHubCredentialMetadata,
-        dataRoot: URL
+        dataRoot: URL,
+        persistConnection: @Sendable () async throws -> Void = {}
     ) async throws {
         let account = Self.credentialAccount(dataRoot: dataRoot)
         var token = token
         token.accountID = metadata.userID
         token.refreshTokenAccountID = token.refreshToken == nil ? nil : metadata.userID
+        let prior = try replacementSnapshot(dataRoot: dataRoot, account: account)
+        generation[account, default: 0] += 1
+        let started = generation[account, default: 0]
+        lastRefresh[account] = nil
+        do {
+            try writeOAuth(token, account: account)
+            try await rewriteMetadata(dataRoot: dataRoot, metadata: metadata, createMissing: true,
+                                      authMode: "oauth_device")
+            guard generation[account] == started else { throw GitHubCredentialVaultError.accountChanged }
+            try await persistConnection()
+        } catch {
+            try rollbackReplacement(prior, account: account, generation: started)
+            throw error
+        }
+    }
+
+    private struct ReplacementSnapshot {
+        let credentials: [(service: String, value: String?)]
+        let metadata: [(path: URL, bytes: Data?)]
+    }
+
+    private func replacementSnapshot(dataRoot: URL, account: String) throws -> ReplacementSnapshot {
+        let metadata = try Self.metadataPaths(dataRoot: dataRoot).map { path in
+            _ = try Self.readObject(at: path)
+            let bytes = FileManager.default.fileExists(atPath: path.path) ? try Data(contentsOf: path) : nil
+            return (path: path, bytes: bytes)
+        }
+        let credentials = try [Self.keychainService, Self.oauthKeychainService].map {
+            (service: $0, value: try vault.read(service: $0, account: account))
+        }
+        return ReplacementSnapshot(credentials: credentials, metadata: metadata)
+    }
+
+    private func rollbackReplacement(_ prior: ReplacementSnapshot, account: String, generation started: Int) throws {
+        guard generation[account] == started else { return }
+        // A refresh begun on the rejected replacement must not resurrect it.
         generation[account, default: 0] += 1
         lastRefresh[account] = nil
-        try writeOAuth(token, account: account)
-        try await rewriteMetadata(dataRoot: dataRoot, metadata: metadata, createMissing: true,
-                                  authMode: "oauth_device")
+        do {
+            try restoreReplacement(prior, account: account)
+        } catch {
+            throw GitHubCredentialVaultError.replacementRollbackFailed
+        }
+    }
+
+    private func restoreReplacement(_ prior: ReplacementSnapshot, account: String) throws {
+        for credential in prior.credentials {
+            if let value = credential.value {
+                try vault.write(value, service: credential.service, account: account)
+            } else {
+                try vault.delete(service: credential.service, account: account)
+            }
+            guard try vault.read(service: credential.service, account: account) == credential.value else {
+                throw GitHubCredentialVaultError.verificationFailed
+            }
+        }
+        for metadata in prior.metadata {
+            if let bytes = metadata.bytes {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: metadata.path)
+            } else if FileManager.default.fileExists(atPath: metadata.path.path) {
+                try FileManager.default.removeItem(at: metadata.path)
+            }
+        }
     }
 
     /// After GitHub answered 401 to `rejected`: refresh the sign-in once and

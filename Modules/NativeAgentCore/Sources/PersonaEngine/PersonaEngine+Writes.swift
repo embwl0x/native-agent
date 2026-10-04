@@ -2,76 +2,13 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - Persona WRITE path (wave 32 W19)
+// MARK: - Persona writes
 //
-// Native port of the two daemon persona-WRITE routes:
-//
-//   POST /v1/personality       -> Runtime.save_personality(body)
-//
-//   POST /v1/personality/docs  -> Runtime.save_personality_doc(body)
-//
-//
-// The READ side of this subsystem (listPersonaDocs / listPersonaDocSpecs /
-// PersonaCompiler.loadProfile) shipped in earlier waves and is FLAG_FLIPPED
-// behind `.personaEngine`. The write side was held HTTP-only (`POST /v1/personality`,
-// `POST /v1/personality/docs`; no `save*` write methods existed). This file
-// closes that gap.
-//
-// PARITY CONTRACT (must match the daemon byte-for-byte on the wire):
-//
-//   save_personality(body):
-//     existing = self.personality()          # normalize(read(profile.json))
-//     merged   = dict(existing); merged.update(body)
-//     merged["updatedAt"] = now_iso()
-//     profile  = self.normalize_personality(merged)
-//     write_json(self.personality_path(), profile)   # indent=2, sort_keys
-//     self.persona_compile_cache.clear()      # daemon-process-only; N/A here
-//     return profile
-//
-//   save_personality_doc(body):
-//     doc_id  = (body.id or body.docId or "").strip().upper()
-//     content = str(body.content or "")[:30000]      # 30K cap, CODE POINTS
-//     soul_initialized = (_resolve_persona_root()/"SOUL.md").exists()
-//     if not soul_initialized and doc_id != "SOUL": return {"error":"onboarding_required", ...}
-//     if not soul_initialized and doc_id == "SOUL": return {"error":"onboarding_required", ...}
-//     path = self.personality_doc_path(doc_id)        # raises on unknown id
-//     _atomic_write_text(path, content)               # temp+O_EXCL 0600+rename
-//     self.persona_compile_cache.clear()              # daemon-only; N/A here
-//     spec = matching personality_doc_specs() entry
-//     return {**spec, "path": str(path), "content": <reread>, "updatedAt": iso(mtime)}
-//
-// CROSS-PROCESS SAFETY (single-writer rule, the standing prereq class that
-// reverted W03/W09):
-//   profile.json AND the persona doc files are written by BOTH the Python
-//   onboarding, dream/REM, memory consolidation, and this Swift path. To avoid
-//   a split-write, every Swift write here is wrapped in
-//   `withFileLock(<target>)` (PersistenceCore+FileLock.swift), which takes a
-//   POSIX flock(2) on `<target>.lock`.
-//   - The 3 RESIDUAL unlocked writers (wave-33 W06 §6.96 prereq A-residual)
-//     were flocked in wave-34 W02 (CUTOVER §6.97), CLOSING prereq A-residual:
-//       * `Runtime.personality()` (normalize-on-read profile.json write) now
-//         holds the REENTRANT `_profile_file_lock()` guard — reentrant because
-//         `save_personality` calls it from inside its own profile lock and a
-//         second flock to the same lock file from the same process deadlocks
-//         (POSIX flock non-reentrant; mirrors WAVE-31-W16 `_jobs_file_lock`).
-//       * the persona-doc auto-scaffold (`personality_doc_contents` create
-//         branch + the improvement_summary GROWTH scaffold) wraps each create
-//         in `file_lock(<doc>)` with an inside-lock existence re-check.
-//       * the Swift onboarding write path (`completeOnboarding` writes +
-//         `resetOnboarding` renames) wraps each in `withFileLock(<target>)`.
-//     ALL persona-file writers now share the cross-process `<path>.lock`.
-//
-// DORMANCY: the NativeClient persona WRITE gates are gated on the DEDICATED
-// `.personaEngineWrites` flag (wave-33 W06), NOT the live read flag
-// `.personaEngine`. `.personaEngineWrites` is DEFAULT-OFF and independent of
-// the read flag, so this native write path is reached ONLY when the user explicitly
-// adds `personaEngineWrites` to NATIVE_AGENT_SWIFT_SUBSYSTEMS. Until the
-// §6.96 pre-flip prereqs close (A-residual unlocked writers — CLOSED wave-34
-// W02 §6.97; B record_activity parity — CLOSED wave-36 W16 §6.138, the doc-save
-// seam now emits the daemon's `record_activity("memory", ...)` row via the
-// scoped `recordPersonaDocActivity` writer; C NFKC co-requisite still open)
-// callers should keep writes disabled or fail closed.
-// This module exposes the native impl + tests for the direct Swift writer.
+// NativeAgent.app uses this Swift owner unconditionally for profile updates,
+// persona document saves and missing-document scaffolding. Onboarding and
+// caller authorization still apply; no subsystem environment flag is required.
+// Mutations hold the target's shared cross-process file lock. USER.md remains
+// a MemoryV2 projection and cannot be saved or scaffolded through this owner.
 
 public enum PersonaWriteError: Error, LocalizedError, Equatable {
     /// Mirrors the daemon `{"error":"onboarding_required", "detail": ...}`
@@ -479,8 +416,7 @@ extension SwiftNativePersonaEngine {
     ///   detail  = "Personality document saved" (a constant),
     ///   payload = {} (empty — `save_personality_doc` passes no payload).
     /// None can match a secret pattern, so the redactor is a verified
-    /// pass-through and we emit the event verbatim — exactly the justification
-    /// `ProactiveOutcomeLedger.recordOutcome` uses for its single echo. This is
+    /// pass-through and we emit the event verbatim. This is
     /// NOT a general replacement for the daemon redactor; do not route a payload
     /// that can carry credential-shaped strings through here without porting the
     /// redactor first.
@@ -490,8 +426,7 @@ extension SwiftNativePersonaEngine {
     /// the retired daemon `append_jsonl` L1195-1202). `appendJSONL` uses
     /// `O_WRONLY|O_APPEND`, which interleaves at line boundaries; a separate
     /// flock here would only serialize against itself, not the daemon. We mirror
-    /// the daemon's single-writer-per-line atomicity exactly (same posture
-    /// `ProactiveOutcomeLedger` documents). The activity append targets a
+    /// the daemon's single-writer-per-line atomicity exactly. The activity append targets a
     /// DIFFERENT file than the persona doc, so emitting it while the caller still
     /// holds `withFileLock(<doc>.md)` takes a lock on `<doc>.md.lock` only — no
     /// second flock on `events.jsonl`, hence no reentrancy concern and no need
@@ -501,8 +436,8 @@ extension SwiftNativePersonaEngine {
     ///
     /// retirement_path: subsumed by a future wave that ports the daemon activity
     /// feed (`record_activity` + `redact_secret_text`/`redact_secret_value`)
-    /// wholesale into a Swift ActivityFeed module — at which point this and
-    /// `ProactiveOutcomeLedger`'s inline echo both call the shared port.
+    /// wholesale into a Swift ActivityFeed module — at which point this calls
+    /// the shared port.
     func recordPersonaDocActivity(docId: String) async throws {
         // event = record_activity("memory", f"{doc_id}.md updated",
         //                          "Personality document saved", "ok")
@@ -706,7 +641,7 @@ extension JSONValue {
     /// inspects Foundation types) consumes a body decoded from JSON. Mirrors
     /// what `JSONSerialization.jsonObject` would produce, so a body built from
     /// `JSONValue` normalizes identically to one read off the wire.
-    var foundationValue: Any {
+    package var foundationValue: Any {
         switch self {
         case .null:            return NSNull()
         case .bool(let b):     return b

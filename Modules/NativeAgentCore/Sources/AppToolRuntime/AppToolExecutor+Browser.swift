@@ -24,15 +24,15 @@ extension AppToolExecutor {
         "browser.chrome_click", "browser.chrome_keypress", "browser.chrome_double_click",
     ]
 
-    public func runBrowserTool(actionId: String, input: [String: JSONValue], surface: String, host: any ToolLoading) async throws -> JSONValue {
+    public func runBrowserTool(actionId: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let dryRun = Self.inputBool(input["dryRun"] ?? input["dry_run"], default: false)
         // The browser's own back/forward chords are history, not page keys.
         if actionId == "browser.chrome_keypress",
            let history = ["Meta+[": "back", "BrowserBack": "back", "Meta+]": "forward", "BrowserForward": "forward"][Self.inputString(input["key"]) ?? ""],
            await chromeFollowUpAllowed("browser.chrome_navigate", input: input, surface: surface) {
             var go: [String: JSONValue] = ["url": .string(history)]
-            if let lease = input["lease_id"] { go["lease_id"] = lease }
-            return try await runBrowserTool(actionId: "browser.chrome_navigate", input: go, surface: surface, host: host)
+            for key in ["lease_id", "dryRun", "dry_run", "expected_user_sequence"] { go[key] = input[key] }
+            return try await runBrowserTool(actionId: "browser.chrome_navigate", input: go, surface: surface)
         }
         // 09-24: a key pressed at no row. Page keys mean "move the page": that
         // is a scroll (verified by how far it moved); any other key needs a row.
@@ -45,8 +45,8 @@ extension AppToolExecutor {
                         + "To move down the page, call browser.chrome_scroll{delta_y: 1200}. Nothing was sent.")])
             }
             var scroll: [String: JSONValue] = ["delta_x": .int(0), "delta_y": .int(Int64(delta))]
-            if let lease = input["lease_id"] { scroll["lease_id"] = lease }
-            return try await runBrowserTool(actionId: "browser.chrome_scroll", input: scroll, surface: surface, host: host)
+            for key in ["lease_id", "dryRun", "dry_run", "expected_user_sequence"] { scroll[key] = input[key] }
+            return try await runBrowserTool(actionId: "browser.chrome_scroll", input: scroll, surface: surface)
         }
         let origin = AppChatToolDispatcher.securityOrigin(input: input, surface: surface)
         func run(_ id: String, _ input: [String: JSONValue]) async throws -> JSONValue {
@@ -65,9 +65,8 @@ extension AppToolExecutor {
         // No tab yet (or its lease lapsed): open one for this navigate. Same
         // lease model — Chrome owns the lease, and it lapses (closing this
         // untouched tab) ~60s after the last call, so no release call is
-        // needed. An X/Twitter post is given at creation: the extension opens
-        // posts in its unfocused work window only from the creation URL
-        // (09-24: X profiles were refused here and she had to acquire by hand).
+        // needed. An X/Twitter post is given at creation so its background
+        // lease is known before any page action.
         func openTab() async throws -> JSONValue? {
             let url = Self.inputString(input["url"]) ?? ""
             var create: [String: JSONValue] = ["mode": .string("create")]
@@ -110,7 +109,7 @@ extension AppToolExecutor {
         // from the last page read on this tab; a form in one call (fields).
         if let refusal = Self.resolveChromeTarget(actionId, &input) { return refusal }
         if !dryRun, ["browser.chrome_fill", "browser.chrome_navigate"].contains(actionId), let fields = Self.chromeFields(input) {
-            return try await runChromeFieldsCall(actionId: actionId, input: input, fields: fields, direct: direct, surface: surface, host: host, run: run)
+            return try await runChromeFieldsCall(actionId: actionId, input: input, fields: fields, direct: direct, surface: surface, run: run)
         }
         // A keypress is judged by what it did: the page it acted on, as read.
         // and a scroll shows only the rows it brought into view.
@@ -123,9 +122,6 @@ extension AppToolExecutor {
         let result = try await run(actionId, input)
         Self.mirrorChromePage(result, releasedBy: actionId, input: input)
         if actionId == "browser.chrome_acquire" { await chrome().noteAcquired(result) }
-        if !dryRun, ["browser.chrome_navigate", "browser.chrome_acquire"].contains(actionId) {
-            await preloadBrowserTools(input, surface: surface, host: host)
-        }
         guard case .object(var obj) = result else {
             return result
         }
@@ -234,27 +230,19 @@ extension AppToolExecutor {
     }
 
     public static let postOnBackgroundNote = "This background tab is now on an X/Twitter post; actions on it are refused. "
-        + "To act on the post, open it with browser.chrome_acquire (mode create, initial_url = the post), "
-        + "which uses the visible work window."
+        + "It needs a visible work window. Only when the task explicitly requests one, use "
+        + "browser.chrome_acquire (mode create, initial_url = the post, rendering_mode = visible_work_window)."
 
     /// A read the app makes on her behalf clears the same Trust gate her own
     /// call would; anything that would ask or is blocked is simply not made.
-    public func chromeFollowUpAllowed(_ tool: String, input: [String: JSONValue], surface: String) async -> Bool {
+    public func chromeFollowUpAllowed(_ tool: String, input: [String: JSONValue], surface: String, enforceAutonomy: Bool? = nil) async -> Bool {
         let envelope = await securityCenter.evaluateTool(
             tool: tool, input: [:], origin: AppChatToolDispatcher.securityOrigin(input: input, surface: surface),
-            enforceAutonomy: enforceAutonomySecurity)
+            enforceAutonomy: enforceAutonomy ?? enforceAutonomySecurity)
         try? await securityCenter.record(envelope)
+        if enforceAutonomy == true,
+           AutonomyGate.map(level: envelope.autonomyLevel, toolName: tool) != .allow { return false }
         return envelope.decision != .block && !envelope.requiresApproval
-    }
-
-    /// A page is open: its hands (click/fill/type/select/keypress) load now, so
-    /// the next reply can use them without a tool_load call.
-    public func preloadBrowserTools(_ input: [String: JSONValue], surface: String, host: any ToolLoading) async {
-        let session = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty } ?? Self.extractSessionId(input)
-        guard !session.isEmpty, let group = ToolPreloadHeuristics.loadGroup(forCategory: "browser") else { return }
-        await host.loadTools(group.tools.sorted(), sessionId: session, surface: surface)
     }
 
     public static func providerAlias(for name: String) -> String {
@@ -392,8 +380,8 @@ extension AppToolExecutor {
             // top frame); `url` is the address she means. An empty pair is absent.
             if let value = [string("initial_url"), string("url")].compactMap({ $0 }).first(where: { !$0.isEmpty }) {
                 payload["initialUrl"] = .string(value)
-                // Only initial_url takes the X-post visible window by default;
-                // `url` stays a background tab unless she asks for a visible one.
+                // Both URL aliases stay in the background unless the caller
+                // explicitly asks for a visible work window.
                 if (string("initial_url") ?? "").isEmpty, mode == "create" {
                     payload["renderingMode"] = .string("grouped_background")
                 }

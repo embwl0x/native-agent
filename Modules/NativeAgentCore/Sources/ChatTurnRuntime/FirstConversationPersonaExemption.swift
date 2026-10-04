@@ -343,7 +343,7 @@ public enum FirstConversationPersonaExemption {
         return """
         [First conversation. After writing who you are to them, you ask (once) how they \
         would like you to sound. When they answer it, write ONE line with \
-        persona_append_section(kind: "voice", title: "\(token.title)"): a single first-person \
+        app {action: "persona.append", args: {kind: "voice", title: "\(token.title)", content}}: a single first-person \
         sentence, on one line, built only from what they said. If they named someone to sound \
         like, write that person's style — cadence, humor, warmth, vocabulary, energy (e.g. \
         "dry, deadpan, short sentences, understated humor") — never a claim to be them; SOUL.md \

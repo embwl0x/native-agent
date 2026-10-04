@@ -211,6 +211,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
     private var webView: WKWebView?
     private let navDelegate = BrowserNavDelegate()
     private var activeNavigationID: String?
+    private var browserOwnerID: String?
 
     // IPC server state
     private let ipcListener = NativeLoopbackListener(
@@ -348,14 +349,21 @@ final class BrowserWindowController: NSObject, ObservableObject {
         return scheme == "http" || scheme == "https"
     }
 
-    func navigate(_ url: URL, runID: String) async throws -> NavResult {
+    func acquireBrowser(runID: String) throws {
+        guard browserOwnerID == nil, navDelegate.onFinish == nil else { throw BrowserError.busy }
+        browserOwnerID = runID
+    }
+
+    func releaseBrowser(runID: String) {
+        if browserOwnerID == runID { browserOwnerID = nil }
+    }
+
+    func navigate(_ url: URL, runID: String, ownerID: String? = nil) async throws -> NavResult {
         ensureWindow()
         guard let webView else { throw BrowserError.notReady }
 
-        // C7 fix: serialize navigation — if a previous navigate is still in
-        // progress (onFinish is set), return a busy error rather than letting the
-        // second call overwrite onFinish and cause the first continuation to hang.
-        if navDelegate.onFinish != nil {
+        // Ownership spans navigation and captures; IPC calls have no owner.
+        if navDelegate.onFinish != nil || browserOwnerID != ownerID {
             throw BrowserError.busy
         }
 
@@ -778,13 +786,10 @@ final class BrowserWindowController: NSObject, ObservableObject {
             conn?.cancel()
             _ = self
         }
-        // Auth check (unauthenticated health only)
-        if path != "/browser/status" {
-            let auth = headers["authorization"] ?? ""
-            guard auth == "Bearer \(ipcToken)" else {
-                writeIPCJSON(conn, status: 401, obj: ["error": "unauthorized"])
-                return
-            }
+        let auth = headers["authorization"] ?? ""
+        guard auth == "Bearer \(ipcToken)" else {
+            writeIPCJSON(conn, status: 401, obj: ["error": "unauthorized"])
+            return
         }
 
         Task {

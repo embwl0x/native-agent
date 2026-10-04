@@ -73,13 +73,14 @@ import TrustCenter
 public protocol InnerStateProviding: Sendable {
     func innerStateReading(
         windowHours: Double,
-        detail: CognitiveInnerStateReading.Detail
+        detail: CognitiveInnerStateReading.Detail,
+        surface: String
     ) async -> CognitiveInnerStateReading
 }
 
 extension SwiftToolDispatcher {
 
-    func impl_inner_state(input: [String: JSONValue]) async -> JSONValue {
+    func impl_inner_state(input: [String: JSONValue], surface: String) async -> JSONValue {
         let requested = Self.innerStateWindowHours(input)
         let detail: CognitiveInnerStateReading.Detail =
             (optionalString(input, "detail")?.lowercased() == "full") ? .full : .compact
@@ -97,7 +98,7 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        let reading = await mind.innerStateReading(windowHours: requested, detail: detail)
+        let reading = await mind.innerStateReading(windowHours: requested, detail: detail, surface: surface)
         return Self.innerStateJSON(reading, requestedWindowHours: Self.innerStateRawWindowHours(input))
     }
 
@@ -275,7 +276,7 @@ extension SwiftToolDispatcher {
                 ])
             } ?? .null,
             "standing_views": .array(reading.standingViews.map { view in
-                .object([
+                var fields: [String: JSONValue] = [
                     "id": .string(view.id.uuidString),
                     "status": .string(view.status),
                     "text": .string(innerStateSafeText(
@@ -284,7 +285,12 @@ extension SwiftToolDispatcher {
                     // user's words and stay behind law 2.
                     "evidence_count": .int(Int64(view.evidenceCount)),
                     "revisit_count": .int(Int64(view.revisitCount)),
-                ])
+                ]
+                // Phase 5 D: her own reasons and history, in her words.
+                if !view.reasons.isEmpty {
+                    fields["reasons"] = .array(view.reasons.map { .string(innerStateSafeText($0, limit: 200)) })
+                }
+                return .object(fields)
             }),
         ]
         // WHAT CHANGED THIS WEEK. The substrate has computed these lines on the
@@ -350,6 +356,6 @@ extension SwiftToolDispatcher {
 
     /// Whole numbers read as whole numbers: "168", not "168.0".
     static func innerStateHours(_ value: Double) -> String {
-        value == value.rounded() ? String(Int(value)) : String(value)
+        Int(exactly: value).map(String.init) ?? String(value)
     }
 }

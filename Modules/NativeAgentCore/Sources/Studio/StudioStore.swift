@@ -851,8 +851,9 @@ public struct SwiftNativeStudioStore: Sendable {
     /// it is deletion, and it would break the one promise the journal makes —
     /// no entry ever ceases to exist (gpt-5.5 review). So before any trim can
     /// run, the doomed lines are moved HERE, byte for byte. This file is never
-    /// capped, never registered in the path-owned registry, and never read by
-    /// `recall` — it is the overflow shelf, not a second journal.
+    /// capped or registered in the path-owned registry. Recall, encounter
+    /// intake and work history read it together with the live journal through
+    /// `journalEntriesIncludingArchive`.
     ///
     /// One file per trim event, stamped, so each event is self-describing.
     public func journalArchivePath(now: Date = Date()) -> URL {
@@ -873,10 +874,9 @@ public struct SwiftNativeStudioStore: Sendable {
             .appendingPathComponent("trim_receipts.jsonl")
     }
 
-    /// Every overflow archive on the shelf, oldest stamp first. Nothing in the
-    /// product calls this — `recall` deliberately reads the live journal only —
-    /// but the shelf has to be enumerable, or "archived" would just be a nicer
-    /// word for lost.
+    /// Every overflow archive on the shelf, oldest stamp first. The combined
+    /// journal reader uses this inventory for recall, encounter intake and
+    /// work history.
     public func journalArchivePaths() throws -> [URL] {
         let directory = studioRoot.appendingPathComponent("journal", isDirectory: true)
         guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
@@ -1164,9 +1164,13 @@ public struct SwiftNativeStudioStore: Sendable {
     /// — a few entries a week, not telemetry — so reading it whole is honest and
     /// cheap; `recall` is what bounds what a caller sees.
     public func readJournal() async throws -> [StudioJournalEntry] {
+        await applyAmendments(try await rawJournalEntries())
+    }
+
+    private func rawJournalEntries() async throws -> [StudioJournalEntry] {
         guard FileManager.default.fileExists(atPath: journalPath.path) else { return [] }
         let rows = try await persistence.readJSONL(journalPath)
-        return await applyAmendments(rows.compactMap { StudioJournalEntry.fromJSON($0) })
+        return rows.compactMap { StudioJournalEntry.fromJSON($0) }
     }
 
     // MARK: Amendments (0.4.14)
@@ -1293,21 +1297,6 @@ public struct SwiftNativeStudioStore: Sendable {
                 let occurrences = response.components(separatedBy: trimmed).count - 1
                 guard occurrences > 0 else { throw StudioError.amendmentPassageNotFound(trimmed) }
                 guard occurrences == 1 else { throw StudioError.amendmentPassageNotUnique(trimmed) }
-                // And it must be free words in the CORRECTED projection, not
-                // words another amendment has already struck through. A second
-                // correction over the same or overlapping passage would nest one
-                // strike-through inside another, leaving half-marked Markdown
-                // and no honest reading of what the entry now says.
-                guard let range = response.range(of: trimmed) else {
-                    throw StudioError.amendmentPassageNotFound(trimmed)
-                }
-                for existing in entry.amendments {
-                    guard let taken = existing.supersedes,
-                          let takenRange = response.range(of: taken),
-                          takenRange.overlaps(range) else { continue }
-                    throw StudioError.amendmentPassageOverlaps(
-                        passage: trimmed, existingAmendmentID: existing.id, existingPassage: taken)
-                }
                 passage = trimmed
             }
         }
@@ -1324,20 +1313,36 @@ public struct SwiftNativeStudioStore: Sendable {
             at: journalAmendmentsPath.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try await persistence.appendJSONLDurable(amendment.toJSON(), to: journalAmendmentsPath)
-        var corrected = entry
-        corrected.amendments = (entry.amendments + [amendment]).sorted { $0.amendedAt < $1.amendedAt }
-        return (amendment, corrected)
+        return try await persistence.withFileLock(journalAmendmentsPath) {
+            let read = try await readAmendmentsReporting()
+            guard !read.unreadable else {
+                throw PersistenceCoreError.ioFailure("Journal corrections are unreadable; correction was not appended.")
+            }
+            let existing = read.amendments.filter { $0.entryId == id }
+            // Recheck overlap under the append lock: another caller may have
+            // corrected this passage since the journal entry was read.
+            if let passage = amendment.supersedes, let response = entry.response,
+               let range = response.range(of: passage) {
+                for correction in existing {
+                    guard let taken = correction.supersedes,
+                          let takenRange = response.range(of: taken),
+                          takenRange.overlaps(range) else { continue }
+                    throw StudioError.amendmentPassageOverlaps(
+                        passage: passage, existingAmendmentID: correction.id, existingPassage: taken)
+                }
+            }
+            try await persistence.appendJSONLDurable(amendment.toJSON(), to: journalAmendmentsPath)
+            var corrected = entry
+            corrected.amendments = (existing + [amendment]).sorted { $0.amendedAt < $1.amendedAt }
+            return (amendment, corrected)
+        }
     }
 
     /// 2026-09-06: the overflow shelf's entries, oldest archive first.
     ///
-    /// The shelf was written as "never read by `recall` — it is the overflow
-    /// shelf, not a second journal". That is right for what `recall` SHOWS, and
-    /// wrong for everything derived from the journal: an archived entry still
-    /// answered its consult, still named its refs, still happened. Reading only
-    /// the hot file made overflow re-offer encounters User had already had, and
-    /// made a work she had written about read as one she never met.
+    /// Archived entries remain available to recall, encounter intake and work
+    /// history: each still answered its consult, still named its refs, still
+    /// happened. The combined reader projects corrections after deduplication.
     ///
     /// A shelf file this build cannot read is skipped rather than thrown: the
     /// shelf deliberately holds bytes a future build may not decode, and the
@@ -1353,9 +1358,7 @@ public struct SwiftNativeStudioStore: Sendable {
             }
             out.append(contentsOf: rows.compactMap { StudioJournalEntry.fromJSON($0) })
         }
-        // An archived entry is corrected exactly like a hot one: the shelf holds
-        // the bytes as they were written, and the correction is projected on.
-        return await applyAmendments(out)
+        return out
     }
 
     /// Every journal entry that still exists — the shelf in age order, then the
@@ -1371,7 +1374,11 @@ public struct SwiftNativeStudioStore: Sendable {
     /// keep readable.
     public func journalEntriesIncludingArchive() async throws -> [StudioJournalEntry] {
         try await persistence.withFileLock(journalPath) {
-            await self.archivedJournalEntries() + (try await self.readJournal())
+            let entries = await self.archivedJournalEntries() + (try await self.rawJournalEntries())
+            // A crash after archiving but before trimming leaves the same entry
+            // in both files. It is still one encounter, with one correction view.
+            var seen = Set<String>()
+            return await self.applyAmendments(entries.filter { seen.insert($0.id).inserted })
         }
     }
 
@@ -1418,18 +1425,6 @@ public struct SwiftNativeStudioStore: Sendable {
         // Oldest first: something left unanswered longest is the one still
         // sitting there, and nothing about this queue is a ranking of taste.
         return Array(candidates.sorted { $0.noticedAt < $1.noticedAt }.prefix(max(0, limit)))
-    }
-
-    /// The work titles the journal has actually answered, folded for comparison
-    /// against another store's names. The knowledge-graph half of the intake
-    /// needs this to know what is already attended to.
-    public func journaledWorkTitles() async throws -> Set<String> {
-        Set(try await journalEntriesIncludingArchive().map {
-            $0.work.title.folding(
-                options: [.caseInsensitive, .diacriticInsensitive],
-                locale: Locale(identifier: "en_US_POSIX")
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
-        })
     }
 
     /// User, 2026-09-06: what the journal has answered, identified the way the

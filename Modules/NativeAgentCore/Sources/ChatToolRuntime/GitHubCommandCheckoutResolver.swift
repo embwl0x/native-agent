@@ -1,4 +1,5 @@
 import Foundation
+import Dispatcher
 
 // Trusted repository-checkout resolution for explicit codex_message repository
 // selection. The GitHub watcher never invokes this resolver.
@@ -17,14 +18,17 @@ enum GitHubCommandCheckoutResolver {
         dataRoot: URL,
         searchRoots: [URL]? = nil
     ) -> URL? {
-        let parts = repository.split(separator: "/", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return nil }
+        let parts = repository.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2, parts.allSatisfy({
+            !$0.isEmpty && $0 != "." && $0 != ".."
+                && $0.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || "-_.".contains($0)) }
+        }) else { return nil }
         let repoName = parts[1]
         let roots = searchRoots ?? defaultSearchRoots(dataRoot: dataRoot)
         let candidates = checkoutCandidates(repoName: repoName, roots: roots)
         return candidates.compactMap { candidate -> (URL, Int)? in
             guard remoteOutput(candidate).split(separator: "\n").contains(where: {
-                normalizedRemote(String($0)).hasSuffix("github.com/\(repository.lowercased())")
+                remoteRepository(String($0)) == repository.lowercased()
             }) else { return nil }
             var score = 0
             let name = candidate.lastPathComponent.lowercased()
@@ -84,34 +88,37 @@ enum GitHubCommandCheckoutResolver {
         git(["remote", "-v"], at: directory)
     }
 
-    private static func normalizedRemote(_ line: String) -> String {
-        let field = line.split(whereSeparator: { $0.isWhitespace })
-            .map(String.init)
-            .first { $0.localizedCaseInsensitiveContains("github.com") } ?? ""
-        return field.lowercased()
-            .replacingOccurrences(of: "git@github.com:", with: "github.com/")
-            .replacingOccurrences(of: "ssh://git@github.com/", with: "github.com/")
-            .replacingOccurrences(of: "https://", with: "")
-            .replacingOccurrences(of: "http://", with: "")
-            // Only the suffix: "o/o.github.io.git" is o/o.github.io.
-            .replacingOccurrences(of: #"\.git$"#, with: "", options: .regularExpression)
+    private static func remoteRepository(_ line: String) -> String? {
+        let fields = line.split(whereSeparator: { $0.isWhitespace })
+        guard fields.count == 3 else { return nil }
+        let address = String(fields[1])
+        let path: String
+        if address.contains("://") {
+            guard let remote = URLComponents(string: address),
+                  ["https", "http", "ssh", "git"].contains(remote.scheme?.lowercased() ?? ""),
+                  remote.host?.lowercased() == "github.com",
+                  remote.query == nil, remote.fragment == nil,
+                  remote.path.hasPrefix("/") else { return nil }
+            path = String(remote.path.dropFirst())
+        } else {
+            let parts = address.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { return nil }
+            let authority = parts[0].split(separator: "@", omittingEmptySubsequences: false)
+            guard authority.count <= 2, authority.last?.lowercased() == "github.com" else { return nil }
+            path = String(parts[1])
+        }
+        // Only the suffix: "o/o.github.io.git" is o/o.github.io.
+        let normalized = path.lowercased()
+        return normalized.hasSuffix(".git") ? String(normalized.dropLast(4)) : normalized
     }
 
     private static func git(_ arguments: [String], at directory: URL) -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["-C", directory.path] + arguments
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return ""
-        }
-        guard process.terminationStatus == 0 else { return "" }
-        return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let result = runProcess(
+            "/usr/bin/git", ["-C", directory.path] + arguments, timeout: 5
+        )
+        guard result.launched, !result.timedOut, !result.captureReadFailed,
+              result.status == 0 else { return "" }
+        return result.stdout
     }
 
     private static func unique(_ urls: [URL]) -> [URL] {

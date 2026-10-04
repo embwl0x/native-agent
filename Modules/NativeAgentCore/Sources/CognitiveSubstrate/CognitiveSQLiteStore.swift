@@ -54,6 +54,9 @@ private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     // One row, rewritten in place: the capsule cadence ledger. Tiny, but losing
     // it re-opens a suppressed nag on the next relaunch.
     "capsule_presentation": 1,
+    // One row, rewritten in place, already capped (48 rejections, 24 undo
+    // entries): her own corrections must never be pruned out (Phase 5 B0).
+    "mind_ledger": 1,
     "disposition": 32,
     "emotional_consolidation": 32,
     "thought_seed": 128,
@@ -300,6 +303,22 @@ public actor CognitiveSQLiteStore {
                 ),
                 at: now
             )
+        }
+    }
+
+    /// Approval and its capacity releases are one artifact transaction.
+    func commitArtifactTransition(
+        artifacts: [CognitiveArtifactWrite],
+        deletedArtifactIDs: [UUID],
+        at now: Date
+    ) async throws {
+        try await dbQueue.write { db in
+            for artifact in artifacts {
+                try Self.upsertArtifact(db, artifact: artifact, at: now)
+            }
+            for id in Set(deletedArtifactIDs) {
+                try db.execute(sql: "DELETE FROM cognitive_artifacts WHERE id = ?", arguments: [id.uuidString])
+            }
         }
     }
 

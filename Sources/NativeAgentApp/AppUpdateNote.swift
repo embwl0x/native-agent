@@ -101,7 +101,7 @@ enum AppUpdateNote {
         if text.count > maximumCharacters {
             let kept = String(text.prefix(maximumCharacters))
             text = kept + "\n\n[Trimmed here. The full notes for every version ship with the app; "
-                + "read \(bundledNotesRelativeDirectory)/<version>.md with read_file.]\n"
+                + "read it with app {action:\"files.read\", args:{path:\"\(bundledNotesRelativeDirectory)/<version>.md\"}}.]\n"
         }
         text += """
 

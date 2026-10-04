@@ -44,8 +44,8 @@ import ProviderRouting
 //   - The LLM call. SwiftNativeWorkshopRunner injects a `WorkshopPlannerLLM`
 //     protocol; the production `SwiftNativeWorkshopPlannerLLM` (wired by
 //     `makeWorkshopRunner` factory) calls the in-app `SwiftNativeLLMClient`
-//     which routes by model-id prefix to the Anthropic / OpenAI / Codex
-//     adapters. One checked routing snapshot admits the complete 'executions'
+//     which dispatches through the selected provider adapter. One checked
+//     routing snapshot admits the complete 'executions'
 //     provider/model/effort/tier tuple and task-local admission prevents a
 //     valid preference change from splicing generations mid-call. Falls back to the
 //     deterministic stub on LLM throw or timeout, matching Python's
@@ -69,23 +69,10 @@ import ProviderRouting
 //     any non-JSON LLM response, any 0-valid-step parse, any
 //     autonomy-disabled state → 2-step stub. We never enqueue an empty
 //     `plan: []` execution (the wave-12 regression).
-//   - PARITY GAP (wave 23 known limitation). Python's `run_codex` resolves
-//     the ACTIVE PROVIDER for the executions surface via daemon
-//     `active_provider_for_surface(...)` (default policy: `openai_oauth_direct`)
-//     at the retired daemon, then calls THAT provider's OAuth token /
-//     API key (depending on provider).
-//     Swift's `SwiftNativeLLMClient` routes by MODEL-ID PREFIX (claude-*/
-//     gpt-*/codex) at LLMClient+Real.swift L110 — a different mechanism.
-//     Empirical impact: with default config and no `OPENAI_API_KEY` env or
-//     credentials/openai.json, the Swift path will throw `.notConfigured`
-//     from the OpenAI adapter, the runCodex catch wraps it as
-//     `WorkshopExecutionError.plannerFailure`, and the planner falls back to the
-//     2-step deterministic stub — same observable behavior as Python's
-//     own broad-except fallback at the retired daemon, but for a
-//     different reason. Closing this gap requires extending ProviderRouting
-//     to honor active-provider config (out of scope for wave 23; tracked
-//     as a wave-24+ candidate). Until then, callers must provision a working API key for
-//     whichever adapter the model-id-prefix routing picks.
+//   - Provider dispatch uses one checked executions routing snapshot. The
+//     selected provider adapter owns authentication (OAuth or API key); model
+//     prefixes do not choose the provider. Unavailable routing fails planning
+//     without borrowing another provider's credentials.
 //   - CANCELLATION (wave 23). `runCodex` and `_planWorkshopExecutionWithReason`
 //     propagate `CancellationError` distinctly from `WorkshopExecutionError`. A
 //     cancelled `submit()` MUST NOT write `mission.json` or fire the

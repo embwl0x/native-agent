@@ -12,6 +12,24 @@ import SwiftUI
 import NativeAgentShared
 
 extension iCloudSyncEngine {
+    private nonisolated static let workOverviewCacheLock = NSLock()
+
+    private nonisolated static func writeWorkOverviewCache(_ data: Data, to url: URL) throws {
+        workOverviewCacheLock.lock()
+        defer { workOverviewCacheLock.unlock() }
+        let incoming = try JSONDecoder().decode(WorkOverview.self, from: data)
+        guard let incomingDate = DeskActivityState.movementDate(incoming.capturedAt) else {
+            throw DeviceSyncError.underlying(message: "invalid work overview capture time")
+        }
+        if FileManager.default.fileExists(atPath: url.path) {
+            let currentData = try Data(contentsOf: url)
+            if let current = try? JSONDecoder().decode(WorkOverview.self, from: currentData),
+               let currentDate = DeskActivityState.movementDate(current.capturedAt),
+               incomingDate <= currentDate { return }
+        }
+        try data.write(to: url, options: .atomic)
+    }
+
     private enum KVSKey {
         static let snapshotUpdated = "snapshot_updated"
     }
@@ -32,7 +50,8 @@ extension iCloudSyncEngine {
     // MARK: - Setup (called after iCloudBridge.setup() completes)
 
     func setup(docsURL: URL) {
-        if isSetUp, snapshotDir?.deletingLastPathComponent() == docsURL {
+        if isSetUp, !prefersCloudKitSnapshotCache,
+           driveSnapshotRoot == docsURL.appendingPathComponent(Folder.snapshots) {
             return
         }
         tearDown()
@@ -41,12 +60,16 @@ extension iCloudSyncEngine {
         let fm = FileManager.default
         if prefersCloudKitSnapshotCache {
             let root = cloudKitCacheRoot()
-            snapshotDir = root.appendingPathComponent(Folder.snapshots)
+            snapshotDir = cloudKitSnapshotCacheDirectory(pairing: pairingStore?.iCloudPairingSecret)
             inboxDir = nil
             responsesDir = root.appendingPathComponent(Folder.responses)
             transactionDir = root.appendingPathComponent("transactions", isDirectory: true)
         } else {
-            snapshotDir = docsURL.appendingPathComponent(Folder.snapshots)
+            let root = docsURL.appendingPathComponent(Folder.snapshots)
+            driveSnapshotRoot = root
+            let secret = pairingStore?.iCloudPairingSecret
+            snapshotDir = AgentNameCache.fingerprint(secret) == nil
+                ? nil : Self.cachedSnapshotDirectory(in: root, pairing: secret)
             inboxDir = docsURL.appendingPathComponent(Folder.inbox)
             responsesDir = docsURL.appendingPathComponent(Folder.responses)
             transactionDir = docsURL.appendingPathComponent(Folder.transactions)
@@ -63,7 +86,7 @@ extension iCloudSyncEngine {
                 name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
                 object: kvs
             )
-            kvs.synchronize()
+            Task { await PairingStore.synchronizeKVSWithTimeout() }
         }
 
         pruneEphemeralDirectoriesIfDue()
@@ -188,10 +211,22 @@ extension iCloudSyncEngine {
         return EphemeralFileIdentity(inode: inode, modified: modified, size: size)
     }
 
+    func connectionRepairMailboxes() -> (transactions: URL?, responses: URL?, inbox: URL?) {
+        let root = cloudKitCacheRoot()
+        let cachedTransactions = root.appendingPathComponent("transactions", isDirectory: true)
+        let cachedResponses = root.appendingPathComponent("responses", isDirectory: true)
+        return (
+            transactionDir ?? (FileManager.default.fileExists(atPath: cachedTransactions.path) ? cachedTransactions : nil),
+            responsesDir ?? (FileManager.default.fileExists(atPath: cachedResponses.path) ? cachedResponses : nil),
+            inboxDir
+        )
+    }
+
     func tearDown() {
         providerSignIns = [:]
         lifecycleGeneration &+= 1
         schedulerSnapshot = nil
+        workOverview = nil
         schedulerJobReceiptTimes = [:]
         schedulerError = nil
         snapshotRefreshGeneration &+= 1
@@ -200,6 +235,7 @@ extension iCloudSyncEngine {
         chatSessionListRefreshGeneration &+= 1
         NotificationCenter.default.removeObserver(self)
         snapshotDir = nil
+        driveSnapshotRoot = nil
         helpersSnapshot = nil
         inboxDir = nil
         responsesDir = nil
@@ -207,6 +243,9 @@ extension iCloudSyncEngine {
         isSetUp = false
         refreshInFlight = false
         refreshQueued = false
+        fullRefreshQueued = false
+        transportDeliveryQueued = false
+        pendingPhoneSurfaceModels = [:]
         syncError = nil
     }
 
@@ -221,6 +260,9 @@ extension iCloudSyncEngine {
         chatSessionListRefreshGeneration &+= 1
         refreshInFlight = false
         refreshQueued = false
+        fullRefreshQueued = false
+        transportDeliveryQueued = false
+        pendingPhoneSurfaceModels = [:]
         prefersCloudKitSnapshotCache = true
         NotificationCenter.default.removeObserver(
             self,
@@ -228,7 +270,7 @@ extension iCloudSyncEngine {
             object: kvs
         )
         let root = cloudKitCacheRoot()
-        let snapshots = root.appendingPathComponent("snapshots", isDirectory: true)
+        let snapshots = cloudKitSnapshotCacheDirectory(pairing: pairingStore?.iCloudPairingSecret)
         let responses = root.appendingPathComponent("responses", isDirectory: true)
         let transactions = root.appendingPathComponent("transactions", isDirectory: true)
         for directory in [snapshots, responses, transactions] {
@@ -255,25 +297,36 @@ extension iCloudSyncEngine {
     @discardableResult
     func applyCloudKitSnapshotStatus(
         _ value: String,
-        group: NAMobileSnapshotGroup
+        group: NAMobileSnapshotGroup,
+        writtenAt: Date? = nil
     ) async -> Bool {
         let generation = lifecycleGeneration
+        let deliveryPairing = pairingStore?.iCloudPairingSecret
+        // Leave deliveries eligible for retry until pairing is installed.
+        guard AgentNameCache.fingerprint(deliveryPairing) != nil else { return false }
         do {
-            let files = try NAMobileSnapshotStatusCodec.decode(
-                value,
-                expectedGroup: group
-            )
-            let directory = cloudKitSnapshotCacheDirectory()
+            let directory = cloudKitSnapshotCacheDirectory(pairing: deliveryPairing)
             try await Task.detached(priority: .utility) {
+                let files = try NAMobileSnapshotStatusCodec.decode(
+                    value,
+                    expectedGroup: group
+                )
                 let fm = FileManager.default
                 try fm.createDirectory(at: directory, withIntermediateDirectories: true)
                 for (filename, data) in files {
+                    if filename == "work_overview.json" {
+                        // Compare and write together so concurrent deliveries
+                        // cannot undo a newer overview.
+                        try Self.writeWorkOverviewCache(data, to: directory.appendingPathComponent(filename))
+                        continue
+                    }
                     try data.write(
                         to: directory.appendingPathComponent(filename),
                         options: .atomic
                     )
                 }
             }.value
+            guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return true }
             prefersCloudKitSnapshotCache = true
             snapshotDir = directory
@@ -287,20 +340,28 @@ extension iCloudSyncEngine {
             // transport fresh for a refresh that never landed. Only a refresh
             // that reported success renews this group's delivery clock.
             let refreshed = await refreshSnapshotGroup(group)
+            guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return true }
             if refreshed {
+                if let writtenAt {
+                    iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
+                }
                 noteTransportDelivery(groups: [group])
                 noteRefreshSucceeded()
             }
             return true
         } catch {
+            guard generation == lifecycleGeneration else { return false }
             syncError = "CloudKit \(group.rawValue) snapshot failed: \(error.localizedDescription)"
             return false
         }
     }
 
-    private func cloudKitSnapshotCacheDirectory() -> URL {
-        cloudKitCacheRoot().appendingPathComponent("snapshots", isDirectory: true)
+    func cloudKitSnapshotCacheDirectory(pairing secret: Data?) -> URL {
+        Self.cachedSnapshotDirectory(
+            in: cloudKitCacheRoot().appendingPathComponent("snapshots", isDirectory: true),
+            pairing: secret
+        )
     }
 
     private func cloudKitCacheRoot() -> URL {
@@ -324,8 +385,14 @@ extension iCloudSyncEngine {
     @objc private nonisolated func kvsDidChange(_ note: Notification) {
         let changed = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
         Task { @MainActor in
+            if changed?.contains(where: { $0.hasPrefix("inbox_response_") }) == true {
+                await self.settleUnobservedActionResponses()
+            }
             guard let changed, changed.contains(KVSKey.snapshotUpdated) else { return }
             let signal = self.kvs.string(forKey: KVSKey.snapshotUpdated)
+            let writtenAt = signal?.components(separatedBy: "|").first.flatMap {
+                ISO8601DateFormatter().date(from: $0)
+            }
             // Old Mac builds published only an ISO timestamp. Treat that as an
             // unknown group and do one targeted transcript read for continuity;
             // current builds name changed groups and avoid unrelated reads.
@@ -335,13 +402,18 @@ extension iCloudSyncEngine {
             if let groups = Self.snapshotSignalGroups(signal), !groups.isEmpty {
                 for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
                     if await self.refreshSnapshotGroup(group) {
+                        if let writtenAt {
+                            iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
+                        }
                         self.noteTransportDelivery(groups: [group])
                     }
                 }
             } else {
                 // Legacy timestamp-only publishers did not identify the
                 // changed group, so compatibility requires one complete read.
-                await self.refreshSnapshots(recordTransportDelivery: true)
+                if await self.refreshSnapshots(recordTransportDelivery: true), let writtenAt {
+                    iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
+                }
             }
         }
     }
@@ -366,6 +438,8 @@ extension iCloudSyncEngine {
             return await refreshSchedulerSnapshot()
         case .activity:
             return await refreshActivitySnapshot()
+        case .work:
+            return await refreshWorkActivitySnapshot()
         case .advanced:
             // Summaries and runs must both land. Older Macs do not publish helpers;
             // its views report their own refresh failures.

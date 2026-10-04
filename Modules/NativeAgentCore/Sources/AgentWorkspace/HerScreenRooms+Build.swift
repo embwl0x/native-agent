@@ -89,7 +89,7 @@ extension HerScreen {
     /// listed as (`files.3.add`, `replies.2.follow`). Nil leaves the old view.
     static func buildRecordRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL, issue: String?) -> String? {
         guard case .record(let tool, let input, let title) = location, let value, let room = family(tool, input: input, dataRoot: dataRoot) else { return nil }
-        var projection = AgentWorkspaceProjection.project(location: location, result: value)
+        let projection = AgentWorkspaceProjection.project(location: location, result: value)
         let object: [String: JSONValue] = if case .object(let row) = value { row } else { [:] }
         func text(_ value: JSONValue?) -> String? {
             switch value {
@@ -110,25 +110,6 @@ extension HerScreen {
         var header = [clip(title, 48), room]
         var rows: [String] = [], label = "TEXT"
         switch tool {
-        case "app_settings_list":
-            // One line per page: its settings' names, so the change form needs no lookup.
-            let settings = rowsOf(object["settings"])
-            var order: [String] = [], byPage: [String: [String]] = [:]
-            for setting in settings {
-                guard var id = text(setting["id"]) else { continue }
-                // A helper's rows go by its label ("Sideways schedule"), which the
-                // change form also takes, never its raw UUID id (walk 4).
-                if id.split(separator: ".").contains(where: { UUID(uuidString: String($0)) != nil }), let label = text(setting["label"]) {
-                    id = label
-                }
-                let page = text(setting["page"]) ?? "other"
-                if byPage[page] == nil { order.append(page) }
-                byPage[page, default: []].append(id)
-            }
-            rows = order.flatMap { wrap(pad($0, 12) + byPage[$0, default: []].joined(separator: ", ")) }
-            header = ["SETTINGS", "\(settings.count) settings", "\(order.count) pages"] + (text(object["trust_mode"]).map { [$0] } ?? [])
-            label = "PAGES"
-            projection.actions.append(.init(label: "Change a setting", action: .configure(tool: "app_setting_set", input: [:], title: "Change a setting")))
         case "git_log":
             let commits = rowsOf(object["commits"])
             rows = commits.map { pad(text($0["hash"]) ?? "", 11) + pad(String((text($0["date"]) ?? "").prefix(16)), 18) + clip(text($0["subject"]) ?? "", 80) }
@@ -158,8 +139,9 @@ extension HerScreen {
             rows = apps.prefix(10).map { pad(clip($0.key, 28), 30) + age($0.value) }
                 + (apps.count > 10 ? ["+\(apps.count - 10) more apps"] : [])
             header = ["ACTIVITY", (text(input["range"]) ?? "today").replacingOccurrences(of: "_", with: " "), "\(apps.count) apps"]; label = "APPS"
-        case "telegram_status":
+        case "app" where input["item"] == .string("status"):
             // The link's health in words (walk 3: this was raw JSON).
+            let object: [String: JSONValue] = if case .object(let row)? = object["item"] { row } else { [:] }
             let now = Date()
             func when(_ key: String) -> String? { text(object[key]).flatMap(date).map { friendly($0, now: now) } }
             let on = object["enabled"] == .bool(true), polling = object["poller_running"] == .bool(true)
@@ -174,21 +156,6 @@ extension HerScreen {
                 object["token_configured"] == .bool(false) ? "token     not set" : nil,
             ].compactMap { $0 }
             header = ["TELEGRAM", on ? "on" : "off", broken ? "error now" : "ok"]; label = "LINK"; body = nil
-        case "tool_catalog":
-            // Found tools as calls, what each does under it; calling one loads it (walk 3: raw JSON).
-            let matches = rowsOf(object["matches"])
-            rows = matches.prefix(8).flatMap { match -> [String] in
-                [clip(text(match["call"]) ?? text(match["name"]) ?? "", 110)]
-                    + (text(match["description"]).map { ["    " + clip(sentence($0), 100)] } ?? [])
-            }
-            // The count is what is shown; weaker matches left off the shortlist
-            // are said as such (walk 4: "3 matches" over one row).
-            let shown = min(matches.count, 8), total = max(Int(text(object["match_count"]) ?? "") ?? 0, matches.count)
-            if total > shown { rows.append("+\(total - shown) weaker, not shown · tools.find with other words") }
-            if !matches.isEmpty { rows.append("Call one by its name with those arguments; calling loads it.") }
-            header = ["TOOLS", text(input["query"]).map { "found for \"" + clip($0, 40) + "\"" } ?? "found",
-                      "\(shown) match\(shown == 1 ? "" : "es")"]
-            label = "FOUND"; body = nil
         default:
             guard let body, issue == nil else { break }
             // Whole lines, wrapped, never clipped: the cap is on source lines.
@@ -198,8 +165,8 @@ extension HerScreen {
             // A web page read keeps its whole text in its source receipt.
             let saved: String? = if case .object(let receipt)? = object["source_receipt"] { text(receipt["path"]) } else { nil }
             if lines.count > cap {
-                rows.append("+\(lines.count - cap) more lines" + (tool == "read_file" ? " · read_file with offset reads on"
-                    : saved.map { " · all of it: read_file " + $0 } ?? ""))
+                rows.append("+\(lines.count - cap) more lines" + (tool == "read_file" ? " · app files.read with offset reads on"
+                    : saved.map { " · all of it: app files.read " + $0 } ?? ""))
             }
             if tool != "screen" { header.append("\(lines.count) line\(lines.count == 1 ? "" : "s")") }
             let coverage: [String: JSONValue] = if case .object(let row)? = object["coverage"] { row } else { [:] }
@@ -254,10 +221,8 @@ extension HerScreen {
             return listed("github", "github") { $0 == "\(repo)#\(kind)#\(number)" }
         case "git_log": return "code"
         case "screen": return "mac"
-        case "app_settings_list": return "app"
         case "activity_query": return "activity"
-        case "telegram_status": return "status"
-        case "tool_catalog": return "tools"
+        case "app": return input["item"] == .string("status") ? "status" : nil
         // research.read: the page's text as a room, not the fetch receipt's JSON (walk 6).
         case "read_page": return "research"
         default: return nil
@@ -317,7 +282,7 @@ extension HerScreen {
             [section("RECENT", rows.isEmpty ? ["nothing in the workspace yet · files.new writes one"] : rows), section("TINY", stubs)],
             verbs: [("files.N", "read it"), ("files.N.append", "add to its end (text)"), ("files.new", "write a new file (form)"),
                     ("files.find", "find a document by what it was for (text)"), ("clipboard.read", "what is on the clipboard"),
-                    ("clipboard.copy", "put text on the clipboard (text)"), ("list_dir · grep", "any other folder, or inside files")])
+                    ("clipboard.copy", "put text on the clipboard (text)"), ("app files.list · files.grep", "any other folder, or inside files")])
     }
 
     private static func size(_ bytes: Int) -> String {
@@ -348,7 +313,7 @@ extension HerScreen {
                        status == nil ? "git unreadable" : lines.isEmpty ? "clean" : "\(lines.count) changed"],
             [section("CHANGED", changed), section("COMMITS", commits), section("RUNS", runs(dataRoot: dataRoot, now: now))],
             verbs: [("code.diff", "the uncommitted changes"), ("code.log", "the last 10 commits"),
-                    ("code.run", "run a shell command in the checkout (text)"), ("swift_build · swift_test", "build or test")])
+                    ("code.run", "run a shell command in the checkout (text)"), ("app swift.build · swift.test", "build or test")])
     }
 
     private static func git(_ args: [String], in repo: URL) -> String? {

@@ -172,10 +172,12 @@ struct MacSyncChatSnapshotCoalescerState: Equatable {
 }
 
 enum MacSyncArchiveRetentionWatchPaths {
-    static func resolve(inboxDirectory: URL?, responsesDirectory: URL?, fileManager: FileManager = .default) -> [URL] {
-        guard let inboxDirectory, let responsesDirectory else { return [] }
-        let rejected = inboxDirectory.appendingPathComponent("_rejected", isDirectory: true)
-        let paths = [inboxDirectory, responsesDirectory, rejected]
+    static func resolve(inboxDirectory: URL?, responsesDirectory: URL?, transactionDirectory: URL?, dataRoot: URL, fileManager: FileManager = .default) -> [URL] {
+        guard let responsesDirectory, let transactionDirectory else { return [] }
+        let rejected = inboxDirectory?.appendingPathComponent("_rejected", isDirectory: true)
+        let paths = [inboxDirectory, responsesDirectory, rejected, transactionDirectory,
+                     dataRoot.appendingPathComponent("icloud/_rejected", isDirectory: true),
+                     dataRoot.appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
         for path in paths {
             var isDirectory: ObjCBool = false
             if fileManager.fileExists(atPath: path.path, isDirectory: &isDirectory) {

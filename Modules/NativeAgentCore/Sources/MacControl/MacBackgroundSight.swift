@@ -111,7 +111,7 @@ public enum MacBackgroundSight {
             // alternative, so the retry was always the same call again.
             return "\"\(name)\" is NativeAgent itself, and this app's own window can never be "
                 + "captured — reading our own UI over accessibility deadlocks the app. "
-                + "Use desk_read, inner_state or agent_introspect for our own state, and "
+                + "Use app (desk.read, mind.inner_state, agent.introspect) for our own state, and "
                 + "screen only for another app's window."
         case .notRunning(let candidates):
             guard !candidates.isEmpty else {

@@ -36,23 +36,18 @@ extension BrowserActionRoutes {
             // Browser Core projects the one canonical terminal transition into
             // the native-action receipt feed for both public aliases. Do not
             // append a second app-owned receipt for browser.navigate.
-            if action.id == "browser.open_url" || action.id == "browser.navigate" {
-                return NativeActionReceipt(
-                    id: run.id,
-                    actionId: action.id,
-                    name: action.name,
-                    kind: action.kind,
-                    status: run.status,
-                    dryRun: run.dryRun,
-                    approvalId: run.approvalId,
-                    createdAt: run.createdAt
-                )
-            }
-            return try await effects.appendNativeActionReceipt(
-                action: action,
+            return NativeActionReceipt(
+                id: run.id,
+                actionId: action.id,
+                name: action.name,
+                kind: action.kind,
                 status: run.status,
-                dryRun: dryRun,
-                output: try JSONValue.fromEncodable(run)
+                dryRun: run.dryRun,
+                approvalId: run.approvalId,
+                createdAt: run.createdAt,
+                url: run.url,
+                sourceReceipt: run.sourceReceipt,
+                screenshotReceipt: run.screenshotReceipt
             )
 
         case "browser.read_text":
@@ -73,7 +68,8 @@ extension BrowserActionRoutes {
                 id: "browser-text-\(UUID().uuidString.lowercased())",
                 url: capture.url,
                 text: capture.text ?? "",
-                links: nil
+                links: nil,
+                dataRoot: dataRoot
             )
             return try await effects.appendNativeActionReceipt(
                 action: action,
@@ -99,7 +95,8 @@ extension BrowserActionRoutes {
             let receipt = try await persistBrowserLinksCapture(
                 id: "browser-links-\(UUID().uuidString.lowercased())",
                 url: capture.url,
-                links: capture.links ?? []
+                links: capture.links ?? [],
+                dataRoot: dataRoot
             )
             return try await effects.appendNativeActionReceipt(
                 action: action,
@@ -130,7 +127,8 @@ extension BrowserActionRoutes {
             let receipt = try await persistBrowserScreenshotCapture(
                 id: "browser-shot-\(UUID().uuidString.lowercased())",
                 url: capture.url,
-                png: png
+                png: png,
+                dataRoot: dataRoot
             )
             return try await effects.appendNativeActionReceipt(
                 action: action,

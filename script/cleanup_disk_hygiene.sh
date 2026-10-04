@@ -125,8 +125,42 @@ fi
 
 echo "1. Stale self-improvement worktrees (data/self_worktrees/*, >${WORKTREE_AGE}d)"
 if [ -d data/self_worktrees ]; then
-    do_delete "stale worktrees" \
-        find data/self_worktrees -maxdepth 1 -mindepth 1 -type d -mtime +"$WORKTREE_AGE"
+    # A directory's age says nothing about edits or a worker using its files.
+    # Keep unknown/unregistered directories and let Git refuse dirty/locked work.
+    ACTIVE_CWDS=""
+    if ACTIVE_CWDS=$(lsof -a -d cwd -Fn 2>/dev/null); then
+        while IFS= read -r -d '' worktree; do
+            worktree="$(cd "$worktree" && pwd -P)"
+            top="$(git -C "$worktree" rev-parse --show-toplevel 2>/dev/null)" || continue
+            [ "$top" = "$worktree" ] || continue
+            gitdir="$(git -C "$worktree" rev-parse --absolute-git-dir)" || continue
+            [ ! -e "$gitdir/locked" ] || continue
+            status="$(git -C "$worktree" status --porcelain --untracked-files=all)" || continue
+            if [ -n "$status" ]; then
+                echo "  Skipping dirty worktree: $worktree"
+                continue
+            fi
+            active=false
+            while IFS= read -r cwd; do
+                case "$cwd" in
+                    "n$worktree"|"n$worktree/"*) active=true; break ;;
+                esac
+            done <<< "$ACTIVE_CWDS"
+            if $active; then
+                echo "  Skipping active worktree: $worktree"
+                continue
+            fi
+            # Existing tracked files can change without touching the root mtime.
+            recent="$(find "$worktree" -type f -mtime -"$WORKTREE_AGE" -print -quit)" || continue
+            [ -z "$recent" ] || continue
+            echo "  Eligible worktree: $worktree"
+            if ! $DRY_RUN; then
+                git worktree remove "$worktree"
+            fi
+        done < <(find data/self_worktrees -maxdepth 1 -mindepth 1 -type d -mtime +"$WORKTREE_AGE" -print0)
+    else
+        echo "  Worktrees preserved: active working directories could not be read."
+    fi
 else
     echo "  (data/self_worktrees not present)"
 fi
@@ -135,7 +169,7 @@ echo ""
 echo "2. Old run directories (data/runs/*, >${RUN_AGE}d)"
 if [ -d data/runs ]; then
     do_delete "old runs" \
-        find data/runs -maxdepth 1 -mindepth 1 -mtime +"$RUN_AGE"
+        find data/runs -maxdepth 1 -mindepth 1 -type d -mtime +"$RUN_AGE"
 else
     echo "  (data/runs not present)"
 fi
@@ -152,19 +186,19 @@ echo ""
 
 echo "4. Python bytecode caches (__pycache__/, *.pyc)"
 do_delete "__pycache__ dirs" \
-    find . -path ./.venv -prune -o -path ./node_modules -prune -o -type d -name __pycache__ -print
+    find . -path ./.venv -prune -o -path ./node_modules -prune -o -type d -name __pycache__
 do_delete "*.pyc files" \
-    find . -path ./.venv -prune -o -path ./node_modules -prune -o -type f -name "*.pyc" -print
+    find . -path ./.venv -prune -o -path ./node_modules -prune -o -type f -name "*.pyc"
 echo ""
 
 echo "5. macOS metadata (.DS_Store)"
 do_delete ".DS_Store files" \
-    find . -path ./.venv -prune -o -type f -name ".DS_Store" -print
+    find . -path ./.venv -prune -o -type f -name ".DS_Store"
 echo ""
 
 echo "6. Pytest cache (.pytest_cache/)"
 do_delete ".pytest_cache dirs" \
-    find . -path ./.venv -prune -o -type d -name ".pytest_cache" -print
+    find . -path ./.venv -prune -o -type d -name ".pytest_cache"
 echo ""
 
 # --- After ----------------------------------------------------------------

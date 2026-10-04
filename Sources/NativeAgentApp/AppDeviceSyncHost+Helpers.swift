@@ -84,7 +84,7 @@ extension AppDeviceSyncHost {
                 guard let paused = payload["paused"], ["true", "false"].contains(paused) else { throw HelperRemoteError.invalid }
                 _ = try store.pause(id, paused: paused == "true")
             } else if action == "run_helper" {
-                runID = try BotRunQueue(dataRoot: root).enqueueRequest(bot: id)
+                runID = try await BotRunConversation.enqueueRequestedCheck(botID: id, dataRoot: root)
             }
             var result = try Self.helperReceipt(store.get(id))
             if let runID { result["run_id"] = runID.uuidString; result["message"] = "Run queued." }

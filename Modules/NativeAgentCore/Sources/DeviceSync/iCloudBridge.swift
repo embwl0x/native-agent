@@ -27,6 +27,64 @@ private typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
 /// One serial authentication owner per bridge. No suspension inside a check;
 /// cancellation checks can still run while delivery awaits a chat's reply.
 private actor ICloudIncomingVerifier {
+    enum ChatAdmission: Sendable {
+        case reserved, completed, interrupted, unreadable, collision, stale, unavailable
+    }
+
+    /// Both transports reserve the same canonical envelope before a turn starts.
+    func reserveChat(_ message: BridgeMessage, dataRoot: URL, canDispatch: Bool) -> ChatAdmission {
+        do {
+            let digest = MacSyncSnapshotIntegrity.digest(try message.canonicalBodyForSigning())
+            let id = MacSyncSnapshotIntegrity.digest(Data(message.id.utf8))
+            let directory = dataRoot.appendingPathComponent("icloud/chat_transactions", isDirectory: true)
+            let url = directory.appendingPathComponent("\(id).json")
+            switch MacSyncEngine.coordinatedReadOutcome(at: url) {
+            case .data(let data):
+                guard let row = try? JSONDecoder().decode(ICloudTransactionRecord.self, from: data) else { return .unreadable }
+                guard row.id == id, row.msgId == message.id, row.actionDigest == digest,
+                      row.direction == "ios_to_mac", row.action == "chat" else { return .collision }
+                return row.state == "completed" ? .completed : .interrupted
+            case .failed:
+                return .unreadable
+            case .missing:
+                break
+            }
+            let age = Date().timeIntervalSince(message.timestamp)
+            guard age <= 24 * 60 * 60, age >= -15 * 60 else { return .stale }
+            guard canDispatch else { return .unavailable }
+            let now = ISO8601DateFormatter().string(from: Date())
+            let row = ICloudTransactionRecord(id: id, direction: "ios_to_mac", action: "chat",
+                                             state: "running", createdAt: now, updatedAt: now,
+                                             attempts: 1, msgId: message.id, actionDigest: digest)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(row)
+            try data.write(to: url, options: .withoutOverwriting)
+            guard case .data(let retained) = MacSyncEngine.coordinatedReadOutcome(at: url),
+                  retained == data else { return .unavailable }
+            return .reserved
+        } catch {
+            NSLog("[iCloudBridge] chat reservation unavailable: %@", error.localizedDescription)
+            return .unavailable
+        }
+    }
+
+    func finishChat(_ message: BridgeMessage, dataRoot: URL, completed: Bool) -> Bool {
+        do {
+            let id = MacSyncSnapshotIntegrity.digest(Data(message.id.utf8))
+            let url = dataRoot.appendingPathComponent("icloud/chat_transactions/\(id).json")
+            guard case .data(let data) = MacSyncEngine.coordinatedReadOutcome(at: url) else { return false }
+            var row = try JSONDecoder().decode(ICloudTransactionRecord.self, from: data)
+            guard row.msgId == message.id,
+                  row.actionDigest == MacSyncSnapshotIntegrity.digest(try message.canonicalBodyForSigning()) else { return false }
+            row.state = completed ? "completed" : "unknown"
+            row.updatedAt = ISO8601DateFormatter().string(from: Date())
+            return MacSyncEngine.coordinatedWrite(data: try JSONEncoder().encode(row), to: url)
+        } catch {
+            NSLog("[iCloudBridge] chat outcome could not be saved: %@", error.localizedDescription)
+            return false
+        }
+    }
+
     func quarantine(_ message: BridgeMessage, dataRoot: URL) -> Bool {
         iCloudBridge.quarantineIncomingSender(message, dataRoot: dataRoot)
     }
@@ -38,8 +96,14 @@ private actor ICloudIncomingVerifier {
     }
 
     func admitsCancellation(_ message: BridgeMessage, secret: Data?) -> Bool {
-        guard message.metadata?["kind"] == "icloud_action",
-              let key = try? secret ?? PairingSecretManager.loadOrGenerateSecret() else { return false }
+        guard let key = try? secret ?? PairingSecretManager.loadOrGenerateSecret() else { return false }
+        if message.metadata?["kind"] != "icloud_action",
+           UserMessageIntentSignals.isControlHandoff(message.text),
+           let session = message.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           NativeAgentChatSessionID.normalizedPathComponent(session) != nil,
+           case .deliver = ICloudIncomingMessageDisposition.classify(message, secret: key, now: Date()) {
+            return true
+        }
         return iCloudBridge.isAuthenticatedRunScopedCancellation(message, secret: key)
     }
 }
@@ -553,7 +617,8 @@ public final class iCloudBridge: ObservableObject {
         correlationID: String? = nil,
         metadata: [String: String]? = nil,
         attachments: [NativeAgentShared.MultimodalAttachment] = [],
-        messageID: String = UUID().uuidString
+        messageID: String = UUID().uuidString,
+        timestamp: Date? = nil
     ) async throws -> BridgeMessage {
         let unsigned = BridgeMessage.make(
             id: messageID,
@@ -562,7 +627,8 @@ public final class iCloudBridge: ObservableObject {
             sessionID: sessionID,
             correlationID: correlationID,
             metadata: metadata,
-            attachments: attachments.isEmpty ? nil : attachments
+            attachments: attachments.isEmpty ? nil : attachments,
+            timestamp: timestamp ?? Date()
         )
         // Phase 14e-iCloud: sign with the pairing secret. PairingSecretManager
         // is the Mac-side single source of truth (used by MacSyncEngine for
@@ -868,22 +934,13 @@ public final class iCloudBridge: ObservableObject {
     /// The status record is a bounded LWW projection; the Mac remains the only
     /// provider configuration owner.
     @discardableResult
-    public func publishProviderCatalogStatus(providers suppliedProviders: [NAProviderCatalogProvider]? = nil) async -> Bool {
+    public func publishProviderCatalogStatus() async -> Bool {
         guard let deviceTransport else { return false }
         do {
-            let providerRows: [NAProviderCatalogProvider]
-            if let suppliedProviders {
-                providerRows = suppliedProviders
-            } else {
-                providerRows = try await sync.host.providerCatalogProviders()
-            }
-            let snapshot = try await SwiftNativeProviderRouting(
-                dataRoot: testDataRoot ?? PersistenceCore.defaultDataRoot()
-            ).checkedRoutingSnapshot()
-
+            let snapshot = try await sync.host.providerCatalogSnapshot()
             let catalog = NAProviderCatalogStatus(
-                providers: providerRows,
-                surfaces: Self.providerSurfaceSelections(from: snapshot)
+                providers: snapshot.providers,
+                surfaces: Self.providerSurfaceSelections(from: snapshot.routing)
             )
             let value = try NAProviderCatalogStatusCodec.encode(catalog)
             let outcome = await ICloudBridgeStatusPublication.publish(
@@ -920,20 +977,22 @@ public final class iCloudBridge: ObservableObject {
     /// Publish selected rebuildable iOS read projections through the existing
     /// bounded CloudKit status seam. The snapshot writer remains the only
     /// projection compiler; this adapter only transports its exact file bytes.
+    /// Returns each group that did not publish, with why; nil when there is no
+    /// CloudKit transport or the pass was torn down.
     @discardableResult
     func publishMobileSnapshotStatus(
         groups: Set<NAMobileSnapshotGroup>,
         snapshotDirectory: URL,
         shouldPublish: @MainActor () -> Bool = { true }
-    ) async -> Bool {
-        guard let deviceTransport, !groups.isEmpty else { return false }
-        var allSucceeded = true
+    ) async -> [NAMobileSnapshotGroup: String]? {
+        guard let deviceTransport, !groups.isEmpty else { return nil }
+        var failures: [NAMobileSnapshotGroup: String] = [:]
         for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
             do {
                 guard let value = try await MobileSnapshotBuilder.shared.status(
                     group: group, directory: snapshotDirectory
                 ) else { continue }
-                guard shouldPublish() else { return false }
+                guard shouldPublish() else { return nil }
                 if lastPublishedMobileSnapshotStatus[group] == value {
                     continue
                 }
@@ -941,11 +1000,11 @@ public final class iCloudBridge: ObservableObject {
                     key: group.statusKey,
                     value: value
                 )
-                guard shouldPublish() else { return false }
+                guard shouldPublish() else { return nil }
                 lastPublishedMobileSnapshotStatus[group] = value
             } catch {
-                guard shouldPublish() else { return false }
-                allSucceeded = false
+                guard shouldPublish() else { return nil }
+                failures[group] = error.localizedDescription
                 // Forget what was last published for this group: the retained
                 // value is what suppresses the next attempt, and this group is
                 // now known not to be on the phone as published.
@@ -957,7 +1016,7 @@ public final class iCloudBridge: ObservableObject {
                 )
             }
         }
-        return allSucceeded
+        return failures
     }
 
     @discardableResult
@@ -1230,6 +1289,14 @@ public final class iCloudBridge: ObservableObject {
         if seenMessageIDs.contains(msg.id) { return true }
         switch disposition {
         case .permanentlyRejected(let reason):
+            if reason == "stale_timestamp" {
+                if msg.metadata?["kind"] != PhonePlaceEvent.messageKind,
+                   msg.metadata?["kind"] != PhoneRequestResult.messageKind {
+                    // Chat and action ledgers may already own this expired request.
+                    break
+                }
+                guard await sendIncomingRejection(msg, reason: Date() > msg.timestamp ? "request_expired" : "clock_ahead") else { return false }
+            }
             NSLog("[iCloudBridge] dropping iOS→Mac CK msg %@: %@", msg.id, reason)
             guard await recordPermanentIncomingRejection(msg, reason: reason) else {
                 syncStatus = "iPhone rejection receipt unavailable — retaining message for retry"
@@ -1286,25 +1353,24 @@ public final class iCloudBridge: ObservableObject {
             NSLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
                   msg.id, error.localizedDescription)
         }
-        var delivered = false
         activeCloudKitChats += 1
         defer { activeCloudKitChats -= 1 }
         drainPolicy.notePeerActivity(at: Date())
         scheduleNextDeviceDrainFallback()
-        for handler in messageHandlers {
-            if await handler(msg) { delivered = true }
-        }
-        if delivered {
+        let delivery = await deliverIncomingChat(msg)
+        if delivery != .deferred {
             // E3: this turn's reply is owed — hold the fast drain cadence until
             // it is sent (or the correlation ages out).
             drainPolicy.noteOutstanding(msg.id, at: Date())
-            await Self.appendInboundSuccessReceipt(
-                msg,
-                transport: "cloudkit",
-                secret: secret,
-                dataRoot: testDataRoot ?? PersistenceCore.defaultDataRoot()
-            )
-            recordSeenMessageID(msg.id)
+            if delivery == .delivered {
+                await Self.appendInboundSuccessReceipt(
+                    msg,
+                    transport: "cloudkit",
+                    secret: secret,
+                    dataRoot: testDataRoot ?? PersistenceCore.defaultDataRoot()
+                )
+            }
+            if delivery != .rejected { recordSeenMessageID(msg.id) }
             // CK-3c: persist the CK-consumed id so a restart within the cursor's
             // 30s clock-skew re-pull window doesn't re-deliver it (gpt-5.5 CK-3c
             // review P1). Synchronous UserDefaults (ordered on the main actor,
@@ -1312,13 +1378,77 @@ public final class iCloudBridge: ObservableObject {
             // saves or not flush before exit. Mirrors the iOS bridge's approach;
             // merged back into the seen-set on setup. Only the DELIVERED branch
             // needs it (a re-dropped bad-sig/stale is harmless).
-            persistCKSeenIDs()
+            if delivery != .rejected { persistCKSeenIDs() }
             lastSyncAt = Date()
-            syncStatus = "Received message from iOS (CloudKit)"
+            syncStatus = "Processed iPhone request (CloudKit)"
             return true
         }
         markMacRuntimeUnavailable()
         return false  // transient — retry next drain
+    }
+
+    private func sendIncomingRejection(_ message: BridgeMessage, reason: String) async -> Bool {
+        let text: String
+        switch reason {
+        case "request_expired":
+            text = "Your Mac received this after its request window expired. It wasn't started."
+        case "clock_ahead":
+            text = "iPhone message rejected: its timestamp is in the future. Check both devices' clocks and try again."
+        case "message_id_collision":
+            text = "This message ID already belongs to a different request. This request wasn't started."
+        default:
+            text = "Mac could not confirm whether this request completed, so it was not started again. Check the conversation and any actions before sending a new request."
+        }
+        do {
+            let isOutcomeError = reason == "unknown_outcome" || reason == "message_id_collision"
+            _ = try await sendChatMessage(text: text, sessionID: message.sessionID, correlationID: message.id,
+                                          metadata: ["kind": isOutcomeError ? "error" : "rejection", "reason": reason,
+                                                     "errorDetail": text,
+                                                     "targetSourceKey": message.metadata?["routeKey"]
+                                                        ?? message.metadata?["deviceSourceKey"]
+                                                        ?? message.metadata?["sourceKey"] ?? ""])
+            return true
+        } catch {
+            syncStatus = "iPhone response could not be sent — retaining request for retry"
+            return false
+        }
+    }
+
+    private enum IncomingChatDelivery { case delivered, handled, rejected, deferred }
+
+    private func deliverIncomingChat(_ message: BridgeMessage) async -> IncomingChatDelivery {
+        guard !inFlightIncomingMessageIDs.contains(message.id) else { return .deferred }
+        inFlightIncomingMessageIDs.insert(message.id)
+        defer { inFlightIncomingMessageIDs.remove(message.id) }
+        let dataRoot = testDataRoot ?? PersistenceCore.defaultDataRoot()
+        switch await incomingVerifier.reserveChat(message, dataRoot: dataRoot, canDispatch: !messageHandlers.isEmpty) {
+        case .completed:
+            return .handled
+        case .collision:
+            return await sendIncomingRejection(message, reason: "message_id_collision") ? .rejected : .deferred
+        case .stale:
+            return await sendIncomingRejection(message, reason: Date() > message.timestamp ? "request_expired" : "clock_ahead") ? .rejected : .deferred
+        case .unavailable:
+            syncStatus = "iPhone request record unavailable — retaining request for retry"
+            return .deferred
+        case .interrupted:
+            guard await sendIncomingRejection(message, reason: "unknown_outcome") else { return .deferred }
+            return await incomingVerifier.finishChat(message, dataRoot: dataRoot, completed: false) ? .handled : .deferred
+        case .unreadable:
+            // Unknown authority stays byte-preserved and never authorizes dispatch.
+            return await sendIncomingRejection(message, reason: "unknown_outcome") ? .handled : .deferred
+        case .reserved:
+            break
+        }
+        var delivered = false
+        for handler in messageHandlers {
+            if await handler(message) { delivered = true }
+        }
+        if !delivered {
+            guard await sendIncomingRejection(message, reason: "unknown_outcome") else { return .deferred }
+        }
+        guard await incomingVerifier.finishChat(message, dataRoot: dataRoot, completed: delivered) else { return .deferred }
+        return delivered ? .delivered : .handled
     }
 
     /// A terminal rejection advances the transport cursor only after this
@@ -1535,20 +1665,6 @@ public final class iCloudBridge: ObservableObject {
                     }
                 }
                 guard !Task.isCancelled else { return }
-                for rejection in scan.rejections {
-                    Task { @MainActor in
-                        _ = try? await self.sendChatMessage(
-                            text: rejection.text,
-                            sessionID: rejection.sessionID,
-                            correlationID: rejection.correlationID,
-                            metadata: [
-                                "kind": "rejection",
-                                "reason": rejection.reason,
-                                "targetSourceKey": rejection.targetSourceKey,
-                            ]
-                        )
-                    }
-                }
                 for id in scan.seenIDs {
                     self.recordSeenMessageID(id)
                 }
@@ -1577,14 +1693,14 @@ public final class iCloudBridge: ObservableObject {
                 // session message unwedges the hang via the supersede-cancel.
                 // Check-then-insert runs with no await in between (MainActor),
                 // so duplicate ids within or across scans dispatch only once.
-                let backlog = scan.messages
+                // Explicit control messages must not wait behind a streaming turn.
+                let handoffs = scan.messages.filter { UserMessageIntentSignals.isControlHandoff($0.message.text) }
+                let ordinary = scan.messages.filter { !UserMessageIntentSignals.isControlHandoff($0.message.text) }
+                let backlog = handoffs + ordinary
                 Task { @MainActor in
                     for pending in backlog {
-                        guard !self.inFlightIncomingMessageIDs.contains(pending.message.id) else { continue }
-                        self.inFlightIncomingMessageIDs.insert(pending.message.id)
-                        defer {
-                            self.inFlightIncomingMessageIDs.remove(pending.message.id)
-                        }
+                        guard !self.seenMessageIDs.contains(pending.message.id),
+                              !self.inFlightIncomingMessageIDs.contains(pending.message.id) else { continue }
                         do {
                             try await SignedPeerEvidenceStore.record(
                                 eventID: pending.message.id,
@@ -1596,22 +1712,19 @@ public final class iCloudBridge: ObservableObject {
                             NSLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
                                   pending.message.id, error.localizedDescription)
                         }
-                        var delivered = false
-                        for handler in self.messageHandlers {
-                            if await handler(pending.message) {
-                                delivered = true
-                            }
-                        }
-                        if delivered {
+                        let delivery = await self.deliverIncomingChat(pending.message)
+                        if delivery != .deferred {
                             // E3: same owed-reply bookkeeping as the CloudKit lane.
                             self.drainPolicy.noteOutstanding(pending.message.id, at: Date())
-                            await Self.appendInboundSuccessReceipt(
-                                pending.message,
-                                transport: "icloud_drive",
-                                secret: secret,
-                                dataRoot: self.testDataRoot ?? PersistenceCore.defaultDataRoot()
-                            )
-                            await self.markIosMessageProcessed(pending, docsURL: docsURL)
+                            if delivery == .delivered {
+                                await Self.appendInboundSuccessReceipt(
+                                    pending.message,
+                                    transport: "icloud_drive",
+                                    secret: secret,
+                                    dataRoot: self.testDataRoot ?? PersistenceCore.defaultDataRoot()
+                                )
+                            }
+                            await self.markIosMessageProcessed(pending, docsURL: docsURL, recordIdentity: delivery != .rejected)
                         } else {
                             self.markMacRuntimeUnavailable()
                         }
@@ -1634,14 +1747,6 @@ public final class iCloudBridge: ObservableObject {
                 }
             }
         }
-    }
-
-    struct OutboxRejection {
-        var text: String
-        var sessionID: String?
-        var correlationID: String
-        var reason: String
-        var targetSourceKey: String
     }
 
     struct PendingOutboxMessage: Sendable {
@@ -1675,9 +1780,9 @@ public final class iCloudBridge: ObservableObject {
         try? data.write(to: url, options: .atomic)
     }
 
-    private func markIosMessageProcessed(_ pending: PendingOutboxMessage, docsURL: URL) async {
+    private func markIosMessageProcessed(_ pending: PendingOutboxMessage, docsURL: URL, recordIdentity: Bool) async {
         let processedDir = docsURL.appendingPathComponent(DriveFolder.processed)
-        recordSeenMessageID(pending.message.id)
+        if recordIdentity { recordSeenMessageID(pending.message.id) }
         let dest = processedDir.appendingPathComponent(pending.fileURL.lastPathComponent)
         let idsSnapshot = seenMessageIDsOrdered
         let sourceURL = pending.fileURL
@@ -1689,7 +1794,7 @@ public final class iCloudBridge: ObservableObject {
             try? FileManager.default.moveItem(at: sourceURL, to: dest)
         }.value
         lastSyncAt = Date()
-        syncStatus = "iPhone message delivered"
+        syncStatus = "iPhone request processed"
     }
 
     nonisolated static func scanIosOutboxFiles(
@@ -1697,13 +1802,12 @@ public final class iCloudBridge: ObservableObject {
         seenMessageIDs: Set<String>,
         inFlightMessageIDs: Set<String>,
         secret: Data
-    ) -> (messages: [PendingOutboxMessage], rejections: [OutboxRejection], seenIDs: [String]) {
+    ) -> (messages: [PendingOutboxMessage], seenIDs: [String]) {
         let iosOutbox = docsURL.appendingPathComponent(DriveFolder.outboxIos)
         let processingDir = docsURL.appendingPathComponent(DriveFolder.processing)
         let processedDir = docsURL.appendingPathComponent(DriveFolder.processed)
         let fm = FileManager.default
         var messages: [PendingOutboxMessage] = []
-        var rejections: [OutboxRejection] = []
         var seenIDs: [String] = []
 
         try? fm.startDownloadingUbiquitousItem(at: iosOutbox)
@@ -1789,39 +1893,15 @@ public final class iCloudBridge: ObservableObject {
                 }
                 continue
             }
-            let messageAge = Date().timeIntervalSince(msg.timestamp)
-            if messageAge > 24 * 60 * 60 || messageAge < -15 * 60 {
-                // 2026-09-13 (first-failure pass): one check, two entirely
-                // different facts. A Mac asleep over a weekend reads a
-                // day-old request with both clocks perfectly correct — telling
-                // that person to check their clocks sends them to diagnose
-                // something that isn't broken. Only a FUTURE timestamp is
-                // evidence about clocks. Either way this happens before the
-                // agent runs, so the request was never started.
-                let expired = messageAge > 0
-                NSLog("[iCloudBridge] dropping iOS→Mac message %@: %@", msg.id,
-                      expired ? "request expired" : "future timestamp")
-                let targetSourceKey = msg.metadata?["sourceKey"] ?? ""
-                rejections.append(OutboxRejection(
-                    text: expired
-                        ? "Your Mac received this after its request window expired. It wasn't started."
-                        : "iPhone message rejected: its timestamp is in the future. Check both devices' clocks and try again.",
-                    sessionID: msg.sessionID,
-                    correlationID: msg.id,
-                    reason: expired ? "request_expired" : "clock_ahead",
-                    targetSourceKey: targetSourceKey
-                ))
-                let dest = processedDir.appendingPathComponent(currentURL.lastPathComponent)
-                if fm.fileExists(atPath: dest.path) {
-                    try? fm.removeItem(at: dest)
-                }
-                try? fm.moveItem(at: currentURL, to: dest)
-                continue
-            }
-
             messages.append(PendingOutboxMessage(message: msg, fileURL: currentURL))
         }
-        return (messages, rejections, seenIDs)
+        messages.sort {
+            if $0.message.timestamp != $1.message.timestamp {
+                return $0.message.timestamp < $1.message.timestamp
+            }
+            return $0.fileURL.lastPathComponent < $1.fileURL.lastPathComponent
+        }
+        return (messages, seenIDs)
     }
 
     // MARK: - NSMetadataQuery (watches iOS outbox for new iCloud files)

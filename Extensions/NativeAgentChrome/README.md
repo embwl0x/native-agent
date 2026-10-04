@@ -10,15 +10,14 @@ Tab leases are now real, bounded, renewable, persisted in
 `chrome.storage.session`, and recovered across Manifest V3 service-worker
 restarts. Physical pointer, keyboard, wheel, touch, or tab-activation evidence
 terminally yields the lease without closing the tab. Default grouped tabs remain
-inactive. Creating an X/Twitter post URL automatically opens a separate ordinary
-window with `focused: false` and its own active
-tab. It never selects a tab in the user's window. Window focus, additional tabs,
+inactive, including X/Twitter post URLs. Explicit `visible_work_window` creation
+opens a separate ordinary window with `focused: false` and its own active tab.
+It never selects a tab in the user's window. Window focus, additional tabs,
 minimization, or trusted interaction ends control; cleanup closes only the exact
 created tab while its window remains unfocused. The create-only `rendering_mode`
 option can explicitly select `visible_work_window` or `grouped_background`.
-Automatic matching requires the exact X/Twitter hosts and a username/status/id
-path, HTTP(S), no credentials or nonstandard port. Claims and other URLs are
-unchanged. Resident verification read multiple actual replies on one X thread
+Claims remain unchanged. Resident verification read multiple actual replies
+on one X thread
 with visible rendering, zero takeover sequence and successful tab cleanup. This
 is not a universal guarantee: macOS occlusion can still suspend rendering. Snapshot
 `rendering` reports actual visibility and readiness, not completeness of a feed.

@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import MacControl
 import PersistenceCore
 
 /// The narrow isolation seam for asynchronous coding builders.
@@ -527,36 +528,21 @@ actor BuilderWorktreeAllocator {
     }
 
     private func git(_ arguments: [String], cwd: URL) async -> GitResult {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-            process.arguments = arguments
-            process.currentDirectoryURL = cwd
-            var environment = ProcessInfo.processInfo.environment
-            environment["GIT_TERMINAL_PROMPT"] = "0"
-            process.environment = environment
-            let stdout = Pipe()
-            let stderr = Pipe()
-            process.standardOutput = stdout
-            process.standardError = stderr
-            process.terminationHandler = { process in
-                let out = stdout.fileHandleForReading.readDataToEndOfFile()
-                let err = stderr.fileHandleForReading.readDataToEndOfFile()
-                continuation.resume(returning: GitResult(
-                    status: process.terminationStatus,
-                    stdout: String(data: out, encoding: .utf8) ?? "",
-                    stderr: String(data: err, encoding: .utf8) ?? ""
-                ))
-            }
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: GitResult(
-                    status: -1,
-                    stdout: "",
-                    stderr: String(describing: error)
-                ))
-            }
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        do {
+            let result = try await SystemProcessAdapter().run(
+                executable: "/usr/bin/git", arguments: arguments,
+                currentDirectory: cwd, environment: environment,
+                standardInput: nil, timeoutSeconds: 30
+            )
+            return GitResult(
+                status: result.timedOut ? -1 : result.exitCode,
+                stdout: result.stdout,
+                stderr: result.timedOut ? "Git timed out.\n" + result.stderr : result.stderr
+            )
+        } catch {
+            return GitResult(status: -1, stdout: "", stderr: String(describing: error))
         }
     }
 }

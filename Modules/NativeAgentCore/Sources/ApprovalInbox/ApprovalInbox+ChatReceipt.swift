@@ -8,6 +8,7 @@ extension SwiftNativeApprovalInbox {
     public func writeChatReceipt(
         approvalID: String, sessionID: String, toolName: String, surface: String,
         summary: String, resultClass: String, ok: Bool?, resultPreview: String?,
+        returnedID: String? = nil, effects: String? = nil,
         recoveredAt: String? = nil
     ) async throws -> String? {
         guard !sessionID.isEmpty, sessionID != ".", sessionID != "..",
@@ -52,6 +53,8 @@ extension SwiftNativeApprovalInbox {
             }
             if let ok { metadata["ok"] = .bool(ok) }
             metadata["resultClass"] = .string(resultClass)
+            if let returnedID { metadata["resultReturnedID"] = .string(returnedID) }
+            if let effects { metadata["resultEffects"] = .string(effects) }
             // The envelope above is what the pill parses; its prose preamble
             // is longer than the history projection's head, so the result
             // body never survived into the model's next turn (it re-ran the

@@ -3,7 +3,7 @@ import Network
 
 extension AgentContactA2AEndpoint {
     public enum RESTResponse: @unchecked Sendable {
-        case json(Int, [String: Any])
+        case json(Int, [String: Any], onSent: (@Sendable () async -> Void)? = nil)
         case stream(AsyncStream<AgentContactEvent>)
     }
 
@@ -89,11 +89,11 @@ extension AgentContactA2AEndpoint {
             let request = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": "rest", "method": operation, "params": params], options: [.sortedKeys])
             switch await handle(request, principal: principal, version: version ?? "1.0") {
             case .stream(_, let events, _): return .stream(events)
-            case .json(let envelope):
+            case .json(let envelope, let onSent):
                 if let error = envelope["error"] as? [String: Any] {
                     return Self.restError(code: error["code"] as? Int ?? -32603, message: error["message"] as? String ?? "Request failed")
                 }
-                return .json(200, envelope["result"] as? [String: Any] ?? [:])
+                return .json(200, envelope["result"] as? [String: Any] ?? [:], onSent: onSent)
             }
         } catch {
             return Self.restError(code: -32700, message: "Invalid JSON")

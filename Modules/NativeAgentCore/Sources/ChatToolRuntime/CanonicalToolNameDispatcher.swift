@@ -23,6 +23,14 @@ import ChatTurnContracts
 import ChatSessionWork
 import AgentConversations
 
+/// The `app` door's way back in: the canonical dispatcher binds it around an
+/// `app` call, and each call of a script re-enters the whole chain through it
+/// as its own `app` call.
+public enum AppDoorReentry {
+    public typealias Perform = @Sendable (String, [String: JSONValue]) async throws -> JSONValue
+    @TaskLocal public static var perform: Perform?
+}
+
 // MARK: - Dotted-alias canonicalization (outermost)
 
 /// 2026-09-06: the dispatcher's dotted-alias canonicalizer (`save.skill` →
@@ -92,11 +100,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
 
     private func dispatchWithWorkspacePorts(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let result = try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
-            try await CraftToolContext.$dispatch.withValue({ name, arguments in
-                try await self.dispatch(tool: name, input: arguments, surface: surface)
-            }) {
-                try await dispatchNormalized(tool: tool, input: input, surface: surface)
-            }
+            try await dispatchNormalized(tool: tool, input: input, surface: surface)
         }
         // A released Chrome tab leaves her screen's windows and home too.
         if case .object(let fields) = result, fields["tool"] == .string("browser.chrome_release"),
@@ -121,6 +125,20 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     }
 
     private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        // The app door: `app` is admitted first under its
+        // own profile, classified by action, and an action runs in process, so
+        // this was its one pass. Each call of a script re-enters the SAME
+        // complete chain as its own `app` call; a script cannot confer its
+        // authority. The name it reaches is active for that call only.
+        if Self.canonical(tool) == "app" {
+            return try await AppDoorReentry.$perform.withValue({ name, arguments in
+                try await LLMCallContext.$turnActiveTools.withValue((LLMCallContext.turnActiveTools ?? []).union([name])) {
+                    try await self.dispatch(tool: name, input: arguments, surface: surface)
+                }
+            }) {
+                try await dispatchExact(tool: tool, input: input, surface: surface)
+            }
+        }
         if Self.canonical(tool) == "workspace" {
             guard let root = peerDataRoot,
                   let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty else {
@@ -146,14 +164,6 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
               }
               }
               }
-            }
-            // Phase 3: opening a place loads its whole tool group, so her next
-            // call needs no tool_load round trip. Loading grants nothing; every
-            // call still clears its own gates.
-            let key = root.standardizedFileURL.path + "\u{0}" + scope
-            if let group = await AgentWorkspaceNavigation.shared.currentToolGroup(key: key) {
-                _ = try? await dispatchExact(tool: "tool_load", input: ChatToolSessionInjection.apply(
-                    toolName: "tool_load", input: ["category": .string(group)], sessionId: scope), surface: surface)
             }
             return result
         }
@@ -303,6 +313,10 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
 
     public func listAvailableTools() async throws -> [String] {
         try await inner.listAvailableTools()
+    }
+
+    public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(named: names)
     }
 
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {

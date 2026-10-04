@@ -63,15 +63,3 @@ struct PersonalityDocsResponse: Codable, Hashable {
     var docs: [PersonalityDoc]
     var updatedAt: String?
 }
-
-typealias ContextBudget = EngineRuntime.ContextBudget
-
-typealias ContextSkillRef = EngineRuntime.ContextSkillRef
-
-typealias ContextSelectionRef = EngineRuntime.ContextSelectionRef
-
-typealias ContextInjectedSection = EngineRuntime.ContextInjectedSection
-
-typealias ContextCacheState = EngineRuntime.ContextCacheState
-
-typealias ContextReceipt = EngineRuntime.ContextReceipt

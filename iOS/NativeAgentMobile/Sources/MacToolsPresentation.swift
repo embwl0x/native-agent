@@ -14,6 +14,7 @@ enum MacSystemQuickActionExecution {
         let state: RemoteActionState
         let status: String
         let detail: String
+        var approvalID: String? = nil
     }
 
     static func unsupported(named action: String) -> Completion {
@@ -46,7 +47,8 @@ enum MacSystemQuickActionExecution {
             return Completion(
                 state: RemoteActionState.forError(error),
                 status: error.localizedDescription,
-                detail: error.localizedDescription
+                detail: error.localizedDescription,
+                approvalID: (error as? SyncError)?.approvalID
             )
         }
     }
@@ -222,13 +224,14 @@ enum MacToolsSpotlightPresentation {
 
     enum Outcome: Equatable {
         case emptyResponse
+        case invalidResponse
         case noResults
         case results([String])
 
         var rows: [String] {
             switch self {
             case .results(let results): results
-            case .emptyResponse, .noResults: []
+            case .emptyResponse, .invalidResponse, .noResults: []
             }
         }
 
@@ -236,6 +239,8 @@ enum MacToolsSpotlightPresentation {
             switch self {
             case .emptyResponse:
                 "Mac returned an empty Spotlight response; results are unavailable."
+            case .invalidResponse:
+                "Mac returned an unreadable Spotlight response; results are unavailable."
             case .noResults:
                 "No Spotlight results."
             case .results(let results):
@@ -265,10 +270,13 @@ enum MacToolsSpotlightPresentation {
     static func outcome(from rawResponse: String) -> Outcome {
         guard !rawResponse.isEmpty else { return .emptyResponse }
 
-        let results = rawResponse
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        struct SearchResponse: Decodable {
+            let results: [String]
+        }
+        guard let response = try? JSONDecoder().decode(SearchResponse.self, from: Data(rawResponse.utf8)) else {
+            return .invalidResponse
+        }
+        let results = response.results
 
         return results.isEmpty ? .noResults : .results(results)
     }

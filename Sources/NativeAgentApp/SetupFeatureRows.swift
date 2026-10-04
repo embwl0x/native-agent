@@ -20,10 +20,10 @@ struct SetupFeatureRows: View {
 
     // Same keys the Subconscious section and the Observatory bind, so no two
     // surfaces can show different truth.
-    @AppStorage("cognitiveSubstrateEnabled") private var subconsciousEnabled = false
+    @AppStorage("cognitiveSubstrateEnabled") private var subconsciousEnabled = true
     @AppStorage("cognitiveSubstrateReflectionEnabled") private var reflectionEnabled = false
     @AppStorage("organismKernelEnabled") private var organismEnabled = false
-    @AppStorage("contextFlowMode") private var contextFlowMode = ContextFlowMode.shadow.rawValue
+    @AppStorage("contextFlowMode") private var contextFlowMode = ContextFlowMode.active.rawValue
     @AppStorage("selfImprovementEnabled") private var selfImprovementEnabled = true
 
     // Optimistic local mirrors for the writes that go over the trust policy or
@@ -48,9 +48,11 @@ struct SetupFeatureRows: View {
         // cards, the inner life and then memory, where each was its own card.
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             SetupSection(title: "Inner life") {
-                reflectionRow
-                organismRow
-                fluidContextRow
+                DisclosureGroup("Mind diagnostics") {
+                    reflectionRow
+                    organismRow
+                    fluidContextRow
+                }
                 dreamsRow
                 weeklyConsolidationRow
                 selfImprovementRow
@@ -120,21 +122,21 @@ struct SetupFeatureRows: View {
 
     // MARK: - Memory in every reply (contextFlowMode)
 
-    /// Three modes, so a menu, as the original control was: a switch cannot
-    /// round-trip out of Off (the reviewer's catch, 2026-09-04).
+    /// A menu, as the original control was: a switch cannot round-trip out
+    /// of Off (the reviewer's catch, 2026-09-04).
     private var fluidContextRow: some View {
         SetupFeatureCard(
             title: "Memory in every reply",
-            detail: "What I remember shapes each reply. Observe only measures what would have helped and changes nothing."
+            detail: "What I remember shapes each reply."
         ) {
             Picker("Memory in every reply", selection: Binding(
-                get: { ContextFlowMode(rawValue: contextFlowMode) ?? .shadow },
+                get: { ContextFlowMode(rawValue: contextFlowMode) ?? .active },
                 set: { mode in
                     contextFlowMode = mode.rawValue
                     Task { await setFluidContext(mode) }
                 }
             )) {
-                ForEach([ContextFlowMode.off, .shadow, .active], id: \.rawValue) { mode in
+                ForEach([ContextFlowMode.off, .active], id: \.rawValue) { mode in
                     Text(OperationalSettingsControlPresentation.fluidContextLabel(mode)).tag(mode)
                 }
             }

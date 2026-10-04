@@ -20,9 +20,9 @@ import Foundation
 // take the next turn, which on a Mac with a bot shelf running is routinely not
 // the one the person is typing in.
 //
-// One shot, like the note: stamped delivered as the prompt is built, so a crash
-// afterwards cannot repeat it. Retention bounds a directive whose session was
-// abandoned; nothing else cleans these up.
+// One shot, like the note: stamped delivered after provider acceptance.
+// Retention bounds a directive whose session was abandoned; nothing else cleans
+// these up.
 public struct ChatSessionDirectiveRecord: Codable, Equatable, Sendable {
     public var createdAt: String
     public var directive: String
@@ -110,11 +110,13 @@ public enum ChatSessionDirective {
     public static func markDelivered(
         dataRoot: URL,
         sessionID: String,
-        now: Date = Date()
+        now: Date = Date(),
+        expectedDirective: String? = nil
     ) {
         guard let url = recordURL(dataRoot: dataRoot, sessionID: sessionID),
               var record = load(dataRoot: dataRoot, sessionID: sessionID),
               record.deliveredAt == nil else { return }
+        if let expectedDirective, record.directive.trimmingCharacters(in: .whitespacesAndNewlines) != expectedDirective { return }
         record.deliveredAt = ISO8601DateFormatter().string(from: now)
         guard let data = try? JSONEncoder().encode(record) else { return }
         try? data.write(to: url, options: [.atomic])

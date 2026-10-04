@@ -263,7 +263,7 @@ extension TelegramPollLoop {
             _tgAppendString("--\(boundary)--\r\n", to: &body)
             req.httpBody = body
 
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await replySendSession.data(for: req)
             _ = try _tgValidateResponse(
                 data,
                 response: resp,
@@ -283,8 +283,8 @@ extension TelegramPollLoop {
         return URLSession(configuration: configuration)
     }()
 
-    // Ordinary reply chunks: bounded, but roomier than the 30s delivery bound
-    // so a slow chunk mid-reply does not fail after earlier chunks landed.
+    // Reply chunks and photo uploads: bounded, but roomier than the 30s
+    // delivery bound so a slow reply does not fail after earlier chunks landed.
     private static let replySendSession: URLSession = {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 60

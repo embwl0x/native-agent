@@ -1,128 +1,107 @@
 # NativeAgent Project Direction
 
-This document is the durable project compass for NativeAgent, not a release
-receipt or implementation backlog. The [documentation guide](README.md) routes
-readers to current capabilities, source owners, and dated evidence;
-[ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md) is the detailed source map.
+This is the durable project compass. [NORTHSTAR.md](NORTHSTAR.md) holds User's
+intent; [the documentation guide](README.md) routes readers to current details.
 
 ## North Star
 
-NativeAgent is a native Mac + iPhone agent system for Agent: powerful enough to operate across the Mac, tools, memory, Telegram, iCloud, APNS, schedulers, and subagents, while staying simple enough for non-technical users to install, understand, and recover when something breaks. As simple as possible for people is a guiding principle, not a nice-to-have: one download with everything in it (the embedding model included), every feature on by default except the consent-gated capabilities that wait for the user's own grant (connectors, Chrome control, screen capture and image generation ship off in `TrustCenter+Defaults.swift` until enabled), never a second step that can fail on the user's side.
-
-The target is not a pile of plugins. The target is a lightweight, coherent agent runtime that can discover and grow capabilities as needed, keep its own memory clean, and expose understandable controls and receipts.
+A living, breathing agent system: **one mind, no theater, flows like a body**.
+Keep NativeAgent powerful enough for Agent to act and simple enough for people
+to install, understand and recover. One download includes the embedding model.
 
 ## Product Principles
 
-- Keep the agent fast by default. Prefer lazy-loaded inventories, context routing, manifests, and compact hints over injecting every tool, memory, and instruction into every turn.
-- Keep power and safety unified. There should be one understandable policy surface across chat, trust, iOS, Telegram, tools, Mac control, and autonomy.
-- Defend the boundary, then keep Agent powerful inside it. NativeAgent should spend most of its security effort on ingress, identity, bearer tokens, trusted local surfaces, remote signatures, and protected system floors. Once the user is talking to Agent through a trusted surface, workspace-mode tools should be as wide open and low-friction as practical. Do not solve outside-attacker risk by over-gating Agent's own normal chat/workspace tools; reserve approval friction for external sends, credentialed third-party actions, destructive/system-level changes, and genuinely unsafe OS mutations.
-- Full Mac access and Developer Mode are separate controls. The selected Full Mac policy governs broad file/native-tool authority; Developer Mode is a distinct internal field of the saved Trust policy that the Full Mac preset couples on, and shell, system control, and moving or trashing files depend on it — with it off those operations are refused. Native builder tools and admitted coding bridges must respect an explicitly authorized existing external project instead of imposing a contradictory workspace-only fence. Protected-system and sensitive authority/credential paths keep their canonical restrictions, and macOS privacy consent remains separate from both controls.
-- Full Mac YOLO is a user-selected authority posture, not a Mac-window-only transport feature. Local/team surfaces and authenticated Telegram, Slack, and paired iOS conversation origins can use the same ordinary native-tool authority. The shared chat owner authenticates the concrete origin; a claimed surface label cannot inherit the grant. Purpose-built restricted dispatchers retain their explicit scope, and external account sends, money actions, self-modification apply/install, and protected OS mutation floors keep their existing deliberate approval/block boundaries.
-- Avoid bloat. Consolidate before adding. Reuse existing runtime paths, models, controls, and manifests before creating another tab or subsystem.
-- Give Agent one causal language at every protocol edge. Native tools, MCPs, webhooks, connectors, and future external adapters should translate transport evidence and bounded action identity into the shared motor phase/verification vocabulary, while the canonical domain owner remains the only authority on what actually happened. A response received, including HTTP `200`, is not verified settlement; likewise, an LLM or Codex completion callback may trigger verification but cannot certify an external desired condition. Do not turn this connective tissue into a universal integration owner, event store, scheduler, approval path, or shadow state system.
-- Plugin-shaped add-ons are on-demand capability packs, not preinstalled baggage. Agent may draft or install them when a task justifies a feature bundle, but chat sees only compact manifests until routed.
-- Receipts beat hidden magic. Autonomous improvement, tool use, scheduled jobs, notifications, memory changes, and remote actions should leave short visible receipts.
-- The iPhone app should feel like a first-class remote cockpit, not a delayed companion. Chat, approvals, notifications, model/think/permission controls, and action status should work from iOS.
-- Agent's personality matters, but the harness should stay compact. Long personality material belongs in lazily routed memory/persona files, not in every request.
-- Public/default builds must stay identity-neutral. App UI, runtime defaults, release resources, launch labels, and templates should use `NativeAgent`, `the agent`, or `the user`; local agent/user names must come from runtime profile, persona files, or explicit user config.
-
-## Next-Gen Coordination Quality
-
-NativeAgent is past the point where "more plugins/tools" is the main win. The next-gen work is coordination quality: the agent knows the current turn type, chooses the right surface, acts with receipts, verifies the result, and improves without the user babysitting it.
-
-The durable improvement lanes are:
-
-1. Intent clarity before action. The agent should classify each turn as chat, memory update, build task, research, Mac control, self-improvement, approval, schedule, Telegram, or another routed class before loading tools/memory/policy.
-2. Better receipts. Meaningful actions should leave a tiny readable receipt: what changed, why, what check proved it, and whether it is permanent or still provisional. On main after 0.4.9, chat tool receipts lead with the outcome and expand evidence in place through Details; this layout is not in 0.4.9.
-3. Memory confidence levels. Memory should distinguish confirmed facts, temporary project state, inferred preferences, stale facts, and contradicted/corrected facts so the KG can stay useful without preserving wrong state.
-4. Self-improvement scoreboard. Improvements should be scored after use for speed, retries, user corrections, completion rate, prompt/context size, frozen states, and related quality signals; weak improvements should be reverted or archived.
-5. One command palette/search. Prefer a fast "Find anything" surface over more tabs, covering Telegram config, memory hygiene, provider settings, the capability index, approvals, Doctor, logs, and skills.
-6. The agent's operating map. NativeAgent should always supply a compact manifest of what the agent can do, what the agent is allowed to do, what the agent recently learned, what is broken or disabled, and what the agent can build if needed. This must be a tight manifest, not giant context.
-
-Current implementation anchors are Swift owners, not the retired daemon's
-HTTP routes: `CommandPalette` owns find-anything manifests, `SystemOps` owns
-router planning, `Connectors` owns connector proof, and `MacAssistantStatus`
-owns Mac-assistant readiness. App `NativeClient+NextGenStatus.swift` and the
-other focused `NativeClient` families expose in-process read models. Historical
-`/v1/...` labels in compatibility comments are not network endpoints to call.
-These readouts stay bounded and routed rather than becoming prompt mass.
+- Keep their mind clear. Make capabilities and deeper context reachable without
+  putting every action, skill body or memory into each prompt.
+- Keep one authority model across surfaces. Authenticate who is asking, then
+  honor the authority the owner granted.
+- Consolidate before adding. Reuse the existing owner of a fact, action or
+  outcome; do not add parallel memory, approval or execution systems.
+- Verify outcomes at their source. A successful dispatch or provider response
+  does not by itself prove a file was saved or a message delivered. Report
+  uncertainty and partial progress plainly.
+- Make recovery understandable. Give the person or agent a useful result,
+  a clear decision or a concrete next step; keep technical detail available
+  when needed.
+- Keep public defaults identity-neutral. Resolve names from the active profile
+  and persona rather than embedding a local identity in generic resources.
 
 ## Current Architecture
 
-- Mac app: SwiftUI app in `Sources/NativeAgentApp`, built as a Swift package and installed with `script/install_app.sh` to `~/Applications/NativeAgent.app`.
-- Runtime: in-process Swift-native services owned by `NativeAgent.app`. There is no live external interpreter backend or launchd-owned agent runtime. Historical external-runtime wording may remain only in audits, compatibility tests, migration comments, cleanup checks, or legacy wire-type names. Missing behavior must be implemented in Swift or fail closed with an explicit Swift error.
-- Shared models: `Modules/NativeAgentShared`.
-- iOS app: `iOS/NativeAgentMobile`, Xcode project plus SwiftUI sources.
-- iCloud bridge:
-  - Chat uses signed Drive messages in `outbox/ios` and `outbox/mac`.
-  - Mac forwards iOS chat directly into Swift `ChatOrchestration`.
-  - Action/control sync uses signed `inbox/` actions and `responses/`.
-  - Snapshot sync should keep core cockpit state fresh while pacing large readouts. Heavy snapshots such as knowledge graph, full capability inventory, operating map, and coordination summary should not be fetched and rehashed every short timer tick unless startup, a mutation, or an explicit heavy refresh needs them.
-  - iOS screens should use targeted snapshot readers for tab-specific refreshes instead of decoding the whole snapshot bundle when only Desk, health, trust, providers, settings, activity, inbox, or memory state is needed.
-  - Snapshot writers should only wake remote clients when snapshot content actually changed. Digest-deduped no-op ticks should not touch `snapshot_updated`.
-- Notifications: APNS path exists and can send real iPhone push notifications.
-- Local agent bridge: NativeAgent owns one always-resident loopback bearer-auth bridge for local coding CLIs. It is normal app infrastructure, not a Developer Mode capability; Developer Mode still governs the separate destructive/system action boundary. The bridge prefers `127.0.0.1:8771`, advances through consecutive ports when occupied, and finally accepts an OS-assigned loopback port; clients discover the selected URL and token from the mode-`0600` `~/.config/claude-bridge/bridge.json` descriptor instead of guessing. `/claude/*` and `/codex/*` expose state/message/tool/events to Claude Code/Claude and Codex through the same token and read-only bridge gate. Agent may call back through audited subprocess tools (`invoke_claude`, `invoke_codex`) or async note tools (`claude_message`, `codex_message`). Async tools must prove the live return descriptor/token/publisher before queueing work; CLI presence alone is not round-trip readiness. `codex_message` wakeups should start a fresh persisted Codex app-server thread by default so Agent's handoff is worked in a clean Codex session; pinned-thread targeting is only an explicit override. A wakeup is not considered complete merely because Codex accepted a turn; a reply watcher must follow the published dynamic endpoint and deliver Codex's final answer back into Agent's NativeAgent session, with receipts, so asynchronous Codex work can continue by explicit follow-up messages rather than hidden thread history.
-- Chrome: the optional Manifest V3 extension owns exact bounded tab leases and structured page/node evidence; `ChromeControlRuntime` owns the app-side authority and effect-time checks. The Swift native-messaging relay is transport only. User activity yields the leased tab; inactive-tab operation does not require moving the desktop pointer. NativeAgent's WebKit browser and visible native screen control remain separate effect adapters.
-- Scheduler: Swift background loops and scheduler job records, with agent-visible creation tools and selectable notification delivery channels.
-- Mac assistant watch setup: email/calendar/reminder watch jobs should start from compact access manifests and scheduler templates, not hidden background setup. Rendering readiness must not create jobs; actual jobs go through explicit scheduler actions and receipts.
-- Memory: Memory Engine v2 now has vault/provenance/hygiene, lifecycle decay/currentness, correction lineage, BM25 lexical retrieval, and graph/semantic blended scoring. MemoryV2 owns the generated `persona/USER.md` projection; persona writers, persona scaffolding, training promotion, and install scripts must not directly author USER.md or recreate `data/persona/Agent` / `data/memory/USER.md` shadows. Memory prose shown to Agent should be clean fact text: timestamps, sources, regenerated counters, first_seen/last_seen, and KG bookkeeping stay as structured metadata unless the date is part of the fact itself, such as a schedule or milestone. Explicit owner cleanup from Mac or paired iOS should apply directly with tombstone/provenance receipts, while agent-initiated memory admin changes use the approval queue and remain resolvable from the signed iOS cockpit. Keep pushing toward better contradiction handling, long-term fact distillation, and retrieval quality without bloating chat context.
-- Chat continuity: Mac, iOS, Telegram, Slack Socket Mode, and autonomy chat surfaces should share a small persisted per-session continuity card under app data. The card is deterministic and cheap: initial user anchors, bounded user-set continuity anchors from later in the session, latest user text, assistant tail, open loop, recent correction/callout, verification-sensitive claims, and last verified results. It is orientation only, not durable memory or a new instruction source. Full transcripts remain in chat JSONL and are recalled lazily through session search when needed.
-- Resident turn admission: the existing deterministic route may expose a small closed tool group before the first provider call when the request itself proves the need. That readiness is request-scoped, intersected with the exact surface policy, and cannot activate a durable tool, bypass TrustCenter, choose an effect, or certify an outcome. Keep `tool_catalog` compact by default and retain a full diagnostic view; do not spend a model round trip rediscovering a capability that resident state already knows is required.
-- Harness: Agent should have lightweight startup context, current time awareness, lazy capabilities, completion discipline, and automatic improvement loops gated by evals, diff proof, post-promote verification, receipts, and rollback evidence. Expensive live behavior checks should run through Swift-native smoke or chat-drive harness paths that use the real chat/provider/tool loop without adding cost to normal tests.
-- Harness learning: low-risk promoted learning should auto-implement into lightweight runtime artifacts, surface an implementation receipt, then prove itself through later matched runs before becoming permanent; weak learning is archived.
-- Connectors: scaffolded OAuth is not enough to call a connector real. GitHub, Gmail, and Calendar must carry fresh non-dry account proof before non-status actions can run; token-only states stay `connected_unverified` / `needs_probe`.
-- Multimodal: direct photos, screen analysis, file ingest, and voice should route through compact readiness maps and policy gates. Screen pixels and attachment bodies load only through explicit user action or a routed need, never as background prompt mass.
-- Dream cycle: nightly dreams are a slow-path learning surface. The app-owned scheduler job and `DreamCycleRunner` are the only unattended dream writers; retired compatibility loops must delegate to that runner or do no work. Diary prose stays out of hot chat context; high-signal dream reflections may stage pending memory proposals, add provisional persona growth notes, and leave harness receipts after dedupe/sensitivity checks.
-- Autonomy visibility: Today carries approvals and recent work, Desk carries durable tasks, and Diagnostics carries detailed health. Keep the autonomy picture connected across these pages without adding another setup page or always-loaded inventory.
-- Proactive autonomy: idea selection should learn from the outcome ledger. Useful/archive outcomes can raise a kind's score, repeated dismissals should quiet it, repeated no-op/bounded/failed Act outcomes should hard-cool the kind even when noisy `notifyAll` scans are enabled, and repeated unresolved notifications should be cooled down. Safe inbox maintenance may summarize noisy autonomy cards, archive stale/superseded duplicate app-owned cards, clear resolved dirty-main receipts once the repo is clean again, and backfill outcome feedback; it must not hide approvals, the newest actionable duplicate, external sends, shell work, or file mutation. User-surfaced proactive cards should be concrete enough to offer an Act path that quickly acknowledges the user, records a neutral request outcome, and starts the next safe gated step. Known safe suggested actions should route to compact app-owned handlers before using chat, so Act does useful work without spending tool turns rediscovering the obvious handler. Act handling must be idempotent for repeated mobile taps, and only useful completed follow-ups should count as useful; bounded, failed, or no-op follow-ups should stop cleanly and teach the idea loop that the card did not produce enough value. Final Act outcomes should push a compact iPhone receipt so the user sees what the tap produced, while the initial `act_requested` stays ledger-only. Recursive/meta idea prompts stay in shadow readouts rather than creating notifications. The explanation lives in compact decision rationales and readouts, not prompt mass.
-- Provider tool results should pass through the shared NativeAgent fast tool gateway before any model sees them. The gateway applies app-wide surface budgets to Mac chat, iOS chat, Telegram, autonomy, swarms, and streaming/non-streaming turns; large external web/browser/search/email-style payloads are compressed into source/hash/preview envelopes with a narrow-refetch hint rather than fed back as bulk text. This is NativeAgent's local equivalent of a managed tool gateway: deterministic, cheap, prompt-injection aware, and shared across every chat surface.
-- Swarms are temporary fan-out, not another agent tier. Their default brain comes from the canonical Swarms provider selection. Read-only reasoning stays the cheap default; tool-capable workers must reuse the existing ephemeral tool loop and preserve the parent surface/session authority under TrustCenter, workspace, receipt, and verification gates. They may not recursively delegate or own app lifecycle.
-- UI readouts should batch independent runtime reads and cache stable manifest summaries where possible. The goal is fewer repeated local scans and less manifest recomputation, without hiding mutations or removing direct detail paths.
+**One brain, many doors.** `NativeAgent.app` owns the Swift runtime in-process.
+The Mac and remote conversation surfaces use the shared core:
 
-## Current UX Priorities
+- [EngineRuntime/NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/EngineRuntime/NativeAgentEngine.swift)
+  composes chat clients, tool chains and runtime services from one data root
+  and the app's platform ports.
+- [ChatTurnRuntime](../Modules/NativeAgentCore/Sources/ChatTurnRuntime/)
+  owns turn orchestration.
+- [AppActionRegistry.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppActionRegistry.swift)
+  defines the actions exposed through `app`.
+- [TrustCenter](../Modules/NativeAgentCore/Sources/TrustCenter/) owns policy;
+  SecurityCenter checks each dispatch. The app supplies platform effects.
 
-- iOS chat must stay visually stable while typing, streaming, or showing progress updates.
-- iOS should show lightweight live activity while Agent is working: received, thinking, attachment reading, tool/action progress where available.
-- Mac and iOS controls should converge around a single policy model: model, think level, file/Mac access, autonomy, remote permissions.
-- The Mac window has Simple, Advanced and Agent views (a fresh install opens in Simple: the agent, its agents and helpers beside the chat, no settings pages). The Advanced rail exposes, in order, Chat, Today, Memories, Desk, Notifications and Helpers above the hairline, then Personality, Providers, Trust, Connectors, Capabilities and Diagnostics, with Settings at the foot (`SidebarItem.shellPrimaryItems` plus the Bots rail preference, default on). Mac integration is a Trust tab; MCP, Telegram, and iPhone are Connector tabs; Skills and Tools are Diagnostic tabs. The phone tabs are Chat, Activity, Memories, Desk, and More, with Desk tasks and notifications named for their purpose.
-- Setup starts with names and an optional overview. Providers leads with connected accounts and Manage, keeps sign-in and API key routes visible, and groups activity choices as Chat, Work, and Memory and mind, each captioned Explicit override, Same as Chat, or Built-in default, with Use default to clear a saved one. Browser sign-in can be cancelled; first chat offers Open Providers when no account is ready.
-- Trust leads with Safe, Work mode, Builder, and Full Mac. Presets save as they are chosen and there is no policy draft; Feature permissions cards (Multimodal, Chrome Control, Self-Improvement, Desk Autonomy, Living Memory) and an Advanced fold for safety boundaries, privacy map, policy simulator, and backups sit below them. Set up Chrome opens the bundled extension and installation steps. Pairing starts with the same Apple Account and Check for Mac before verified manual correction.
-- Memories puts Keep / Don't keep beside proposals and reveals more loaded history on request. Today offers Read dream; Personality labels documents by purpose. Connectors offers Choose Folder… and distinct search states, and Capabilities offers Show all actions. The Helpers page exposes a live Minimum interval floor; configured read tool sources never grant action permission.
-- Doctor should remain non-LLM by default and capable of opening OAuth login paths when auth breaks.
-- Autonomy visibility should favor one command readout over separate proposal queues: what is running, what is provisional, what became permanent, what needs approval, and which policy gate is responsible.
+See [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md) for source ownership.
+
+## Agent Interface
+
+Agent has one always-on tool: `app`.
+
+| Call | Purpose |
+| --- | --- |
+| `app {}` | Home: where they left off, open work, waiting items and arrivals, followed by the pages. |
+| `app {page:"providers"}` | Read a page's state, settings, version and available actions. |
+| `app {item:"…"}` | Open a name or reference returned by home; some items act immediately. |
+| `app {find:"…"}` | Find pages and actions by intent; with `page:"home"`, search their work and conversations. |
+| `app {action:"…", args:{…}}` | Run one registered action. |
+| `app {script:"…"}` | Run JavaScriptCore code using the app's permitted actions, reads and search. Each action is checked separately. |
+
+Scripts stop at a blocked action or approval; completed earlier actions stay
+done. Standalone tool names are refused with a translated `app` call. There is
+no tool-loading step.
+
+Self-authored executable tools follow `tool.propose` → `tool.approve` →
+`authored.<id>`, all through `app`. Mounted MCP actions appear as
+`mcp.<server>.<tool>`. `web.search` tries Codex web search first for general
+queries and SearXNG first for code queries. Unfiltered searches try the other
+route if the first fails or returns no results; the result identifies it.
+Non-general categories and time ranges use only SearXNG.
+Procedure skills are guidance, read through `skill.read`; see the
+[skill contract](skill_manifest_spec.md).
+
+## Authority
+
+Under Full Mac, Agent acts autonomously on admitted surfaces without routine
+approval cards. Explicit blocks and security checks still apply; macOS grants
+remain separate. **Resetting macOS privacy permissions always asks the owner.**
+
+A peer-steered turn still asks User for deletes and irreversible acts, sends in
+their name, persona writes and approvals. Peer conversation itself does not
+require a new approval for each reply. These boundaries live in
+`SecurityCenter.swift` and `PeerTurnEffectPolicy.swift`, not in prompt guesses.
+Authenticated turns from agents enabled in Trust → Connected agents carry
+User's authority and skip extra peer approvals; ordinary Trust and domain checks
+still apply.
 
 ## Guardrails For Future Work
 
-- Do not add always-loaded prompt mass for tools, skills, or memory. Add a manifest, router, index, or compact hint instead.
-- Do not infer current architecture from historical external-runtime vocabulary. Those words are legacy compatibility/audit markers only; the live runtime is Swift in `NativeAgent.app`.
-- Do not preinstall broad plugin piles. Treat plugins as reviewed, signed, task-justified capability packs composed of skills, tools, MCP definitions, workflows, or panels.
-- Do not let Developer Mode erase the safety floor. Shell/file actions from chat, iOS, Telegram, connector actions, and generic dispatch must hit the same validator before approval or execution.
-- Do not mark connector integrations as real because a token exists. Require a live account/status proof and keep the proof visible through compact readouts.
-- Do not create duplicate process stacks. Clean up local `node`, `xcodebuild`, simulator, MCP, bridge, or other helper processes started by the task. Do not start an external interpreter runtime for NativeAgent behavior.
-- Do not create duplicate state roots. USER memory belongs in MemoryV2 SQLite plus the generated active `persona/USER.md` projection; avoid parallel `data/persona/Agent`, `data/memory/USER.md`, installer seed copies, or persona-tool writes that can diverge from that source.
-- Do not put machine chronology into Agent-facing memory prose. Keep created/updated/indexed/first_seen/last_seen values in SQLite/KG/receipts for sorting and audit, but strip them from USER.md, recall snippets, and automatic memory proposals unless the date is semantically important to the fact.
-- Do not leave the working tree dirty unless the user explicitly asks to pause before commit.
-- Do not hardcode local agent/user identity into public defaults, bundled resources, launch labels, or generic templates.
-- Do not ship live runtime state, live persona files, test artifacts, API/OAuth tokens, private keys, or secret-shaped values in release bundles. Release artifacts should be a blank slate that onboards the user into their own local config.
-- Use `rg` for repo search and `apply_patch` for manual edits.
-- For Mac/iOS changes, run targeted builds. Use an available simulator name from `xcodebuild -list` if generic `name=Any` fails.
-- Prefer fixing root causes over adding fallback loops that hide broken state.
+- Add capability through the existing app action registry and owners.
+- Keep skill guidance separate from executable code and authority.
+- Preserve canonical state and truthful receipts; do not hide broken state
+  with fallback loops or duplicate stores.
+- Keep private runtime state, credentials and live persona material out of
+  release artifacts.
+- Check the current code and git history before treating an old plan as work.
 
 ## Verification Baseline
 
-Assemble the coherent change, build the integrated target, then validate the
-finished workflow in the installed app. There is no automated test suite.
-
-- Mac app package: `swift build --jobs 4 --force-resolved-versions --skip-update`
-- Swift smoke sweep: `./script/smoke_all.sh`
-- Install/restart Mac app: `./script/install_app.sh`
-- Swift-only checks: tracked source scan, working-tree retired-script scan outside generated/runtime caches, installed-app artifact scan, and retired-runtime process scan.
+For runtime changes, assemble the coherent change, build the actual app,
+install it, then check the requested behavior in that installed app. Keep the
+check bounded. Do not create or run separate test suites, harnesses or load
+campaigns. Documentation-only changes need a direct text readback.
 
 ## Update Rule
 
-When a session changes direction, architecture, major behavior, or priorities:
-
-1. Update this file.
-2. Update `docs/ARCHITECTURE_BLUEPRINT.md` when architecture ownership, source maps, state roots, or policy chokepoints change.
-3. Update `docs/HANDOFF_CURRENT.md`.
-4. Commit the docs with the related code or as a dedicated handoff commit.
+Update the smallest document whose contract changed. Keep source ownership in
+the architecture map and history in git and CHANGELOG; do not turn this compass
+into a release receipt or backlog.

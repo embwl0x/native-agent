@@ -60,9 +60,9 @@ enum ActivityScreenPresentation {
     }
 
     static func counts(
-        storedApprovals: Int,
+        storedApprovals: Int?,
         snapshotApprovals: [ApprovalRequest],
-        storedInbox: Int,
+        storedInbox: Int?,
         snapshotInbox: [InboxItemRecord],
         memoryProposals: [MemoryProposalRecord],
         trainingProposals: [TrainingProposalSummary],
@@ -83,17 +83,17 @@ enum ActivityScreenPresentation {
     }
 
     static func counts(
-        storedApprovals: Int,
+        storedApprovals: Int?,
         snapshotApprovalsPending: Int,
-        storedInbox: Int,
+        storedInbox: Int?,
         snapshotInboxPending: Int,
         memoryProposalsPending: Int,
         trainingProposalsPending: Int,
         promotionCandidatesPending: Int
     ) -> Counts {
         Counts(
-            approvals: max(storedApprovals, snapshotApprovalsPending),
-            inbox: max(storedInbox, snapshotInboxPending),
+            approvals: storedApprovals ?? snapshotApprovalsPending,
+            inbox: storedInbox ?? snapshotInboxPending,
             memoryProposals: memoryProposalsPending,
             selfImprovement: trainingProposalsPending + promotionCandidatesPending
         )
@@ -277,9 +277,9 @@ struct ActivityView: View {
 
     private var activityCounts: ActivityScreenPresentation.Counts {
         ActivityScreenPresentation.counts(
-            storedApprovals: approvalsStore.pendingCount,
+            storedApprovals: approvalsStore.hasLoadedSnapshot && !isDesignSample ? approvalsStore.pendingCount : nil,
             snapshotApprovals: MobileDesignSamples.rows(sync.approvals),
-            storedInbox: inboxStore.activeCount,
+            storedInbox: inboxStore.hasLoadedSnapshot && !isDesignSample ? inboxStore.activeCount : nil,
             snapshotInbox: MobileDesignSamples.rows(sync.inboxItems),
             memoryProposals: sync.memoryProposals,
             trainingProposals: MobileDesignSamples.rows(sync.trainingProposals),
@@ -290,9 +290,7 @@ struct ActivityView: View {
     /// The first two of each queue, in one list, so the landing can answer
     /// them in place. Each queue's full list is one row further down.
     private var waitingItems: [ActivityWaitingItem] {
-        var items: [ActivityWaitingItem] = pendingApprovals.prefix(2).map { .approval($0) }
-        items += pendingInbox.prefix(2).map { .inbox($0) }
-        items += pendingMemoryProposals.prefix(2).map { .memory($0) }
+        var items: [ActivityWaitingItem] = pendingMemoryProposals.prefix(2).map { .memory($0) }
         let trainings = pendingTrainingProposals.prefix(2)
         items += trainings.map { .training($0) }
         items += pendingPromotionCandidates.prefix(2 - trainings.count).map { .promotion($0) }
@@ -301,19 +299,7 @@ struct ActivityView: View {
 
     /// The page's one line, and the only place sync state is said.
     private var headerLine: String {
-        let known = [pendingApprovalsCount, pendingInboxCount, pendingMemoryProposalsCount, pendingSelfImprovementCount]
-        let total = known.compactMap { $0 }.reduce(0, +)
-        if total > 0 {
-            return total == 1
-                ? "One thing is waiting on you."
-                : "\(AliveWords.spelled(total)) things are waiting on you."
-        }
-        if known.contains(where: { $0 == nil }) {
-            return pairingStore.usesICloudTransport
-                ? "Checking with your Mac for anything new."
-                : "Pair with your Mac and what needs you will show up here."
-        }
-        return "Nothing needs you right now."
+        sync.workOverview?.headline ?? "The overview is unavailable. Refresh from your Mac to read it."
     }
 
     // MARK: - Body
@@ -321,10 +307,10 @@ struct ActivityView: View {
     var body: some View {
         NavigationStack(path: $path) {
             AlivePage(title: "Activity", line: headerLine, style: .root) {
-                let items = waitingItems
-                if !items.isEmpty {
-                    AliveSection("Waiting for you", surface: .waiting) {
-                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                MobileWorkOverviewView()
+                if !waitingItems.isEmpty {
+                    AliveSection("Other reviews", surface: .waiting) {
+                        ForEach(Array(waitingItems.enumerated()), id: \.element.id) { index, item in
                             if index > 0 { AliveDivider() }
                             waitingRow(item)
                         }
@@ -437,14 +423,16 @@ struct ActivityView: View {
         case .training(let proposal):
             InlineSelfImprovementPreviewCard(
                 title: proposal.title,
-                summary: proposal.proposed ?? proposal.rationale ?? ""
+                summary: proposal.proposed ?? proposal.rationale ?? "",
+                note: "You decide this training change on your Mac."
             ) {
                 path.append(ActivitySection.selfImprovement)
             }
         case .promotion(let candidate):
             InlineSelfImprovementPreviewCard(
                 title: candidate.title,
-                summary: "Something I learned that I'd like to make part of how I work."
+                summary: "Something I learned that I'd like to make part of how I work.",
+                note: "Approve or reject this learned behavior in Self-Improvement."
             ) {
                 path.append(ActivitySection.selfImprovement)
             }
@@ -755,11 +743,12 @@ private struct InlineMemoryProposalPreviewCard: View {
 private struct InlineSelfImprovementPreviewCard: View {
     let title: String
     let summary: String
+    let note: String
     var onView: () -> Void
 
     var body: some View {
         ActivityWaitingRow(kind: "A change to how I work", title: title, detail: summary,
-                           note: "You decide this one on your Mac.") {
+                           note: note) {
             AliveActionRow {
                 Button("Details") { onView() }
                     .aliveSecondaryButton()

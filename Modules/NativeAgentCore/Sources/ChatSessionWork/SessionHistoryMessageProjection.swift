@@ -15,13 +15,8 @@ import ProviderRouting
 /// across turns) and becomes a real message prefix that a provider cache can
 /// match byte-for-byte from one turn to the next.
 ///
-/// ADMISSION IS NOT RE-DERIVED. This replays EXACTLY the rows
-/// `SessionHistoryPromptRenderer.conversationHistory` admits — same
-/// `renderable` filter, same `capForRole`, same
-/// `budget(for:windowTokens:)`, same newest-first fill including the
-/// compaction-summary reservation — by calling the renderer's own internal
-/// helpers. A second, drifting copy of that rule is the one way this change
-/// could silently change what the model sees.
+/// Admission shares the renderer's row filtering, role caps and budgets;
+/// the window cursor owns the replayed head.
 ///
 /// Mapping (deliberately conservative — prior tool rounds have NO provider
 /// call ids, so inventing `tool_use`/`tool_result` pairs would be a lie the
@@ -45,7 +40,7 @@ package enum SessionHistoryMessageProjection {
         /// identity, role, rendered length, anchor/recollection exemption.
         /// Payload-free by construction: no transcript content leaves here.
         package let rows: [HistoryWindowRow]
-        /// Sum of every rendered row's v1 line length — the number the window
+        /// Sum of every rendered row's budgeted line length — the number the window
         /// cursor compares against `budget.historyChars`.
         package let usedChars: Int
         /// Rows the cursor skipped this turn (already outside the window).
@@ -60,20 +55,6 @@ package enum SessionHistoryMessageProjection {
         package static let empty = Result(
             messages: [], rows: [], usedChars: 0, droppedRowCount: 0, replayedRunIds: []
         )
-    }
-
-    /// How a REPLAYED tool row announces itself to the model.
-    ///
-    /// 2026-09-13: this used to read `[tool <name> <status>]`, which looks
-    /// exactly like a receipt the app prints. A model that had just run
-    /// `tool_load` reproduced that shape verbatim in ordinary prose —
-    /// "[tool bot_create ran] bot_create ok after approval: {...}" — for a call
-    /// it never made, and the text read as a real receipt. The information is
-    /// unchanged (tool name, status, projected result); only the shape is, so
-    /// the prefix no longer teaches a receipt template. The UI never trusts
-    /// this string either way — a receipt renders only from a real tool row.
-    static func replayedToolLabel(name: String?, status: String?) -> String {
-        "Earlier this session \(name ?? "a tool") \(status ?? "ran") and returned:"
     }
 
     /// Rows pinned at the HEAD regardless of the window cursor. Mirrors the
@@ -92,17 +73,7 @@ package enum SessionHistoryMessageProjection {
         package var usedChars: Int { rows.reduce(0) { $0 + $1.length + 1 } }
     }
 
-    /// v2 ADMISSION — deliberately NOT the v1 rule.
-    ///
-    /// v1 fills newest-first against `budget.historyChars` and re-runs that
-    /// fill every turn. Both halves of that are per-turn moving parts: the
-    /// `suffix(historyLimit)` head slides as the session grows, and the
-    /// budget fill re-decides where the block starts every time a row's size
-    /// changes. Either one rewrites the head of the replayed prefix, which is
-    /// precisely what a provider cache cannot survive — so on v2 they are both
-    /// gone and the cursor is the ONLY head.
-    ///
-    /// What remains here: the contiguous range the reader returned, rendered
+    /// Admission retains the contiguous range the reader returned, rendered
     /// under the SAME per-row caps (`capForRole`), with the anchors and the
     /// compaction recollection pinned. Size is enforced downstream, and only
     /// by the cursor's hysteresis — rarely, at a turn boundary, oldest-first.
@@ -115,8 +86,19 @@ package enum SessionHistoryMessageProjection {
         surface: String,
         windowTokens: Int? = nil
     ) -> Admission? {
+        admission(
+            renderables: messages.compactMap(SessionHistoryPromptRenderer.renderable),
+            historyLimit: historyLimit, surface: surface, windowTokens: windowTokens
+        )
+    }
+
+    package static func admission(
+        renderables: [SessionHistoryPromptRenderer.Renderable],
+        historyLimit: Int,
+        surface: String,
+        windowTokens: Int?
+    ) -> Admission? {
         guard max(0, historyLimit) > 0 else { return nil }
-        let renderables = messages.compactMap(SessionHistoryPromptRenderer.renderable)
         guard !renderables.isEmpty else { return nil }
         let budget = SessionHistoryPromptRenderer.budget(
             for: surface, windowTokens: windowTokens
@@ -277,17 +259,14 @@ package enum SessionHistoryMessageProjection {
             }
             if row.isTool {
                 flushPendingReplay()
-                let label = Self.replayedToolLabel(
-                    name: row.toolName, status: row.toolStatus
-                )
                 if let last = out.last, last.role == .assistant {
                     out[out.count - 1] = LLMMessage(
                         role: .assistant,
-                        content: last.content + [.text("\(label) \(body)")]
+                        content: last.content + [.text(body)]
                     )
                 } else {
                     out.append(LLMMessage(
-                        role: .assistant, content: [.text("\(label) \(body)")]
+                        role: .assistant, content: [.text(body)]
                     ))
                 }
                 continue

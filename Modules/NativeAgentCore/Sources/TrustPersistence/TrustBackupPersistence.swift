@@ -152,11 +152,16 @@ public enum TrustBackupPersistence {
             let ordinaryPaths = Self.backupRelativePaths.filter {
                 $0 != "memory" && !$0.hasPrefix("chat/")
             }
-            copied = try Self.copySelectedDataPaths(
-                root: root,
-                destinationRoot: dataDir,
-                relativePaths: ordinaryPaths
-            )
+            for relative in ordinaryPaths {
+                let source = root.appendingNativeRelativePath(relative)
+                guard Self.pathEntryExists(source) else { continue }
+                try await Self.copyLocalSnapshotItem(
+                    from: source,
+                    to: dataDir.appendingNativeRelativePath(relative),
+                    relative: relative
+                )
+                copied.append(relative)
+            }
             let memorySource = root.appendingNativeRelativePath("memory")
             if Self.pathEntryExists(memorySource) {
                 // A linked Memory root would aim the SQLite backup below through it.
@@ -578,22 +583,44 @@ public enum TrustBackupPersistence {
         guard Self.pathEntryExists(intentPath) else { return nil }
 
         var intent = try Self.readRestoreIntent(at: intentPath)
-        let target = try Self.validateBackupSnapshot(id: intent.targetID, dataRoot: root)
         var safety = try Self.validateBackupSnapshot(
             id: intent.safetyBackupID,
             dataRoot: root,
             requireRestorableAuthority: false
         )
-        guard target.manifestSHA256 == intent.targetManifestSHA256,
-              safety.manifestSHA256 == intent.safetyManifestSHA256 else {
+        guard safety.manifestSHA256 == intent.safetyManifestSHA256 else {
             throw Self.backupError(
                 code: 422,
                 "A staged restore backup changed after approval. NativeAgent preserved the intent and refused to start."
             )
         }
 
-        switch intent.state {
-        case .staged:
+        if intent.state == .applying || intent.state == .rollingBack {
+            if intent.state == .applying {
+                intent.state = .rollingBack
+                try Self.writeRestoreIntent(intent, to: intentPath)
+            }
+            return try Self.rollbackInterruptedRestore(
+                intent: intent,
+                safety: safety,
+                intentPath: intentPath,
+                dataRoot: root,
+                originalError: Self.backupError(
+                    code: 500,
+                    "NativeAgent detected an interrupted restore and restored the pre-restore safety snapshot."
+                )
+            )
+        }
+
+        let target = try Self.validateBackupSnapshot(id: intent.targetID, dataRoot: root)
+        guard target.manifestSHA256 == intent.targetManifestSHA256 else {
+            throw Self.backupError(
+                code: 422,
+                "A staged restore backup changed after approval. NativeAgent preserved the intent and refused to start."
+            )
+        }
+
+        if intent.state == .staged {
             // Staging leaves runtime owners live until exit. Capture their final
             // writes now, before any owner opens, and bind this exact rollback
             // and effect-fence source before the first destructive copy.
@@ -620,23 +647,7 @@ public enum TrustBackupPersistence {
                 )
             }
 
-        case .applying, .rollingBack:
-            if intent.state == .applying {
-                intent.state = .rollingBack
-                try Self.writeRestoreIntent(intent, to: intentPath)
-            }
-            return try Self.rollbackInterruptedRestore(
-                intent: intent,
-                safety: safety,
-                intentPath: intentPath,
-                dataRoot: root,
-                originalError: Self.backupError(
-                    code: 500,
-                    "NativeAgent detected an interrupted restore and restored the pre-restore safety snapshot."
-                )
-            )
-
-        case .completed:
+        } else {
             // A crash after the completed marker but before intent removal is
             // still pre-owner. Reapplying the verified target plus the same
             // monotonic safety overlay is deterministic and idempotent.
@@ -752,7 +763,7 @@ public enum TrustBackupPersistence {
                 path: backupDir.path, createdAt: snapshot.createdAt
             )
             let records = [record] + (try Self.readBackupRecords(root: root))
-            let catalog = try JSONValue.array(records.prefix(200).map(Self.backupRecordJSON))
+            let catalog = try JSONValue.array(records.map(Self.backupRecordJSON))
                 .serializedData(pretty: true)
             for name in ["index.json", "registry.json"] {
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(
@@ -1570,6 +1581,8 @@ public enum TrustBackupPersistence {
         "improvements",
         "workflows",
         "catalog/registry.json",
+        "catalog/installs.json",
+        "catalog/packs",
         "catalog/sources/sources.json",
         "catalog/trust/roots.json",
         "capabilities",
@@ -1611,6 +1624,51 @@ public enum TrustBackupPersistence {
         }
         try fm.copyItem(at: source, to: destination)
         return true
+    }
+
+    private static func copyLocalSnapshotItem(
+        from source: URL,
+        to destination: URL,
+        relative: String
+    ) async throws {
+        let fm = FileManager.default
+        let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true,
+              relative == "workshop" || relative == "workshop/github_command" else {
+            try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.copyItem(at: source, to: destination)
+            return
+        }
+        if relative == "workshop/github_command" {
+            try await SwiftNativePersistenceCore().withFileLock(source.appendingPathComponent("ops.jsonl")) {
+                try await Self.copyLocalSnapshotDirectory(from: source, to: destination, relative: relative)
+            }
+        } else {
+            try await Self.copyLocalSnapshotDirectory(from: source, to: destination, relative: relative)
+        }
+    }
+
+    private static func copyLocalSnapshotDirectory(
+        from source: URL,
+        to destination: URL,
+        relative: String
+    ) async throws {
+        let fm = FileManager.default
+        try Self.requireRegularDirectory(source)
+        guard let permissions = try fm.attributesOfItem(atPath: source.path)[.posixPermissions] else {
+            throw Self.backupError(code: 422, "Backup source permissions are unavailable.")
+        }
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        for child in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
+            let name = child.lastPathComponent
+            if relative == "workshop/github_command", name == "ops.jsonl.lock" { continue }
+            try await Self.copyLocalSnapshotItem(
+                from: child,
+                to: destination.appendingPathComponent(name),
+                relative: relative + "/" + name
+            )
+        }
+        try fm.setAttributes([.posixPermissions: permissions], ofItemAtPath: destination.path)
     }
 
     /// Copy one mutable file tree while holding the same per-file lock its
@@ -1735,33 +1793,41 @@ public enum TrustBackupPersistence {
         // validated backup root, so retaining compatibility adds no authority.
         // Snapshot directories have no automatic retention policy. Their
         // discoverability must not expire independently of their bytes.
-        try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("registry.json"), id: record.id, maxRows: nil)
-        try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("index.json"), id: record.id, maxRows: nil)
+        try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("registry.json"), id: record.id, maxRows: nil, isBackupCatalog: true)
+        try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("index.json"), id: record.id, maxRows: nil, isBackupCatalog: true)
     }
 
     public static func appendRegistryRow(_ row: JSONValue, path: URL, id: String, maxRows: Int? = 200) async throws {
+        try await appendRegistryRow(row, path: path, id: id, maxRows: maxRows, isBackupCatalog: false)
+    }
+
+    private static func appendRegistryRow(_ row: JSONValue, path: URL, id: String, maxRows: Int?, isBackupCatalog: Bool) async throws {
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
             // 2026-09-06: only absence bootstraps a registry. Preserve unreadable
-            // or malformed existing bytes instead of replacing backup discovery.
+            // or malformed existing bytes instead of replacing discovery.
             let existing: [JSONValue]
-            do {
-                let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
-                guard attributes[.type] as? FileAttributeType == .typeRegular else {
-                    throw NSError(domain: "NativeAgentBackup", code: 1, userInfo: [
-                        NSLocalizedDescriptionKey: "Registry must be a regular file."
-                    ])
+            if isBackupCatalog {
+                existing = try Self.readBackupCatalogChecked(path).rows
+            } else {
+                do {
+                    let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+                    guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                        throw NSError(domain: "NativeAgentBackup", code: 1, userInfo: [
+                            NSLocalizedDescriptionKey: "Registry must be a regular file."
+                        ])
+                    }
+                    let raw = try JSONValue.parse(Data(contentsOf: path))
+                    guard case .array(let rows) = raw else {
+                        throw NSError(domain: "NativeAgentBackup", code: 1, userInfo: [
+                            NSLocalizedDescriptionKey: "Registry must contain an array."
+                        ])
+                    }
+                    existing = rows
+                } catch let error as NSError where error.domain == NSCocoaErrorDomain
+                    && error.code == NSFileReadNoSuchFileError {
+                    existing = []
                 }
-                let raw = try JSONValue.parse(Data(contentsOf: path))
-                guard case .array(let rows) = raw else {
-                    throw NSError(domain: "NativeAgentBackup", code: 1, userInfo: [
-                        NSLocalizedDescriptionKey: "Registry must contain an array."
-                    ])
-                }
-                existing = rows
-            } catch let error as NSError where error.domain == NSCocoaErrorDomain
-                && error.code == NSFileReadNoSuchFileError {
-                existing = []
             }
             var rows = existing.filter { Self.jsonObjectString($0, key: "id") != id }
             rows.append(row)
@@ -1797,19 +1863,38 @@ public enum TrustBackupPersistence {
     }
 
     private static func readBackupRecordsFile(_ path: URL) throws -> [BackupRecord] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        guard let data = try? Data(contentsOf: path) else { return [] }
-        let decoder = JSONDecoder.nativeAgent
-        if let arr = try? decoder.decode([BackupRecord].self, from: data) {
-            return arr
+        try Self.readBackupCatalogChecked(path).records
+    }
+
+    private static func readBackupCatalogChecked(_ path: URL) throws
+        -> (rows: [JSONValue], records: [BackupRecord])
+    {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw Self.backupError(code: 422, "Backup catalog is malformed: \(path.lastPathComponent)")
+            }
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain
+            && error.code == NSFileReadNoSuchFileError {
+            return ([], [])
         }
-        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let backups = obj["backups"],
-           let backupsData = try? JSONSerialization.data(withJSONObject: backups),
-           let arr = try? decoder.decode([BackupRecord].self, from: backupsData) {
-            return arr
+        let raw = try JSONValue.parse(Data(contentsOf: path))
+        let rows: [JSONValue]
+        switch raw {
+        case .array(let values): rows = values
+        case .object(let object):
+            guard case .array(let values)? = object["backups"] else {
+                throw Self.backupError(code: 422, "Backup catalog is malformed: \(path.lastPathComponent)")
+            }
+            rows = values
+        default:
+            throw Self.backupError(code: 422, "Backup catalog is malformed: \(path.lastPathComponent)")
         }
-        return []
+        let records = try JSONDecoder.nativeAgent.decode(
+            [BackupRecord].self,
+            from: JSONValue.array(rows).serializedData(pretty: false)
+        )
+        return (rows, records)
     }
 
     private static func validateBackupChatSessionIndex(dataDir: URL) throws {
@@ -1836,8 +1921,10 @@ public enum TrustBackupPersistence {
         guard FileManager.default.fileExists(atPath: dataDir.path) else { return }
         let sources = dataDir.appendingNativeRelativePath("catalog/sources/sources.json")
         let roots = dataDir.appendingNativeRelativePath("catalog/trust/roots.json")
+        let installs = dataDir.appendingNativeRelativePath("catalog/installs.json")
         _ = try CapabilityCatalogStoreReader.loadCatalogSourcesChecked(at: sources)
         _ = try CapabilityCatalogStoreReader.loadCapabilityTrustRootsChecked(at: roots)
+        _ = try CapabilityCatalogStoreReader.loadCapabilityPackInstallsChecked(at: installs)
     }
 
     private static func backupRecordJSON(_ record: BackupRecord) -> JSONValue {

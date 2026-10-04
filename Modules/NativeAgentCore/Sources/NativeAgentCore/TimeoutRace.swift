@@ -19,9 +19,10 @@ private actor TimeoutRaceLatch<T: Sendable> {
     private var resolved: TimeoutRaceOutcome<T>?
     private var waiter: CheckedContinuation<TimeoutRaceOutcome<T>, Never>?
 
-    func resolve(_ outcome: TimeoutRaceOutcome<T>) {
+    func resolve(_ outcome: TimeoutRaceOutcome<T>, beforeResume: @Sendable () -> Void = {}) {
         guard resolved == nil else { return }
         resolved = outcome
+        beforeResume()
         if let waiter {
             self.waiter = nil
             waiter.resume(returning: outcome)
@@ -70,30 +71,24 @@ public func raceAgainstTimeout<T: Sendable>(
     let deadlineNanos = UInt64(max(0, seconds * 1_000_000_000).rounded())
     let timerTask = Task {
         do { try await Task.sleep(nanoseconds: deadlineNanos) } catch { return }
-        // Cancel the body BEFORE resolving: Task.cancel() sets isCancelled
-        // synchronously, so by the time the runner observes `.timedOut` every
-        // cooperative guard in the abandoned body already sees cancellation —
-        // there is no window where it can commit an artifact after the runner
-        // moved on (review finding 2026-07-01).
-        bodyTask.cancel()
-        await latch.resolve(.timedOut)
+        // Claim the receipt before cancellation can trigger a body completion,
+        // but set the body's cancellation flag before waking the caller.
+        await latch.resolve(.timedOut) { bodyTask.cancel() }
     }
 
     // Propagate PARENT cancellation into the race: if the enclosing task (the
     // runDueJobs loop) is cancelled while we're suspended on the latch, the
-    // handler cancels the body + deadline tasks FIRST (synchronous flag set —
-    // closes the same commit window), then resolves `.cancelled`. The timer's
-    // do/catch bails on cancellation, and the body's CancellationError is
-    // silent, so neither can race a mislabeled outcome in. DOCUMENTED BIAS:
-    // a body that completes in the same instant as a parent cancel may still
-    // be labeled cancelled even though its work committed — acceptable for
-    // scheduler-stopping semantics; the receipt errs loud, never silent.
+    // handler claims cancellation, then cancels both tasks before waking the
+    // caller. An independently completed body still retains its first-wins receipt.
     let outcome = await withTaskCancellationHandler {
         await latch.wait()
     } onCancel: {
-        bodyTask.cancel()
-        timerTask.cancel()
-        Task { await latch.resolve(.cancelled) }
+        Task {
+            await latch.resolve(.cancelled) {
+                bodyTask.cancel()
+                timerTask.cancel()
+            }
+        }
     }
     timerTask.cancel()
     return outcome

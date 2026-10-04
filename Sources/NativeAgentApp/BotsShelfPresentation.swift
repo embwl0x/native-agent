@@ -120,7 +120,7 @@ struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     }
     /// "GPT-5.5 · Low · Weekly": what the bot runs on and when.
     var choiceLine: String {
-        guard let model = definition.model else { return "Same model as Chat · \(cadence)" }
+        guard !needsModelChoice, let model = definition.model else { return "Choose a model · \(cadence)" }
         return [model, definition.reasoningEffort?.capitalized, cadence].compactMap { $0 }.joined(separator: " · ")
     }
     /// "Wakes on: GitHub · owner/repo", plus the last event when one arrived.

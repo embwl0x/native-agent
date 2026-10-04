@@ -1,12 +1,12 @@
 import ActivityKit
 import Foundation
+import NativeAgentShared
 
 struct PhoneTurnAttributes: ActivityAttributes, Sendable {
-    struct ContentState: Codable, Hashable, Sendable {
-        var status: String
-        var updatedAt: Date
-    }
-    let correlationID: String
+    typealias ContentState = MobileWorkActivity.ContentState
+    let workID: String
+    let pairingFingerprint: String
+    let sessionID: String?
     let agentName: String
     let startedAt: Date
 }

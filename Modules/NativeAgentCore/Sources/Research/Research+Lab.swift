@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Privacy
 
 extension SwiftNativeResearchClient {
     // MARK: research lab (wave 30 W17)
@@ -23,7 +24,11 @@ extension SwiftNativeResearchClient {
     /// `_catalog_sources_unlocked` lock-free-inner precedent.
     private func readLabRunsSorted() async throws -> [JSONValue] {
         let raw = try await persistence.readJSON(labRunsPath, ifMissing: .array([]))
-        guard case .array(let rows) = raw else { return [] }
+        guard case .array(let rows) = raw else {
+            throw PersistenceCoreError.ioFailure(
+                "Saved research runs must be an array. Original contents have been preserved."
+            )
+        }
         // Python: sorted(runs, key=createdAt, reverse=True). Stable sort with
         // empty-string default for missing createdAt (matches Python's
         // `str(item.get("createdAt") or "")`).
@@ -56,21 +61,31 @@ extension SwiftNativeResearchClient {
 
         var results: [ResearchSearchResult] = []
         var searchError = ""
+        var enginesFailed = false
+        var needsConnector = false
         do {
             let resp = try await search(query: objective)
             results = Array(resp.results.prefix(maxResults))
+            if results.isEmpty, !resp.unresponsiveEngines.isEmpty {
+                enginesFailed = true
+                searchError = "Search engines returned no sources: " + resp.unresponsiveEngines.joined(separator: "; ")
+            }
+        } catch where Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+            throw CancellationError()
         } catch {
             // Python catches all exceptions and records the string form.
             // ResearchClientError.notConfigured mirrors the daemon's
             // ValueError("SearXNG base URL is not configured").
             switch error {
             case ResearchClientError.notConfigured:
+                needsConnector = true
                 searchError = "SearXNG base URL is not configured"
             default:
-                searchError = String(describing: error)
+                searchError = error.localizedDescription
             }
         }
 
+        try Task.checkCancellation()
         let connector: String
         let cfg = try await persistence.readJSON(configPath, ifMissing: .object([:]))
         if case .object(let obj) = cfg,
@@ -83,10 +98,12 @@ extension SwiftNativeResearchClient {
         let run = ResearchLabRun(
             id: receiptIDFactory(),
             objective: objective,
-            status: searchError.isEmpty ? "completed" : "needs_connector",
+            status: needsConnector ? "needs_connector" : (searchError.isEmpty ? "completed" : "failed"),
             query: objective,
             sources: results,
-            brief: Self.buildResearchBrief(objective: objective, results: results, error: searchError),
+            brief: enginesFailed ? searchError : (needsConnector
+                ? "Research connector needs setup before this can run fully: \(searchError)"
+                : Self.buildResearchBrief(objective: objective, results: results, error: searchError)),
             createdAt: Self.isoTimestamp(now()),
             connector: connector,
             error: searchError.isEmpty ? nil : searchError
@@ -107,6 +124,7 @@ extension SwiftNativeResearchClient {
             var existing = try await self.readLabRunsSorted()
             existing.insert(run.toJSON(), at: 0)
             let capped = Array(existing.prefix(100))
+            try Task.checkCancellation()
             try await self.persistence.writeJSON(.array(capped), to: labRunsPath)
         }
         // Uniform locking (L7, 2026-08-01): `withFileLock` is a
@@ -114,16 +132,18 @@ extension SwiftNativeResearchClient {
         // every conformer already has it. The old downcast to
         // SwiftNativePersistenceCore only had the effect of running this critical
         // section UNLOCKED for any other conformer.
+        try Task.checkCancellation()
         try await persistence.withFileLock(labRunsPath, writeBack)
 
         // Emit activity and trace side effects so the Mac activity feed and
         // trace ledger stay complete for in-process research runs.
         let activityStatus = searchError.isEmpty ? "ok" : "warn"
-        let detail = Self.pythonCodepointPrefix(objective, 120)
+        let detail = Self.pythonCodepointPrefix(NativeAgentSecretRedactor.redactText(objective), 120)
         let activityPayload: JSONValue = .object([
             "researchRunId": .string(run.id),
             "sourceCount": .int(Int64(results.count)),
         ])
+        try Task.checkCancellation()
         try await recordActivity(
             kind: "research",
             title: "Research lab run",
@@ -136,13 +156,14 @@ extension SwiftNativeResearchClient {
         //   {"researchRunId": run["id"], "status": run["status"],
         //    "sourceCount": len(results)}). The trace envelope's `status` field
         // is derived from payload["status"] (record_trace at L8557), so it is
-        // run.status ("completed" | "needs_connector"), NOT the activity
+        // run.status ("completed" | "needs_connector" | "failed"), NOT the activity
         // "ok"/"warn" mapping — preserved deliberately.
         let tracePayload: JSONValue = .object([
             "researchRunId": .string(run.id),
             "status": .string(run.status),
             "sourceCount": .int(Int64(results.count)),
         ])
+        try Task.checkCancellation()
         try await recordTrace(
             kind: "research.run",
             title: detail,
@@ -156,7 +177,7 @@ extension SwiftNativeResearchClient {
     /// Mirror `Daemon.build_research_brief`.
     static func buildResearchBrief(objective: String, results: [ResearchSearchResult], error: String) -> String {
         if !error.isEmpty {
-            return "Research connector needs setup before this can run fully: \(error)"
+            return "Research failed: \(error)"
         }
         if results.isEmpty {
             return "No sources returned. Configure SearXNG or broaden the query."

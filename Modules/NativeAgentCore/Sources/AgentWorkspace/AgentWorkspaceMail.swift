@@ -2,6 +2,28 @@ import Foundation
 import MacIntegration
 import PersistenceCore
 
+extension AgentWorkspace {
+    /// Bind observed workspace names once; caller-supplied locator fields may
+    /// never override the selected message. Invalid names stay as refused items.
+    public static func bindMailBatch(_ input: [String: JSONValue], dataRoot: URL) -> [String: JSONValue] {
+        guard case .array(let items)? = input["items"], (1...10).contains(items.count) else { return input }
+        var bound = input
+        bound["items"] = .array(items.map { item in
+            guard case .object(let row) = item, case .string(let name)? = row["name"] else { return item }
+            let parts = name.split(separator: ".")
+            let edits: Set<String> = ["name", "body_offset", "mark_read", "flagged", "archive"]
+            guard Set(row.keys).isSubset(of: edits), parts.count == 2, parts[0] == "mail", let n = Int(parts[1]),
+                  n > 0, case .open(let place)? = HerScreen.namedAction(name, dataRoot: dataRoot),
+                  case .record("mail_list_recent", let locator, _) = place else { return .object(row.filter { edits.contains($0.key) }) }
+            var selected = locator.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope"].contains($0.key) }
+            selected["scope"] = locator["scope"] ?? locator["mailbox"] ?? .string("inbox")
+            selected.merge(row) { _, new in new }
+            return .object(selected)
+        })
+        return bound
+    }
+}
+
 /// Reads use exact inbox identity, with the RFC identifier when available.
 /// Replies require that identifier; display text never selects a recipient.
 enum AgentWorkspaceMail {
@@ -14,9 +36,9 @@ enum AgentWorkspaceMail {
             return .init(title: "Mail", content: result, items: [], actions: actions)
         }
         if input["message_id"] == nil, content["status"] == .string("completed"),
-           case .int(let offset)? = content["next_offset"], offset > 0, offset <= 10000 {
+           let offset = content["next_offset"] {
             var next = input
-            next["offset"] = .int(offset)
+            next["offset"] = offset
             let tool = input["query"] == nil ? "mail_list_recent" : "mail_search"
             actions.insert(.init(label: "More email", action: .open(.record(tool: tool, input: next, title: "Mail"))), at: 0)
         }
@@ -27,7 +49,7 @@ enum AgentWorkspaceMail {
         }
         rows = rows.enumerated().sorted { (received($0.element), -$0.offset) > (received($1.element), -$1.offset) }.map(\.element)
         content.removeValue(forKey: "messages")
-        content["preview_note"] = .string("Open an inbox message to read its body and reply to that exact message. A moved, changed, or ambiguous message is refused; refresh the inbox to locate it again.")
+        content["preview_note"] = .string("Open a message to read its body. A moved, changed, or ambiguous message is refused; refresh the same mailbox to locate it again. Replies require an inbox message.")
         return .init(title: "Mail", content: .object(content), items: rows.map { row in
             var title = "Email preview"
             if case .object(let object) = row, case .string(let subject)? = object["subject"], !subject.isEmpty { title = subject }
@@ -36,6 +58,7 @@ enum AgentWorkspaceMail {
                let locator = MailReadLocator.parse(object, allowMissingMessageID: true),
                content["status"] == .string("completed") {
                 var bound: [String: JSONValue] = ["message_id": .int(locator.id), "expected_message_id": .string(locator.messageID)]
+                bound["scope"] = object["scope"] ?? content["scope"] ?? .string("inbox")
                 // Its account too: the same email in another account's inbox is never the target.
                 if let account = locator.account { bound["expected_account"] = .string(account) }
                 // Its place in that inbox: the fast way back to it (a hint; identity still decides).
@@ -44,7 +67,7 @@ enum AgentWorkspaceMail {
                     if object["truncated"] == .bool(true), case .int(let end)? = object["body_end"], end > 0, end <= 2_000_000 {
                         rowActions.append(.init(label: "Read next part", action: .open(.record(tool: "mail_list_recent", input: bound.merging(["body_offset": .int(end)]) { _, new in new }, title: title))))
                     }
-                    if !locator.messageID.isEmpty {
+                    if !locator.messageID.isEmpty, bound["scope"] == .string("inbox") {
                         rowActions.append(.init(label: "Reply to sender", action: .perform(tool: "mail_reply", input: bound, title: "Reply to \(title)", textField: "body", isEffect: true), needsText: true))
                         rowActions.append(.init(label: "Reply to all", action: .configure(tool: "mail_reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new }, title: "Reply to all: \(title)")))
                     }

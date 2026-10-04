@@ -1,4 +1,5 @@
 import SwiftUI
+import Agents
 import ChatOrchestration
 import NativeAgentCore
 import NativeAgentShared
@@ -48,10 +49,14 @@ struct SimpleContactThread: View {
         }
     }
 
-    /// Chats this contact opened with the agent over the bridge. The bridge
-    /// titles them "[from: <label>, via bridge] …".
+    /// Chats this contact opened with the agent over the bridge. Peer-owned
+    /// session IDs survive retitling; legacy bridge chats carry their label.
+    /// The contact's own conversation is this thread, so it is not listed.
     private var openedChats: [ChatSession] {
-        appModel.engine.transcripts.sessions.filter { session in
+        let owner = contact.builtIn ? contact.id : String(contact.id.dropFirst(5))
+        return appModel.engine.transcripts.sessions.filter { session in
+            if session.id == ContactThread.session(owner: owner) { return false }
+            if !contact.builtIn, session.id.hasPrefix(ContactThread.prefix(owner: owner)) { return true }
             guard session.title.hasPrefix("[from: "),
                   let end = session.title.range(of: ", via bridge]") else { return false }
             let label = session.title[session.title.index(session.title.startIndex, offsetBy: 7)..<end.lowerBound]
@@ -65,6 +70,11 @@ struct SimpleContactThread: View {
         let opened = openedChats
         ScrollView {
             VStack(alignment: .leading, spacing: 26) {
+                if let error = store.refreshError {
+                    Text(error)
+                        .font(ShellType.body)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                }
                 if !opened.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Chats \(contact.name) started with \(agentName)")
@@ -89,13 +99,16 @@ struct SimpleContactThread: View {
                         }
                     }
                 }
-                if lines.isEmpty {
-                    Text("Nothing has passed between \(agentName) and \(contact.name) yet.")
+                if lines.isEmpty && opened.isEmpty && store.refreshError == nil {
+                    Text(contact.lastActivityAt == nil
+                         ? "Nothing has passed between \(agentName) and \(contact.name) yet."
+                         : "Earlier activity is recorded, but no messages are retained here.")
                         .font(ShellType.body)
                         .foregroundStyle(NativeAgentShell.secondary)
                 }
                 ForEach(lines) { line in
-                    SimpleTranscriptEntry(speaker: line.byPerson ? "You" : line.fromAgent ? agentName : contact.name,
+                    SimpleTranscriptEntry(speaker: (line.byPerson ? "You" : line.fromAgent ? agentName : contact.name)
+                                          + (line.door.map { " · " + $0 } ?? ""),
                                           text: line.text, at: line.at)
                 }
                 let flight = store.flights[contact.id]
@@ -152,8 +165,18 @@ struct SimpleContactThread: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            SimpleComposer(placeholder: "Message \(contact.name)", recipient: contact.name, note: note) { text in
-                await send(text)
+            if let restriction = contact.sendRestriction {
+                Text(restriction == "Replies only"
+                     ? "Replies only · \(agentName) can't start a conversation with \(contact.name)."
+                     : restriction)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .simpleRoomColumn()
+                    .padding(.vertical, 12)
+            } else {
+                SimpleComposer(placeholder: "Message \(contact.name)", recipient: contact.name, note: note) { text in
+                    await send(text)
+                }
             }
         }
     }
@@ -165,6 +188,7 @@ struct SimpleContactThread: View {
     }
 
     private func send(_ text: String) async -> Bool {
+        guard contact.sendRestriction == nil else { return false }
         guard !contact.builtIn else {
             let acceptance = await appModel.startActiveChatTurn("Tell \(contact.name): \(text)",
                                                                 expectedSessionId: appModel.activeChatSessionId)
@@ -188,11 +212,10 @@ struct SimpleContactThread: View {
         failure = nil
         sending += 1
         let agent = contact.id
-        Task { @MainActor in
-            if let why = await ContactThreadSend.send(agent: agent, text: text, session: session, root: root) {
-                failure = why
-            }
-            sending -= 1
+        defer { sending -= 1 }
+        if let why = await ContactThreadSend.send(agent: agent, text: text, session: session, root: root) {
+            failure = why
+            return false
         }
         return true
     }
@@ -218,18 +241,19 @@ struct SimpleContactThread: View {
     /// A held message, sent again by the person's tap; the held copy leaves
     /// the thread once the new send is accepted (sent or queued).
     private func sendAgain(_ item: SimpleFlight.Queued, from flight: SimpleFlight) {
-        let session = appModel.activeChatSessionId
+        let session = flight.scope
         guard !resending.contains(item.id) else { return }
         guard !session.isEmpty, appModel.engine.transcripts.sessions.contains(where: { $0.id == session }) else {
-            note = "Chat is still starting. Nothing was sent."
+            note = "The original chat is unavailable. Nothing was sent."
             return
         }
         let root = root
-        let agent = contact.id
+        let agent = flight.agent
         resending.insert(item.id)
         failure = nil
         Task { @MainActor in
-            if let why = await ContactThreadSend.send(agent: agent, text: item.text, session: session, root: root) {
+            if let why = await ContactThreadSend.send(agent: agent, text: item.text, session: session, root: root,
+                                                      conversation: flight.agent.hasPrefix("bot:") ? nil : flight.recordID) {
                 failure = why
             } else {
                 await ContactThreadSend.withdraw(item.id, record: flight.recordID, root: root)
@@ -246,23 +270,26 @@ struct SimpleContactThread: View {
 /// made, and only a composer click or Return reaches it.
 enum ContactThreadSend {
     /// Nil when the message went; otherwise why not, in plain words.
-    static func send(agent: String, text: String, session: String, root: URL) async -> String? {
+    static func send(agent: String, text: String, session: String, root: URL, conversation: String? = nil) async -> String? {
         let tools = NativeAgentEngine.live.toolDispatchClient(denyExternalMcp: false, enforceAppAutonomy: false)
         // No approval filer: nothing here can raise a card the thread can't show.
         let chain = makeGatedToolDispatchClient(tools: tools, fileAccess: "auto", dataRoot: root, verifiedSessionId: session)
+        var input: [String: JSONValue] = ["agent": .string(agent), "text": .string(text)]
+        if let conversation { input["conversation"] = .string(conversation) }
+        let sendInput = input
         do {
             let result = try await PersonInitiatedSend.$current.withValue(PersonInitiatedSend(agent: agent, text: text)) {
                 try await ChatToolSessionContext.$verifiedSessionId.withValue(session) {
                     try await chain.dispatch(tool: "agent_message",
-                        input: ["agent": .string(agent), "text": .string(text)], surface: "chat")
+                        input: sendInput, surface: "chat")
                 }
             }
             guard case .object(let fields) = result else { return "Nothing came back from the send." }
             // Queued behind the reply in progress: accepted, it goes by itself.
             if fields["queued"] == .bool(true) { return nil }
-            guard fields["sent"] == .bool(false) || fields["state"] == .string("attention") else { return nil }
+            if fields["sent"] == .bool(true), fields["state"] != .string("attention") { return nil }
             if case .string(let detail)? = fields["detail"], !detail.isEmpty { return detail }
-            return "The message didn't go through."
+            return "The send wasn't confirmed."
         } catch {
             return error.localizedDescription
         }
@@ -336,7 +363,7 @@ private struct SimpleLiveReply: View {
                     Text("Stopping…")
                         .font(ShellType.caption)
                         .foregroundStyle(NativeAgentShell.tertiary)
-                } else if stopState == nil {
+                } else if flight != nil, stopState == nil {
                     Button(action: stop) {
                         Label("Stop", systemImage: "stop.fill")
                             .labelStyle(.titleAndIcon)
@@ -545,11 +572,9 @@ struct SimpleHelperRuns: View {
         failure = nil
         inFlight = true
         let agent = key
-        Task { @MainActor in
-            failure = await ContactThreadSend.send(agent: agent, text: text, session: session, root: root)
-            inFlight = false
-        }
-        return true
+        defer { inFlight = false }
+        failure = await ContactThreadSend.send(agent: agent, text: text, session: session, root: root)
+        return failure == nil
     }
 
     /// The old path, kept to one side: the agent answers, in her chat.
@@ -852,12 +877,14 @@ private struct SimpleComposer: View {
 
     private func submit(_ route: ((String) async -> Bool)? = nil) {
         guard sendable else { return }
+        let draft = text
+        let destination = recipient
         let message = trimmed
         let deliver = route ?? send
         sending = true
         Task { @MainActor in
             defer { sending = false }
-            if await deliver(message) { text = prefill }
+            if await deliver(message), text == draft, recipient == destination { text = prefill }
         }
     }
 }

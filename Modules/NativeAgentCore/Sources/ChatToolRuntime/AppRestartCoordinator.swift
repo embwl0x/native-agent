@@ -6,16 +6,14 @@ import PersistenceCore
 // Swift app restart support for Telegram /restart and the restart_app tool.
 // The Swift app is an SMAppService login item — quitting does NOT respawn it —
 // so the restart sequence needs a DETACHED relauncher process that outlives
-// the app: it polls for our PID to exit (up to 30s), then `open`s the app
+// the app: it waits for our PID to exit, then `open`s the app
 // bundle again.
 //
 // ONE core routine for every surface (chat tool `restart_app`, Telegram
 // /restart via the injected TelegramRestartRef): cooldown guard, audit
 // envelope, stamp, relauncher spawn, and grace-period termination all live
-// here exactly once. Surfaces differ only in how they gate the call
-// (chat: Full Mac + autonomy `confirm`; Telegram: owner allowlist;
-// claude/codex bridge: reachable as of 2026-06-13 but confirm-tier with no
-// approval inbox there, so it fails closed without a human).
+// here exactly once. Surfaces apply their origin and approval gates before
+// calling this coordinator; Telegram /restart also checks its owner allowlist.
 //
 // Sequencing contract that keeps the turn intact:
 //   cooldown check → audit write → stamp write → relauncher spawn →
@@ -23,13 +21,9 @@ import PersistenceCore
 // The grace is what lets the in-flight turn finish persisting and the
 // reply reach the surface BEFORE the app dies.
 //
-// PRODUCTION ENABLEMENT (chat surface): production chat wires NO
-// ApprovalFiler, so restart_app's default toolAutonomy `confirm` resolves
-// to an honest deny ("approval required, no filer") before this coordinator
-// is ever reached. That deny is BY DESIGN — the default stays `confirm`.
-// The production path to enable the tool is the user setting
-// `toolAutonomy.restart_app = "auto"` in data/trust/policy.json (a
-// the user-consented install-time step; code must NEVER write the live policy).
+// Production chat files an inline approval card when restart_app requires
+// confirmation. The person approves the card to replay the guarded restart;
+// no manual trust-policy edit is needed.
 public actor AppRestartCoordinator {
     // MARK: Constants
 
@@ -42,16 +36,12 @@ public actor AppRestartCoordinator {
     /// 20s, NOT the daemon-era 5s: on the chat surface the tool RESULT is
     /// not the reply — the tool loop makes ANOTHER LLM call to compose the
     /// final reply after dispatch returns, then persists it
-    /// (ChatOrchestrationClient.executeTurn → appendMessage). The grace must
+    /// (ChatOrchestrationClient.chat → appendMessage). The grace must
     /// outlive that final reply LLM call + persistence or the app dies
     /// mid-turn and the reply is lost. Turn-completion-TRIGGERED termination
     /// (no fixed timer) is a ledgered follow-up; until then the constant
     /// must stay comfortably above worst-case reply-compose latency.
     public static let terminateGraceSeconds: TimeInterval = 20
-    /// How long the detached relauncher polls for our PID to exit before it
-    /// `open`s the bundle anyway (covers a wedged-but-terminating app).
-    public static let relauncherPollSeconds = 30
-
     /// Process-wide instance used by the chat dispatch case and the app
     /// layer Telegram bridge. The app layer MUST `configure(...)` it at
     /// launch with the real terminate and relauncher closures (platform
@@ -113,16 +103,13 @@ public actor AppRestartCoordinator {
 
     // MARK: Relauncher command
 
-    /// Pure argv builder so tests can assert the exact command without
-    /// spawning. The script polls `kill -0 <pid>` once a second for up to
-    /// `relauncherPollSeconds`, then `open`s the bundle — open after the
-    /// poll window even if the PID is somehow still alive, because `open`
-    /// on a running app is a no-op activate, never a second instance.
+    /// Wait for exit even when a surface takes longer to send its reply.
+    /// Opening a still-running app would only activate it, losing the restart.
     public static func relauncherArgv(pid: Int32, appPath: String) -> [String] {
         // Single-quote the app path for the shell; escape embedded quotes.
         let quoted = "'" + appPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let script = """
-        i=0; while /bin/kill -0 \(pid) 2>/dev/null; do i=$((i+1)); if [ "$i" -ge \(relauncherPollSeconds) ]; then break; fi; /bin/sleep 1; done; exec /usr/bin/open \(quoted)
+        while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 1; done; exec /usr/bin/open \(quoted)
         """
         return ["/bin/sh", "-c", script]
     }
@@ -159,14 +146,14 @@ public actor AppRestartCoordinator {
     /// to the transport. The restart is already COMMITTED (stamp written,
     /// relauncher spawned) once the
     /// closure exists, so the caller MUST invoke it even if the reply send
-    /// fails — otherwise the relauncher times out against a live app while
+    /// fails — otherwise the relauncher waits against a live app while
     /// the cooldown stamp claims a restart happened.
     public func requestRestartDeferringTerminate(
         reason: String, source: String
     ) async -> (envelope: JSONValue, armTerminate: (@Sendable () -> Void)?) {
         // Fail closed when the app layer hasn't injected both hooks: spawning
         // a relauncher without being able to exit would just no-op `open`
-        // against a live app 30s later while claiming "restarting".
+        // against a live app while claiming "restarting".
         guard let scheduleTerminate, let spawnRelauncher else {
             return (.object([
                 "status": .string("failed"),
@@ -308,7 +295,7 @@ public actor AppRestartCoordinator {
                 return .object([
                     "status": .string("restarting"),
                     "tool": .string("restart_app"),
-                    "note": .string("Restarting in ~\(Int(grace))s — keep the final reply brief (one short sentence) so it lands before termination. A detached relauncher reopens \(appPath) once the process exits (polls up to \(Self.relauncherPollSeconds)s)."),
+                    "note": .string("Restarting in ~\(Int(grace))s — keep the final reply brief (one short sentence) so it lands before termination. A detached relauncher reopens \(appPath) once the process exits."),
                     "runId": .string(runId),
                     "reason": .string(effectiveReason),
                     "source": .string(source),

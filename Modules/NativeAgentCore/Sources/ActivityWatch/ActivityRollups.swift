@@ -140,11 +140,6 @@ public struct ActivityRollups: Sendable {
         var component: Calendar.Component { self == .hourly ? .hour : .day }
     }
 
-    /// Adjacent spans of the same app separated by less than this coalesce
-    /// (W4 "span merge"). Purely a presentation concern for exemplars — bucket
-    /// totals sum real observed time either way.
-    public static let mergeGapSeconds: Double = 30
-
     /// The acceptance criterion from the plan, as a constant: any single answer
     /// fits in ~50 rows.
     public static let answerRowCap = 50
@@ -312,7 +307,7 @@ public struct ActivityRollups: Sendable {
         var seconds: [String: Double] = [:]
         var names: [String: String] = [:]
         var counts: [String: Int] = [:]
-        var events: [String: Int] = [:]
+        var events: [String: Double] = [:]
 
         for span in spans {
             let spanEnd = span.endedAt ?? span.lastSeenAt
@@ -321,7 +316,9 @@ public struct ActivityRollups: Sendable {
             seconds[span.bundleId, default: 0] += max(0, overlap)
             names[span.bundleId] = span.appName
             counts[span.bundleId, default: 0] += 1
-            events[span.bundleId, default: 0] += span.eventCount
+            let total = max(0, spanEnd - span.startedAt)
+            let share = total > 0 ? max(0, overlap) / total : 1
+            events[span.bundleId, default: 0] += Double(span.eventCount) * share
         }
 
         let all = seconds
@@ -331,7 +328,7 @@ public struct ActivityRollups: Sendable {
                     appName: names[bundleId] ?? bundleId,
                     seconds: secs,
                     spanCount: counts[bundleId] ?? 0,
-                    eventCount: events[bundleId] ?? 0
+                    eventCount: Int((events[bundleId] ?? 0).rounded())
                 )
             }
             // Deterministic order: seconds desc, then bundle id — never
@@ -351,8 +348,7 @@ public struct ActivityRollups: Sendable {
 
     // MARK: Exemplars
 
-    /// The longest spans in the window, after merging adjacent same-app spans
-    /// separated by less than `mergeGapSeconds`.
+    /// The longest spans in the window, after merging contiguous same-app spans.
     public static func exemplars(
         spans: [ActivitySpan], limit: Int
     ) -> [ActivitySpan] {
@@ -364,7 +360,7 @@ public struct ActivityRollups: Sendable {
         )
     }
 
-    /// W4 span merge. Same app, same redacted title, gap under the threshold →
+    /// Same app, same redacted title, no unobserved gap →
     /// one span. Keeps the first row's id so an exemplar still points at a real
     /// stored row.
     public static func merge(spans: [ActivitySpan]) -> [ActivitySpan] {
@@ -378,7 +374,7 @@ public struct ActivityRollups: Sendable {
                 continue
             }
             let previousEnd = previous.endedAt ?? previous.lastSeenAt
-            guard span.startedAt - previousEnd <= mergeGapSeconds else {
+            guard span.startedAt <= previousEnd else {
                 out.append(span)
                 continue
             }
@@ -455,7 +451,23 @@ public struct ActivityRollups: Sendable {
             .prefix(bucketLimit)
             .sorted { ($0.start, $0.seconds) < ($1.start, $1.seconds) }
 
-        let allExemplars = Self.exemplars(spans: spans, limit: Int.max)
+        let clipped = spans.compactMap { span -> ActivitySpan? in
+            let spanEnd = span.endedAt ?? span.lastSeenAt
+            let start = max(span.startedAt, from)
+            let end = min(spanEnd, to)
+            guard end >= start else { return nil }
+            let total = max(0, spanEnd - span.startedAt)
+            let share = total > 0 ? (end - start) / total : 1
+            return ActivitySpan(
+                id: span.id, startedAt: start,
+                endedAt: span.endedAt == nil ? nil : end, lastSeenAt: end,
+                bundleId: span.bundleId, appName: span.appName,
+                titleRedacted: span.titleRedacted,
+                eventCount: Int((Double(span.eventCount) * share).rounded()),
+                closeReason: span.closeReason, tzOffsetMin: span.tzOffsetMin
+            )
+        }
+        let allExemplars = Self.exemplars(spans: clipped, limit: Int.max)
         let keptExemplars = Array(allExemplars.prefix(exemplarLimit))
 
         var truncated: [String] = []

@@ -107,6 +107,14 @@ public enum InlineInteractionSignatureWitness {
             // Mutable fields (outcome, claim, replay checkpoint) stay out:
             // they move on the row after the mint.
             fields.append(Self.digest(continuation.resumeText))
+            if let sources = continuation.peerSources {
+                fields.append("peer-sources")
+                fields.append(String(sources.count))
+                fields.append(contentsOf: sources)
+                let elevated = continuation.elevatedPeerSources ?? []
+                fields.append(String(elevated.count))
+                fields.append(contentsOf: elevated)
+            }
             fields.append(Self.digest(interaction.map {
                 "\($0.kind.rawValue)\u{1F}\($0.declineConsequence)"
             }))

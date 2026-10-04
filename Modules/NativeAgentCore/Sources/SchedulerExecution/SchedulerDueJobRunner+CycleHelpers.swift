@@ -62,15 +62,8 @@ extension SchedulerDueJobRunner {
         // scheduled in 15 minutes" receipt was a lie. A LATER existing stamp
         // still yields to the freshly computed schedule.
         //
-        // 2026-07-23 FIX 1 (A4.1): a PENDING retry stamp is a FLOOR, not a
-        // candidate for the min() below. During a provider outage the failed
-        // run stamps a backoff retry (retryPendingUntilEpoch); the catch-up
-        // path recomputes nextRunEpoch ≈ now (a failed run does not count as
-        // "ran today", so dreamCatchUp stays armed). Under the bare min() rule
-        // that ≈now candidate would BEAT the retry stamp and pull the job back
-        // to now — collapsing the 15/30/60-minute backoff into a ~60s all-day
-        // retry loop (1440 provider calls/day + receipt-cap poisoning). Honor
-        // the retry stamp instead: catch-up may never pull earlier than it.
+        // A pending retry is a floor: catch-up may never pull a job earlier
+        // than the backoff chosen by the bounded retry policy.
         //
         // A CHANGED schedule invalidates the stamp that was computed from the
         // old one. The nightly dream fires on the machine's own zone, so a row
@@ -177,40 +170,41 @@ extension SchedulerDueJobRunner {
         ) ?? now.addingTimeInterval(fallbackInterval).timeIntervalSince1970
     }
 
-    static func containsLastRunToday(rows: [JSONValue], kind: String, dateKey: String) -> Bool {
+    static func containsLastRunToday(rows: [JSONValue], kind: String, dateKey: String, includingFailed: Bool = false) -> Bool {
         rows.contains { row in
             guard case .object(let obj) = row else { return false }
             let rowKind = (SchedulerJobRuntime.string(obj["kind"]) ?? "").lowercased()
             guard rowKind == kind else { return false }
-            // A FAILED run must not count as "ran today" — it disarmed the
-            // catch-up for the whole day (2026-07-20/21 live: two nights of
-            // "connection refused: api.kimi.com" at 03:31, and the failed
-            // attempt itself then blocked the daytime catch-up that would
-            // have recovered the dream once the network was back).
             let status = (SchedulerJobRuntime.string(obj["lastRunStatus"]) ?? "").lowercased()
-            guard status != "error" else { return false }
+            guard includingFailed || status != "error" else { return false }
             guard let raw = SchedulerJobRuntime.string(obj["lastRunAt"]),
                   let date = parseISODate(raw) else { return false }
             return NativeAgentDreamCycleSchedule.runDateKey(date) == dateKey
         }
     }
 
-    static func notificationRowReferencesDate(_ obj: [String: JSONValue], dateKey: String) -> Bool {
+    static func notificationRowDiaryDateKeys(_ obj: [String: JSONValue]) -> Set<String> {
+        var dates: Set<String> = []
         if let id = SchedulerJobRuntime.string(obj["id"]),
-           id.contains("dream-cycle-\(dateKey)") {
-            return true
+           id.hasPrefix("dream-cycle-") {
+            let dateKey = String(id.dropFirst("dream-cycle-".count).prefix(10))
+            if dateKey.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
+                dates.insert(dateKey)
+            }
         }
         guard case .array(let paths)? = obj["related_paths"] else {
-            return false
+            return dates
         }
         for pathValue in paths {
             guard let path = SchedulerJobRuntime.string(pathValue) else { continue }
             let name = (path as NSString).lastPathComponent
+            let dateKey = String(name.prefix(10))
+            guard dateKey.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else { continue }
             if name == "\(dateKey).md" || (name.hasPrefix("\(dateKey)_") && name.hasSuffix(".md")) {
-                return true
+                dates.insert(dateKey)
             }
         }
-        return false
+        return dates
     }
 
     static func hasDreamEntry(dataRoot: URL, dateKey: String) -> Bool {
@@ -383,8 +377,7 @@ extension SchedulerDueJobRunner {
     }
 
     /// A default cycle job parked (retry cap reached) on `dateKey`. While
-    /// parked for the day the catch-up path must stay disarmed even though the
-    /// failed run does not count as "ran today".
+    /// parked for the day the catch-up path must stay disarmed.
     static func containsRetryParkedToday(rows: [JSONValue], kind: String, dateKey: String) -> Bool {
         rows.contains { row in
             guard case .object(let obj) = row else { return false }

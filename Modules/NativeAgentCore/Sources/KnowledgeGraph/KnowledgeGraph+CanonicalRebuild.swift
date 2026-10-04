@@ -21,6 +21,13 @@ extension SwiftNativeKnowledgeGraphIndexer {
     public func rebuildMemoryDerivedGraphFromCanonicalStore(
         producing: Bool = true
     ) async throws -> KnowledgeGraphMemoryRebuildReport {
+        try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: producing, excludingMemoryID: nil)
+    }
+
+    func rebuildMemoryDerivedGraphFromCanonicalStore(
+        producing: Bool = true,
+        excludingMemoryID: String?
+    ) async throws -> KnowledgeGraphMemoryRebuildReport {
         let dbPool = try await pool()
         let primaryUserName = resolvedPrimaryUserName()
         return try await dbPool.write { db in
@@ -49,8 +56,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
                   AND lower(COALESCE(NULLIF(TRIM(lifecycle), ''), 'confirmed'))
                         NOT IN ('corrected', 'contradicted', 'deleted')
                   AND id NOT LIKE 'skill-pointer:%'
+                  AND (? IS NULL OR id <> ?)
                 ORDER BY id ASC
-                """)
+                """, arguments: [excludingMemoryID, excludingMemoryID])
             let facts: [KnowledgeGraphMemoryFact] = !producing ? [] : rows.compactMap { row in
                 guard let id: String = row["id"],
                       let content: String = row["content"] else { return nil }
@@ -71,6 +79,15 @@ extension SwiftNativeKnowledgeGraphIndexer {
             let ownedIndexerPlaceholders = Self.ownedIndexerVersions
                 .map { _ in "?" }
                 .joined(separator: ", ")
+            // Clear memory-derived summaries on foreign-owned entities before
+            // surviving facts rederive them, including when production is off.
+            try db.execute(sql: """
+                UPDATE kg_entities SET summary = NULL,
+                    metadata_json = json_remove(metadata_json,
+                        '$.last_memory_id', '$.last_memory_source', '$.embedding_text', '$.indexer')
+                WHERE json_extract(metadata_json, '$.indexer') IN (\(ownedIndexerPlaceholders))
+                  AND json_extract(metadata_json, '$.\(Self.createdByKey)') IS NULL
+                """, arguments: StatementArguments(Self.ownedIndexerVersions))
             let provenanceSubquery = """
                 SELECT id FROM kg_entities
                 WHERE json_extract(metadata_json, '$.\(Self.createdByKey)')
@@ -174,7 +191,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             for fact in facts {
                 let memoryID = fact.id.trimmingCharacters(in: .whitespacesAndNewlines)
                 let content = fact.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                let contentHash = Self.contentHash("\(Self.indexVersion):\(content)")
+                let contentHash = Self.factFingerprint(fact, content: content)
                 try Self.indexActiveFact(
                     db,
                     fact: fact,
@@ -271,7 +288,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     fact: fact,
                     memoryID: memoryID,
                     content: trimmed,
-                    contentHash: Self.contentHash("\(Self.indexVersion):\(trimmed)"),
+                    contentHash: Self.factFingerprint(fact, content: trimmed),
                     now: now,
                     extracted: Self.extractEntities(from: trimmed, knownPeople: knownPeople),
                     primaryUserName: primaryUserName

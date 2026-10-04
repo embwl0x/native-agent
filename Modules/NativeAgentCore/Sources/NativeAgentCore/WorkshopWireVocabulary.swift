@@ -273,28 +273,6 @@ public enum WorkshopOpenNotificationAction {
     }
 }
 
-/// P2-6 residue: the Apple Shortcuts connector's "start an execution" action
-/// name. `data/connectors/registry.json` is LIVE persisted data carrying
-/// `start_mission`; nothing rewrites it, so any reader that matches this action
-/// must accept both spellings.
-public enum WorkshopStartConnectorAction {
-    public static let canonical = "start_execution"
-    public static let legacy = "start_mission"
-    public static let bothSpellings: [String] = [canonical, legacy]
-
-    /// Fold either spelling onto the canonical one; every other action name
-    /// passes through with only whitespace trimmed (these are wire tokens).
-    public static func canonicalAction(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed == legacy ? canonical : trimmed
-    }
-
-    /// Equality that tolerates either side being written in either vocabulary.
-    public static func matches(_ lhs: String, _ rhs: String) -> Bool {
-        canonicalAction(lhs) == canonicalAction(rhs)
-    }
-}
-
 // MARK: - P2-5: environment variable vocabulary
 
 /// Public env-var contract. The `..._MISSION[S]_...` spellings are documented

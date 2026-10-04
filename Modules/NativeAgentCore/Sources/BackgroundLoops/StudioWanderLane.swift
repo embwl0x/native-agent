@@ -18,8 +18,7 @@ import Studio
 //
 // ── NO SCHEDULE, NO BUDGET, NO WATCHDOG (NORTHSTAR clause 4) ─────────────────
 // There is no timer here and no loop id. The lane is consulted from the
-// residual-repair reschedule the organism already owns — the same seam
-// `considerPressureDream` and `considerStudioEncounter` ride — so it wakes
+// residual-repair reschedule the organism already owns, so it wakes
 // because a signal REACHED it, never because a clock said so. `refractory`
 // below is not a cadence: it is the "at most once a day" ceiling, and the
 // ordinary answer on every other reading is "no".
@@ -107,10 +106,6 @@ public enum StudioWanderLane {
         /// A turn is running or still settling. Her hour is not for the middle
         /// of a conversation.
         case turnInFlight = "turn_in_flight"
-        /// A due dream outranks an hour spent looking at pictures. Her rule for
-        /// encounters, applied unchanged here: "a due dream beats an encounter
-        /// for the same pressure; encounters never preempt."
-        case dreamOutranks = "dream_outranks"
         /// Something happened inside the quiet window.
         case notQuiet = "not_quiet"
         /// The user's sleep window. Nothing of hers runs across it.
@@ -124,8 +119,6 @@ public enum StudioWanderLane {
     /// - Parameters:
     ///   - now: the caller's clock (injected; this type never reads one).
     ///   - turnInFlight: the runtime's own latch.
-    ///   - dreamIsDue: the identity-dream lane's decision, already made from the
-    ///     same residual reading — `.fire` or `.turnInFlight`.
     ///   - lastTurnActivityAt: the most recent instant a turn was observed in
     ///     flight. `nil` means none has been seen, which IS quiet.
     ///   - lastWanderAt: from the durable state; `nil` means she has never had
@@ -135,13 +128,11 @@ public enum StudioWanderLane {
     public static func decide(
         now: Date,
         turnInFlight: Bool,
-        dreamIsDue: Bool,
         lastTurnActivityAt: Date?,
         lastWanderAt: Date?,
         inQuietHours: Bool
     ) -> Decision {
         if turnInFlight { return .turnInFlight }
-        if dreamIsDue { return .dreamOutranks }
         if inQuietHours { return .quietHours }
         if let lastTurnActivityAt,
            now.timeIntervalSince(lastTurnActivityAt) < quietInterval {
@@ -344,21 +335,31 @@ public enum StudioWanderLane {
         /// Titles she has written about lately — so she can notice a rut, not
         /// so anything avoids one for her.
         public var recentJournalTitles: [String]
+        /// Phase 5 D2: her open interests ("topic — her question"), strongest
+        /// first. Offered ahead of everything else, never assigned.
+        public var interests: [String]
+        /// Phase 5 D2: the experiment is on, so the hour may end with the
+        /// question she would come back with.
+        public var asksForQuestion: Bool
 
         public init(
             curiosity: [String] = [],
             invitations: [String] = [],
-            recentJournalTitles: [String] = []
+            recentJournalTitles: [String] = [],
+            interests: [String] = [],
+            asksForQuestion: Bool = false
         ) {
             self.curiosity = curiosity
             self.invitations = invitations
             self.recentJournalTitles = recentJournalTitles
+            self.interests = interests
+            self.asksForQuestion = asksForQuestion
         }
 
         /// Nothing of her own to look at. The hour still happened; she simply
         /// had nothing in reach, which is a decline and not a failure.
         public var isEmpty: Bool {
-            curiosity.isEmpty && invitations.isEmpty
+            curiosity.isEmpty && invitations.isEmpty && interests.isEmpty
         }
 
         public static let bulletLimit = 8
@@ -397,22 +398,35 @@ public enum StudioWanderLane {
 
             If you choose to spend it on a work, meeting it has to be HONEST — get the \
             actual thing in front of you first:
-            - a page: browser.open_url (ask it to capture the source), then \
-            browser.read_text or browser.screenshot
-            - a document or a local file: read, or read_file
-            - something on the table: studio_consult_read with the consult_id in the line, \
-            which shows you the real artifact refs to go and open
+            - a page: app {action:"browser.open", args:{url:"…", capture_source:true}}, then \
+            app {action:"browser.text"} or app {action:"browser.screenshot"}
+            - a document or a local file: app {action:"mac.read"}, or \
+            app {action:"files.read", args:{path:"…"}}
+            - something on the table: app {action:"studio.consult_read", args:{consult_id:"…"}} \
+            with the consult_id in the line; it shows you the real artifact refs to go and open
             If you cannot actually receive it, say so and stop; do not write about a work \
             you did not meet. Meeting one does not owe a verdict either — "not enough to \
             judge yet" is a real ending.
 
             Nothing is written down unless you write it. If, and only if, you want this in \
-            your journal, file it yourself with studio_journal. Otherwise the hour simply \
-            happened.
+            your journal, file it yourself with app action studio.journal. Read \
+            app {find:"studio.journal"} for its arguments. Otherwise the hour simply happened.
 
             End with one short line saying what you did with it.
             """,
         ]
+        if material.asksForQuestion {
+            sections[0] += "\n\nIf what you met left you with a question you would want to come back to, "
+                + "put it on its own line beginning \"still wondering:\" just before that last line. "
+                + "Leave it out otherwise."
+        }
+        if material.isEmpty {
+            sections.append("Nothing is on the table today. The hour is still yours: anything you are "
+                + "curious about is fair, or decline.")
+        }
+        if !material.interests.isEmpty {
+            sections.append("# You were wondering\n" + Material.bullets(material.interests))
+        }
         if !material.curiosity.isEmpty {
             sections.append("# Still open for you\n" + Material.bullets(material.curiosity))
         }

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public struct OrganismPersistentState: Codable, Sendable, Equatable {
     public var schemaVersion: Int
@@ -8,7 +9,9 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
     public var field: OrganismField
     public var predictionLedger: OrganismPredictionLedger
     public var dreamRepairState: OrganismDreamRepairState
-    public var reflexState: OrganismReflexState
+    /// Retired reflexes (Phase 5 F): always written as `{}` so an older build,
+    /// which decodes this key as required, can still restore the file.
+    private var reflexState = RetiredReflexState()
     public var signalCount: Int
     public var lastSignalAt: Date?
     /// ONE ENCOUNTER, ONE DOSE (2026-09-11). The rolling caring-encounter
@@ -33,7 +36,6 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         field = try container.decode(OrganismField.self, forKey: .field)
         predictionLedger = try container.decode(OrganismPredictionLedger.self, forKey: .predictionLedger)
         dreamRepairState = try container.decode(OrganismDreamRepairState.self, forKey: .dreamRepairState)
-        reflexState = try container.decode(OrganismReflexState.self, forKey: .reflexState)
         signalCount = try container.decode(Int.self, forKey: .signalCount)
         lastSignalAt = try container.decodeIfPresent(Date.self, forKey: .lastSignalAt)
         // decodeIfPresent: every state written before this pass has no
@@ -58,9 +60,44 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         }
         try requireMatchingIDs(field.nodes, id: \.id, key: .field)
         try requireMatchingIDs(field.edges, id: \.id, key: .field)
-        try requireMatchingIDs(predictionLedger.predictions, id: \.id, key: .predictionLedger)
-        try requireMatchingIDs(reflexState.observations, id: \.id, key: .reflexState)
-        try requireMatchingIDs(reflexState.candidates, id: \.id, key: .reflexState)
+        // Legacy semantic identities were stored in full as keys, while the
+        // prediction initializer clipped their embedded IDs to 120 characters.
+        // Hash the full recognized identity so distinct clipped prefixes survive.
+        var predictions: [String: OrganismPrediction] = [:]
+        for (key, var prediction) in predictionLedger.predictions {
+            var normalizedKey = key
+            let parts = key.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            if prediction.kind == .semanticExpectation,
+               key.count > 120, prediction.id == String(key.prefix(120)),
+               parts.count == 6, parts[0] == OrganismSemanticExpectation.idPrefix,
+               parts[1] == OrganismToken.canonicalToken(prediction.sourceOrgan),
+               let scope = prediction.semanticScope,
+               parts[2] == OrganismToken.canonicalToken(scope.sessionID),
+               parts[3] == OrganismToken.canonicalToken(scope.turnID),
+               parts[4] != "unknown", parts[4] == OrganismToken.canonicalToken(parts[4]),
+               parts[5] == String(Int(prediction.createdAt.timeIntervalSince1970)) {
+                let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+                prediction.id = "\(OrganismSemanticExpectation.idPrefix):\(digest)"
+                normalizedKey = prediction.id
+            }
+            guard predictions.updateValue(prediction, forKey: normalizedKey) == nil else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .predictionLedger, in: container,
+                    debugDescription: "Organism prediction identities must be unique"
+                )
+            }
+        }
+        try requireMatchingIDs(predictions, id: \.id, key: .predictionLedger)
+        predictionLedger.predictions = predictions
+        // Interpret the old shared clock only from already-recorded felt
+        // misses, before restore decay can expire a pending row at today's time.
+        if predictionLedger.lastFeltViolationAt == nil, let lastViolation = predictionLedger.lastViolationAt {
+            predictionLedger.lastFeltViolationAt = predictions.values.filter {
+                OrganismProspectiveAffect.carriesFeeling($0.kind)
+                    && ($0.status == .violated || ($0.status == .expired && $0.horizon == nil))
+                    && $0.lastUpdatedAt <= lastViolation
+            }.map(\.lastUpdatedAt).max()
+        }
     }
 
     public init(
@@ -71,7 +108,6 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         field: OrganismField = .empty,
         predictionLedger: OrganismPredictionLedger = .empty,
         dreamRepairState: OrganismDreamRepairState = .empty,
-        reflexState: OrganismReflexState = .empty,
         signalCount: Int = 0,
         lastSignalAt: Date? = nil,
         caringEncounter: OrganismCaringEvent.Encounter = .empty
@@ -83,7 +119,6 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         self.field = field
         self.predictionLedger = predictionLedger
         self.dreamRepairState = dreamRepairState
-        self.reflexState = reflexState
         self.signalCount = max(0, signalCount)
         self.lastSignalAt = lastSignalAt
         self.caringEncounter = caringEncounter
@@ -92,7 +127,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
     public func decayed(
         at now: Date,
         limits: OrganismPersistenceLimits = .defaults,
-        settleBodySchema: Bool = true
+        settleBodySchema: Bool = true,
+        deferringPredictionExpiry deferredIDs: Set<String> = []
     ) -> OrganismPersistentState {
         let elapsedHours = max(0, now.timeIntervalSince(savedAt) / 3_600)
         guard elapsedHours > 0 else { return self }
@@ -111,8 +147,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             chemicalState, hours: boundedHours, tendernessHours: elapsedHours)
         next.bodySchema = settleBodySchema ? settledBodySchema(bodySchema) : bodySchema
         next.field = decayedField(field, hours: boundedHours, limits: limits)
-        next.predictionLedger = decayedPredictions(predictionLedger, now: now, hours: boundedHours, limits: limits)
-        next.reflexState = boundedReflexes(reflexState, limits: limits)
+        next.predictionLedger = decayedPredictions(
+            predictionLedger, now: now, hours: boundedHours, limits: limits, deferredIDs: deferredIDs)
         next.signalCount = min(max(0, signalCount), limits.maximumSignalCount)
         return next
     }
@@ -215,7 +251,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         _ ledger: OrganismPredictionLedger,
         now: Date,
         hours: Double,
-        limits: OrganismPersistenceLimits
+        limits: OrganismPersistenceLimits,
+        deferredIDs: Set<String>
     ) -> OrganismPredictionLedger {
         var next = ledger
         next.peripheralUncertainty = OrganismBodyConfidence.clamp(next.peripheralUncertainty * pow(0.84, hours))
@@ -224,7 +261,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         var expiredHorizons = 0
         let decayed = next.predictions.values.map { prediction -> OrganismPrediction in
                 var copy = prediction
-                if copy.status == .pending && copy.dueAt < now {
+                if copy.status == .pending && copy.dueAt < now && !deferredIDs.contains(copy.id) {
                     // ONE expiry transition, shared with the live sweep
                     // (`OrganismPredictiveBody.expireOverdue`) so the two can no
                     // longer disagree about what an expired row looks like. It
@@ -310,41 +347,16 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             return next
         }
     }
-
-    private func boundedReflexes(
-        _ state: OrganismReflexState,
-        limits: OrganismPersistenceLimits
-    ) -> OrganismReflexState {
-        var next = state
-        next.observations = Dictionary(uniqueKeysWithValues: state.observations.values
-            .sorted(by: reflexSort)
-            .prefix(limits.maximumPersistedReflexes)
-            .map { ($0.id, $0) })
-        next.candidates = Dictionary(uniqueKeysWithValues: state.candidates.values
-            .sorted(by: reflexSort)
-            .prefix(limits.maximumPersistedReflexes)
-            .map { ($0.id, $0) })
-        next.reviewReceipts = Array(state.reviewReceipts.suffix(limits.maximumPersistedReflexReviewReceipts))
-        return next
-    }
-
-    private func reflexSort(_ lhs: OrganismReflexCandidate, _ rhs: OrganismReflexCandidate) -> Bool {
-        if (lhs.retiredAt == nil) != (rhs.retiredAt == nil) { return lhs.retiredAt == nil }
-        if lhs.reviewRequired != rhs.reviewRequired { return lhs.reviewRequired && !rhs.reviewRequired }
-        if lhs.confidence != rhs.confidence { return lhs.confidence > rhs.confidence }
-        if lhs.lastUpdatedAt != rhs.lastUpdatedAt { return lhs.lastUpdatedAt > rhs.lastUpdatedAt }
-        return lhs.id < rhs.id
-    }
-
 }
+
+/// Encodes as `{}`.
+struct RetiredReflexState: Codable, Sendable, Equatable {}
 
 public struct OrganismPersistenceLimits: Sendable, Equatable {
     public var maximumDecayHours: Double
     public var maximumPersistedNodes: Int
     public var maximumPersistedEdges: Int
     public var maximumPersistedPredictions: Int
-    public var maximumPersistedReflexes: Int
-    public var maximumPersistedReflexReviewReceipts: Int
     public var maximumSignalCount: Int
 
     public init(
@@ -352,16 +364,12 @@ public struct OrganismPersistenceLimits: Sendable, Equatable {
         maximumPersistedNodes: Int = 96,
         maximumPersistedEdges: Int = 192,
         maximumPersistedPredictions: Int = 96,
-        maximumPersistedReflexes: Int = 64,
-        maximumPersistedReflexReviewReceipts: Int = 128,
         maximumSignalCount: Int = 1_000_000
     ) {
         self.maximumDecayHours = max(0, maximumDecayHours)
         self.maximumPersistedNodes = max(0, maximumPersistedNodes)
         self.maximumPersistedEdges = max(0, maximumPersistedEdges)
         self.maximumPersistedPredictions = max(0, maximumPersistedPredictions)
-        self.maximumPersistedReflexes = max(0, maximumPersistedReflexes)
-        self.maximumPersistedReflexReviewReceipts = max(0, maximumPersistedReflexReviewReceipts)
         self.maximumSignalCount = max(0, maximumSignalCount)
     }
 

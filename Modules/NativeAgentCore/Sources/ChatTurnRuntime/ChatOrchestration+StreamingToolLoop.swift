@@ -1,5 +1,7 @@
 import ChatToolParsing
+import ToolRegistry
 import Foundation
+import CryptoKit
 import Dispatcher
 import NativeAgentCore
 import PersistenceCore
@@ -16,7 +18,7 @@ extension SwiftNativeTurnEngine {
     /// they arrive, so a surface that renders `progress` never looks dead
     /// while a tool-capable response is running. Callers that do not render
     /// progress simply await the result.
-    public func executeTurnWithStreamingToolLoop(
+    func executeContinuationTurnBody(
         surface: String = "chat",
         userMessage: String,
         sessionId: String? = nil,
@@ -45,9 +47,8 @@ extension SwiftNativeTurnEngine {
         // P2-3: fold the Workshop surface once at the loop entry (see
         // buildTurnContext) so the whole tool loop threads one vocabulary.
         let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
-        // Image-only turn (no caption) is valid when the pre-built context
-        // carries image blocks.
-        if userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Prepared document text and image-only turns need no caption.
+        if (preBuiltContext?.userMessage ?? userMessage).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && (preBuiltContext?.imageBlocks.isEmpty ?? true) {
             throw TurnEngineError.emptyMessage
         }
@@ -63,8 +64,8 @@ extension SwiftNativeTurnEngine {
         var wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface, requestedSeconds: turnWallClockSecondsOverride)
         let startNs = DispatchTime.now().uptimeNanoseconds
         // Shared pre-loop context resolution (C2): prefer preBuiltContext, else
-        // build + lazy-filter through the session's active tools (so the turn
-        // never ships the full eager catalog), then fire the context snapshot.
+        // build + lazy-filter (so the turn never ships the full eager catalog),
+        // then fire the context snapshot.
         let resolvedTurnContext = try await resolveToolLoopContext(
             surface: surface,
             userMessage: userMessage,
@@ -72,36 +73,11 @@ extension SwiftNativeTurnEngine {
             runId: runId,
             preBuiltContext: preBuiltContext
         )
+        var commitInstructionDelivery = pendingInstructionDelivery(in: resolvedTurnContext, sessionID: sessionId)
 
-        // v2Prefix (2026-09-01): prior turns become a REAL message prefix and
-        // the per-turn volatile mass moves out of the churning tail of the
-        // system prompt into a message that sits AFTER it. On `.v1Legacy` this
-        // returns the exact single-user-message array built here before —
-        // `ctx` untouched, byte-identical request body.
-        // The BOUND shape, never `.effective`: the adapters read only the
-        // task-local, so resolving a second time here could disagree with what
-        // the outer turn entry bound and with what the context was built under.
-        // Mid-conversation tool changes (Anthropic structured lane). Unbound
-        // on every other lane → nil → nothing below this line changes.
-        //
-        // The provider-name map is built from the ARRAY and then held still
-        // for the whole turn: the array is turn-invariant, so its aliases are
-        // too, and every `tool_reference` name has to be the one THIS map
-        // minted or the request 400s.
-        let toolChangePlan = StructuredToolChangeContext.plan
-        var providerTools = ProviderToolNameMap(
-            toolChangePlan?.array ?? resolvedTurnContext.toolSchemas
-        )
-        let turnToolChanges = toolChangePlan.flatMap { plan in
-            ConversationPrefixSeeding.toolChangeMessage(
-                additions: plan.additions.compactMap {
-                    providerTools.providerName(forInternalName: $0)
-                },
-                removals: plan.removals.compactMap {
-                    providerTools.providerName(forInternalName: $0)
-                }
-            )
-        }
+        // The provider-name map is built from the array and then held still
+        // for the whole turn.
+        var providerTools = ProviderToolNameMap(resolvedTurnContext.toolSchemas)
         // How tools are offered and calls read back, per provider (8a seam).
         // Chosen from the provider the client itself resolves under the SAME
         // bindings every call of this turn runs with, so a route the client
@@ -116,31 +92,22 @@ extension SwiftNativeTurnEngine {
         )
         let prefixSeed = ConversationPrefixSeeding.seed(
             resolvedTurnContext,
-            shape: ConversationPrefixShape.override ?? .v1Legacy,
             // The marker catalog's session-loaded run rides the volatile block
             // on v2, so a mid-session tool_load cannot move the cached prefix.
             textToolCatalogAppendix: toolCallCodec == .textMarkers
                 ? TextMarkerCodec.volatileCatalogAppendix(for: resolvedTurnContext)
-                : nil,
-            toolChanges: turnToolChanges
+                : nil
         )
         let ctx = prefixSeed.context
-        // The system prompt the provider reads. The marker protocol carries
-        // its catalog there (floor in `stable`, the session-loaded run in
-        // `stableSuffix` on v1), placed under the shape the seed ACTUALLY
-        // produced, which is what decides where that run rides.
         let wireSystem: (prompt: String?, segments: SystemPromptSegments?) = toolCallCodec == .textMarkers
-            ? ConversationPrefixShape.$override.withValue(prefixSeed.shape) {
+            ? {
                 let layout = TextMarkerCodec.systemLayout(
                     baseSystem: ctx.systemPrompt, segments: ctx.systemSegments, context: ctx)
                 return (layout.system, layout.segments)
-            }
+            }()
             : (ctx.systemPrompt, ctx.systemSegments)
-        // ARCHIVE THIS TURN'S REPLAYABLE TAIL — the tool-change message and the
-        // turn-scoped volatile block, exactly as seeded. The tool-change
-        // message is NOT turn-scoped: removing an already-sent one invalidates
-        // the prefix from that point, so it has the same must-stay contract as
-        // the volatile block and the same failure if dropped.
+        // ARCHIVE THIS TURN'S REPLAYABLE TAIL — the turn-scoped volatile block,
+        // exactly as seeded.
         if let sessionId, !sessionId.isEmpty, let runId, !runId.isEmpty {
             let replayable = Array(prefixSeed.messages.dropFirst(prefixSeed.currentUserIndex + 1))
             if !replayable.isEmpty {
@@ -149,19 +116,10 @@ extension SwiftNativeTurnEngine {
                     .record(sessionId: sessionId, runId: runId, messages: replayable)
             }
         }
-        if prefixSeed.shape == .v2Prefix {
-            ConversationPrefixTelemetry.sink?.set(ConversationPrefixSeeding.telemetry(
-                prefixSeed,
-                shape: prefixSeed.shape,
-                // On a plan lane the cacheable tool contribution is the ARRAY,
-                // not the offered set: hashing the offered set would report a
-                // moved prefix on exactly the loads this lane stopped moving.
-                toolSchemaFingerprint: Self.toolSchemaFingerprint(
-                    toolChangePlan?.array ?? ctx.toolSchemas
-                ),
-                toolChangePlan: toolChangePlan
-            ))
-        }
+        ConversationPrefixTelemetry.sink?.set(ConversationPrefixSeeding.telemetry(
+            prefixSeed,
+            toolSchemaFingerprint: Self.toolSchemaFingerprint(ctx.toolSchemas)
+        ))
         var conversation: [LLMMessage] = prefixSeed.messages
         // Context-overflow survival (2026-09-05): the model's REAL window,
         // resolved once per turn, plus the working-notes writer the compactor
@@ -194,9 +152,6 @@ extension SwiftNativeTurnEngine {
             return await IntraTurnContextCompaction.withDeadline(
                 seconds: IntraTurnContextCompaction.distillDeadlineSeconds
             ) {
-                // A plain prompt with no replayed prefix: say v1 outright rather
-                // than inheriting whatever shape the turn bound.
-                try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
                 try await ProviderTurnChoice.$current.withValue(nil) {
                 try await LLMCallContext.$admittedModel.withValue(route.modelId) {
                 try await LLMCallContext.$providerId.withValue(route.providerId) {
@@ -213,14 +168,17 @@ extension SwiftNativeTurnEngine {
                 }
                 }
                 }
-                }
             }
         }
-        var activeToolSchemas = toolChangePlan?.array ?? ctx.toolSchemas
-        // Offered-so-far, so a mid-turn `tool_load` only ever adds what is not
-        // already on the table.
-        var offeredToolNames = Set(toolChangePlan?.offered ?? [])
+        let activeToolSchemas = ctx.toolSchemas
         var dispatches: [TurnEngineResult.ToolDispatchRecord] = []
+        var counters = TurnEngineResult.LoopCounters()
+        defer { ToolLoopTraceObservation.current?.record(counters, dispatches: dispatches) }
+        var previousRoundFailed = false
+        var brakeReason = TurnEngineResult.TerminalReason.iterationLimit
+        func observed(_ result: TurnEngineResult, reason: TurnEngineResult.TerminalReason) -> TurnEngineResult {
+            result.observingTerminal(reason: reason, counters: counters)
+        }
         var lastRawResponse = ""
         // #5: visible prose accumulated across iterations (text deltas only, no
         // tool markers) — carried across a mid-stream throw so the partial isn't
@@ -336,6 +294,7 @@ extension SwiftNativeTurnEngine {
             // `attemptBase*` are the per-turn accumulators as they stood BEFORE
             // this attempt, so a replay can discard the attempt whole.
             var callAttempt = 1
+            var recoveryMode = "replay"
             var retryAfterDrop: Error?
             var reachedLengthLimit = false
             var lengthLimitPartial = ""
@@ -372,12 +331,58 @@ extension SwiftNativeTurnEngine {
             let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
             // Keep stream reduction out of the nested generic expressions;
             // construction and consumption still run inside every binding below.
+            let wakeRoot = remPinsDataRoot
             let consumeAttempt: () async throws -> Void = {
             // Before the stream exists, so a refusal starts no provider call.
             do {
                 try await providerAdmission?()
             } catch {
                 throw ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
+            }
+            // Iteration, budget, compaction, schema refresh and provider
+            // admission all succeeded. Only now can a follow-up leave its queue.
+            if !dispatches.isEmpty, let sessionId, !sessionId.isEmpty {
+                let offers = await ChatTurnSteering.shared.drain(
+                    sessionId: sessionId, cancelFlagPath: cancelFlagPath)
+                if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
+                    await ChatTurnSteering.shared.returnUndelivered(offers, sessionId: sessionId)
+                    throw TurnEngineError.streamCancelled(
+                        partial: toolCallCodec.visiblePrefix(in: visibleText),
+                        underlying: CancellationError())
+                }
+                if wholeTurnBudget.isExhausted {
+                    await ChatTurnSteering.shared.returnUndelivered(offers, sessionId: sessionId)
+                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                    return
+                }
+                for offer in offers {
+                    Self.appendStructuredUserNudge(
+                        ChatTurnSteering.deliveryText(offer.text), to: &conversation)
+                    Self.appendStructuredUserNudge(
+                        ChatTurnSteering.deliveryText(offer.text), to: &attemptMessages)
+                }
+                // What resolved meanwhile feeds this turn, not a second one:
+                // hers only, never a helper's or one a peer steers or answers to.
+                if let root = wakeRoot, !sessionId.hasPrefix("bot-"), PeerDataTaint.current?.isTainted != true,
+                   [nil, "self"].contains(ChatToolSessionContext.envelope?.agent),
+                   let arrived = ResidentWake.shared.take(dataRoot: root) {
+                    Self.appendStructuredUserNudge(arrived, to: &conversation)
+                    Self.appendStructuredUserNudge(arrived, to: &attemptMessages)
+                }
+            }
+            // Sample after steering persistence has spent its wall time.
+            try await LLMCallContext.$remainingTurnSeconds
+                .withValue(wholeTurnBudget.remainingSeconds) {
+            counters.providerAttemptCount += 1
+            if callAttempt == 1 {
+                counters.providerRoundCount += 1
+                if previousRoundFailed { counters.roundsAfterToolFailureCount += 1 }
+                previousRoundFailed = false
+            } else {
+                counters.providerRecoveryCount += 1
+                if recoveryMode == "overflow" { counters.contextOverflowRecoveryCount += 1 }
+                if recoveryMode == "continuation" { counters.providerContinuationCount += 1 }
+                else { counters.providerReplayCount += 1 }
             }
             let stream = llm.streamMessages(
                 messages: attemptMessages,
@@ -413,6 +418,10 @@ extension SwiftNativeTurnEngine {
                         replyTextSettled = settled
                         await progress?(.replyTextSettled(settled))
                     case .textDelta(let delta):
+                        if !delta.isEmpty {
+                            commitInstructionDelivery?()
+                            commitInstructionDelivery = nil
+                        }
                         if !delta.isEmpty, !emittedProviderFirstDelta {
                             emittedProviderFirstDelta = true
                             TurnLifecycleTelemetry.emit(
@@ -432,6 +441,8 @@ extension SwiftNativeTurnEngine {
                             await progress?(.delta(safe))
                         }
                     case .toolCall(let call):
+                        commitInstructionDelivery?()
+                        commitInstructionDelivery = nil
                         guard let parsed = try toolCallCodec.decode(call) else {
                             continue
                         }
@@ -453,6 +464,8 @@ extension SwiftNativeTurnEngine {
                 if ChatCancelFlag.isRaised(cancelFlagPath) {
                     throw CancellationError()
                 }
+                commitInstructionDelivery?()
+                commitInstructionDelivery = nil
             } catch is CancellationError {
                 // 2026-07-21 audit fix: a user stop mid-stream CARRIES the
                 // visible partial (marker-stripped, same as the interrupted
@@ -476,6 +489,7 @@ extension SwiftNativeTurnEngine {
                     lengthLimitPartial = partial
                     return
                 }
+                counters.failedProviderAttemptCount += 1
                 // A reply that was all thinking and no text: the Anthropic-wire
                 // adapters report it as a transient error ("no answer text"),
                 // and an identical replay is proven useless against it
@@ -546,11 +560,8 @@ extension SwiftNativeTurnEngine {
                     underlying: ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
                 )
             }
+            } // LLMCallContext.$remainingTurnSeconds.withValue
             }
-            // Seeding may have fallen back to the v1 message array (no
-            // replayed history). Re-bind what was ACTUALLY produced so the
-            // adapter's wire layout and this body cannot disagree.
-            try await ConversationPrefixShape.$override.withValue(prefixSeed.shape) {
             // Where THIS turn begins. The adapter cannot re-derive it: replayed
             // history carries archived `system` blocks of its own, so the old
             // `lastIndex(.system)` anchor selected one of THOSE and dropped the
@@ -558,10 +569,6 @@ extension SwiftNativeTurnEngine {
             // only ever APPEND, so this index stays correct for the whole turn.
             try await ConversationPrefixBoundary.$currentUserIndex
                 .withValue(prefixSeed.currentUserIndex) {
-            // User, 2026-09-06: how long the WHOLE turn has left, so the router
-            // can shorten this call's wall to leave the reconnect ladder room.
-            try await LLMCallContext.$remainingTurnSeconds
-                .withValue(wholeTurnBudget.remainingSeconds) {
             try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
             try await LLMCallContext.$providerId.withValue(providerRoute) {
             try await LLMCallContext.$serviceTier.withValue(serviceTier) {
@@ -583,9 +590,12 @@ extension SwiftNativeTurnEngine {
             } // LLMCallContext.$serviceTier.withValue
             } // LLMCallContext.$providerId.withValue
             } // LLMCallContext.$admittedModel.withValue
-            } // LLMCallContext.$remainingTurnSeconds.withValue
             } // ConversationPrefixBoundary.$currentUserIndex.withValue
-            } // ConversationPrefixShape.$override.withValue
+
+            if wallClockElapsedSeconds != nil {
+                providerCallCount -= 1
+                break streamingIterations
+            }
 
             // The same Stop checks a clean end of stream gets.
             if emptyThinkingOnlyReply, Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
@@ -601,10 +611,10 @@ extension SwiftNativeTurnEngine {
                         underlying: CancellationError()
                     )
                 }
-                return await finishLengthLimitedTurn(
+                return observed(await finishLengthLimitedTurn(
                     ctx: ctx, partial: rendersProse ? visibleText : lengthLimitPartial, dispatches: dispatches,
                     startNs: startNs, providerCallCount: providerCallCount, codec: toolCallCodec
-                )
+                ), reason: .outputLimit)
             }
 
             // Context-overflow survival, second act: the conversation was
@@ -645,6 +655,7 @@ extension SwiftNativeTurnEngine {
                     break streamingIterations
                 }
                 callAttempt += 1
+                recoveryMode = "overflow"
                 providerCallCount += 1
                 streamedCalls.removeAll(keepingCapacity: true)
                 pendingProtocolDelta = ""
@@ -662,7 +673,7 @@ extension SwiftNativeTurnEngine {
             // the identical call. Something emitted → continuation: keep those
             // bytes as the prefix and ask the provider to resume after them,
             // because re-issuing would render the same paragraph twice.
-            let recoveryMode = iterEmittedProse.isEmpty || !rendersProse ? "replay" : "continuation"
+            recoveryMode = iterEmittedProse.isEmpty || !rendersProse ? "replay" : "continuation"
             // User, 2026-09-06: honor the provider's own Retry-After when it
             // asked for a longer wait than the ladder's backoff, and refuse a
             // wait the turn cannot afford — sleeping past the budget only
@@ -776,8 +787,16 @@ extension SwiftNativeTurnEngine {
             }
             if let violation = roundViolation {
                 lastProtocolViolation = violation
+                counters.protocolViolationRoundCount += 1
                 violationNudgeCount += 1
-                if violationNudgeCount > 2 { break }
+                // Rejected arguments may contain secrets; retain no raw output.
+                let rejectedBytes = Data(iterAccumulated.utf8)
+                TurnTraceBus.fireFromContext(kind: "tool.protocol_violation", surface: surface, payload: .object([
+                    "type": .string(violation.traceType),
+                    "byteSize": .int(Int64(rejectedBytes.count)),
+                    "sha256": .string(SHA256.hash(data: rejectedBytes).map { String(format: "%02x", $0) }.joined()),
+                ]))
+                if violationNudgeCount > 2 { brakeReason = .protocolViolation; break }
                 lastProviderHadToolCalls = false
                 pendingProtocolDelta.removeAll(keepingCapacity: true)
                 // Rewind to where THIS iteration started, not to nothing.
@@ -804,9 +823,11 @@ extension SwiftNativeTurnEngine {
                 let reply = ToolCallParser.containsOnlyIgnorableCalls(iterAccumulated)
                     ? ToolCallParser.stripToolUseMarkers(iterAccumulated).trimmingCharacters(in: .whitespacesAndNewlines)
                     : iterAccumulated
+                let emptyReply = reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                if emptyReply { counters.emptyReplyRoundCount += 1 }
                 // FIX 1 (B1.1): empty-reply recovery, checked BEFORE the announce
                 // bounce. Empty text + empty tool calls is not a valid final;
-                // nudge (max 2) then accept. Resets the accumulated stream state
+                // nudge (max 2) then settle incomplete. Resets the stream state
                 // exactly like the announce/violation siblings so the re-prompted
                 // response cannot leak into the next iteration. An empty string
                 // can never match looksLikeUnfulfilledActionPromise, so the two
@@ -827,6 +848,11 @@ extension SwiftNativeTurnEngine {
                     lastRawResponse = attemptBaseRawResponse
                     visibleText = attemptBaseVisibleText
                     continue
+                }
+                if reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    loopRecoveryReply = "Stopped without a final answer: the model returned no reply text."
+                    brakeReason = .emptyReply
+                    break
                 }
                 // F2-M4: completion-contract bounce, BEFORE flushing the pending
                 // delta as final. Only when tools are available and at most
@@ -850,10 +876,15 @@ extension SwiftNativeTurnEngine {
                     || (dispatches.contains(where: { !ChatToolOutcome.neverRan($0.result) })
                         && ToolCallParser.looksLikeAnnouncedNextToolStep(reply))
                 if promisesWork {
+                    counters.unfulfilledPromiseRoundCount += 1
                     let stoppedAt = dispatches.last(where: { !ChatToolOutcome.neverRan($0.result) })
-                        .map { "after the \($0.name) result" } ?? "before any tool ran"
+                        .map { "after the \(ToolNameAliases.shown($0.name, input: .object($0.input)).name) result" }
+                        ?? "before any tool ran"
                     loopRecoveryReply = "Stopped \(stoppedAt): the reply announced more work without making a tool call. The remaining work is unfinished."
-                    guard announceNudgeCount < 2, !providerTools.schemas.isEmpty else { break }
+                    guard announceNudgeCount < 2, !providerTools.schemas.isEmpty else {
+                        brakeReason = .unfulfilledPromise
+                        break
+                    }
                     announceNudgeCount += 1
                     conversation.append(.assistantText(iterAccumulated))
                     conversation.append(.user(
@@ -881,7 +912,7 @@ extension SwiftNativeTurnEngine {
                 // iteration's text — not just the last iteration. Single-round
                 // turns leave `turnInterstitialProse` empty, so they persist
                 // exactly `reply` as before.
-                return await finishCompletedTurn(
+                let completed = await finishCompletedTurn(
                     reply: Self.joinedProse(turnInterstitialProse, reply),
                     ctx: ctx,
                     dispatches: dispatches,
@@ -898,6 +929,7 @@ extension SwiftNativeTurnEngine {
                     workingCommentaryCharacters: turnInterstitialProse.isEmpty
                         ? nil : turnInterstitialProse.count
                 )
+                return observed(completed, reason: emptyReply ? .emptyReply : completed.resolvedTerminalReason(dataRoot: remPinsDataRoot))
             }
 
             let pendingProse = toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta)
@@ -906,11 +938,11 @@ extension SwiftNativeTurnEngine {
                 await progress?(.delta(pendingProse))
             }
             pendingProtocolDelta.removeAll(keepingCapacity: true)
-            // The marker protocol's call encoding rides the text deltas, so
+            // Text-parsed call encoding rides the text deltas, so
             // the round's raw text in `visibleText` would cut every later
             // partial at this round's first marker. Keep only what reached the
             // surface, as the violation bounce's rewind does.
-            if toolCallCodec == .textMarkers {
+            if streamedCalls.isEmpty || toolCallCodec == .textMarkers {
                 visibleText = attemptBaseVisibleText + iterEmittedProse
             }
             // This iteration is committed (it dispatches tools, so it can never
@@ -932,25 +964,46 @@ extension SwiftNativeTurnEngine {
             // dispatch core → no-progress guard → paired tool_result append →
             // schema refresh + compat-only sweep. The pending-prose flush above
             // runs first.
-            let outcome = try await runToolDispatchRound(
-                providerCalls: providerCalls,
-                iterationRawText: iterAccumulated,
-                ctx: ctx,
-                surface: surface,
-                sessionId: toolSessionId ?? sessionId,
-                tools: tools,
-                progress: progress,
-                conversation: &conversation,
-                dispatches: &dispatches,
-                activeToolSchemas: &activeToolSchemas,
-                providerTools: &providerTools,
-                noProgressGuard: &noProgressGuard,
-                loopRecoveryReply: &loopRecoveryReply,
-                toolChangePlan: toolChangePlan,
-                offeredToolNames: &offeredToolNames,
-                cancelFlagPath: cancelFlagPath,
-                markerCodec: markerCodec
-            )
+            counters.toolRoundCount += 1
+            let roundStart = dispatches.count
+            let outcome: ToolDispatchRoundOutcome
+            do {
+                outcome = try await runToolDispatchRound(
+                    providerCalls: providerCalls,
+                    iterationRawText: iterAccumulated,
+                    ctx: ctx,
+                    surface: surface,
+                    sessionId: toolSessionId ?? sessionId,
+                    tools: tools,
+                    progress: progress,
+                    conversation: &conversation,
+                    dispatches: &dispatches,
+                    providerTools: &providerTools,
+                    noProgressGuard: &noProgressGuard,
+                    loopRecoveryReply: &loopRecoveryReply,
+                    cancelFlagPath: cancelFlagPath,
+                    markerCodec: markerCodec
+                )
+            } catch is CancellationError {
+                throw TurnEngineError.streamCancelled(
+                    partial: toolCallCodec.visiblePrefix(in: visibleText),
+                    underlying: CancellationError()
+                )
+            } catch {
+                // Schema refresh can fail after dispatch; keep the same partial
+                // and whole-turn retry veto as a failure inside the stream.
+                throw TurnEngineError.streamInterrupted(
+                    partial: toolCallCodec.visiblePrefix(in: visibleText),
+                    underlying: ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
+                )
+            }
+            previousRoundFailed = dispatches.dropFirst(roundStart).contains {
+                !ChatToolOutcome.outputLooksSuccessful($0.result)
+                    && !ChatToolOutcome.wasCancelled($0.result)
+                    && !ToolLoopTraceObservation.wasStopped($0.result)
+                    && !ChatToolOutcome.isWaitingOnPerson($0.result)
+                    && !ChatToolOutcome.neverRan($0.result)
+            }
             // A6 progress extension: a round that actually landed a tool result
             // re-earns the surface window (capped at the unattended ceiling).
             // Streamed TEXT is never progress.
@@ -963,7 +1016,8 @@ extension SwiftNativeTurnEngine {
             // prose the user already watched render, exactly like a Stop inside
             // the stream does.
             if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
-                let safePartial = toolCallCodec.visiblePrefix(in: visibleText)
+                let shown = toolCallCodec.visiblePrefix(in: visibleText).trimmingCharacters(in: .whitespacesAndNewlines)
+                let safePartial = loopRecoveryReply.map { shown.isEmpty ? $0 : shown + "\n\n" + $0 } ?? shown
                 throw TurnEngineError.streamCancelled(
                     partial: safePartial, underlying: CancellationError()
                 )
@@ -971,12 +1025,12 @@ extension SwiftNativeTurnEngine {
             // A bot round that filed an approval ends the run here: the
             // approval resumes it, and the reply is what the bot said so far.
             if surface == "bot", ChatTurnExecution.current?.waitingForApproval == true {
-                return TurnEngineResult(reply: toolCallCodec.visiblePrefix(in: LLMCallContext.turnTokenBudget?.partialReply ?? iterAccumulated),
+                return observed(TurnEngineResult(reply: toolCallCodec.visiblePrefix(in: LLMCallContext.turnTokenBudget?.partialReply ?? iterAccumulated),
                     modelUsed: ctx.modelId, recalledIds: ctx.resolvedRecalledIds, toolDispatches: dispatches,
                     elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
-                    rawLLMResponse: lastRawResponse, providerCallCount: providerCallCount, completionState: .incomplete)
+                    rawLLMResponse: lastRawResponse, providerCallCount: providerCallCount, completionState: .incomplete), reason: .approvalRequired)
             }
-            if case .stopLoop = outcome { break }
+            if case .stopLoop = outcome { brakeReason = .noProgress; break }
         }
 
         // A raised need is its own terminal, not exhaustion: the turn ends as
@@ -985,7 +1039,7 @@ extension SwiftNativeTurnEngine {
         // A finished round returned above; a need outranks the exhaustion
         // below on this lane.
         if TurnSettle.isWaitingOnCard(finishedRound: false, capped: false) {
-            return waitingOnInteractionResult(
+            return observed(waitingOnInteractionResult(
                 ctx: ctx,
                 visible: rendersProse
                     ? toolCallCodec.visiblePrefix(in: visibleText)
@@ -994,12 +1048,12 @@ extension SwiftNativeTurnEngine {
                 dispatches: dispatches,
                 startNs: startNs,
                 providerCallCount: providerCallCount
-            )
+            ), reason: .interactionRequired)
         }
         // Shared exhaustion tail (C2). Streaming also treats a streamed
         // tool-call round as "only a structured tool call", so it passes
         // lastProviderHadToolCalls as the extra signal.
-        return await finishExhaustedTurn(
+        return observed(await finishExhaustedTurn(
             ctx: ctx,
             lastRawResponse: rendersProse ? lastRawResponse : lastRoundRaw,
             lastProtocolViolation: lastProtocolViolation,
@@ -1019,7 +1073,7 @@ extension SwiftNativeTurnEngine {
                 && lastProviderHadToolCalls,
             visiblePartial: rendersProse ? toolCallCodec.visiblePrefix(in: visibleText) : "",
             codec: toolCallCodec
-        )
+        ), reason: wallClockElapsedSeconds == nil ? brakeReason : .wallClockLimit)
     }
 
     /// 2026-09-22: each round's narration and the answer were concatenated

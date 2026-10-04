@@ -116,7 +116,7 @@ private final class MobileToolCatalogStore: ObservableObject {
     @Published var isLoading = false
     @Published var error: String?
 
-    func refresh(pairingStore: PairingStore) async {
+    func refresh(pairingStore: PairingStore, pollIncoming: Bool = true) async {
         #if DEBUG
         if MobileDesignSamples.screen != nil {
             tools = MobileToolDesignSample.tools
@@ -131,10 +131,11 @@ private final class MobileToolCatalogStore: ObservableObject {
         error = nil
         defer { isLoading = false }
 
-        await iCloudBridge.shared.pollIncomingNow()
+        if pollIncoming { await iCloudBridge.shared.pollIncomingNow() }
         if let rows: [ToolRecord] = await iCloudSyncEngine.shared.loadSnapshotArrayAsync(
             named: "tools_snapshot.json"
         ) {
+            guard !Task.isCancelled else { return }
             tools = rows.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         } else if tools.isEmpty {
             error = "No tool catalog has synced yet — Mac is publishing."
@@ -159,6 +160,7 @@ private struct MobileToolCatalogView: View {
     let accessory: AnyView
     @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = MobileToolCatalogStore()
+    @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var searchText = ""
 
     private var visibleTools: [ToolRecord] {
@@ -167,7 +169,7 @@ private struct MobileToolCatalogView: View {
 
     var body: some View {
         AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
-                 freshnessGroup: "skills_snapshot", accessory: accessory) {
+                 freshnessGroup: "tools_snapshot", accessory: accessory) {
             switch ToolCatalogPresentation.contentState(
                 isLoading: store.isLoading,
                 error: store.error,
@@ -211,8 +213,9 @@ private struct MobileToolCatalogView: View {
         .refreshable {
             await store.refresh(pairingStore: pairingStore)
         }
-        .task {
-            await store.refresh(pairingStore: pairingStore)
+        .task(id: sync.groupTransportDeliveryAt["catalog"]) {
+            await store.refresh(pairingStore: pairingStore,
+                                pollIncoming: sync.groupTransportDeliveryAt["catalog"] == nil)
         }
     }
 

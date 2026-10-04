@@ -20,7 +20,7 @@ extension MacSyncEngine {
     // the "signature" field in the JSON.  Until then all unsigned messages are
     // rejected when signature validation is enforced.
 
-    private func pairingSecret() throws -> Data {
+    func pairingSecret() throws -> Data {
         guard !pairingSecretRotationInProgress else {
             throw NSError(
                 domain: "MacSyncEngine.Security",
@@ -45,6 +45,12 @@ extension MacSyncEngine {
     public func finishPairingSecretRotation(with persistedSecret: Data?) {
         _pairingSecret = persistedSecret
         pairingSecretRotationInProgress = false
+        // Revoke the old Drive write generation and republish into this key's
+        // directory. Late writes remain confined to their captured old URL.
+        if isActive, inboxDir != nil, let docsURL = activeDocsURL {
+            stop()
+            start(docsURL: docsURL)
+        }
     }
 
     /// Compute HMAC-SHA256 over `body` using the pairing secret.
@@ -68,6 +74,12 @@ extension MacSyncEngine {
         return body
     }
 
+    func authenticateInboxResponse(_ response: [String: String]) -> Bool {
+        guard let signature = response["signature"],
+              let expected = try? signedResponse(response)["signature"] else { return false }
+        return constantTimeEqual(signature.lowercased(), expected)
+    }
+
     @discardableResult
     func writeRejectedResponseIfNeeded(
         action: InboxAction,
@@ -84,7 +96,9 @@ extension MacSyncEngine {
         let code: String
         if lower.contains("hmac") || lower.contains("signature wrong") {
             code = "signature_invalid"
-        } else if lower.contains("timestamp") || lower.contains("too old") {
+        } else if lower.hasPrefix("message too old:") {
+            code = "expired_before_execution"
+        } else if lower.contains("timestamp") {
             code = "timestamp_invalid"
         } else {
             code = "signature_required"
@@ -157,9 +171,12 @@ extension MacSyncEngine {
         guard let ts = formatter.date(from: action.createdAt) ?? formatter2.date(from: action.createdAt) else {
             return "invalid timestamp: \(action.createdAt)"
         }
-        let age = abs(Date().timeIntervalSince(ts))
+        let age = Date().timeIntervalSince(ts)
         if age > 300 {
             return "message too old: \(Int(age))s"
+        }
+        if age < -300 {
+            return "timestamp is too far in the future: \(Int(-age))s"
         }
         return nil
     }

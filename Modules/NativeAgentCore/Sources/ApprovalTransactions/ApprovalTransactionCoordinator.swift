@@ -6,9 +6,11 @@ import PersistenceCore
 import Studio
 import TurnTrace
 import MemoryV2
+import AgentWorkspace
 import ApprovalInbox
 import ChatOrchestration
 import TrustCenter
+import ToolRegistry
 import DreamREMCycle
 import WorkshopExecution
 import Dispatcher
@@ -102,7 +104,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                         detail: "self-improvement \(op) FAILED: missing target for \(op)")
                     return
                 }
-                try await effects.enableSkill(name: target)
+                try await effects.enableSkill(name: target, reviewedDigest: nil)
             default:
                 NSLog("[selfImprovement] unknown apply op: \(op)")
                 try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
@@ -222,6 +224,16 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 let appended = try await REMGrowthWriter.appendApprovedLesson(
                     personaRoot: personaRoot, proposalText: proposalText)
                 _ = try await store.applyApproval(proposalId: proposalId)
+                // Phase 5 C1: the lesson keeps the moment that taught it.
+                // Best-effort: the approval stands whatever happens here.
+                if let row = store.loadAll().first(where: { $0.id == proposalId }) {
+                    do {
+                        try await REMLessonOrigin.record(
+                            row, memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot), dataRoot: dataRoot)
+                    } catch {
+                        NSLog("[remProposal] lesson origin not kept for \(proposalId): \(error)")
+                    }
+                }
                 try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                     id: rec.id,
                     executedAction: .object([
@@ -273,71 +285,33 @@ public struct ApprovalTransactionCoordinator: Sendable {
         }
     }
 
-    /// Applies a resolved `skill.proposal` card (sweep item 38 — the
-    /// procedural lane's only landing).
-    ///
-    /// APPROVE → the draft body the card previewed lands under
-    /// `data/skills/bodies/<name>.md` (the RUNTIME shelf; `persona/skills/
-    /// bodies` stays curated, per the plan's non-goals), then the canonical
-    /// serialized pointer sync runs so recall surfaces it. DENY/CANCEL → the
-    /// core refuses to write and returns `.declined`; nothing lands and no
-    /// pointer appears. Every branch annotates, including failures: an
-    /// approved card must never read as silently applied (W8 lesson).
-    public func applyResolvedProceduralSkillProposal(
-        from rec: ApprovalRecord,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
-        guard rec.action == ProceduralSkillProposal.approvalAction,
-              rec.status == "resolved", let decision = rec.decision else { return }
-        do {
-            let outcome = try await ProceduralSkillProposal.applyResolved(
-                record: rec, dataRoot: dataRoot
-            )
-            switch outcome {
-            case .applied(let skillName, let bodyPath, let bodyWritten):
-                // Pointer sync AFTER the body exists. A sync failure must not
-                // make a written body read as unwritten, so it annotates its
-                // own outcome rather than throwing the whole apply away.
-                var pointerSynced = true
-                do {
-                    try await effects.reconcileSkillEvolutionRecall(
-                        memory: SwiftNativeMemoryV2.shared,
-                        dataRoot: dataRoot,
-                        personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-                    )
-                } catch {
-                    pointerSynced = false
-                    NSLog("[proceduralSkill] pointer sync failed for \(skillName): \(error)")
-                }
-                try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                    id: rec.id,
-                    executedAction: .object([
-                        "op": .string("procedural_skill_approve"),
-                        "skillName": .string(skillName),
-                        "bodyWritten": .bool(bodyWritten),
-                        "pointerSynced": .bool(pointerSynced),
-                    ]),
-                    detail: pointerSynced
-                        ? "Skill proposal approved — body at \(bodyPath); recall pointer synced"
-                        : "Skill proposal approved — body at \(bodyPath); POINTER SYNC FAILED "
-                            + "(the body is on disk; the next skill mutation or launch re-syncs)")
-            case .declined(let skillName):
-                try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                    id: rec.id,
-                    executedAction: .object([
-                        "op": .string("procedural_skill_\(decision)"),
-                        "skillName": .string(skillName),
-                        "bodyWritten": .bool(false),
-                    ]),
-                    detail: "Skill proposal \(decision) — nothing written, no recall pointer")
-            }
-        } catch {
-            NSLog("[proceduralSkill] \(decision) failed for approval \(rec.id): \(error)")
-            try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                id: rec.id,
-                executedAction: .object(["error": .string("\(error)")]),
-                detail: "Skill proposal \(decision) FAILED: \(error.localizedDescription)")
+    /// User's answer to a skill script install card. Approved admits exactly
+    /// the digest the card showed, through the Skills page's own Install
+    /// (`enableSkill(name:reviewedDigest:)`), which refuses a script changed
+    /// since; denied or withdrawn leaves it drafted. Every branch annotates.
+    public func applyResolvedSkillScriptInstall(from rec: ApprovalRecord) async {
+        guard rec.action == SwiftNativeApprovalInbox.skillScriptInstallAction, rec.status == "resolved" else { return }
+        let root = dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
+        guard let (skill, digest) = SwiftNativeApprovalInbox.skillScriptInstallBinding(rec) else {
+            try? await ApprovalExecutionAnnotation.annotateApprovalExecution(id: rec.id,
+                executedAction: .object(["installed": .bool(false), "error": .string("no skill or digest bound")]),
+                detail: "Nothing was installed: the card names no skill and digest.", root: root)
+            return
         }
+        var done: [String: JSONValue] = ["skill": .string(skill), "digest": .string(digest), "installed": .bool(false)]
+        var detail = "Not approved: \(skill)'s script was not turned on; it stays drafted."
+        if rec.decision == ApprovalDecision.approved.rawValue {
+            do {
+                try await effects.enableSkill(name: skill, reviewedDigest: digest)
+                done["installed"] = .bool(true)
+                detail = "Installed \(skill)'s script, digest \(digest.prefix(12))."
+            } catch {
+                done["error"] = .string(error.localizedDescription)
+                detail = "Nothing was installed: \(error.localizedDescription)"
+            }
+        }
+        try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
+            id: rec.id, executedAction: .object(done), detail: detail, root: root)
     }
 
     /// Applies a resolved `studio.canon` card (desk 903 phase 4) — the ONE card
@@ -405,7 +379,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             detail: herSeat
                 ? "Canon proposal approved by the agent but the row did not land; an executor has "
                     + "no live turn to record, so nothing was written. Re-run "
-                    + "studio_canon_resolve in chat — it is idempotent by proposal id."
+                    + "app studio.canon_resolve in chat — it is idempotent by proposal id."
                 : "Canon proposal NOT applied: "
                     + (StudioCanonError.approvalNotFromAgentSeat(rec.decidedBy ?? "unknown")
                         .errorDescription ?? "the canon is the agent's to tend"))
@@ -627,10 +601,6 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 action: ExternalSendApprovalRequest.approvalAction,
                 shouldReconcile: { _ in true },
                 execute: { _ = await effects.applyResolvedExternalSend(from: $0) }),
-            ApprovalExecutionReconcileKind(
-                action: ProceduralSkillProposal.approvalAction,
-                shouldReconcile: { _ in true },
-                execute: { await self.applyResolvedProceduralSkillProposal(from: $0) }),
             // Desk 903 phase 4. Reconcilable like the rest, and refusing like
             // nothing else: an owner-resolved canon card replays into the same
             // annotated refusal rather than into her museum.
@@ -638,6 +608,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 action: StudioCanonProposal.approvalAction,
                 shouldReconcile: { _ in true },
                 execute: { await self.applyResolvedStudioCanonProposal(from: $0) }),
+            ApprovalExecutionReconcileKind(
+                action: SwiftNativeApprovalInbox.skillScriptInstallAction,
+                shouldReconcile: { _ in true },
+                execute: { await self.applyResolvedSkillScriptInstall(from: $0) }),
             ApprovalExecutionReconcileKind(
                 action: SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
                 shouldReconcile: { _ in true },
@@ -1118,11 +1092,16 @@ public struct ApprovalTransactionCoordinator: Sendable {
         }
 
         do {
+            // Raw built-in bridge approvals retain their original file and
+            // external-MCP envelope after the person resolves the card.
+            let isBuiltInBridge = ["codex-bridge", "claude-bridge"].contains(
+                replay.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            )
             let tools = effects.toolDispatchClient(
                 includeEvolutionBridge: evolutionBridgeEnabledForApprovalReplay(
                     surface: replay.surface
                 ),
-                denyExternalMcp: false,
+                denyExternalMcp: isBuiltInBridge,
                 enforceAppAutonomy: false
             )
             let trust = SingleApprovedToolAutonomyResolver(
@@ -1132,7 +1111,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             )
             let gated = makeGatedToolDispatchClient(
                 tools: tools,
-                fileAccess: "auto",
+                fileAccess: isBuiltInBridge ? "read_only" : "auto",
                 approvalFiler: nil,
                 dataRoot: dataRoot,
                 trust: trust,
@@ -1217,7 +1196,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
     }
 
     /// Persist exactly one compact tool receipt into the conversation that
-    /// originated a generic approval, then claim one read-only follow-up on
+    /// originated a generic approval, then claim one follow-up turn on
     /// that same surface. A refused turn leaves the receipt as recovery evidence.
     @discardableResult
     public func ensureChatToolApprovalOutcomeReceipt(
@@ -1343,11 +1322,23 @@ public struct ApprovalTransactionCoordinator: Sendable {
             envelope["status"] = .string(normalizedStatus)
         }
         let summary = (try? JSONValue.object(envelope).serialize(pretty: false)) ?? prose
+        // Wave 2 #8: the steps queued for after this card, read fresh (a
+        // decline drops them here), and the steer the card and they carried.
+        let resume = await HerScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
+                                            dataRoot: dataRoot)
+        let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
+        // No record at all: a card filed before cards kept one (`unrecorded`).
+        let carried = PeerDataTaint.steer(in: payload["peer"])
+        let steer = PeerDataTaint(restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
+        // The filing turn's file access; nil for an older card (the host's chat default).
+        let fileAccess: String? = if case .string(let mode)? = payload["fileAccess"] { mode } else { nil }
         do {
             let legacyStartedAt = try await inbox.writeChatReceipt(
                 approvalID: rec.id, sessionID: safeSessionID, toolName: replay.toolName,
                 surface: replay.surface, summary: summary, resultClass: resultClass.rawValue,
                 ok: ok, resultPreview: resultPreview,
+                returnedID: Self.jsonString(executedAction, "returned_id"),
+                effects: Self.jsonString(executedAction, "effects"),
                 recoveredAt: continueConversation ? nil : (rec.resolvedAt ?? rec.createdAt))
             let abandonedClaim: Bool = {
                 guard case .object(let state)? = rec.chatContinuation else { return false }
@@ -1366,11 +1357,15 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 rec.id, done: false, clearQueuedDelivery: true) {
                 var settlement = "completed"
                 do {
-                    try await continuation(dataRoot, safeSessionID, replay.envelope, """
-                        The approval for \(replay.toolName) was decided. This is its receipt, not a new user request:
-                        \(summary)
-                        Use read-only tools to verify the outcome and finish any remaining reads, then briefly tell the user what happened, including any failure or uncertainty. Do not repeat the approved action or ask to approve this card again. Effectful tools are unavailable in this follow-up; report any remaining actions as unfinished.
-                        """)
+                    try await PeerDataTaint.$current.withValue(steer) {
+                        try await ChatToolSessionContext.$fileAccess.withValue(fileAccess) {
+                        try await continuation(dataRoot, safeSessionID, replay.envelope, """
+                            The approval for \(replay.toolName) was decided. This is its receipt, not a new user request:
+                            \(summary)\(resume.text.isEmpty ? "" : "\n" + resume.text)
+                            Verify the outcome as needed, then briefly tell the user what happened, including any failure or uncertainty. Do not repeat the approved action or ask to approve this card again.
+                            """)
+                        }
+                    }
                 } catch {
                     settlement = "failed"
                     NSLog("[approvals] continuation failed for \(rec.id); receipt retained: \(error)")
@@ -1392,108 +1387,16 @@ public struct ApprovalTransactionCoordinator: Sendable {
 
     public typealias ChatApprovalContinuation = @Sendable (URL, String, TurnEnvelope, String) async throws -> Void
 
-    /// The receipt carries no authority to act again. A closed set of readers
-    /// is enforced at both discovery and dispatch, including after lazy loads.
-    /// Readers are available only for this turn; session tool state is untouched.
-    public struct ApprovalReceiptTools: ToolDispatchClient {
-        private let inner: any ToolDispatchClient
-        private static let readers: Set<String> = [
-            "time_now", "read_file", "list_dir", "file_excerpt", "grep",
-            "git_status", "git_log", "repo_dirty_summary",
-            "mac_calendar_list_upcoming", "mac_reminders_list_due_today",
-            "contacts_search", "mail_list_recent", "mail_search",
-            "messages_recent_threads", "notes_search",
-            "music_now_playing", "music_list_library", "music_list_playlists",
-            "desk_read", "delegation_status", "scheduler_list_jobs", "list_memories",
-        ]
-        private static let discovery: Set<String> = ["tool_catalog", "tool_load"]
-
-        public init(inner: any ToolDispatchClient) { self.inner = inner }
-
-        public static func withTransientLoadout<T: Sendable>(
-            _ operation: @Sendable () async throws -> T
-        ) async rethrows -> T {
-            try await LLMCallContext.$transientToolLoadout.withValue(readers.union(discovery)) {
-                try await operation()
-            }
-        }
-
-        public func listAvailableTools() async throws -> [String] {
-            try await inner.listAvailableTools().filter {
-                Self.readers.contains($0) || Self.discovery.contains($0)
-            }
-        }
-
-        public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-            try await inner.listAvailableToolSchemas().filter {
-                Self.readers.contains($0.name) || Self.discovery.contains($0.name)
-            }
-        }
-
-        public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-            guard Self.readers.contains(tool) || Self.discovery.contains(tool) else {
-                throw AutonomyGateError.toolDenied(reason: "Approval follow-up is read-only. Use tool_catalog to find a reader; report remaining actions as unfinished until a new user turn.")
-            }
-            if tool == "tool_catalog" {
-                // Do not forward a broad catalog search: it can auto-load
-                // writers and return their schemas inside its result.
-                let names = try await listAvailableTools().filter { Self.readers.contains($0) }.sorted()
-                return .object([
-                    "status": .string("ok"),
-                    "read_only": .bool(true),
-                    "tools": .array(names.map { .object(["name": .string($0)]) }),
-                    "next_step": .string("Call tool_load with names from this read-only list, then verify the outcome. Effectful tools are unavailable in this follow-up."),
-                ])
-            }
-            if tool == "tool_load" {
-                var names: [String] = []
-                if case .array(let values)? = input["names"] {
-                    names = values.compactMap { value in
-                        guard case .string(let name) = value else { return nil }
-                        return name.trimmingCharacters(in: .whitespacesAndNewlines)
-                    }
-                }
-                if case .string(let name)? = input["name"] {
-                    names.append(name.trimmingCharacters(in: .whitespacesAndNewlines))
-                }
-                guard input["category"] == nil || input["category"] == .null,
-                      !names.isEmpty, names.allSatisfy({ Self.readers.contains($0) }) else {
-                    throw AutonomyGateError.toolDenied(reason: "Approval follow-up can load only reader names from tool_catalog. Use names, not category; no tools were loaded.")
-                }
-                // All available readers are already offered for this turn.
-                // Never invoke the session loader, including its family expansion.
-                let available = Set(try await listAvailableToolSchemas().map(\.name))
-                let requested = Set(names)
-                let loaded = requested.intersection(available).sorted().map(JSONValue.string)
-                let unavailable = requested.subtracting(available).sorted().map(JSONValue.string)
-                return .object([
-                    "status": .string(unavailable.isEmpty ? "loaded" : (loaded.isEmpty ? "unavailable" : "partial")),
-                    "read_only": .bool(true),
-                    "loaded": .array(loaded),
-                    "loaded_now": .array([]),
-                    "already_active": .array(loaded),
-                    "turn_active": .array(loaded),
-                    "schemas_added": .array([]),
-                    "unavailable": .array(unavailable),
-                ])
-            }
-            return try await Self.withTransientLoadout {
-                try await inner.dispatch(tool: tool, input: input, surface: surface)
-            }
-        }
-    }
-
+    /// The follow-up after User decides runs with her normal tools (Wave 2 #8),
+    /// under the steer the card and its queued steps carried: the caller binds
+    /// it as `PeerDataTaint.current`, and the host turn keeps it.
     public func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String) async throws {
-        let readers = ApprovalReceiptTools(inner: effects.toolDispatchClient(
-            // The ordinary chat membrane owns autonomy for the saved origin.
-            includeEvolutionBridge: false, denyExternalMcp: true, enforceAppAutonomy: false))
-        try await effects.continueChatToolApproval(
-            dataRoot: dataRoot, sessionID: sessionID, envelope: envelope, prompt: prompt, tools: readers)
+        try await effects.continueChatToolApproval(dataRoot: dataRoot, sessionID: sessionID, envelope: envelope, prompt: prompt)
     }
 
     /// The actual replay writer's projection, shared with injected fixtures.
-    /// Preserve only the canonical outcome tag from the original status-bearing
-    /// result before the privacy-safe preview is clipped; never persist raw data.
+    /// Preserve outcome and receipt fields from the complete result before the
+    /// privacy-safe preview is clipped; never persist the full result.
     public static func chatToolApprovalExecutionReceipt(
         toolName: String,
         surface: String,
@@ -1501,8 +1404,13 @@ public struct ApprovalTransactionCoordinator: Sendable {
     ) -> (action: JSONValue, preview: String) {
         // Approval records sync across surfaces. Tool-specific redaction must
         // remove literal values typed by ax_act before general redaction/caps.
-        let preview = Self.approvalResultPreview(
-            MacInjectionResultRedaction.redacted(tool: toolName, result: result))
+        let redactedResult = MacInjectionResultRedaction.redacted(tool: toolName, result: result)
+        let returnedID = SessionHistoryPromptRenderer.returnedIdentifier(redactedResult)
+            .map(TurnTraceRedactor.redactText)
+        let resultEffects = SessionHistoryPromptRenderer.receiptField("effects", in: redactedResult).map {
+            String(SessionHistoryPromptRenderer.receiptValue(TurnTraceRedactor.redactValue($0)).prefix(512))
+        }
+        let preview = Self.approvalResultPreview(redactedResult)
         // The outcome is derived from the COMPLETE original result and retained
         // here, before the preview clips it. A result without a `status` field
         // still carries evidence (ok/success/error); it is never assumed to have
@@ -1525,6 +1433,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
             "resultClass": .string(resultClass.rawValue),
             "resultPreview": .string(preview),
         ]
+        if let returnedID { action["returned_id"] = .string(returnedID) }
+        if let resultEffects { action["effects"] = .string(resultEffects) }
         if toolName == "agent_connect" || toolName == "agent_message" {
             action["contactResult"] = Self.agentContactReceipt(TurnTraceRedactor.redactValue(result))
         }
@@ -1620,7 +1530,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
     /// step (W6: resume must never mark-without-executing) and continues the
     /// plan; denied → step rejected + execution failed (also via the
     /// executor, so the timeline + step record stay daemon-shaped). Every
-    /// branch annotates the approval record executed/FAILED. On an
+    /// completed branch annotates the approval record executed/FAILED. Capacity
+    /// deferral leaves the resolved approval unannotated for the executor drain. On an
     /// infrastructure failure the blocked step's approval_id claim is
     /// CLEARED so a later pass can re-stage a fresh approval instead of
     /// dead-ending on a stamp that no longer matches anything.
@@ -1666,8 +1577,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
         // FROZEN WIRE — deliberate keep, do NOT de-mission these (P2-8 owns any
         // future move).
         //
-        // The five `"missionId"` keys and the three `mission_step_*` `op`
-        // labels below are PERSISTED AUDIT ANNOTATIONS: they are written into
+        // The `"missionId"` keys and `mission_step_*` `op` labels here and in
+        // the executor's approved-step annotation are PERSISTED AUDIT ANNOTATIONS: they are written into
         // the approval record's `executedAction` and land in
         // `workflows/approvals/requests.json`, which is append-and-amend and is
         // never rewritten. A rename here does not migrate the ~thousands of
@@ -1683,17 +1594,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
         do {
             switch decision {
             case "approved":
-                let record = try await executor.resumeAfterApproval(
+                _ = try await executor.resumeAfterApproval(
                     executionId: executionId, stepId: stepId, approved: true, approvalId: rec.id)
-                try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
-                    id: rec.id,
-                    executedAction: .object([
-                        "op": .string("mission_step_resume"),
-                        "missionId": .string(executionId),
-                        "stepId": .string(stepId),
-                        "missionStatus": .string(record.status),
-                    ]),
-                    detail: "Desk step approved — executed; Desk execution now \(record.status)")
             case "denied":
                 let record = try await executor.resumeAfterApproval(
                     executionId: executionId, stepId: stepId, approved: false, approvalId: rec.id)
@@ -1718,6 +1620,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
                     ]),
                     detail: "Desk step approval canceled — claim cleared; Desk execution stays blocked")
             }
+        } catch WorkshopExecutionError.approvalDeferred {
+            // Preserve the resolved decision and approval_id. Capacity-opening
+            // execution events wake the drain, which retries this exact approval.
+            return
         } catch WorkshopExecutionError.staleApproval(let detail) {
             // gpt-5.5 executor-port blocker #3 (2026-06-10): stale card —
             // the execution is no longer blocked_on_approval (cancelled/
@@ -1878,14 +1784,14 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 from: rec,
                 dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
             )
-        } else if rec.action == ProceduralSkillProposal.approvalAction {
-            // Sweep item 38, the procedural lane: approve WRITES the draft
-            // body the card showed verbatim to data/skills/bodies and fires
-            // the same pointer sync every other skill mutation fires, so the
-            // craft is recallable the same day. Deny/cancel write nothing —
-            // the executor self-guards on the decision. Crash window healed by
-            // the reconcile kind registered below.
-            await self.applyResolvedProceduralSkillProposal(from: rec)
+        } else if rec.action == "skill.proposal" {
+            // The procedural lane that filed these is retired (skills-as-code
+            // 4b): an old card resolves with a result line, never silently.
+            try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
+                id: rec.id, executedAction: .object(["op": .string("skill_proposal_retired")]),
+                detail: "The old skill-proposal flow is retired; nothing was saved. Agent writes skills herself now.")
+        } else if rec.action == SwiftNativeApprovalInbox.skillScriptInstallAction {
+            await applyResolvedSkillScriptInstall(from: rec)
         } else if rec.action == StudioCanonProposal.approvalAction {
             // Desk 903 phase 4, and the one inverted card in the app: SHE is the
             // sole approver of her own canon. Resolving from an owner surface
@@ -1960,6 +1866,11 @@ private struct SingleApprovedToolAutonomyResolver: AutonomyResolver {
     }
 
     func autonomyLevel(forTool toolName: String, surface: String) async throws -> String {
+        // A saved approval cannot override a later Trust revocation.
+        let currentLevel = try await delegate.autonomyLevel(forTool: toolName, surface: surface)
+        if currentLevel == "blocked" || currentLevel == "deny" {
+            return currentLevel
+        }
         // 2026-09-06: `approvedTool` is the PERSISTED spelling (`save.skill`),
         // and the gated chain canonicalizes before this resolver is consulted,
         // so a pre-upgrade dotted approval no longer recognized its own tool.
@@ -1969,6 +1880,6 @@ private struct SingleApprovedToolAutonomyResolver: AutonomyResolver {
            surface == approvedSurface {
             return "auto"
         }
-        return try await delegate.autonomyLevel(forTool: toolName, surface: surface)
+        return currentLevel
     }
 }

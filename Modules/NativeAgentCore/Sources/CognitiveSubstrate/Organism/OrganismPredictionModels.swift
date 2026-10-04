@@ -32,7 +32,7 @@ public enum OrganismPredictionKind: String, Codable, Sendable, Equatable, CaseIt
         case .toolCompletion: return "a tool to finish"
         case .providerCompletion: return "a reply to come back"
         case .phoneDelivery: return "a message to reach him"
-        case .approvalResolution: return "an approval from User"
+        case .approvalResolution: return "your approval"
         case .workflowAdvance: return "the work to move on"
         case .semanticExpectation: return "how that landed"
         }
@@ -487,7 +487,8 @@ public struct OrganismPrediction: Codable, Sendable, Equatable, Identifiable {
         semanticScope: OrganismSemanticScope? = nil,
         horizon: OrganismHorizonExpectation? = nil
     ) {
-        self.id = String(id.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
+        // Correlated operational identities can occupy 124 characters.
+        self.id = String(id.trimmingCharacters(in: .whitespacesAndNewlines).prefix(128))
         self.kind = kind
         self.sourceOrgan = String(sourceOrgan.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
         self.createdAt = createdAt
@@ -640,6 +641,9 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
     public var bodyConfidence: OrganismBodyConfidence
     public var lastUpdatedAt: Date?
     public var lastViolationAt: Date?
+    /// Feeling-bearing misses have their own clock; infrastructure misses
+    /// still update the operational violation clock above.
+    public var lastFeltViolationAt: Date?
     /// Added after the original bounded prediction ledger shipped. `nil`
     /// means historical per-kind totals were never recorded; readers must not
     /// reinterpret the status-biased legacy reservoir as an outcome sample.
@@ -661,6 +665,7 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
         bodyConfidence: OrganismBodyConfidence = .neutral,
         lastUpdatedAt: Date? = nil,
         lastViolationAt: Date? = nil,
+        lastFeltViolationAt: Date? = nil,
         outcomeCountsByKind: [String: OrganismPredictionOutcomeCounts]? = nil
     ) {
         self.predictions = predictions
@@ -672,6 +677,7 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
         self.bodyConfidence = bodyConfidence
         self.lastUpdatedAt = lastUpdatedAt
         self.lastViolationAt = lastViolationAt
+        self.lastFeltViolationAt = lastFeltViolationAt
         self.outcomeCountsByKind = outcomeCountsByKind
     }
 

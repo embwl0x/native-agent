@@ -112,6 +112,7 @@ struct TrackingEntity: Sendable, Equatable {
     // from `signature` (it is not remote state) and optional so pre-delta
     // snapshots decode as nil, which fails open into a full detail fetch.
     var detailFetchedAt: String? = nil
+    var reopenedObservedAt: String? = nil
 
     var signature: String {
         // "needs_user" is an internal fingerprint token (never persisted —
@@ -150,6 +151,7 @@ struct TrackingEntity: Sendable, Equatable {
         if let checks { o["checks"] = .string(checks) }
         if let mergeable { o["mergeable"] = .string(mergeable) }
         if let detailFetchedAt { o["detailFetchedAt"] = .string(detailFetchedAt) }
+        if let reopenedObservedAt { o["reopenedObservedAt"] = .string(reopenedObservedAt) }
         if let commandObservation,
            let data = try? JSONEncoder().encode(commandObservation),
            let value = try? JSONValue.parse(data) {
@@ -171,7 +173,7 @@ struct TrackingEntity: Sendable, Equatable {
                   let data = try? raw.serializedData(pretty: false) else { return nil }
             return try? JSONDecoder().decode(GitHubCommandObservation.self, from: data)
         }()
-        return TrackingEntity(key: key, repo: repo, number: Int(number), kind: kind, title: title, state: state, updatedAt: updatedAt, url: url, author: str("author"), reviewState: str("reviewState"), checks: str("checks"), mergeable: str("mergeable"), needsUser: flag("needsUser"), blocked: flag("blocked"), stale: flag("stale"), commandObservation: commandObservation, detailFetchedAt: str("detailFetchedAt"))
+        return TrackingEntity(key: key, repo: repo, number: Int(number), kind: kind, title: title, state: state, updatedAt: updatedAt, url: url, author: str("author"), reviewState: str("reviewState"), checks: str("checks"), mergeable: str("mergeable"), needsUser: flag("needsUser"), blocked: flag("blocked"), stale: flag("stale"), commandObservation: commandObservation, detailFetchedAt: str("detailFetchedAt"), reopenedObservedAt: str("reopenedObservedAt"))
     }
 }
 
@@ -186,6 +188,9 @@ struct TrackingSnapshot: Sendable, Equatable {
     let deskCreated: Int
     let deskUpdated: Int
     let deskArchived: Int
+    var refreshedRepositories: [String]? = nil
+    var refreshFailures: [String: String] = [:]
+    var skippedRepositories: [String] = []
 
     var json: JSONValue {
         var out: [String: JSONValue] = [
@@ -196,6 +201,9 @@ struct TrackingSnapshot: Sendable, Equatable {
         ]
         if let mode { out["mode"] = .string(mode.rawValue) }
         if let contributorLogin { out["contributorLogin"] = .string(contributorLogin) }
+        if let refreshedRepositories { out["refreshedRepositories"] = .array(refreshedRepositories.map(JSONValue.string)) }
+        out["refreshFailures"] = .object(refreshFailures.mapValues(JSONValue.string))
+        out["skippedRepositories"] = .array(skippedRepositories.map(JSONValue.string))
         return .object(out)
     }
 
@@ -216,7 +224,13 @@ struct TrackingSnapshot: Sendable, Equatable {
             newKeys: strings("newKeys"),
             deskCreated: int("deskCreated"),
             deskUpdated: int("deskUpdated"),
-            deskArchived: int("deskArchived")
+            deskArchived: int("deskArchived"),
+            refreshedRepositories: o["refreshedRepositories"] == nil ? nil : strings("refreshedRepositories"),
+            refreshFailures: {
+                guard case .object(let failures)? = o["refreshFailures"] else { return [:] }
+                return failures.compactMapValues { if case .string(let error) = $0 { return error }; return nil }
+            }(),
+            skippedRepositories: strings("skippedRepositories")
         )
     }
 }

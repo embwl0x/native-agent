@@ -17,10 +17,6 @@ public struct RoutePlanResult: Sendable, Equatable {
     public let risk: String
     public let requiresApproval: Bool
     public let matchedCapabilities: [JSONValue]
-    /// High-confidence tool groups already implied by the deterministic route.
-    /// This is readiness only: it exposes schemas before the first provider
-    /// call and grants no dispatch, approval, or effect authority.
-    public let toolReadinessGroups: [String]
     public let nextActions: [String]
     public let createdAt: String
 
@@ -33,7 +29,6 @@ public struct RoutePlanResult: Sendable, Equatable {
         risk: String,
         requiresApproval: Bool,
         matchedCapabilities: [JSONValue],
-        toolReadinessGroups: [String] = [],
         nextActions: [String],
         createdAt: String
     ) {
@@ -45,7 +40,6 @@ public struct RoutePlanResult: Sendable, Equatable {
         self.risk = risk
         self.requiresApproval = requiresApproval
         self.matchedCapabilities = matchedCapabilities
-        self.toolReadinessGroups = toolReadinessGroups
         self.nextActions = nextActions
         self.createdAt = createdAt
     }
@@ -60,7 +54,6 @@ public struct RoutePlanResult: Sendable, Equatable {
             "risk": .string(risk),
             "requiresApproval": .bool(requiresApproval),
             "matchedCapabilities": .array(matchedCapabilities),
-            "toolReadinessGroups": .array(toolReadinessGroups.map { .string($0) }),
             "nextActions": .array(nextActions.map { .string($0) }),
             "createdAt": .string(createdAt),
         ])
@@ -87,13 +80,6 @@ public struct RoutePlanResult: Sendable, Equatable {
                 return nil
             }
         }
-        var readinessGroups: [String] = []
-        if case .array(let arr) = obj["toolReadinessGroups"] ?? .null {
-            readinessGroups = arr.compactMap {
-                if case .string(let s) = $0 { return s }
-                return nil
-            }
-        }
         self.init(
             id: try str("id"),
             message: try str("message"),
@@ -103,7 +89,6 @@ public struct RoutePlanResult: Sendable, Equatable {
             risk: try str("risk"),
             requiresApproval: boolean("requiresApproval"),
             matchedCapabilities: caps,
-            toolReadinessGroups: readinessGroups,
             nextActions: actions,
             createdAt: try str("createdAt")
         )
@@ -125,29 +110,6 @@ public struct SystemRebuildOpResult: Sendable, Equatable {
         .object([
             "ok": .bool(ok),
             "message": message.map { .string($0) } ?? .null,
-            "error": error.map { .string($0) } ?? .null,
-        ])
-    }
-}
-
-public struct GitStashRecoverOpResult: Sendable, Equatable {
-    public let ok: Bool
-    public let stashRef: String
-    public let output: String
-    public let error: String?
-
-    public init(ok: Bool, stashRef: String, output: String, error: String?) {
-        self.ok = ok
-        self.stashRef = stashRef
-        self.output = output
-        self.error = error
-    }
-
-    public func toJSON() -> JSONValue {
-        .object([
-            "ok": .bool(ok),
-            "stashRef": .string(stashRef),
-            "output": .string(output),
             "error": error.map { .string($0) } ?? .null,
         ])
     }
@@ -202,24 +164,35 @@ public protocol SystemRebuildClient: Sendable {
     func systemRebuild() async throws -> SystemRebuildOpResult
 }
 
-public protocol GitStashRecoverClient: Sendable {
-    func gitStashRecover(label: String) async throws -> GitStashRecoverOpResult
-}
-
 // MARK: - Subprocess seam (test-injectable)
 
 public protocol SubprocessRunner: Sendable {
     /// Run a subprocess and wait for it to exit (when `detached` is false) or
     /// kick it off without waiting (when `detached` is true). Returns
     /// (exitCode, stdout, stderr). For detached invocations exitCode is 0,
-    /// stdout/stderr are empty.
+    /// stdout/stderr are empty. `onTermination` observes the actual exit,
+    /// including detached invocations.
+    func run(
+        executable: String,
+        arguments: [String],
+        cwd: URL?,
+        timeout: TimeInterval,
+        detached: Bool,
+        onTermination: (@Sendable (Int32) -> Void)?
+    ) async throws -> (exitCode: Int32, stdout: String, stderr: String)
+}
+
+public extension SubprocessRunner {
     func run(
         executable: String,
         arguments: [String],
         cwd: URL?,
         timeout: TimeInterval,
         detached: Bool
-    ) async throws -> (exitCode: Int32, stdout: String, stderr: String)
+    ) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
+        try await run(executable: executable, arguments: arguments, cwd: cwd,
+            timeout: timeout, detached: detached, onTermination: nil)
+    }
 }
 
 /// Production impl backed by Foundation.Process.
@@ -231,12 +204,16 @@ public final class SystemSubprocessRunner: SubprocessRunner {
         arguments: [String],
         cwd: URL?,
         timeout: TimeInterval,
-        detached: Bool
+        detached: Bool,
+        onTermination: (@Sendable (Int32) -> Void)?
     ) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = arguments
         if let cwd = cwd { proc.currentDirectoryURL = cwd }
+        if let onTermination {
+            proc.terminationHandler = { process in onTermination(process.terminationStatus) }
+        }
         if detached {
             // Detach: discard fds, don't wait. Mirrors Python's
             // subprocess.Popen(stdin/out/err=DEVNULL, start_new_session=True).

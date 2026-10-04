@@ -53,7 +53,7 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
         // rejecting those only here leaves an admitted connector unable to
         // start its inbound transport.
         let botToken = firstString(
-            keys: ["access_token", "oauth_token", "token", "bot_token"],
+            keys: SlackConnectorActions.credentialKeys,
             in: objects
         )
         let appToken = firstString(keys: ["socket_mode_app_token", "app_token", "slack_app_token"], in: objects)

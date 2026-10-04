@@ -41,9 +41,8 @@ import MacIntegration
 //      stays in the veto with the rest of the surface. Effect-time gates are
 //      untouched — Full-Mac access, the autonomy gate and the sandbox still
 //      decide whether any of these run at all.
-//   3. Explicit serial names: session-state mutators (tool_load/tool_unload
-//      write ActiveToolsStore; agent_swarm spawns workers), the agent
-//      subprocess pair (invoke_claude/invoke_codex), and the notify
+//   3. Explicit serial names: agent_swarm (spawns workers), the agent
+//      subprocess (invoke_codex), and the notify
 //      channels — mirrors SecurityCenter.profile's explicit branches.
 //   4. Mac Integration WRITE tools → SERIAL, derived from the SAME
 //      (integration, mode) table the dispatch gate uses
@@ -151,10 +150,11 @@ enum ParallelToolDispatch {
     /// notify channels). claude_message/codex_message also trip the
     /// "message" keyword; listed anyway so the intent is visible.
     static let explicitSerialNames: Set<String> = [
-        "tool_load", "tool_unload", "agent_swarm",
-        "invoke_claude", "invoke_codex",
+        "agent_swarm",
+        "invoke_codex",
         "mac_notify", "mobile_notify", "phone_request", "mac.notify", "mobile.notify",
         "claude_message", "codex_message",
+        "commit_memory", "forget_memory", "memory_moment_review", "rebuild_knowledge_graph",
     ]
 
     /// Rule 5 — danger keywords, drawn from SecurityCenter.profile's
@@ -191,7 +191,7 @@ enum ParallelToolDispatch {
     /// the tool's impl and confirming zero side effects.
     static let readOnlyAllowlist: Set<String> = [
         "time_now", "agent_introspect", "daemon_introspect",
-        "recent_trace_summary", "tool_catalog",
+        "recent_trace_summary",
         "web_fetch", "x_me", "x_timeline",
         "music_now_playing", "market_quote",
     ]
@@ -230,13 +230,11 @@ enum ParallelToolDispatch {
     /// Fleet-dispatch exception (User, 2026-08-27): `invoke_codex` is serial by
     /// name (explicitSerialNames) because two spawns sharing a checkout stash
     /// each other's edits. But when EVERY invoke_codex call in the iteration
-    /// carries an explicit cwd and those cwds are pairwise distinct (per-lane
-    /// worktrees), the spawns share no mutable state and may run concurrently —
+    /// carries an explicit cwd in a distinct, non-overlapping checkout (per-lane
+    /// worktrees), the spawns may run concurrently —
     /// that is exactly Agent's lane-burn shape. Any missing, blank, or
     /// duplicate cwd disables the override for the whole iteration (fail
-    /// closed, back to serial). `invoke_claude` is deliberately never
-    /// overridden: it resumes ONE pinned session, and concurrent resumes of
-    /// the same session corrupt it.
+    /// closed, back to serial).
     ///
     /// Returns one entry per call: `true` to force parallel-safe, `nil` to
     /// keep the name-based verdict.
@@ -249,15 +247,22 @@ enum ParallelToolDispatch {
         // Distinctness must be FILESYSTEM identity, not string identity:
         // symlinked or case-aliased paths on APFS can name the same checkout
         // (gpt-5.5 review BLOCKING, 2026-08-27). Each cwd must exist and
-        // resolve to a unique (device, inode); anything else fails closed.
+        // resolve to a unique checkout (device, inode), with no overlapping
+        // writable roots; subdirectories of one checkout are not isolated.
         var identities: Set<FleetCwdIdentity> = []
+        var roots: [String] = []
         for i in codexIdx {
             guard case .string(let c)? = inputs[i]["cwd"],
                   !c.trimmingCharacters(in: .whitespaces).isEmpty,
-                  let identity = Self.fleetCwdIdentity(path: c),
+                  let root = Self.fleetCheckoutRoot(path: c),
+                  !roots.contains(where: {
+                      root == $0 || root.hasPrefix($0 + "/") || $0.hasPrefix(root + "/")
+                  }),
+                  let identity = Self.fleetCwdIdentity(path: root),
                   identities.insert(identity).inserted else {
                 return none
             }
+            roots.append(root)
         }
         var out = none
         for i in codexIdx { out[i] = true }
@@ -269,11 +274,40 @@ enum ParallelToolDispatch {
         let inode: UInt64
     }
 
+    /// Locate the checkout containing cwd, including linked Git worktrees.
+    /// Canonical roots also expose overlaps between nested checkouts.
+    static func fleetCheckoutRoot(path: String) -> String? {
+        guard NSString(string: path).isAbsolutePath else { return nil }
+        let files = FileManager.default
+        var directory = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL
+        guard let attrs = try? files.attributesOfItem(atPath: directory.path),
+              attrs[.type] as? FileAttributeType == .typeDirectory else { return nil }
+        while directory.path != "/" {
+            let marker = directory.appendingPathComponent(".git")
+            if let attrs = try? files.attributesOfItem(atPath: marker.path) {
+                if attrs[.type] as? FileAttributeType == .typeDirectory { return directory.path }
+                guard attrs[.type] as? FileAttributeType == .typeRegular,
+                      let text = try? String(contentsOf: marker, encoding: .utf8),
+                      text.hasPrefix("gitdir: ") else { return nil }
+                let gitPath = String(text.dropFirst("gitdir: ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !gitPath.isEmpty else { return nil }
+                let gitDirectory = URL(fileURLWithPath: gitPath, relativeTo: directory)
+                    .resolvingSymlinksInPath()
+                guard let gitAttrs = try? files.attributesOfItem(atPath: gitDirectory.path),
+                      gitAttrs[.type] as? FileAttributeType == .typeDirectory else { return nil }
+                return directory.path
+            }
+            directory.deleteLastPathComponent()
+        }
+        return nil
+    }
+
     /// (device, inode) of the resolved directory — nil when it does not
     /// exist. Symlinks are resolved before stat so aliases collapse.
     static func fleetCwdIdentity(path: String) -> FleetCwdIdentity? {
         let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: resolved),
+              attrs[.type] as? FileAttributeType == .typeDirectory,
               let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value,
               let device = (attrs[.systemNumber] as? NSNumber)?.uint64Value else {
             return nil

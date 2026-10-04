@@ -60,11 +60,6 @@ final class ActivityCognitionSubscription {
         state = .stopped
     }
 
-    func refreshNow() async {
-        let currentGeneration = generation
-        await refresh(currentGeneration, allowStopped: true)
-    }
-
     static func shouldRefresh(
         for change: NativeCognitionRuntimeChange,
         after lastRevision: UInt64?
@@ -77,14 +72,14 @@ final class ActivityCognitionSubscription {
         candidate == generation
     }
 
-    private func refresh(_ currentGeneration: UInt64, allowStopped: Bool = false) async {
-        guard allowStopped || isCurrent(currentGeneration) else { return }
+    private func refresh(_ currentGeneration: UInt64) async {
+        guard isCurrent(currentGeneration) else { return }
         activeRefreshes += 1
         peakConcurrentRefreshes = max(peakConcurrentRefreshes, activeRefreshes)
         defer { activeRefreshes -= 1 }
 
         let read = await cognition.pendingProposals()
-        guard allowStopped || isCurrent(currentGeneration) else { return }
+        guard isCurrent(currentGeneration) else { return }
         refreshCount += 1
         switch read {
         case .available(let next):

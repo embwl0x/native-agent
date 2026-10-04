@@ -42,17 +42,19 @@ import MacIntegration
 //     providers (Codex/OpenRouter; the legacy stream(prompt:) lane) hit a
 //     tripwire: an honest "could not see the image" note is prepended to the
 //     turn AND a `vision.attachment_unsupported` trace row is written — never a
-//     silent describe-or-pretend. Non-image attachment types are skipped (they
-//     were only ever stringified before).
+//     silent describe-or-pretend. PDF and plain-text attachments contribute
+//     bounded extracted text to the current user message; PDF ingestion follows
+//     Trust Center policy. Skipped or unreadable documents are named to the
+//     model, and DOCX attachments are rejected with a PDF/text recovery hint.
 //   * fileAccess: 'workspace' lets regular Swift tool policy decide. 'none'
 //     blocks file/shell tools. 'read_only' permits read-side tools but filters
 //     write/shell/app-control tools BEFORE they reach AutonomyGate. Path bounds
 //     remain enforced by the Swift tool-dispatch policy gates.
-//   * sessionId continuity: when nil, we mint a UUID. The Swift path mirrors
-//     the daemon's session-index side effects by keeping chat/sessions.json in
-//     sync with the per-session JSONL append.
-//   * Persona compilation: same placeholder template as TurnEngine. Custom
-//     persona merging must be implemented in Swift before it is enabled here.
+//   * sessionId continuity: callers must supply an existing session identity.
+//     The Swift path keeps chat/sessions.json in sync with the per-session
+//     JSONL append.
+//   * Persona compilation: PersonaCompiler compiles the selected persona for
+//     the originating surface, including a caller-supplied persona override.
 //
 // There is no daemon proxy fallback. Missing behavior must be implemented in
 // Swift or reported as an explicit Swift runtime error.

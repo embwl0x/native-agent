@@ -13,52 +13,6 @@ struct PolicySimulation: Codable, Hashable {
     var risk: String
     var action: String
     var reasons: [String]
-
-    /// The SecurityCenter returns a fail-closed envelope when its saved policy
-    /// cannot be read. That is not a policy denial: the simulator has no
-    /// authority generation to evaluate, so the UI must say it is unavailable.
-    var authorityUnavailable: Bool {
-        reasons.contains {
-            $0.localizedCaseInsensitiveContains("saved trust policy is unavailable")
-        }
-    }
-}
-
-enum PolicySimulationVerdict: Equatable {
-    case allowed
-    case approvalRequired
-    case denied
-    case unavailable
-
-    init(simulation: PolicySimulation) {
-        if simulation.authorityUnavailable {
-            self = .unavailable
-        } else if simulation.requiresApproval {
-            self = .approvalRequired
-        } else if simulation.allowed {
-            self = .allowed
-        } else {
-            self = .denied
-        }
-    }
-
-    var title: String {
-        switch self {
-        case .allowed: "Allowed"
-        case .approvalRequired: "Requires Approval"
-        case .denied: "Denied"
-        case .unavailable: "Policy Unavailable"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .allowed: "checkmark.circle"
-        case .approvalRequired: "hand.raised.circle"
-        case .denied: "xmark.octagon"
-        case .unavailable: "exclamationmark.triangle"
-        }
-    }
 }
 
 typealias BackupRecord = TrustPersistence.BackupRecord

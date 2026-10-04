@@ -265,7 +265,7 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
     public var compatibilityPathHealthy: Bool? {
         if !transportConfigured { return true }
         if transportFailed { return false }
-        if deviceReceived { return true }
+        if deviceReceived && freshness > 0 { return true }
         return nil
     }
 
@@ -296,7 +296,17 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
         self.displayed = supportedDisplayed
         self.userSeen = supportedSeen
         self.transportFailed = supportedFailure
-        let receivedAt = bounded.first?.receivedAt
+        let receivedAt = bounded.first {
+            if supportedFailure {
+                return $0.evidenceClass == .notificationTransportFailure
+                    || $0.evidenceClass == .deviceProcessFailure
+            }
+            if supportedSeen { return $0.evidenceClass == .explicitUserReaction }
+            if supportedDisplayed { return $0.evidenceClass == .displayReceipt }
+            if supportedReceived { return $0.evidenceClass == .deviceProcessReceipt }
+            if supportedAccepted { return $0.evidenceClass == .apnsAcceptance }
+            return false
+        }?.receivedAt
         let freshness = BodyBeliefMetrics.freshness(
             receivedAt: receivedAt,
             now: generatedAt,

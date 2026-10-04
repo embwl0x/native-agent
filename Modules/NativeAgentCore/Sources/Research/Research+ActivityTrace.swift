@@ -7,8 +7,8 @@ import PersistenceCore
 extension SwiftNativeResearchClient {
     // MARK: - activity / trace emission (wave 31 W03)
     //
-    // Byte-for-byte mirrors of Daemon.record_activity
-    // and Daemon.record_trace (L8541). Both append a sort_keys=True JSONL line
+    // Activity and trace retain their legacy envelope shapes with redacted
+    // content. Both append a sort_keys=True JSONL line
     // (persistence.appendJSONL serializes with UTF-8-byte-ordered keys to match
     // Python's json.dumps(sort_keys=True)).
     //
@@ -54,25 +54,24 @@ extension SwiftNativeResearchClient {
 
     /// Mirror `Daemon.record_trace`. Envelope keys:
     /// {id, kind, title, status, payload, createdAt}. The envelope `status`
-    /// is `str(payload.get("status") or "ok")`. Trace payloads are NOT
-    /// redacted in Python (record_trace does no redaction), so we don't
-    /// redact here either — only error-field normalization, which the
-    /// research.run trace never carries.
+    /// is `str(payload.get("status") or "ok")`. Titles and payloads are
+    /// redacted before persistence, as they may contain private credentials.
     func recordTrace(
         kind: String,
         title: String,
         payload: JSONValue
     ) async throws {
+        let redactedPayload = NativeAgentSecretRedactor.redactValue(payload)
         var statusField = "ok"
-        if case .object(let obj) = payload, case .string(let s) = obj["status"] ?? .null, !s.isEmpty {
+        if case .object(let obj) = redactedPayload, case .string(let s) = obj["status"] ?? .null, !s.isEmpty {
             statusField = s
         }
         let event: JSONValue = .object([
             "id": .string(receiptIDFactory()),
             "kind": .string(kind),
-            "title": .string(title),
+            "title": .string(NativeAgentSecretRedactor.redactText(title)),
             "status": .string(statusField),
-            "payload": payload,
+            "payload": redactedPayload,
             "createdAt": .string(Self.isoTimestamp(now())),
         ])
         try await appendEnvelope(event, to: tracesPath)

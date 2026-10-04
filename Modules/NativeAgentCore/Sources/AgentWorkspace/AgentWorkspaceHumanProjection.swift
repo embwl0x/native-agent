@@ -2,6 +2,16 @@ import Foundation
 import PersistenceCore
 
 enum AgentWorkspaceHumanProjection {
+    /// A selected conversation reads through its explicit owner; the list is the index's own rows.
+    static func read(_ input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue {
+        guard let id = input["conversation_session_id"] else { return try HumanConversationIndex.list(input, dataRoot: dataRoot) }
+        guard case .string(let session) = id else {
+            return .object(["status": .string("unavailable"), "detail": .string("This conversation is unavailable. Open the conversation list again.")])
+        }
+        let limit: Int? = if case .int(let value)? = input["limit"] { Int(exactly: value) } else { nil }
+        return try await AgentWorkspacePorts.current.conversations.openHuman(sessionID: session, limit: limit, dataRoot: dataRoot)
+    }
+
     static func project(input: [String: JSONValue], result: JSONValue,
                         observations: [AgentWorkspaceChanges.Stamp] = []) -> AgentWorkspaceProjection {
         guard case .object(let row) = result, row["status"] == .string("ok") else {

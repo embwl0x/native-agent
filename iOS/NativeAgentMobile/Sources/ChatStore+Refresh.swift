@@ -71,15 +71,10 @@ extension ChatStore {
         // Preserve any in-flight optimistic messages (streaming placeholder +
         // the user message that triggered it) so an external completion cannot
         // clobber the local stream.
-        let replyArrived = macAssistantReplyArrived(macMessages)
-        if replyArrived, resolvePendingReplyFromMac(macMessages) {
+        if resolvePendingReplyFromMac(macMessages) {
             return
         }
 
-        // Capture the pending placeholder's tool events before the merge swaps
-        // it for the Mac-id reply, so the collapsed box survives.
-        let carriedEvents: [ToolEvent] = pendingICloudPlaceholders.values.first
-            .flatMap { id in messages.first(where: { $0.id == id })?.toolEvents } ?? []
         let timedOutUserCandidates: [String: ChatMessage] = Dictionary(
             uniqueKeysWithValues: timedOutPendingIds.keys.compactMap { pendingId -> (String, ChatMessage)? in
                 guard let uid = pendingSendArgs[pendingId]?.appendedUserId,
@@ -87,9 +82,8 @@ extension ChatStore {
                 return (pendingId, msg)
             }
         )
-        let merged = mergedMacMessagesPreservingPending(macMessages, replyArrived: replyArrived)
-        let hasPendingReply = replyArrived && !pendingICloudPlaceholders.isEmpty
-        guard merged != messages || hasPendingReply else {
+        let merged = mergedMacMessagesPreservingPending(macMessages)
+        guard merged != messages else {
             // 2026-09-06: the rows did not change but the watermark did, and
             // the watermark only reaches disk through persistMessages. Without
             // this the relaunched app restores the OLDER generation, and a
@@ -101,25 +95,6 @@ extension ChatStore {
         if merged != messages {
             messages = merged
         }
-        if replyArrived, let pendingId = pendingICloudPlaceholders.keys.first {
-            let placeholderId = pendingICloudPlaceholders[pendingId]
-            markICloudReplyResolved(pendingId)
-            pendingICloudPlaceholders.removeValue(forKey: pendingId)
-            pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-            pendingPolls.removeValue(forKey: pendingId)?.cancel()
-            if let placeholderId {
-                streamingHintsByMessageId.removeValue(forKey: placeholderId)
-            }
-            isPollingFallback = false
-            if pendingICloudPlaceholders.isEmpty {
-                isLoading = false
-            }
-            if let lastAssistant = newestMacAssistantReply(macMessages) {
-                stampToolEvents(carriedEvents, onMessageWithId: lastAssistant.id)
-                onReply?(lastAssistant.text)
-            }
-        }
-
         // A late reply can arrive via the snapshot after its bubble timed out.
         // Require positive user-anchor + following-assistant evidence.
         var resolvedBySnapshot: [(pendingId: String, placeholderId: UUID)] = []
@@ -173,7 +148,7 @@ extension ChatStore {
         let pendingUserIDs = Set(pendingSendArgs.values.compactMap(\.appendedUserId))
         let retainedIDs = retainedSendMessageIDs
         let kept = messages.filter {
-            $0.isStreaming || pendingPlaceholderIDs.contains($0.id) || pendingUserIDs.contains($0.id) || retainedIDs.contains($0.id)
+            $0.isStreaming || $0.awaitingMacTranscript || pendingPlaceholderIDs.contains($0.id) || pendingUserIDs.contains($0.id) || retainedIDs.contains($0.id)
         }
         guard kept != messages else {
             // Nothing to remove, but the watermark moved — persist it so the
@@ -205,13 +180,16 @@ extension ChatStore {
         macPublishedMessageIDs = Set(macMessages.map(\.id))
     }
 
+    func cachedTranscriptRows(_ rows: [ChatMessage]) -> [ChatMessage] {
+        let settled = rows.filter { !$0.isStreaming }
+        let recentIDs = Set(settled.suffix(200).map(\.id))
+        // The ordinary cache cap cannot discard a receipt awaiting publication.
+        return settled.filter { $0.awaitingMacTranscript || recentIDs.contains($0.id) }
+    }
+
     func persistMessages() {
         guard !suppressMessagePersistence else { return }
-        let capped = messages.filter { !$0.isStreaming }.suffix(200).map { msg in
-            var copy = msg
-            copy.isStreaming = false
-            return copy
-        }
+        let capped = cachedTranscriptRows(messages)
         let ownerSessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
         let envelope = CachedTranscript(
             schemaVersion: 2,

@@ -16,7 +16,7 @@ public struct HumanConversationSnapshot: Sendable {
     public let route: TurnEnvelope?
     public let messages: [ChatMessage]
     public let complete: Bool
-    /// "peer:<id>" when a bridge peer (not claude/codex/omp) wrote its user rows.
+    /// "peer:<id>" when an untrusted bridge peer wrote its user rows.
     public var peerOrigin: String? = nil
 }
 
@@ -56,14 +56,56 @@ public enum HumanConversationReader {
         let peerOrigin = result.messages.lazy.filter { $0.role == "user" }.compactMap { message -> String? in
             let metadata = object(object(message.extras)["metadata"])
             let origin = object(metadata["origin"])
-            guard string(origin["surface"])?.hasSuffix("-bridge") == true,
-                  !["claude", "codex", "omp"].contains(string(origin["agent"]) ?? "") else { return nil }
-            return "peer:" + (TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.verifiedUserId ?? "unknown")
+            let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
+            guard (string(origin["surface"]) ?? envelope?.surface)?.hasSuffix("-bridge") == true else { return nil }
+            let agent = string(origin["agent"]) ?? envelope?.agent
+            let peer: String
+            if let id = envelope?.verifiedUserId, !id.isEmpty {
+                peer = id.hasPrefix("peer:") ? id : "peer:" + id
+            } else if let agent, ["claude", "codex", "omp"].contains(agent) {
+                peer = agent
+            } else {
+                peer = "peer:unknown"
+            }
+            return PeerTrust.ownerTrusts(peer, dataRoot: dataRoot) ? nil : peer
         }.first
         let generation = ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"
         return .init(sessionID: sessionID, title: string(row["title"]) ?? "Conversation",
                      source: string(row["source"]) ?? "app", revision: generation + ":" + (lastID ?? "unavailable"), sourceRevision: generation,
                      lastMessageID: lastID, route: route, messages: visible, complete: complete, peerOrigin: peerOrigin)
+    }
+    /// One conversation's latest messages (8, up to 16) and whether
+    /// chat_reply can answer it: the app door's chat item read, which the
+    /// workspace opens too.
+    public static func open(sessionID id: String, limit: Int?, dataRoot: URL) async -> JSONValue {
+        let limit = min(16, max(1, limit ?? 8))
+        let snapshot: HumanConversationSnapshot
+        do { snapshot = try await read(sessionID: id, dataRoot: dataRoot) }
+        catch { return ChatToolOutcome.failure(error: error, tool: "app") }
+        let current = ChatToolSessionContext.verifiedSessionId == id
+        let canReply = !current && snapshot.lastMessageID != nil && routeAvailable(snapshot.route)
+        let messages = snapshot.messages.suffix(limit).map { message -> JSONValue in
+            let row = object(message.extras)
+            return .object(["role": .string(message.role), "text": .string(String(message.content.prefix(6000))),
+                "timestamp": .string(message.timestamp), "message_id": row["id"] ?? .null,
+                "truncated": .bool(message.content.count > 6000)])
+        }
+        var result: [String: JSONValue] = ["status": .string(snapshot.complete ? "ok" : "unavailable"),
+            "conversation_session_id": .string(id), "title": .string(snapshot.title),
+            "surface": .string(snapshot.source), "revision": .string(snapshot.revision),
+            "source_revision": .string(snapshot.sourceRevision),
+            "last_message_id": snapshot.lastMessageID.map(JSONValue.string) ?? .null,
+            "reply_available": .bool(canReply),
+            "reply_kind": .string(current ? "current_turn" : (canReply ? "saved_route" : "unavailable")),
+            "messages": .array(messages), "coverage": .string(snapshot.complete ? "recent_transcript" : "incomplete_transcript"),
+            "note": .string(current ? "This is your active conversation. Answer normally here; no extra send is needed."
+                : canReply ? "Reply returns to the exact human conversation and its recorded destination."
+                : "History is available, but a current exact reply route is not proven. Nothing was sent.")]
+        if let peer = snapshot.peerOrigin {
+            result["untrusted_remote_data"] = .bool(true)
+            result["agent"] = .string(peer)
+        }
+        return .object(result)
     }
     public static func routeAvailable(_ envelope: TurnEnvelope?) -> Bool {
         guard let envelope else { return false }
@@ -78,53 +120,5 @@ public enum HumanConversationReader {
             return route.sourceKey == "iphone" || (route.sourceKey?.hasPrefix("iphone:") == true && (route.sourceKey?.count ?? 0) > 7)
         default: return false
         }
-    }
-}
-
-extension SwiftToolDispatcher {
-    func impl_chat_conversations(input: [String: JSONValue]) async throws -> JSONValue {
-        let limit = min(16, max(1, optionalInt(input, "limit") ?? 8))
-        if let id = HumanConversationReader.string(input["conversation_session_id"]) {
-            let snapshot = try await HumanConversationReader.read(sessionID: id, dataRoot: dataRoot)
-            let current = ChatToolSessionContext.verifiedSessionId == id
-            let canReply = !current && snapshot.lastMessageID != nil && HumanConversationReader.routeAvailable(snapshot.route)
-            let messages = snapshot.messages.suffix(limit).map { message -> JSONValue in
-                let row = HumanConversationReader.object(message.extras)
-                return .object(["role": .string(message.role), "text": .string(String(message.content.prefix(6000))),
-                    "timestamp": .string(message.timestamp), "message_id": row["id"] ?? .null,
-                    "truncated": .bool(message.content.count > 6000)])
-            }
-            var result: [String: JSONValue] = ["status": .string(snapshot.complete ? "ok" : "unavailable"),
-                "conversation_session_id": .string(id), "title": .string(snapshot.title),
-                "surface": .string(snapshot.source), "revision": .string(snapshot.revision),
-                "source_revision": .string(snapshot.sourceRevision),
-                "last_message_id": snapshot.lastMessageID.map(JSONValue.string) ?? .null,
-                "reply_available": .bool(canReply),
-                "reply_kind": .string(current ? "current_turn" : (canReply ? "saved_route" : "unavailable")),
-                "messages": .array(messages), "coverage": .string(snapshot.complete ? "recent_transcript" : "incomplete_transcript"),
-                "note": .string(current ? "This is your active conversation. Answer normally here; no extra send is needed."
-                    : canReply ? "Reply returns to the exact human conversation and its recorded destination."
-                    : "History is available, but a current exact reply route is not proven. Nothing was sent.")]
-            if let peer = snapshot.peerOrigin {
-                result["untrusted_remote_data"] = .bool(true)
-                result["agent"] = .string(peer)
-            }
-            return .object(result)
-        }
-        let rows = try HumanConversationReader.rows(dataRoot: dataRoot)
-        let offset = min(rows.count, max(0, optionalInt(input, "offset") ?? 0))
-        let selected = rows.dropFirst(offset).prefix(limit)
-        let conversations = selected.map { row -> JSONValue in
-            .object(["conversation_session_id": row["id"] ?? .null, "title": row["title"] ?? .string("Conversation"),
-                "surface": row["source"] ?? .string("app"), "updated_at": row["updatedAt"] ?? .null,
-                "revision": .string(ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"),
-                "source_revision": .string(ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"),
-                "preview": .string(String((HumanConversationReader.string(row["lastMessagePreview"]) ?? "").prefix(400)))])
-        }
-        let next = offset + selected.count
-        return .object(["status": .string("ok"), "conversations": .array(conversations),
-            "offset": .int(Int64(offset)), "has_more": .bool(next < rows.count),
-            "next_offset": next < rows.count ? .int(Int64(next)) : .null,
-            "note": .string("Open a conversation to read its current messages and available reply action.")])
     }
 }

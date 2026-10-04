@@ -145,6 +145,10 @@ extension SwiftNativeTurnEngine {
             "segmented": .bool(segments != nil),
             "containsCognitiveSubstrate": .bool(cognitive != nil),
             "personaSourceBytes": .int(Int64(sourceBytes)),
+            "userBlockBytes": .int(Int64(context.personaDocs["USER"].map {
+                let block = "# USER\n" + $0
+                return !$0.isEmpty && systemPrompt.contains(block) ? block.utf8.count : 0
+            } ?? 0)),
             "personaSources": .array(sourceSizes),
             "systemTotalBytes": .int(Int64(systemBytes)),
             "stableBytes": .int(Int64(stableBytes)),
@@ -176,20 +180,10 @@ extension SwiftNativeTurnEngine {
                 "cognitiveChars": .int(Int64(contextSnapshotCognitiveLimit)),
             ]),
         ]
-        // v2Prefix receipts (2026-09-01). Sizes and digests only: the
-        // fingerprint is what makes "did the cached prefix actually hold from
-        // turn N to turn N+1" observable without putting prompt bytes in a
-        // trace row. Absent on `.v1Legacy` and on every turn that never seeded
-        // a prefix, so those rows read exactly as before.
-        // ALWAYS stamped, on every turn: a reader that has to infer the shape
-        // from a missing key cannot tell "v1" from "the field was dropped
-        // somewhere in the rebuild chain" — which is exactly the bug that hid
-        // the text lane's blindness for two rounds.
-        payload["shapeVersion"] = .string(
-            ridesVolatileBlock
-                ? ConversationPrefixShape.v2Prefix.rawValue
-                : (ConversationPrefixShape.override ?? .v1Legacy).rawValue
-        )
+        if let preparationMs = context.preparationMs {
+            payload["preparationMs"] = .int(preparationMs)
+        }
+        payload["shapeVersion"] = .string("v2Prefix")
         // What the seeding ladder chooses for this model/provider — the same
         // pure function the lanes call, so the snapshot cannot describe a
         // delivery the turn did not use. `none` when nothing is being lifted.
@@ -200,25 +194,7 @@ extension SwiftNativeTurnEngine {
                 ).rawValue
                 : ConversationPrefixSeeding.VolatileDelivery.none.rawValue
         )
-        // HOW this turn carried its prior turns — stamped on EVERY turn, so a
-        // reader can tell "no history lane" from "the key was never written".
-        // On `.v2Prefix` prior turns ride as real messages and are measured
-        // below. On `.v1Legacy` they are rendered as TEXT into the system
-        // prompt's dynamic segment, so their bytes are already inside
-        // `systemTotalBytes`: measuring them again would double-count them,
-        // and writing zero would be a confident zero about a turn that did
-        // carry history. The consumer shows the row either way rather than
-        // dropping it, which is what hid the lane (live, multi-turn: the
-        // receipt listed System, Tools, Your message and nothing between).
-        let historyShape = ridesVolatileBlock
-            ? ConversationPrefixShape.v2Prefix
-            : (ConversationPrefixShape.override ?? .v1Legacy)
-        let historyDelivery: String
-        if !context.historyMessages.isEmpty {
-            historyDelivery = "messages"
-        } else {
-            historyDelivery = historyShape == .v2Prefix ? "none" : "systemPrompt"
-        }
+        let historyDelivery = context.historyMessages.isEmpty ? "none" : "messages"
         payload["historyDelivery"] = .string(historyDelivery)
         if !context.historyMessages.isEmpty || context.turnVolatileBlock != nil {
             payload["historyMessageCount"] = .int(Int64(context.historyMessages.count))
@@ -494,8 +470,9 @@ extension SwiftNativeTurnEngine {
     ) -> Bool {
         let headerEnd = text.index(markerEnd, offsetBy: 500, limitedBy: text.endIndex) ?? text.endIndex
         let header = String(text[markerEnd..<headerEnd])
-        return header.contains("\nrun_id:")
-            && (header.contains("\nsession_id:") || header.contains("\nsurface:"))
+        return header.hasPrefix(" private —")
+            || (header.contains("\nrun_id:")
+                && (header.contains("\nsession_id:") || header.contains("\nsurface:")))
     }
 
     private nonisolated static func cognitiveMarkerMatchesExpectedRunId(
@@ -506,6 +483,10 @@ extension SwiftNativeTurnEngine {
         guard let expectedRunId, !expectedRunId.isEmpty else { return true }
         let headerEnd = text.index(markerEnd, offsetBy: 500, limitedBy: text.endIndex) ?? text.endIndex
         let header = String(text[markerEnd..<headerEnd])
+        // The one-line header (Phase 5A) carries no run id: the capsule is
+        // rebuilt per turn inside the volatile block, so there is no older one
+        // in the same string to confuse it with.
+        if header.hasPrefix(" private —") { return true }
         return extractRuntimeValue("run_id", from: header) == expectedRunId
     }
 

@@ -24,8 +24,8 @@ import TurnTrace
 // # SURFACE-AGNOSTIC BY CONSTRUCTION
 //
 // NativeAgent is built so any messaging surface can be connected later —
-// Signal, WhatsApp, whatever User adds. Telegram is merely the only publisher
-// that exists today, and NOTHING in this file knows that. A new adapter calls
+// Signal, WhatsApp, whatever User adds. Telegram, Slack DMs, the Mac
+// composer, the phone and Siri publish it, and NOTHING in this file knows that. A new adapter calls
 // `publish` with its own source name and its own conversation kind; the
 // consuming side (Mac pin strip, main-window default, iOS snapshot, retention)
 // reads `ConversationAnchor.current` and never mentions any surface by name.
@@ -105,11 +105,10 @@ public enum ConversationAnchor {
     ///
     /// # For a new surface adapter
     ///
-    /// Call this whenever the conversation the human is active in CHANGES —
-    /// the first message of a conversation, and again whenever the human
-    /// starts a fresh one (Telegram's `/new`, a `/resume` onto a different
-    /// session). Do not call it per message; `unchanged` makes that harmless,
-    /// but it is not what the hook is for.
+    /// Call this whenever USER sends at that door — any session, including an
+    /// agent contact's thread he chose to talk in — and on `/new`/`/resume`.
+    /// `unchanged` makes the per-message call cheap. Never call it for a turn
+    /// an agent, peer, bot or wake started: those must not move him.
     ///
     /// # Locking
     ///

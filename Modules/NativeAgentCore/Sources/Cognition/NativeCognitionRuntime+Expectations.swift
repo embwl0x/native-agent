@@ -37,8 +37,7 @@ import TriggerScheduler
 // written back to any of them.
 //
 // ── NO NEW TIMER, NO POLLING ─────────────────────────────────────────────────
-// Modelled on NativeCognitionRuntime+PressureDream.swift and
-// +StudioEncounters.swift: called from `rescheduleResidualRepairDeadline`,
+// Called from `rescheduleResidualRepairDeadline`,
 // which already runs on every somatic signal, every deadline fire and every
 // wake re-anchor. This lane adds no loop, no scheduler job, no second
 // authority. `horizonRefreshMinimumInterval` bounds how often the composition
@@ -109,9 +108,13 @@ extension NativeCognitionRuntime {
     /// How long a delegated peer job runs before she is WAITING on it rather
     /// than merely expecting it.
     static let horizonPeerReplyWindow: TimeInterval = 30 * 60
-    /// Scheduler kinds she has any relationship with. A `notify` row or a
-    /// connector action is somebody else's errand; the dream is her night.
-    static let horizonSchedulerKinds: Set<String> = ["dream", "rem", "workshop"]
+    /// Scheduler kinds that may become something she looks toward. EMPTY since
+    /// Phase 5 D (Agent, binding): a schedule is not anticipation. The nightly
+    /// dream, REM and upkeep are internal processes; they leaned her "toward"
+    /// with positive valence for no reason she had. Anticipation attaches to
+    /// something she has a reason to look forward to — a day User set (a
+    /// stated plan), a reply she is waiting on — never to a cron row.
+    static let horizonSchedulerKinds: Set<String> = []
 
     /// Her valence GUESS per source — the sign that decides whether a horizon
     /// lifts curiosity/warmth or raises vigilance, and how much. These are
@@ -134,20 +137,10 @@ extension NativeCognitionRuntime {
 
     // MARK: - The hop from the residual-repair deadline
 
-    /// Called from `rescheduleResidualRepairDeadline`, beside
-    /// `considerPressureDream` and `considerStudioEncounter`. Hands off to a
+    /// Called from `rescheduleResidualRepairDeadline`. Hands off to a
     /// detached task so four disk reads never sit in front of signal ingestion.
-    func considerHorizonExpectations(_ opportunity: OrganismResidualRepairOpportunity) {
+    func considerHorizonExpectations() {
         guard !isFlushedForTermination else { return }
-        // Never preempt the dream, for the same reason the encounter lane does
-        // not: a due dream is the one thing on this reading that outranks
-        // everything, and four disk reads must not sit in front of it. Read
-        // from the SAME opportunity the dream lane just used.
-        let dreamDecision = OrganismIdentityDreamTrigger.decide(
-            opportunity: opportunity,
-            turnInFlight: liveTurnInFlight
-        )
-        guard dreamDecision != .fire, dreamDecision != .turnInFlight else { return }
         Task { [weak self] in
             await self?.refreshHorizonExpectationsIfDue()
         }
@@ -190,7 +183,9 @@ extension NativeCognitionRuntime {
         // free.
         guard !settled.isEmpty || !open.isEmpty || !composed.tokens.isEmpty else { return }
 
-        for row in settled {
+        // A scheduled job no longer opens a horizon, so one still open from
+        // before settles silently: no relief, no "still waiting" on a cron row.
+        for row in settled where row.horizon?.sourceKind != .scheduledJob {
             await announceHorizonResolution(row, at: at)
         }
 
@@ -290,8 +285,7 @@ extension NativeCognitionRuntime {
         )
         if await substrate.ingestResident(event) {
             scheduleDirtyMicrocycle(
-                reason: "horizon_resolution:\(phase)",
-                turnClass: InstalledPhysiologySoakRecorder.physiologyTurnClass(event.turnKind)
+                reason: "horizon_resolution:\(phase)"
             )
         }
     }
@@ -325,11 +319,14 @@ extension NativeCognitionRuntime {
             await openQuestionSources(at: now),
             peerReplySources(at: now),
         ]
-        var rows = readings.flatMap(\.rows)
+        var rows = readings.flatMap { reading in
+            reading.rows.map { (token: $0.token, dueAt: $0.dueAt, kind: reading.kind) }
+        }
         rows.sort { lhs, rhs in
             if lhs.dueAt != rhs.dueAt { return lhs.dueAt < rhs.dueAt }
             return lhs.token < rhs.token
         }
+        let truncatedKinds = Set(rows.dropFirst(OrganismHorizonRegister.maximumOpen).map(\.kind.rawValue))
         return (
             // Cut to the register's own cap, nearest first. Not a nicety:
             // somatic metadata bounds arrays at
@@ -337,7 +334,7 @@ extension NativeCognitionRuntime {
             // would be truncated in COMPOSITION order, and a source silently
             // dropped off the end reads as a source that went away.
             rows.prefix(OrganismHorizonRegister.maximumOpen).map(\.token),
-            readings.filter(\.complete).map(\.kind.rawValue).sorted()
+            readings.filter { $0.complete && !truncatedKinds.contains($0.kind.rawValue) }.map(\.kind.rawValue).sorted()
         )
     }
 
@@ -414,7 +411,7 @@ extension NativeCognitionRuntime {
     /// way several jobs to one peer collapse into one thing she is waiting on.
     /// That is how a person holds it: Friday is one Friday.
     private func datedMemorySources(at now: Date) async -> (rows: [(token: String, dueAt: Date)], complete: Bool) {
-        guard let records = try? await SwiftNativeMemoryV2.shared.listMemory(kind: nil) else {
+        guard let records = try? await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).listMemory(kind: nil) else {
             // The store could not be read. Not "every plan came round".
             return ([], false)
         }

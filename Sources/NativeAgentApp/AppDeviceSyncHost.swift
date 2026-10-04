@@ -1,11 +1,13 @@
 import Foundation
 import AttentionRouting
 import ApprovalInbox
+import Desk
 import DeviceSync
 import MemoryV2
 import NativeAgentShared
 import NotificationInbox
 import PersistenceCore
+import ProviderRouting
 import ToolRegistry
 import Transcripts
 
@@ -62,17 +64,20 @@ extension NAProviderCatalogProvider {
 /// Device sync's reads and actions through the app's NativeClient, the live
 /// engine's facades, remote Mac control and the attention router.
 struct AppDeviceSyncHost: DeviceSyncHost {
+    func retryRequestedResults() async {
+        do { try await AttentionRouter.shared.retryRequestedResults(dataRoot: PersistenceCore.defaultDataRoot()) }
+        catch { NSLog("requested_result: publication retry failed: %@", error.localizedDescription) }
+    }
+
     private var api: NativeClient { NativeClient(baseURL: "") }
     private var engine: NativeAgentEngine { NativeAgentEngine.live }
 
     func getWorkshopExecutions() async throws -> DeviceSyncSnapshotRows { try await engine.desk.taskRows() }
-    func getChatSessions() async throws -> [ChatSession] { try await engine.transcripts.list() }
-    @MainActor func currentChatAnchor() -> ConversationAnchorPin? {
-        let defaults = UserDefaults.standard
-        guard let id = defaults.string(forKey: "activeChatSessionId"), !id.isEmpty else { return nil }
-        return ConversationAnchorPin(sessionId: id, source: "mac",
-                                     updatedAt: defaults.string(forKey: "activeChatSessionUpdatedAt") ?? "1970-01-01T00:00:00Z")
+    func workOverview() async -> (overview: WorkOverview, deskItems: [DeskItem]?) {
+        let board = await engine.desk.loadBoard(includeOverview: true)
+        return (board.overview!, board.deskState?.items)
     }
+    func getChatSessions() async throws -> [ChatSession] { try await engine.transcripts.list() }
     func getChatMessages(sessionId: String) async throws -> [any DeviceSyncTranscriptMessage & Sendable] {
         try await engine.transcripts.loadMessages(sessionId: sessionId)
     }
@@ -89,8 +94,9 @@ struct AppDeviceSyncHost: DeviceSyncHost {
         MobileToolCatalogProjection.records(from: try await engine.tools.loadCatalog())
     }
     func providers() async throws -> DeviceSyncSnapshotRows { try await engine.providers.list() }
-    func providerCatalogProviders() async throws -> [NAProviderCatalogProvider] {
-        try await engine.providers.list().map(NAProviderCatalogProvider.init)
+    func providerCatalogSnapshot() async throws -> (providers: [NAProviderCatalogProvider], routing: ProviderRoutingSnapshot) {
+        let snapshot = try await engine.providers.routing.checkedProviderSnapshot()
+        return (try ProvidersFacade.connections(from: snapshot).map(NAProviderCatalogProvider.init), snapshot.routing)
     }
     func trustSnapshotData() async throws -> Data { try await engine.trust.snapshotData() }
     func getPersonality() async throws -> PersonalityProfile { try await api.getPersonality() }
@@ -139,6 +145,7 @@ struct AppDeviceSyncHost: DeviceSyncHost {
     func cancelChatSession(sessionId: String) async throws { try await engine.turns.stop(sessionId: sessionId) }
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws {
         _ = try await api.configureProvider(id, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
+        await QuietSelfAdmin.shared.appModel?.adoptProviderForBlankSurfaces(id)
     }
     func testProvider(_ id: String) async throws -> NativeAgentShared.ProviderTestResult { try await api.testProvider(id) }
     func clearProvider(_ id: String) async throws { _ = try await api.clearProvider(id) }
@@ -176,7 +183,7 @@ struct AppDeviceSyncHost: DeviceSyncHost {
         // had already delivered — is a delivery. `.noChannel`, `.deferred`
         // and `.failed` all mean nothing reached User, so throw: the caller
         // treats delivery as the commit point and a throw keeps the episode
-        // unwritten for the next snapshot pass to retry.
+        // unwritten for the next overview read to retry.
         let projection = outcome.deliveryProjection
         guard projection.reachedAChannel || projection == .previouslyHandled else {
             throw NeedsUserNotifyUndelivered(projection: projection)

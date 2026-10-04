@@ -1,68 +1,66 @@
-# Images through the actual Codex tool
+# Image generation
 
-User's requested route is Codex's built-in `image_gen.imagegen`, not a custom
-NativeAgent HTTP image integration. `image_generate` defaults to that route:
-it runs `codex exec --enable image_generation --json` in a private run directory,
-with instructions to use only the built-in tool. `codex_cli` is an alias.
-No direct HTTP image client or platform API fallback runs on this path.
-The existing paid provider remains explicit and is never selected automatically.
-
-## Proven path and model visibility
-
-The 2026-09-08 local Codex proof called the real built-in tool, generated a
-brass telescope with an AGENT plaque, and verified its PNG alpha channel.
-Its Codex task was `01a08302-8f19-75e2-a939-50b640449b5d`; the persisted tool
-call and artifact corroborate execution. The built-in result exposed no model
-identifier. Neither the image's appearance nor an accepted model name proves
-Images 2.5. [Codex documentation](https://learn.chatgpt.com/docs/image-generation)
-still names gpt-image-2, while API documentation has separate 2.5 controls.
-Do not substitute API support claims for the actual Codex tool surface.
+Agent makes images through the always-on `app` tool. `AppActionRegistry.swift`
+registers `image.generate` on the Chat page. Discover it with
+`app {"find":"image"}` or read `app {"page":"chat"}`.
 
 ## How Agent uses it
 
-Find image_generate with tool_catalog and retrieve its help with tool_load.
-For generation, describe the subject, composition, lighting, exact quoted text
-and desired finish. Request a transparent cutout in the prompt or with the
-background preference. For editing, inspect references first and supply
-referenced_image_paths; state precisely what changes and what stays.
+Pass the image request inside `args`:
 
 ```json
-{"prompt":"A polished brass telescope on a teal base, plaque reading AGENT; isolated cutout","background":"transparent"}
+{"action":"image.generate","args":{"prompt":"A polished brass telescope on a teal base, plaque reading AGENT; isolated cutout","background":"transparent"}}
 ```
+
+For an edit on the Codex route, inspect the reference first, then supply its
+local path and describe exactly what changes:
 
 ```json
-{"prompt":"Change only the base to violet; preserve the telescope and AGENT plaque","action":"edit","referenced_image_paths":["/absolute/path/from/previous/result.png"]}
+{"action":"image.generate","args":{"prompt":"Change only the base to violet; preserve the telescope and AGENT plaque","action":"edit","referenced_image_paths":["/absolute/path/from/previous/result.png"]}}
 ```
 
-References are authorized through existing file gates, copied into the private
-run directory and attached to Codex. Their order is preserved. Use image 1 for
-layout and image 2 for colors, for example. Continue by supplying the latest
-returned result path. Separate calls have no implicit shared image history.
+Reuse the latest returned image path for another edit. Independent calls have
+no implicit shared image history. Reference order is preserved.
 
-The actual built-in callable accepts a prompt and reference inputs. It does
-not expose a model selector or explicit quality field. NativeAgent's quality,
-size/aspect, format and background fields are therefore **prompt preferences**.
-High detail may be requested, but executed high quality is not inferred.
-NativeAgent does not choose Sunburst/Flare or claim an exact Images version.
-Masks, compression controls and image reasoning effort are not exposed.
+## Provider selection
+
+The checked **Work** provider route selects the backend. In
+`FirstPartyModelCatalog.imageRoute(forProviderID:)`, OpenAI maps to `openai_api`;
+Codex and `openai_oauth_direct` map to `codex`. An unsupported Work route stops
+with a model-choice card. Request arguments cannot select a different provider
+or image model; a conflicting `provider`, `backend`, or `model` is refused.
+`codex_cli` is accepted as an alias when Work resolves to Codex.
+
+The Codex path runs `codex exec --enable image_generation --json` and requests
+the built-in `image_gen.imagegen` tool. It uses the app's resolved Codex auth
+home and the Work controller model. The worker has an empty per-run directory,
+a read-only sandbox, an allowlisted environment, ignored user config/rules,
+and disabled non-image tool families. It is still a general Codex worker,
+not a dedicated image API. Failure does not switch providers.
+
+The OpenAI API path requires its configured API key and supports generation;
+the edit/reference/background controls above are not implemented on that path.
 
 ## Results and execution boundaries
 
-`transport=codex_builtin`, `sourceTool=image_gen.imagegen` and `codexThreadId`
-identify the execution route. Model identity remains unknown when Codex does
-not expose it. `qualityRequestForwarding=prompt_preference` and unknown quality
-fulfillment make that limitation explicit. Decoded raster dimensions and format
-are reported separately from requested preferences; alpha metadata describes
-channel presence, not a guarantee every background pixel is clear.
+On the Codex route, quality, size/aspect, format and background are prompt
+preferences. The receipt reports `transport=codex_builtin`,
+`sourceTool=image_gen.imagegen`, and `codexThreadId`. It records image-model
+identity and quality fulfillment as unknown when the built-in result does not
+expose them. A controller model or requested quality is not image-model proof.
 
-Only images inside the exact Codex task's generated_images directory can be
-collected. Other concurrent Codex images are excluded. Complete raster decoding
-is required; corrupt/missing files fail instead of becoming success artifacts.
-Outputs and receipts remain private in NativeAgent data/generated_images.
+NativeAgent decodes the returned raster and reports actual dimensions, format
+and alpha-channel presence. Alpha presence alone does not prove a transparent
+background. Only files from that exact Codex thread's `generated_images`
+directory are collected; outputs and receipts are kept under
+`<dataRoot>/generated_images`.
 
-Trust Center precedes reference reads and process launch. Four references at
-most, 8 MiB each, 20 MiB total, 40 MP each. n requests 1–4 images. The whole
-Codex run has a 30–1800 second timeout (default 600). Cancellation uses the
-existing process-tree owner. Failures never switch to an API or automatically
-retry. Build the integrated app, run focused image tests, then directly verify
-the installed NativeAgent tool with a real Codex generation/edit.
+Trust admission precedes execution and reference reads. Codex accepts up to
+four local PNG/JPEG/WebP references, each at most 8 MiB and 40 megapixels,
+20 MiB total. `n` is clamped to 1–4; `timeout_seconds` to 30–1800, default 600.
+Masks, implicit prior-image references, compression and image reasoning-effort
+controls are refused.
+
+Implementation: `ChatToolRuntime/SwiftToolDispatcher+ImageGenerationTools.swift`
+and `ChatToolRuntime/CodexImageGenerationControls.swift` under
+`Modules/NativeAgentCore/Sources/`.

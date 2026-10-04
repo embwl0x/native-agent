@@ -15,6 +15,7 @@ import TrustCenter
 @Observable
 public final class TrustFacade {
     public nonisolated let dataRoot: URL
+    private nonisolated let connectorActionStatuses: (@Sendable () async throws -> [String: String])?
 
     /// The saved policy as of the last read or write.
     public var policy: TrustPolicy? {
@@ -26,8 +27,13 @@ public final class TrustFacade {
     public var capabilityNetwork: CapabilityTrustNetwork?
     public var capabilitySummary: CapabilitySummaryResponse?
 
-    public nonisolated init(dataRoot: URL) {
+    public nonisolated init(
+        dataRoot: URL,
+        // Policy-only readers need no connector binding. Capability reads do.
+        connectorActionStatuses: (@Sendable () async throws -> [String: String])? = nil
+    ) {
         self.dataRoot = dataRoot
+        self.connectorActionStatuses = connectorActionStatuses
     }
 
     nonisolated private var center: SwiftNativeTrustCenter {
@@ -35,11 +41,13 @@ public final class TrustFacade {
     }
 
     public nonisolated func loadCapabilities() async throws -> CapabilitySummaryResponse {
+        guard let connectorActionStatuses else { throw CapabilityTrustError.unavailable }
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
         let root = dataRoot
         let rows = try await capabilityRecordsFull(
             dataRoot: root, nowISO: nowISO,
-            mcpServers: { await listMCPServersAsDicts(dataRoot: root) }
+            connectorActionStatuses: connectorActionStatuses,
+            mcpServers: { try await listMCPServersAsDicts(dataRoot: root) }
         )
         var records: [CapabilityRecord] = []
         var firstError: Error?
@@ -97,16 +105,20 @@ public final class TrustFacade {
     /// The capability trust network: roots, catalog sources and one trust
     /// record per capability.
     public nonisolated func loadCapabilityNetwork() async throws -> CapabilityTrustNetwork {
-        try await capabilityTrust.network()
+        try await capabilityTrust().network()
     }
 
     public nonisolated func evaluateCapability(id: String) async throws -> CapabilityTrustEvaluation {
-        try await capabilityTrust.evaluate(capabilityId: id)
+        try await capabilityTrust().evaluate(capabilityId: id)
     }
 
-    nonisolated private var capabilityTrust: any CapabilityTrustProtocol {
-        makeCapabilityTrust(mcpServers: {
-            await listMCPServersAsDicts(dataRoot: PersistenceCore.defaultDataRoot())
-        })
+    nonisolated private func capabilityTrust() throws -> any CapabilityTrustProtocol {
+        guard let connectorActionStatuses else { throw CapabilityTrustError.unavailable }
+        return makeCapabilityTrust(
+            dataRoot: dataRoot, connectorActionStatuses: connectorActionStatuses,
+            mcpServers: { [dataRoot] in
+                try await listMCPServersAsDicts(dataRoot: dataRoot)
+            }
+        )
     }
 }

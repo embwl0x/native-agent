@@ -15,8 +15,8 @@ import TurnTrace
 // sessions would be exactly the sweep-item-3 lie)." So this check does not get
 // to be quiet about what it could not measure. Three separate honesty rules:
 //
-//   * A hot session count of 0 on a root that HAS a sessions.json is a FAIL,
-//     not an "ok, nothing to see". It means the index is unreadable.
+//   * An unreadable or malformed index is a FAIL. A valid empty or entirely
+//     archived index legitimately has 0 hot sessions.
 //   * Transcripts this check could not scan are reported as `unreadable`
 //     rather than folded into "0 disagreements". A zero that was never
 //     measured is the lie the sweep names.
@@ -63,12 +63,10 @@ public struct SessionIdentityCheck: DoctorCheck {
             )
         }
 
-        // The sweep-item-3 guard: a readable index with rows must not report 0.
-        if report.hotSessionCount == 0 {
+        if !report.indexReadable {
             return CheckResult(
                 id: id, title: title, status: "fail",
-                detail: "chat/sessions.json exists but yielded 0 live session rows —"
-                    + " the index is unreadable, malformed, or every row is archived."
+                detail: "chat/sessions.json is unreadable or malformed."
                     + " Session identity cannot be measured.",
                 repair: "Inspect data/chat/sessions.json; run Repair Safe Issues to"
                     + " rebuild app-owned chat directories."

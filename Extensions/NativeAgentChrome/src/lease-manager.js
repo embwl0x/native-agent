@@ -85,8 +85,7 @@ export class TabLeaseManager {
   async acquireLocked(payload) {
     let tab;
     let ownership;
-    const rendered = payload.mode === "create" && (payload.renderingMode === "visible_work_window"
-      || (payload.renderingMode === undefined && isXPostURL(payload.initialUrl)));
+    const rendered = payload.mode === "create" && payload.renderingMode === "visible_work_window";
     if (payload.mode === "create") {
       tab = rendered ? await this.createRenderedTab(payload.initialUrl) : this.workspace ? await this.workspace.createTab(payload.initialUrl) : await this.chrome.tabs.create({
         active: false,
@@ -409,16 +408,6 @@ export class TabLeaseManager {
       // Cleanup cannot recover focus, but must not hide the original invariant error.
     }
   }
-}
-
-function isXPostURL(value) {
-  if (typeof value !== "string") return false;
-  try {
-    const url = new URL(value);
-    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password && !url.port
-      && ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(url.hostname)
-      && /^\/[A-Za-z0-9_]{1,15}\/status\/[0-9]+\/?$/.test(url.pathname);
-  } catch { return false; }
 }
 
 function validStoredLease(row) {

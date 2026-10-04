@@ -5,8 +5,8 @@ import Foundation
 /// **Why this exists** (live-run defect, 2026-08-14): the "instant pause"
 /// guarantee held only for the in-app Trust Center toggle, which calls
 /// `ActivityWatcher.updatePolicy` directly. Any OUT-OF-BAND write to
-/// `activity_watch/activity_policy.json` — `activity-probe policy --disable`,
-/// a second process, a user editing the file, a restore — was invisible to a
+/// `activity_watch/activity_policy.json` — a second process, a user editing
+/// the file, a restore — was invisible to a
 /// watcher that was already running. A live run proved it: capture was disabled
 /// on disk and 40 further seconds of app switching still added 4 rows.
 ///

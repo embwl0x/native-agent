@@ -328,15 +328,13 @@ public protocol ToolRegistryProtocol: Sendable {
     func listTools(filter: ToolFilter) async throws -> [ToolRecord]
     func getTool(id: String) async throws -> ToolRecord?
     @discardableResult
-    func promote(id: String) async throws -> ToolRecord
-    @discardableResult
     func quarantine(id: String, reason: String) async throws -> ToolRecord
 }
 
 // MARK: - SwiftNative impl
 
-/// File-backed tool registry mirroring the retired daemon promote_tool +
-/// quarantine_tool. Actor-isolated for R-M-W serialization on
+/// File-backed tool registry for listing and quarantine. Promotion belongs to
+/// SwiftNativeToolExecution. Actor-isolated for R-M-W serialization on
 /// `<root>/tools/registry.json`.
 ///
 /// HARD SCOPE CARVE-OUTS — Swift impl deliberately does NOT touch:
@@ -346,13 +344,10 @@ public protocol ToolRegistryProtocol: Sendable {
 ///   - validationStatus / validationErrors / lastValidatedAt (validate_tool pipeline)
 ///   - autoPromotable / autoRun / autoPromote                (policy fields)
 ///   - manualApprovalRequired                                (policy)
-///   - quarantinePath — promote DOES clear it to JSON null on the way back
-///     to active. Quarantine now SETS it: see _quarantineImpl, which
-///     mirrors the daemon's shutil.copytree of <tools>/active/<id>/ →
-///     <tools>/quarantine/<id>/ and stamps the resulting path onto the
-///     record. Carve is therefore symmetric: both paths write this field.
 ///   - riskAcknowledgedAt / riskAcknowledgedBy / userRequestedActivation
 /// All carve-outs round-trip via `extras` untouched.
+/// Quarantine copies the active body to the quarantine directory and records
+/// the resulting `quarantinePath`.
 public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
     private let root: URL
     private let persistence: any PersistenceCoreProtocol
@@ -379,8 +374,15 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
 
     public func listTools(filter: ToolFilter) async throws -> [ToolRecord] {
         let raw = try await persistence.readJSON(registryPath, ifMissing: .array([]))
-        guard case .array(let items) = raw else { return [] }
-        let records = items.compactMap(ToolRecord.init(json:))
+        guard case .array(let items) = raw else {
+            throw ToolRegistryError.registryUnreadable(reason: "registry must be an array")
+        }
+        let records = try items.enumerated().map { index, item in
+            guard let record = ToolRecord(json: item) else {
+                throw ToolRegistryError.registryUnreadable(reason: "row \(index + 1) has missing or invalid required fields")
+            }
+            return record
+        }
         // Newest effective timestamp first; ties retain their on-disk order.
         func sortKey(_ r: ToolRecord) -> String {
             (r.updatedAt?.isEmpty == false ? r.updatedAt : nil) ?? r.createdAt
@@ -417,28 +419,6 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
         return try await task.value
     }
 
-    @discardableResult
-    public func promote(id: String) async throws -> ToolRecord {
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            throw ToolRegistryError.invalidRequest("empty id")
-        }
-        return try await runSerialized { [persistence, registryPath, clock] in
-            let now = clock()
-            let work: @Sendable () async throws -> ToolRecord = {
-                try await Self._promoteImpl(
-                    id: id,
-                    persistence: persistence,
-                    registryPath: registryPath,
-                    now: now
-                )
-            }
-            // Process-local serialization precedes the cross-process file lock.
-            // Every persistence conformer supplies this locking extension.
-            return try await persistence.withFileLock(registryPath, work)
-        }
-    }
-
     /// Resolve the first exact-ID row while the caller owns the mutation lock.
     private static func editableRecord(
         id: String, persistence: any PersistenceCoreProtocol, registryPath: URL
@@ -454,46 +434,6 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
             return (items, idx, obj)
         }
         throw ToolRegistryError.toolNotFound(id)
-    }
-
-    private static func _promoteImpl(
-        id: String,
-        persistence: any PersistenceCoreProtocol,
-        registryPath: URL,
-        now: Date
-    ) async throws -> ToolRecord {
-        var (mutated, idx, obj) = try await Self.editableRecord(
-            id: id, persistence: persistence, registryPath: registryPath
-        )
-        let stamp = isoTimestamp(now)
-        // Flip status + phase to active; restamp updatedAt; mirror daemon
-        // L33949-33997: write promotedAt, clear quarantineReason+quarantinePath
-        // by setting them to JSON null (NOT removing the keys — the daemon
-        // emits `None`, which json.dumps writes as `null`).
-        obj["status"] = .string("active")
-        obj["phase"] = .string("active")
-        obj["updatedAt"] = .string(stamp)
-        obj["promotedAt"] = .string(stamp)
-        obj["quarantineReason"] = .null
-        obj["quarantinePath"] = .null
-        // CARVED OUT (NOT TOUCHED) — see struct doc above. Listed here so a
-        // future reader doesn't think the omission is a bug:
-        //   manifestSignature, signedAt, signatureVersion  (daemon HMAC signer)
-        //   codeFingerprint                                 (re-hashes tool on disk)
-        //   activePath                                      (copytree work)
-        //   validationStatus, validationErrors, lastValidatedAt
-        //                                                   (daemon validate_tool pipeline)
-        //   autoPromotable, autoRun, autoPromote, manualApprovalRequired
-        //                                                   (policy fields)
-        //   riskAcknowledgedAt, riskAcknowledgedBy, userRequestedActivation
-        //                                                   (only set by the daemon's
-        //                                                    permission-intersection path)
-        mutated[idx] = .object(obj)
-        try await persistence.writeJSON(.array(mutated), to: registryPath)
-        guard let rec = ToolRecord(json: .object(obj)) else {
-            throw ToolRegistryError.registryUnreadable(reason: "post-promote record unparseable")
-        }
-        return rec
     }
 
     @discardableResult

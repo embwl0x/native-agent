@@ -116,7 +116,7 @@ enum CapabilitiesPlainCopy {
         case "runnable_tools": return "Add tools that help me complete tasks."
         case "capability_foundry": return "See the skills, tools, and connections I can use."
         case "proactive_autonomy": return "Let me suggest useful next steps and keep you updated."
-        case "workflows": return "Run a series of steps with approvals when needed."
+        case "workflows": return "View saved definitions for tasks with several steps."
         case "agent_swarm": return "Ask several assistants to help with a task."
         case "mcp_runtime": return "Connect tools from other apps and services."
         case "research_browser": return "Research topics and read web pages."
@@ -130,7 +130,7 @@ enum CapabilitiesPlainCopy {
         }
     }
 
-    static func toolDescription(_ id: String) -> String {
+    static func toolDescription(_ id: String, catalogDescription: String? = nil) -> String {
         var name = id.split(separator: ":").last.map(String.init) ?? id
         if name.hasPrefix("mac_assistant.") || name.hasPrefix("mac_assistant_") {
             return "Choose what to watch for on your Mac."
@@ -155,15 +155,12 @@ enum CapabilitiesPlainCopy {
         case "install_app", "self_install": return "Build and install an updated app."
         case "get_persona_doc": return "Read my personality notes."
         case "delegation_status": return "Check work assigned to other assistants."
-        case "list_memories": return "Browse saved memories."
-        case "rewrite_memory": return "Update a saved memory."
         case "forget_memory": return "Remove a saved memory."
-        case "rebuild_knowledge_graph": return "Refresh connections between saved memories."
+        case "rebuild_knowledge_graph": return "Refresh connections between saved memories, or clear out orphaned ones."
         case "read_chat_message": return "Read a complete earlier message."
         case "hold_view": return "Keep a considered opinion for future conversations."
         case "release_view": return "Let go of a previously held opinion."
         case "dream_diary_read": return "Read my dream journal."
-        case "reflex_review": return "Review a suggested automatic response."
         case "clipboard_read": return "Read what you have copied."
         case "clipboard_write": return "Copy text to the clipboard."
         case "menu": return "Read an app's menu."
@@ -281,7 +278,7 @@ enum CapabilitiesPlainCopy {
         case "studio": return "Explore ideas and keep creative notes."
         case "memory": return "Review moments to remember."
         case "evolution": return "Propose and review app improvements."
-        default: return "An additional tool I can use for your tasks."
+        default: return catalogDescription ?? "An additional tool I can use for your tasks."
         }
     }
 }

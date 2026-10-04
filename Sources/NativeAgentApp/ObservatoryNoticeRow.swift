@@ -1,7 +1,6 @@
 import SwiftUI
 
-/// Shared compact notice row used by the observatory panels
-/// (ContextFlowObservatoryPanel + WorkshopObservatoryPanel). Follows the
+/// Shared compact notice row used by the observatory panels. Follows the
 /// StalePanelNotice visual idiom (ChatView.swift): a tinted SF Symbol + text
 /// over a faint tinted rounded background.
 ///

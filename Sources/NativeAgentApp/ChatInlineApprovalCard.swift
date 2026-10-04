@@ -1,5 +1,7 @@
 import SwiftUI
+import ApprovalInbox
 import PersistenceCore
+import NativeAgentShared
 
 /// The inline approval card is a safety control, so it has an explicit state
 /// for missing authority rather than presenting disabled actions as though the
@@ -16,23 +18,23 @@ enum InlineApprovalPresentation {
         approvalID: String,
         locallyResolved: Bool,
         localDecision: String,
-        externalStatus: String?
+        externalStatus: String?,
+        externalDecision: String?
     ) -> State {
         guard !approvalID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .unavailable
         }
-        let externalDecision = externalStatus?
+        let status = externalStatus?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         if locallyResolved {
             return .resolved(decision: localDecision)
         }
-        guard let externalDecision,
-              !externalDecision.isEmpty,
-              externalDecision != "pending" else {
+        guard let status, !status.isEmpty, status != "pending" else {
             return .pending
         }
-        return .resolved(decision: externalDecision)
+        return .resolved(decision: externalDecision?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
     }
 }
 
@@ -47,11 +49,18 @@ struct InlineApprovalCard: View {
 
     private var meta: ChatMessageMetadata? { message.metadata }
     private var approvalId: String { meta?.approvalId ?? "" }
+    private var displayContent: String {
+        let tool = appModel.engine.approvals.records.first(where: { $0.id == approvalId })?.action
+            ?? meta?.toolName ?? ""
+        let titleEnd = message.content.firstIndex(of: "\n") ?? message.content.endIndex
+        let title = ToolActivityPresentation.approvalText(String(message.content[..<titleEnd]), tool: tool)
+        return title + String(message.content[titleEnd...])
+    }
 
-    /// The daemon's own view of this approval, so a card recreated by a
+    /// The inbox's own view of this approval, so a card recreated by a
     /// re-render cannot offer a second click on an already-resolved request.
-    private var externalDecision: String? {
-        appModel.engine.approvals.records.first(where: { $0.id == approvalId })?.status.lowercased()
+    private var externalApproval: ApprovalRecord? {
+        appModel.engine.approvals.records.first(where: { $0.id == approvalId })
     }
 
     private var state: InlineApprovalPresentation.State {
@@ -59,7 +68,8 @@ struct InlineApprovalCard: View {
             approvalID: approvalId,
             locallyResolved: resolved,
             localDecision: resolvedDecision,
-            externalStatus: externalDecision
+            externalStatus: externalApproval?.status,
+            externalDecision: externalApproval?.decision
         )
     }
 
@@ -106,8 +116,8 @@ struct InlineApprovalCard: View {
     /// The approval projected into the shared card value. Nothing is stored
     /// here that the approval itself does not already say.
     private var cardModel: InlineCardModel {
-        let title = ChatShellApprovalCopy.title(message.content)
-        let detail = ChatShellApprovalCopy.detail(message.content)
+        let title = ChatShellApprovalCopy.title(displayContent)
+        let detail = ChatShellApprovalCopy.detail(displayContent)
         var model = InlineCardModel(
             id: approvalId.isEmpty ? message.id : approvalId,
             kind: .confirm,

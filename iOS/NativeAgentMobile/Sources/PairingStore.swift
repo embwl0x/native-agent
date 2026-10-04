@@ -54,8 +54,8 @@ final class PairingStore: ObservableObject {
         // erase values written by older builds.
         static let retiredServerURL = "mobile.pairing.serverURL"
         static let retiredBearerToken = "mobile.pairing.bearerToken"
-        // PATCH-2026-05-07: icloud-bridge iCloud pairing flag
-        static let iCloudPaired = "mobile.pairing.iCloudPaired"
+        // Older builds' installed-key flag did not prove Mac confirmation.
+        static let iCloudPaired = "mobile.pairing.macConfirmed"
         // Legacy UserDefaults key — only read for one-time migration
         static let iCloudPairingSecretLegacy = "mobile.pairing.iCloudPairingSecret"
     }
@@ -147,12 +147,46 @@ final class PairingStore: ObservableObject {
     }
     // 32-byte HMAC key shared with the Mac; nil until user scans or pastes the pairing key.
     // v1: stored in Keychain (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly — device-local, no iCloud sync).
-    // Persistence is owned only by installPairingSecret. Keeping
-    // the published value free of a side-effecting observer prevents a failed
-    // Keychain mutation from being represented as committed UI/runtime state.
-    @Published var iCloudPairingSecret: Data? = nil
+    // Persistence is owned only by installPairingSecret. The observer only
+    // invalidates snapshot projections after committed pairing changes.
+    @Published var iCloudPairingSecret: Data? = nil {
+        didSet {
+            if oldValue != iCloudPairingSecret, iCloudSyncEngine.shared.pairingStore === self {
+                iCloudSyncEngine.shared.invalidateSnapshots(pairing: iCloudPairingSecret)
+            }
+        }
+    }
+    @Published private(set) var connectionRepairPending = UserDefaults.standard.bool(forKey: "mobile.pairing.connectionRepairPending")
+    @Published var isRepairingConnection = false
 
-    /// True when signed iCloud pairing is configured.
+    func clearPairingForConnectionRepair() throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.keychainService,
+            kSecAttrAccount as String: Self.keychainAccount,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+        let verified = readSecretFromKeychain()
+        guard verified.status == errSecItemNotFound else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(verified.status == errSecSuccess ? errSecDecode : verified.status))
+        }
+        connectionRepairPending = true
+        UserDefaults.standard.set(true, forKey: "mobile.pairing.connectionRepairPending")
+        UserDefaults.standard.removeObject(forKey: Keys.iCloudPairingSecretLegacy)
+        UserDefaults.standard.removeObject(forKey: Self.knownSecretVersionKey)
+        isICloudPaired = false
+        iCloudPairingSecret = nil
+    }
+
+    func finishConnectionRepair() {
+        connectionRepairPending = false
+        UserDefaults.standard.removeObject(forKey: "mobile.pairing.connectionRepairPending")
+    }
+
+    /// True after the Mac confirms this phone, with signed transport configured.
     var isPaired: Bool {
         isICloudPaired && isICloudSigned
     }
@@ -235,7 +269,7 @@ final class PairingStore: ObservableObject {
 
         // Register for live KVS change notifications so if the Mac publishes
         // AFTER this app is already running (e.g. on the pairing screen), the
-        // pairing screen dismisses automatically within one KVS sync cycle.
+        // Connect step becomes available within one KVS sync cycle.
         // Pattern follows iCloudBridge's @objc nonisolated selector convention
         // (KVS callbacks fire on com.apple.kvs.client.callback, not main).
         NotificationCenter.default.addObserver(
@@ -269,8 +303,7 @@ final class PairingStore: ObservableObject {
     @objc private nonisolated func protectedDataBecameAvailable() {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if self.isICloudPaired,
-               let data = self.loadSecretFromKeychain(), data.count == 32 {
+            if let data = self.loadSecretFromKeychain(), data.count == 32 {
                 self.iCloudPairingSecret = data
             }
             self.applyKVSPairingMaterialIfNeededAsync()
@@ -279,7 +312,7 @@ final class PairingStore: ObservableObject {
 
     /// Runs NSUbiquitousKeyValueStore.synchronize() under a wall-clock timeout
     /// so a wedged cloudd / KVS subsystem can't freeze the caller.
-    private nonisolated static func synchronizeKVSWithTimeout() async {
+    nonisolated static func synchronizeKVSWithTimeout() async {
         _ = await withCKTimeout("PairingStore.KVS.synchronize", seconds: 2) {
             NSUbiquitousKeyValueStore.default.synchronize()
         }
@@ -293,10 +326,12 @@ final class PairingStore: ObservableObject {
     }
 
     /// Reads the HMAC secret from iCloud KVS and, if it differs from (or is newer than)
-    /// the value currently in Keychain, writes it to Keychain and sets isICloudPaired.
+    /// the value currently in Keychain, writes it to Keychain for signed transport.
     /// Safe to call repeatedly — no-ops when everything is already current.
     @discardableResult
-    func applyKVSPairingMaterialIfNeeded() -> Bool {
+    func applyKVSPairingMaterialIfNeeded(allowDuringRepair: Bool = false) -> Bool {
+        guard !isRepairingConnection,
+              !connectionRepairPending || allowDuringRepair else { return false }
         let kvs = NSUbiquitousKeyValueStore.default
         guard let secretData = Self.validatedKVSPairingSecret(
             base64: kvs.string(forKey: KVSPairingKey.hmacSecret)
@@ -316,7 +351,7 @@ final class PairingStore: ObservableObject {
         // Idempotency: compare KVS secret to what's already in Keychain.
         // Only write if different (avoids unnecessary Keychain writes on every launch).
         let existing = loadSecretFromKeychain()
-        if existing == secretData && isICloudPaired {
+        if existing == secretData {
             iCloudPairingSecret = secretData
             return false
         }
@@ -338,8 +373,8 @@ final class PairingStore: ObservableObject {
         _ data: Data,
         persist: ((Data) -> OSStatus)? = nil
     ) -> Bool {
-        guard data.count == 32 else { return false }
-        if iCloudPairingSecret == data, isICloudPaired {
+        guard !isRepairingConnection, data.count == 32 else { return false }
+        if iCloudPairingSecret == data {
             return true
         }
         return installPairingSecret(data, source: "CloudKit", persist: persist)
@@ -356,7 +391,7 @@ final class PairingStore: ObservableObject {
             NSLog("[PairingStore] \(source) pairing rejected: expected 32 bytes, received \(data.count)")
             return false
         }
-        if loadSecretFromKeychain() == data, isICloudPaired {
+        if loadSecretFromKeychain() == data {
             iCloudPairingSecret = data
             return true
         }
@@ -365,8 +400,8 @@ final class PairingStore: ObservableObject {
             NSLog("[PairingStore] \(source) pairing Keychain write failed (status=\(writeStatus))")
             return false
         }
+        isICloudPaired = false
         iCloudPairingSecret = data
-        isICloudPaired = true
         NSLog("[PairingStore] \(source) pairing installed transactionally")
         return true
     }
@@ -374,7 +409,7 @@ final class PairingStore: ObservableObject {
     /// Re-read HMAC material from KVS. Returns true only when a different
     /// secret is durably installed in Keychain.
     @discardableResult
-    func refreshFromKVS() async -> Bool {
+    func refreshFromKVS(allowDuringRepair: Bool = false) async -> Bool {
         // Synchronize first so we get the freshest KVS state — but under the
         // same timeout wrapper the launch path uses: this self-heal fires
         // precisely when KVS/cloudd is misbehaving (signature resync), and a
@@ -384,7 +419,7 @@ final class PairingStore: ObservableObject {
         // Drop the cached in-memory copy so the next applyKVSPairingMaterialIfNeeded
         // pass writes the new Keychain entry rather than no-op'ing on equality.
         let previousSecret = iCloudPairingSecret
-        let applied = applyKVSPairingMaterialIfNeeded()
+        let applied = applyKVSPairingMaterialIfNeeded(allowDuringRepair: allowDuringRepair)
         if PairingKVSRefreshResult.installedNewMaterial(
             applied: applied,
             previousSecret: previousSecret,
@@ -404,12 +439,12 @@ final class PairingStore: ObservableObject {
         Task { @MainActor in
             let applied = self.applyKVSPairingMaterialIfNeeded()
             if applied {
-                NSLog("[PairingStore] auto-bootstrap: live KVS update applied — pairing screen should dismiss")
+                NSLog("[PairingStore] auto-bootstrap: live KVS pairing key installed")
             }
         }
     }
 
-    // PATCH-2026-05-07: icloud-bridge set iCloud as the active transport
+    // Only a successful pairDevice response completes pairing.
     func applyICloudPairing() {
         isICloudPaired = true
     }

@@ -200,6 +200,8 @@ struct OnboardingTourOverlay: View {
     let onSelectTab: (SidebarItem) -> Void
 
     @State private var tour = OnboardingTourState()
+    @AppStorage(SimpleViewMode.key) private var viewMode = ""
+    @State private var previousViewMode: String?
 
     private var step: OnboardingTourStep { tour.step }
     private var presentation: OnboardingTourPresentation { .init(state: tour) }
@@ -293,7 +295,14 @@ struct OnboardingTourOverlay: View {
             .id(tour.stepIndex) // force transition on step change
             .animation(NativeAgentMotion.standard, value: tour.stepIndex)
         }
-        .onAppear { onSelectTab(tour.route) }
+        .onAppear {
+            if previousViewMode == nil { previousViewMode = viewMode }
+            viewMode = SimpleViewMode.advanced
+            onSelectTab(tour.route)
+        }
+        .onDisappear {
+            if let previousViewMode { viewMode = previousViewMode }
+        }
         // S.4: mark overlay as accessibility modal so VoiceOver focuses only overlay content
         .accessibilityAddTraits(.isModal)
         .accessibilityIdentifier("onboarding-tour.overlay")
@@ -365,8 +374,10 @@ struct OnboardingTourOverlay: View {
         case .none:
             break
         case let .route(item):
+            viewMode = SimpleViewMode.advanced
             onSelectTab(item)
         case .complete:
+            if let previousViewMode { viewMode = previousViewMode }
             onComplete()
         }
     }

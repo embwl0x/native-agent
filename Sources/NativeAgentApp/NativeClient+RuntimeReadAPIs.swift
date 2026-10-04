@@ -21,7 +21,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -62,52 +61,7 @@ enum NativeClientRuntimeReadError: LocalizedError, Equatable {
 }
 
 extension NativeClient {
-    func searchCommandPalette(query: String, limit: Int = 25) async throws -> [CommandPaletteEntry] {
-        // WAVE 15 (2026-06-01): Swift-only — daemon route retired.
-        let context = await makeCommandPaletteContext()
-        return CommandPalette.searchCommandPalette(query, limit: limit, context: context)
-    }
-
-    /// Subsystem #17 cluster C4 / WAVE 5 (2026-05-31): builds the
-    /// `CommandPaletteContext` consumed by the SwiftNative palette renderer.
-    /// Pulls live values from the Swift subsystems that have a port today:
-    ///
-    ///   - personaName       — current persona display name via
-    ///                         `PersonaCompiler.agentDisplayName()` normalizer
-    ///                         (generic names like "agent"/"AI" fall back to
-    ///                         "NativeAgent"; non-isolated static — no actor
-    ///                         hop, no IO beyond a single ~1 KB read).
-    ///   - approvalCount     — `SwiftNativeApprovalInbox.list(filter:.pending).count`.
-    ///                         Drives BOTH the `approvals` entry's count badge
-    ///                         AND the autonomy.counts.pendingApprovals slot
-    ///                         (legacy HTTP read them from different sources,
-    ///                         but the values are equal by definition).
-    ///   - enableAutonomy    — `SwiftNativeTrustCenter.loadTrustPolicy()["enableAutonomy"]`
-    ///                         coerced to Bool. Drives the operating-map
-    ///                         entry's ready/attention flip.
-    ///   - improvementFailedCount — `SwiftNativeSelfImprovement
-    ///                         .improvementSummaryLocal().failedCount`.
-    ///                         Drives the self-improvement-scoreboard
-    ///                         entry's ready/attention flip.
-    ///   - macAssistantStatus/templateAttentionCount — one lightweight read
-    ///                         from the same app-configured
-    ///                         `MacAssistantStatusClient` as the watch panel.
-    ///                         An unreadable/invalid status remains visibly
-    ///                         unavailable; it is never converted to ready.
-    ///
-    /// All other fields default to `CommandPaletteContext.wave2NeutralBaseline` — see
-    /// the CAVEAT block in CommandPalette.swift for the per-field carve list.
-    /// Errors from the source-of-truth calls are non-fatal: we log via NSLog.
-    /// The Mac assistant's specific fallback is `unavailable`, rather than
-    /// the neutral "ready" literal, so its badge/status remain honest.
-    func makeCommandPaletteContext(
-        macAssistantStatusClient: (any MacAssistantStatusClient)? = nil
-    ) async -> CommandPaletteContext {
-        await RuntimeReadProjection.makeCommandPaletteContext(macAssistantStatusClient: macAssistantStatusClient ?? makeAppMacAssistantStatusClient())
-    }
-
-    /// Both the panel and palette must observe the same native status owner
-    /// and app-local PIM adapters. Callers choose only the payload depth.
+    /// The panel observes the native status owner and app-local PIM adapters.
     private func makeAppMacAssistantStatusClient() -> any MacAssistantStatusClient {
         Self.makeAppMacAssistantStatusClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
     }
@@ -120,7 +74,7 @@ extension NativeClient {
             dispatcherTools: StaticDispatcherToolAvailabilityProvider(
                 availableTools: SwiftToolDispatcher.catalogRegisteredToolNames
             ),
-            localPIM: NativeAppLocalPIMStatusProvider()
+            localPIM: NativeAppLocalPIMStatusProvider(root: root)
         )
     }
 
@@ -141,20 +95,6 @@ extension NativeClient {
     // (User authorized). It was polled on every AppModel refresh to render a
     // ledger frozen since 2026-05-08. data/workflows/runs.jsonl stays on disk
     // as history; nothing reads it.
-
-    /// Create/replace a workflow record through the Swift runtime. The
-    /// SwiftNative client does the registry read->merge->filter->append->write
-    /// plus activity/trace side-effects in-process.
-    /// No Mac-UI view calls this yet (the route's only callers are
-    /// script/smoke_all.sh + script/test.sh), so it exists to keep the cutover
-    /// entry point complete for script and smoke-test callers.
-    @discardableResult
-    func createWorkflow(_ body: JSONValue) async throws -> WorkflowRecord {
-        let impl = makeWorkflowOrchestrationClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
-        let row = try await impl.createWorkflow(body)
-        let data = try row.serializedData(pretty: false)
-        return try JSONDecoder().decode(WorkflowRecord.self, from: data)
-    }
 
     func getMCPServers() async throws -> [MCPServerRecord] {
         return try await swiftListMCPServers()

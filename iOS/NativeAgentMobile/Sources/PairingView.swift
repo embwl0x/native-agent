@@ -40,6 +40,8 @@ struct PairingView: View {
     @State private var errorMessage: String?
     @State private var iCloudSecretError: String?
     @State private var isCheckingForMac = false
+    @State private var isConnecting = false
+    @State private var connectionTask: Task<Void, Never>?
     @State private var phoneCode = ""
 
     var body: some View {
@@ -82,9 +84,11 @@ struct PairingView: View {
                     // otherwise look for it again.
                     let canConnect = bridge.available && pairingStore.isICloudSigned
                     Button {
-                        if canConnect { connectViaICloud() } else { checkForMac() }
+                        if canConnect {
+                            connectionTask = Task { await connectViaICloud() }
+                        } else { checkForMac() }
                     } label: {
-                        Text(isCheckingForMac ? "Checking for Mac…" : canConnect ? "Connect" : "Check for Mac")
+                        Text(isConnecting ? "Waiting for Mac confirmation…" : isCheckingForMac ? "Checking for Mac…" : canConnect ? "Connect" : "Check for Mac")
                             .font(.body.weight(.semibold))
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity, minHeight: 52)
@@ -93,7 +97,7 @@ struct PairingView: View {
                                         tint: HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true))
                     }
                     .buttonStyle(.plain)
-                    .disabled(isCheckingForMac)
+                    .disabled(isConnecting || isCheckingForMac)
 
                     VStack(alignment: .leading, spacing: 8) {
                         if let err = iCloudSecretError {
@@ -119,6 +123,16 @@ struct PairingView: View {
                 }
             }
             .onAppear { bridge.setup() }
+            .onDisappear { connectionTask?.cancel() }
+            .task(id: pairingStore.iCloudPairingSecret) {
+                guard pairingStore.connectionRepairPending else { return }
+                if pairingStore.isICloudSigned {
+                    await connectViaICloud()
+                } else {
+                    await pairingStore.refreshFromKVS(allowDuringRepair: !bridge.usesCloudKitDeviceTransport)
+                    await bridge.drainDeviceTransport()
+                }
+            }
         }
     }
 
@@ -168,7 +182,7 @@ struct PairingView: View {
         Task {
             isCheckingForMac = true
             iCloudSecretError = nil
-            await pairingStore.refreshFromKVS()
+            await pairingStore.refreshFromKVS(allowDuringRepair: !bridge.usesCloudKitDeviceTransport)
             await bridge.drainDeviceTransport()
             isCheckingForMac = false
             if !pairingStore.isICloudSigned {
@@ -179,27 +193,55 @@ struct PairingView: View {
         }
     }
 
-    private func connectViaICloud() {
+    private func connectViaICloud() async {
+        guard !isConnecting, !pairingStore.isRepairingConnection else { return }
         guard pairingStore.isICloudSigned else {
             errorMessage = IOSPairingPresentation.missingKeyMessage
             return
         }
-        pairingStore.applyICloudPairing()
-        Task {
-            do {
-                let key = try PhoneSigningIdentity.key()
-                phoneCode = DeviceApprovalSignature.deviceID(publicKey: key.publicKey.rawRepresentation)
-                iCloudSyncEngine.shared.pairingStore = pairingStore
-                let id = try await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true)
-                let response = try iCloudSyncEngine.shared.requireSuccessfulActionResponse(
-                    await iCloudSyncEngine.shared.pollWithTimeout(msgId: id, timeout: 30, interval: 0.5, expectedAction: "pairDevice")
+        isConnecting = true
+        defer { isConnecting = false }
+        errorMessage = nil
+        let repairing = pairingStore.connectionRepairPending
+        let deadline = Date().addingTimeInterval(60)
+        do {
+            let key = try PhoneSigningIdentity.key()
+            phoneCode = DeviceApprovalSignature.deviceID(publicKey: key.publicKey.rawRepresentation)
+            let sync = iCloudSyncEngine.shared
+            sync.pairingStore = pairingStore
+            if repairing, let secret = pairingStore.iCloudPairingSecret {
+                try sync.requireIdleActionForConnectionRepair()
+                pairingStore.isRepairingConnection = true
+                defer { pairingStore.isRepairingConnection = false }
+                let mailboxes = sync.connectionRepairMailboxes()
+                try await iCloudSyncEngine.reconcileActionsForConnectionRepair(
+                    transactions: mailboxes.transactions, responses: mailboxes.responses,
+                    inbox: mailboxes.inbox, currentSecret: secret
                 )
+            }
+            repeat {
+                try Task.checkCancellation()
+                let id = try await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true)
+                let result = await iCloudSyncEngine.shared.pollWithTimeout(
+                    msgId: id, timeout: min(30, max(0, deadline.timeIntervalSinceNow)), interval: 0.5, expectedAction: "pairDevice"
+                )
+                try Task.checkCancellation()
+                if repairing, result?["code"] == "device_not_verified", deadline.timeIntervalSinceNow > 10 {
+                    try await Task.sleep(for: .seconds(10))
+                    continue
+                }
+                let response = try iCloudSyncEngine.shared.requireSuccessfulActionResponse(result)
                 guard response["ok"] == "true" else {
                     errorMessage = response["message"] ?? "Choose Pair on your Mac, then connect again."
                     return
                 }
+                pairingStore.finishConnectionRepair()
+                pairingStore.applyICloudPairing()
                 onPaired?()
-            } catch { errorMessage = error.localizedDescription }
-        }
+                return
+            } while Date() < deadline
+            errorMessage = "Choose Pair on your Mac, then tap Connect again."
+        } catch is CancellationError {
+        } catch { errorMessage = error.localizedDescription }
     }
 }

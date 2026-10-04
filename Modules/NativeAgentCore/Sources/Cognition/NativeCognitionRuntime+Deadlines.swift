@@ -107,52 +107,30 @@ extension NativeCognitionRuntime {
         let generation = residualDeadline.invalidate()
         let opportunity = await organismKernel.residualRepairOpportunity()
         guard generation == residualDeadline.generation else { return }
-        // NORTHSTAR clause 4 (sweep item 39): the identity-Dream lane's own
-        // reading decides here. This adds no loop and no timer — it reads the
-        // opportunity this method already derived, on the events this method is
-        // already called for, and hands off to a detached task so a dream's
-        // provider call never blocks signal ingestion. See
-        // NativeCognitionRuntime+PressureDream.swift.
-        considerPressureDream(opportunity)
-        // Desk 903 phase 1: the encounter lane rides the SAME reading, on the
-        // same events, and never preempts the dream above it. No new timer, no
-        // new budget. See NativeCognitionRuntime+StudioEncounters.swift.
-        considerStudioEncounter(opportunity)
+        // Desk 903 phase 4: canon tending rides the same events, throttled. No
+        // new timer, no new budget. See NativeCognitionRuntime+StudioCanon.swift.
+        considerStudioCanonTending()
         // Item 5 (2026-09-02): the forward register reads its sources on the
         // SAME reading, on the same events. No new timer, no new budget, and no
         // polling — the composition is rate-limited and hands off to a detached
-        // task exactly like the two lanes above it. See
+        // task like canon tending above it. See
         // NativeCognitionRuntime+Expectations.swift.
-        considerHorizonExpectations(opportunity)
+        considerHorizonExpectations()
         // Personality depth item 9 (2026-09-02) — HER HOUR. Same reading, same
-        // events, no timer of its own, and it never preempts the dream. When the
+        // events, no timer of its own. When the
         // Settings switch is off the lane is NOT INSTALLED: the call below
         // returns having read nothing and written nothing. See
         // NativeCognitionRuntime+StudioWander.swift.
-        considerStudioWander(opportunity)
-        // Personality depth item 12 (2026-09-02): the shoulder tap rides the
-        // SAME reading, on the same events, and owns no timer either. It never
-        // preempts anything — it does not compete for the pressure, it only asks
-        // whether one already-loud seed is worth a push. See
-        // NativeCognitionRuntime+Notify.swift.
-        considerShoulderTap(opportunity)
+        considerStudioWander()
+        // Phase 5 E1 (2026-10-03): her one initiative path (the shoulder tap
+        // folded in) rides the same events and owns no timer either. See
+        // NativeCognitionRuntime+Reach.swift.
+        considerReach()
         // The same exact-deadline owner also wakes at pending prediction/model
         // expiry. That wake only re-derives pressure and may schedule the quiet
         // repair boundary; it does not perform cognition or call a provider.
         guard let deadline = opportunity.nextWakeAt ?? opportunity.nextRepairAt else {
-            submitPhysiology { recorder in
-                await recorder.recordResidualDeadlineArmed(
-                    deadline: nil,
-                    opportunity: opportunity
-                )
-            }
             return
-        }
-        submitPhysiology { recorder in
-            await recorder.recordResidualDeadlineArmed(
-                deadline: deadline,
-                opportunity: opportunity
-            )
         }
         if microcycleSchedulingMode == .manuallyFlushed {
             residualDeadline.armForProof(generation: generation, deadline: deadline)
@@ -163,49 +141,25 @@ extension NativeCognitionRuntime {
             now: now(),
             clampSeconds: Self.residualRepairSleepClampSeconds
         ) { [weak self] in
-            await self?.runResidualRepairDeadline(generation: generation, scheduledAt: deadline)
+            await self?.runResidualRepairDeadline(generation: generation)
         }
     }
 
-    private func runResidualRepairDeadline(generation: UInt64, scheduledAt: Date) async {
+    private func runResidualRepairDeadline(generation: UInt64) async {
         guard generation == residualDeadline.generation else { return }
         residualDeadline.consumeForFire()
-        let firedAt = now()
         let opportunity = await organismKernel.residualRepairOpportunity()
         guard generation == residualDeadline.generation else { return }
         guard opportunity.ready else {
-            submitPhysiology { recorder in
-                await recorder.recordResidualDeadlineFired(
-                    scheduledAt: scheduledAt,
-                    firedAt: firedAt,
-                    wasDue: false,
-                    localRepairPerformed: false,
-                    operationalConsolidationPerformed: false
-                )
-            }
             await rescheduleResidualRepairDeadline()
             return
         }
         let repaired = await organismKernel.runResidualRepairIfDue()
-        // G-H1 (2026-07-18): d0bcd775 accidentally severed the operational-
-        // consolidation lane from this fire path, hardcoding the telemetry field
-        // to false. Restore the call beside the residual repair; the fired record
-        // now carries the real disposition.
-        let operational = await organismKernel.runOperationalConsolidationIfDue()
-        // G-L2 (2026-07-18): re-check generation after the repair/consolidation
-        // awaits, mirroring the guards at the top of this function. A concurrent
+        // G-L2 (2026-07-18): re-check generation after the repair
+        // await, mirroring the guards at the top of this function. A concurrent
         // reschedule or wake re-anchor may have superseded this arm while the
         // organism actor ran; the newer arm owns persist/publish/reschedule.
         guard generation == residualDeadline.generation else { return }
-        submitPhysiology { recorder in
-            await recorder.recordResidualDeadlineFired(
-                scheduledAt: scheduledAt,
-                firedAt: firedAt,
-                wasDue: opportunity.ready,
-                localRepairPerformed: repaired,
-                operationalConsolidationPerformed: operational != nil
-            )
-        }
         if repaired {
             _ = await persistOrganismContinuity(reason: "residual_pressure_repair")
             publishRuntimeChange(reason: "residual_repair:completed")
@@ -221,7 +175,7 @@ extension NativeCognitionRuntime {
         guard await organismKernel.residualRepairOpportunity().ready else { return false }
         let before = await organismKernel.snapshot().dreamRepairSummary.receiptCount
         let generation = residualDeadline.invalidate()
-        await runResidualRepairDeadline(generation: generation, scheduledAt: now())
+        await runResidualRepairDeadline(generation: generation)
         let after = await organismKernel.snapshot().dreamRepairSummary.receiptCount
         let stillReady = await organismKernel.residualRepairOpportunity().ready
         return after > before && !stillReady
@@ -237,7 +191,9 @@ extension NativeCognitionRuntime {
         // G-H2: covers every re-arm site, not just the wake re-anchor. Once
         // `flushForTermination` has latched, no path may resurrect this timer.
         guard !isFlushedForTermination else { return }
+        let currentGeneration = cognitionDeadline.generation
         let opportunity = await substrate.maintenanceOpportunity()
+        guard !isFlushedForTermination, cognitionDeadline.generation == currentGeneration else { return }
         let projectedDeadline = opportunity.nextMaintenanceAt
         let deadline: Date
         if let projectedDeadline,
@@ -355,8 +311,7 @@ extension NativeCognitionRuntime {
               let pending = residualDeadline.pendingForProof,
               now() >= pending.deadline else { return }
         await runResidualRepairDeadline(
-            generation: pending.generation,
-            scheduledAt: pending.deadline
+            generation: pending.generation
         )
     }
 

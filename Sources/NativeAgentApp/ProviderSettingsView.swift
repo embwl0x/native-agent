@@ -51,13 +51,6 @@ struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: Vie
     }
 }
 
-enum ProviderSurfaceRowLayout {
-    // Includes the field label, the longest current value ("No Think"), and
-    // the macOS menu-picker chrome without truncating the active selection.
-    static let reasoningPickerWidth: CGFloat = 148
-    static let fastToggleWidth: CGFloat = 88
-}
-
 /// Presentation truth for the Providers refresh control. Missing provider
 /// rows are a normal first-run result only after a successful refresh; a
 /// failed authority read must remain distinguishable from that empty state.
@@ -326,11 +319,13 @@ struct ProviderSettingsView: View {
     private static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
     @Environment(AppModel.self) private var appModel
     @State private var providers: [ProviderInfo] = []
+    @State private var failedTests: [String: String] = [:]
     @State private var isLoading = false
     /// A reload asked for while another was in flight. The `isLoading`
     /// guard drops the second call; this makes it run once afterwards so a
     /// save that lands during another save's reload is still reflected.
     @State private var reloadRequested = false
+    @State private var refreshCatalogNote: String?
     /// The refresh control must distinguish an authority-read failure from a
     /// genuinely empty provider catalog. Kept separate from the general
     /// status line because save/configure actions also write that line.
@@ -551,6 +546,9 @@ struct ProviderSettingsView: View {
             .environment(appModel)
         }
         .quietReadTask { await loadProviders() }
+        .onChange(of: appModel.engine.providers.accountModelRevision) { _, _ in
+            Task { await loadProviders() }
+        }
     }
 
     @ViewBuilder
@@ -586,7 +584,8 @@ struct ProviderSettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Text(ProviderAccountStateLinePresentation.line(
                         state: provider.auth_status.state,
-                        detail: provider.auth_status.detail))
+                        detail: provider.auth_status.detail,
+                        failedTest: failedTests[provider.provider_id]))
                         .font(.system(size: 12)).foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(provider.auth_modes.map { mode in
@@ -675,46 +674,14 @@ struct ProviderSettingsView: View {
 
                 DisclosureGroup("Sign in, reconnect or add an account") {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        // A2.2 close-out (2026-07-24): title/copy said sign-in
-                        // ran through Codex's device flow — stale since the
-                        // 2026-07-05 codex-free loopback cutover. The codex
-                        // device flow remains the alternative path (its
-                        // in-flight UI renders below).
                         card {
                             VStack(alignment: .leading, spacing: 12) {
                                 ProviderCardTitle(
                                     title: "ChatGPT",
-                                    line: "Sign in with your ChatGPT Plus or Pro account in the browser. The codex command-line device flow is still there as an alternative."
+                                    line: "Sign in with your ChatGPT Plus or Pro account in the browser."
                                 )
                                 OAuthSignInButton(provider: .chatgpt) {
                                     Task { await loadProviders() }
-                                }
-                                if let login = appModel.codexDeviceLogin {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        Text("Open \(login.url ?? "https://auth.openai.com/codex/device")")
-                                            .font(ShellType.label)
-                                            .foregroundStyle(NativeAgentShell.text)
-                                        Text(login.code ?? "waiting")
-                                            .font(ProviderType.code)
-                                            .foregroundStyle(NativeAgentShell.text)
-                                        if let home = login.codexHome, !home.isEmpty {
-                                            Text(home)
-                                                .font(ProviderType.code)
-                                                .foregroundStyle(secondaryInk)
-                                        }
-                                        HStack(spacing: 8) {
-                                            Button("Cancel") {
-                                                Task { await appModel.cancelCodexDeviceLogin() }
-                                            }
-                                            Button("Clear") {
-                                                Task { await appModel.clearCodexDeviceLogin() }
-                                            }
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-                                        .font(ShellType.labelMedium)
-                                    }
-                                    .textSelection(.enabled)
                                 }
                             }
                         }
@@ -1020,31 +987,17 @@ struct ProviderSettingsView: View {
         guard !isLoading, !savingGroups.contains(group.id) else { return }
         savingGroups.insert(group.id)
         defer { savingGroups.remove(group.id) }
-        var cleared: [String] = []
         do {
-            for surface in group.surfaces where surface != "chat" {
-                try await appModel.clearSurfaceOverride(surface: surface)
-                cleared.append(surface)
+            guard let routingGroup = ProviderSurfaceGroups.all.first(where: { $0.id == group.id }) else {
+                throw ProviderRoutingError.invalidRequest
             }
+            _ = try await appModel.saveProviderGroupSelection(group: routingGroup, clearOverride: true)
             await loadProviders()
             if providerLoadError == nil, !overrideReadFailed {
                 statusText = "\(group.title) → default restored"
                 inlineReceipts[group.id] = SaveReceipt(text: statusText)
             }
         } catch {
-            // Put back what was already cleared so the group is all-or-nothing,
-            // then reload so the page shows the real state either way.
-            for surface in cleared {
-                let model = surfaceModel[surface] ?? ""
-                if model.isEmpty {
-                    _ = try? await appModel.setActiveProvider(surface: surface, providerId: activeSurface[surface] ?? "")
-                } else {
-                    _ = try? await appModel.configureSurfaceSelection(
-                        surface: surface, providerID: activeSurface[surface] ?? "", model: model,
-                        reasoningEffort: surfaceReasoningEffort[surface] ?? "",
-                        serviceTier: (surfaceFastMode[surface] ?? false) ? "priority" : "default")
-                }
-            }
             await loadProviders()
             statusText = "Default could not be restored: \(error.localizedDescription)"
         }
@@ -1059,9 +1012,11 @@ struct ProviderSettingsView: View {
         // it again. A single re-run would exit on that second save's stale
         // snapshot, so loop until a whole load passes with nothing requested
         // during it (2026-09-13 review).
+        var shouldRefreshCatalog = refreshCatalog
         repeat {
             reloadRequested = false
-            await performProviderLoad(refreshCatalog: refreshCatalog)
+            await performProviderLoad(refreshCatalog: shouldRefreshCatalog)
+            shouldRefreshCatalog = false
         } while reloadRequested
     }
 
@@ -1078,8 +1033,7 @@ struct ProviderSettingsView: View {
         ) {
         case let .loaded(snapshot):
             do {
-                let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-                let routing = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
+                let routing = snapshot.routing
                 // 2026-09-13 review: the origin caption is derived from what the
                 // RESOLVER answers, never from the raw surfaces.json keys. A key
                 // can name a pick the route no longer carries (the resolver drops
@@ -1102,10 +1056,9 @@ struct ProviderSettingsView: View {
                     .union(MODEL_SURFACES.filter { $0 != "chat" && resolvedDiffersFromChat($0) })
                 unusablePicks = routing.unusablePicks
                 overrideReadFailed = false
-            } catch {
-                overrideReadFailed = true
             }
             providers = snapshot.providers
+            failedTests = snapshot.failedTests
             rowSet = snapshot.rowSet
             if let catalog = snapshot.catalog {
                 catalogModels = catalog.models
@@ -1147,24 +1100,27 @@ struct ProviderSettingsView: View {
             // catalog read that never reached the provider was overwritten
             // here with a flat "Providers loaded". The read says where its
             // rows came from; so does this line.
-            let catalogNote: String? = {
-                guard refreshCatalog else { return nil }
+            if let catalogError = snapshot.catalogError {
+                refreshCatalogNote = "couldn't load models: \(catalogError)"
+            } else if refreshCatalog {
                 switch snapshot.catalog?.catalogFreshness
                     .flatMap(ModelCatalogFreshness.init(rawValue:)) {
                 case .staleAfterFailedRefresh, .unavailable:
-                    return snapshot.catalog?.catalogNote ?? "couldn't load models"
+                    refreshCatalogNote = snapshot.catalog?.catalogNote ?? "couldn't load models"
                 case .cached:
-                    return "model catalog unchanged, showing the cached list"
+                    refreshCatalogNote = "model catalog unchanged, showing the cached list"
                 case .liveIncomplete:
-                    return "model catalog refreshed; the provider's list may be partial"
+                    refreshCatalogNote = "model catalog refreshed; the provider's list may be partial"
                 case .live, .none:
-                    return nil
+                    refreshCatalogNote = nil
                 }
-            }()
+            } else {
+                refreshCatalogNote = nil
+            }
             let loadedText = rowSet.unsupportedStoredKeys.isEmpty
                 ? "Providers loaded at \(shortTime())"
                 : "Provider settings need repair before every saved activity can be configured."
-            statusText = catalogNote.map { "\(loadedText) — \($0)" } ?? loadedText
+            statusText = refreshCatalogNote.map { "\(loadedText) — \($0)" } ?? loadedText
             providerLoadError = nil
         case let .failed(detail):
             providerLoadError = detail
@@ -1257,15 +1213,13 @@ struct ProviderSettingsView: View {
     }
 
     /// One choice, written to every surface the group covers. The optimistic
-    /// local state moves first so the row reads as settled; a failure restores
-    /// each surface to exactly what it had, including its inheritance.
+    /// local state moves first; ProviderRouting commits all members together.
     private func requestSetGroupSelection(
         group: ProviderSettingsSurfaceGroup,
         target: SurfaceSelection,
         providerOnly: Bool = false
     ) {
         let previous = Dictionary(uniqueKeysWithValues: group.surfaces.map { ($0, selection(of: $0)) })
-        let previouslyExplicit = explicitSurfaces
         for surface in group.surfaces {
             activeSurface[surface] = target.provider
             if !providerOnly {
@@ -1285,7 +1239,6 @@ struct ProviderSettingsView: View {
                 target: target,
                 providerOnly: providerOnly,
                 previous: previous,
-                previouslyExplicit: previouslyExplicit,
                 token: token
             )
         }
@@ -1296,7 +1249,6 @@ struct ProviderSettingsView: View {
         target: SurfaceSelection,
         providerOnly: Bool,
         previous: [String: SurfaceSelection],
-        previouslyExplicit: Set<String>,
         token: UUID
     ) async {
         guard groupSaveTokens[group.id] == token else { return }
@@ -1321,21 +1273,24 @@ struct ProviderSettingsView: View {
                 && surfaceModel[surface] != target.model
         }
         do {
+            guard let routingGroup = ProviderSurfaceGroups.all.first(where: { $0.id == group.id }) else {
+                throw ProviderRoutingError.invalidRequest
+            }
+            let result = try await appModel.saveProviderGroupSelection(
+                group: routingGroup, providerID: target.provider,
+                model: providerOnly ? nil : target.model,
+                reasoningEffort: providerOnly ? nil : target.reasoningEffort,
+                serviceTier: providerOnly ? nil : (target.fastMode ? "priority" : "default")
+            )
+            guard groupSaveTokens[group.id] == token else { return }
             for surface in group.surfaces {
-                if providerOnly {
-                    _ = try await appModel
-                        .setActiveProvider(surface: surface, providerId: target.provider)
-                } else {
-                    _ = try await appModel.configureSurfaceSelection(
-                        surface: surface,
-                        providerID: target.provider,
-                        model: target.model,
-                        reasoningEffort: target.reasoningEffort,
-                        serviceTier: target.fastMode ? "priority" : "default"
-                    )
+                activeSurface[surface] = result.snapshot.activeProviders[surface] ?? ""
+                if let preference = result.snapshot.preferences[surface] {
+                    surfaceModel[surface] = preference.model
+                    surfaceReasoningEffort[surface] = preference.reasoningEffort
+                    surfaceFastMode[surface] = preference.serviceTier == "priority"
                 }
             }
-            guard groupSaveTokens[group.id] == token else { return }
             explicitSurfaces.formUnion(group.surfaces)
             statusText = providerOnly
                 ? "\(group.title) → provider saved"
@@ -1360,34 +1315,8 @@ struct ProviderSettingsView: View {
         } catch {
             // A newer edit owns this group now; its writes must not be undone.
             guard groupSaveTokens[group.id] == token else { return }
-            for (surface, prior) in previous {
-                if previouslyExplicit.contains(surface) || surface == "chat" {
-                    if prior.model.isEmpty {
-                        _ = try? await appModel
-                            .setActiveProvider(surface: surface, providerId: prior.provider)
-                    } else {
-                        _ = try? await appModel.configureSurfaceSelection(
-                            surface: surface,
-                            providerID: prior.provider,
-                            model: prior.model,
-                            reasoningEffort: prior.reasoningEffort,
-                            serviceTier: prior.fastMode ? "priority" : "default"
-                        )
-                    }
-                } else {
-                    // It was inheriting before this attempt; leave it inheriting.
-                    try? await appModel.clearSurfaceOverride(surface: surface)
-                }
-            }
-            guard groupSaveTokens[group.id] == token else { return }
-            for (surface, prior) in previous {
-                activeSurface[surface] = prior.provider
-                surfaceModel[surface] = prior.model
-                surfaceReasoningEffort[surface] = prior.reasoningEffort
-                surfaceFastMode[surface] = prior.fastMode
-            }
-            explicitSurfaces = previouslyExplicit
             finishGroupSave(group)
+            await loadProviders()
             statusText = "Model settings could not be saved: \(error.localizedDescription)"
         }
     }

@@ -105,6 +105,21 @@ extension CognitiveSubstrate {
         )
     }
 
+    func persistArtifactTransition(
+        artifacts: [CognitiveArtifactWrite],
+        deletedArtifactIDs: [UUID],
+        at now: Date
+    ) async throws {
+        guard configuration.persistenceEnabled else { return }
+        guard let store else { throw CognitivePersistenceError.storeUnavailable }
+        guard !persistenceWritesBlocked else {
+            throw CognitivePersistenceError.writesBlocked(
+                status: persistenceHealth.status, detail: persistenceHealth.failureDetail)
+        }
+        try await store.commitArtifactTransition(
+            artifacts: artifacts, deletedArtifactIDs: deletedArtifactIDs, at: now)
+    }
+
     /// Persist the complete current thought-seed family as one exact SQLite
     /// transition. Callers own in-memory rollback when this throws.
     func persistThoughtSeedFamily() async throws {

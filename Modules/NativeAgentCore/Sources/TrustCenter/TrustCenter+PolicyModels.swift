@@ -63,18 +63,6 @@ public enum TrustCenterDefaultWorkspaceRoots {
     }
 }
 
-// MARK: - TrustSimulationResult
-
-/// Trust simulation result shape:
-///   {allowed, requiresApproval, risk, action, reasons, policy}.
-/// Preserve verbatim — callers may need any subfield.
-public struct TrustSimulationResult: Sendable, Codable, Equatable {
-    public var rawResponse: JSONValue
-    public init(rawResponse: JSONValue) { self.rawResponse = rawResponse }
-
-    enum CodingKeys: String, CodingKey { case rawResponse = "raw_response" }
-}
-
 // MARK: - Errors
 
 public enum TrustCenterError: Error, LocalizedError {

@@ -447,11 +447,20 @@ public actor ContextSQLiteStore {
             )
             try db.execute(
                 sql: """
+                UPDATE context_source_versions
+                SET health = 'degraded', last_error = ?
+                WHERE source_id = ? AND valid_to_generation IS NULL AND health != 'removed'
+                """,
+                arguments: [boundedError, sourceID.rawValue]
+            )
+            try db.execute(
+                sql: """
                 INSERT INTO context_compile_failures (source_id, error, created_at)
                 VALUES (?, ?, ?)
                 """,
                 arguments: [sourceID.rawValue, boundedError, date.timeIntervalSince1970]
             )
+            try Self.pruneCompileFailures(db, sourceID: sourceID.rawValue)
             try Self.insertReceipt(
                 ContextStoreReceipt(
                     kind: .degraded,
@@ -695,6 +704,8 @@ public actor ContextSQLiteStore {
                   )
                 """)
 
+            try Self.pruneCompileFailures(db)
+
             return ContextStorePruneResult(
                 deletedGenerations: deadGenerations.count,
                 deletedAtomVersions: deadAtomKeys.count,
@@ -703,6 +714,25 @@ public actor ContextSQLiteStore {
                 deletedReceipts: receiptIDs.count
             )
         }
+    }
+
+    /// Keep the newest 64 failures per source, including recovered sources.
+    private static func pruneCompileFailures(_ db: Database, sourceID: String? = nil) throws {
+        try db.execute(
+            sql: """
+            DELETE FROM context_compile_failures
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY source_id ORDER BY created_at DESC, id DESC
+                    ) AS ordinal
+                    FROM context_compile_failures
+                    WHERE ? IS NULL OR source_id = ?
+                ) WHERE ordinal > 64
+            )
+            """,
+            arguments: [sourceID, sourceID]
+        )
     }
 
     /// A5.5(b): reclaim the disk that `prune()`'s DELETEs freed. SQLite keeps
@@ -1179,6 +1209,15 @@ public actor ContextSQLiteStore {
                 receipt.createdAt.timeIntervalSince1970,
             ]
         )
+        // Turn receipts must stay bounded even when no source changes trigger
+        // generation pruning. Retention is part of the receipt transaction.
+        try db.execute(sql: """
+            DELETE FROM context_receipts WHERE id IN (
+                SELECT id FROM context_receipts
+                ORDER BY created_at DESC, id ASC
+                LIMIT -1 OFFSET 10000
+            )
+            """)
     }
 
     private static func unusedVersionKeys(

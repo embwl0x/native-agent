@@ -16,7 +16,20 @@ public enum DeskParking {
 
     /// The newest touch on the item or any of its parts.
     public static func lastTouch(_ item: DeskItem, in state: DeskState) -> Date? {
-        ([item] + state.children(of: item.handle)).compactMap { date($0.updatedAt) }.max()
+        let handles = subtreeHandles(item.handle, in: state)
+        return state.items.filter { handles.contains($0.handle) }.compactMap { date($0.updatedAt) }.max()
+    }
+
+    public static func subtreeHandles(_ handle: String, in state: DeskState) -> Set<String> {
+        let children = Dictionary(grouping: state.items, by: { $0.parent ?? "" })
+        var handles: Set<String> = [handle]
+        var pending = [handle]
+        while let parent = pending.popLast() {
+            for child in children[parent] ?? [] where handles.insert(child.handle).inserted {
+                pending.append(child.handle)
+            }
+        }
+        return handles
     }
 
     public static func isParked(_ item: DeskItem, in state: DeskState, plan: DeskSequencing.Plan,

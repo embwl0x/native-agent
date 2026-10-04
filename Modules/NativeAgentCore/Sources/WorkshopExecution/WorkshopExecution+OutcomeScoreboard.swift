@@ -266,7 +266,7 @@ public enum WorkshopOutcomeScoreboard {
             deskHandle: record.deskHandle,
             createdAt: created,
             updatedAt: updated,
-            status: record.status,
+            status: outcomeStatus(status: record.status, verification: record.verification?.status),
             totalSteps: record.plan.count,
             completedSteps: record.stepsCompleted.count,
             rerunCount: record.rerunCount,
@@ -298,12 +298,16 @@ public enum WorkshopOutcomeScoreboard {
     /// being proven. Legacy receipts omit verificationStatus and retain their
     /// historical interpretation instead of being rewritten speculatively.
     private static func outcomeStatus(for receipt: WorkshopDirectedTaskReceipt) -> String {
-        guard completedStatuses.contains(receipt.status.lowercased()) else {
-            return receipt.status
+        outcomeStatus(status: receipt.status, verification: receipt.verificationStatus)
+    }
+
+    private static func outcomeStatus(status: String, verification: WorkshopVerificationStatus?) -> String {
+        guard completedStatuses.contains(status.lowercased()) else {
+            return status
         }
-        switch receipt.verificationStatus {
+        switch verification {
         case .satisfied, .none:
-            return receipt.status
+            return status
         case .failed:
             return "failed"
         case .unverified:

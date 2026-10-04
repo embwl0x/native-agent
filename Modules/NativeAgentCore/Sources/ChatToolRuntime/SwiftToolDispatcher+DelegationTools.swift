@@ -102,7 +102,9 @@ extension SwiftToolDispatcher {
             "legacy_or_other_build_count": .int(Int64(legacyOrOther.count)),
             "legacy_or_other_build_delivery_unknown_count": .int(Int64(legacyOrOther.filter { $0.deliveryOutcome == "unknown" }.count)),
             "jobs": .array(jobs.map { job in
-                let value = fullDetail ? job.toJSON(includeReplyText: messageID != nil) : job.toCompactJSON()
+                let value = PeerDataTaintDispatcher.labelled(
+                    fullDetail ? job.toJSON(includeReplyText: messageID != nil) : job.toCompactJSON(),
+                    agent: job.agent, dataRoot: dataRoot)
                 guard let messageID, case .object(var object) = value else { return value }
                 object["matched_message_id"] = .string(messageID)
                 if let threadID = job.recordedThreadID { object["thread_id"] = .string(threadID) }

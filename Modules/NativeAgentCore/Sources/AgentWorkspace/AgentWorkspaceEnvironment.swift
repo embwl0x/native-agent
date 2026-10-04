@@ -20,8 +20,9 @@ enum AgentWorkspaceEnvironment {
     static var destinations: [AgentWorkspaceDestination] {
         AgentWorkspaceKnowledge.destinations + AgentWorkspaceApps.destinations + AgentWorkspaceActivity.destinations + AgentWorkspaceBuild.destinations + HerScreen.commsDestinations
             + AgentWorkspaceLife.destinations + HerScreen.coreDestinations + [
-            .init(id: "app", title: "NativeAgent", summary: "The app itself: its pages and settings, read and changed quietly with receipts.",
-                  tool: nil, tools: ["app_settings_list", "app_page_read", "app_page_screenshot", "app_setting_set"]),
+            // The app is its own door, called directly.
+            .init(id: "app", title: "NativeAgent", summary: "The app itself is its own door: call app {} directly for its pages, settings and actions, with receipts.",
+                  tool: nil),
             .init(id: "self", title: "My state", summary: "How things stand, current context and available abilities.",
                   tool: "inner_state", tools: ["agent_introspect", "context_lookup"])
         ]
@@ -30,7 +31,7 @@ enum AgentWorkspaceEnvironment {
     static var readTools: Set<String> {
         AgentWorkspaceKnowledge.readTools.union(AgentWorkspaceApps.readTools).union(AgentWorkspaceActivity.readTools).union(AgentWorkspaceBuild.readTools).union(HerScreen.commsReadTools)
             .union(AgentWorkspaceLife.readTools).union(HerScreen.coreReadTools)
-            .union(["app_settings_list", "app_page_read", "app_page_screenshot", "work_context", "artifact_find", "read_chat_message", "chat_conversations", "read_file", "agent_contacts", "agent_read", "inner_state", "agent_introspect", "context_lookup", "time_now", "search_chat_history"])
+            .union(["work_context", "artifact_find", "read_chat_message", "chat_conversations", "read_file", "agent_contacts", "agent_read", "inner_state", "agent_introspect", "context_lookup", "time_now", "search_chat_history"])
     }
 
     /// A status check reads and changes nothing: it opens as a reading, never
@@ -44,7 +45,7 @@ enum AgentWorkspaceEnvironment {
     }
 
     private static func browsable(_ schema: LLMToolSchema) -> Bool {
-        !["workspace", "tool_load", "tool_unload", "tool_catalog", "tool_result_page"].contains(schema.name)
+        !["workspace", "tool_result_page"].contains(schema.name)
     }
 
     static func schema(_ name: String, catalog: AgentWorkspace.Catalog) async throws -> LLMToolSchema {
@@ -62,6 +63,10 @@ enum AgentWorkspaceEnvironment {
     }
 
     static func retained(_ result: JSONValue) -> JSONValue {
+        // A bounded Mail triage receipt must retain every item's partial effects.
+        if case .object(let row) = result, row["integration"] == .string("mail"),
+           case .array(let items)? = row["items"], (1...10).contains(items.count),
+           items.allSatisfy({ if case .object(let item) = $0 { item["body"] == nil } else { false } }) { return result }
         guard let serialized = try? result.serialize(pretty: false), serialized.utf8.count > 24_000 else { return result }
         return .object(["status": outcome(result), "excerpt": .string(String(serialized.prefix(12_000))),
             "truncated": .bool(true), "detail": .string("Bounded retained receipt. Open the capability's recorded result for further detail; this excerpt is not the full response.")])
@@ -70,6 +75,9 @@ enum AgentWorkspaceEnvironment {
     /// Only a target reference survives a write, never its submitted contents.
     /// Reading it is a new gated owner operation, not proof the write succeeded.
     static func readback(tool: String, input: [String: JSONValue]) -> AgentWorkspaceLocation? {
+        if tool == "google_calendar_send_invitations", let calendarID = input["calendar_id"], let eventID = input["event_id"] {
+            return .record(tool: "google_calendar_read", input: ["calendar_id": calendarID, "event_id": eventID], title: "Meeting")
+        }
         if tool.hasPrefix("browser.chrome_"), case .string(let lease)? = input["lease_id"] {
             return .record(tool: "browser.chrome_snapshot", input: ["lease_id": .string(lease), "max_nodes": .int(80), "max_text_chars": .int(10000)], title: "Selected browser page")
         }
@@ -133,6 +141,13 @@ enum AgentWorkspaceEnvironment {
             }
             if id == "research", names.contains(AgentWorkspaceKnowledge.webSearchTool) {
                 projection.actions.insert(.init(label: "Search the web", action: .searchWeb, needsText: true), at: 0)
+            }
+            // Status reads Doctor and Telegram through the app door's item reads.
+            if id == "status", names.contains("app") {
+                for (label, page, item) in [("Doctor check of the whole app", "diagnostics", "doctor"), ("Telegram link", "telegram", "status")] {
+                    projection.actions.append(.init(label: label, action: .open(.record(
+                        tool: "app", input: ["page": .string(page), "item": .string(item)], title: label))))
+                }
             }
             if id == "activity", names.contains("activity_query") {
                 projection.actions.append(.init(label: "This week", action: .open(.record(

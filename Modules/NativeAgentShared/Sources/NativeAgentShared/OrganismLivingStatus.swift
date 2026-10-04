@@ -36,6 +36,44 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         availability ?? (enabled ? .live : .disabled)
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case generatedAt, enabled, posture, bodyLine, behaviorLine, needsUser, needsAttention
+        case signalCount, lastSignalAt, body, counters, reflexCandidates, standingViewProposals
+        case availability, unavailableReason
+    }
+
+    private struct OwnerFlagKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        generatedAt = try c.decode(Date.self, forKey: .generatedAt)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        posture = try c.decode(String.self, forKey: .posture)
+        bodyLine = try c.decodeIfPresent(String.self, forKey: .bodyLine)
+        behaviorLine = try c.decode(String.self, forKey: .behaviorLine)
+        // Dynamic keys tolerate public-export identity rewrites without duplicate enum cases.
+        let flags = try decoder.container(keyedBy: OwnerFlagKey.self)
+        let ownerKey = ["needsOwner", "needsUser", "needsUser"]
+            .map { OwnerFlagKey(stringValue: $0) }
+            .first { flags.contains($0) }
+        needsUser = try ownerKey.map { try flags.decode(Bool.self, forKey: $0) } ?? false
+        needsAttention = try c.decodeIfPresent(Bool.self, forKey: .needsAttention)
+        signalCount = try c.decode(Int.self, forKey: .signalCount)
+        lastSignalAt = try c.decodeIfPresent(Date.self, forKey: .lastSignalAt)
+        body = try c.decode(OrganismLivingBodyFile.self, forKey: .body)
+        counters = try c.decode(OrganismLivingCountersFile.self, forKey: .counters)
+        reflexCandidates = try c.decodeIfPresent([OrganismLivingReflexCandidateFile].self, forKey: .reflexCandidates)
+        standingViewProposals = try c.decodeIfPresent([OrganismLivingStandingViewProposalFile].self, forKey: .standingViewProposals)
+        availability = try c.decodeIfPresent(OrganismLivingStatusAvailability.self, forKey: .availability)
+        unavailableReason = try c.decodeIfPresent(String.self, forKey: .unavailableReason)
+    }
+
     public init(
         generatedAt: Date,
         enabled: Bool,

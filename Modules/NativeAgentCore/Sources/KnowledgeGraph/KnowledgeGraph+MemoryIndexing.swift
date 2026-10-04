@@ -68,7 +68,7 @@ public struct KnowledgeGraphMemoryRebuildReport: Sendable, Equatable {
 
 public actor SwiftNativeKnowledgeGraphIndexer {
     private enum IndexingControl: Error {
-        case requiresCanonicalRebuild
+        case requiresCanonicalRebuild(excludingMemoryID: String?)
     }
     // v5, 2026-09-05: names come from the on-device name tagger, not from
     // capitalisation. Every row re-indexes on its next touch or a rebuild.
@@ -171,7 +171,9 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
     }
 
-    public func indexMemory(_ fact: KnowledgeGraphMemoryFact, deleted: Bool = false) async throws {
+    public func indexMemory(
+        _ fact: KnowledgeGraphMemoryFact, deleted: Bool = false, producing: Bool = true
+    ) async throws {
         let memoryID = fact.id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !memoryID.isEmpty else { return }
 
@@ -184,7 +186,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             _ = await predecessor?.value
             let result: Result<Void, any Error>
             do {
-                try await self.performIndex(fact, memoryID: memoryID, deleted: deleted)
+                try await self.performIndex(fact, memoryID: memoryID, deleted: deleted, producing: producing)
                 result = .success(())
             } catch {
                 result = .failure(error)
@@ -213,7 +215,8 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     private func performIndex(
         _ fact: KnowledgeGraphMemoryFact,
         memoryID: String,
-        deleted: Bool
+        deleted: Bool,
+        producing: Bool
     ) async throws {
         let dbPool = try await pool()
         let primaryUserName = resolvedPrimaryUserName()
@@ -228,7 +231,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     WHERE type = 'table' AND name = 'memories'
                     """) ?? 0) > 0
                 let canonicalFact: KnowledgeGraphMemoryFact?
-                if deleted {
+                if deleted || !producing {
                     // 2026-09-06: the caller's `deleted` is authority in BOTH
                     // branches. It used to be read only when there was no
                     // memories table, so the production hook's "graph disabled
@@ -300,6 +303,9 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                 }
 
                 guard let canonicalFact else {
+                    if hasMemoryTable {
+                        throw IndexingControl.requiresCanonicalRebuild(excludingMemoryID: memoryID)
+                    }
                     try Self.deleteMemoryFactEntity(db, memoryID: memoryID)
                     try db.execute(
                         sql: "DELETE FROM kg_memory_index WHERE memory_id = ?",
@@ -310,7 +316,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
 
                 let content = canonicalFact.content
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                let contentHash = Self.contentHash("\(Self.indexVersion):\(content)")
+                let contentHash = Self.factFingerprint(canonicalFact, content: content)
                 let now = Self.nowISO8601()
                 let extracted = Self.extractEntities(from: content, knownPeople: knownPeople)
 
@@ -325,7 +331,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     arguments: [memoryID]
                 )
                 guard existingHash != contentHash else { return }
-                if existingHash != nil { throw IndexingControl.requiresCanonicalRebuild }
+                if existingHash != nil { throw IndexingControl.requiresCanonicalRebuild(excludingMemoryID: nil) }
                 try Self.indexActiveFact(
                     db,
                     fact: canonicalFact,
@@ -337,8 +343,8 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     primaryUserName: primaryUserName
                 )
             }
-        } catch IndexingControl.requiresCanonicalRebuild {
-            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore()
+        } catch IndexingControl.requiresCanonicalRebuild(let excludedMemoryID) {
+            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: producing, excludingMemoryID: excludedMemoryID)
         }
     }
 
@@ -685,6 +691,11 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     static func contentHash(_ text: String) -> String {
         let digest = SHA256.hash(data: Data(text.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func factFingerprint(_ fact: KnowledgeGraphMemoryFact, content: String) -> String {
+        let kind = metadataString(fact.metadata, "kind") ?? "fact"
+        return contentHash("\(indexVersion):\(kind.utf8.count):\(kind):\(content)")
     }
 
     static func nowISO8601() -> String {

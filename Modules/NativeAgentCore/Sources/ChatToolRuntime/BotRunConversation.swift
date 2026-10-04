@@ -4,8 +4,31 @@ import StandingBots
 
 /// A return address for a deliberately requested check, not a bot scheduler or
 /// second conversation. The canonical queue and shelf remain execution truth.
-enum BotRunConversation {
+public enum BotRunConversation {
     typealias Dispatch = @Sendable (String, [String: JSONValue]) async throws -> JSONValue
+
+    /// Run once from a Helper control uses the same durable return owner as a
+    /// requested chat check. Scheduled occurrences never enter this boundary.
+    public static func enqueueRequestedCheck(botID: UUID, dataRoot: URL) async throws -> UUID {
+        let bot = try BotDefinitionStore(dataRoot: dataRoot).get(botID)
+        let result = try await ChatToolSessionContext.withReplyRoute(.init(surface: "chat")) {
+            try await dispatch(input: ["id": .string(botID.uuidString)], surface: "chat",
+                               scope: bot.sessionID, dataRoot: dataRoot) { _, _ in
+                let request = try BotRunQueue(dataRoot: dataRoot).enqueueRequest(bot: botID)
+                return .object(["status": .string("queued"), "id": .string(botID.uuidString),
+                                "requestId": .string(request.uuidString)])
+            }
+        }
+        if case .object(let fields) = result, fields["status"] == .string("waiting"),
+           case .string(let detail)? = fields["detail"] {
+            throw StandingBotsError.invalidValue(detail)
+        }
+        guard case .object(let fields) = result, fields["automatic_return"] == .bool(true),
+              case .string(let raw)? = fields["requestId"], let requestID = UUID(uuidString: raw) else {
+            throw StandingBotsError.invalidValue("The requested check has no confirmed return address. Inspect its saved work before requesting it again.")
+        }
+        return requestID
+    }
 
     static func dispatch(input: [String: JSONValue], surface: String, scope: String,
                          dataRoot: URL, perform: Dispatch) async throws -> JSONValue {

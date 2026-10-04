@@ -62,6 +62,10 @@ actor TelegramTurnProgressCardDriver {
     private var lastRenderedText: String?
     private var lastEditAt: Date?
     private var heartbeatTask: Task<Void, Never>?
+    private var progressFlushTask: Task<Void, Never>?
+    private var progressFlushRequested = false
+    private var progressForcedFlush = false
+    private var progressBypassThrottle = false
     private var editInFlight = false
     private var pendingFlush = false
     private var pendingForcedFlush = false
@@ -133,7 +137,7 @@ actor TelegramTurnProgressCardDriver {
         }
     }
 
-    func record(progress event: TelegramChatProgressEvent) async {
+    func record(progress event: TelegramChatProgressEvent) {
         guard !state.isTerminal else { return }
         if case .replyTextSettled(let settled) = event {
             guard replyTextSettled != settled else { return }
@@ -143,7 +147,7 @@ actor TelegramTurnProgressCardDriver {
                     state, lifecycle: .working(action: nil), at: clock()
                 )
             }
-            await flushIfDue(force: true, bypassThrottle: true)
+            scheduleProgressFlush(force: true, bypassThrottle: true)
             return
         }
         replyTextSettled = false
@@ -155,8 +159,31 @@ actor TelegramTurnProgressCardDriver {
         guard next != state else { return }
         state = next
         guard !transportFailed else { return }
-        _ = await persistIdentity(at: clock(), terminalText: nil)
-        await flushIfDue(force: false)
+        scheduleProgressFlush(force: false)
+    }
+
+    private func scheduleProgressFlush(force: Bool, bypassThrottle: Bool = false) {
+        progressFlushRequested = true
+        progressForcedFlush = progressForcedFlush || force
+        progressBypassThrottle = progressBypassThrottle || bypassThrottle
+        guard progressFlushTask == nil else { return }
+        progressFlushTask = Task { [weak self] in
+            await self?.flushRecordedProgress()
+        }
+    }
+
+    private func flushRecordedProgress() async {
+        while progressFlushRequested, !state.isTerminal, !transportFailed {
+            let force = progressForcedFlush
+            let bypassThrottle = progressBypassThrottle
+            progressFlushRequested = false
+            progressForcedFlush = false
+            progressBypassThrottle = false
+            _ = await persistIdentity(at: clock(), terminalText: nil)
+            guard !state.isTerminal else { break }
+            await flushIfDue(force: force, bypassThrottle: bypassThrottle)
+        }
+        progressFlushTask = nil
     }
 
     func transition(_ event: TelegramTurnPresentationLifecycleEvent) async {

@@ -40,7 +40,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -54,11 +53,6 @@ import WorkshopExecution
 import NotificationInbox
 // SystemOps owns router planning, rebuild, stash recovery, and crash reports.
 import SystemOps
-// ScreenVision v1 (2026-06-06): Swift-native ScreenCaptureKit wrapper.
-// Powers NativeClient.captureScreenForChat() and (via ContentView's
-// NativeScreenCapture shim) the chat composer's "Show agent my screen"
-// button. Fail-closed on permission denial; no daemon HTTP fallback.
-import ScreenVision
 // Telegram management reads live in engine.telegram; mutation executors remain here.
 import TelegramBot
 // Dispatcher owns the Swift-native POST /v1/dispatch path.
@@ -99,8 +93,6 @@ struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
     }
 }
 
-typealias CodexCheckResponse = ProviderRouting.CodexCheckResponse
-
 struct NativeClient: Sendable {
     typealias GauntletProcessRunner = @Sendable (
         _ executable: String,
@@ -117,7 +109,6 @@ struct NativeClient: Sendable {
     /// Watchdog reads observe the already-owned manager. Tests may inject an
     /// isolated manager; this client never starts a manager as a read effect.
     var backgroundLoopsManager: BackgroundLoopsManager = .shared
-    static let codexDeviceLoginManager = SwiftCodexDeviceLoginManager(platform: AppCodexDeviceLoginPlatform())
     /// The Mac surface keeps one immutable orchestration body resident. The
     /// client owns no canonical mind state; it reuses the same live cognition,
     /// memory, routing, TrustCenter, and tool owners while preserving their
@@ -313,32 +304,6 @@ struct NativeClient: Sendable {
     /// by the wave-32 W15 skill mutation gates (updateSkill → SkillRecord).
     static func decodeJSONValue<T: Decodable>(_ value: JSONValue, as type: T.Type, context: String) throws -> T {
         try RuntimeReadProjection.decodeJSONValue(value, as: type, context: context)
-    }
-
-    /// U5 W-A item 1: honest JSONL read. `readJSONL` returns [] for a
-    /// MISSING file (legitimate healthy-empty) but ALSO drops unparseable
-    /// lines silently — so a fully-corrupt file is indistinguishable from
-    /// an empty one. This wrapper applies decodeLossyArray's all-fail rule
-    /// at the line layer: the file has bytes on disk but zero rows parsed →
-    /// throw, so the caller surfaces a read error instead of rendering a
-    /// fabricated empty list.
-    static func readJSONLHonest(
-        _ persistence: SwiftNativePersistenceCore,
-        path: URL,
-        context: String
-    ) async throws -> [JSONValue] {
-        let rows = try await persistence.readJSONL(path)
-        if rows.isEmpty,
-           let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-           let size = attrs[.size] as? NSNumber,
-           size.intValue > 0 {
-            throw NSError(domain: "NativeAgent", code: -3, userInfo: [
-                NSLocalizedDescriptionKey:
-                    "\(context): \(path.lastPathComponent) has \(size.intValue) byte(s) "
-                    + "but no JSONL row parsed — corrupt file, refusing to render it as empty"
-            ])
-        }
-        return rows
     }
 
     // A small number of view callers still use this catch-all shape. Sniff the

@@ -4,11 +4,13 @@ public struct TelegramLastUserMessage: Sendable, Equatable {
     public let chatId: Int
     public let text: String
     public let recordedAt: String
+    public let message: TelegramMessage?
 
-    public init(chatId: Int, text: String, recordedAt: String) {
+    public init(chatId: Int, text: String, recordedAt: String, message: TelegramMessage? = nil) {
         self.chatId = chatId
         self.text = text
         self.recordedAt = recordedAt
+        self.message = message
     }
 }
 
@@ -77,9 +79,11 @@ public actor TelegramTurnCoordinator {
 
     private var activeTurns: [TelegramDestination: ActiveTurn] = [:]
     private var commandTasks: [UUID: Task<Void, Never>] = [:]
+    private var commandDestinations: [UUID: TelegramDestination] = [:]
     private var isShuttingDown = false
     private var shutdownGeneration: UInt64 = 0
     private var queuedTurns: [TelegramDestination: [QueuedTurn]] = [:]
+    private var pausedQueueDestinations: Set<TelegramDestination> = []
     private var lastMessages: [TelegramDestination: TelegramLastUserMessage] = [:]
     private var claimedCallbackIds: Set<String> = []
     private var callbackClaimOrder: [String] = []
@@ -202,13 +206,14 @@ public actor TelegramTurnCoordinator {
         inFlightUpdateIds.contains(updateId)
     }
 
-    public func recordLastUserMessage(destination: TelegramDestination, text: String) {
+    public func recordLastUserMessage(destination: TelegramDestination, text: String, message: TelegramMessage? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         lastMessages[destination] = TelegramLastUserMessage(
             chatId: destination.chatId,
             text: trimmed,
-            recordedAt: _tgNowString()
+            recordedAt: _tgNowString(),
+            message: message
         )
     }
 
@@ -253,6 +258,7 @@ public actor TelegramTurnCoordinator {
         operation: @escaping @Sendable (_ turnId: UUID) async -> Void
     ) -> (id: UUID, task: Task<Void, Never>)? {
         guard !isShuttingDown, activeTurns[destination] == nil else { return nil }
+        pausedQueueDestinations.remove(destination)
         return launchTurn(
             destination: destination,
             text: text,
@@ -432,6 +438,7 @@ public actor TelegramTurnCoordinator {
             return nil
         }
         let item = queue.remove(at: index)
+        pausedQueueDestinations.remove(destination)
         queue.insert(item, at: 0)
         queuedTurns[destination] = queue
         if activeTurns[destination] == nil {
@@ -462,6 +469,11 @@ public actor TelegramTurnCoordinator {
 
     func activeCard(destination: TelegramDestination) -> TelegramTurnProgressCardDriver? {
         activeTurns[destination]?.card
+    }
+
+    func prepareControlHandoff(destination: TelegramDestination) -> (UUID?, TelegramTurnProgressCardDriver?) {
+        pausedQueueDestinations.insert(destination)
+        return (activeTurns[destination]?.id, activeTurns[destination]?.card)
     }
 
     func controlCard(destination: TelegramDestination, turnId: UUID) -> TelegramTurnProgressCardDriver? {
@@ -496,6 +508,7 @@ public actor TelegramTurnCoordinator {
 
     private func startNextQueuedTurn(destination: TelegramDestination) {
         guard !isShuttingDown, activeTurns[destination] == nil,
+              !pausedQueueDestinations.contains(destination),
               var queue = queuedTurns[destination],
               !queue.isEmpty else { return }
         let next = queue.removeFirst()
@@ -519,12 +532,18 @@ public actor TelegramTurnCoordinator {
     func requestStop(
         destination: TelegramDestination,
         turnId: UUID? = nil,
+        pauseQueuedTurns: Bool = false,
         confirmationTimeoutNanoseconds: UInt64,
         sleeper: @escaping @Sendable (_ nanoseconds: UInt64) async throws -> Void
     ) async -> StopOutcome {
+        if pauseQueuedTurns { pausedQueueDestinations.insert(destination) }
+        let commands = turnId == nil ? commandDestinations.compactMap {
+            $0.value == destination ? $0.key : nil
+        } : []
+        for id in commands { commandTasks[id]?.cancel() }
         guard let active = activeTurns[destination],
               turnId == nil || active.id == turnId else {
-            return .notRunning
+            return commands.isEmpty ? .notRunning : .outcomeUnknown
         }
         active.task.cancel()
         guard let card = active.card else { return .outcomeUnknown }
@@ -540,7 +559,7 @@ public actor TelegramTurnCoordinator {
             // snapshot(destination:).isRunning true. The task's own finishTurn call
             // becomes a no-op (same-id guard).
             finishTurn(destination: destination, turnId: active.id)
-            return .confirmed
+            return commands.contains(where: { commandTasks[$0] != nil }) ? .outcomeUnknown : .confirmed
         }
         await card.transition(
             .outcomeUnknown(reason: "Stop requested, but cancellation was not confirmed")
@@ -595,22 +614,26 @@ public actor TelegramTurnCoordinator {
 
     // 2026-09-06: command creation and registration are atomic with shutdown.
     // Admission still releases ingress before the command's reply send finishes.
+    @discardableResult
     func runCommandUntilAdmitted(
+        destination: TelegramDestination? = nil,
         operation: @escaping @Sendable (@escaping @Sendable () -> Void) async -> Void
-    ) async {
-        guard !isShuttingDown else { return }
+    ) async -> Bool {
+        guard !isShuttingDown else { return false }
         let id = UUID()
         let generation = shutdownGeneration
-        await withCheckedContinuation { (admission: CheckedContinuation<Void, Never>) in
+        return await withCheckedContinuation { (admission: CheckedContinuation<Bool, Never>) in
             // 2026-09-06: admission accepted before shutdown cannot register
             // in a replacement lifecycle, even after the shutdown flag resets.
             guard !isShuttingDown, shutdownGeneration == generation else {
-                admission.resume()
+                admission.resume(returning: false)
                 return
             }
+            commandDestinations[id] = destination
             commandTasks[id] = Task {
-                await operation { admission.resume() }
+                await operation { admission.resume(returning: true) }
                 commandTasks.removeValue(forKey: id)
+                commandDestinations.removeValue(forKey: id)
             }
         }
     }
@@ -620,11 +643,13 @@ public actor TelegramTurnCoordinator {
         isShuttingDown = true
         for queued in queuedTurns.values.flatMap({ $0 }) { queued.onDiscard?() }
         queuedTurns.removeAll()
+        pausedQueueDestinations.removeAll()
         let tasks = activeTurns.values.map(\.task) + Array(commandTasks.values)
         for task in tasks { task.cancel() }
         for task in tasks { await task.value }
         activeTurns.removeAll()
         commandTasks.removeAll()
+        commandDestinations.removeAll()
         queuedTurns.removeAll()
         // 2026-09-06: nothing is running after shutdown, so no update id may
         // stay marked in-flight — a leftover mark would keep the recovery pass

@@ -166,7 +166,6 @@ public enum ContextBudgetPolicy {
         public let systemCap: Int
         public let compactionSummaryCap: Int
         public let toolCap: Int
-        public let continuityCap: Int
         public let relevantChars: Int
         public let relevantItemCap: Int
     }
@@ -183,7 +182,6 @@ public enum ContextBudgetPolicy {
                 systemCap: 700,
                 compactionSummaryCap: 4_000,
                 toolCap: 220,
-                continuityCap: 2_200,
                 relevantChars: 1_600,
                 relevantItemCap: 420
             )
@@ -195,7 +193,6 @@ public enum ContextBudgetPolicy {
                 systemCap: 900,
                 compactionSummaryCap: 6_000,
                 toolCap: 260,
-                continuityCap: 2_600,
                 relevantChars: 2_000,
                 relevantItemCap: 520
             )
@@ -210,7 +207,6 @@ public enum ContextBudgetPolicy {
                 // recollection AND ~10k of live turns.
                 compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
                 toolCap: 320,
-                continuityCap: 3_200,
                 relevantChars: 2_400,
                 relevantItemCap: 650
             )
@@ -222,7 +218,6 @@ public enum ContextBudgetPolicy {
                 systemCap: 800,
                 compactionSummaryCap: 5_000,
                 toolCap: 240,
-                continuityCap: 2_200,
                 relevantChars: 1_700,
                 relevantItemCap: 460
             )
@@ -251,7 +246,6 @@ public enum ContextBudgetPolicy {
         public let systemCap: Int
         public let compactionSummaryCap: Int
         public let toolCap: Int
-        public let continuityCap: Int
         public let relevantChars: Int
         public let relevantItemCap: Int
 
@@ -351,7 +345,6 @@ public enum ContextBudgetPolicy {
             // The whole recollection renders; per-surface floors would cut it.
             compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
             toolCap: grow(floors.toolCap, rowScale),
-            continuityCap: grow(floors.continuityCap, rowScale),
             relevantChars: min(maximumRelevantCharacters, grow(floors.relevantChars, scale)),
             relevantItemCap: grow(floors.relevantItemCap, rowScale),
             recallRowLimit: recallRowLimit,
@@ -406,7 +399,6 @@ public enum ContextBudgetPolicy {
             systemCap: floors.systemCap,
             compactionSummaryCap: floors.compactionSummaryCap,
             toolCap: floors.toolCap,
-            continuityCap: floors.continuityCap,
             relevantChars: floors.relevantChars,
             relevantItemCap: floors.relevantItemCap,
             recallRowLimit: floorRecallRowLimit,

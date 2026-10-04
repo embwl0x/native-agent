@@ -181,6 +181,7 @@ extension SwiftToolDispatcher {
                             sourceRelativePath: Self.procedureRelativePath(source),
                             destinationRelativePath: Self.procedureRelativePath(destination),
                             invocationKey: invocationKey,
+                            deskHandle: optionalString(input, "desk_handle"),
                             store: store
                         )
                     } catch {
@@ -198,6 +199,8 @@ extension SwiftToolDispatcher {
                         return try await ordinaryWorkshopSubmission(
                             title: title,
                             text: text,
+                            deskHandle: optionalString(input, "desk_handle")?
+                                .trimmingCharacters(in: .whitespacesAndNewlines),
                             procedureFallbackReason: procedureFallbackReason
                         )
                     }
@@ -245,12 +248,16 @@ extension SwiftToolDispatcher {
                         // pre-admission policy refusal must not manufacture a
                         // motor action, while an admitted failure must remain
                         // visible to resident cognition and Outcome Tissue.
-                        if let record = try await workshopRunner()
-                            .getWorkshopExecution(invocation.executionID) {
-                            failure["id"] = .string(record.id)
-                            failure["execution_status"] = .string(record.status)
-                            failure["verification_status"] = record.verification
-                                .map { .string($0.status.rawValue) } ?? .null
+                        do {
+                            if let record = try await workshopRunner()
+                                .getWorkshopExecution(invocation.executionID) {
+                                failure["id"] = .string(record.id)
+                                failure["execution_status"] = .string(record.status)
+                                failure["verification_status"] = record.verification
+                                    .map { .string($0.status.rawValue) } ?? .null
+                            }
+                        } catch {
+                            failure["execution_read_error"] = .string(error.localizedDescription)
                         }
                         return .object(failure)
                     }
@@ -282,7 +289,9 @@ extension SwiftToolDispatcher {
         deskHandle: String? = nil,
         procedureFallbackReason: String?
     ) async throws -> JSONValue {
-        let spec = WorkshopExecutionSpec(title: title, objective: text)
+        // "agent", not the person's "manual": workshop_reject may stop only
+        // work she started, never his.
+        let spec = WorkshopExecutionSpec(title: title, objective: text, triggerSource: "agent")
         let result: WorkshopDirectedTaskResult
         do {
             result = try await WorkshopDirectedTaskSubmitter(
@@ -438,6 +447,12 @@ extension SwiftToolDispatcher {
 
         // List branch: active (live) first, then recent history.
         let snapshot = await runner.listStatusSnapshot()
+        if let unavailable = snapshot.active.first(where: { $0.status == "unavailable" }) {
+            return .object([
+                "status": .string("unavailable"),
+                "result": unavailable.result,
+            ])
+        }
         func row(_ r: WorkshopExecutionRecord) -> JSONValue {
             var fields: [String: JSONValue] = [
                 "id": .string(r.id),
@@ -531,32 +546,27 @@ extension SwiftToolDispatcher {
     }
 
     /// task_ledger_list — read-only view of the derived task states (newest
-    /// updated first). With `task_id`: that one task's full event timeline.
+    /// updated first). With `task_id`: that task's state and retained events.
     /// Without: the compacted per-task summary. `include_done` (default false)
     /// folds terminal tasks back in. Pure read; bridge-ALLOWED.
     func impl_task_ledger_list(input: [String: JSONValue]) async throws -> JSONValue {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
         let id = optionalString(input, "task_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Detail branch: one task's events.
+        // Detail branch: authoritative base + tail state, with retained events.
         if let id, !id.isEmpty {
-            let events = (try? await ledger.readEventsUnlocked()) ?? []
-            let forTask = events.filter { $0.taskId == id }
-            if forTask.isEmpty {
+            let state = try await ledger.listTasks().first { $0.taskId == id }
+            let forTask = try await ledger.readEventsUnlocked().filter { $0.taskId == id }
+            guard let state else {
                 return .object([
                     "status": .string("not_found"),
                     "task_id": .string(id),
-                    "reason": .string("no task with id \(id)"),
+                    "reason": .string(forTask.isEmpty ? "no task with id \(id)" : "task_deleted"),
                 ])
-            }
-            let state = try await ledger.listTasks().first { $0.taskId == id }
-            if state == nil {
-                return .object(["status": .string("not_found"), "task_id": .string(id),
-                    "reason": .string("task_deleted")])
             }
             return .object([
                 "status": .string("ok"),
-                "task": state?.toJSON() ?? .null,
+                "task": state.toJSON(),
                 "events": .array(forTask.map { $0.toJSON() }),
             ])
         }
@@ -568,7 +578,7 @@ extension SwiftToolDispatcher {
         case .some(.string(let s)): includeDone = ["true", "1", "yes", "y", "on"].contains(s.lowercased())
         default: includeDone = false
         }
-        let tasks = (try? await ledger.listTasks(includeTerminal: includeDone)) ?? []
+        let tasks = try await ledger.listTasks(includeTerminal: includeDone)
         return .object([
             "status": .string("ok"),
             "tasks": .array(tasks.map { $0.toJSON() }),

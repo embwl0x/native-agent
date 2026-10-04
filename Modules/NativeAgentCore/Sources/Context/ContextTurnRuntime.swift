@@ -175,6 +175,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let contextualTerms: Set<String>
     public let cognitiveActivation: [ContextAtomID: Double]
     public let workingAtomIDs: Set<ContextAtomID>
+    /// Phase 5 B0: memory atoms she rejected for this kind of message.
+    public let suppressedAtomIDs: Set<ContextAtomID>
     public let queryEmbedding: [Float]?
     /// The question in the other voice, same vector space as `queryEmbedding`.
     /// See `ContextQueryEmbeddingValue.alternateValues`.
@@ -201,6 +203,10 @@ public struct ContextTurnRequest: Sendable, Equatable {
     /// documents (SOUL/VOICE + surface guidance) are precovered and the rest of
     /// the persona rides the packet.
     public let stableSegmentCarriesRequiredDocuments: Bool
+    /// Nil is the pre-pin transition; [] withholds all generated USER facts.
+    public let userMemoryCore: [String]?
+    /// Automatic memory disclosure, including correction/identity atoms.
+    public let memoryRecallEnabled: Bool
     /// Body length above which the caller's packet renderer replaces an atom's
     /// full text with a lead plus a `context_expand` pointer. The selector uses
     /// it for ONE thing: publishing an expandable pointer for every atom the
@@ -228,6 +234,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
         contextualTerms: Set<String> = [],
         cognitiveActivation: [ContextAtomID: Double] = [:],
         workingAtomIDs: Set<ContextAtomID> = [],
+        suppressedAtomIDs: Set<ContextAtomID> = [],
         queryEmbedding: [Float]? = nil,
         alternateQueryEmbedding: [Float]? = nil,
         queryEmbeddingModelFingerprint: String? = nil,
@@ -237,6 +244,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
         maximumCharacterBudget: Int? = nil,
         postMandatoryCharacterReserve: Int = 0,
         stableSegmentCarriesRequiredDocuments: Bool = false,
+        userMemoryCore: [String]? = nil,
+        memoryRecallEnabled: Bool = true,
         packetAtomExpandThresholdChars: Int = 0,
         memoryAtomRowLimit: Int? = nil
     ) {
@@ -253,6 +262,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
         self.contextualTerms = contextualTerms
         self.cognitiveActivation = cognitiveActivation
         self.workingAtomIDs = workingAtomIDs
+        self.suppressedAtomIDs = suppressedAtomIDs
         self.queryEmbedding = queryEmbedding.flatMap { vector in
             !vector.isEmpty && vector.allSatisfy(\.isFinite) ? vector : nil
         }
@@ -275,6 +285,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
         )
         self.postMandatoryCharacterReserve = max(0, postMandatoryCharacterReserve)
         self.stableSegmentCarriesRequiredDocuments = stableSegmentCarriesRequiredDocuments
+        self.userMemoryCore = userMemoryCore
+        self.memoryRecallEnabled = memoryRecallEnabled
         self.packetAtomExpandThresholdChars = max(0, packetAtomExpandThresholdChars)
         self.memoryAtomRowLimit = memoryAtomRowLimit.map { max(0, $0) }
     }
@@ -371,6 +383,11 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         feedbackLock.withLock { memoryRecordProvenance ?? [] }
     }
 
+    /// Phase 5 B0: the memory record behind one selected atom, once attached.
+    public func memoryRecordID(for atomID: ContextAtomID) -> String? {
+        feedbackLock.withLock { atomMemoryRecords[atomID] }
+    }
+
     public func attachMemoryRecordProvenance(
         _ recordIDs: [String], atomRecords: [ContextAtomID: String] = [:]
     ) {
@@ -440,10 +457,22 @@ public extension ContextTurnPreparing {
     }
 }
 
-public enum ContextTurnPreparationError: Error, Equatable, Sendable {
+public enum ContextTurnPreparationError: Error, Equatable, Sendable, LocalizedError {
     case coordinatorNotStarted
     case generationUnavailable
     case kernelUnavailable(surface: ContextSurface, personaIDHint: String?)
+    case personaSelectionUnavailable
+
+    public var errorDescription: String? {
+        switch self {
+        case .coordinatorNotStarted: "Context Flow has not started"
+        case .generationUnavailable: "Context Flow has no built context yet"
+        case .kernelUnavailable(let surface, let personaID):
+            "no persona context is built for \(surface.rawValue) (persona \(personaID ?? "default"))"
+        case .personaSelectionUnavailable:
+            "The selected persona could not be prepared. Try again."
+        }
+    }
 }
 
 /// Mutation-free revision read used to prove that a frozen evaluation epoch

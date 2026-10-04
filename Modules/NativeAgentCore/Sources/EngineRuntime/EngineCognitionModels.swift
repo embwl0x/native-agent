@@ -6,42 +6,6 @@ import NativeAgentShared
 import PersistenceCore
 import DeviceSync
 import DreamREMCycle
-/// Counts derived from the recent turn-trace tail.
-public struct ContextFlowFallbackSummary: Equatable, Sendable {
-    /// Distinct recent turns carrying a Context Flow summary in any mode.
-    public let observedTurns: Int
-    /// How many observed turns ran in observe-only (shadow) mode.
-    public let shadowTurns: Int
-    /// Number of `context.summary` turn events inspected (the recent window).
-    public let windowTurns: Int
-    /// How many of those turns fell back to the legacy context path.
-    public let fallbackCount: Int
-    /// The `contextFlow.fallbackError` string from the MOST RECENT fallen-back
-    /// turn, bounded. `nil` when no fallback carried an error label.
-    public let latestError: String?
-    public init(
-        observedTurns: Int,
-        shadowTurns: Int,
-        windowTurns: Int,
-        fallbackCount: Int,
-        latestError: String? = nil
-    ) {
-        self.observedTurns = observedTurns
-        self.shadowTurns = shadowTurns
-        self.windowTurns = windowTurns
-        self.fallbackCount = fallbackCount
-        self.latestError = latestError
-    }
-
-}
-
-/// Honest fallback state for the Observatory chip. `unavailable` is distinct
-/// from a healthy zero: a read that could not complete must never render as
-/// "no fallbacks" (M12 rule — read failures must not look like health).
-public enum ContextFlowFallbackState: Equatable, Sendable {
-    case unavailable(String)
-    case summary(ContextFlowFallbackSummary)
-}
 
 public enum CognitionProposalsFeed: Sendable {
     public struct Pending: Sendable, Equatable {
@@ -102,17 +66,12 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         organism: OrganismSnapshot,
         activeDeskCount: Int,
         blockedDeskCount: Int,
-        ownerDecisionDeskCount: Int = 0,
+        ownerWaiting: Int,
         pendingApprovals: Int,
-        requiredApprovals: Int? = nil,
         latestDream: DreamEntry?,
         agentDisplayName: String = "NativeAgent"
     ) -> LivingStatusSnapshot {
-        let effectiveRequiredApprovals = requiredApprovals ?? pendingApprovals
-        let needsUser = LivingAttentionPolicy.needsUser(
-            requiredApprovals: effectiveRequiredApprovals,
-            ownerDecisionDeskCount: ownerDecisionDeskCount
-        )
+        let needsUser = ownerWaiting > 0
         let needsAttention = !needsUser && (
             blockedDeskCount > 0 || LivingAttentionPolicy.organismNeedsAttention(organism)
         )
@@ -133,18 +92,15 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
             whyLine: Self.whyLine(
                 for: organism,
                 pendingApprovals: pendingApprovals,
-                requiredApprovals: effectiveRequiredApprovals,
+                ownerWaiting: ownerWaiting,
                 blockedDeskCount: blockedDeskCount,
-                ownerDecisionDeskCount: ownerDecisionDeskCount,
                 agentDisplayName: agentDisplayName
             ),
             carryLine: Self.carryLine(for: organism),
             innerLine: Self.innerLine(from: organism.projectedBodyLine, enabled: organism.enabled),
             deskSummary: Self.deskSummary(active: activeDeskCount, blocked: blockedDeskCount),
-            approvalsSummary: Self.approvalsSummary(
-                pending: pendingApprovals,
-                required: effectiveRequiredApprovals
-            ),
+            approvalsSummary: pendingApprovals > 0
+                ? "\(pendingApprovals) approval\(pendingApprovals == 1 ? "" : "s") pending" : "no approvals pending",
             lastDreamSummary: latestDream.map { "last dream \($0.date)" } ?? "no dream entry yet",
             needsText: needsUser ? "needs you" : (needsAttention ? "no action needed" : "needs nothing"),
             showsOrganismDetails: organism.enabled
@@ -199,13 +155,12 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
     private static func whyLine(
         for organism: OrganismSnapshot,
         pendingApprovals: Int,
-        requiredApprovals: Int,
+        ownerWaiting: Int,
         blockedDeskCount: Int,
-        ownerDecisionDeskCount: Int,
         agentDisplayName: String
     ) -> String {
-        if requiredApprovals > 0 { return "Waiting on approval before irreversible movement." }
-        if ownerDecisionDeskCount > 0 { return "Desk has work explicitly waiting on your decision." }
+        if pendingApprovals > 0 { return "Waiting on approval before irreversible movement." }
+        if ownerWaiting > 0 { return "The Desk's Needs you holds \(ownerWaiting) thing\(ownerWaiting == 1 ? "" : "s") for your decision." }
         guard organism.enabled else { return "No body line appears while the organism kernel is off." }
         let body = organism.bodySchema
         if !body.providersHealthy || !body.toolHandsAvailable { return "Provider or tool path is brittle, so completion claims tighten." }
@@ -215,12 +170,6 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
             return "A local body path needs \(agentDisplayName)'s attention, but no user action is requested."
         }
         if blockedDeskCount > 0 { return "Desk has blocked work, but it is not waiting on your decision." }
-        if organism.reflexSummary.reviewRequiredCount > 0 {
-            return "\(agentDisplayName) has review work queued, but no user action is requested."
-        }
-        if pendingApprovals > 0 {
-            return "Optional reviews are ready, but nothing is waiting on you."
-        }
         if organism.projectedBodyLine == nil { return "No Body line appears because the body state is steady enough to stay quiet." }
         return "Body line is active because the current state is shaping the turn."
     }
@@ -228,22 +177,13 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
     private static func carryLine(for organism: OrganismSnapshot) -> String {
         guard organism.enabled else { return "carrying no organism state" }
         let proposals = organism.dreamRepairSummary.proposedStandingViews
-        let approved = organism.reflexSummary.approvedLowRiskCount
-        return sanitized("carrying \(organism.signalCount) signals, \(organism.fieldSummary.nodeCount) field nodes, \(organism.reflexSummary.reviewRequiredCount) reflex reviews, \(approved) approved biases, \(proposals) dream proposals")
+        return sanitized("carrying \(organism.signalCount) signals, \(organism.fieldSummary.nodeCount) field nodes, \(proposals) dream proposals")
     }
 
     private static func deskSummary(active: Int, blocked: Int) -> String {
         let activeText = "\(max(0, active)) desk item\(active == 1 ? "" : "s")"
         guard blocked > 0 else { return activeText }
         return "\(activeText), \(blocked) blocked"
-    }
-
-    private static func approvalsSummary(pending: Int, required: Int) -> String {
-        guard pending > 0 else { return "no approvals pending" }
-        guard required == 0 else {
-            return "\(pending) approval\(pending == 1 ? "" : "s") pending"
-        }
-        return "\(pending) optional review\(pending == 1 ? "" : "s")"
     }
 
     private static func innerLine(from projectedBodyLine: String?, enabled: Bool) -> String {

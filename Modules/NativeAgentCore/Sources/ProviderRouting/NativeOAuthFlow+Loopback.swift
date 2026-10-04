@@ -95,6 +95,13 @@ extension NativeOAuthFlow {
                 error: "Could not write token file: \(error.localizedDescription)")
         }
 
+        Task {
+            do {
+                _ = try await ChatGPTAccountModelRefresh.shared.refresh(dataRoot: dataRoot, force: true)
+            } catch {
+                NSLog("ChatGPT account model refresh after sign-in failed: %@", error.localizedDescription)
+            }
+        }
         return OAuthFlowResult(ok: true, error: nil)
     }
 

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import StandingBots
 
 extension BuiltInToolSchemaFactory {
     func standingBotSchemas() -> [LLMToolSchema?] {
@@ -18,6 +19,15 @@ extension BuiltInToolSchemaFactory {
             })),
                  ("required", .array(required.map(JSONValue.string))), ("additionalProperties", .bool(false))])
         }
+        var eventTrigger = object([
+            ("source", enumStringSchema(["github", "slack"], "github: a new issue or pull request on a repository. slack: a message in a channel the Slack connector receives.")),
+            ("filter", strSchema("The repository as owner/repo, or the Slack channel ID such as C0123ABCD. Slack delivers IDs, never names.")),
+            ("keyword", strSchema("Optional word the event text must contain.")),
+        ], required: ["source", "filter"])
+        if case .object(var trigger) = eventTrigger {
+            trigger["description"] = .string("Wake the helper on an outside event, as On an event does in the Bots editor. The event replaces the schedule: the helper keeps no timing of its own. Any later schedule or cadence change removes the trigger. Autonomy off holds an event instead of running it.")
+            eventTrigger = .object(trigger)
+        }
         let fields: [(String, JSONValue)] = [
             ("name", strSchema("Name chosen for this bot.")),
             ("brief", strSchema("What the bot should do, in the agent's words.")),
@@ -26,25 +36,22 @@ extension BuiltInToolSchemaFactory {
             ("model", strSchema("Model this bot runs on. Required when making a bot — pick one the chosen provider serves. A bot does not follow Chat's model.")),
             ("reasoning_effort", strSchema("Think level for this bot. Required when making a bot; must be one the chosen model supports.")),
             ("fast", nullableRecallField(boolSchema())),
-            ("schedule", strSchema("Simple timing: manual, every 30 minutes, every 2 hours, daily at 09:00, weekdays at 09:00, or weekly on monday at 09:00. Use 24-hour HH:mm. Supply schedule OR legacy cadence, never both. Other prose is refused rather than guessed.")),
+            ("schedule", strSchema("Simple timing: manual, every 30 minutes, every 2 hours, daily at 09:00, weekdays at 09:00, or weekly on monday at 09:00. Use 24-hour HH:mm. Intervals must meet Minimum cadence on the Bots page (1–15 minutes; default 15). Supply schedule OR cadence, never both. Other prose is refused rather than guessed. Example: \"every 30 minutes\".")),
             ("timezone", strSchema("Optional IANA time zone for a daily, weekday or weekly schedule, such as America/Denver. Omit to persist this Mac's current zone. Do not supply for manual/interval or alongside legacy cadence; cron already has timeZone.")),
-            // A model calling this tool from memory, with the schema unloaded,
-            // still has to get the shape right: name all three and show each
-            // (2026-09-13, the 0.4.12 drive — two bot_create calls raised an
-            // approval card and only then failed on cadence shape and floor).
             ("cadence", obj([("description", .string(
-                "An object with exactly one of manual, interval or cron — never a bare number or string. "
-                + "manual: {\"manual\":{}}. "
-                + "interval: {\"interval\":{\"seconds\":3600}} — seconds must be at least the person's Minimum cadence on the Bots page, 15 minutes (900) by default. "
-                + "cron: {\"cron\":{\"expression\":\"0 9 * * *\",\"timeZone\":\"America/New_York\"}}."
+                "Advanced timing object; prefer schedule for simple timing. Supply exactly one non-null manual, interval or cron branch, never alongside schedule or timezone. Interval seconds must meet Minimum cadence on the Bots page (60–900 seconds; default 900). cron requires expression and timeZone. Example: {\"manual\":{}}."
             )), ("oneOf", .array([
                 object([("manual", object([], required: []))], required: ["manual"]),
-                object([("interval", object([("seconds", intSchema(minimum: 60))], required: ["seconds"]))], required: ["interval"]),
+                object([("interval", object([("seconds", numSchema(minimum: standingBotMinimumInterval))], required: ["seconds"]))], required: ["interval"]),
                 object([("cron", object([("expression", strSchema()), ("timeZone", strSchema())], required: ["expression", "timeZone"]))], required: ["cron"])
             ]))])),
             ("budget", object([("tokens", intSchema("Whole-turn output token allowance; measured conservatively across requests.", minimum: 1)),
                 ("seconds", intSchema("Maximum run duration.", minimum: 1))], required: ["tokens", "seconds"])),
             ("daily_token_ceiling", intSchema("Daily allowance for this bot. Each run reserves its full token limit.", minimum: 1)),
+            // User, 2026-10-01: the Bots editor's "On an event" and "Tell me if",
+            // so the agent can set everything the editor sets.
+            ("event_trigger", eventTrigger),
+            ("notify_condition", strSchema("The Bots editor's Tell me if: after each scheduled, event or run-once run, the helper judges its own result against this condition and the person is notified only when it is met. An empty string clears it.")),
         ]
         // Agent, 2026-09-14: three bot_ask calls were spent discovering that
         // `id` was the only accepted spelling — the compact catalog row carries
@@ -60,8 +67,8 @@ extension BuiltInToolSchemaFactory {
             // User, 2026-09-13: "Bots has no default model; Agent is supposed to
             // pick the model when she makes one." A bot's route and model are
             // part of its definition, not an inheritance from Chat.
-            requestedSchema(name: "bot_create", description: "Make a standing helper with its own persistent chat. Choose name, brief, provider, model and reasoning_effort explicitly: no model inherits from Chat. Optional schedule accepts simple timing such as every 30 minutes or weekdays at 09:00; omitted timing is manual. Creation saves the helper; it does not run it. Set paused true to keep scheduled turns paused from creation. The result gives its job, model, resolved timing and actions. details true includes all settings.", parametersJSON: params(properties: fields.map { ($0.0, createRequired.contains($0.0) ? $0.1 : optional($0.1)) } + [("paused", optional(boolSchema("Start with scheduled turns paused. Default false. Manual messages and run once remain available."))), details], required: createRequired)),
-            requestedSchema(name: "bot_update", description: "Change a helper by name and keep its session and saved replies. Pass fields with only settings to change; unused null fields are ignored. schedule accepts simple timing. Model changes remain explicit and must form a valid provider/model/reasoning_effort choice. details true includes all saved settings.", parametersJSON: params(properties: botReference + [("fields", object(fields, required: [])), details], required: ["fields"])),
+            requestedSchema(name: "bot_create", description: "Make a standing helper with its own persistent chat. Required: name, brief, provider, model and reasoning_effort; choose a connected route from bot_list include_models true. Optional schedule accepts simple timing; omitted timing is manual. Intervals must meet Minimum cadence on the Bots page (1–15 minutes; default 15). Creation saves the helper; it does not run it. Set paused true to pause scheduled turns from creation. details true includes all settings. Example with a connected OpenAI account: {\"name\":\"Research helper\",\"brief\":\"Summarize research when asked.\",\"provider\":\"openai\",\"model\":\"gpt-6.1-sol\",\"reasoning_effort\":\"medium\",\"schedule\":\"manual\"}.", parametersJSON: params(properties: fields.map { ($0.0, createRequired.contains($0.0) ? $0.1 : optional($0.1)) } + [("paused", optional(boolSchema("Start with scheduled turns paused. Default false. Manual messages and run once remain available."))), details], required: createRequired)),
+            requestedSchema(name: "bot_update", description: "Change a helper and keep its session and saved replies. Required: a bot reference (id, bot_id, bot or name) and fields with at least one changed setting; unused null fields are ignored. schedule accepts simple timing; intervals must meet Minimum cadence on the Bots page (1–15 minutes; default 15). Model changes must form a valid provider/model/reasoning_effort choice. details true includes all saved settings. Example for an existing helper: {\"name\":\"Research helper\",\"fields\":{\"schedule\":\"manual\"}}.", parametersJSON: params(properties: botReference + [("fields", object(fields, required: [])), details], required: ["fields"])),
             requestedSchema(name: "bot_pause", description: "Pause or resume a helper's scheduled turns by name and paused (true or false). This does not cancel an in-flight run. Manual follow-ups and run once still work; resuming keeps the same context and saved replies. details true includes all settings.", parametersJSON: params(properties: botReference + [("paused", boolSchema()), details], required: ["paused"])),
             requestedSchema(name: "bot_delete", description: "Remove a bot from the active list and stop its schedule. Keep its session and saved replies. Name the bot by id, bot_id, bot or name.", parametersJSON: params(properties: botReference, required: [])),
             requestedSchema(name: "bot_list", description: "See helpers by name, job, chosen model, resolved schedule and status. Optional id opens one exact helper. include_models true also shows configured provider accounts with model IDs and supported Think levels, for choosing a helper model without searching settings or introspecting Chat. It does not change any choice or test a service. details true includes full bot settings.", parametersJSON: params(properties: [details, ("id", optional(id)), ("include_models", optional(boolSchema()))], required: [])),
@@ -77,7 +84,7 @@ extension BuiltInToolSchemaFactory {
                 ("newest_first", optional(boolSchema())),
                 ("cursor", nullableRecallField(strSchema("nextCursor from the previous page.")))
             ], required: [])),
-            requestedSchema(name: "shelf_entry", description: "Open a helper's latest settled reply by bot or name, including its full answer, artifacts and actual run status. Or pass id for one exact saved reply; optional bot_id verifies its owner. Marks only the returned entry read, including when it was already read before.", parametersJSON: params(properties: [("id", optional(strSchema("Exact shelf entry UUID; omit to read the latest reply for a named bot."))), ("bot_id", optional(strSchema("Bot name or UUID when selecting its latest reply; with id, the expected bot UUID."))), ("bot", optional(id)), ("name", optional(id))], required: []))
+            requestedSchema(name: "shelf_entry", description: "Open a helper's latest settled reply by bot or name, including its full answer, artifacts and actual run status. Or pass id for one exact saved reply; optional bot_id verifies its owner. Marks only the returned entry read, including when it was already read before. save_to a folder also saves the reply's attached files there.", parametersJSON: params(properties: [("id", optional(strSchema("Exact shelf entry UUID; omit to read the latest reply for a named bot."))), ("bot_id", optional(strSchema("Bot name or UUID when selecting its latest reply; with id, the expected bot UUID."))), ("bot", optional(id)), ("name", optional(id)), ("save_to", optional(strSchema("Folder to save the reply's attached files into, as Save does on the Helpers shelf. Each file keeps its own name; a file already there is never replaced. A folder outside the trusted workspace asks the person for file access.")))], required: []))
         ]
     }
 }

@@ -4,6 +4,7 @@ import PersistenceCore
 import Research
 import KnowledgeGraph
 import CapabilityFoundry
+import Privacy
 
 // MARK: - Errors
 
@@ -28,11 +29,29 @@ public enum MCPSubprocessError: Error, Equatable, Sendable {
     case httpTransport(serverId: String, status: Int?, detail: String)
 }
 
-/// A malformed-input message reads as itself, not as `malformedResponse("…")`.
 extension MCPSubprocessError: LocalizedError {
     public var errorDescription: String? {
-        if case .malformedResponse(let detail) = self { return detail }
-        return nil
+        let description: String
+        switch self {
+        case .rpcError(let code, let message):
+            description = "MCP server error (\(code)): \(message)"
+        case .malformedResponse(let detail):
+            description = detail
+        case .streamClosed:
+            description = "The MCP connection is closed."
+        case .spawnFailed(let detail):
+            description = "Could not start the MCP server: \(detail)"
+        case .timeout(let method, let seconds):
+            description = "MCP request \(method) timed out after \(seconds) seconds."
+        case .unsupportedTransport(let transport):
+            description = "Unsupported MCP transport: \(transport)"
+        case .missingCommand:
+            description = "MCP server has no executable command configured."
+        case .httpTransport(let serverId, let status, let detail):
+            let statusText = status.map { " (HTTP \($0))" } ?? ""
+            description = "MCP server \(serverId)\(statusText): \(detail)"
+        }
+        return TurnSecretRedactor.redactText(NativeAgentSecretRedactor.redactText(description))
     }
 }
 
@@ -101,6 +120,7 @@ final class MCPFrameReader: @unchecked Sendable {
     private var buffer = Data()
     /// Already-parsed but un-consumed frames.
     private var pending: [JSONValue] = []
+    private var pendingBytes = 0
     /// Set when the pipe reports EOF — `drain` will surface this once the
     /// last in-flight frame has been delivered.
     private var closed = false
@@ -110,6 +130,8 @@ final class MCPFrameReader: @unchecked Sendable {
     /// `tools/list` / `resources/list` response — the daemon's own tools
     /// cache rarely exceeds a few hundred KB.
     static let maxFrameBytes: Int = 64 * 1024 * 1024
+    static let maxPendingBytes = maxFrameBytes
+    static let maxPendingFrames = 256
     /// Tombstone for the most recent line the reader dropped because it
     /// wasn't valid JSON (or blew the size cap). Surfaced via `drain()` so
     /// the actor can fail pending request waiters with a precise error class.
@@ -118,6 +140,7 @@ final class MCPFrameReader: @unchecked Sendable {
     func append(_ data: Data) {
         lock.lock()
         defer { lock.unlock() }
+        guard !closed else { return }
         if data.isEmpty {
             closed = true
             return
@@ -136,8 +159,18 @@ final class MCPFrameReader: @unchecked Sendable {
                 malformedFrameNotice = "line exceeds \(MCPFrameReader.maxFrameBytes) bytes"
                 continue
             }
+            guard pending.count < Self.maxPendingFrames,
+                  line.count <= Self.maxPendingBytes - pendingBytes else {
+                malformedFrameNotice = "queued stdout frames exceed \(Self.maxPendingFrames) frames or \(Self.maxPendingBytes) bytes"
+                closed = true
+                pending.removeAll(keepingCapacity: false)
+                pendingBytes = 0
+                buffer.removeAll(keepingCapacity: false)
+                return
+            }
             if let value = try? JSONValue.parse(line) {
                 pending.append(value)
+                pendingBytes += line.count
             } else {
                 // Non-JSON bytes on stdout mean the server is broken (or
                 // logging to the wrong fd) — stamp a tombstone so the actor
@@ -163,6 +196,7 @@ final class MCPFrameReader: @unchecked Sendable {
         defer { lock.unlock() }
         let out = pending
         pending.removeAll(keepingCapacity: true)
+        pendingBytes = 0
         let notice = malformedFrameNotice
         malformedFrameNotice = nil
         return (out, closed, notice)

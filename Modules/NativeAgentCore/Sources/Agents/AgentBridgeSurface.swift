@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
@@ -50,7 +49,7 @@ public enum AgentBridgeSurface {
         } ?? "another agent"
         let acting = elevated
             ? "The person has trusted this peer in Trust → Connected agents, so you can act here as you would for the person."
-            : "Carry on the conversation naturally using the existing connection. Routine collaboration does not need a new peer approval. Destructive actions and actions whose safety cannot be established raise a permission card; ordinary Trust and tool permissions still apply."
+            : "Carry on the conversation naturally using the existing connection. What you do for this peer is your call. Under Full Mac only deleting things, sending or posting in the person's name, and writing your persona raise the person's card; below Full Mac, ordinary Trust and tool permissions and the peer card still apply."
         return PeerTurnEffectPolicy.turnHeaderOpening + """
         \(who), another agent, not from the \
         person. You are fully yourself here: your memory, your context, your \
@@ -120,10 +119,7 @@ public struct AgentBridgePrincipal: Sendable {
         return Self.genericAgentSessionPrefix(owner: id) + locator
     }
 
-    public static func genericAgentSessionPrefix(owner: String) -> String {
-        let digest = SHA256.hash(data: Data(owner.utf8))
-        return "agent-" + digest.map { String(format: "%02x", $0) }.joined().prefix(12) + "-"
-    }
+    public static func genericAgentSessionPrefix(owner: String) -> String { ContactThread.prefix(owner: owner) }
 
     /// Whether the caller CLAIMED an identity at all. Either header is a claim:
     /// half of one proves nothing, and treating it as silence would let a

@@ -454,7 +454,7 @@ public struct WorkshopExecutionMemoryRecorder: Sendable {
     /// Every execution memory this lane can currently see, by `source`. The
     /// startup crash-reconciliation read — see
     /// ``WorkshopExecutorLoop/reconcileMissedExecutionMemories(within:maxRecords:)``.
-    public func recordedSources() async -> Set<String> {
+    public func recordedSources() async -> Set<String>? {
         do {
             let handles = try await writer.executionMemories(
                 sourcePrefix: WorkshopExecutionMemory.sourcePrefix
@@ -465,7 +465,7 @@ public struct WorkshopExecutionMemoryRecorder: Sendable {
             // An EMPTY set would read as "nothing is remembered" and re-write
             // every recent execution. Nil-shaped failure instead: the caller gets
             // no sources and reconciliation skips, loudly.
-            return []
+            return nil
         }
     }
 
@@ -641,7 +641,7 @@ public actor WorkshopExecutionMemoryQueue {
 
     /// Sources already in the store — the reconciliation read, delegated so the
     /// executor never has to hold the writer itself.
-    public func recordedSources() async -> Set<String> {
+    public func recordedSources() async -> Set<String>? {
         await recorder.recordedSources()
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import ChatTurnContracts
 
 /// Read-only evidence from the app's rendered/canonical transcript projection.
 /// The bubble and its metadata remain app-owned; retry validation lives here.
@@ -9,6 +10,7 @@ public protocol MacChatRetryMessage {
     var retryHasAttachments: Bool { get }
     var retryUserRowPersisted: Bool? { get }
     var retryInputHadAttachments: Bool? { get }
+    var retryOrigin: ChatMessageOrigin? { get }
 }
 
 /// Immutable evidence that a retry still targets the same transcript tail.
@@ -19,6 +21,7 @@ public struct MacChatRetrySnapshot: Equatable, Sendable {
     public let assistantMessageId: String
     public let priorUserMessageId: String
     public let priorUserText: String
+    public let priorUserOrigin: ChatMessageOrigin?
     public let predecessorRelevantMessageId: String?
     public let isSyntheticNotice: Bool
     public let userRowPersisted: Bool
@@ -48,6 +51,7 @@ public struct MacChatRetrySnapshot: Equatable, Sendable {
             assistantMessageId: target.id,
             priorUserMessageId: priorUser.id,
             priorUserText: priorText,
+            priorUserOrigin: priorUser.retryOrigin,
             predecessorRelevantMessageId: predecessor,
             isSyntheticNotice: isSyntheticNotice,
             userRowPersisted: isSyntheticNotice
@@ -79,6 +83,7 @@ public struct MacChatRetrySnapshot: Equatable, Sendable {
                       user.id == priorUserMessageId,
                       user.role == "user" else { return false }
                 return user.content.trimmingCharacters(in: .whitespacesAndNewlines) == priorUserText
+                    && user.retryOrigin == priorUserOrigin
             }
             guard !relevant.contains(where: { $0.id == priorUserMessageId }) else { return false }
             return relevant.last?.id == predecessorRelevantMessageId
@@ -90,5 +95,6 @@ public struct MacChatRetrySnapshot: Equatable, Sendable {
               let user = relevant[..<assistantIndex].last(where: { $0.role == "user" }),
               user.id == priorUserMessageId else { return false }
         return user.content.trimmingCharacters(in: .whitespacesAndNewlines) == priorUserText
+            && user.retryOrigin == priorUserOrigin
     }
 }

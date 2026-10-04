@@ -3,6 +3,7 @@ import AttentionRouting
 import BackgroundLoops
 import ChatOrchestration
 import Cognition
+import NotificationInbox
 import PersistenceCore
 import Desk
 
@@ -45,8 +46,10 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
 
     public func physiologyEvents() -> AsyncStream<Void> {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
+        // The inbox too: a knock held for quiet hours books their end.
         return EventDeadlinePhysiology.storeAndFileEvents(
-            paths: [store.opsPath, store.statePath],
+            paths: [store.opsPath, store.statePath, DeskNagConfigStore(dataRoot: dataRoot).configPath,
+                    LiveNotificationInbox.livePath(dataRoot: dataRoot)],
             stores: [.desk],
             loopId: loopId
         )
@@ -58,8 +61,9 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         }
         let notify = DeskNotifyEvaluator.nextMeaningfulDeadline(state, after: now)
         let nagConfig = await DeskNagConfigStore(dataRoot: dataRoot).load()
+        let held = await AttentionRouter.hasHeld(dataRoot: dataRoot)
         let quietEnd: Date? = {
-            guard nagConfig.enabled || DeskNotifyEvaluator.decisions(state, now: now).contains(where: { $0.level != .urgent }),
+            guard held || nagConfig.enabled || DeskNotifyEvaluator.decisions(state, now: now).contains(where: { $0.level != .urgent }),
                   AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot, at: now),
                   let window = TurnQuietHoursWindow.read(dataRoot: dataRoot) else { return nil }
             var calendar = Calendar(identifier: .gregorian)
@@ -101,7 +105,10 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         // lane whenever no item was marked direct/urgent).
         let quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
         let nagCount = quietHours ? 0 : await runNagPass(state: state, failures: &failures)
-        if decisions.isEmpty && nagCount == 0 && failures.isEmpty {
+        // What her resident wake held for quiet hours goes out once they end.
+        let released = quietHours ? 0 : await AttentionRouter.releaseHeld(
+            dataRoot: dataRoot, router: attention, banner: postMacNotification)
+        if decisions.isEmpty && nagCount == 0 && released == 0 && failures.isEmpty {
             return .skipped(reason: "no Desk notification due")
         }
         // Quiet hours hold a direct ping's Mac banner exactly as they hold its
@@ -134,7 +141,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
                 // projection instead.
                 let outcome = try? await attention.route(
                     eventId: "desk_notify:\(decision.handle):\(revision)",
-                    importance: .ownerWaiting,
+                    importance: decision.level == .urgent ? .adverse : .ownerWaiting,
                     title: decision.title,
                     body: decision.body,
                     userInfo: ["screen": "inbox", "source": "desk"]
@@ -294,13 +301,14 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         // The banner carries the handle it is about, so a click lands on that
         // item instead of on the app's front page. The unmute digest is about
         // no single item and carries nothing.
-        let mobileOK = (try? await attention.route(
+        let mobileOutcome = try? await attention.route(
             eventId: "desk_nag:\(label)",
             importance: .ownerWaiting,
             title: title,
             body: body,
             userInfo: ["screen": "inbox", "source": "desk"]
-        )) != nil
+        )
+        let mobileOK = mobileOutcome.map { $0.deliveryProjection != .failed } ?? false
         // The banner obeys the router's quiet hours, like the push.
         let macPosted = await AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
             ? true

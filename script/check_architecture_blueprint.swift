@@ -441,23 +441,6 @@ func appendResidentMindConvergenceErrors(repo: URL, errors: inout [String]) thro
             ["_PersistPump", "capacity: 4096"],
             []
         ),
-        (
-            "Modules/NativeAgentCore/Sources/Cognition/InstalledPhysiologySoak.swift",
-            [
-                "minimumLatencySampleCount = 20",
-                "currentMeasurementEpoch = \"resident-live-latency-v3\"",
-                "acceptanceP95 >= 25",
-                "microcycleP95 >= 25",
-                "qualifiesForResidentLatency",
-                "qualifiesForOrdinaryTurnLatency",
-                "retention capacity was saturated",
-                "fewer than 20 ordinary chat latency samples",
-                "cognitiveSubstrateAcceptanceMilliseconds",
-                "somaticAcceptanceMilliseconds",
-                "residualSchedulingAcceptanceMilliseconds",
-            ],
-            []
-        ),
     ]
 
     for contract in contracts {

@@ -208,20 +208,28 @@ struct ContextFillBar: View {
             }
 
             if let lastError {
-                let retryLabel = lastErrorWasCompaction
+                let retryCompaction = lastErrorWasCompaction
+                let retryLabel = retryCompaction
                     ? "Compaction failed. Retry"
                     : "Context status unavailable. Retry"
                 Button {
-                    Task { await refresh() }
+                    Task {
+                        if retryCompaction {
+                            await compactNow()
+                        } else {
+                            await refresh()
+                        }
+                    }
                 } label: {
                     Label(
-                        lastErrorWasCompaction ? "Compaction failed" : "Context unavailable",
+                        retryCompaction ? "Compaction failed" : "Context unavailable",
                         systemImage: "exclamationmark.triangle.fill"
                     )
                     .font(.caption2)
                     .foregroundStyle(.orange)
                 }
                 .buttonStyle(.borderless)
+                .disabled(isCompacting)
                 .help("\(retryLabel): \(lastError)")
                 .accessibilityIdentifier("chat.context-fill.retry-button")
                 .accessibilityLabel(retryLabel)
@@ -307,6 +315,7 @@ struct ContextFillBar: View {
 
     @MainActor
     private func compactNow() async {
+        guard !isCompacting else { return }
         isCompacting = true; defer { isCompacting = false }
         lastError = nil
         lastErrorWasCompaction = false

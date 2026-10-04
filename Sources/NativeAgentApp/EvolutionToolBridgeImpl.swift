@@ -4,7 +4,6 @@ import ChatOrchestration
 import PersistenceCore
 import SelfImprovement
 import ApprovalInbox
-import TrustCenter
 
 // MARK: - EvolutionToolBridgeImpl (2026-06-11, U2b)
 //
@@ -16,11 +15,10 @@ import TrustCenter
 // (SelfImprovement module) and the install-card stager
 // (BackgroundLoopsAssembly) — neither of which ChatOrchestration may import.
 //
-// SAFETY: evolutionStageInstall NEVER installs. It validates a candidate_green
-// proposal, then calls BackgroundLoopsAssembly.stageEvolutionApprovals
-// (idempotent) which only STAGES a self_evolution.apply approval card a human
-// still approves — it never calls SystemOps.systemRebuild or
-// applyApprovedSelfEvolution.
+// SAFETY: evolutionStageInstall requires a candidate_green proposal and calls
+// the canonical stager. Restricted authority stages a human approval card;
+// active Full Mac authority may enter the approved executor without a card.
+// The executor retains candidate validation and systemRebuild install gates.
 struct EvolutionToolBridgeImpl: EvolutionToolBridge {
     let dataRoot: URL
 
@@ -85,8 +83,8 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
             "proposal_status": .string(proposal.status.rawValue),
             "has_diff": .bool(proposal.diffText != nil),
             "note": .string(proposal.status == .needsDiff
-                ? "Filed without a diff (needs_diff). Attach a diff before it can build."
-                : "Filed as 'proposed' — eligible to build in an isolated worktree."),
+                ? "Filed without a diff (needs_diff): a finding note only. Filing a proposal does not build or install it."
+                : "Filed as 'proposed' with a diff. Filing a proposal does not build or install it."),
         ])
     }
 
@@ -196,8 +194,8 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
                 "status": .string("candidate_in_flight"),
                 "id": .string(id),
                 "proposal_status": .string(proposal.status.rawValue),
-                "reason": .string("a candidate build run is in flight\(runId)"),
-                "fix": .string("Wait for the run to land on candidate_green or candidate_failed, then withdraw."),
+                "reason": .string("the proposal is recorded as building\(runId)"),
+                "fix": .string("Automatic candidate builds are unavailable. Ask User to review this recorded state."),
             ])
         }
         guard Self.withdrawableStatuses.contains(proposal.status) else {
@@ -247,7 +245,7 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
         ])
     }
 
-    // MARK: - self_install (stage only — never installs)
+    // MARK: - self_install (approval staging or Full Mac execution)
 
     func evolutionStageInstall(input: [String: JSONValue]) async throws -> JSONValue {
         // Cap the caller-supplied id at extraction (gpt-5.5 review-3) — echoed
@@ -270,7 +268,7 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
                 "id": .string(id),
                 "proposal_status": .string(proposal.status.rawValue),
                 "reason": .string("not installable yet: status=\(proposal.status.rawValue)"),
-                "fix": .string("self_install requires status=candidate_green (the proposal must build GREEN in an isolated worktree first)."),
+                "fix": .string("self_install requires status=candidate_green and matching successful build evidence. Filing a proposal does not produce that evidence; automatic candidate builds are unavailable."),
             ])
         }
         // Idempotent + targeted: stage ONLY this proposal's card (gpt-5.5
@@ -278,55 +276,46 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
         // unrelated green candidates). Reuses the single card-staging path.
         await BackgroundLoopsAssembly.stageEvolutionApprovals(dataRoot: dataRoot, onlyProposalId: id)
 
-        let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-            .fullMacYoloAuthority(
-                tool: NativeClient.selfEvolutionAction,
-                origin: SecurityOriginContext(
-                    surface: "chat",
-                    source: "evolution_tool_bridge",
-                    isRemote: false
-                )
-            )
-        if yolo.admitted {
-            let updated = try? await store.get(id: id)
-            return .object([
-                "status": .string("admitted"),
-                "id": .string(id),
-                "proposal_status": .string(updated?.status.rawValue ?? proposal.status.rawValue),
-                "note": .string("Active Full Mac authority admitted the validated candidate through the canonical evolution executor; no approval prompt was created."),
-            ])
+        guard let updated = try await store.get(id: id) else {
+            return .object(["status": .string("not_found"), "id": .string(id)])
         }
-
         // Report the staged self_evolution.apply card for THIS proposal.
-        let card = await latestEvolutionApproval(proposalId: id)
-        let postStatus = (try? await store.get(id: id))?.status.rawValue ?? proposal.status.rawValue
-        if let card {
+        let card = try await latestEvolutionApproval(proposalId: id)
+        if updated.status == .staged, let card, card.status == "pending" {
             return .object([
                 "status": .string("staged"),
                 "id": .string(id),
-                "proposal_status": .string(postStatus),
+                "proposal_status": .string(updated.status.rawValue),
                 "approval_id": .string(card.id),
                 "approval_status": .string(card.status),
                 "approval_decision": card.decision.map { JSONValue.string($0) } ?? .null,
                 "note": .string("A self_evolution.apply approval card is staged. It only commits + self-installs after approval (and the install fires only once systemRebuild is enabled). This tool did NOT install anything."),
             ])
         }
-        // Stager ran but no card surfaced (e.g. missing candidateRunId/diff on
-        // the record) — report honestly rather than implying a card exists.
+        // Authority is not an execution receipt. Report only persisted changes
+        // when no pending card was staged; never infer that an install ran.
+        if updated.status != proposal.status || updated.receipts != proposal.receipts {
+            return .object([
+                "status": .string("proposal_updated"),
+                "id": .string(id),
+                "proposal": summary(updated, includeReceipts: true),
+                "note": .string("The proposal's recorded state and receipts are shown below. No pending approval card was confirmed."),
+            ])
+        }
         return .object([
             "status": .string("stage_incomplete"),
             "id": .string(id),
-            "proposal_status": .string(postStatus),
-            "reason": .string("stageEvolutionApprovals ran but no self_evolution.apply card was found for this proposal (it may lack a candidate run id / diff)."),
+            "proposal_status": .string(updated.status.rawValue),
+            "reason": .string("No staged approval or change to the proposal was confirmed. Read evolution_status for the current state and receipts."),
         ])
     }
 
     // MARK: - Helpers
 
-    private func latestEvolutionApproval(proposalId: String) async -> ApprovalRecord? {
+    private func latestEvolutionApproval(proposalId: String) async throws -> ApprovalRecord? {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        guard let records = try? await inbox.list(
-            filter: ApprovalFilter(action: NativeClient.selfEvolutionAction)) else { return nil }
+        let records = try await inbox.list(
+            filter: ApprovalFilter(action: NativeClient.selfEvolutionAction))
         return records
             .filter { rec in
                 guard case .object(let p) = rec.payload,

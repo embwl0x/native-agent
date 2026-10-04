@@ -108,7 +108,9 @@ public struct ApprovalInboxApprovedReplayVerifier: ApprovedReplayVerifying {
            Self.normalized(recordSurface) != Self.normalized(surface) {
             return .surfaceMismatch
         }
-        guard case .object(let recordInput)? = payload["input"] else { return .malformedRecord }
+        let workshopStep = ExecutionEventVocabulary.matches(record.action, WorkshopStepApprovalAction.canonical)
+        if workshopStep, surface != "mission" { return .surfaceMismatch }
+        guard case .object(let recordInput)? = payload[workshopStep ? "args" : "input"] else { return .malformedRecord }
         guard recordInput == input else { return .bodyMismatch }
 
         // The executor's durable spend, which it writes immediately before it

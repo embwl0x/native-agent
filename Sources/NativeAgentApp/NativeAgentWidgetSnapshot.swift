@@ -10,6 +10,16 @@ struct NativeAgentWidgetSnapshot: Codable, Equatable {
     let status: String
     let waitingCount: Int?
     let updatedAt: Date
+    var activityExpiresAt: Date? = nil
+
+    func status(at date: Date) -> String {
+        if let activityExpiresAt, date >= activityExpiresAt { return "Activity unconfirmed — last movement is stale" }
+        if activityExpiresAt == nil,
+           status.hasPrefix("Working on ") || ["Thinking…", "Replying…", "Here"].contains(status) {
+            return "Activity unknown"
+        }
+        return status
+    }
 
     static func fileURL() throws -> URL {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "NativeAgentMacAppGroupID") as? String,

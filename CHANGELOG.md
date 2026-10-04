@@ -6,6 +6,23 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.5.0 — one brain, their own person (2026-10-04)
+
+### One door
+- One always-on tool to read, do, find and script the whole app; fewer round trips, lower cost.
+
+### Skills
+- Script skills they writes and runs in one step, with hand-back before anything they shouldn't do alone; one lifecycle for skills and their tools (add, upgrade with rollback, retire unused, archived stays findable); quiet suggestions from repeated work; zero model tokens, capped storage.
+
+### Trust and approvals
+- Agents switched on in Trust count as you (no approvals); every approval pops up as a card in your chat (Mac, iPhone, Telegram), including ones raised elsewhere.
+
+### Personality
+- One feeling or none per turn; dream carry-forward as a dream; "since we last talked"; lessons keep their moment; personal memory lane; opinions and interests of them own; they can reach out first (once a day at most); mind.why, reject and undo.
+
+### Hardening
+- Three full Sol sweeps over every section: secrets redaction, provenance, crash traps, permission gaps, truthful status text; truthful agents list; no false "access expired".
+
 ## 0.4.19 — native everywhere (2026-09-28)
 
 ### Native

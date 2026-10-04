@@ -15,6 +15,12 @@ extension CognitiveSubstrate {
             persistenceHealth = .disabled
             return
         }
+        guard !restoreInFlight else {
+            throw CognitivePersistenceError.writesBlocked(status: .restoring, detail: nil)
+        }
+        restoreInFlight = true
+        defer { restoreInFlight = false }
+        await waitForMaintenanceTransition()
 
         let attemptAt = dependencies.now()
         guard let store else {
@@ -71,7 +77,51 @@ extension CognitiveSubstrate {
             throw error
         }
 
-        let clampedStandingViewIds = applyRestoreBundle(bundle)
+        // Read resident state AFTER the suspended load. On recovery it is the
+        // complete current family, including removals; on the first load its
+        // accepted rows overlay the persisted family.
+        await waitForMaintenanceTransition()
+        let resident = residentRestoreArtifacts(at: dependencies.now())
+        var reconciled = bundle
+        for (family, rows) in resident {
+            if residentRestoreIsAuthoritative {
+                reconciled.artifacts[family] = rows
+            } else if !rows.isEmpty {
+                let identityField = family == "rumination_release" ? "seedId" : "id"
+                if rows.allSatisfy({ row in
+                    guard case .object(let object) = row else { return false }
+                    return uuidValue(object[identityField]) != nil
+                }) {
+                    let residentIDs = Set(rows.compactMap { row -> UUID? in
+                        guard case .object(let object) = row else { return nil }
+                        return uuidValue(object[identityField])
+                    })
+                    reconciled.artifacts[family] = (bundle.artifacts[family] ?? []).filter { row in
+                        guard case .object(let object) = row,
+                              let id = uuidValue(object[identityField]) else { return false }
+                        return !residentIDs.contains(id)
+                    } + rows
+                } else {
+                    reconciled.artifacts[family] = rows
+                }
+            }
+        }
+        let clampedStandingViewIds = applyRestoreBundle(reconciled)
+        residentRestoreIsAuthoritative = true
+        // Commit the reconciled nodes and artifacts together, including the
+        // exact bounded seed family and resident removals.
+        do {
+            try await persistReconciledRestoreState(replacing: bundle)
+        } catch {
+            persistenceWritesBlocked = true
+            persistenceHealth = CognitivePersistenceHealth(
+                status: .degraded, writesBlocked: true,
+                lastRestoreAttemptAt: attemptAt, lastSuccessfulRestoreAt: previousSuccessAt,
+                failureStage: "restore_reconciliation",
+                failureDetail: bounded(String(describing: error), maxCharacters: 320)
+            )
+            throw error
+        }
         persistenceWritesBlocked = false
         persistenceHealth = CognitivePersistenceHealth(
             status: .healthy,
@@ -79,14 +129,8 @@ extension CognitiveSubstrate {
             lastRestoreAttemptAt: attemptAt,
             lastSuccessfulRestoreAt: dependencies.now()
         )
-
-        await reconcileRestoredAffectWithRecentConversation(nodes: bundle.nodes)
+        await reconcileRestoredAffectWithRecentConversation(nodes: field.peekNodes())
         publishAttentionProjection(at: dependencies.now())
-        // `loadRestoreBundle` reads only the configured newest-N seed window.
-        // Replace the persisted family with that exact bounded live set before
-        // declaring restore healthy so legacy overflow cannot survive offscreen
-        // and return during a later relaunch.
-        try await persistThoughtSeedFamily()
         // Defensive repair: a half-persisted approval (crash between the active upsert and
         // the cap deletes) could leave >cap active rows — demote LRU + heal the store.
         await repairStandingViewCapIfNeeded()
@@ -95,7 +139,7 @@ extension CognitiveSubstrate {
         try? await store.appendReceipt(
             kind: "lifecycle.restore",
             payload: .object([
-                "nodeCount": .int(Int64(bundle.nodes.count)),
+                "nodeCount": .int(Int64(field.peekNodes().count)),
                 "thoughtSeedCount": .int(Int64(projectedThoughtSeeds(at: dependencies.now()).count)),
                 "episodeCount": .int(Int64(episodes.count)),
                 "schemaProposalCount": .int(Int64(schemaProposals.count)),
@@ -106,6 +150,100 @@ extension CognitiveSubstrate {
                 "writesBlocked": .bool(false),
             ]),
             at: dependencies.now()
+        )
+    }
+
+    private func residentRestoreArtifacts(at now: Date) -> [String: [JSONValue]] {
+        var rows: [String: [JSONValue]] = [
+            "thought_seed": thoughtSeeds.values.map { $0.toJSON() },
+            "episode": episodes.values.map { $0.toJSON() },
+            "schema_proposal": schemaProposals.values.map { $0.toJSON() },
+            "standing_view": standingViews.values.map { $0.toJSON() },
+            "developmental_timeline": developmentalTimeline.values.map { $0.toJSON() },
+            "reflection_receipt": reflectionReceipts.values.map { $0.toJSON() },
+            "experiment": experimentResults.values.map { $0.toJSON() },
+            "rumination_release": ruminationReleasedAt.map { id, at in
+                .object(["seedId": .string(id.uuidString), "releasedAt": .double(at.timeIntervalSince1970)])
+            },
+            "emotional_consolidation": lastEmotionalConsolidationAt.map {
+                [.object(["ranAt": .double($0.timeIntervalSince1970)])]
+            } ?? [],
+            "affect": [], "capsule_presentation": [], "disposition": [],
+            "dream_residue": [], "mind_ledger": [],
+        ]
+        if residentRestoreIsAuthoritative || affect != CognitiveAffectState() {
+            rows["affect"] = [affect.toJSON(
+                lastUserPresenceAt: lastUserPresenceAt, lastWarmPresenceAt: lastWarmPresenceAt)]
+        }
+        if residentRestoreIsAuthoritative || capsulePresentationDirty {
+            rows["capsule_presentation"] = [capsulePresentationArtifactPayload(at: now)]
+        }
+        if residentRestoreIsAuthoritative || disposition != CognitiveDisposition() {
+            rows["disposition"] = [dispositionArtifactPayload(at: disposition.updatedAt)]
+        }
+        if residentRestoreIsAuthoritative || dreamResidueClaimKey != nil || dreamResidue != nil {
+            rows["dream_residue"] = [dreamResidueArtifactPayload(at: now)]
+        }
+        if residentRestoreIsAuthoritative || !associationSuppressions.isEmpty || !undoLedger.isEmpty {
+            rows["mind_ledger"] = [mindLedgerArtifactPayload(at: now)]
+        }
+        return rows
+    }
+
+    private func restoreArtifactID(family: String, payload: JSONValue) -> UUID {
+        guard case .object(let object) = payload else { return stableArtifactID(family) }
+        if family == "rumination_release", let seedID = uuidValue(object["seedId"]) {
+            return stableArtifactID("rumination_release|\(seedID.uuidString)")
+        }
+        return uuidValue(object["id"]) ?? stableArtifactID(family)
+    }
+
+    private func persistReconciledRestoreState(replacing bundle: CognitiveSQLiteRestoreBundle) async throws {
+        guard let store else { throw CognitivePersistenceError.storeUnavailable }
+        let now = dependencies.now()
+        let families = residentRestoreArtifacts(at: now)
+        var artifacts: [CognitiveArtifactWrite] = []
+        var retainedIDs: Set<UUID> = []
+        for (family, rows) in families where family != "thought_seed" {
+            for payload in rows {
+                guard case .object(let object) = payload else { continue }
+                let id = restoreArtifactID(family: family, payload: payload)
+                if family == "standing_view", stringValue(object["status"]) == "retired" { continue }
+                retainedIDs.insert(id)
+                // Counts in this diagnostic payload live only in SQLite. A
+                // matching consolidation clock does not replace that evidence.
+                if family == "emotional_consolidation",
+                   case .object(let persisted)? = bundle.artifacts[family]?.first,
+                   object["ranAt"] == persisted["ranAt"] { continue }
+                var status = stringValue(object["status"]) ?? "current"
+                var score = doubleValue(object["confidence"]) ?? doubleValue(object["score"]) ?? 0
+                switch family {
+                case "episode", "developmental_timeline": status = "recorded"; score = 0.5
+                case "reflection_receipt": status = object["cancelled"] == .bool(true) ? "cancelled" : "recorded"
+                case "experiment": status = "recorded"
+                case "rumination_release": status = "released"
+                case "standing_view": score = max(0, doubleValue(object["moodValenceAtFormation"]) ?? 0)
+                case "disposition": score = ((doubleValue(object["valence"]) ?? 0) + 1) / 2
+                case "affect": score = doubleValue(object["arousal"]) ?? 0
+                default: break
+                }
+                artifacts.append(CognitiveArtifactWrite(
+                    kind: family, id: id, status: status, score: score, payload: payload
+                ))
+            }
+        }
+        let deletedIDs = bundle.artifacts.flatMap { family, rows in
+            family == "thought_seed" ? [] : rows.map { restoreArtifactID(family: family, payload: $0) }
+        }.filter { !retainedIDs.contains($0) }
+        markDirty(at: now)
+        // Ordinary writes remain blocked until this recovery transaction lands.
+        try await store.commitMaintenance(
+            nodes: field.snapshot(at: now, configuration: configuration),
+            thoughtSeeds: thoughtSeeds.values.map {
+                CognitiveArtifactReplacement(id: $0.id, status: "open", score: $0.priority, payload: $0.toJSON())
+            },
+            artifacts: artifacts, deletedArtifactIDs: deletedIDs, receipts: [],
+            maxNodes: configuration.maximumActiveNodes, maxArtifacts: artifactCap(configuration), at: now
         )
     }
 
@@ -152,6 +290,7 @@ extension CognitiveSubstrate {
                 limit: max(40, configuration.dailyReflectionCallBudget * 4)
             ),
             CognitiveArtifactFamilyLoad(key: "experiment", kindPrefix: "experiment", limit: 40),
+            CognitiveArtifactFamilyLoad(key: "mind_ledger", kindPrefix: "mind_ledger", limit: 1),
         ]
     }
 
@@ -241,6 +380,8 @@ extension CognitiveSubstrate {
                 && stringValue(object["resultSummary"]) != nil
                 && stringValue(object["provider"]) != nil
                 && dateValue(object["createdAt"]) != nil
+        case "mind_ledger":
+            return dateValue(object["updatedAt"]) != nil
         case "experiment":
             guard let kind = stringValue(object["kind"]) else { return false }
             return uuidValue(object["id"]) != nil
@@ -254,16 +395,20 @@ extension CognitiveSubstrate {
     }
 
     private func applyRestoreBundle(_ bundle: CognitiveSQLiteRestoreBundle) -> [UUID] {
+        // A successfully loaded (or explicitly cleared) resident field also
+        // owns evictions and deletions. A disk snapshot cannot revive them.
+        if !residentRestoreIsAuthoritative {
+            field.mergeRestoredNodes(
+                bundle.nodes,
+                decayAnchorsByID: bundle.nodeDecayAnchors,
+                configuration: configuration
+            )
+        }
         func payloads(_ family: String) -> [JSONValue] {
             bundle.artifacts[family] ?? []
         }
 
-        field.replaceNodes(
-            bundle.nodes,
-            decayAnchorsByID: bundle.nodeDecayAnchors,
-            configuration: configuration
-        )
-        verificationNodeMayExist = bundle.nodes.contains { $0.turnKind == .verification }
+        verificationNodeMayExist = field.peekNodes().contains { $0.turnKind == .verification }
         restoreAffect(from: payloads("affect"))
         restoreCapsulePresentation(from: payloads("capsule_presentation"))
         restoreDisposition(from: payloads("disposition"))
@@ -279,6 +424,12 @@ extension CognitiveSubstrate {
         restoreDevelopmentalTimeline(from: payloads("developmental_timeline"))
         restoreReflectionReceipts(from: payloads("reflection_receipt"))
         restoreExperimentResults(from: payloads("experiment"))
+        restoreMindLedger(from: payloads("mind_ledger"))
+        enforceEpisodeCap()
+        enforceSchemaProposalCap()
+        enforceDevelopmentalTimelineCap()
+        enforceReflectionReceiptCap()
+        enforceExperimentResultCap()
         return clampedStandingViewIds
     }
 

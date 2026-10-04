@@ -1,6 +1,6 @@
 import Foundation
+import ToolRegistry
 import Network
-import UniformTypeIdentifiers
 import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
@@ -8,7 +8,7 @@ import ProviderRouting
 
 public struct AgentContactA2AEndpoint: Sendable {
     public enum Response: @unchecked Sendable {
-        case json([String: Any])
+        case json([String: Any], onSent: (@Sendable () async -> Void)? = nil)
         case stream(id: Any, events: AsyncStream<AgentContactEvent>, version: String)
     }
     let tasks: AgentContactTasks
@@ -62,9 +62,12 @@ public struct AgentContactA2AEndpoint: Sendable {
                 }
                 let returned = send.blocking ? try await tasks.settled(task.id, owner: principal.id) : task
                 let projected = try NativeAgentA2AWire.project(returned, version: wireVersion)
-                return .json(NativeAgentA2AWire.result(id, wireVersion == "1.0" ? ["task": projected] : projected))
+                return .json(NativeAgentA2AWire.result(id, wireVersion == "1.0" ? ["task": projected] : projected),
+                             onSent: replyAcknowledgement(returned))
             case .get(_, let task, _, _):
-                return .json(NativeAgentA2AWire.result(id, try NativeAgentA2AWire.project(try await tasks.get(task, owner: principal.id), version: wireVersion)))
+                let returned = try await tasks.get(task, owner: principal.id)
+                let projected = try NativeAgentA2AWire.project(returned, version: wireVersion)
+                return .json(NativeAgentA2AWire.result(id, projected), onSent: replyAcknowledgement(returned))
             case .subscribe(_, let task):
                 if wireVersion == "1.0", try await tasks.get(task, owner: principal.id).state.terminal {
                     throw AgentContactFailure(code: -32004, message: "This task has ended; retrieve it with GetTask")
@@ -83,35 +86,71 @@ public struct AgentContactA2AEndpoint: Sendable {
             return .json(NativeAgentA2AWire.error(id, -32603, "Work could not be accepted. Do not send it again automatically."))
         }
     }
+
+    /// The transport invokes this only after writing the selected reply.
+    private func replyAcknowledgement(_ task: AgentContactTask) -> (@Sendable () async -> Void)? {
+        guard !task.replyText.isEmpty else { return nil }
+        return { await tasks.recordReplyFetch(task) }
+    }
 }
 
 enum AgentContactRuntime {
+    private static func revalidated(_ principal: AgentBridgePrincipal, dataRoot: URL) throws -> AgentBridgePrincipal {
+        guard let peerID = principal.peerID else { return principal }
+        guard let peer = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peerID }),
+              peer.grokSetup != "disconnected" else {
+            throw AgentContactFailure(code: -32001, message: "The contact is no longer connected. Work: nothing ran.")
+        }
+        return AgentBridgePrincipal(id: principal.id, peerID: peerID,
+            elevated: principal.elevated && peer.elevationAllowed, displayName: peer.name,
+            replyOnly: principal.replyOnly)
+    }
+
+    static func inboundRequest(principal: AgentBridgePrincipal, context: String, plain: String,
+                               attachments: [MultimodalAttachment] = [], messageID: String? = nil,
+                               originID: String? = nil) -> TurnRequest {
+        let route = ChatToolSessionContext.ReplyRoute(surface: "caller-result", destinationId: principal.id,
+                                                     threadId: context, correlationId: messageID)
+        let envelope = TurnEnvelope(surface: principal.surface, agent: "peer", verifiedUserId: principal.peerID,
+                                    commandSignatureVerified: principal.peerID != nil, deliveryRoute: route,
+                                    declaredRemote: !principal.elevated)
+        let text = AgentBridgeSurface.turnHeader(peerName: principal.displayName, elevated: principal.elevated)
+            + (plain.isEmpty ? "Please read the attached content." : AgentBridgeSurface.quotingImpersonation(plain))
+        return TurnRequest(message: text, sessionID: principal.storedConversation(context), attachments: attachments,
+                           surface: principal.surface, envelope: envelope, replyRoute: route,
+                           origin: ChatMessageOrigin(surface: "agent-bridge", agent: "agent", authored: .agent, replyTo: originID))
+    }
+
     static func run(_ turn: AgentContactTurn, client: SwiftNativeChatOrchestrationClient, dataRoot: URL,
+                    enqueued acceptedMessage: EnqueuedUserMessage? = nil,
                     emit: @escaping @Sendable (AgentContactProgress) async -> Void) async throws -> AgentContactOutcome {
         let principal = turn.principal
         let session = principal.storedConversation(turn.context)
-        let envelope = TurnEnvelope(surface: principal.surface, agent: "peer", verifiedUserId: principal.peerID,
-                                    commandSignatureVerified: principal.peerID != nil, declaredRemote: !principal.elevated)
-        let origin = ChatMessageOrigin(surface: "agent-bridge", agent: "agent", authored: .agent)
         let attachments = turn.parts.compactMap(\.attachment)
         let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
-        let text = AgentBridgeSurface.turnHeader(peerName: principal.displayName, elevated: principal.elevated)
-            + (plain.isEmpty ? "Please read the attached content." : AgentBridgeSurface.quotingImpersonation(plain))
-        let request = TurnRequest(message: text, sessionID: session, attachments: attachments,
-                                  surface: principal.surface, envelope: envelope, origin: origin)
         // One turn at a time in this conversation: a second message waits for
         // the first reply to finish instead of interleaving with it.
         do {
             return try await TurnAdmission.shared.run(sessionID: session) {
                 try Task.checkCancellation()
-                let enqueued = try await request.enqueue(on: client)
+                let admitted = try revalidated(principal, dataRoot: dataRoot)
+                let acceptedRequest = inboundRequest(principal: admitted, context: turn.context, plain: plain,
+                    attachments: attachments, messageID: turn.requestID)
+                let enqueued: EnqueuedUserMessage
+                if let accepted = acceptedMessage { enqueued = accepted }
+                else { enqueued = try await acceptedRequest.enqueue(on: client) }
                 try await turn.bindRun(session, enqueued.runId)
+                // Enqueue and run binding suspend too; bind only current authority.
+                let current = try revalidated(principal, dataRoot: dataRoot)
+                let request = inboundRequest(principal: current, context: turn.context, plain: plain,
+                    attachments: attachments, messageID: turn.requestID)
+                let text = request.message
                 if let peerID = principal.peerID { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true) }
                 return try await request.consuming(enqueued).bind {
                     try Task.checkCancellation()
                     await emit(.working)
                     let execution = client.chatStreamExecution(message: text, sessionId: session, model: "", reasoningEffort: "",
-                        fileAccess: "auto", attachments: attachments, persona: nil, surface: principal.surface, suppressUserAppend: true)
+                        fileAccess: "auto", attachments: attachments, persona: nil, surface: current.surface, suppressUserAppend: true)
                     let outcome = try await withTaskCancellationHandler {
                         var final: TurnEngineResult?
                         var waiting = false
@@ -165,6 +204,9 @@ enum AgentContactRuntime {
                 }
             }
         } catch let full as TurnAdmission.Full {
+            // An already-saved row still needs consumption; let its owner
+            // retain the receipt and retry admission without appending again.
+            if acceptedMessage != nil { throw full }
             return AgentContactOutcome(state: .failed, parts: [], detail: (full.errorDescription ?? "") + " Work: nothing ran.")
         }
     }
@@ -183,15 +225,9 @@ enum AgentContactRuntime {
         }
         // A successful write receipt proves the produced bytes. Do not scan
         // reply prose for paths or read an arbitrary path from a tool result.
-        for dispatch in result.toolDispatches where dispatch.name == "write_file" {
-            guard case .object(let receipt) = dispatch.result, receipt["ok"] == .bool(true), receipt["append"] == .bool(false),
-                  case .string(let content)? = dispatch.input["content"],
-                  receipt["bytes_written"] == .int(Int64(content.utf8.count)),
-                  case .string(let path)? = dispatch.input["path"], content.utf8.count <= AgentContactPart.maximumFileBytes else { continue }
-            let name = URL(fileURLWithPath: path).lastPathComponent
-            guard AgentContactPart.safeName(name) else { continue }
-            let mime = UTType(filenameExtension: (name as NSString).pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-            parts.append(.file(name: name, mediaType: mime, bytes: Data(content.utf8),
+        // app files.write is write_file, with its args as the input.
+        for file in ChatWrittenFileArtifacts.files(from: result.toolDispatches, maximumBytes: AgentContactPart.maximumFileBytes) {
+            parts.append(.file(name: file.name, mediaType: file.mime, bytes: file.bytes,
                                metadata: .object(["source": .string("agent"), "taskId": .string(taskID)])))
         }
         let size = try JSONSerialization.data(withJSONObject: parts.map(\.wire03)).count

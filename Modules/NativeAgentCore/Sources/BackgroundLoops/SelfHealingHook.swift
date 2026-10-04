@@ -74,6 +74,7 @@ public struct SelfHealingHook: LoopRunner {
     private let router: any ProviderRoutingProtocol
     private let dataRoot: URL
     private let clock: @Sendable () -> Date
+    private let isEnabled: @Sendable () async -> Bool
     /// Files a `needs_diff` evolution proposal (title, evidence). Injected so
     /// this module gains no SelfImprovement dep; the assembly wires it to
     /// `EvolutionProposalStore.propose(source: .selfHeal, ...)`.
@@ -88,6 +89,7 @@ public struct SelfHealingHook: LoopRunner {
         router: any ProviderRoutingProtocol = SwiftNativeProviderRouting(),
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         clock: @escaping @Sendable () -> Date = { Date() },
+        isEnabled: @escaping @Sendable () async -> Bool,
         fileProposal: @escaping @Sendable (_ title: String, _ evidence: String) async throws -> Void,
         closeDoctorFailureProposals: @escaping @Sendable () async -> Void = {}
     ) {
@@ -96,6 +98,7 @@ public struct SelfHealingHook: LoopRunner {
         self.router = router
         self.dataRoot = dataRoot
         self.clock = clock
+        self.isEnabled = isEnabled
         self.fileProposal = fileProposal
         self.closeDoctorFailureProposals = closeDoctorFailureProposals
     }
@@ -148,6 +151,10 @@ public struct SelfHealingHook: LoopRunner {
 
         guard doctorTransition || burst != nil else {
             return .skipped(reason: "no self-healing trigger")
+        }
+
+        guard await isEnabled() else {
+            return .skipped(reason: "autonomy disabled")
         }
 
         // --- Build evidence (redacted) --------------------------------------
@@ -396,7 +403,7 @@ public struct SelfHealingHook: LoopRunner {
         for line in text.split(separator: "\n").reversed() {
             guard let lineData = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let ts = (obj["createdAt"] as? String ?? obj["at"] as? String
+                  let ts = (obj["lastAt"] as? String ?? obj["createdAt"] as? String ?? obj["at"] as? String
                     ?? obj["ts"] as? String ?? obj["timestamp"] as? String).flatMap(parseISO)
             else { continue }  // undated/malformed: never counted as current
             // No early break: writers can interleave slightly out-of-order

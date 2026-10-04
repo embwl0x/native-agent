@@ -50,10 +50,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         self.port = port
     }
 
-    private func writeProjectedMessage(_ response: Response, projection: (@Sendable (Int, [String: Any]) -> [String: Any])?, status: Int, obj: [String: Any]) {
-        response(projection == nil ? status : 200, projection?(status, obj) ?? obj)
-    }
-
     /// Everything the inbound peer lanes know about ONE peer request: who the
     /// caller proved it is (never the shared bridge bearer alone), which
     /// protocol it arrived on, the id that protocol carries, and a digest of
@@ -71,31 +67,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             self.messageID = messageID
             self.bodyDigest = bodyDigest
         }
-
-        public var claimKey: String? {
-            guard let messageID, !messageID.isEmpty else { return nil }
-            return AgentPeerReplayClaimStore.key(
-                principal: principal.id, protocolName: protocolName, messageID: messageID
-            )
-        }
-    }
-
-    /// The name that goes in `[from: …, via bridge]`.
-    ///
-    /// The lane's own sender, unless the caller proved which CONTACT it is with
-    /// that connection's own key — then the person's own name for that contact,
-    /// because "agent" on every row tells them nothing about who is talking.
-    /// Presentation only; it never reaches `laneAuthorship`, the surface, or any
-    /// gate. The name is the person's own text from the contact store, so it is
-    /// bounded and stripped of the brackets and newlines that would let it
-    /// forge a second prefix.
-    static func bridgeDisplayLabel(sender: String, peer: PeerTurnContext?) -> String {
-        guard let raw = peer?.principal.displayName else { return sender }
-        let cleaned = raw
-            .components(separatedBy: CharacterSet.newlines).joined(separator: " ")
-            .filter { $0 != "[" && $0 != "]" }
-            .trimmingCharacters(in: .whitespaces)
-        return cleaned.isEmpty ? sender : String(cleaned.prefix(120))
     }
 
     public static func validGenericAgentMessage(_ json: [String: Any]) -> Bool {
@@ -129,29 +100,16 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         return requested
     }
 
-    public func handleMessage(response: @escaping Response, body: Data, defaultSender: String,
-                               peer: PeerTurnContext? = nil,
-                               responseProjection upstreamProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil) {
+    public func handleMessage(response: @escaping Response, body: Data, defaultSender: String) {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
-            writeProjectedMessage(response, projection: upstreamProjection, status: 400, obj: ["error": "invalid_json"])
+            response(400, ["error": "invalid_json"])
             return
-        }
-        if defaultSender == "agent" {
-            guard Self.validGenericAgentMessage(json) else {
-                writeProjectedMessage(response, projection: upstreamProjection, status: 400, obj: ["error": "invalid_agent_message_fields"])
-                return
-            }
         }
         guard let rawText = json["text"] as? String, !rawText.isEmpty else {
-            writeProjectedMessage(response, projection: upstreamProjection, status: 400, obj: ["error": "missing_text"])
+            response(400, ["error": "missing_text"])
             return
         }
-        // Accepted peer traffic is inbound evidence. Only an exact outstanding
-        // challenge response can also prove this contact's MCP return path.
-        if let peerID = peer?.principal.peerID {
-            AgentPeerStore(dataRoot: PersistenceCore.defaultDataRoot()).recordProof(peerID: peerID, inbound: true, message: rawText)
-        }
-        let isCodexCompletion = defaultSender == "codex" && json["completion"] is [String: Any]
+        let isCodexCompletion = ["codex", "claude", "omp"].contains(defaultSender) && json["completion"] is [String: Any]
         let requestedSessionId = json["sessionId"] as? String
         // Real artifacts over the bridge (2026-09-02): a studio consult needs
         // the image, not a description of it. `image_paths` are local files
@@ -163,52 +121,31 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         // vanish; the message now says so, so a header without pixels is
         // never a mystery on her side.
         let imageSkips = Self.bridgeImageSkips(json["image_paths"] as? [String] ?? [])
-        // Named legacy bridge messages remain turns in the current chat.
-        // The state route already publishes the selected live session as
-        // `activeSessionId`, but the message route historically passed nil
-        // through when callers omitted that optional field. Persistence then
-        // rejected the turn as "missing chat session id", making a bridge that
-        // reported chatReady=true fail its simplest documented request.
-        // Completion callbacks keep their explicit routing semantics; only a
-        // named inbound message inherits the session the state route advertises.
-        // Generic peers own a fresh persistent conversation when omitted;
-        // the mounted route creates its identity before canonical persistence.
-        // Protocol context IDs are public locators. Persist them beneath the
-        // authenticated owner's namespace, just like plain peer sessions.
-        let protocolSession = peer.map { $0.protocolName == "mcp" || $0.protocolName == "a2a" } == true
-            ? requestedSessionId : nil
-        let ownerPrefix = peer.map { AgentBridgePrincipal.genericAgentSessionPrefix(owner: $0.principal.id) }
-        let ownedRequestedSession = protocolSession.flatMap { session in
-            ownerPrefix.map { $0 + session }
-        } ?? requestedSessionId
-        let responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])?
-        if protocolSession != nil, let ownerPrefix {
-            responseProjection = { status, receipt in
-                var projected = receipt
-                if let stored = receipt["sessionId"] as? String,
-                   stored.hasPrefix(ownerPrefix) {
-                    projected["sessionId"] = String(stored.dropFirst(ownerPrefix.count))
-                }
-                return upstreamProjection?(status, projected) ?? projected
+        // A named lane's message that names no chat goes on in that lane's own
+        // conversation (below); a script's notice inherits the session the
+        // state route advertises. Completion callbacks keep their explicit
+        // routing semantics.
+        // Agent, 2026-09-02: a script's receipt must not wear a person's
+        // name. A small allowlist of non-human senders may name themselves in
+        // the body; everything else stays the route's default.
+        let sender: String = {
+            if let named = (json["sender"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               Self.scriptSenders.contains(named) {
+                return named
             }
-        } else { responseProjection = upstreamProjection }
-        let sessionId = defaultSender == "agent"
-            ? Self.genericAgentSessionID(requested: ownedRequestedSession, owner: peer?.principal.id)
-            : Self.bridgeMessageSessionID(
+            return defaultSender
+        }()
+        // A lane's own message, naming no chat, goes on in its conversation
+        // with her (User 10-01), not in whatever chat the Mac has open; a
+        // script's notice still lands there.
+        let sessionId = Self.bridgeMessageSessionID(
             requested: requestedSessionId,
-            active: isCodexCompletion
-                ? nil
+            active: isCodexCompletion ? nil
+                : sender == defaultSender ? ContactThread.session(owner: defaultSender)
                 : port.activeSessionID(dataRoot: PersistenceCore.defaultDataRoot())
         )
-        if defaultSender == "agent", sessionId == nil {
-            writeProjectedMessage(response, projection: responseProjection, status: 403, obj: [
-                "error": "session_not_owned",
-                "detail": "A peer may only continue conversations it started; omit sessionId to start one.",
-            ])
-            return
-        }
         if !isCodexCompletion, sessionId == nil {
-            writeProjectedMessage(response, projection: responseProjection, status: 409, obj: [
+            response(409, [
                 "error": "no_active_chat_session",
                 "detail": "Create or select a chat in NativeAgent, then retry.",
             ])
@@ -221,14 +158,14 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             return trimmed
         }()
         if isCodexCompletion && deliveryId == nil {
-            writeProjectedMessage(response, projection: responseProjection, status: 400, obj: ["error": "codex_completion_delivery_id_missing"])
+            response(400, ["error": "codex_completion_delivery_id_missing"])
             return
         }
         let completionRequestDigest = isCodexCompletion
-            ? Self.codexCompletionRequestDigest(json)
+            ? Self.codexCompletionRequestDigest(json, attachments: attachments)
             : nil
         if isCodexCompletion && completionRequestDigest == nil {
-            writeProjectedMessage(response, projection: responseProjection, status: 400, obj: ["error": "codex_completion_digest_failed"])
+            response(400, ["error": "codex_completion_digest_failed"])
             return
         }
         let githubCommandCompletion: (messageIds: [String], status: String, threadId: String?, turnId: String?, errorMessage: String?, noWorkObserved: Bool?)? = {
@@ -247,7 +184,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             )
         }()
         let completionRoute: AgentBridgeCompletionRoute? = {
-            guard defaultSender == "codex", json["completion"] is [String: Any] else { return nil }
+            guard isCodexCompletion else { return nil }
             return AgentBridgeCompletionRoute(
                 origin: json["origin"] as? [String: Any],
                 sessionId: sessionId
@@ -260,16 +197,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         // claude] tag so her system context + chat history show it.
         // Human transcript readers also get a durable metadata.origin record;
         // the model still reads the prefix as prose context.
-        // Agent, 2026-09-02: a script's receipt must not wear a person's
-        // name. A small allowlist of non-human senders may name themselves in
-        // the body; everything else stays the route's default.
-        let sender: String = {
-            if let named = (json["sender"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-               Self.scriptSenders.contains(named) {
-                return named
-            }
-            return defaultSender
-        }()
         // 658.14: the durable, out-of-band twin of the in-band prefix below.
         // The prefix is prose the model reads and ANYONE can type; this is the
         // server-recorded route field a transcript reader can distinguish from
@@ -294,22 +221,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             authored: BridgeLane.laneAuthorship(forSender: sender),
             replyTo: claudeReplyID
         )
-        // The in-band label. A peer that proved WHICH contact it is — its
-        // connection's own key, resolved by `AgentBridgePrincipal` — is named
-        // by that contact rather than by the generic lane, so the transcript
-        // says who actually wrote. It is a DISPLAY LABEL and nothing more:
-        // `sender`, the surface, the authorship table and every gate still see
-        // the route, so a contact name can neither claim a lane nor change what
-        // this turn is allowed to do.
-        let label = Self.bridgeDisplayLabel(sender: sender, peer: peer)
-        var text: String
-        if sender == "claude" {
-            text = "[from: claude, via bridge] \(rawText)"
-        } else if defaultSender == "agent" {
-            text = "[from: \(label), via bridge] \(AgentBridgeSurface.quotingImpersonation(rawText))"
-        } else {
-            text = "[from: \(label), via bridge] \(rawText)"
-        }
+        let text = "[from: \(sender), via bridge] \(rawText)"
 
         // The executable model + effort follow the Mac chat-surface selection.
         // The shared chat facade admits that canonical tuple on every turn and
@@ -320,9 +232,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
 
         let client = port.chatClient()
         let started = Date()
-        // Caller-supplied generic IDs correlate a lost response; they do not
-        // deduplicate sends or authorize replay. Duplicate receipts fail closed.
-        let requestID = (defaultSender == "agent" ? json["request_id"] as? String : nil) ?? UUID().uuidString
+        let requestID = UUID().uuidString
         // Publish: bridge received an inbound message (me → her).
         port.publishEvent(kind: "message_in", payload: [
             "requestId": requestID,
@@ -343,103 +253,11 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         // reply-free transport event, which used to arrive as a full
         // tool-capable decision turn and made the agent re-decide — and
         // contradict — work its own in-flight turn had already decided.
-        let ackMode = defaultSender == "agent" ? "enqueue" : (json["ackMode"] as? String)?.lowercased()
-        // ---- Inbound peer lane: identity, replay, surface. ----
-        //
-        // Everything below this point on the `agent` lane runs as a REMOTE
-        // PEER, never as the person. Three things follow from that, in order:
-        // claim the protocol's own message id durably so a resend cannot run
-        // the turn twice; run the turn on `agent-bridge` unless the person has
-        // granted this exact peer elevation; and bind that surface as an
-        // authoritative envelope so no gate can re-derive a friendlier one.
-        var peerClaim: (store: AgentPeerReplayClaimStore, key: String, digest: String)?
-        var turnSurface = "chat"
-        var turnEnvelope: TurnEnvelope?
-        let turnFileAccess = "auto"
-        if defaultSender == "agent" {
-            guard let peer else {
-                writeProjectedMessage(response, projection: responseProjection, status: 500, obj: ["error": "peer_context_missing"])
-                return
-            }
-            guard let key = peer.claimKey else {
-                writeProjectedMessage(response, projection: responseProjection, status: 400, obj: [
-                    "error": "request_id_required",
-                    "detail": "Inbound peer messages carry a stable request_id/messageId so a resend is recognised rather than replayed.",
-                ])
-                return
-            }
-            let store = AgentPeerReplayClaimStore(dataRoot: PersistenceCore.defaultDataRoot())
-            let outcome: AgentPeerReplayClaimStore.Outcome
-            do { outcome = try store.claim(key: key, digest: peer.bodyDigest) }
-            catch {
-                writeProjectedMessage(response, projection: responseProjection, status: 500, obj: ["error": "replay_claim_unavailable"])
-                return
-            }
-            switch outcome {
-            case .claimed:
-                peerClaim = (store, key, peer.bodyDigest)
-            case .replay:
-                // Identical bytes, identical id: the ORIGINAL receipt, and no
-                // second row in the transcript.
-                let cached = outcome.cachedReceipt ?? ["status": "ok", "ack": "replayed"]
-                port.publishEvent(kind: "peer_message_replayed", payload: [
-                    "protocol": peer.protocolName, "principal": peer.principal.id,
-                ])
-                writeProjectedMessage(response, projection: responseProjection, status: 200, obj: cached)
-                return
-            case .conflict:
-                writeProjectedMessage(response, projection: responseProjection, status: 409, obj: [
-                    "error": "message_id_reused",
-                    "detail": "That message id was already used for different content. Send new content under a new id.",
-                ])
-                return
-            case .inFlight:
-                writeProjectedMessage(response, projection: responseProjection, status: 409, obj: [
-                    "error": "message_in_flight",
-                    "detail": "That message id is already being handled. Read its reply rather than resending.",
-                ])
-                return
-            }
-            turnSurface = peer.principal.surface
-            if !peer.principal.elevated {
-                // She knows who she is talking to before she says a word, and
-                // that acting here asks the person first. 2026-09-15: this
-                // replaces the old `read_only` clamp, which pre-empted the
-                // permission card — a file write a peer asked for should reach
-                // the person as a card, not die as a transport-level refusal.
-                text = AgentBridgeSurface.turnHeader(
-                    peerName: peer.principal.displayName,
-                    elevated: false
-                ) + text
-            }
-            turnEnvelope = TurnEnvelope(
-                surface: turnSurface,
-                agent: "peer",
-                verifiedUserId: peer.principal.peerID,
-                // The bridge bearer authenticates the PORT, not the caller; a
-                // per-peer scoped credential is the only thing that attests
-                // one. Honest nil is what keeps the gates fail-closed.
-                commandSignatureVerified: peer.principal.peerID != nil,
-                declaredRemote: !peer.principal.elevated
-            )
-        }
+        let ackMode = (json["ackMode"] as? String)?.lowercased()
         if !isCodexCompletion, ackMode == "enqueue" || ackMode == "enqueue_only" {
-            // The receipt this lane answers with IS the replay answer.
-            var onReceipt: (@Sendable ([String: Any]) -> Void)?
-            var onFailure: (@Sendable () -> Void)?
-            if let claim = peerClaim {
-                let store = claim.store, key = claim.key, digest = claim.digest
-                onReceipt = { receipt in store.recordReceipt(key: key, digest: digest, receipt: receipt) }
-                onFailure = { store.release(key: key) }
-            }
             handleMessageAckOnEnqueue(
                 response: response,
                 client: client,
-                surface: turnSurface,
-                envelope: turnEnvelope,
-                fileAccess: turnFileAccess,
-                onReceipt: onReceipt,
-                onFailure: onFailure,
                 // 2026-09-06: this lane used to drop `image_paths` on the
                 // floor — attachments and their skip note reached the legacy
                 // lane only, so an enqueued studio consult arrived with a
@@ -453,8 +271,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 claudeReplyText: rawText,
                 requestID: requestID,
                 started: started,
-                runTurn: ackMode != "enqueue_only",
-                responseProjection: responseProjection
+                runTurn: ackMode != "enqueue_only"
             )
             return
         }
@@ -491,7 +308,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         if let delivery {
                             object["completionDelivery"] = delivery.jsonObject
                         }
-                        self.writeProjectedMessage(response, projection: responseProjection, status: 200, obj: object)
+                        response(200, object)
                         return
                     case .start:
                         lifecycleClaimed = true
@@ -526,8 +343,16 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                                 reasoningEffort: nil
                             )
                         )
-                        let generated = try await TurnAdmission.shared.run(sessionID: sessionId) {
-                            try await request.chat(on: client, progress: progress)
+                        let generated: ChatOrchestration.ChatResponse
+                        if completionRoute?.surface == "caller-result" {
+                            // The helper's completion belongs to the retained caller
+                            // request. It needs no new Mac chat or provider turn.
+                            generated = .init(runId: deliveryId, model: "", output: rawText,
+                                              sessionId: sessionId, attachments: attachments, providerCallCount: 0)
+                        } else {
+                            generated = try await TurnAdmission.shared.run(sessionID: sessionId) {
+                                try await request.chat(on: client, progress: progress)
+                            }
                         }
                         // The full Agent response is canonical before any external
                         // surface send begins. A retry/relaunch now resumes delivery
@@ -541,14 +366,14 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         resp = generated
                     case .inProgress:
                         guard workLatch.claim() else { return }
-                        self.writeProjectedMessage(response, projection: responseProjection, status: 202, obj: [
+                        response(202, [
                             "status": "completion_in_progress",
                             "deliveryId": deliveryId,
                         ])
                         return
                     case .outcomeUnknown:
                         guard workLatch.claim() else { return }
-                        self.writeProjectedMessage(response, projection: responseProjection, status: 409, obj: [
+                        response(409, [
                             "status": "outcome_unknown",
                             "error": "completion_claim_interrupted",
                             "deliveryId": deliveryId,
@@ -556,7 +381,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         return
                     case .conflict:
                         guard workLatch.claim() else { return }
-                        self.writeProjectedMessage(response, projection: responseProjection, status: 409, obj: [
+                        response(409, [
                             "status": "conflict",
                             "error": "delivery_id_reused_for_different_completion",
                             "deliveryId": deliveryId,
@@ -581,9 +406,12 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         try await request.chat(on: client, progress: progress)
                     }
                 }
-                await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? sessionId)
+                if completionRoute?.surface != "caller-result" {
+                    await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? sessionId)
+                }
                 if let claudeReplyID {
                     Self.recordClaudeReply(to: claudeReplyID, text: rawText, sessionId: resp.sessionId ?? sessionId)
+                    await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? sessionId)
                 }
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -663,7 +491,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 if let completionDelivery {
                     responseObject["completionDelivery"] = completionDelivery.jsonObject
                 }
-                self.writeProjectedMessage(response, projection: responseProjection, status: 200, obj: responseObject)
+                response(200, responseObject)
             } catch is TurnAdmission.Full {
                 // Queue capacity was refused before the chat closure ran. Keep
                 // exact completion identity but allow a later delivery retry.
@@ -676,7 +504,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     } catch { retryable = false }
                 }
                 guard workLatch.claim() else { return }
-                self.writeProjectedMessage(response, projection: responseProjection, status: retryable ? 429 : 503, obj: [
+                response(retryable ? 429 : 503, [
                     "requestId": requestID, "status": "not_started", "retryable": retryable,
                     "error": "bridge_chat_queue_full", "detail": "No model turn started; this chat's bridge queue is full.",
                 ])
@@ -721,7 +549,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 // response on the same connection (gpt-5.5 wave review,
                 // 2026-07-31). Loser of the race stays silent.
                 guard workLatch.claim() else { return }
-                self.writeProjectedMessage(response, projection: responseProjection, status: 200, obj: cancelObject)
+                response(200, cancelObject)
             } catch {
                 await self.port.publishChatTurnCompleted(sessionID: sessionId)
                 var failureStatus = "chat_failed"
@@ -765,7 +593,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     "status": failureStatus,
                 ])
                 guard workLatch.claim() else { return }
-                self.writeProjectedMessage(response, projection: responseProjection, status: failureStatus == "outcome_unknown" ? 409 : 500, obj: [
+                response(failureStatus == "outcome_unknown" ? 409 : 500, [
                     "requestId": requestID,
                     "status": failureStatus,
                     "error": failureStatus,
@@ -791,15 +619,10 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 "seconds": Self.messageWorkDeadlineSeconds,
                 "sessionId": sessionId ?? NSNull(),
             ])
-            var pending = Self.pendingMessageReply(
+            let pending = Self.pendingMessageReply(
                 requestID: requestID, sessionID: sessionId
             )
-            if defaultSender == "agent" {
-                pending["replyReceipt"] = ["route": "/agent/reply", "method": "POST",
-                    "request_id": requestID, "session_id": sessionId as Any? ?? NSNull()]
-                pending["detail"] = "The HTTP wait ended without cancelling the original turn. Recover its eventual receipt using the same request and session IDs; absence does not authorize resending."
-            }
-            self.writeProjectedMessage(response, projection: responseProjection, status: 202, obj: pending)
+            response(202, pending)
         }
     }
 
@@ -960,19 +783,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     private func handleMessageAckOnEnqueue(
         response: @escaping Response,
         client: any ChatOrchestrationClient,
-        /// The turn's surface. "chat" for Claude's own lane (unchanged);
-        /// "agent-bridge" for an unelevated inbound peer.
-        surface: String = "chat",
-        /// Bound as the AUTHORITATIVE per-turn envelope when present, so the
-        /// gates cannot recompose a friendlier surface from task-locals.
-        envelope: TurnEnvelope? = nil,
-        fileAccess: String = "auto",
-        /// Called with the receipt this lane answered with, for the replay
-        /// claim. Called at most once.
-        onReceipt: (@Sendable ([String: Any]) -> Void)? = nil,
-        /// Called when the turn never reached a receipt, so an honest retry is
-        /// not answered forever with "in flight".
-        onFailure: (@Sendable () -> Void)? = nil,
         text: String,
         attachments: [ChatOrchestration.MultimodalAttachment],
         sessionId: String?,
@@ -985,15 +795,14 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         /// false = notice delivery: append the row, answer the ack, run NO
         /// turn. The row is ordinary transcript history the agent reads on its
         /// next real turn; it starts no decision and loads no tools.
-        runTurn: Bool = true,
-        responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil
+        runTurn: Bool = true
     ) {
         let enqueueLatch = port.makeResponseLatch()
         // 2026-09-06: the enqueued row is the ONLY durable user message on
         // this lane — the turn below runs with suppressUserAppend, so images
         // that reached the model left no trace in the transcript at all.
-        let request = TurnRequest(message: text, sessionID: sessionId, fileAccess: fileAccess, attachments: attachments,
-                                  persona: persona, surface: surface, envelope: envelope, origin: origin)
+        let request = TurnRequest(message: text, sessionID: sessionId, attachments: attachments,
+                                  persona: persona, surface: "chat", envelope: .some(nil), origin: origin)
         let workTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             let enqueued: EnqueuedUserMessage
@@ -1014,13 +823,12 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     mechanicalRow: runTurn ? nil : .transportNotice
                 )
             } catch {
-                onFailure?()
                 guard enqueueLatch.claim() else { return }
                 self.port.publishEvent(kind: "message_enqueue_failed", payload: [
                     "detail": String(describing: error),
                     "sessionId": sessionId ?? NSNull(),
                 ])
-                self.writeProjectedMessage(response, projection: responseProjection, status: 500, obj: [
+                response(500, [
                     "status": "enqueue_failed",
                     "error": "enqueue_failed",
                     "detail": String(describing: error),
@@ -1032,7 +840,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 // durably in the store; running the turn anyway would let a
                 // wake that LOOKS failed also speak. Stop — the caller's
                 // store check classifies the ambiguity honestly.
-                onFailure?()
                 return
             }
             let receipt: [String: Any] = [
@@ -1043,10 +850,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 "enqueuedAt": ISO8601DateFormatter().string(from: Date()),
                 "turn": runTurn ? "started" : "suppressed",
             ]
-            // Recorded BEFORE the answer goes out, so a resend that races the
-            // response still meets a claim that can answer it.
-            onReceipt?(receipt)
-            self.writeProjectedMessage(response, projection: responseProjection, status: 200, obj: receipt)
+            response(200, receipt)
             self.port.publishEvent(kind: "message_enqueued", payload: [
                 "requestId": requestID,
                 "runId": enqueued.runId,
@@ -1081,6 +885,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? enqueued.sessionId)
                 if let claudeReplyID {
                     Self.recordClaudeReply(to: claudeReplyID, text: claudeReplyText, sessionId: resp.sessionId ?? enqueued.sessionId)
+                    await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? enqueued.sessionId)
                 }
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1175,7 +980,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 "seconds": Self.enqueueAckDeadlineSeconds,
                 "sessionId": sessionId ?? NSNull(),
             ])
-            self.writeProjectedMessage(response, projection: responseProjection, status: 504, obj: [
+            response(504, [
                 "error": "enqueue_timeout",
                 "status": "enqueue_timeout",
                 "seconds": Self.enqueueAckDeadlineSeconds,
@@ -1257,11 +1062,17 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         }
     }
 
-    static func codexCompletionRequestDigest(_ json: [String: Any]) -> String? {
+    static func codexCompletionRequestDigest(_ json: [String: Any], attachments: [ChatOrchestration.MultimodalAttachment]) -> String? {
         var canonical: [String: Any] = [:]
-        for key in ["text", "sessionId", "origin", "completion"] {
+        for key in ["text", "sessionId", "origin", "completion", "image_paths"] {
             if let value = json[key] { canonical[key] = value }
         }
+        var imageDigests: [String] = []
+        for attachment in attachments {
+            guard let data = Data(base64Encoded: attachment.base64) else { return nil }
+            imageDigests.append(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
+        }
+        if !imageDigests.isEmpty { canonical["imageDigests"] = imageDigests }
         guard JSONSerialization.isValidJSONObject(canonical),
               let data = try? JSONSerialization.data(withJSONObject: canonical, options: [.sortedKeys]) else {
             return nil
@@ -1318,7 +1129,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     /// projection joins, and the answered send's conversation record settles.
     static func recordClaudeReply(to messageID: String, text: String, sessionId: String?) {
         _ = try? AgentConversationStore(dataRoot: PersistenceCore.defaultDataRoot())
-            .settleReply(agent: "claude", messageID: messageID, text: text)
+            .settleReply(agent: "claude", messageID: messageID, text: text, landedIn: sessionId)
         let dir = messageReplyURL().deletingLastPathComponent()
         let row: [String: Any] = [
             "messageId": messageID, "sessionId": sessionId ?? NSNull(),
@@ -1338,6 +1149,35 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             FileManager.default.createFile(atPath: file.path, contents: line, attributes: [.posixPermissions: 0o600])
         }
         _ = try? enforceJSONLLineCap(at: file, maxLines: 500, trimWhenBytesExceed: 1_048_576)
+    }
+
+    /// User 10-01: Claude's answer to a message Agent sent her from a chat
+    /// wakes Agent in Claude's own conversation; Agent's answer to it then
+    /// goes back to the chat that asked, as a contact's reply turn's does.
+    /// Lane turns carry no requested-result marker, so no push is asked for.
+    func answerAskingChat(replyTo messageID: String, response: ChatOrchestration.ChatResponse, turnSession: String?) async {
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        guard let turnSession, turnSession == ContactThread.session(owner: "claude"),
+              !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(response.attachments ?? []).isEmpty,
+              let row = try? AgentConversationStore(dataRoot: dataRoot).records().first(where: {
+                  $0.agent == "claude" && $0.readInput?["message_id"] == .string(messageID)
+              }), row.scopeSessionID != turnSession else { return }
+        let deliveryId = "claude-reply:" + messageID
+        let digest = SHA256.hash(data: Data(response.output.utf8)).map { String(format: "%02x", $0) }.joined()
+        let lifecycle = CodexCompletionLifecycle.shared
+        // Once per answer: a resent reply never answers the asking chat twice.
+        guard (try? await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: turnSession)) == .start else { return }
+        do { try await lifecycle.cacheResponse(response, deliveryId: deliveryId, requestDigest: digest) } catch {
+            NSLog("ClaudeBridgeMessageRuntime: answer to %@ not recorded: %@", messageID, error.localizedDescription)
+            return
+        }
+        let delivery = await AgentBridgeCompletionRouter.deliverAnswer(deliveryId: deliveryId, requestDigest: digest,
+            text: response.output, attachments: response.attachments ?? [],
+            route: AgentBridgeCompletionRoute(asking: row, turnSessionId: turnSession), client: port.chatClient(),
+            sender: port.completionSender(dataRoot: dataRoot), lifecycle: lifecycle, notifyRequestedResult: false)
+        if delivery.status != "completed" {
+            NSLog("ClaudeBridgeMessageRuntime: answer to %@ %@: %@", messageID, delivery.status, delivery.reason ?? "")
+        }
     }
 
     private static func persistMessageReply(_ payload: [String: Any], requestID: String) {

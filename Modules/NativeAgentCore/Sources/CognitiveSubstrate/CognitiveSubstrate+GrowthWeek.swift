@@ -592,6 +592,8 @@ extension CognitiveSubstrate {
         let start = end.addingTimeInterval(-Self.growthWeekWindow)
         // Ask for generously more than the row cap: a single busy item can
         // produce many events, and the cap applies to ROWS, not events.
+        // Phase 5 D: the timeline snapshot already hides opinions and
+        // interests when the experiment is off.
         let events = await developmentalTimelineSnapshot(limit: 240)
             .filter { $0.occurredAt >= start && $0.occurredAt <= end }
             .sorted { lhs, rhs in
@@ -711,39 +713,53 @@ extension CognitiveSubstrate {
         // waiting on an answer, so the row reads "revision proposed". Only once
         // the revising view is actually adopted (signed `.active`, or `.held`
         // by her own hand) has the old view been released — revised.
-        for view in standingViews.values {
+        let revisions = standingViews.values
+            .filter { $0.status != .retired && $0.revisesViewId != nil }
+            .map { view in
+                let predecessor = view.revisesViewId.flatMap { standingViews[$0] }
+                let released = (view.status == .active || view.status == .held)
+                    && predecessor?.status == .retired
+                let releasedAt = predecessor?.updatedAt ?? view.updatedAt
+                return (view: view, released: released, releasedAt: releasedAt,
+                        happenedAt: released ? releasedAt : view.createdAt)
+            }
+            .sorted { lhs, rhs in
+                if lhs.happenedAt != rhs.happenedAt { return lhs.happenedAt < rhs.happenedAt }
+                return lhs.view.id.uuidString < rhs.view.id.uuidString
+            }
+        for revision in revisions {
+            let view = revision.view
             guard let revised = view.revisesViewId else { continue }
             // ADOPTING the revision is not by itself the predecessor's
             // release: nothing in the resolve path retires the view a revision
             // revises, so both were being carried while the readout said
             // "released — revised". The release has to be RECORDED — the old
             // view actually retired — before it is reported.
-            let predecessor = standingViews[revised]
-            let released = (view.status == .active || view.status == .held)
-                && predecessor?.status == .retired
+            let released = revision.released
             // The release IS the predecessor's retirement, so it is timed by
             // the predecessor's own `updatedAt`. Timing it by the revising
             // view's `updatedAt` timed it by the wrong record: that moves on
             // any later edit of the revision, so a view retired this week read
             // as last week's movement (or the reverse) and the week it
             // actually happened in showed nothing.
-            let releasedAt = predecessor?.updatedAt ?? view.updatedAt
+            let releasedAt = revision.releasedAt
             // The week is gated on when the movement HAPPENED. A revision
             // proposed eight days ago and adopted yesterday is this week's
             // release of the old view, so a released revision is placed by
             // the retirement time; one that released nothing by its proposal.
-            let happenedAt = released ? releasedAt : view.createdAt
+            let happenedAt = revision.happenedAt
             guard happenedAt >= start, happenedAt <= end,
                   var accumulator = accumulators[revised] else { continue }
             let outcome: CognitiveGrowthOutcome = released ? .revised : .revisionProposed
-            guard accumulator.outcome != outcome else { continue }
             // A REVISION REACHES A SETTLED ROW TOO. The old guard skipped any
             // accumulator that had already settled, so a view approved or held
             // earlier in the week and contradicted later kept saying "approved"
             // — the one movement the readout exists to show. The revision now
             // takes the row, and the state it settled into first is kept in
             // `priorOutcome` so the line still tells the whole story.
-            if accumulator.outcome.isSettled { accumulator.priorOutcome = accumulator.outcome }
+            if accumulator.outcome != outcome, accumulator.outcome.isSettled {
+                accumulator.priorOutcome = accumulator.outcome
+            }
             accumulator.outcome = outcome
             // The revising view names what replaced this one — that is the why.
             accumulator.outcomeReason = view.title.isEmpty ? view.body : view.title

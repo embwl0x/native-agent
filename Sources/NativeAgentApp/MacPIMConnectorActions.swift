@@ -9,8 +9,29 @@ import MacIntegration
 import Connectors
 
 struct NativeAppLocalPIMStatusProvider: LocalPIMStatusProvider {
+    let root: URL
+
     func localStatus(id: String) async -> [String: JSONValue] {
-        await MainActor.run {
+        let integration: String
+        switch id {
+        case "local_mail": integration = MacIntegrationID.mail
+        case "local_calendar": integration = MacIntegrationID.calendar
+        case "local_reminders": integration = MacIntegrationID.reminders
+        default: return [:]
+        }
+        do {
+            let permissions = try await MacIntegrationPermissionStore(dataRoot: root).currentChecked()
+            guard permissions[integration]?.read == true else {
+                return [
+                    "status": .string("needs_policy"),
+                    "detail": .string("Read access is disabled in Mac Integrations."),
+                    "nextStep": .string("Enable read access in Mac Integrations."),
+                ]
+            }
+        } catch {
+            return ["status": .string("unavailable"), "detail": .string(error.localizedDescription)]
+        }
+        return await MainActor.run {
             MacPIMConnectorActions.authorizationStatusPayload(localId: id)
         }
     }
@@ -85,6 +106,26 @@ enum MacPIMConnectorActions {
         try await Actions.calendarListUpcoming(input: input)
     }
 
+    static func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue {
+        try await Actions.calendarCalendars(input: input)
+    }
+
+    static func calendarFreeBusy(input: [String: JSONValue]) async throws -> JSONValue {
+        try await Actions.calendarFreeBusy(input: input)
+    }
+
+    static func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue {
+        try await Actions.remindersQuery(input: input)
+    }
+
+    static func remindersRead(input: [String: JSONValue]) async throws -> JSONValue {
+        try await Actions.remindersRead(input: input)
+    }
+
+    static func remindersUpdate(input: [String: JSONValue]) async throws -> JSONValue {
+        try await Actions.remindersUpdate(input: input)
+    }
+
     static func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue {
         try await Actions.remindersListDueToday(input: input)
     }
@@ -150,7 +191,7 @@ enum MacPIMConnectorActions {
     /// post-request status in the wizard vocabulary.
     public static func requestReminderAccess() async -> String {
         let status = EKEventStore.authorizationStatus(for: .reminder)
-        if status == .notDetermined {
+        if status == .notDetermined, !SkillRunContext.handsBack {
             let store = EKEventStore()
             _ = try? await store.requestFullAccessToReminders()
         }
@@ -180,7 +221,8 @@ enum MacPIMConnectorActions {
         case .ready:
             return true
         case .requestWriteOnly:
-            return try await store.requestWriteOnlyAccessToEvents()
+            // A skill never asks macOS for access (`SkillRunContext`); its step hands back.
+            return SkillRunContext.handsBack ? false : try await store.requestWriteOnlyAccessToEvents()
         case .requestFull, .unavailable:
             return false
         }
@@ -192,7 +234,7 @@ enum MacPIMConnectorActions {
         case .ready:
             return true
         case .requestFull:
-            return try await store.requestFullAccessToEvents()
+            return SkillRunContext.handsBack ? false : try await store.requestFullAccessToEvents()
         case .requestWriteOnly, .unavailable:
             return false
         }

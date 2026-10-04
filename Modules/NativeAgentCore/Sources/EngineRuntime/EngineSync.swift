@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import Combine
 import DeviceSync
+import TrustCenter
 
 /// Settings' observable projection of the engine's canonical device-sync owner.
 /// Combine subscriptions bridge the core's published values without wire models.
@@ -15,6 +16,8 @@ public final class SyncFacade {
     public var secretBase64 = ""
     public var pairingError: String?
     @ObservationIgnored private var subscriptions: Set<AnyCancellable> = []
+    @ObservationIgnored private var isRotatingSecret = false
+    @ObservationIgnored private var secretRevision: UInt64 = 0
 
     public nonisolated init(owner: DeviceSync?) {
         self.owner = owner
@@ -37,6 +40,8 @@ public final class SyncFacade {
     }
 
     public func loadSecret(quiet: Bool) async {
+        guard !isRotatingSecret else { return }
+        let revision = secretRevision
         guard owner != nil else {
             secretBase64 = ""
             pairingError = "Pairing is unavailable."
@@ -48,7 +53,7 @@ public final class SyncFacade {
                 return (try PairingSecretManager.currentSecretBase64(), nil)
             } catch { return (nil, error.localizedDescription) }
         }.value
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !isRotatingSecret, revision == secretRevision else { return }
         if let secret = result.0 {
             pairingError = nil
             secretBase64 = secret
@@ -59,7 +64,10 @@ public final class SyncFacade {
     }
 
     public func regenerateSecret() async {
-        guard let owner else { return }
+        guard let owner, !isRotatingSecret else { return }
+        isRotatingSecret = true
+        secretRevision &+= 1
+        defer { isRotatingSecret = false }
         // Close admission before changing durable signing bytes, and reopen
         // with exactly the read-back key before either publication awaits.
         owner.engine.beginPairingSecretRotation()

@@ -36,9 +36,10 @@ extension NativeClient {
         model: String,
         reasoningEffort: String,
         serviceTier: String?,
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        dataRoot suppliedRoot: URL? = nil,
         codexCacheURL: URL? = nil
     ) async throws -> ModelCatalogResponse {
+        let dataRoot = suppliedRoot ?? dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let validateSelection = try await Self.providerSelectionValidator(dataRoot: dataRoot)
         try await SwiftNativeProviderRouting(dataRoot: dataRoot).saveSurfaceConfiguration(
             surface: surface,
@@ -150,14 +151,7 @@ extension NativeClient {
     /// signed account catalog. The routing owner calls this before any write,
     /// with the route resolved inside its transaction lock.
     private static func providerSelectionValidator(dataRoot: URL) async throws -> @Sendable (String, String) throws -> Void {
-        let providers = try await ProvidersFacade(dataRoot: dataRoot).list()
-        return { route, model in
-            guard let provider = providers.first(where: { $0.provider_id == route }),
-                  provider.auth_status.state == "ready",
-                  provider.models.contains(where: { $0.id == model }) else {
-                throw ProviderRoutingError.configurationFailed("\(route) cannot serve \(model). Refresh Providers and choose an available model.")
-            }
-        }
+        try await SwiftNativeProviderRouting(dataRoot: dataRoot).selectionValidator()
     }
 
     static func inferProviderID(forModel model: String) -> String? {
@@ -255,23 +249,9 @@ extension NativeClient {
         return try JSONDecoder().decode(CapabilityCatalogSource.self, from: data)
     }
 
-    // PORTED wave 31 W15 (2026-06-01): `.capabilityTrust` snapshot routes
-    // POST /v1/capability-catalog/updates/check through SwiftNativeCatalogWrites.
-    // Reads the installs list (lock-free), emits a "current" update row per
-    // install, then stamps lastCheckedAt on every source under the sources flock
-    // — byte-identical to `check_capability_updates()`,
-    // including the symmetric flock on catalog_sources_path.
+    // The catalog owner reports update checking as unavailable until it can
+    // compare source versions; this request does not stamp source check times.
     func checkCapabilityUpdates() async throws -> CapabilityUpdateCheck {
-        // RE-ENABLED wave 32 W02 (2026-06-01): the W31-W15 revert cited the
-        // "same write-parity gap as upsertCatalogSource". Unlike the upsert,
-        // check_capability_updates() emits NO record_trace (the retired daemon
-        // has no audit call — it only stamps lastCheckedAt), so there is no trace
-        // side-effect to port here. The only remaining concern was cross-process
-        // write coordination on catalog/sources/sources.json, which is moot for
-        // the same reason as upsertCatalogSource: wave-30 W07's read-side actor
-        // already performs the flock'd write-back of that file live in
-        // production. The "checked" result shape, the per-install "current"
-        // update rows, and the lastCheckedAt stamp are byte-identical to Python.
         let writes = SwiftNativeCatalogWrites(
             dataRoot: PersistenceCore.defaultDataRoot(),
             persistence: SwiftNativePersistenceCore()

@@ -19,7 +19,7 @@ public func parseExpiresAt(_ raw: Any?) -> Date? {
 
 /// A refresh belongs to one sign-in. If the endpoint supplies no identity,
 /// a fresh local sign-in ID still prevents borrowing a previous grant.
-enum OAuthRefreshBinding {
+public enum OAuthRefreshBinding {
     static func string(_ value: Any?) -> String? {
         guard let value = value as? String else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -56,7 +56,7 @@ enum OAuthRefreshBinding {
         return object
     }
 
-    static func permitsRefresh(_ object: [String: Any], provider: String) -> Bool {
+    public static func permitsRefresh(_ object: [String: Any], provider: String) -> Bool {
         let tokens = tokenSet(object, provider: provider)
         guard let account = string(tokens["oauth_account_identity"]),
               account == string(tokens["refresh_token_account_identity"]) else { return false }
@@ -81,14 +81,17 @@ enum OAuthRefreshBinding {
 
 /// Lives for one request, including its refresh queue wait and HTTP retry.
 /// Access-only credentials can continue unchanged, but cannot adopt a new token
-/// without a recorded account binding.
+/// without a recorded account binding. Read-only CLI sessions can instead
+/// prove account continuity from their token identity.
 final class OAuthRequestAccount: @unchecked Sendable {
     private let lock = NSLock()
     private var original: (account: String?, access: String?)?
 
-    func check(_ object: [String: Any], provider: String, rejectedToken: String? = nil) throws {
+    func check(_ object: [String: Any], provider: String, rejectedToken: String? = nil,
+               allowUnboundIdentity: Bool = false) throws {
         let tokens = OAuthRefreshBinding.tokenSet(object, provider: provider)
         let account = OAuthRefreshBinding.string(tokens["oauth_account_identity"])
+            ?? (allowUnboundIdentity ? OAuthRefreshBinding.identity(tokens, provider: provider) : nil)
         let access = OAuthRefreshBinding.string(tokens["access_token"])
         lock.lock()
         defer { lock.unlock() }

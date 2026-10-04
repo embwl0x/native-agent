@@ -15,6 +15,10 @@ public protocol ICloudIncomingTurnPort: Sendable {
     func received(in sessionID: String)
     func completed(sessionID: String?)
     func signatureVerified(_ message: BridgeMessage) -> Bool
+    func stopChatForControlHandoff(sessionID: String, messageDate: Date) async throws -> String
+    func controlHandoffGeneration(sessionID: String) -> Int
+    func holdsMessageAfterControlHandoff(sessionID: String, receivedAtGeneration: Int, sentAt: Date) -> Bool
+    func awaitPendingChatStop(sessionID: String) async
     func registerActiveChatTask(_ task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int), Never>,
                                 for sessionID: String, runID: String)
     func unregisterActiveChatTask(for sessionID: String,

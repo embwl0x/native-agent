@@ -38,6 +38,12 @@ public final class MacChatTurnRuntime {
     @ObservationIgnored public var drainingQueueSessions: Set<String> = []
     public var pendingStopWrites: [String: Task<Void, Never>] = [:]
     public var pendingStopWriteGenerations: [String: Int] = [:]
+    /// Bumped by every control handoff. A remote input that entered under an
+    /// older value was already waiting when control was released.
+    @ObservationIgnored public var controlHandoffGenerations: [String: Int] = [:]
+    /// The newest phone handoff's own send time. Later-arriving phone inputs
+    /// are ordered against it on the phone's clock, never the Mac's.
+    @ObservationIgnored public var phoneControlHandoffSentAt: [String: Date] = [:]
     @ObservationIgnored public var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading = MacChatTurnTranscriptProofReader()
     @ObservationIgnored public var chatTurnLifecycleRepairCompleted = false
     @ObservationIgnored public var queuedChatTurnStartOverride: (@MainActor @Sendable (QueuedChatTurn, String) async -> MacChatTurnAcceptance)?
@@ -60,6 +66,48 @@ public final class MacChatTurnRuntime {
         tasks[sessionId] = nil
         taskGenerations[sessionId] = nil
         return true
+    }
+
+    /// Install the Stop barrier before any revocation can suspend. Every
+    /// subsequent admission waits for this same marker write.
+    @discardableResult
+    public func requestStop(
+        sessionId: String, pauseQueuedTurns: Bool = true,
+        revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil
+    ) -> Task<Void, Never> {
+        if pauseQueuedTurns {
+            pausedQueueSessions.insert(sessionId)
+            queuePauseReasons.removeValue(forKey: sessionId)
+        } else {
+            pausedQueueSessions.remove(sessionId)
+        }
+        let activeTask = tasks[sessionId]
+        let generation = (pendingStopWriteGenerations[sessionId] ?? 0) + 1
+        pendingStopWriteGenerations[sessionId] = generation
+        let previousWrite = pendingStopWrites[sessionId]
+        if revokeDriverControl == nil {
+            activeTask?.cancel()
+            tasks[sessionId] = nil
+            streamingSessions.remove(sessionId)
+        }
+        let write = Task { @MainActor in
+            if let revokeDriverControl {
+                await revokeDriverControl()
+                activeTask?.cancel()
+                if tasks[sessionId] == activeTask {
+                    tasks[sessionId] = nil
+                    streamingSessions.remove(sessionId)
+                }
+            }
+            await previousWrite?.value
+            try? await stop(sessionId: sessionId)
+            if pendingStopWriteGenerations[sessionId] == generation {
+                pendingStopWrites[sessionId] = nil
+                pendingStopWriteGenerations[sessionId] = nil
+            }
+        }
+        pendingStopWrites[sessionId] = write
+        return write
     }
 
     public nonisolated func stop(sessionId: String) async throws {

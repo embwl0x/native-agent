@@ -38,6 +38,9 @@ private final class ProviderSignInHandoff {
                 platform: NativeOAuthPlatform.self, providerId: id, dataRoot: root
             )
             let signedIn = result.ok && NativeOAuthFlow.isSignedIn(providerId: id, dataRoot: root)
+            if signedIn {
+                await QuietSelfAdmin.shared.appModel?.adoptProviderForBlankSurfaces(id)
+            }
             states[id] = ["request_id": requestID, "state": signedIn ? "signed_in" : "failed"]
             tasks[id] = nil
             await NativeAgentEngine.live.deviceSync?.engine.writeSnapshots(forceHeavy: true)

@@ -24,7 +24,9 @@ enum MobileSchedulerProjection {
                 }
             }
             let schedule: String
-            if case .object(let fields)? = object["schedule"] {
+            if let once = job.onceScheduleDescription {
+                schedule = once
+            } else if case .object(let fields)? = object["schedule"] {
                 // Only schedule metadata; never pass arbitrary payload fields through.
                 let labels = [
                     "type": "Schedule", "kind": "Schedule", "seconds": "Seconds",

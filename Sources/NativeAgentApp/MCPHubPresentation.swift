@@ -141,7 +141,8 @@ enum MCPHubRecentCallState {
 /// view-local call result. A malformed neighbouring JSONL row is reported as
 /// partial while a valid latest MCP receipt remains usable.
 enum MCPHubDurableCallHistory {
-    private static let maximumRows = 200
+    private static let readChunkBytes = 65_536
+    private static let maximumReceiptBytes = 1_048_576
 
     private struct ActivityReceiptRow: Decodable {
         let id: String
@@ -156,27 +157,56 @@ enum MCPHubDurableCallHistory {
             .appendingPathComponent("activity", isDirectory: true)
             .appendingPathComponent("events.jsonl")
         guard FileManager.default.fileExists(atPath: path.path) else { return .absent }
-        let raw: String
-        do {
-            raw = try String(contentsOf: path, encoding: .utf8)
-        } catch {
-            return .unavailable(boundedDetail(error))
-        }
-
-        let lines = raw.split(whereSeparator: \.isNewline).suffix(maximumRows)
         let decoder = JSONDecoder.nativeAgent
         var rejectedRows = 0
-        for line in lines.reversed() {
-            guard let row = try? decoder.decode(ActivityReceiptRow.self, from: Data(line.utf8)) else {
-                rejectedRows += 1
-                continue
+        var reversedLine: [UInt8] = []
+        var oversized = false
+        func finishLine() -> MCPHubRecentCallState? {
+            defer {
+                reversedLine.removeAll(keepingCapacity: true)
+                oversized = false
             }
-            guard row.kind == "mcp_tool" else { continue }
+            if oversized {
+                rejectedRows += 1
+                return nil
+            }
+            guard !reversedLine.isEmpty else { return nil }
+            guard let row = try? decoder.decode(ActivityReceiptRow.self, from: Data(reversedLine.reversed())) else {
+                rejectedRows += 1
+                return nil
+            }
+            guard row.kind == "mcp_tool" else { return nil }
             guard let result = callResult(from: row) else {
                 rejectedRows += 1
-                continue
+                return nil
             }
             return rejectedRows == 0 ? .durable(result) : .partial(result, rejectedRows: rejectedRows)
+        }
+        do {
+            let handle = try FileHandle(forReadingFrom: path)
+            defer { try? handle.close() }
+            var offset = try handle.seekToEnd()
+            // Start at the newest row and stop at the first usable MCP receipt.
+            // Both each read and an individual row stay bounded.
+            while offset > 0 {
+                let count = Int(min(offset, UInt64(readChunkBytes)))
+                offset -= UInt64(count)
+                try handle.seek(toOffset: offset)
+                guard let chunk = try handle.read(upToCount: count), chunk.count == count else {
+                    return .unavailable("Activity changed while reading its receipts. Refresh to try again.")
+                }
+                for byte in chunk.reversed() {
+                    if byte == 10 || byte == 13 {
+                        if let result = finishLine() { return result }
+                    } else if !oversized {
+                        if reversedLine.count < maximumReceiptBytes { reversedLine.append(byte) }
+                        else { oversized = true }
+                    }
+                }
+            }
+            if let result = finishLine() { return result }
+        } catch {
+            return .unavailable(boundedDetail(error))
         }
         return rejectedRows == 0 ? .absent : .partial(nil, rejectedRows: rejectedRows)
     }

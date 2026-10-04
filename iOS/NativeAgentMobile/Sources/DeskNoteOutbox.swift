@@ -11,7 +11,7 @@ import SwiftUI
 /// reconciled when the Mac confirms. Delivery is retried only under that same
 /// retained identity, so a Desk item can never collect the same note twice.
 struct MobileDeskPendingNote: Codable, Identifiable, Sendable {
-    /// Stable across a signature re-sign, which replaces `submission`.
+    /// Stable across a pre-execution replacement of `submission`.
     let localID: UUID
     var id: String { localID.uuidString }
     let handle: String
@@ -22,8 +22,13 @@ struct MobileDeskPendingNote: Codable, Identifiable, Sendable {
     /// Last delivery problem, kept for honesty. A note that has not reached the
     /// Mac yet is still waiting — it is never described as lost.
     var lastError: String?
+    var rejectedByMac: Bool? = nil
 
-    var statusLine: String { "Waiting to reach your Mac" }
+    var statusLine: String {
+        if rejectedByMac == true { return "Your Mac did not add this note" }
+        if lastError != nil { return "Delivery is unconfirmed" }
+        return "Waiting to reach your Mac"
+    }
 }
 
 /// Drafts (unsubmitted text) and pending notes (submitted, unconfirmed), both
@@ -104,7 +109,7 @@ final class MobileDeskNoteOutbox: ObservableObject {
     }
 
     private func deliver(_ note: MobileDeskPendingNote, engine: iCloudSyncEngine) {
-        guard !inFlight.contains(note.id) else { return }
+        guard note.rejectedByMac != true, !inFlight.contains(note.id) else { return }
         inFlight.insert(note.id)
         Task { @MainActor in
             defer { inFlight.remove(note.id) }
@@ -113,10 +118,11 @@ final class MobileDeskNoteOutbox: ObservableObject {
                     handle: note.handle,
                     text: note.text,
                     submission: note.submission,
+                    intentionalNewRequest: true,
                     onReplacement: { [weak self = self] replacement in
-                        // Signature recovery re-signs under a new identity; the
-                        // retained record must name the one actually in flight.
-                        Task { @MainActor in self?.replaceSubmission(id: note.id, with: replacement) }
+                        // Persist the replacement before its first send so an
+                        // uncertain delivery is retried under the same identity.
+                        self?.replaceSubmission(id: note.id, with: replacement)
                     }
                 )
                 // The Mac owns the Desk: its confirmation is what retires this
@@ -124,7 +130,13 @@ final class MobileDeskNoteOutbox: ObservableObject {
                 resolve(id: note.id)
                 await engine.refreshDeskSnapshot()
             } catch {
-                noteFailure(id: note.id, message: error.localizedDescription)
+                let rejected: Bool
+                if let syncError = error as? SyncError, case .macRejected = syncError {
+                    rejected = true
+                } else {
+                    rejected = false
+                }
+                noteFailure(id: note.id, message: error.localizedDescription, rejected: rejected)
             }
         }
     }
@@ -138,8 +150,9 @@ final class MobileDeskNoteOutbox: ObservableObject {
         pending.removeAll { $0.id == id }
     }
 
-    private func noteFailure(id: String, message: String) {
+    private func noteFailure(id: String, message: String, rejected: Bool) {
         guard let index = pending.firstIndex(where: { $0.id == id }) else { return }
         pending[index].lastError = message
+        pending[index].rejectedByMac = rejected
     }
 }

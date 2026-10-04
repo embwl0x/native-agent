@@ -1,4 +1,6 @@
 import AppToolRuntime
+import ApprovalTransactions
+import Privacy
 import SchedulerExecution
 import Foundation
 import TriggerScheduler
@@ -49,7 +51,8 @@ extension NativeAgentEnginePorts {
                 desktop: { await NativeAgentEngine.live.agents.desktop.run(plan: $0, inner: $1, surface: $2) }
             ),
             catalogPosture: { await NativeAgentEngine.liveCognition.organismBehaviorPosture() },
-            evolutionBridge: { EvolutionToolBridgeImpl(dataRoot: $0) }
+            evolutionBridge: { EvolutionToolBridgeImpl(dataRoot: $0) },
+            connectorActionStatuses: { try await NativeClient.checkedConnectorActionStatuses(root: dataRoot) }
         )
     }
 }
@@ -57,7 +60,7 @@ extension NativeAgentEnginePorts {
 extension NativeAgentEngine {
     static let live: NativeAgentEngine = {
         let dataRoot = PersistenceCore.defaultDataRoot()
-        return NativeAgentEngine(dataRoot: dataRoot, activeToolsStore: .shared, ports: .app(dataRoot: dataRoot))
+        return NativeAgentEngine(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot))
     }()
     /// The running app's mind. The live root is built with the app's body.
     static var liveCognition: NativeCognitionRuntime { live.cognition! }
@@ -95,23 +98,30 @@ struct AppCognitionHost: CognitionHost {
         eventId: String, title: String, body: String, reason: String,
         userInfo: [String: String], at date: Date
     ) async throws -> String? {
+        // Her knock points at the conversation the Mac and the phone show, so
+        // it goes to the phone, never to a Telegram chat that lacks it.
         let outcome = try await AttentionRouter.shared.route(
             eventId: eventId, importance: .informational, title: title, body: body,
-            reason: reason, userInfo: userInfo, at: date
+            reason: reason, userInfo: userInfo, pinnedTo: .phone, at: date
         )
         guard outcome.delivery != .none, !outcome.suppressed else { return nil }
         return outcome.delivery.rawValue
     }
 
+    func sendToOwnerTelegram(sessionId: String, text: String, dataRoot: URL) async -> Bool? {
+        guard let owner = await ApprovalChatCards.ownerDM(boundTo: sessionId, dataRoot: dataRoot) else { return nil }
+        guard let telegram = TelegramApprovalFilerRef.shared.current() else { return false }
+        do {
+            try await telegram.sendChatCard(text: NativeAppSecretRedactor.redactText(text), chatId: owner,
+                                            markup: .object(["inline_keyboard": .array([])]))
+            return true
+        } catch {
+            NSLog("reach: Telegram send failed: %@", error.localizedDescription)
+            return false
+        }
+    }
+
     func writeSyncSnapshots() async { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
-
-    func dreamEnabled() async -> Bool {
-        await NativeAgentEngine.live.cognitionView.dreamEnabled()
-    }
-
-    func runPressureDream() async throws -> [String: Any] {
-        try await NativeClient(baseURL: "").runDream(force: false, trigger: .pressure)
-    }
 
     func backgroundLLMClient(dataRoot: URL, cognition: NativeCognitionRuntime?) -> any LLMClient {
         BackgroundLoopsAssembly.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition)

@@ -227,21 +227,22 @@ enum ChatViewportPresentation {
 /// dismiss a confirmation dialog more than once (button action plus binding
 /// teardown), so only a currently presented dialog may consume the clear.
 struct ChatClearConfirmationState: Equatable {
-    private(set) var isPresented = false
+    private(set) var sessionId: String?
+    var isPresented: Bool { sessionId != nil }
 
-    mutating func request() {
-        isPresented = true
+    mutating func request(sessionId: String) {
+        guard !isPresented else { return }
+        self.sessionId = sessionId
     }
 
     mutating func cancel() {
-        isPresented = false
+        sessionId = nil
     }
 
-    /// Returns true exactly once for a presented destructive confirmation.
-    mutating func consumeConfirmation() -> Bool {
-        guard isPresented else { return false }
-        isPresented = false
-        return true
+    /// Returns the captured session exactly once per confirmation.
+    mutating func consumeConfirmation() -> String? {
+        defer { cancel() }
+        return sessionId
     }
 }
 
@@ -441,7 +442,7 @@ struct ChatReadAloudObserver: View {
             .frame(width: 0, height: 0)
             .accessibilityHidden(true)
             .onChange(of: appModel.chatMessages.count) {
-                onChanged()
+                if !turnIsBusy { onChanged() }
             }
             .onChange(of: appModel.chatMessages.last?.content) {
                 if !turnIsBusy { onChanged() }
@@ -661,7 +662,7 @@ struct ChatView: View {
             get: { clearConfirmation.isPresented },
             set: { isPresented in
                 if isPresented {
-                    clearConfirmation.request()
+                    clearConfirmation.request(sessionId: appModel.activeChatSessionId)
                 } else {
                     clearConfirmation.cancel()
                 }
@@ -793,7 +794,6 @@ struct ChatView: View {
         // the floating glass panel (SimpleSetupPanel.swift).
         .inlineCardSetup(inlineCards)
         .liveOnAppear {
-            voiceOutput.nativeBaseURL = appModel.nativeBaseURL
             prunePinnedSessions()
             hasUsableProvider = appModel.hasAnyUsableProvider()
             // H5: pick up whatever draft this session already holds (a prefill
@@ -1381,7 +1381,10 @@ struct ChatView: View {
                             Task { await appModel.loadChatState() }
                             return
                         }
-                        guard completedSessionId == appModel.activeChatSessionId else { return }
+                        guard completedSessionId == appModel.activeChatSessionId else {
+                            Task { await appModel.followMovedAnchorInSimple() }
+                            return
+                        }
                         // A local turn that already landed its disk snapshot says
                         // so in userInfo; skip the duplicate whole-transcript read
                         // (remote turns and failed local refreshes never set it).
@@ -1396,6 +1399,7 @@ struct ChatView: View {
                             await inlineCards.refresh(sessionID: completedSessionId)
                         }
                     }
+                    .modifier(TranscriptChangeRefresh(appModel: appModel))
                     // Notify-don't-hang (2026-06-09): in-turn tool notices
                     // (invoke_claude start / 30s heartbeat / timeout) surface
                     // as live toasts instead of a silent multi-minute hang.
@@ -1626,8 +1630,8 @@ struct ChatView: View {
             titleVisibility: .visible
         ) {
             Button("Clear Messages", role: .destructive) {
-                guard clearConfirmation.consumeConfirmation() else { return }
-                Task { await appModel.clearActiveChatMessages() }
+                guard let sessionId = clearConfirmation.consumeConfirmation() else { return }
+                Task { await appModel.clearActiveChatMessages(sessionId: sessionId) }
             }
             Button("Cancel", role: .cancel) {
                 clearConfirmation.cancel()
@@ -1753,5 +1757,19 @@ struct StalePanelNotice: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Stale data. \(text)")
         .help(text)
+    }
+}
+
+/// Any row written to the open chat from another door (Telegram, the phone,
+/// an agent, a contact's reply) shows as it lands, not on the next turn.
+private struct TranscriptChangeRefresh: ViewModifier {
+    let appModel: AppModel
+
+    func body(content: Content) -> some View {
+        content.onReceive(NotificationCenter.default.publisher(for: .nativeAgentChatTranscriptDidChange)
+            .receive(on: DispatchQueue.main)) { note in
+            guard let changed = note.object as? String, changed == appModel.activeChatSessionId else { return }
+            Task { await appModel.refreshChatMessagesAfterTurn(sessionId: changed) }
+        }
     }
 }

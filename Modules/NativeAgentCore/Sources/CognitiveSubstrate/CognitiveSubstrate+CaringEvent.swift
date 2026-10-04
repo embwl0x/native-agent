@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // CARING EVENTS, APPRAISED BY THE ONLY OWNER THAT CAN (2026-09-11, second pass).
@@ -14,7 +15,7 @@ import PersistenceCore
 // Agent named the three moments of this week that should have registered and
 // none of them contains a needle — see the header of
 // `CognitiveSubstrate+CaringAppraisal.swift` for what they were. The verdict now
-// comes from one small model call on the Memory route (`CaringAppraising`).
+// comes from the shared after-turn interpretation on the Memory route.
 //
 // THE WARMTH TIER IS UNTOUCHED. The phrase groups below still exist and
 // `relationalWarmthBoost` still composes its high tier from them, exactly as
@@ -38,6 +39,40 @@ import PersistenceCore
 // the human?). A working agent-to-agent message is `none`; so is a digest or a
 // recap of an earlier conversation, which is a retelling whatever wire it came
 // on.
+
+/// Provenance from the durable incoming transcript row, independent of affect.
+public struct AfterTurnOrigin: Sendable {
+    public let sessionId: String
+    public let runId: String?
+    public let messageId: String
+    public let occurredAt: Date?
+    public let userMessage: String
+
+    public init(sessionId: String, runId: String?, messageId: String,
+                occurredAt: Date?, userMessage: String) {
+        self.sessionId = sessionId
+        self.runId = runId
+        self.messageId = messageId
+        self.occurredAt = occurredAt
+        self.userMessage = userMessage
+    }
+}
+
+public enum AfterTurnSource {
+    @TaskLocal public static var origin: AfterTurnOrigin?
+}
+
+public struct AfterTurnContext: Sendable {
+    public let event: CognitiveEvent
+    public let caring: CaringAppraisalRequest?
+    public let generation: UInt64
+
+    public init(event: CognitiveEvent, caring: CaringAppraisalRequest?, generation: UInt64) {
+        self.event = event
+        self.caring = caring
+        self.generation = generation
+    }
+}
 
 extension CognitiveSubstrate {
 
@@ -106,9 +141,6 @@ extension CognitiveSubstrate {
 
     /// Install the model appraiser. Without one nothing ever doses, which is the
     /// safe direction and the state every test and every headless tool starts in.
-    public func setCaringAppraiser(_ appraiser: (any CaringAppraising)?) {
-        caringAppraiser = appraiser
-    }
 
     /// Install the door into the body. Without one a verdict is computed and
     /// dropped, which is again the safe direction and what a test or a headless
@@ -136,8 +168,9 @@ extension CognitiveSubstrate {
     /// as well is belt — `MindCaringAppraiser` checks `Task.isCancelled`.
     public func clearCaringState() {
         caringAppraisalGeneration &+= 1
-        for task in caringAppraisalTasks { task.cancel() }
-        caringAppraisalTasks.removeAll(keepingCapacity: false)
+        deferredTurns.removeAll()
+        afterTurnAppraisals.removeAll()
+        afterTurnAppraisalOrder.removeAll()
         appraisedCaringTurns.removeAll(keepingCapacity: false)
         appraisedCaringTurnOrder.removeAll(keepingCapacity: false)
         recentTurnsBySession.removeAll(keepingCapacity: false)
@@ -259,9 +292,6 @@ extension CognitiveSubstrate {
     /// (`appraisedCaringTurns`), so the two minters for one chat message cost one
     /// call, not two.
     public func noteCaringTurn(for event: CognitiveEvent) {
-        if let candidate = caringEventCandidate(for: event) {
-            startCaringAppraisal(candidate)
-        }
         // Record the turn AFTER building its request, so a turn is never part of
         // its own context.
         noteTurnForContext(event)
@@ -300,35 +330,81 @@ extension CognitiveSubstrate {
 
     /// Ask the model, once per turn, without blocking the turn, and hand the
     /// verdict to the body the moment it lands.
-    private func startCaringAppraisal(_ request: CaringAppraisalRequest) {
-        guard let appraiser = caringAppraiser else { return }
-        let scope = "\(request.session)|\(request.turn)"
-        guard !appraisedCaringTurns.contains(scope) else { return }
-        appraisedCaringTurns.insert(scope)
-        appraisedCaringTurnOrder.append(scope)
-        if appraisedCaringTurnOrder.count > OrganismCaringEvent.maximumRememberedKeys {
-            appraisedCaringTurns.remove(appraisedCaringTurnOrder.removeFirst())
+    public func afterTurnContext(origin: AfterTurnOrigin) -> AfterTurnContext? {
+        guard let deferred = deferredTurns.first(where: {
+            $0.context.event.sessionId == origin.sessionId
+                && $0.context.event.metadata["messageId"] == .string(origin.messageId)
+                && (origin.runId == nil || $0.context.event.metadata["runId"] == origin.runId.map(JSONValue.string))
+        }) else { return nil }
+        let context = deferred.context
+        guard let request = context.caring, request.relayed else { return context }
+        let current = CaringAppraisalRequest(userMessage: request.userMessage, at: request.at,
+            context: request.context, relayed: true,
+            recentEncounters: recentCaringEncounters.filter { $0.at <= request.at },
+            personName: request.personName, session: request.session, turn: request.turn)
+        return AfterTurnContext(event: context.event, caring: current, generation: context.generation)
+    }
+
+    public func finishAfterTurn(_ context: AfterTurnContext, appraisal: AffectAppraisal?,
+                                caring: CaringAppraisalVerdict?) async -> [String: JSONValue]? {
+        await waitForMaintenanceTransition()
+        guard context.generation == caringAppraisalGeneration,
+              let index = deferredTurns.firstIndex(where: {
+                  $0.context.event.subject == context.event.subject
+                      && $0.context.generation == context.generation
+              }) else { return nil }
+        let deferred = deferredTurns.remove(at: index)
+        guard configuration.enabled, configuration.affectEnabled, let appraisal else { return nil }
+        var weighted = appraisal
+        let weight = Self.relationalSource(for: context.event).appraisalWeight
+        weighted.valence *= weight
+        weighted.warmth *= weight
+        weighted.tension *= weight
+        weighted.pressure *= weight
+        weighted.arousal *= weight
+        weighted.warmthBoost *= weight
+        weighted.affectionWeight = weight
+        afterTurnAppraisals[context.event.subject.id] = appraisal
+        afterTurnAppraisalOrder.append(context.event.subject.id)
+        if afterTurnAppraisalOrder.count > 32 {
+            afterTurnAppraisals.removeValue(forKey: afterTurnAppraisalOrder.removeFirst())
         }
-        let generation = caringAppraisalGeneration
-        let task = Task { [weak self] in
-            let verdict = await appraiser.appraise(request)
-            // FAIL CLOSED: nil is a failed call, and a `.none` verdict is the
-            // common answer. Neither doses.
-            guard let verdict, let kind = verdict.kind else { return }
-            await self?.deliverCaringVerdict(
-                verdict, kind: kind, for: request, generation: generation
-            )
+        let now = dependencies.now()
+        let updated = applyAffectFromEvent(context.event, precomputedAppraisal: weighted,
+                                          precomputedWarmthBoost: weighted.warmthBoost)
+        if let outcome = deferred.outcome, field.node(forKey: outcome.key) != nil {
+            let semantic = semanticAppraisal(for: context.event, post: updated,
+                precomputedAppraisal: weighted, precomputedWarmthBoost: weighted.warmthBoost)
+            let tag = emotionTag(for: context.event, affect: updated, semantic: semantic,
+                                 precomputedAppraisal: weighted)
+            field.stampEmotionTag(key: outcome.key, tag: tag, isNewNode: true, configuration: configuration)
         }
-        caringAppraisalTasks.append(task)
-        // Drop handles that already finished as well as cancelled ones (review
-        // r2): one retained task per user turn for a whole day is a leak.
-        caringAppraisalTasks.removeAll { $0.isCancelled }
-        // Dropping a handle does not cancel the task; the handles are kept only
-        // so a clear can cancel what is still in flight, and nothing is in
-        // flight longer than the twenty-second deadline. A short bound is enough.
-        if caringAppraisalTasks.count > 16 {
-            caringAppraisalTasks.removeFirst(caringAppraisalTasks.count - 16)
+        let currentCompletion = pendingCompletion
+        pendingCompletion = deferred.completion
+        reconsolidatePendingCompletion(with: context.event, outcome: deferred.outcome,
+                                       now: context.event.occurredAt, precomputedAppraisal: weighted)
+        pendingCompletion = currentCompletion
+        let reaction = semanticExpectationMetadata(for: context.event)
+        if weighted.warmthBoost > 0 { lastWarmPresenceAt = context.event.occurredAt }
+        markDirty(at: now)
+        publishAttentionProjection(at: now)
+        if configuration.persistenceEnabled, !configuration.backgroundMicrocyclesEnabled {
+            await persistArtifact(kind: "affect", id: stableArtifactID("affect"), status: "current",
+                score: updated.arousal, payload: updated.toJSON(
+                    lastUserPresenceAt: lastUserPresenceAt, lastWarmPresenceAt: lastWarmPresenceAt))
+            try? await persistSnapshot()
         }
+        if let request = context.caring, let caring, let kind = caring.kind {
+            let scope = "\(request.session)|\(request.turn)"
+            guard !appraisedCaringTurns.contains(scope) else { return reaction }
+            appraisedCaringTurns.insert(scope)
+            appraisedCaringTurnOrder.append(scope)
+            if appraisedCaringTurnOrder.count > OrganismCaringEvent.maximumRememberedKeys {
+                appraisedCaringTurns.remove(appraisedCaringTurnOrder.removeFirst())
+            }
+            await deliverCaringVerdict(caring, kind: kind, for: request, generation: context.generation)
+        }
+        return reaction
     }
 
     /// Hand one verdict to the body, and decide which encounter window it is
@@ -471,15 +547,6 @@ extension CognitiveSubstrate {
             recentCaringEncounters.removeFirst(
                 recentCaringEncounters.count - Self.recentCaringEncounterCap
             )
-        }
-    }
-
-    /// Wait for every appraisal launched so far. For the DEBUG replay and for
-    /// tests; production never calls it.
-    public func awaitCaringAppraisals() async {
-        while let task = caringAppraisalTasks.first {
-            caringAppraisalTasks.removeFirst()
-            _ = await task.result
         }
     }
 

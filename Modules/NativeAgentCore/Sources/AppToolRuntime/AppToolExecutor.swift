@@ -7,6 +7,7 @@ import ChatOrchestration
 import Cognition
 import CognitiveSubstrate
 import MacIntegration
+import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -35,45 +36,46 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// Production uses the shared persisted authority; injected executors
     /// may carry a hermetic real store without replacing the gate itself.
     private let macIntegrationPermissionStore: MacIntegrationPermissionStore
-    private let doctorStatusProvider: @Sendable () async throws -> JSONValue
+    private let doctorStatusProvider: @Sendable (_ repair: Bool) async throws -> JSONValue
     private let telegramStatusProvider: @Sendable () async throws -> JSONValue
-    private let reflexReviewHandler: @Sendable (
-        String,
-        OrganismReflexReviewDecision,
-        String?,
-        String
-    ) async -> OrganismReflexReviewApplyOutcome
     private let humanConversationReplyHandler: @Sendable ([String: JSONValue]) async throws -> JSONValue
-
-    public static func defaultReflexReviewerIdentity(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> String {
-        PersonaCompiler.agentDisplayName(dataRoot: dataRoot)
-    }
+    /// Deny, or under Full Mac approve (true), a Desk task's waiting step:
+    /// execution id in, receipt out.
+    private let workshopStepDecider: @Sendable (String, Bool) async throws -> JSONValue
 
     public init(
         securityCenter: SwiftNativeSecurityCenter,
         enforceAutonomySecurity: Bool,
         browserActionRunner: @escaping @Sendable (String, Bool, [String: JSONValue]) async throws -> JSONValue,
         chrome: @escaping @Sendable () -> ChromeControlRuntime,
-        pageIDs: [String], drawOnlyPageIDs: [String],
         macPersonAway: @escaping @Sendable () -> Bool,
         motorActionObserver: @escaping @Sendable (MotorActionReadModel) async -> Void,
         mobileNotificationSender: @escaping @Sendable (String, String, [String: String]) async throws -> MobileNotificationDeliveryReceipt,
         macNotificationSender: @escaping @Sendable (String, String) async throws -> NativeAgentNotificationPostResult,
         macIntegrationPermissionStore: MacIntegrationPermissionStore,
-        doctorStatusProvider: @escaping @Sendable () async throws -> JSONValue,
+        doctorStatusProvider: @escaping @Sendable (_ repair: Bool) async throws -> JSONValue,
         telegramStatusProvider: @escaping @Sendable () async throws -> JSONValue,
-        reflexReviewHandler: @escaping @Sendable (String, OrganismReflexReviewDecision, String?, String) async -> OrganismReflexReviewApplyOutcome,
         humanConversationReplyHandler: @escaping @Sendable ([String: JSONValue]) async throws -> JSONValue,
+        workshopStepDecider: @escaping @Sendable (String, Bool) async throws -> JSONValue,
         quietHost: @escaping @MainActor @Sendable () -> (any QuietToolHost)?,
         presentation: any QuietToolPresentationPort,
         interactions: any ToolInteractionResolving
     ) {
+        AppActionPolicy.register(Dictionary(AppActions.all.map { ($0.id, $0.policy) },
+                                            uniquingKeysWith: { first, _ in first }))
+        // Register a closure, not a static table dependency: app's schema
+        // already reads AppActions during descriptor assembly below.
+        RunawayOutputDetector.registerAppReadOnlyCalls { input in
+            guard Self.doorText(input["script"]).isEmpty else { return false }
+            let action = Self.doorText(input["action"])
+            if !action.isEmpty { return AppActions.action(action)?.read == true }
+            guard !Self.opensHomeItem(input) else { return false }
+            return true // home, page/item reads, and find
+        }
         self.securityCenter = securityCenter
         self.enforceAutonomySecurity = enforceAutonomySecurity
         self.browserActionRunner = browserActionRunner
-        self.descriptors = AppToolExecutor.appToolSchemas(pageIDs: pageIDs, drawOnlyPageIDs: drawOnlyPageIDs).compactMap { schema in
+        self.descriptors = AppToolExecutor.appToolSchemas().compactMap { schema in
             AppToolExecutor.buckets[schema.name].map { ToolDescriptor(schema: schema, bucket: $0) }
         }.sorted { $0.name < $1.name }
 
@@ -85,8 +87,8 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         self.macIntegrationPermissionStore = macIntegrationPermissionStore
         self.doctorStatusProvider = doctorStatusProvider
         self.telegramStatusProvider = telegramStatusProvider
-        self.reflexReviewHandler = reflexReviewHandler
         self.humanConversationReplyHandler = humanConversationReplyHandler
+        self.workshopStepDecider = workshopStepDecider
         self.quietHost = quietHost
         self.presentation = presentation
         self.interactions = interactions
@@ -118,20 +120,12 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         "browser.chrome_scroll",
         "browser.chrome_release",
     ]
-    public static let healthToolNames = ["doctor_status", "telegram_status"]
-    public static let organismToolNames = ["reflex_review"]
-    /// Quiet self-administration (0.4.14). Lazy like every other app tool.
-    public static let selfAdminToolNames = [
-        "app_page_read", "app_page_screenshot", "app_settings_list",
-        "app_setting_set", "interaction_act", "chat_reply",
-    ]
-
     /// name → bucket, in family order. Every name is canonical
-    /// (ToolNameAliases) and model-visible.
+    /// (ToolNameAliases). The app itself is the one `app` door; the browser
+    /// tools and `chat_reply` are its actions (browser.*, chrome.*, chat.reply)
+    /// and stay here for internal callers and the membranes that name them.
     private static let buckets: [String: ChatToolCatalogBucket] = Dictionary(uniqueKeysWithValues:
-        browserToolNames.map { ($0, .browser) }
-        + healthToolNames.map { ($0, .system) } + organismToolNames.map { ($0, .core) }
-        + selfAdminToolNames.map { ($0, .core) })
+        browserToolNames.map { ($0, .browser) } + [("chat_reply", .core)] + doorToolNames.map { ($0, .alwaysOn) })
 
     /// Built once: the schemas are constant, and Core reads this on every call.
     /// Name order, as the app's own loader always listed them.
@@ -139,37 +133,8 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
 
     public var replacesCoreTools: Set<String> { Set(Self.notificationToolNames) }
 
-    /// Trust decides first, as the full catalog's available_now does: a
-    /// blocked app tool is neither ranked nor loaded by a search.
-    public func blockedHere(_ tool: String, surface: String) async -> Bool {
-        await securityCenter.evaluateTool(
-            tool: tool, input: [:],
-            origin: AppChatToolDispatcher.securityOrigin(input: [:], surface: surface),
-            enforceAutonomy: enforceAutonomySecurity
-        ).decision == .block
-    }
-
-    public var families: [ToolFamily] {
-        [
-            ToolFamily(group: "notifications",
-                       aliases: ["notification", "notify", "mobile", "ios", "iphone", "apns", "push", "push_notifications"],
-                       tools: Set(Self.notificationToolNames)),
-            ToolFamily(group: "browser", aliases: ["browsing", "visible_browser", "visible-browser", "web", "webpage", "page"],
-                       tools: Set(Self.browserToolNames)),
-            // Research is the browser plus web search (SearXNG), not Chrome alone.
-            ToolFamily(group: "research", aliases: ["web_search", "search", "news"],
-                       tools: Set(Self.browserToolNames).union(ToolPreloadHeuristics.webSearchTools)),
-            ToolFamily(group: "health", aliases: ["diagnostics", "system_health", "runtime_health"],
-                       tools: Set(Self.healthToolNames)),
-            ToolFamily(group: "organism", aliases: ["reflex", "reflexes", "reflex_review"],
-                       tools: Set(Self.organismToolNames)),
-            ToolFamily(group: "app", aliases: ["app_self", "self_admin", "own_app", "app_pages", "settings"],
-                       tools: Set(Self.selfAdminToolNames)),
-        ]
-    }
-
     public func execute(
-        tool: String, input: [String: JSONValue], surface: String, host: any ToolLoading
+        tool: String, input: [String: JSONValue], surface: String
     ) async throws -> JSONValue {
         switch tool {
         // B5 (tightness-sweep 2026-07-17) — SINGLE OWNER of notify on app
@@ -205,15 +170,11 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             }
             return try await runMacNotify(input: input, surface: surface)
         case _ where Self.browserToolNames.contains(tool):
-            return try await runBrowserTool(actionId: tool, input: input, surface: surface, host: host)
-        case "doctor_status", "telegram_status":
-            return try await runHealthStatusTool(tool: tool, surface: surface)
-        case "reflex_review":
-            return await runReflexReview(input: input, surface: surface)
+            return try await runBrowserTool(actionId: tool, input: input, surface: surface)
         case "chat_reply":
             return try await humanConversationReplyHandler(input)
-        case _ where Self.quietSelfAdminToolNames.contains(tool):
-            return await runQuietSelfAdminTool(tool: tool, input: input, surface: surface)
+        case "app":
+            return try await runAppDoor(input: input, surface: surface)
         default:
             return .object([
                 "status": .string("failed"), "reason": .string("not_in_dispatch_table"), "tool": .string(tool),
@@ -250,7 +211,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             "tool": .string("mac.notify"),
             "surface": .string(surface),
             "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(NativeAppSecretRedactor.redactText(String(message.prefix(200)))),
+            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
         ]) { _, new in new }
         return .object(obj)
     }
@@ -281,7 +242,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             "source": .string(source),
             "urgency": .string(urgency),
             "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(NativeAppSecretRedactor.redactText(String(message.prefix(200)))),
+            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
         ]) { _, new in new }
         return .object(obj)
     }
@@ -312,121 +273,172 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
 
     // MARK: - Health
 
-    private func runHealthStatusTool(tool: String, surface: String) async throws -> JSONValue {
-        let result = tool == "doctor_status" ? try await doctorStatusProvider() : try await telegramStatusProvider()
+    /// Doctor's checks or Telegram's status, read and changing nothing: the
+    /// `app` door's diagnostics/doctor and telegram/status item reads.
+    func healthRead(_ item: String) async throws -> JSONValue {
+        item == "doctor" ? try await doctorStatusProvider(false) : try await telegramStatusProvider()
+    }
+
+    private static func healthResult(_ result: JSONValue, surface: String) -> JSONValue {
         guard case .object(var object) = result else { return result }
-        object["tool"] = .string(tool)
         object["runtime"] = .string("swift-native")
         object["surface"] = .string(surface)
-        object["read_only"] = .bool(true)
+        object["read_only"] = .bool(false)
         return .object(object)
     }
 
-    // MARK: - Organism
+    // MARK: - Actions
 
-    private func runReflexReview(input: [String: JSONValue], surface: String) async -> JSONValue {
-        let input = input.filter { $0.value != .null && $0.value != .string("") }
-        let candidateID = Self.inputString(input["candidate_id"] ?? input["candidateId"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !candidateID.isEmpty else {
-            return Self.reflexReviewError(
-                status: "invalid_input",
-                candidateID: nil,
-                decision: nil,
-                message: "reflex_review requires candidate_id"
-            )
+    /// One `app` action, in process. `input` is the entry's verb and the
+    /// arguments under the names the host's call takes; `action.tool` names
+    /// the code it runs (and the Trust key a saved level binds by). Safe
+    /// refuses it unless the entry runs in Safe; the host's own call does the rest.
+    @MainActor
+    func runFolded(_ action: AppAction, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        // A folded tool runs as itself: the chain is re-entered under its own
+        // name, so its gates, Trust key and cards judge it, and what comes
+        // back is its own result. A card it files replays that call, not this one.
+        if action.isFold {
+            guard let perform = AppDoorReentry.perform else {
+                return Self.doorRefusal("door_unavailable",
+                    "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
+                    remedy: "none", "Use app from a chat turn.")
+            }
+            let call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
+                                                      sessionId: Self.inputString(input["__session_id"]))
+            do { return try await perform(action.tool, call) }
+            catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
         }
-        let rawDecision = Self.inputString(input["decision"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() ?? ""
-        guard let decision = OrganismReflexReviewDecision(rawValue: rawDecision),
-              decision == .approve || decision == .hold || decision == .reject
-        else {
-            return Self.reflexReviewError(
-                status: "invalid_input",
-                candidateID: candidateID,
-                decision: rawDecision.isEmpty ? nil : rawDecision,
-                message: "decision must be approve, hold, or reject"
-            )
+        // A setting and a card hold the posture gate themselves, and say it in
+        // their own words (a setting's requested and current values; a card's
+        // origin and Full Mac checks).
+        if action.tool == "app_setting_set" { return await runAppSettingSet(input: input, surface: surface) }
+        if action.isCard { return await runCardAction(input: input, surface: surface) }
+        if !action.safe, let refusal = await Self.quietChangesRefusal() { return refusal }
+        let verb = Self.inputString(action.input["verb"]) ?? ""
+        switch action.tool {
+        case "app_page_screenshot":
+            return await presentation.pageScreenshot(input: input)
+        case "doctor_status":
+            return Self.healthResult(try await doctorStatusProvider(true), surface: surface)
+        case "my_queue":
+            return await runMyQueue(verb: verb, input: input, surface: surface)
+        case "workshop_reject":
+            let id = Self.inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !id.isEmpty else {
+                return .object(["status": .string("failed"), "reason": .string("invalid_input"),
+                    "detail": .string("Pass id: the execution id of a Desk task whose status is blocked_on_approval in app workshop.status.")])
+            }
+            // desk.approve: User's, so only Full Mac reaches it (the door).
+            let approve = input["decision"] == .string("approve")
+            let result: JSONValue
+            do { result = try await workshopStepDecider(id, approve) }
+            catch {
+                return .object(["status": .string("failed"), "reason": .string("workshop_\(approve ? "approve" : "reject")_failed"),
+                    "id": .string(id), "detail": .string(error.localizedDescription + " Nothing was \(approve ? "approved" : "denied"); "
+                        + "app workshop.status shows the task's current state.")])
+            }
+            if approve, case .object(let fields) = result, fields["status"] == .string("approved") {
+                HarnessDecidedRow.post(requester: "Full Mac", tool: "desk.approve \(id)",
+                                       sessionID: Self.inputString(input["__session_id"]),
+                                       dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            }
+            return result
+        case "list_memories", "rewrite_memory":
+            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let curation = MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
+            return action.tool == "list_memories"
+                ? try await curation.listMemories(input: input, surface: surface,
+                    persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID))
+                : try await curation.rewriteMemory(input: input, surface: surface,
+                    persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID))
+        default:
+            break
         }
-        let note = Self.inputString(input["note"])
-        let outcome = await reflexReviewHandler(candidateID, decision, note, surface)
-        guard outcome.applied,
-              let receipt = outcome.receipt,
-              let candidate = outcome.candidate
-        else {
-            return Self.reflexReviewError(
-                status: outcome.status.rawValue,
-                candidateID: candidateID,
-                decision: decision.rawValue,
-                message: outcome.error ?? "The reflex review was not applied."
-            )
+        guard let host = quietHost() else { return Self.unattachedFailure() }
+        switch action.tool {
+        case "inbox":
+            return await host.inbox(verb: verb, input: input)
+        case "provider", "connections":
+            let answer = action.tool == "provider"
+                ? await host.provider(verb: verb, input: input) : await host.connections(verb: verb, input: input)
+            guard case .object(var body) = answer else {
+                return Self.failure("\(action.tool)_failed", "The app gave no answer for that verb.")
+            }
+            body["verb"] = .string(verb)
+            if action.tool == "connections" { body["decided_by"] = .string("agent") }
+            return .object(body)
+        case "upkeep", "mind_run", "skill_manage":
+            let outcome = switch action.tool {
+            case "upkeep": await host.runUpkeep(verb: verb, input: input)
+            case "mind_run": await host.runMind(verb: verb, input: input)
+            default:
+                await host.manageSkill(verb: verb, input: input, steer: Self.skillSteer(surface: surface))
+            }
+            var body = outcome.fields
+            body["status"] = .string(outcome.ok ? "ok" : "failed")
+            body["verb"] = .string(verb)
+            body["detail"] = .string(outcome.detail)
+            return .object(body)
+        case "chat_session":
+            return await runChatSessionAction(verb: verb, input: input, surface: surface, host: host)
+        case "chat_conversations":
+            // A read: the sidebar's rows, as chat.list and the chat page show them.
+            return await host.runChatSession(verb: "list", input: input, reachesUser: false)
+        case "interaction_act" where action.input["target"] == .string("composer"):
+            return await runComposerAction(verb: verb, input: input, surface: surface, host: host)
+        default:
+            return Self.failure("not_folded", "\(action.id) is not run in process.", extra: ["tool": .string(action.tool)])
         }
-        return .object([
-            "status": .string("reviewed"),
-            "applied": .bool(true),
-            "runtime": .string("swift-native"),
-            "candidate_id": .string(candidate.id),
-            "decision": .string(decision.rawValue),
-            "candidate": Self.reflexCandidateJSON(candidate),
-            "receipt": Self.reflexReviewReceiptJSON(receipt),
-        ])
     }
 
-    private static func reflexReviewError(
-        status: String,
-        candidateID: String?,
-        decision: String?,
-        message: String
-    ) -> JSONValue {
-        .object([
-            "status": .string("error"),
-            "applied": .bool(false),
-            "runtime": .string("swift-native"),
-            "error": .string(status),
-            "candidate_id": candidateID.map { .string($0) } ?? .null,
-            "decision": decision.map { .string($0) } ?? .null,
-            "message": .string(message),
-        ])
+    /// The peers steering this turn, as `skill_manage` weighs them.
+    static func skillSteer(surface: String) -> [String] {
+        let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                                          peerID: ChatToolSessionContext.envelope?.verifiedUserId)
+        return steer.sources + steer.elevated
     }
 
-    private static func reflexCandidateJSON(_ candidate: OrganismReflexCandidate) -> JSONValue {
-        let iso = ISO8601DateFormatter()
-        return .object([
-            "id": .string(candidate.id),
-            "pattern": .string(candidate.pattern),
-            "trust_class": .string(candidate.trustClass.rawValue),
-            "evidence_count": .int(Int64(candidate.evidenceCount)),
-            "success_count": .int(Int64(candidate.successCount)),
-            "failure_count": .int(Int64(candidate.failureCount)),
-            "confidence": .double(candidate.confidence),
-            "review_required": .bool(candidate.reviewRequired),
-            "auto_activation_allowed": .bool(candidate.autoActivationAllowed),
-            "permanently_deliberate": .bool(candidate.isPermanentlyDeliberate),
-            "approved_at": candidate.approvedAt.map { .string(iso.string(from: $0)) } ?? .null,
-            "rejected_at": candidate.rejectedAt.map { .string(iso.string(from: $0)) } ?? .null,
-        ])
-    }
-
-    private static func reflexReviewReceiptJSON(_ receipt: OrganismReflexReviewReceipt) -> JSONValue {
-        let iso = ISO8601DateFormatter()
-        return .object([
-            "id": .string(receipt.id),
-            "candidate_id": .string(receipt.candidateID),
-            "pattern": .string(receipt.pattern),
-            "trust_class": .string(receipt.trustClass.rawValue),
-            "decision": .string(receipt.decision.rawValue),
-            "reviewed_at": .string(iso.string(from: receipt.reviewedAt)),
-            "reviewed_by": .string(receipt.reviewedBy),
-            "source": .string(receipt.source),
-            "note": receipt.note.map { .string($0) } ?? .null,
-            "evidence_count": .int(Int64(receipt.evidenceCount)),
-            "success_count": .int(Int64(receipt.successCount)),
-            "failure_count": .int(Int64(receipt.failureCount)),
-            "confidence": .double(receipt.confidence),
-            "auto_activation_allowed": .bool(receipt.autoActivationAllowed),
-            "permanently_deliberate": .bool(receipt.permanentlyDeliberate),
-        ])
+    /// What would refuse an action now, asked without running it, for
+    /// the door's preview: the checks its real run makes first, through the
+    /// same functions (a card's `cardRefusal`, a setting's `settingRefusal`,
+    /// Safe, the composer's `composerRefusal`, the app's inbox and chat
+    /// fences). Nil when nothing would.
+    @MainActor
+    func foldedRefusal(_ action: AppAction, input: [String: JSONValue], surface: String) async -> JSONValue? {
+        // A folded tool's checks are its own call's, made when it runs.
+        if action.isFold { return nil }
+        if action.isCard { return await cardRefusal(input: input, surface: surface) }
+        if action.tool == "app_setting_set" { return await settingRefusal(input: input) }
+        if !action.safe, let refusal = await Self.quietChangesRefusal() { return refusal }
+        // Turning a skill or tool on, back or back a version: whose it is turns
+        // on the script's origin, the steer and Trust. The real call's own
+        // checks, run as a preview, say whose it is and what it would leave
+        // (status `would`, for the door to say).
+        if ["skill.enable", "skill.restore", "skill.rollback", "tool.restore", "tool.rollback"].contains(action.id) {
+            guard let host = quietHost() else { return Self.unattachedFailure() }
+            let asked = await host.manageSkill(verb: Self.inputString(action.input["verb"]) ?? "",
+                                               input: input.merging(["preview": .bool(true)]) { $1 },
+                                               steer: Self.skillSteer(surface: surface))
+            let would = asked.fields.filter { $0.key.hasPrefix("would_") || $0.key == "versions" }
+            guard !asked.ok else {
+                return .object(would.merging(["status": .string("would"), "detail": .string(asked.detail)]) { $1 })
+            }
+            return Self.failure(Self.inputString(asked.fields["reason"]) ?? "refused", asked.detail,
+                                extra: would.merging(["would_card": .bool(asked.fields["needs_user"] == .bool(true))]) { $1 })
+        }
+        guard ["inbox", "chat_session", "interaction_act"].contains(action.tool) else { return nil }
+        guard let host = quietHost() else { return Self.unattachedFailure() }
+        let verb = Self.inputString(action.input["verb"]) ?? ""
+        switch action.tool {
+        case "inbox": return await host.inboxFence(verb: verb, input: input)
+        case "chat_session":
+            let root = host.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let fullMac = await Self.freshQuietPosture(dataRoot: root)?.name == Self.fullMacModeName
+            let reachesUser = await Self.reachesUser(surface: surface, fullMac: fullMac, dataRoot: root)
+            return host.chatSessionFence(verb: verb, input: input, reachesUser: reachesUser)
+        default: return await composerRefusal(verb: verb, input: input, surface: surface, host: host)
+        }
     }
 
     public static func inputString(_ raw: JSONValue?) -> String? {

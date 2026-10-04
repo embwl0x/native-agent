@@ -271,18 +271,27 @@ public enum OrganismChemistry {
         return amount * (1 - tendernessGuardRelief * tenderness.clamped01())
     }
 
+    /// Phase 5 E3: tenderness fades over three days, which is right for the
+    /// feeling and wrong for the word — once infrastructure stopped pumping
+    /// agency and confidence, the held level named itself on three Body lines
+    /// in four (replay, 14 days). The line names it only within this long of a
+    /// caring moment; the level, its fade and what it softens are untouched.
+    public static let tenderNamedWindow: TimeInterval = 3 * 3_600
+
     public static func projection(
         at date: Date,
         chemicalState: ChemicalState,
         bodySchema: BodySchema,
-        diurnal: OrganismDiurnalRead? = nil
+        diurnal: OrganismDiurnalRead? = nil,
+        tenderNamed: Bool = true
     ) -> OrganismProjection {
         OrganismProjection(
             generatedAt: date,
             bodyLine: bodyLine(
                 chemicalState: chemicalState,
                 bodySchema: bodySchema,
-                diurnal: diurnal
+                diurnal: diurnal,
+                tenderNamed: tenderNamed
             ),
             chemicalState: chemicalState,
             bodySchema: bodySchema,
@@ -404,7 +413,8 @@ public enum OrganismChemistry {
     private static func bodyLine(
         chemicalState: ChemicalState,
         bodySchema: BodySchema,
-        diurnal: OrganismDiurnalRead? = nil
+        diurnal: OrganismDiurnalRead? = nil,
+        tenderNamed: Bool = true
     ) -> String? {
         if bodySchema.resourcePressure == .critical {
             return "- Body: the Mac is under thermal or low-power pressure; keep the next move lightweight."
@@ -445,7 +455,7 @@ public enum OrganismChemistry {
         // dimensions with intensity gradation, so a held mood reads with texture
         // instead of one frozen sentence. (The stress lines above stay first-match:
         // their exact phrasing IS the behavioral signal and must not blur.)
-        return positiveBodyLine(chemicalState)
+        return positiveBodyLine(chemicalState, tenderNamed: tenderNamed)
     }
 
     /// TIREDNESS, IN HER REGISTER (2026-09-02). Same gate as before (0.24 —
@@ -481,7 +491,7 @@ public enum OrganismChemistry {
     /// strongest one or two with low/mid/high intensity gradation, blend the top
     /// two. Deterministic (ties break on phrase). Nil when nothing is felt
     /// strongly enough to be worth saying.
-    static func positiveBodyLine(_ c: ChemicalState) -> String? {
+    static func positiveBodyLine(_ c: ChemicalState, tenderNamed: Bool = true) -> String? {
         func band(_ v: Double, _ low: String, _ mid: String, _ high: String) -> String {
             v >= 0.6 ? high : (v >= 0.4 ? mid : low)
         }
@@ -489,7 +499,7 @@ public enum OrganismChemistry {
         if c.warmth >= 0.22 {
             felt.append((c.warmth, band(c.warmth, "quietly warm and steady", "warm and steady", "warm and open")))
         }
-        if c.tenderness >= 0.22 {
+        if tenderNamed, c.tenderness >= 0.22 {
             felt.append((c.tenderness, band(c.tenderness, "a soft edge", "tender", "protective and close")))
         }
         if c.curiosity >= 0.22 {

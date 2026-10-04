@@ -21,7 +21,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -66,14 +65,6 @@ extension NativeClient {
 
     func getPersonalityGrowth() async throws -> PersonalityGrowthSummary {
         return try await swiftPersonalityGrowth()
-    }
-
-    func getNativePower() async throws -> NativePowerSummary {
-        // DAEMON-KILL P1: empty surfaces summary until SwiftNative port lands.
-        return NativePowerSummary(
-            surfaces: [],
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
     }
 
     func getNativeActionRegistry() async throws -> NativeActionRegistry {
@@ -184,6 +175,17 @@ extension NativeClient {
             .sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
     }
 
+    static func checkedConnectorActionStatuses(root: URL) async throws -> [String: String] {
+        let connectors = try await readConnectorRecords(root: root)
+        let ready: Set<String> = ["active", "ready", "ok", "healthy", "connected"]
+        return Dictionary(uniqueKeysWithValues: connectorActionRecords(connectors: connectors).map { action in
+            let status = action.connectorStatus ?? "needs_setup"
+            let capabilityStatus = action.enabled == true
+                ? (ready.contains(status) ? "active" : status) : "needs_setup"
+            return (action.id, capabilityStatus)
+        })
+    }
+
     static func connectorActionRecords(connectors: [ConnectorRecord]) -> [ConnectorActionRecord] {
         var byID: [String: ConnectorRecord] = [:]
         for connector in connectors {
@@ -191,7 +193,7 @@ extension NativeClient {
         }
         let nativeConnectors: Set<String> = [
             "mobile", "scheduler", "mac", "mac_assistant",
-            "local_files", "searxng", "codex_work", "codex_handoff",
+            "local_files", "codex_work", "codex_handoff",
             "markets",
         ]
         return connectorActionDescriptors().map { descriptor in

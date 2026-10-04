@@ -241,7 +241,7 @@ extension AppToolExecutor {
             .int(Int64(max(0, now.timeIntervalSince($0.1))))
         } ?? .null
         object["last_error"] = status.lastError.map {
-            .string(NativeAppSecretRedactor.redactText(String($0.prefix(600))))
+            .string(String(NativeAppSecretRedactor.redactText($0).prefix(600)))
         } ?? .null
         if let voice = status.voiceTranscription {
             object["voice_transcription"] = .object([

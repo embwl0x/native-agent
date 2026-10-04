@@ -51,11 +51,6 @@ extension NativeOAuthFlow {
         let normalized = normalizedOAuthProviderId(providerId)
         switch providerId {
         case "openai_oauth_direct":
-            let sharedCodexAuth = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".codex", isDirectory: true)
-                .appendingPathComponent("auth.json")
-                .standardizedFileURL
-                .path
             // User, 2026-09-06: honour the root the caller passed. This walked
             // the DEFAULT root's candidates, so a sign-out against an override
             // root (an alternate install, a test root) deleted the wrong
@@ -74,7 +69,7 @@ extension NativeOAuthFlow {
                 dataRoot: root,
                 allowSharedFallbacks: false
             ) {
-                guard path.standardizedFileURL.path != sharedCodexAuth else { continue }
+                guard !OpenAIOAuthDirectAdapter.isUserCodexPath(path) else { continue }
                 if !removeCredentialFile(at: path) { removed = false }
             }
             // Sign-out must also revoke CLI-session adoption: the shared
@@ -139,6 +134,17 @@ extension NativeOAuthFlow {
         }
     }
 
+    private static func canRefresh(providerId: String, dataRoot: URL?) -> Bool {
+        let provider = normalizedOAuthProviderId(providerId)
+        guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot),
+              provider != "openai_oauth_direct" || !OpenAIOAuthDirectAdapter.isUserCodexPath(path),
+              let data = try? Data(contentsOf: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet(object, provider: provider)["refresh_token"]) != nil
+        else { return false }
+        return OAuthRefreshBinding.permitsRefresh(object, provider: provider)
+    }
+
     /// Read the persisted `expires_at` for a provider, or nil if not
     /// signed in / no expiry persisted.
     public static func expiresAt(providerId: String, dataRoot: URL? = nil) -> Date? {
@@ -192,8 +198,12 @@ extension NativeOAuthFlow {
         guard let exp = expiresAt(providerId: providerId, dataRoot: dataRoot) else { return "Signed in" }
         let now = Date()
         let remaining = exp.timeIntervalSince(now)
+        let isCLI = normalizedOAuthProviderId(providerId) == "openai_oauth_direct"
+            && statusCredentialPath(providerId: providerId, dataRoot: dataRoot)
+                .map { OpenAIOAuthDirectAdapter.isUserCodexPath($0) } == true
         if remaining <= 0 {
-            guard hasRefreshToken(providerId: providerId, dataRoot: dataRoot) else {
+            if isCLI { return "Expired — renew your Codex CLI sign-in" }
+            guard canRefresh(providerId: providerId, dataRoot: dataRoot) else {
                 return "Expired — sign in again"
             }
             return "Expired — refresh on next chat"
@@ -213,7 +223,8 @@ extension NativeOAuthFlow {
             // User, 2026-09-06: a credential minutes from expiry with no refresh
             // token cannot refresh on the next chat any more than an already
             // expired one can — the same check the expired arm makes.
-            guard hasRefreshToken(providerId: providerId, dataRoot: dataRoot) else {
+            if isCLI { return "Signed in (expires in \(label) — renew your Codex CLI sign-in)" }
+            guard canRefresh(providerId: providerId, dataRoot: dataRoot) else {
                 return "Signed in (expires in \(label) — sign in again)"
             }
             return "Signed in (refresh on next chat)"

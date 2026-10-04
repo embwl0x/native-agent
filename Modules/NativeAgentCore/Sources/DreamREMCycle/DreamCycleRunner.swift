@@ -100,7 +100,7 @@ public actor DreamCycleRunner {
     ///
     /// `trigger` records WHO woke this pass and picks the target day. The
     /// scheduled 03:30 run writes the Central day that just ended (unchanged).
-    /// A pressure-fired run happens mid-life, so it writes the day it is
+    /// A manual run happens mid-life, so it writes the day it is
     /// dreaming ABOUT — the current Central day — which is exactly the entry the
     /// NEXT 03:30 job would have written. That single file is the dedupe: the
     /// scheduled tick then finds it and skips honestly (`already_dreamt`), and
@@ -135,7 +135,7 @@ public actor DreamCycleRunner {
 
         // ONE dream run at a time (2026-09-06). The existence check above is
         // taken before the providers and the model are awaited — minutes before
-        // the commit below — so two runs (the 03:30 job and a pressure-fired
+        // the commit below — so two runs (the 03:30 job and a manual
         // one, or two clients) both passed it, both wrote the diary, and the
         // later one replaced the earlier entry while the mood claim at commit
         // had already integrated the EARLIER dream's tone: the diary then
@@ -206,7 +206,9 @@ public actor DreamCycleRunner {
         }
 
         // Resolve the full Agent persona + memory-delta channel ONCE per run.
-        let personaDocs = readFullPersonaDocs()
+        let personaDocs = try await readDreamPersonaDocs(
+            dataRoot: dataRoot, personaRoot: personaRoot, surface: "dream"
+        )
         let memoryDeltas: [String]
         do {
             memoryDeltas = try await memoryDeltaProvider()
@@ -457,7 +459,7 @@ public actor DreamCycleRunner {
     /// Forward-only for the MARK: never regress it, so a re-run/force can't let
     /// already-dreamed material back into a future window. The trigger receipt
     /// beside it is not a mark — it records which lane actually wrote the entry
-    /// this call committed (`schedule` vs `pressure`), so a dream's provenance
+    /// this call committed (`schedule` vs `manual`), so a dream's provenance
     /// is evidence rather than an inference from its timestamp. It lives here,
     /// in the runner's own sidecar, and never in the diary body: nothing about
     /// the mechanism enters her prompt (NORTHSTAR clause 6).
@@ -558,23 +560,6 @@ public actor DreamCycleRunner {
         recent stretch was user-heavy, the Self half is what keeps this from \
         echoing him.
         """
-    }
-
-    /// Load the full Agent persona (SOUL/VOICE/GROWTH/USER/AGENTS)
-    /// untruncated for the bypass system prompt. Missing files → empty
-    /// bodies (the model still gets the section heading so the prompt
-    /// shape stays constant). GROWTH.md gets the same episodic-line strip
-    /// PersonaEngine applies for chat retrieval, so any stale `- <ts> ·
-    /// feedback · ...` line can't leak into the dream context either.
-    private func readFullPersonaDocs() -> [String: String] {
-        let ids = ["SOUL.md", "VOICE.md", "GROWTH.md", "USER.md", "AGENTS.md"]
-        var out: [String: String] = [:]
-        for name in ids {
-            let url = personaRoot.appendingPathComponent(name)
-            let raw = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-            out[name] = (name == "GROWTH.md") ? stripEpisodicGrowthLines(raw) : raw
-        }
-        return out
     }
 
     // Full-Agent-persona-bypass: the dream pass runs OUTSIDE the live
@@ -719,7 +704,7 @@ public actor DreamCycleRunner {
     }
 
     /// The scheduled 03:30 run writes the Central day that just ended. A
-    /// pressure-fired or manually requested run happens mid-life and writes the
+    /// manually requested run happens mid-life and writes the
     /// day it is dreaming about — the current local (Central) calendar day, i.e.
     /// the entry the NEXT 03:30 job would have written. That collision is
     /// deliberate: it is the dedupe.
@@ -732,16 +717,12 @@ public actor DreamCycleRunner {
         switch trigger {
         case .schedule:
             return DreamREMSchedule.dreamEntryDateKey(now: now())
-        case .pressure, .manual:
+        case .manual:
             return DreamREMSchedule.todayKey(
                 now: now(),
                 calendar: DreamREMSchedule.localCalendar()
             )
         }
-    }
-
-    fileprivate func stripEpisodicGrowthLines(_ body: String) -> String {
-        DreamREMGrowthHygiene.stripEpisodicLines(body)
     }
 }
 

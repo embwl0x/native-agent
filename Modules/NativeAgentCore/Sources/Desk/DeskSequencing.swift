@@ -109,7 +109,7 @@ public enum DeskSequencing {
     /// Parse a defer stamp: a bare `yyyy-MM-dd` UTC day (which means the END of
     /// that day — an item parked "until 2026-08-05" is still parked during the
     /// 5th) or a full ISO timestamp.
-    static func parseDeferStamp(_ raw: String) -> Date? {
+    public static func parseDeferStamp(_ raw: String) -> Date? {
         let day = DateFormatter()
         day.locale = Locale(identifier: "en_US_POSIX")
         day.timeZone = TimeZone(identifier: "UTC")
@@ -156,8 +156,8 @@ public enum DeskSequencing {
             childrenOf[parent, default: []].append(item.handle)
         }
 
-        // An item is not actionable while an ANCESTOR is deferred or effectively
-        // blocked — you can't start a child of a parked or blocked parent.
+        // An item is not actionable while an ANCESTOR is deferred, effectively
+        // blocked, or waiting on owner input.
         // Cycle-safe: parent chains can loop in a hand-authored feed.
         func ancestorObstructs(_ handle: String) -> Bool {
             var seen: Set<String> = [handle]
@@ -166,6 +166,7 @@ public enum DeskSequencing {
             while let cur = current, depth < deskMaxGraphDepth, seen.insert(cur).inserted {
                 depth += 1
                 guard let ancestor = byHandle[cur] else { return false }
+                if ancestor.requiresOwnerInput { return true }
                 if deferred[cur] == true { return true }
                 if !(effectiveBlockers[cur] ?? []).isEmpty { return true }
                 if onCycle.contains(cur) { return true }
@@ -182,6 +183,7 @@ public enum DeskSequencing {
             let cyc = onCycle.contains(item.handle)
             let rollup = subtreeRollup(item.handle, childrenOf: childrenOf, byHandle: byHandle)
             let ready = !item.status.isTerminal
+                && !item.requiresOwnerInput
                 && blockers.isEmpty
                 && !isDef
                 && !cyc

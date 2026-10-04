@@ -136,15 +136,16 @@ public enum ProviderSurfaceGroups {
 /// User, 2026-09-13: "Bots has no default model; Agent is supposed to pick the
 /// model when she makes one." A bot carries its own tuple, so nothing downstream
 /// re-resolves it; that makes it the one place a nonsense tuple could reach a
-/// provider, and this is the check that stops it. No provider branches: the
-/// route's catalog is the authority, and a route whose catalog is fetched rather
-/// than shipped is trusted with any id.
+/// provider, and this is the check that stops it. The route's supplied catalog
+/// takes precedence over shipped rows; routes without either accept any id.
 public enum ProviderModelChoice {
     /// nil when the tuple is usable, else a sentence naming what is wrong.
     public static func rejection(
         provider: String?,
         model: String?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        accountModels: [CodexAccountModelCatalog.Model]? = nil,
+        moonshotModels: [ProviderModelDescriptor]? = nil
     ) -> String? {
         let route = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let id = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -155,10 +156,15 @@ public enum ProviderModelChoice {
         guard REASONING_EFFORT_OPTIONS.contains(effort) else {
             return "\(effort) is not a Think level."
         }
-        guard FirstPartyModelCatalog.routeCarries(id, providerID: route) else {
+        let moonshot = ProviderFamilyIdentity.normalize(route) == "moonshot" ? moonshotModels : nil
+        guard moonshot.map({ $0.contains { $0.id.lowercased() == id.lowercased() } })
+            ?? accountModels.map({ $0.contains { $0.id.lowercased() == id.lowercased() } })
+            ?? FirstPartyModelCatalog.routeCarries(id, providerID: route) else {
             return "\(route) does not serve \(id). Pick a model that account offers."
         }
-        if let supported = FirstPartyModelCatalog.routeSupportedEfforts(id, providerID: route),
+        if let supported = moonshot.map({ _ in MoonshotModelCatalog.supportedReasoningEfforts(for: id) })
+            ?? accountModels?.first(where: { $0.id.lowercased() == id.lowercased() })?.supportedReasoningEfforts
+            ?? FirstPartyModelCatalog.routeSupportedEfforts(id, providerID: route),
            !supported.isEmpty,
            !supported.contains(effort) {
             return "\(id) does not support Think \(effort); it supports "
@@ -393,12 +399,12 @@ public enum ProviderRoutingError: Error, LocalizedError {
     }
 }
 
-// MARK: - SurfacePreference (Phase B picker output)
+// MARK: - Resolved surface preferences
 
-/// One per-surface picker entry. Mirrors Python's
-/// `model_preferences()[surface]` dict: {surface, model, reasoningEffort,
-/// modelKnown?}. `modelKnown` is left nil here because computing it requires
-/// the compact model catalog — which is still a daemon-side responsibility.
+/// One surface's resolved preference from the in-process ProviderRouting owner.
+/// Chat members share Chat's tuple; Work and Memory and mind share their
+/// unanimous group override, or inherit Chat. ProviderRouting owns the catalog
+/// too; `modelKnown` is optional catalog metadata, not a routing choice.
 public struct SurfacePreference: Sendable, Codable, Equatable {
     public var surface: String
     public var model: String
@@ -419,6 +425,25 @@ public struct SurfacePreference: Sendable, Codable, Equatable {
         self.serviceTier = serviceTier
         self.modelKnown = modelKnown
     }
+}
+
+/// The committed group and its canonical readback.
+public struct ProviderGroupWriteResult: Sendable {
+    public let surfacesChanged: [String]
+    public let snapshot: ProviderRoutingSnapshot
+}
+
+public struct ProviderGroupWriteFailure: LocalizedError, Sendable {
+    public let detail: String
+    public let surfacesRolledBack: [String]
+    public let surfacesPendingRecovery: [String]
+    public var errorDescription: String? { detail }
+}
+
+public struct ProviderCatalogSnapshot: Sendable {
+    public let routing: ProviderRoutingSnapshot
+    public let providers: [Provider]
+    public let rowSet: ProviderSurfaceRowSet
 }
 
 /// One reconciled, internally consistent view of the two authoritative picker
@@ -461,47 +486,15 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
     }
 }
 
-// MARK: - Phase B constants (mirror daemon)
+// MARK: - Routing vocabulary
 
-/// MUST stay in sync with the retired daemon (`MODEL_SURFACES`).
-/// `rem` was added 2026-06-05 alongside the dream/REM design restore so the
-/// per-surface picker can pin the weekly REM consolidation to a specific
-/// model independently of nightly dream. Both surfaces fall back to `chat`
-/// when unpinned (see DreamCycleRunner + REMConsolidator) so the design
-/// "she speaks in her current voice" intent holds by default.
-/// `memory` was added 2026-06-10 (U3 wave-2 follow-up, the user's directive:
-/// "everything that makes an LLM call should have a model picker") for the
-/// memory-machinery LLM calls — the kind-backfill classifier today, future
-/// hygiene/merge judgments. Unpinned it follows `chat` (pin-only lookup,
-/// same consumer-side pattern as dream/rem) so it always runs on whatever
-/// model Agent is currently on unless the user pins something cheaper.
-/// `heartbeat` + `diagnostics` were added 2026-06-11 (U2b wave 3, the user's HARD
-/// RULE: every LLM call site resolves via the picker, never a hardcoded
-/// model). `heartbeat` is the cheap interval health turn (HeartbeatLoop);
-/// `diagnostics` is the self-healing root-cause pass (SelfHealingHook). Both
-/// follow the `memory` precedent — unpinned they seed to chat's pick (so they
-/// run on Agent's current model), and the user can pin either to a cheaper model.
-/// `slack` was added 2026-06-17 after Slack became a real inbound chat
-/// surface. It follows chat/Telegram by default but must be independently
-/// selectable so the user can pin Anthropic/OpenAI/etc. from Providers like every
-/// other chat surface.
-/// `compaction` was added 2026-07-01 (R4 LLM-distilled chat autocompaction).
-/// It resolves the model for the background pass that re-writes the mechanical
-/// compaction summary into a richer recollection. Unpinned it follows the chat
-/// model (same seed-to-chat rule as `memory`/`ios`) so the summary is written in
-/// the assistant's current voice; the user can pin a cheaper model from Providers.
-/// `missions` was renamed to `workshop` on 2026-08-05 (P2-3). It is NOT listed
-/// here anymore — instead every surface entering this module is folded through
-/// `canonicalRoutingSurface`, and `providers/surfaces.json` / `active.json` keys
-/// are folded at their single read seam (`reconciledPickerState`). A 0.3.x
-/// install whose picker files still say `missions` therefore keeps its pin.
-/// `self_improvement` was added 2026-08-21: WeeklySelfImprovementLoop already
-/// called with that surface, but absent from this registry it silently fell
-/// through to the chat pin — unpinnable and invisible in Providers.
-/// `studio_wander` was added 2026-09-02 (personality depth item 9, "her hour"):
-/// the once-a-day wandering lane makes its own call, and whose model she thinks
-/// with when nobody is watching is a real choice — so it gets its own pickable
-/// row beside `dream` rather than inheriting chat's.
+/// Every in-process LLM consumer routes through one of these surfaces.
+/// `ProviderSurfaceGroups` assigns each to Chat, Work, or Memory and mind.
+/// Members share their group's model, account, effort and service tier; Work
+/// and Memory and mind inherit Chat until a unanimous override is saved.
+/// A provider-only override uses that account's default and requires a model
+/// selection when no usable default exists. Legacy `missions` keys fold to
+/// `workshop` at the checked read and write boundaries.
 public let MODEL_SURFACES: [String] = [
     "chat", "ios", "telegram", "slack", "desk", "workshop", "autonomy", "swarms", "dream", "rem", "training",
     "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction", "self_improvement",
@@ -551,18 +544,17 @@ public func canonicalRoutingSurface(_ surface: String) -> String {
     WorkshopSurfaceVocabulary.canonicalSurface(surface)
 }
 
-/// MUST stay in sync with the retired daemon (`REASONING_EFFORT_OPTIONS`).
+/// Reasoning controls normalized by the in-process routing owner.
 public let REASONING_EFFORT_OPTIONS: [String] = ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
 
 public let SERVICE_TIER_OPTIONS: [String] = ["default", "priority"]
 
 /// Top-level re-export of the canonical model id. Single source of truth
 /// is `nativeAgentPrimaryModel` in NativeAgentCore/Constants.swift; this
-/// alias is kept because existing callsites in this file and tests
-/// reference `PRIMARY_MODEL` by name. Mirrors the retired daemon.
+/// alias is kept for existing callers that reference `PRIMARY_MODEL` by name.
 public let PRIMARY_MODEL: String = nativeAgentPrimaryModel
 
-/// MUST stay in sync with the retired daemon (`DEFAULT_REASONING_EFFORT`).
+/// Default reasoning control before model/account compatibility normalization.
 public let DEFAULT_REASONING_EFFORT: String = "high"
 
 // MARK: - Protocol

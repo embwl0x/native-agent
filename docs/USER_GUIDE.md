@@ -1,559 +1,290 @@
 # NativeAgent user and agent guide
 
-NativeAgent is a personal agent for Mac. Start with a conversation; connect
-other devices and grant access as you need them.
+Start with a conversation. Connect services and grant access as the work needs
+them.
 
 ## First setup
 
-1. On an Apple-silicon Mac running macOS 26 or newer, download the DMG from the
-   [releases page](https://github.com/embwl0x/native-agent/releases). Open it,
-   drag NativeAgent to Applications, and open the app.
-2. Enter your name and the agent's name. Expand **What the agent can help with ·
-   Optional** for an overview.
-3. Connect one AI account during setup, then finish onboarding. You can skip
-   and connect later.
-4. The app opens in **Simple** view. The agent asks what it should be for you
-   and how it should sound, then offers to set things up by talking; anything
-   it needs arrives as a card in the chat.
-
-Without a connected account, the agent points at a **Providers** card beside
-the message. Sign in with an account you already use or add an API key;
-**Cancel** stops a stalled browser sign-in so you can retry.
+1. On macOS 26 or newer, download the DMG from the
+   [releases page](https://github.com/embwl0x/native-agent/releases), drag
+   NativeAgent to Applications, and open it.
+2. Enter your name and the agent's name.
+3. Connect an AI account or add an API key. You can skip this step and connect
+   later in **Providers**, but chat needs a connected account.
 
 ### Simple, Advanced and Agent
 
-The switch at the window's top right picks the view:
+- **Simple** presents chat, the agent's contacts and its helpers. Ask the agent
+  to configure the app. The panel's gear offers appearance controls and
+  **More settings…**, which opens Settings in Advanced.
+- **Advanced** exposes the pages below.
+- **Agent** shows the agent's own desktop read-only.
 
-- **Simple** — the agent, the agents it talks to, and its helpers on one panel
-  beside the chat. Click any of them to talk to it directly; a working one shows
-  a moving rim. There are no settings pages: ask the agent, or use the gear at
-  the foot of the panel for the colour of the light, **Warmth in the glass**
-  (offered in dark mode) and **More settings**, which opens Settings in
-  Advanced.
-- **Advanced** — the full app, with the rail of pages described under
-  [Main Mac pages](#main-mac-pages).
-- **Agent** — what the agent sees on its own desktop, read-only.
+A fresh install starts in Simple. An install with existing chats defaults to
+Advanced. Page names in this guide refer to Advanced.
 
-A fresh install starts in Simple; an install that already had chats starts in
-Advanced. The agent can switch the view for you. The rest of this guide names
-pages as they appear in Advanced.
-
-Connect one AI account to start chatting. **Work** and **Memory and mind** follow
-**Chat** unless you choose otherwise in Providers; a group that holds a choice of
-its own is captioned **Custom choice**, and **Use Chat's choice** clears it. A
-group's choice is the whole answer for every activity in it. There are three
-groups and nothing else:
-
-- **Chat** — Chat, iPhone, Telegram and Slack.
-- **Work** — Desk, Task execution, Independent tasks, Coordinated tasks, Skill
-  practice, Background check-ins and Diagnostics.
-- **Memory and mind** — Memory, Dreams, REM, Reflection, Conversation summaries,
-  Learning and Creative exploration.
-
-Every activity in a group runs on that group's account and model: the group's own
-choice when it has one, Chat's when it does not. No activity carries a model of
-its own, so none can be pointed at a model its account cannot serve. If a model
-you once picked is no longer offered by that account, it stops counting as a
-pick and the activity goes back to the group's choice — nothing is silently
-swapped for a different model.
-
-When a task needs access, open **Trust** on the left rail and choose the least
-authority that fits. Use **Trust → Mac integration** for individual Mac
-services. Trust does not replace macOS permission prompts or service sign-in.
-Shell access is not required for a first chat. Trust saves each control as you
-change it; controls that only take effect after a restart are marked with a
-restart tag beside them.
+Providers has three groups: **Chat**, **Work**, and **Memory and mind**.
+Work and Memory and mind inherit Chat unless you set a **Custom choice**.
+**Use Chat's choice** restores inheritance. The group determines the account
+and model used by its activities; an unusable saved choice is reported.
 
 ## Optional background and memory settings
 
-These settings are optional and can be changed after your first chat.
+In **Settings**, **An inner life** controls the inner-life master setting,
+and **Memory in every reply** selects Active or Off for Fluid Context.
+The memory controls also cover dreams, consolidation and meaning-based recall.
+Use **Diagnostics → Cognition** to inspect the current state.
 
-1. Open **Settings**.
-2. **An inner life** starts on after setup and a working account. Use it to
-   turn background reflection off or on.
-3. Use **Memory in every reply** to choose whether remembered context feeds
-   replies. **Observe Only** measures selection without supplying it to the
-   model; **Off** disables it.
-
-To inspect the exact state of background reflection and context selection,
-open **Diagnostics → Cognition**.
-
-Background reflection can shape attention, voice, and carefulness, but cannot
-grant permissions, approve actions, or bypass Trust.
+Remembered context and inner state do not grant action authority. Trust remains
+the owner of permissions.
 
 ## Turn on Mac computer control and the activity watcher
 
-- Computer control (see, click, type): grant macOS **Accessibility** (and
-  **Screen Recording** for pixel perception) to NativeAgent, then select the
-  intended access in **Trust**. The ordinary agent-facing tools are
-  `screen`, `act`, `go`, and `wait`: named controls and observed visual regions
-  are resolved again before input. Shell execution has its own control further
-  down the same **Trust** tab, in the **Shell Commands** panel:
-  **Enable Shell Commands** (marked restart). The saved policy and
-  macOS permissions still apply, along with redaction, user takeover,
-  locked-screen refusal, and truthful effect receipts.
-- While the agent drives the Mac, the working card above the message box shows
-  what the agent is looking at: a small picture of the last screen the agent
-  took, and a line naming the verb in flight. The line says only what the
-  picture can back. While the agent is still deciding where to click, the
-  picture shows the button unclicked and the line reads **About to click
-  Save**; once the click has happened and the agent has looked again, the line
-  becomes **Clicked Save** — or **Could not click Save**. A plain look says
-  **Looking at Safari**, and a wait says **Waiting for the page**. Click the
-  picture, or select it with Tab and press Space, for a larger view; Escape
-  closes it. It appears only on turns that actually use the Mac, and it goes
-  away when the turn ends. No picture is taken for it and none is kept: it is
-  the frame the verb already captured, held in memory for the length of the
-  turn and dropped when the turn ends — never written to the conversation,
-  never saved to disk, never sent to the AI provider, and never part of memory.
-  Secure fields — password, passcode, and one-time-code boxes — are painted out
-  of it, in web pages as well as in ordinary Mac apps. Only secure fields are
-  hidden: the rest of the picture is the screen as it is, including ordinary
-  text boxes beside them.
-  The per-verb receipts remain the record of what happened; this is the live
-  view while it happens.
-- Chrome control is separate: in **Trust**, click **Set up Chrome**. It opens
-  the bundled extension folder and Chrome's extensions page. Turn on Chrome's
-  **Developer mode**, click **Load unpacked**, and select that folder; no second
-  download is needed. Enable **Chrome control** in Trust and keep Chrome open.
-  See the [extension setup guide](../Extensions/NativeAgentChrome/README.md).
-  It can create an inactive agent tab or claim an exact existing tab, read a
-  bounded structured snapshot, and act on that snapshot's nodes. Touching or
-  activating the tab yields its lease. Native screen control still operates
-  the visible desktop; NativeAgent's built-in Browser is a third, WebKit-based
-  surface. Enabling one does not silently enable the others.
-- Activity watcher: in **Trust**, enable **Record which apps I use**. It records
-  app and permitted, redacted window-title history locally while enabled.
-  **Let the agent answer from activity history** separately allows a requested
-  excerpt to reach the selected AI provider when you ask what you were working
-  on. The database stays local and does not become long-term memory.
+For screen control, grant NativeAgent macOS **Accessibility** and, for pixel
+perception, **Screen Recording**, then choose the appropriate **Trust** mode.
+The agent reaches the Mac through `app` actions such as `mac.look`,
+`mac.act`, `mac.go` and `mac.wait`. Available evidence and permissions
+determine what it can do; a successful input is not by itself proof of the
+intended result.
+
+Chrome uses the optional bundled extension. Open its setup from **Trust** and
+follow the [extension guide](../Extensions/NativeAgentChrome/README.md).
+Chrome tab actions and NativeAgent's built-in browser are available through
+the Browser page of `app`.
+
+The activity watcher has its own **Record which apps you use** control in
+Trust. Recording is off by default. It records app names and durations;
+redacted window titles require separate opt-in. It does not record screenshots
+or typed content. Full Mac permits recorded-activity answers in trusted chats;
+narrower modes require **Let me answer from activity history**. Answers reach
+the selected provider.
 
 ## Main Mac pages
 
-Advanced view puts the main pages on the left rail, in the order below, and
-related controls are tabs within those pages. A hairline separates the everyday
-places from the setup ones, and **Settings** sits at the foot.
-
 | Place | Use it for |
 |---|---|
-| **Chat** | Conversations, attachments, voice, sessions, and the configured agent's name and status. |
-| **Today** | Notifications, approvals, proposals, recent work, and items waiting for the user. **Read dream** checks the source and opens **Dreams**. |
-| **Memories** | Search and manage saved facts; decide **Keep** or **Don't keep** beside each proposal. Kept facts sit under **What I've kept**; a fold at the bottom — **N things I let go** — lists what you rejected, read-only, so the same fact cannot quietly return. The **Knowledge graph** is the second tab. |
-| **Desk** | Line up large projects, dependencies, bridge work, schedules, research, agent pursuits, approvals, progress, verification, and outcomes. |
-| **Notifications** | **Proactive inbox** — **Let the agent raise things unasked** — plus its **Triggers**, **Watched folders**, and the inbox history. |
-| **Helpers** | Standing helpers (bots) the agent runs on a schedule or on a GitHub or Slack event, their dated replies, **Run once** and **Pause**. |
-| **Personality** | Documents labeled by purpose: **Identity**, **Expression**, **About you**, **Personal growth**, and **Working guidelines**; the agent's minds and **Dreams** have their own tabs. |
-| **Providers** | Connect an AI account; optionally tune models per activity group. An account whose access has expired says so rather than reading as ready. |
-| **Trust** | Presets, feature permissions and approvals; the **Mac integration** tab holds individual Mac-service access. |
-| **Connectors** | Service connections, with **Agents**, **MCP**, **Telegram**, and **iPhone** tabs. |
-| **Capabilities** | What the agent can actually do, with **Show all actions**. |
-| **Diagnostics** | **Health checks**, **Status**, **Run history**, **Cognition**, **Chat turn details**, **Skills**, and **Tools** tabs. |
-| **Settings** | Appearance, shortcuts, updates, help, **An inner life**, and **Memory in every reply**. |
+| **Chat** | Conversations, sessions, attachments, voice and turn progress. |
+| **Today** | Notifications, approvals, proposals, recent work and items waiting for you. |
+| **Memories** | Saved facts, pending proposals and the **Knowledge graph** tab. |
+| **Desk** | Projects, dependencies, schedules, pursuits, progress and outcomes. |
+| **Notifications** | Proactive inbox, triggers, watched folders and history. |
+| **Helpers** | Standing bots, their briefs, schedules or event triggers, and replies. |
+| **Personality** | Identity, expression, about-you, growth and working guidelines; **My minds** and **Dreams** tabs. |
+| **Providers** | AI accounts and the model choices for Chat, Work, and Memory and mind. |
+| **Trust** | Access presets, feature permissions and approvals; **Mac integration** for individual Mac services. |
+| **Connectors** | Service setup and the **Agents**, **MCP**, **Telegram** and **iPhone** tabs. |
+| **Capabilities** | Capability inventory and **Show all actions**. |
+| **Diagnostics** | Health checks, Status, Run history, Cognition, Chat turn details, Skills and Tools. |
+| **Settings** | Appearance, shortcuts, updates, inner life and memory settings. |
 
 ### The agent reading and setting these pages, quietly
 
-Since 0.4.14 the agent can look at NativeAgent's own pages and change what they
-expose without touching the desktop. It never brings the window forward, never
-moves the pointer, never changes what is on screen, and makes no sound — the
-page it reads is drawn a second time offscreen, from the same live state the
-visible window shows. A person watching sees nothing happen at all. Scope is
-this app only; anything on the rest of the Mac still goes through Mac control.
+NativeAgent is the agent's one always-on tool, `app`. A normal page read or
+setting change runs in process without bringing the window forward. Actions
+that move the screen or make sound are marked `screen`.
 
-- **Reading is always allowed**, in every Trust mode, including Safe and Work
-  mode. The agent can say what a page shows and what each control is set to.
-- **Changing is allowed in Work mode, Builder and Full Mac.** The app's own
-  settings are the agent's to administer; only Safe, which changes nothing at
-  all, refuses, in plain words rather than half-applying.
-- **Trust's own posture is never the agent's to change** — presets, Full Mac,
-  the unattended-work switch, Mac control, Mac service access, and the file
-  access mode. The agent reads them, reports them, and says it cannot set them.
-- **Every change leaves a receipt you can read**, in the same activity trail
-  every other tool call leaves: the page, the setting, the old value and the new
-  one. The page itself updates immediately, exactly as if it had been clicked.
-- **Reading aloud has a silent path.** The agent can render speech to a file and
-  report how long it runs, how large it is, and which voice spoke, without the
-  speakers ever opening. Your own read-aloud setting is untouched by it.
+| Call | Meaning |
+|---|---|
+| `app {}` | Home: where I left off, open work, what waits and what arrived, followed by the page index. |
+| `app {"page":"desk"}` | Read a page, its version and available actions. |
+| `app {"item":"…"}` | Open or act on an exact name or reference returned by home. |
+| `app {"find":"disconnect telegram"}` | Find matching pages and actions by intent. |
+| `app {"action":"…","args":{…}}` | Run an advertised action with its named arguments. |
+| `app {"script":"return app.read('desk');"}` | Run bounded JavaScriptCore code using the app API. |
 
-The system-health pill (the "N warnings" readout) lives in **Diagnostics**, not
-in the chat window; the composer carries only the context ring. Chat carries one status dot
-instead of two competing warning surfaces.
+Home items can perform actions; follow the item's returned instructions.
+For an action, `preview:true` reports what it would do without doing it.
+`expected_version` refuses the action if the current page version differs
+from the read.
 
-Every page is still reachable by **Command-K** and by its existing deep link,
-whether or not it appears on the rail.
+Scripts can use `app.read`, `app.find`, `app.log` and the registry's
+scriptable actions, such as `app.inbox.archive(args)`. They have no direct
+file or network access. Each call is checked separately. A blocked action or
+one waiting for approval stops the script; earlier completed calls stay done.
+
+Page reads are available in Safe. Ordinary setting changes require Work mode,
+Builder or Full Mac. The returned page states which controls the agent may
+change. Selecting Full Mac and granting macOS privacy access remain owner
+decisions. See [Trust modes and approvals](#trust-modes-and-approvals).
 
 ## Memory, personality, and context
 
-- **Personality** owns the configured agent identity and voice documents.
-- **MemoryV2** owns durable facts. A memory is not canonical merely because it
-  appeared in conversation, a dream, or the knowledge graph.
-- **Knowledge Graph** is a derived index over canonical memory, not a separate
-  place to store truth.
-- **Fluid Context** circulates bounded persona, memory, skill, project,
-  cognitive, and organism material. It is rebuildable and does not replace the
-  original stores.
-- **Dreams and REM** consolidate experience on slow paths. They do not turn raw
-  transcripts into unquestioned facts.
+**MemoryV2** stores durable memories. **Personality** holds identity and voice
+documents. The generated about-you document is a projection of memory; edit
+the facts through **Memories**. The knowledge graph is an index over memory,
+and Fluid Context prepares bounded material for a turn from the underlying
+stores.
 
-Tell the agent explicitly when something should be remembered. Review proposed
-preferences or goals in Today or Memories before treating them as durable.
-In Personality, **About you** is read-only; change those facts in **Memories**.
-Other editable documents use **Save document**, and switching documents keeps
-unsaved edits.
+Tell the agent when a fact should be remembered, and review pending proposals
+in Today or Memories. Skills capture reusable procedures; dreams and REM
+consolidate experience. Neither a conversation nor a dream automatically makes
+a statement a canonical fact.
 
 ## Skills, tools, MCP, and connectors
 
-NativeAgent keeps ordinary turns small by loading capabilities lazily.
+Everything the agent calls goes through `app`. Pages and `find` expose
+actions when needed, without adding more tool schemas to each request.
+The old catalog, loading and per-area tool calls are refused with a translated
+`app` call. Work previously opened through the workspace tool is now in home.
 
-- A short always-on set of tools rides every request (the four Mac verbs only
-  once Full Mac accessibility is on), and so do the tools of any MCP server you
-  have mounted — those are inserted automatically. Everything else is catalogued
-  but costs nothing until it is needed, and leaves again after two turns without
-  a real call — including under Full Mac, where the file and system tools load
-  on intent like any other group. A dropped tool is never gone: it stays in the
-  catalog and one call brings it back. [Tool loading](TOOL_LOADING.md) states
-  the contract.
-- `tool_catalog` or `list_tools` discovers capability names and groups;
-  `tool_load` activates only what the current session needs.
-- `dream_diary_read` lets the agent read its own dream diary — the weekly index
-  the Dreams page shows, one night in full by date, or the nights whose text
-  mentions something. Read-only, and archived nights are included.
-- The agent's studio journal is append-only, and `studio_journal_amend` is how a
-  wrong fact in an entry gets fixed: it files a dated correction against that
-  entry rather than editing it, so the original wording stays visible, struck
-  through, beside the correction and the reason for it. A changed judgment is
-  still a new entry linked to the old one, not an amendment.
-- File, shell, Git, builds, and Mac control follow the saved Trust permissions.
-  A connected external service still needs the applicable access checks.
-- `list_skills` lists compact procedure summaries; `read_skill` loads one
-  relevant body; `save_skill` is the canonical creation/update path. A body saved
-  without a heading is given one from the skill's name rather than refused; the
-  other hygiene rules still refuse, and say why.
-- Skills may recommend a procedure but cannot grant tools, permissions,
-  approvals, or safety authority.
-- MCP servers translate external protocol calls into the same bounded action
-  and verification language as native tools. A protocol response is evidence,
-  not proof that an external effect settled.
-- Connectors provide explicit setup for services such as Telegram, Slack,
-  GitHub, Gmail, Google Calendar, Notion, and X. Credential presence alone is
-  not a successful connection; NativeAgent requires the provider's applicable
-  validation path.
+- Skills are guidance: `skill.list` and `skill.read` find and read them.
+  They do not grant permissions.
+- To author a capability, use `tool.propose`, then `tool.approve`. An
+  activated tool appears as `authored.<id>`. Approval follows the current
+  [Trust and peer-turn rules](#trust-modes-and-approvals), including the
+  exemption for agents enabled in Trust.
+- Mounted MCP tools appear as `mcp.<server>.<tool>` actions on the MCP page.
+  Their availability depends on the server and its connection.
+- `web.search` tries Codex web search for general queries and SearXNG for
+  code queries. Unfiltered searches try the other route if the first fails or
+  returns no results, and the result explains the fallback. Non-general
+  categories and time ranges use only SearXNG.
+- Service connections live in **Connectors**. Authentication and service
+  permissions still apply when an action is available.
 
-In **Connectors → Share a folder**, enter a name, click **Choose Folder…**,
-choose whether to **Let the agent write to it**, then click **Share this folder**.
-**Search the shared folders** distinguishes searching, no matches, and errors;
-narrow the query when more matches are loaded than shown. **Capabilities**,
-reachable with **Command-K**, offers **Show all actions** to expand the native
-action list.
+In **Connectors → Share a folder**, enter a name, click **Choose folder…**,
+select the folder, choose whether to enable **Let me write to it**, then click
+**Share this folder**.
 
-For app-only/public installations, the safe default for file, shell, Git,
-patch, and build work is:
+The [app tool contract](TOOL_LOADING.md) defines this interface. For file work,
+the default folder on an app-only install is:
 
 ```text
 ~/Library/Application Support/NativeAgent/workspace
 ```
 
-A verified source-backed developer install uses the checkout's `workspace/`.
-Every chat surface and the Desk resolves the same canonical workspace for
-relative paths and ordinary trust modes. With Full Mac access, the agent
-may explicitly select an existing absolute project elsewhere on the Mac for
-native shell/build work or a Codex/Claude Code handoff. NativeAgent validates
-that directory again at dispatch time; protected system and credential/
-authority paths do not become valid coding roots.
-
-macOS privacy permission is separate from NativeAgent trust. On a new Mac, a
-project under **Documents**, **Desktop**, **Downloads**, Mail, Messages, or
-another protected location may require an Apple consent prompt or a manual
-grant in **System Settings → Privacy & Security → Files & Folders**. If the
-project must span multiple protected locations, grant **Full Disk Access** to
-NativeAgent and relaunch it. Full Mac access cannot grant macOS privacy
-authority. Projects in ordinary user-owned locations do not need this extra
-Apple permission.
+Source-backed installs use the checkout's `workspace/`. Every surface uses
+the same resolver. Full Mac can authorize work in an explicitly selected
+project elsewhere; Apple's privacy permissions still apply to protected
+locations.
 
 ## Trust modes and approvals
 
-Start with the four presets at the top of **Trust**:
+| Preset | Access |
+|---|---|
+| **Safe** | Read files; no changes or Mac control. |
+| **Work mode** | Edit approved workspaces; no outside writes or shell. |
+| **Builder** | Edit workspaces; ask to write outside; no shell. |
+| **Full Mac** | Files anywhere, shell, system control, move or trash. |
 
-- **Safe** reads files without changes or Mac control.
-- **Work mode** edits approved workspaces and denies writes outside them.
-- **Builder** edits approved workspaces and asks before writing outside them.
-- **Full Mac** permits broader file access after confirmation; macOS permissions
-  still apply. It has no timer: it stays in force until you choose another mode.
+Choosing Full Mac asks for confirmation. It stays on until the mode changes;
+there is no timer. For admitted turns, Full Mac grants the agent autonomy
+without routine per-action approval. Explicit blocks, origin checks, service
+authentication and macOS permissions remain in force.
 
-The four cards sit under **Access and policy**, each with its own one-line
-summary — **Read files; no changes or Mac control**, **Edit approved workspaces;
-no outside writes or shell**, **Edit workspaces; ask to write outside; no
-shell**, **Files anywhere, shell, system control, move or trash**. Choosing one
-applies it immediately and saves it; a line under the cards names the saved
-state, which stays named even with custom settings. Choosing **Full Mac** asks
-**Enable Full Mac access?** first. **Create backup now** is on the same panel.
+**Resetting macOS privacy permissions always asks the owner first**, including
+under Full Mac.
 
-Below that, a read-only summary restates what the saved policy currently allows,
-then **Feature permissions** holds five cards — **Multimodal**, **Chrome
-Control**, **Self-Improvement**, **Desk Autonomy**, and **Living Memory**. Under
-those sit the Mac Control panels (file operations, AppleScript, JXA, **Shell
-Commands**) and the activity watcher. **Advanced** is one fold: **Safety
-boundaries**, **Privacy map**, and **Backups**.
+**Agents enabled in Trust → Connected agents carry User's authority on
+authenticated turns.** They do not receive extra peer approval requirements;
+ordinary Trust, domain, service and macOS permission checks still apply.
 
-There is no separate draft to save. Each control writes its own change; where a
-change only lands on the next launch, the control carries a restart tag.
+**Other peer-steered turns have an additional boundary.** Under Full Mac, deletes
+and irreversible acts, sends or posts in the owner's name, persona writes and
+approvals still raise the owner's card. Routine conversation with a connected
+peer is allowed. More restrictive Trust modes can require additional approvals.
 
-### Three terms that are often confused
-
-- **Full Mac** is one of the four presets above. Choosing it grants the machine:
-  broad file access, shell and system control. It asks for confirmation once and
-  then stays on with no timer — until you pick another preset. Nothing counts it
-  down, and any expiry left in an older install's saved policy is ignored.
-- **Developer mode** is the internal name of an execution field in the saved
-  Trust policy, not a preset and not a control with that title anywhere in the
-  app. It is what actually authorises shell, system control, and moving or
-  trashing files; with it off, those are refused and the policy is rewritten on
-  load to say so. The **Full Mac** card is what turns it on — Full Mac sets it
-  and every other preset clears it. The operator-facing control nearest to it is
-  **Enable Shell Commands**, in the **Shell Commands** panel further down the
-  **Trust** tab; it is marked restart, and its caption says to keep it off
-  unless that field is intentionally on for the operator session.
-- **YOLO** is not a mode and there is nothing to switch on. It is the name for
-  the 2026-08-12 defaults ruling in the Trust defaults table: unlisted tools
-  resolve to `auto` rather than asking, and Mac motor actions are `auto`, so an
-  admitted Full Mac action does not raise a per-call prompt. The Full Mac grant
-  is the consent. Trust presets, the macOS permission grants, and the protected
-  floors below are still the gates — the ruling removed the prompt, not the
-  boundary. `restart_app`, `install_app`, and the self-modification tools are
-  deliberately still held at confirm.
-
-Trust remains authoritative on Telegram, Slack, iPhone, and delegated work.
-
-Broader access does not remove protected-system restrictions, external-service
-checks, or required approval for consequential actions.
-
-If approval is requested, resolve the exact item in **Today**. A pressed
-Approve button is not success until the action produces its terminal receipt
-and, where applicable, domain verification.
-
-Chat tool receipts show the outcome first; **Details** expands the evidence in
-place. A partial result says what was not created and why.
+Resolve requested approvals in Today. An approval authorizes a step; the
+action's receipt and the service that owns the effect establish what actually
+happened. Chat receipts show the outcome, with evidence under **Details**.
 
 ## Desk, background work, and swarms
 
-- Put durable multi-step work on the **Desk**. One Desk identity follows the
-  task through planning, execution, pauses, verification, and completion.
-- A row that reads **held** is work that cannot move yet — blocked, deferred, or
-  waiting on a held parent. The same line says which. It is not a status anyone
-  sets; clear the cause and the row returns to its own status.
-- The agent's own pursuits use a restricted Desk work membrane rather than an
-  unrestricted hidden chat. A Workshop session that ends without recording what
-  it did is written down as **blocked** with the reason named, rather than
-  counted as progress.
-- Background loops handle event-driven maintenance, messaging, snapshots,
-  notifications, dreams, memory hygiene, and scheduled work. Quiet operation
-  should perform no model work unless a real event or due boundary requires it.
-- Swarms are temporary parallel workers inside the same runtime. They use the
-  Swarms provider default unless explicitly specialized, start read-only by
-  default, and gain no authority beyond the parent turn.
+Use **Desk** for durable multi-step work: dependencies, schedules, checkpoints,
+approval pauses and outcomes stay with the task. A **held** row has a blocker,
+defer or held ancestor; its reason explains what needs to change.
+
+Background work is owned by the core's `BackgroundLoopsManager`.
+Temporary swarms are available through `agent.swarm`; read-only workers
+perform reasoning, while inherited access uses the parent's Trust and workspace
+gates. Delegating work does not grant new authority.
 
 ## Helpers: standing bots
 
-**Helpers** holds the standing helpers (bots) the agent makes — for you, or to help itself.
-A bot needs a name, a brief, and a model. It keeps its own conversation, uses the
-agent's ordinary tools under the Trust policy you have saved, gets the same
-remembered context any other turn gets, and lives until the agent deletes it.
+A helper has a name, brief, model and persisted conversation. It runs with its
+saved model choice and the live Trust policy. A missing or invalid model
+choice prevents a run.
 
-- **A bot always runs on the model it was made with.** The account, model, Think
-  level and Fast setting are chosen when the bot is made and are part of it; a
-  bot never follows Chat's model. A bot saved before this rule reads **Choose a
-  model** on its card and does not run until one is set.
-- Timing is manual, twice daily, daily, every N hours, a custom schedule, or
-  **On an event**. **Run once** and **Pause** are always available.
-- **On an event** wakes the bot when something arrives instead of on a clock.
-  Two sources: a new GitHub issue or pull request on a repository the GitHub
-  connector already tracks, and a Slack message in a channel the Slack connector
-  already receives. Enter the repository as `owner/repo`, or the Slack channel
-  ID (Slack delivers an ID, not a name: open the channel, choose **View channel
-  details**, copy the ID at the bottom — it looks like `C0123ABCD`), and a
-  keyword if only some events should wake the bot. The event text goes to the
-  bot as the input for that run, so the brief can say what to do with it. The
-  card shows **Wakes on: GitHub · owner/repo** and the last event that arrived.
-  An event is unattended spend like a scheduled run and passes the same Autonomy
-  switch below: with Autonomy off the card records the event as held and nothing
-  runs.
-- Each finished run is one settled card at the top of the bot's page, newest
-  first: the first line of the reply, when the run happened and how long it took,
-  one word for how it ended (Completed, Stopped, Failed, Blocked), the model the
-  run used, and any file or link the reply produced. **Open the reply** expands
-  the full text in place. The last five cards stay on the page; everything the
-  run said and did is under **Session · messages and tool activity** below them.
-- Scheduled runs are the agent spending on your account while you are not there,
-  so they sit behind one switch: **Trust → Self-Improvement → Let the agent work
-  unattended (bots, practice runs, background improvement)**, the master switch
-  for that card and the same one the Workshop runs behind. (**Desk Autonomy** is
-  a separate card beside it and governs Desk work, not this switch.) A fresh
-  install has it on. Turn it off and no bot timer fires and no event wakes a bot.
-  One exception: **Full Mac** access runs unattended work whatever the switch
-  says, and shows it on — changing the access mode is how to turn it off.
-  **Run once** is you asking, so it still runs either way.
-- A scheduled run that never happened says so. The bot's card reads
-  **Missed Sep 12 at 9:00 AM · the Mac was asleep** — or the app was closed,
-  Autonomy was off, the queue was busy, the daily token ceiling was reached, or
-  plainly "not run" when the app cannot tell. The Desk's schedule fold counts
-  those apart from what runs and what is paused. A missed occurrence is a
-  record, never a retry: nothing runs late behind your back, and the next
-  occurrence is scheduled as usual. **Run once** runs it now if you want it.
-- **Continue in Chat** opens the bot's own conversation and keeps the bot's
-  model, reasoning effort and approval rule. You are typing in the bot's session,
-  not moving its work into Chat's settings.
-- Per-run and daily limits are yours to set; blank means the defaults. A token
-  figure shown against a run is the allowance reserved for it, not what it spent.
-- A brief is an instruction to the agent, not a permission. "Read only" in a
-  brief does not narrow what Trust has already granted — set that in **Trust**.
+Use **Run once** for an explicit request, or configure a schedule or a supported
+GitHub/Slack event. **Pause** stops the helper's scheduled work. A brief does
+not change permissions.
+
+Scheduled and event-triggered helpers use **Trust → Self-Improvement → Let me
+work unattended**. Turn it off to stop unattended runs outside Full Mac. Under
+Full Mac, change the access mode instead. **Run once** remains available.
+
+The helper's page shows run replies and session activity. **Continue in Chat**
+opens that helper's conversation with its own model choice. See
+[Automated systems](AUTOMATED_SYSTEMS.md) for background ownership.
 
 ## iPhone and iPad
 
-1. Install NativeAgent Mobile and keep the Mac and mobile device signed into
-   the intended iCloud account.
-2. On Mac, open **Connectors → iPhone** (in Simple view, ask the agent to pair
-   the phone).
-3. Pairing details arrive automatically for the same Apple Account. On mobile,
-   choose **Connect via iCloud** when ready. If waiting, tap **Check for Mac**.
-   **Correct pairing key manually** appears only after the Mac's details arrive.
-   For correction, expand **Pairing hasn't connected?** on the Mac, **Copy** the
-   key, then use **Paste pairing key** and **Save Pairing Key** on the phone.
-   Manual correction must match the published key. Keep the key secret.
-4. Enable NativeAgent notifications in iOS Settings.
+1. Keep NativeAgent open on the Mac and use the same Apple Account on both
+   devices.
+2. On the Mac, open **Connectors → iPhone**.
+3. On the phone, tap **Check for Mac** if pairing details have not arrived,
+   then **Connect**. If a phone code is shown, match it on the Mac and choose
+   **Pair**, then connect again.
 
-The phone tabs are **Chat**, **Activity**, **Memories**, **Desk**, and **More**.
-Desk includes **Desk tasks** and expandable history. **Activity** waits for each
-section's own data before showing a zero, so an empty list means clear rather than
-not yet arrived, and a freshness badge reports when that screen's data was
-delivered rather than when any sync last ran. The Mac sends the phone a bounded
-slice of the Desk: text it had to cut is marked as cut, and the history says how
-many items were published out of how many exist. Mobile also supports
-sessions and pins, attachments, model controls, approvals, Skills & Tools,
-agent status, signed remote actions, and lock-screen notifications. **More →
-Settings → Push deliveries** shows recent push receipts; **Connection** offers
-**Check for Mac updates** when paired and connected. The Mac must remain
-available to run provider turns and tools. See
-[mobile_companion.md](mobile_companion.md) for transport detail.
+The phone reaches the same Mac runtime through signed iCloud transport.
+Keep the Mac awake for replies. See [Mobile companion](mobile_companion.md)
+and [iPhone approval pairing](ios-device-pairing.md) for transport and pairing
+details.
 
 ## Telegram, Slack, and local bridges
 
-- Configure Telegram in **Connectors → Telegram** and other services in
-  **Connectors**.
-- Each surface has a scoped session but uses the same persona, memory, Fluid
-  Context, provider policy, tools, trust gates, and receipts. A bridge turn is a
-  full turn: what the agent remembers from it names the sender, and the session is
-  digested like any other conversation.
-- Local Codex and Claude Code clients must read the authenticated bridge
-  descriptor at `~/.config/claude-bridge/bridge.json`; never assume port 8771
-  is free or bypass the published bearer token.
-- The local return listener starts automatically with NativeAgent. Developer
-  Mode is not required for Codex or Claude Code to return a completed turn;
-  TrustCenter and the normal action/approval gates still govern what either
-  builder may do.
+Configure messaging services under **Connectors**. Each surface keeps its
+conversation origin while sharing the engine's context, provider and action
+policy.
+
+Local bridge clients read `~/.config/claude-bridge/bridge.json` for the
+current loopback URL and bearer token. Do not hardcode a port. See
+[Agent conversations](agent-communication.md) for connected peers and
+[Codex bridge](CODEX_BRIDGE_DIAGNOSTICS.md) for diagnostics.
 
 ### Codex and Claude Code as specialist builders
 
-NativeAgent has native file, shell, git, patch, test, and build tools and can
-complete ordinary development work itself. For a difficult repository-scale
-task, however, Codex and Claude Code are purpose-built coding environments:
-they are usually better at sustained multi-file implementation, debugging,
-large test runs, review, and repair. The bridge lets the configured agent hand
-that work to a stronger temporary builder without turning the builder into a
-second memory, personality, scheduler, or authority owner.
+The agent can hand a bounded work order to a local coding session through
+`app`: `codex.message` for Codex, and `claude.say` from home for Claude Code.
+Install and sign into the corresponding coding product on the Mac; the
+bundled bridge workers also require Node.js.
 
-These are real coding sessions, not one stateless model call with a copied
-prompt:
+Codex distinguishes new work from an explicit resume using the returned
+conversation identity. Claude Code keeps topic-scoped session continuity.
+The work order should name the project and requested outcome. The builder
+inspects the repository in its own coding environment.
 
-- **Codex:** `codex_message` normally starts a persisted, non-ephemeral Codex
-  app-server thread in the selected project directory. The thread receives the
-  chosen model and reasoning controls, Codex's normal repository tools, a
-  bounded execution policy, durable turn identity, and a tracked final reply.
-  A specifically configured pinned thread can be resumed, but the safe public
-  default is a fresh full thread for each independent handoff; it does not
-  silently hijack whichever Codex task the user currently has open.
-- **Claude Code:** `claude_message` starts the real Claude Code CLI with a
-  durable session id. NativeAgent keeps one session pointer per topic, so a
-  follow-up on the same topic resumes the prior Claude Code conversation and
-  tool history instead of starting an unaware one-shot process. An explicit
-  `working_directory` on a new work order wins over the saved pointer's cwd,
-  allowing that topic to move to the real target project deliberately.
-
-The NativeAgent app bundles both bridge workers; a public install does not need
-a NativeAgent source checkout. The coding products remain user-owned local
-organs: install and sign into Codex CLI and/or Claude Code on the same Mac, and
-install Node.js for the bundled bridge workers. NativeAgent searches standard
-system and user-local locations such as `~/.local/bin`, including when the app
-was launched from Finder and inherited no interactive-shell `PATH`. The
-`tool_catalog` response reports helper, runtime, CLI, and authenticated return
-path readiness separately. Authentication to the coding product is proven only
-when execution begins. Seeing a tool schema is therefore not a claim that an
-uninstalled, signed-out, or incomplete bridge is ready, and an unavailable
-return path fails before NativeAgent queues a message that cannot come back.
-
-Sessions and credentials belong to that Mac's own Codex or Claude Code
-installation. A new computer starts with its own clean builder history; the
-bridge does not import the maintainer's conversations, account, or private
-context from another machine.
-
-NativeAgent sends a bounded work order and the correct working directory; the
-builder then inspects the repository itself. It does **not** receive an
-unbounded dump of private memories, and it does not inherit permission to
-bypass TrustCenter, approvals, connector proof, or effect-time checks.
-Human-out-of-loop bridge turns cannot stop for invisible interactive approval;
-if required authority is unavailable, the builder must return the blocker.
-
-When the builder finishes, NativeAgent records the completion, returns it to
-the originating Mac, Telegram, Slack, or iOS session, and assesses the result
-as success, partial, or failure. A builder's statement is still not proof:
-tests, receipts, git state, and the domain that owns the external effect must
-verify the outcome before the persistent agent treats it as settled. This is
-the intended division of labor: NativeAgent remains the continuous mind;
-Codex or Claude Code temporarily supplies deeper engineering cognition, and
-the verified result returns to that same mind.
+The result returns to the originating conversation. A builder's reply is
+evidence to assess, not proof of completion by itself. Check the resulting
+files, receipts and any external service involved before claiming success.
 
 ## What the configured agent should do
 
-1. Treat persona and MemoryV2 as identity/fact authority; use `commit_memory`
-   for explicit durable facts rather than editing generated `USER.md`.
-2. Use the compact manifest first, then `tool_catalog`, `tool_load`,
-   `list_skills`, and `read_skill`. Do not crawl private registries or stuff the
-   whole catalog into context.
-3. Use only same-turn `context_expand` pointers when deeper Fluid Context is
-   truly needed.
-4. Put work products in the canonical workspace and use Desk for durable
-   multi-step execution.
-5. Respect the originating surface, session, TrustCenter policy, approvals,
-   connector proof, and effect-time checks.
-6. Verify outcomes through the domain that owns reality. A model statement,
-   tool envelope, MCP response, HTTP success, queued push, or approval click is
-   not automatically a completed external effect.
-7. Convert a repeated successful procedure into a reviewed skill or Desk
-   procedure, never into silently expanded authority.
+1. Start at `app {}` when resuming work; use returned names and references.
+2. Read pages or use `find` for the action and its arguments. Do not load
+   tools or crawl private registries.
+3. Use `memory.commit` for durable facts and `skill.read` for relevant
+   procedures. Expand only the context pointers offered for the current turn.
+4. Put work products in the canonical workspace and durable work on Desk.
+5. Follow the originating session's Trust, approval and service checks.
+6. Verify the outcome through the owner of the effect; do not equate a queued
+   request, approval click or protocol response with completion.
 
 ## Health and troubleshooting
 
-- **Diagnostics → Health checks** checks providers, connectors, storage, tools, and
-  background loops. It reports when the checks were taken, not just when the page
-  last saved them, and declines to grade a sample too small to judge.
-- **Diagnostics → Status** and **Run history** show app and execution state, and
-  **Chat turn details** reads one turn end to end.
-- **Diagnostics → Cognition** shows Fluid Context and Organism readouts.
-- **Today** is the first place to check approvals, warnings, and work waiting
-  on the user.
-- Use **Settings → Check for Updates…** for signed public releases.
+- **Diagnostics → Health checks** inspects system health.
+- **Status**, **Run history** and **Chat turn details** expose runtime and turn
+  evidence; **Cognition** exposes the inner-state and context views.
+- **Today** shows approvals and work waiting on the user.
+- **Settings** contains update controls.
 
-For pairing, notifications, permissions, provider, and data-removal steps, see
-[../SUPPORT.md](../SUPPORT.md). Do not post API keys, OAuth tokens, pairing
-keys, private prompts, personal files, or unredacted support archives.
+For installation, permissions, provider and data-removal help, see
+[Support](../SUPPORT.md). Keep credentials, pairing keys and private content
+out of public reports.
 
 ## Honest boundaries
 
-For architecture and runtime details, see
-[NativeAgent Internal Workings](INTERNAL_WORKINGS.md). The
-[capability map](CAPABILITIES.md) and [project status](../PROJECT_STATUS.md)
-describe supported features and current limitations.
-
-NativeAgent is local-first and single-operator, but provider requests and
-configured connectors still send selected data to those external services.
-The shell is not a security sandbox. The Organism and cognitive substrate are
-bounded experimental layers. NativeAgent should not be the sole control for
-medical, legal, financial, emergency, or other safety-critical decisions.
+NativeAgent's provider requests and configured services can send selected data
+off the Mac. A capability still needs its permissions and a working connection.
+The [capability map](CAPABILITIES.md) names the source owners and limits;
+[Project Status](../PROJECT_STATUS.md) describes this checkout.

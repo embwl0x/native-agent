@@ -2,6 +2,8 @@ import AgentWorkspace
 import Foundation
 import PersistenceCore
 import MacIntegration
+import ToolRegistry
+import TrustCenter
 
 package enum ChatWorkspaceBinding {
     package static let ports = AgentWorkspacePorts.Binding(conversations: Conversations(), tools: Tools())
@@ -19,6 +21,9 @@ package enum ChatWorkspaceBinding {
     }
 
     private struct Conversations: AgentWorkspaceConversationPort {
+        func refreshHealth(dataRoot: URL) {
+            Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
+        }
         func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord] {
             let store = AgentConversationStore(dataRoot: dataRoot)
             return try locked ? store.records() : store.recordsUnlocked()
@@ -31,6 +36,17 @@ package enum ChatWorkspaceBinding {
                 .init(id: $0.id, name: $0.name, elevationAllowed: $0.elevationAllowed, canAnswerBack: $0.canAnswerBack)
             }
         }
+        func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue {
+            let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+            guard !SwiftNativeTrustCenter.hasExplicitBlockOverride("chat_conversations", overrides: snapshot.userConfiguredAutonomyOverrides) else {
+                throw AutonomyGateError.toolDenied(reason: "Conversation access is blocked in Trust. Nothing was read.")
+            }
+            let result = await HumanConversationReader.open(sessionID: sessionID, limit: limit, dataRoot: dataRoot)
+            if case .object(let row) = result, row["untrusted_remote_data"] == .bool(true), case .string(let peer)? = row["agent"] {
+                PeerDataTaint.markConsumed(peer: peer)
+            }
+            return result
+        }
         func presentation(_ row: AgentConversationRecord) -> JSONValue {
             AgentConversationSession.conversationPresentation(row)
         }
@@ -42,6 +58,7 @@ package enum ChatWorkspaceBinding {
         func modelVisibleCatalogToolNames(_ names: Set<String>) -> Set<String> {
             SwiftToolDispatcher.modelVisibleCatalogToolNames(names)
         }
+        func appAction(_ tool: String) -> String? { ToolNameAliases.appAction(tool) }
         func macIntegrationGate(_ name: String) -> (integration: String, mode: MacIntegrationPermissionMode)? {
             ToolPreloadHeuristics.macIntegrationGates[name]
         }

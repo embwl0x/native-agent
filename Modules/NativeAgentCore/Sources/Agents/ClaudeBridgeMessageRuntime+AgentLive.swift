@@ -3,7 +3,7 @@ import ChatOrchestration
 import PersistenceCore
 
 extension ClaudeBridgeMessageRuntime {
-    /// Claude/OMP: `<lane>/wake-jobs/<safe id>.json` not yet settled (a
+    /// OMP: `omp-bridge/wake-jobs/<safe id>.json` not yet settled (a
     /// `finished` may race the settlement write, so it needs the job only).
     /// Codex: a reply job still in `reply-jobs/` naming the message.
     static func agentLiveJobActive(agent: String, messageID: String, finishing: Bool) -> Bool {
@@ -19,9 +19,8 @@ extension ClaudeBridgeMessageRuntime {
             }).prefix(limit))
         }
         switch agent {
-        case "claude", "omp":
-            let dir = agent == "claude" ? "claude-bridge" : "omp-bridge"
-            guard let job = json(root.appendingPathComponent("\(dir)/wake-jobs/\(safe(agent == "claude" ? 120 : 160)).json")),
+        case "omp":
+            guard let job = json(root.appendingPathComponent("omp-bridge/wake-jobs/\(safe(160)).json")),
                   job["messageId"] as? String == messageID else { return false }
             return finishing || job["state"] as? String != "settled"
         case "codex":

@@ -47,6 +47,7 @@
 // daemon's data-root resolution.
 
 import Foundation
+import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
 
@@ -114,26 +115,22 @@ public struct SwiftNativeNotificationStatus: NotificationStatusReader {
         // (a) read the whole file unbounded and (b) diverge on receiptCount /
         // latestReceipt for >1 MiB logs. limit:20, maxBytes:1_048_576 are the
         // exact daemon defaults (and the Swift tailJSONL(_:) convenience default).
-        var receipts: [JSONValue] = (try? await persistence.tailJSONL(receiptsPath, limit: 20, maxBytes: 1_048_576)) ?? []
+        let receiptRead = try await persistence.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
+        guard receiptRead.malformedJSONRowCount == 0,
+              receiptRead.rows.allSatisfy({ if case .object = $0 { return true }; return false }),
+              receiptRead.physicalRowsScanned > 0 || receiptRead.bytesRead == 0 else {
+            throw PersistenceCoreError.ioFailure("The notification receipt feed is malformed.")
+        }
+        var receipts = receiptRead.rows
         receipts.reverse()
 
-        // pending_approvals = len([item for item in self.list_approval_requests()
-        //                          if item.get("status") == "pending"])
-        // list_approval_requests = read_json(self.approvals_path, []) then sort.
-        // We only need the COUNT of pending items; the sort order is irrelevant to
-        // a length, so we skip the sort the daemon applies (a non-pending sort is
-        // a no-op for a count). read_json defaults to [] on missing/torn/non-list.
-        let approvalsRaw = try await persistence.readJSON(approvalsPath, ifMissing: .array([]))
-        var pendingApprovals = 0
-        if case .array(let arr) = approvalsRaw {
-            for item in arr {
-                if case .object(let obj) = item,
-                   case .string(let status)? = obj["status"],
-                   status == "pending" {
-                    pendingApprovals += 1
-                }
-            }
-        }
+        // Only a missing approval store is empty; damaged storage must make
+        // this status read fail through the same checked owner as approvals.
+        let approvals = try SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: approvalsPath)
+        let pendingApprovals = approvals.filter {
+            guard case .object(let row) = $0 else { return false }
+            return row["status"] == JSONValue.string("pending")
+        }.count
 
         // notification_status() emits createdAt = now_iso() (response timestamp).
         // actionCategories is a fixed literal in the daemon (no data dependency).

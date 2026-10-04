@@ -1,10 +1,8 @@
 import SwiftUI
 
-/// The iOS self-improvement screen is intentionally observational. Keeping
-/// this copy as a named presentation contract prevents its only authority cue
-/// from disappearing during a visual-only edit to the footer.
+/// Training changes are applied on the Mac; learned behavior can be decided here.
 enum AutonomyMacOnlyNoticePresentation {
-    static let message = "Applying training changes and approving learned behavior happen only on your Mac."
+    static let message = "Applying training changes happens only on your Mac."
     static let systemImage = "lock.circle"
 }
 
@@ -49,7 +47,7 @@ enum AutonomyScreenPresentation {
 }
 
 
-/// iPhone's read-only Self-Improvement drilldown.
+/// iPhone's Self-Improvement drilldown.
 ///
 /// The old screen owned a second store and polled three snapshot files the
 /// Mac never produced, so Activity linked to a permanently empty projection.

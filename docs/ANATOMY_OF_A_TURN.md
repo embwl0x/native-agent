@@ -1,629 +1,184 @@
 # Anatomy of a NativeAgent Turn
 
-NativeAgent is designed so the model is not asked to reconstruct the agent,
-rediscover its capabilities, or reread its whole history every time someone
-sends a message. The Swift runtime prepares a small, relevant working set,
-keeps the reusable parts warm, calls the user-selected model, and then carries
-any requested actions through the same trust and receipt boundaries.
+NativeAgent's turn engine lives in Core: `EngineRuntime` assembles the
+root-scoped clients and `ChatTurnRuntime` owns conversation execution.
+Mac chat, mobile and messaging adapters reach that engine through their
+surface boundaries. One brain, many doors.
 
-This document follows an ordinary turn made by any agent configured in
-NativeAgent. The name, persona, memories, provider, permissions, workspace,
-skills, and connected services belong to that installation. Nothing in the
-turn architecture depends on the maintainer's personal agent or data.
+This guide follows an ordinary chat turn. [Internal Workings](INTERNAL_WORKINGS.md)
+connects it to memory, growth and background work.
 
 ## Human summary
 
-**Message → fast in-RAM selection (“resident context”) → compact model packet → LLM call**
+**Admit the message → persist it → prepare bounded context → call the selected
+model → execute any app actions → settle the answer and its consequences.**
 
-### What “resident context” means
-
-Before you send a message, NativeAgent has already prepared the agent’s working
-context in a bounded RAM arena. That includes:
-
-- **Persona:** The required identity, voice, relationship, and behavior
-  documents.
-- **Relevant knowledge:** Compiled projections from MemoryV2, corrections,
-  skills, projects, Desk, and other enabled sources.
-- **Selection index:** A fast in-memory map used to find which pieces matter for
-  this particular message.
-- **Live inner state:** When Subconscious is enabled, the current cognition and
-  organism state can be distilled into a small private capsule that helps the
-  agent carry its felt state and continuity into the turn.
-- **Capability map:** Which tools, skills, connectors, and providers exist,
-  which are ready, and which are permitted.
-
-When your message arrives, the CPU searches that resident index and selects a
-small, relevant packet. That packet can include:
-
-- Up to **12 dynamically selected context atoms**, plus mandatory identity and
-  correction material.
-- Up to **8 on-demand expandable pointers** to deeper context that remains lazy,
-  plus one more pointer per selected item the renderer truncates — so the whole
-  expandable set is bounded by 8 + the mandatory atoms + the 12 dynamic slots.
-- Up to **3 relevant tool groups** preloaded before the first LLM call.
-- The small always-available tool set and compact capability map.
-
-Those context atoms may represent memories, corrections, skills, project
-knowledge, Desk state, or other relevant information. A turn may select five
-memories or hints, but five is not a fixed limit.
-
-NativeAgent does not reopen dozens of files, reparse Markdown, scan entire
-databases, or rebuild the agent’s identity on every turn. The selected
-generation is held steady through the complete model and tool loop.
-
-NativeAgent still reads a bounded portion of the current conversation
-transcript, while full files, skill bodies, websites, GitHub data, and other
-large payloads remain lazy until needed.
-
-The speedup comes from doing the expensive compilation and indexing before the
-message arrives. The old separate memory-recall step took approximately
-**135–175 ms**. It is now skipped, with relevant memories selected inside the
-resident **4–15 ms** pass. Complete context preparation generally takes around
-**24–49 ms**, compared with approximately **144–188 ms** before the resident
-system.
-
-**The model call is the slowest part of the turn.**
+The model receives selected context, not direct access to the Mac's memory.
+NativeAgent offers one tool, `app`. Its home, pages and actions provide reach
+without sending a catalog of separate tool schemas on every request.
 
 ## The complete turn
 
 ```mermaid
 flowchart TD
-    A["Message arrives<br/>Mac, iPhone, Telegram, Slack, or local bridge"]
-    B["Accept one session turn<br/>assign run and trace identity"]
-    C["Persist the user message<br/>and check context-window health"]
-    D["Prepare in parallel<br/>route, resident context, history, cognition, tools"]
-    E["Assemble a bounded provider request<br/>stable identity first, current need last"]
-    F["Call the selected model"]
-    G{"Tool call?"}
-    H["Authorize at effect time<br/>dispatch, verify, and record receipt"]
-    I["Return bounded result<br/>or load another tool in the same turn"]
-    J["Stream or deliver the answer"]
-    K["Commit transcript and accepted consequences<br/>memory, cognition, organism, sync, notifications"]
-
-    A --> B --> C --> D --> E --> F --> G
-    G -- "yes" --> H --> I --> F
-    G -- "no" --> J --> K
+    A["Admit surface and session"] --> B["Persist incoming message"]
+    B --> C["Prepare route, resident context, history and optional inner state"]
+    C --> D["Provider request with one app schema"]
+    D --> E{"Action requested?"}
+    E -- "yes" --> F["Resolve app action and check authority"]
+    F --> G["Execute through its owner; return bounded evidence"]
+    G --> D
+    E -- "no" --> H["Settle reply, transcript and terminal evidence"]
+    H --> I["After-turn memory and cognition work"]
 ```
-
-The large box in most latency traces is the provider call. NativeAgent's side
-is mostly bounded local work: selecting already-compiled context, reading a
-small history projection, filtering schemas, checking policy, and writing
-durable records.
 
 ## Before the message arrives
 
-Some of the most important work happens outside the user's critical path.
+`NativeContextFlowRuntime` coordinates source projections and generation
+publication. The Context module maintains an immutable generation and a bounded
+`ContextArena` containing reusable entries, indexes and required-document
+mirrors.
 
-NativeAgent continuously turns canonical local sources into rebuildable
-working state:
-
-- Persona documents define the agent's identity, voice, and durable behavioral
-  guidance.
-- MemoryV2 owns long-term facts, preferences, corrections, proposals, and the
-  knowledge graph.
-- Fluid Context compiles eligible persona, memory, skill, cognition, Desk, and
-  project material into immutable SQLite generations.
-- A bounded `ContextArena` keeps the current generation's hot and warm entries,
-  lexical selection index, and required-document mirrors resident in memory.
-- The cognitive substrate and Organism Kernel maintain bounded advisory state
-  when the user has enabled them.
-- The tool runtime knows the installed catalog, readiness, policy classes, and
-  the small always-on tool set. Full schemas for inactive groups do not need to
-  occupy every prompt.
-
-Canonical truth remains in its owning files and databases. The arena is a fast,
-rebuildable circulation layer—not a second memory or identity store.
+Persona, MemoryV2, skills and Desk remain the owners of their source material.
+Context is a derived working set. Full documents, skill bodies and external
+content can be retrieved when needed rather than copied into every packet.
 
 ## 1. A surface admits the turn
 
-A message may begin in Mac chat, a detached window, the iPhone companion,
-Telegram, Slack, or an authenticated local bridge. The surface adapter verifies
-its own transport identity and hands the request to the shared chat
-orchestration path.
+The surface supplies the conversation identity, origin and attachments.
+Core's Mac admission path can accept, queue or reject a request; queued work
+retains its session and origin. The chat client binds run and trace identities
+to the accepted turn.
 
-NativeAgent then:
+Origin survives into dispatch. An admitted remote conversation is not made
+local by text claiming to be User. Trust and peer-origin policy evaluate the
+actual request provenance.
 
-1. resolves the exact conversation session;
-2. assigns one run identity and one trace identity;
-3. accepts the turn through that session's ordering and cancellation boundary;
-4. preserves attachments and the originating surface identity; and
-5. reads the selected provider, model, reasoning effort, and capability tuple
-   from the canonical routing owner.
-
-Surface identity is not decoration. It participates in tool visibility,
-permissions, approvals, and delivery. Telegram and Slack do not silently gain
-the authority of a local Mac turn, and the iPhone does not bypass signed-action
-verification.
+Source: `ChatTurnRuntime/MacChatTurnAdmission.swift` and
+`ChatOrchestrationClient+StructuredChat.swift`.
 
 ## 2. The user message becomes durable
 
-After acceptance, the user message is written to the canonical transcript
-unless the caller is resuming a turn that was already durably enqueued. This
-gives the system an honest record even if context assembly or the provider later
-fails.
+Structured chat writes the incoming message before context preparation unless
+it is resuming an already-enqueued request. History preparation checks whether
+the session needs compaction before assembling the model context.
 
-Before building the request, NativeAgent checks the selected model's verified
-context window. If the session has reached its compaction threshold, the
-canonical compactor creates a verified backup, distills older conversation,
-and preserves recent turns and tool evidence. A compaction failure stops the
-turn rather than silently sending an amnesiac or oversized request.
+In-turn steering also persists a message before handing it to the active turn.
+If that write fails, the offer is returned for queueing instead of disappearing
+into an unrecorded exchange.
+
+Source: `ChatOrchestrationClient+StructuredChat.swift` and
+`ChatOrchestrationClient+MessagePersistence.swift`.
 
 ## 3. NativeAgent prepares the working set in parallel
 
-Several independent local reads overlap before the first provider call.
+Resident turn preparation overlaps the history-aware context build. The
+request combines:
 
-### The turn plan
+- the selected provider/model route from a checked routing snapshot;
+- persona and relevant atoms from the resident Context generation;
+- bounded conversation history and session continuity;
+- a compact turn-plan hint where useful; and
+- an optional cognitive capsule and organism posture.
 
-The CPU classifies the immediate need—ordinary chat, research, file work,
-scheduling, a connected service, or another supported route. It combines that
-with the current surface and the current policy snapshot. The result can make a
-small tool group ready on the first model call; it does not choose an effect or
-grant permission.
+The prepared Context turn holds its generation lease through the provider/tool
+loop. A source update publishes a later generation rather than replacing part
+of the current turn. `app` action `context.expand` retrieves only an eligible
+pointer from the current turn's generation.
 
-For example, a normal GitHub repository URL is enough to prepare the connected
-GitHub read tools. The model should not need a web search or an extra discovery
-round merely to learn that structured repository access exists.
+Cognition is advisory. Its presentation bookkeeping is committed only after
+the engine call succeeds; merely preparing a capsule does not mark it delivered.
 
-### Fluid Context
+### Tools and skills
 
-Fluid Context turns the user's current need into a bounded selection from the
-resident generation. Required identity material is mirrored exactly; relevant
-atoms are selected from the in-memory index; optional semantic help is used
-only when its local embedder is already warm and never delays the turn.
+The request carries only `app`. `app {}` opens home, `find` discovers reach,
+and `action` executes a registry entry. Skill bodies are read through
+`skill.read` when useful. Discovery does not mount a schema or grant permission.
 
-The selected packet receives an immutable generation lease for the complete
-provider/tool loop. If source material changes halfway through a turn, that
-turn does not splice two generations together. A later turn receives the newer
-generation.
-
-The normal packet is deliberately small. When the selected generation offers
-an expandable pointer, `context_expand` may retrieve that exact pointer only
-for the current turn and generation. It is not a global search bypass.
-
-Memory rows also answer to a semantic floor: a `.memory` atom below
-`memorySemanticFloor` cosine is refused admission unless it matches lexically,
-shares an identifier, covers the message, or is already active, and a message
-of four content tokens or fewer gets a narrower memory lane
-(`shortMessageMemoryRowCap`). Small talk stops carrying a full quota of
-low-relevance recall; a cold embedder disables the floor rather than emptying
-the lane.
-
-A recalled memory arrives in the packet with time and provenance on it. Each
-memory atom leads with a coarse relative-age tag derived from the record's own
-recorded time — `(just now)`, `(this morning)`, `(yesterday)`, `(3 days ago)`,
-`(in March)`, `(in December 2025)` — and closes with where it came from, when
-the record says: `[verified]`, `[told by Claude]`, `[inferred]`. Both are
-applied where the packet is rendered, not where the atom is compiled, so
-neither re-compiles an atom or invalidates a cached generation. The age is
-computed from the turn's own frozen evaluation time in the user's local time
-zone — one clock for the whole packet, never a wall-clock read per atom — so
-two memories rendered either side of local midnight agree on what "yesterday"
-means, and the buckets are day-stable: a memory older than yesterday reads
-identically on every turn of that local day. Non-memory atoms — persona documents, instructions, corrections —
-render exactly as before, and a memory with no recorded provenance renders no
-provenance tag.
-
-### Conversation continuity
-
-The history reader keeps recent anchors and the useful tail of the session,
-then samples older middle turns only when needed. Tool results are projected
-into bounded summaries for later turns instead of replaying unlimited raw
-payloads. The selected model's verified context window determines the current
-history and memory budgets.
-
-Continuity also crosses sessions. As a session ages, its older turns are
-distilled into one recollection row that the prefix leads with
-(`[session recollection] …`), but that row lives only in the session that aged
-— so a surface that mints a fresh session per chat used to open knowing
-nothing about the conversation actually in progress. When a session has no
-recollection of its own, and the published conversation anchor names a
-different session that does, the anchor's recollection is seeded at the head of
-that turn's replayed prefix as
-`[session recollection, carried from your main conversation] …`. It is strictly
-read-only: synthesised per turn from the anchor's transcript, never written
-into this session's own transcript, never seen by the aging lane, and replaced
-by this session's own recollection the moment one exists. It is bounded by the
-same per-row cap the pinned recollection gets, and it rides ahead of the
-history window boundary in the cached prefix, so it changes only when the
-anchor's recollection row changes. A missing, unreadable, or not-yet-aged
-anchor simply carries nothing; the turn proceeds either way. The behaviour is
-on by default and can be turned off with `chatCarryAnchorRecollection`.
-
-### Cognition and organism state
-
-If Subconscious is enabled, NativeAgent freezes one bounded cognitive
-projection for the turn. It may include relevant continuity, felt context,
-standing views, and organism posture. These are private advisory inputs that
-color the agent's response; they are not a second persona, a permission system,
-or an excuse to narrate internal machinery.
-
-Preparing a projection does not spend it. Presentation bookkeeping is
-committed only after the provider has actually accepted a successful turn, so
-a failed call cannot consume state that the model never received.
-
-#### The optional subconscious capsule
-
-The capsule is the small part of the subconscious that can be handed directly
-to the model for the current turn. NativeAgent compiles it locally in Swift
-from the frozen, already-resident projection; compiling it does **not** make an
-extra LLM call. Optional budgeted background reflection may use the configured
-model when enabled, but that is a separate background lane rather than part of
-capsule compilation.
-
-Depending on what is relevant and currently available, the bounded capsule may
-carry:
-
-- a short felt fingerprint, such as the current emotional texture and
-  attention quality;
-- one relevant `Inner` view or reflective takeaway;
-- a continuity cue when the agent is returning to an ongoing felt thread;
-- a compact `Body` signal from the optional organism kernel; and
-- a restrained voice or self-exemplar echo when it helps the response land
-  naturally.
-
-The model receives this as private inner context under a compact `How you
-feel:` heading. It is meant to color the agent's tone, judgment, and sense of
-continuity—not to be quoted, announced, or treated as a script. Repetition and
-relevance gates keep an unchanged feeling from becoming a verbal tic, and
-lower-priority lines drop first when the capsule reaches its configured bound.
-
-The capsule never grants authority, edits persona, or promotes a feeling into
-memory or fact. TrustCenter, approvals, tools, and canonical stores retain the
-same boundaries whether the capsule is on or off.
-
-Subconscious is optional. The Settings screen provides a master Subconscious
-switch; turning it off disables the cognitive projection and sends no capsule.
-The advanced Cognition Observatory also exposes separate **Capsule injection**
-and **Organism body kernel** switches. This lets an installation keep cognitive
-state while withholding it from model turns, or use the capsule without the
-organism's body line. Ordinary persona, memory, Fluid Context, tools, and chat
-continue to work when these optional layers are disabled.
-
-### Lazy tools and skills
-
-The agent begins with a compact capability map:
-
-- the 20 always-on core tools — introspection, memory, skill-read, time,
-  bridge-message and tool-loading — plus the tool schemas of any mounted MCP
-  server, which ride the session contract automatically;
-- group names, readiness, policy status, counts, and active tool names;
-- compact skill discovery and instructions for loading one relevant body; and
-- schemas a confident route preload predicted for this request.
-
-Everything outside the core and mounted MCP is lazy. A tool joins the request by
-`tool_load`, by a confident preload for this turn, or by a turn-start promotion,
-and keeps its slot across idle turns. Predictions also persist in append order;
-explicit unload and the existing cap can release slots. The exact rules — what
-counts as use, the offer floor that keeps the array
-byte-stable within a burst, and the per-turn `tools.contract` receipt — are one
-short document: [Tool loading: the contract](TOOL_LOADING.md). That file is the
-contract; this page does not restate it.
-
-This is the crucial RAM distinction: the map and selection machinery are hot,
-but every possible book is not opened on the desk. Full skill bodies, file
-contents, repository data, browser pages, connector responses, and inactive
-tool schemas may remain on disk or behind their canonical service until the
-turn needs them.
+See [Tool loading: the contract](TOOL_LOADING.md) for the exact interface.
 
 ## 4. The provider request is assembled
 
-NativeAgent builds one bounded request around the user's chosen model. In
-conceptual order it contains:
-
-1. the compiled persona and stable identity guidance;
-2. stable pins and the compact lazy-tool contract;
-3. the selected Fluid Context packet and bounded memory recall;
-4. relevant session continuity and recent history;
-5. the turn plan's small routing hint when one is useful;
-6. the optional cognitive/organism projection;
-7. the current user message and image attachments;
-8. only the tool schemas authorized and useful for this turn; and
-9. once, after an app update, a short note saying what changed.
-
-The update note is a one-off. Release notes ship inside the bundle as
-`docs/release-notes/<version>.md`. At launch the app compares the last launched
-version with the current one; a fresh install gets nothing (the first-run
-greeting owns that moment), an unchanged version gets nothing, and an update
-writes one record with every bundled version newer than the stored one, oldest
-first, bounded so the atom cannot be silently dropped. The next turn appends it
-to runtime context, on the dynamic side of the cache boundary so it costs no
-prefix, and marks it delivered before the request is built — stamping after
-assembly would repeat the note on a crash, and repeating it is exactly how an
-agent announces the same update twice. It is a quiet note: no push, no sound,
-no chat row, and the note itself says to summarise when asked or when it fits
-and not to announce it unprompted. A note nobody collected within a week stops
-being news. The agent can always read the full notes for itself — the bundled
-docs are on the read path.
-
-Provider adapters preserve the wire format each model expects, but all surfaces
-share these owners and boundaries. Stable material comes before volatile
-material so supported provider prompt caches can reuse the unchanged prefix.
-
-The language model does not read the Mac's RAM directly. NativeAgent's Swift
-runtime selects from resident structures and sends the resulting packet to the
-configured external or account-backed provider. The user's provider terms and
-data-processing rules still apply.
+The turn engine combines stable persona material with the changing context
+packet, history, current message, attachments and the `app` schema. Provider
+adapters encode that request for the selected route.
 
 ### How prompt caching reduces token cost
 
-NativeAgent saves model input cost in two complementary ways:
+The implementation separates stable system segments from dynamic material.
+Persona documents belong in the stable prefix; the changing clock and turn
+context do not. A turn pins its clock, and prepared context can be reused
+during the tool loop. Keeping `app` as the single static schema also avoids
+discovery changing the request's tool array.
 
-1. **Send fewer tokens.** Fluid Context selects a compact relevant packet;
-   conversation history and tool results are bounded; inactive tools and full
-   skill bodies stay lazy; and long sessions are compacted before their entire
-   history becomes a permanent input cost.
-2. **Pay the provider's cached-input rate for reusable tokens.** NativeAgent
-   deliberately keeps the reusable beginning of the request byte-for-byte
-   stable so a supported provider can reuse its previously processed prefix.
+This arrangement permits provider-side prefix reuse. It does not guarantee a
+cache hit or a particular latency or price reduction; those require actual
+provider usage evidence.
 
-Conceptually, the request is arranged like this:
-
-```text
-[tool definitions + stable identity/persona + REM pins + lazy-tool contract]
-                              cache boundary
-[selected Fluid Context + memory + history + capsule + current request + new tool results]
-```
-
-The first region changes rarely. The second region is supposed to change: it
-contains what is relevant now. Keeping that volatile material after the stable
-prefix means fresh memory and inner context do not unnecessarily invalidate
-the reusable identity and capability mass.
-
-#### Prompt cache and KV cache
-
-The model provider owns the actual inference cache, commonly implemented with
-reusable prefix/KV state. NativeAgent does not store Anthropic's or OpenAI's KV
-tensors and does not describe a local RAM index as a model KV cache. Instead,
-it constructs requests that let the provider's prompt/prefix cache reuse that
-internal work.
-
-- **Anthropic:** NativeAgent places explicit ephemeral `cache_control`
-  breakpoints after reusable tool definitions, identity/system material, and
-  eligible conversation boundaries. Anthropic reports cache-creation and
-  cache-read input tokens separately.
-- **OpenAI Responses:** NativeAgent supplies a stable, exact per-session
-  `prompt_cache_key`; OpenAI performs prefix caching and reports
-  `cached_tokens` when reuse occurs.
-- **ChatGPT OAuth (the Codex responses endpoint):** two things carry the reuse.
-  The request sends a `session_id` header — the chat session id, sanitized to
-  header-safe characters and bounded, unbound requests sending no header at all
-  — and that header is the sticky routing key that lands the call on the node
-  holding the prefix; the body's `prompt_cache_key` alone buys nothing. Second,
-  this route caches on the **whole tools array**, so the array has to be
-  byte-identical across the calls meant to share a prefix. That is what the
-  offer floor is for: `ActiveToolsStore.commitTurnStartContract` commits the
-  array once at turn start, inside one file lock, never mid-turn, and holds it
-  stable through a conversation burst. One changed schema byte costs the whole
-  prefix. See [Tool loading: the contract](TOOL_LOADING.md).
-- **Other providers:** NativeAgent preserves the same stable-first request
-  shape, but cache availability, retention, pricing, and telemetry remain a
-  capability of the selected provider.
-
-A prompt-cache hit does not make the agent stale. Only the unchanged prefix is
-reused. The selected Fluid Context, recalled memory, conversation tail,
-subconscious capsule, current message, and new tool results remain current.
-Prompt caching also does not shrink the model's context window by itself; the
-bounded selection, lazy loading, history policy, and compaction do that.
-
-#### How NativeAgent avoids breaking the cache
-
-Provider prefix caches match exact request content and order. A harmless-looking
-timestamp, reordered schema, or changing sentence near the front can turn the
-rest of the request into full-price uncached input. NativeAgent protects the
-prefix at several boundaries:
-
-1. **One canonical stable/dynamic split.** Persona, natural-expression
-   guidance, REM-approved pins, and the current lazy-tool contract precede
-   per-turn recall and history. A session digest that once changed the stable
-   block across sessions now lives at the head of the dynamic block.
-2. **Byte-faithful provider encoding.** The split is a cache-layout hint, not
-   a prompt rewrite. Before using separate blocks, an adapter verifies that
-   they reassemble into the exact combined prompt. A mismatch falls back to
-   the original combined request rather than changing model-visible content.
-3. **One immutable Fluid Context generation per turn.** The selected generation
-   is leased through the complete model/tool loop. Mid-turn source changes
-   compile for a later turn instead of splicing new bytes into this one.
-4. **One context build across a text-compatible tool loop.** Later tool rounds
-   reuse the first round's prepared `TurnContext`; tool results append through
-   the conversation rather than causing persona, memory, capsule, and Fluid
-   Context to be rebuilt and reshuffled.
-5. **A pinned advertised tool set.** In the text-compatible lane, loading a
-   tool does not silently grow the cacheable tool catalog halfway through the
-   turn. The `tool_load` result carries the newly loaded schemas for immediate
-   use, while the dispatcher still rereads canonical readiness at effect time.
-   A provider-native lane may intentionally refresh its tools array when that
-   array is the model's only valid tool-call channel. Across turns, the offer
-   floor is what holds the array byte-stable through a conversation burst on a
-   provider that caches on the whole array; see
-   [Tool loading: the contract](TOOL_LOADING.md).
-6. **A frozen turn clock.** Time remains accurate for the turn, but crossing a
-   minute boundary during a long tool loop cannot rewrite an earlier dynamic
-   block and invalidate the accumulated prefix.
-7. **Append-only tool conversation.** Each assistant tool request and bounded
-   tool result is appended. Supported Anthropic requests mark the current and,
-   when useful, previous request boundaries so the next round can read the
-   established prefix and create only the new delta.
-8. **No speculative cache writes for one-shot work.** The Anthropic API-key
-   adapter omits its combined-system cache breakpoint for an unbound one-shot
-   call when a later read is unlikely, preventing a write premium with no
-   expected payoff.
-
-These protections matter most on multi-step work. During implementation, one
-21-round tool turn repeatedly rebuilt changing context and produced **369,217
-cache-creation tokens**. After the tool catalog, clock, and complete turn
-context were stabilized, a five-round acceptance turn built context once and
-reported cache reads increasing from **0 → 13,650 → 15,023 → 15,805 → 17,049**
-tokens, while later rounds created only their small appended deltas.
-
-NativeAgent records `cacheReadInputTokens`,
-`cacheCreationInputTokens`, input/output tokens, time to first token, and a
-SHA-256 prompt fingerprint in its turn telemetry. This lets a cache hit or
-regression be measured rather than inferred from similar-looking prompts.
+Source: `ChatTurnRuntime/ChatOrchestration+TurnEngine.swift` and
+`ChatOrchestration+StreamingToolLoop.swift`.
 
 ## 5. The model answers or requests a tool
 
-If the model can answer from the supplied context, the turn may require only
-one provider call. If it requests a tool, NativeAgent enters a structured,
-bounded tool loop.
+A direct answer can finish after one provider call. An action request enters
+the tool loop:
 
-Every tool call crosses the real dispatcher:
+1. Resolve the `app` action and its underlying dispatch identity.
+2. Check current Trust policy, origin, file scope and domain requirements.
+3. Execute, refuse or wait for an exact approval.
+4. Return the result and available outcome evidence to the model.
 
-```mermaid
-flowchart LR
-    A["Model requests a tool"]
-    B["Resolve canonical tool identity"]
-    C["Check surface, TrustCenter, autonomy,<br/>file scope, and approval requirements"]
-    D["Dispatch through the domain owner"]
-    E["Verify outcome and write receipt"]
-    F["Return a bounded result to the model"]
+Full Mac gives Agent autonomy, including app actions otherwise marked User's.
+Explicit blocks and actual platform access still apply. macOS privacy
+permission resets ask the owner first. Peer-steered turns additionally card User
+for deletes and irreversible acts, sends in their name, persona writes and
+protected approvals.
+Authenticated turns from agents enabled in Trust → Connected agents carry
+User's authority and skip extra peer approvals; ordinary Trust and domain checks
+still apply.
 
-    A --> B --> C --> D --> E --> F
-```
+Parallel-safe calls may execute together; the dispatcher classifies the
+underlying action rather than treating every `app` call as a read.
+Provider-facing results are bounded. Oversized results can be retained behind
+a session-and-turn-scoped handle and read through `result.page`.
 
-Prompt text never grants authority. File and shell access, Mac control,
-connectors, notifications, external sends, and MCP servers retain their own
-effect-time gates. A protected action may pause on an approval card. Approval
-is bound to the exact action and does not become a general permission bypass.
+The loop handles cancellation, dispatch deadlines, protocol repair and
+no-progress detection. No schema-loading round is needed between iterations.
+A returned tool result records what that owner observed; it does not establish
+an unverified external effect.
 
-Independent read-only calls may run concurrently, while writes and effects stay
-ordered. Large results are bounded before returning to the provider; when
-possible, the complete redacted result is retained behind a turn-scoped paging
-handle. This prevents one large API response from consuming the model's entire
-window without discarding the agent's ability to inspect more.
-
-If the model calls `tool_load`, the newly authorized schemas are added before
-the next provider iteration in the same turn. The user does not need to send
-another message. Active session tools may remain available for later turns and
-expire through the canonical lifecycle rather than being forgotten at the end
-of every response.
-
-The loop has cancellation, dispatch deadlines, bounded retries, protocol
-repair, and no-progress detection. It preserves completed results and receipts
-when it stops; it does not claim an unverified external effect succeeded.
+Source: `ChatTurnRuntime/ChatOrchestration+ToolLoop.swift`,
+`ChatOrchestration+ToolDispatch.swift`,
+`ChatToolRuntime/ProviderToolResultRecovery.swift` and
+`TrustCenter/PeerTurnEffectPolicy.swift`.
 
 ## 6. The completed turn settles once
 
-When the model produces a final answer, NativeAgent:
+For a completed answer, structured chat commits cognitive presentation
+bookkeeping, persists the assistant row and generated attachments, starts that
+turn's deferred memory-promotion ticket, and emits terminal evidence. Promotion
+starts after the assistant row is durable and is not awaited on the reply's
+delivery path.
 
-- streams or delivers the answer through the originating surface;
-- commits the accepted cognitive presentation state;
-- writes the assistant message and generated attachments to the transcript;
-- records bounded tool evidence, the selected context provenance, provider
-  call count, timing, and terminal trace;
-- sends eligible after-turn observations to the existing MemoryV2 review and
-  cognition/organism pathways; and
-- publishes targeted session or transcript changes to connected displays such
-  as the iPhone companion.
+The Mac stream consumer joins the producer's persistence before settlement.
+Stream closure or a Stop request alone cannot prove completion: the lifecycle
+resolver uses the canonical transcript proof and typed terminal signal. An
+ambiguous outcome remains ambiguous.
 
-**Memory promotion happens after the assistant row, not in front of the reply.**
-When the turn completes, the engine captures what promotion will need — the user
-message, the assistant message, the tool dispatches, the session and surface,
-and the turn's own trace identity — under a fresh per-turn ticket, and returns.
-The assistant row is persisted before any memory work starts, and promotion
-starts right there: the reply is on its way out, not yet delivered, and nothing
-on the delivery path awaits it. The ticket rides home on the turn result, and a
-surface that wants the work finished may drain it after its own delivery
-milestone — Slack, Mac and iOS do not, and a started promotion completes on its
-own. Tickets are held in arrival order, capped, and promoted in turn order, so
-two overlapping turns cannot promote each other's material or start before their
-own row is durable. A turn whose append threw never starts its promotion at all.
-The accepted cost is one window: a process exit between the assistant append and
-the promotion finishing loses that turn's staged proposal — never a transcript
-row.
+`tools.contract` records the schemas actually sent. `turn.terminal`
+records the terminal reason, timing and dispatch/context evidence. These are
+receipts for the specific turn, not a general claim that every connected
+system is healthy.
 
-A turn's terminal is also what the rest of the system waits on. The durable
-terminal row is the signal behind the once-per-launch Doctor refresh, and a
-turn that was accepted and never reached a terminal is reconciled later rather
-than left open; see [Turn resilience map](TURN_RESILIENCE.md).
-
-An external protocol response is not automatically proof of completion. The
-domain that owns the action—GitHub, Browser, Mac Control, messaging, Desk, or
-another connector—owns verification. Ambiguous sends settle as unknown rather
-than being blindly replayed and potentially duplicated.
-
-## What is actually in memory?
-
-| Usually resident or immediately available | Loaded only when relevant |
-|---|---|
-| Current Fluid Context generation and selection index | Full files and long documents |
-| Required persona/document mirrors | Complete skill bodies not supplied to this turn |
-| Bounded memory and context projections | Live GitHub, mail, calendar, browser, or other connector data |
-| Compact tool and skill catalog | Inactive full tool schemas |
-| Tool registry, readiness, and policy metadata | Large tool results and turn-scoped result pages |
-| Current cognition and organism projection state | Artifact bodies and external project contents |
-| Recent session working state and current routing metadata | Cold semantic models or caches that are not already ready |
-
-The exact contents adapt to memory pressure and enabled features. The principle
-does not change: keep the map, indexes, and current working set close; fetch the
-full payload from its canonical owner only when needed.
-
-## Common turn shapes
-
-### Ordinary conversation
-
-Resident persona + relevant Fluid Context + bounded history → one model call →
-answer → transcript and continuity update.
-
-### Read-only connected work
-
-Turn plan prepares the relevant group → model calls a bounded read tool → result
-returns through the tool loop → model answers with evidence.
-
-### Protected action
-
-Model proposes an action → TrustCenter and the domain owner check it at effect
-time → an exact approval may be required → verified execution writes a receipt
-→ model reports the real outcome.
-
-### Large building task
-
-The agent stays the organizing mind and can hand focused work to a configured
-Codex, Claude Code, or OMP bridge session. The builder works in the explicitly
-selected project under the same workspace and Full Mac boundaries, returns a
-receipt/result, and can be resumed by conversation identity. Delegation does
-not create another memory or persona owner.
-
-### Background or Desk work
-
-The same provider, context, tool, trust, and receipt tissue is reused, but Desk
-or the background-loop owner supplies the bounded work packet. Already-finished
-durable work can be reconciled without another model call. New work still
-crosses current posture, policy, and resource gates.
-
-## Making NativeAgent your own
-
-A public installation fills this architecture with the owner's choices:
-
-- **Agent name and persona:** established during onboarding and stored in the
-  canonical persona documents.
-- **Provider and model:** selected independently for supported chat and task
-  surfaces without replacing the personality or memory system.
-- **Memory:** built from that user's conversations, explicit saves, corrections,
-  and reviewed proposals.
-- **Skills:** discovered compactly and loaded one procedure at a time; they
-  guide behavior but never grant authority.
-- **Workspace:** defaults to NativeAgent's local workspace and may expand to an
-  explicitly selected project only under the configured Full Mac policy.
-- **Connectors and devices:** connected by the owner with local credentials,
-  verified routes, and signed pairing where applicable.
-- **Subconscious and Organism:** optional continuity systems controlled from
-  Settings without changing the selected language model.
-
-The result is one persistent agent shaped by its owner—not a collection of
-hidden sub-agents. Persona and MemoryV2 remain authoritative; Fluid Context
-circulates what is relevant; cognition and organism state add bounded
-continuity; tools provide action; TrustCenter, approvals, receipts, and domain
-verification keep that action honest.
+Source: `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift`,
+`MacChatTurnStreamSettlement.swift` and `MacChatTurnLifecycle.swift`.
 
 ## Related reading
 
-- [NativeAgent Internal Workings](INTERNAL_WORKINGS.md)
-- [User and Agent Guide](USER_GUIDE.md)
-- [Capabilities](CAPABILITIES.md)
-- [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md)
-- [Tool loading: the contract](TOOL_LOADING.md)
-- [Turn resilience map](TURN_RESILIENCE.md)
-- [Fluid Context as built](build_plans/fluid-context-as-built-map.md)
-- [Organism Kernel](ORGANISM.md)
-- [Threat Model](threat-model.md)
-- [Data Bounds](data-bounds.md)
+Source paths above are under `Modules/NativeAgentCore/Sources/`.
+
+- [Internal Workings](INTERNAL_WORKINGS.md) — memory, action, growth and surfaces.
+- [Tool loading: the contract](TOOL_LOADING.md) — the one app interface.
+- [Turn resilience](TURN_RESILIENCE.md) — interrupted and incomplete turns.
+- [Automated systems](AUTOMATED_SYSTEMS.md) — work outside the foreground turn.
+- [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md) — source ownership.

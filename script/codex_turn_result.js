@@ -94,6 +94,8 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
   let sawTurnStart = false;
   let finalAgentMessage = "";
   let assistantMessage = "";
+  let observedAgentMessage = "";
+  const commentaryMessages = new Set();
   let toolActivityCount = 0;
   let completed = null;
   const connectorSink = { failures: [], seen: new Set(), occurrences: 0 };
@@ -141,8 +143,11 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
       // mcp_tool_call_end carries the connector reply, including the
       // schema-validation failures that arrive as an MCP success.
       if (payload.type === "mcp_tool_call_end") collectConnectorSchemaMismatch(payload, connectorSink);
-      if (payload.type === "agent_message" && payload.phase === "final_answer" && typeof payload.message === "string") {
-        finalAgentMessage = payload.message;
+      if (payload.type === "agent_message" && typeof payload.message === "string") {
+        observedAgentMessage = payload.message;
+        if (payload.phase === "final_answer") finalAgentMessage = payload.message;
+        else if (payload.phase === "commentary") commentaryMessages.add(payload.message.trim());
+        else if (payload.phase == null) assistantMessage = payload.message;
       } else if (payload.type === "task_complete" && payload.turn_id === turnId) {
         completed = taskCompleteResult(row, payload);
         currentTurnId = null;
@@ -163,7 +168,12 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
         for (const item of payload.content) {
           if (item && item.type === "output_text" && typeof item.text === "string") parts.push(item.text);
         }
-        if (parts.length > 0) assistantMessage = parts.join("\n");
+        if (parts.length > 0) {
+          observedAgentMessage = parts.join("\n");
+          if (payload.phase === "final_answer") finalAgentMessage = observedAgentMessage;
+          else if (payload.phase === "commentary") commentaryMessages.add(observedAgentMessage.trim());
+          else if (payload.phase == null) assistantMessage = observedAgentMessage;
+        }
       } else if (payload.type === "custom_tool_call_output" || payload.type === "function_call_output") {
         // exec-wrapped connector calls surface the same failure text here.
         collectConnectorSchemaMismatch(payload, connectorSink);
@@ -213,25 +223,29 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
         status: "in_flight",
         sawTurnStart,
         toolActivityCount,
-        hasMessage: Boolean((finalAgentMessage || assistantMessage || "").trim()),
+        hasMessage: Boolean((finalAgentMessage || assistantMessage || observedAgentMessage || "").trim()),
+        message: (finalAgentMessage || assistantMessage || observedAgentMessage || "").trim(),
         connectorDiagnostics: summarizeConnectorDiagnostics(connectorSink),
       };
     }
     return null;
   }
   const connectorDiagnostics = summarizeConnectorDiagnostics(connectorSink);
-  const message = (completed.lastAgentMessage || finalAgentMessage || assistantMessage || "").trim();
+  const lastAgentMessage = commentaryMessages.has(completed.lastAgentMessage.trim())
+    ? "" : completed.lastAgentMessage;
+  const legacyAssistantMessage = commentaryMessages.has(assistantMessage.trim()) ? "" : assistantMessage;
+  const message = (finalAgentMessage || lastAgentMessage || legacyAssistantMessage || "").trim();
+  const measuredToolActivityCount = sawTurnStart ? toolActivityCount : null;
+  const noWorkObserved = sawTurnStart ? toolActivityCount === 0 && !message && !observedAgentMessage.trim() : null;
   if (completed.status === "failed") {
-    // Three-state: true = we watched the whole turn and saw nothing execute
-    // (resend cannot stomp partial work); false = activity was observed;
-    // null = the file never showed this turn's task_started, so absence of
-    // observed activity proves nothing (rotated/truncated rollout).
-    const noWorkObserved = !sawTurnStart ? null : (toolActivityCount === 0 && !message);
+    // Three-state observation, never replay authority: true = no activity
+    // recorded after task_started; false = activity recorded; null = the
+    // file lacked task_started (rotated/truncated rollout).
     return {
       ...completed,
       message,
       rolloutPath,
-      toolActivityCount,
+      toolActivityCount: measuredToolActivityCount,
       noWorkObserved,
       connectorDiagnostics,
     };
@@ -242,11 +256,12 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
       status: "completed_without_reply",
       message,
       rolloutPath,
-      toolActivityCount,
+      toolActivityCount: measuredToolActivityCount,
+      noWorkObserved,
       connectorDiagnostics,
     };
   }
-  return { ...completed, message, rolloutPath, toolActivityCount, connectorDiagnostics };
+  return { ...completed, message, rolloutPath, toolActivityCount: measuredToolActivityCount, noWorkObserved, connectorDiagnostics };
 }
 
 function extractTurnResultFromTurn(turn, turnId, rolloutPath = null) {
@@ -256,7 +271,7 @@ function extractTurnResultFromTurn(turn, turnId, rolloutPath = null) {
         && typeof item.text === "string" && item.text.trim() !== "")
     : [];
   const final = [...messages].reverse().find((item) => item.phase === "final_answer")
-    || messages[messages.length - 1];
+    || [...messages].reverse().find((item) => item.phase == null);
   const message = final ? final.text.trim() : "";
   const completedAt = Number.isFinite(turn.completedAt)
     ? new Date(Number(turn.completedAt) * 1000).toISOString()

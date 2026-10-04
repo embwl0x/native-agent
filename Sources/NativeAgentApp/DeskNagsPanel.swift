@@ -54,7 +54,7 @@ struct DeskNagsPanel: View {
             // The honest state line, including the "armed but silent" case —
             // a lane switched on under a global OFF pings nothing, and letting
             // User believe otherwise is the one failure this panel must not have.
-            Text(DeskNagPanelModel.summary(config, lanes: lanes, now: Date()))
+            Text(DeskNagPanelModel.summary(config, items: items, now: Date()))
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

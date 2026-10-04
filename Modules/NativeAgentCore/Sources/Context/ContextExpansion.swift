@@ -10,6 +10,7 @@ public struct ContextExpansionConfiguration: Equatable, Sendable {
 
 public enum ContextExpansionError: Error, Equatable, Sendable {
     case invalidCharacterLimit
+    case invalidCharacterOffset
     case requestedGenerationMismatch(requested: Int64, actual: Int64)
     case pointerGenerationMismatch(pointer: Int64, generation: Int64)
     case snapshotGenerationMismatch(snapshot: Int64, generation: Int64)
@@ -58,6 +59,7 @@ public struct ContextExpansionReceipt: Codable, Equatable, Sendable {
     public let origin: ContextOriginClass
     public let sourceRange: ContextSourceRange
     public let characterLimit: Int
+    public let characterOffset: Int
     public let fullCharacterCount: Int
     public let returnedCharacterCount: Int
     public let returnedUTF8ByteCount: Int
@@ -71,6 +73,9 @@ public struct ContextExpansionResult: Codable, Equatable, Sendable {
 
     public var characterCount: Int { receipt.returnedCharacterCount }
     public var truncated: Bool { receipt.truncated }
+    public var nextOffset: Int? {
+        receipt.truncated ? receipt.characterOffset + receipt.returnedCharacterCount : nil
+    }
 }
 
 /// Resolves a selector-issued, on-demand pointer without mutating context state
@@ -82,21 +87,22 @@ public struct ContextExpander: Sendable {
         self.configuration = configuration
     }
 
-    /// - Parameter offeredTruncationAtomIDs: the atom ids this turn's packet
-    ///   actually published as expandable. It is the CALLER's packet, so the
-    ///   caller supplies it; the expander will not infer it. Empty (the
-    ///   default) means no truncation pointers were offered, so only genuine
-    ///   `.onDemand` atoms expand — which is every pre-existing caller.
+    /// - Parameter offeredSelectedItems: selected representations whose
+    ///   pointers this turn's packet offered. Empty admits only `.onDemand`.
     public func expand(
         _ pointer: ContextAtomPointer,
         for need: NeedSignal,
         from generation: ContextStoredGeneration,
         pinnedTo snapshot: ContextGenerationSnapshot? = nil,
         maximumCharacters requestedMaximum: Int? = nil,
-        offeredTruncationAtomIDs: Set<ContextAtomID> = []
+        offset: Int = 0,
+        offeredSelectedItems: [ContextPacketItem] = []
     ) throws -> ContextExpansionResult {
         if let requestedMaximum, requestedMaximum <= 0 {
             throw ContextExpansionError.invalidCharacterLimit
+        }
+        guard offset >= 0 else {
+            throw ContextExpansionError.invalidCharacterOffset
         }
         let characterLimit = min(requestedMaximum ?? configuration.maximumCharacters,
                                  configuration.maximumCharacters)
@@ -184,30 +190,16 @@ public struct ContextExpander: Sendable {
         guard source.health != .removed else {
             throw ContextExpansionError.sourceRemoved(source.descriptor.id)
         }
-        // Two ways an atom is expandable, and only two.
-        //
-        //  1. `.onDemand` — the classic lazy pointer, selected as a pointer and
-        //     never as a body.
-        //  2. A SELECTED atom whose body THIS TURN's packet actually offered as
-        //     a truncation pointer.
-        //
-        // Case 2 requires BOTH halves, and the offered set is the load-bearing
-        // one. Authorizing on the recomputed `body.count > threshold` predicate
-        // alone would let any caller expand any long atom in the generation by
-        // handing over a hand-built pointer — the atom would never have been
-        // selected, never rendered, never offered, and the packet's bound would
-        // have bought nothing. Membership is what ties the expansion to a
-        // pointer the model was actually shown. The threshold check stays as
-        // the second half: it is what makes the offer legible as truncation
-        // rather than a general expansion grant.
-        //
-        // `.neverInject` stays refused either way: truncation never converts a
-        // withheld atom into a readable one.
-        let truncatedInPacket = offeredTruncationAtomIDs.contains(atom.draft.id)
-            && need.packetAtomExpandThresholdChars > 0
-            && atom.draft.injectionPolicy != .neverInject
-            && atom.draft.body.count > need.packetAtomExpandThresholdChars
-        guard atom.draft.injectionPolicy == .onDemand || truncatedInPacket else {
+        // Admission follows the offered representation, not the full body's
+        // length: a short summary can omit a body below the render threshold.
+        let omittedInPacket = atom.draft.injectionPolicy != .neverInject
+            && offeredSelectedItems.contains { item in
+                item.pointer == pointer
+                    && (item.representation == .deterministicSummary
+                        || (need.packetAtomExpandThresholdChars > 0
+                            && item.text.count > need.packetAtomExpandThresholdChars))
+            }
+        guard atom.draft.injectionPolicy == .onDemand || omittedInPacket else {
             throw ContextExpansionError.atomNotExpandable(policy: atom.draft.injectionPolicy)
         }
         guard source.descriptor.injectionPolicy != .neverInject else {
@@ -276,11 +268,14 @@ public struct ContextExpander: Sendable {
         }
 
         let fullCharacterCount = atom.draft.body.count
-        let text = String(atom.draft.body.prefix(characterLimit))
+        guard offset <= fullCharacterCount else {
+            throw ContextExpansionError.invalidCharacterOffset
+        }
+        let text = String(atom.draft.body.dropFirst(offset).prefix(characterLimit))
         let returnedCharacterCount = text.count
-        let truncated = returnedCharacterCount < fullCharacterCount
+        let truncated = offset + returnedCharacterCount < fullCharacterCount
         let receiptID = ContextStableID.digest(parts: [
-            "context-expansion-v1",
+            "context-expansion-v2",
             need.deterministicFingerprint,
             String(generationID),
             generation.generation.sourceFingerprint,
@@ -290,6 +285,7 @@ public struct ContextExpander: Sendable {
             String(pointer.sourceRange.utf8Start),
             String(pointer.sourceRange.utf8End),
             String(characterLimit),
+            String(offset),
             String(returnedCharacterCount),
         ])
         let receipt = ContextExpansionReceipt(
@@ -302,6 +298,7 @@ public struct ContextExpander: Sendable {
             origin: need.origin,
             sourceRange: atom.draft.sourceRange,
             characterLimit: characterLimit,
+            characterOffset: offset,
             fullCharacterCount: fullCharacterCount,
             returnedCharacterCount: returnedCharacterCount,
             returnedUTF8ByteCount: text.utf8.count,

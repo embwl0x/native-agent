@@ -174,8 +174,11 @@ extension NativeClient {
             ])
 
         case "tool.lazy.index":
-            let tools = try await ToolsFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).listAuthored()
-            let capabilities = try await TrustFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).loadCapabilities()
+            let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let tools = try await ToolsFacade(dataRoot: root).listAuthored()
+            let capabilities = try await TrustFacade(dataRoot: root, connectorActionStatuses: {
+                try await Self.checkedConnectorActionStatuses(root: root)
+            }).loadCapabilities()
             return .object([
                 "actionId": .string(id),
                 "toolCount": .int(Int64(tools.count)),

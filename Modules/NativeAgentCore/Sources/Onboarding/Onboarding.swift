@@ -984,6 +984,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
 
         do {
             try FileManager.default.removeItem(at: manifestPath)
+            try SwiftNativePersistenceCore.syncDirectory(manifestPath.deletingLastPathComponent())
         } catch {
             throw OnboardingError.ioFailure("clear onboarding transaction failed: \(error.localizedDescription)")
         }
@@ -1170,6 +1171,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
 
         do {
             try FileManager.default.removeItem(at: resetTransactionManifestPath)
+            try SwiftNativePersistenceCore.syncDirectory(resetTransactionManifestPath.deletingLastPathComponent())
         } catch {
             throw OnboardingError.ioFailure(
                 "clear onboarding reset transaction failed: \(error.localizedDescription)"
@@ -1289,9 +1291,11 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         fileManager fm: FileManager
     ) -> Bool {
         if fm.fileExists(atPath: targets["sentinel"]!.path) { return true }
-        return ["soul", "voice", "user", "growth"].allSatisfy {
-            fm.fileExists(atPath: targets[$0]!.path)
-        }
+        return NativeAgentPublicSafety.hasLegacyCompletionAnchor(
+            personaRoot: targets["soul"]!.deletingLastPathComponent(),
+            profileURL: targets["profile"]!,
+            allowMissingProfile: true
+        )
     }
 
     private static func expectedTargetURLs(
@@ -1460,6 +1464,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                     "reset backup \(backup.lastPathComponent) changed outside the pending transaction"
                 )
             }
+            try SwiftNativePersistenceCore.syncDirectory(backup.deletingLastPathComponent())
             return
         }
         try atomicWriteData(intended, to: backup)
@@ -1475,7 +1480,10 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         _ intent: OnboardingResetTargetIntent,
         at source: URL
     ) throws {
-        guard FileManager.default.fileExists(atPath: source.path) else { return }
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            try SwiftNativePersistenceCore.syncDirectory(source.deletingLastPathComponent())
+            return
+        }
         let current: Data
         do {
             current = try Data(contentsOf: source)
@@ -1491,6 +1499,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         }
         do {
             try FileManager.default.removeItem(at: source)
+            try SwiftNativePersistenceCore.syncDirectory(source.deletingLastPathComponent())
         } catch {
             throw OnboardingError.ioFailure(
                 "remove \(source.lastPathComponent) during reset failed: \(error.localizedDescription)"
@@ -1506,7 +1515,10 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         at path: URL,
         label: String
     ) throws {
-        guard FileManager.default.fileExists(atPath: path.path) else { return }
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            try SwiftNativePersistenceCore.syncDirectory(path.deletingLastPathComponent())
+            return
+        }
         guard let expectedSHA256 else {
             throw OnboardingError.ioFailure("\(label) appeared outside the pending reset transaction")
         }
@@ -1521,6 +1533,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         }
         do {
             try FileManager.default.removeItem(at: path)
+            try SwiftNativePersistenceCore.syncDirectory(path.deletingLastPathComponent())
         } catch {
             throw OnboardingError.ioFailure(
                 "remove \(label) during reset failed: \(error.localizedDescription)"
@@ -1592,7 +1605,10 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                 throw OnboardingError.ioFailure("read \(path.lastPathComponent) during onboarding recovery failed")
             }
             let currentHash = sha256(current)
-            if currentHash == intent.sha256 { return }
+            if currentHash == intent.sha256 {
+                try SwiftNativePersistenceCore.syncDirectory(path.deletingLastPathComponent())
+                return
+            }
             guard let base = intent.baseSHA256, currentHash == base else {
                 throw OnboardingError.ioFailure("\(path.lastPathComponent) changed outside the pending onboarding transaction")
             }
@@ -1628,9 +1644,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         }
     }
 
-    /// Crash-safe atomic write mirroring Python `_atomic_write_text` at
-    /// the retired daemon: write to `.<name>.<pid>.<rand>.tmp`, fsync,
-    /// rename(2), chmod 0600.
+    /// Durable private write shared with the other canonical stores.
     static func atomicWriteText(_ content: String, to path: URL) throws {
         try atomicWriteData(Data(content.utf8), to: path)
     }
@@ -1639,61 +1653,11 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
     /// normally UTF-8, but reset is a safety operation and must preserve the
     /// exact bytes it found rather than normalizing invalid or legacy text.
     static func atomicWriteData(_ data: Data, to path: URL) throws {
-        let dir = path.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let name = path.lastPathComponent
-        let pid = getpid()
-        let rand = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "").prefix(8)
-        let tmpName = ".\(name).\(pid).\(rand).tmp"
-        let tmpPath = dir.appendingPathComponent(String(tmpName))
-
-        let fd = open(tmpPath.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-        if fd < 0 {
-            throw OnboardingError.ioFailure("open(tmp) failed: \(String(cString: strerror(errno)))")
+        do {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
+        } catch {
+            throw OnboardingError.ioFailure("write \(path.lastPathComponent) failed: \(error.localizedDescription)")
         }
-        // Mirror PersistenceCore.atomicWrite: tmp file is unlinked on any
-        // error path before rename succeeds; close failures are escalated so
-        // a buffer flush error never silently survives into the renamed file.
-        // GOTCHA: GPT-5.5 review caught the original port ignoring close(2)
-        // failure — a late writeback error could still rename a partially-
-        // written file into place looking like a success.
-        var fdClosed = false
-        var didRename = false
-        defer {
-            if !fdClosed { _ = close(fd) }
-            if !didRename { _ = unlink(tmpPath.path) }
-        }
-        let bytes = Array(data)
-        var written = 0
-        while written < bytes.count {
-            let n = bytes.withUnsafeBufferPointer { bp -> Int in
-                Darwin.write(fd, bp.baseAddress!.advanced(by: written), bp.count - written)
-            }
-            if n < 0 {
-                if errno == EINTR { continue }
-                let err = String(cString: strerror(errno))
-                throw OnboardingError.ioFailure("write(tmp) failed: \(err)")
-            }
-            written += n
-        }
-        if fsync(fd) != 0 {
-            let err = String(cString: strerror(errno))
-            throw OnboardingError.ioFailure("fsync(tmp) failed: \(err)")
-        }
-        if close(fd) != 0 {
-            // Some filesystems defer write errors until close() — escalate so
-            // the rename never commits a half-written file.
-            let err = String(cString: strerror(errno))
-            fdClosed = true  // already closed by failing close(); avoid double-close in defer
-            throw OnboardingError.ioFailure("close(tmp) failed: \(err)")
-        }
-        fdClosed = true
-        if rename(tmpPath.path, path.path) != 0 {
-            let err = String(cString: strerror(errno))
-            throw OnboardingError.ioFailure("rename failed: \(err)")
-        }
-        didRename = true
-        _ = chmod(path.path, 0o600)
     }
 
     private struct ProfileUpdatePlan: Sendable {
@@ -1793,7 +1757,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             "creativity": p.traits.creativity,
             "brevity": p.traits.brevity,
         ]
-        return [
+        var out: [String: Any] = [
             "schemaVersion": p.schemaVersion,
             "personaEngineVersion": p.personaEngineVersion,
             "name": p.name,
@@ -1809,6 +1773,10 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             "surfaceOverrides": p.surfaceOverrides,
             "updatedAt": p.updatedAt,
         ]
+        for (key, value) in p.extras where out[key] == nil {
+            out[key] = value.foundationValue
+        }
+        return out
     }
 
     /// Best-effort read of `<dataRoot>/memory/profile.json` → `name` field.
@@ -1909,15 +1877,6 @@ extension JSONValue {
 
     private static func fromAny(_ value: Any) throws -> JSONValue {
         if value is NSNull { return .null }
-        if let b = value as? Bool { return .bool(b) }
-        if let i = value as? Int { return .int(Int64(i)) }
-        if let i = value as? Int64 { return .int(i) }
-        if let d = value as? Double {
-            // Match the integer-vs-double semantics of Python's json: a Double
-            // whose fractional part is zero is still emitted as a float
-            // (e.g. `0.45`). We preserve doubles as doubles.
-            return .double(d)
-        }
         if let n = value as? NSNumber {
             // Disambiguate Bool from numeric NSNumber.
             if CFGetTypeID(n) == CFBooleanGetTypeID() { return .bool(n.boolValue) }

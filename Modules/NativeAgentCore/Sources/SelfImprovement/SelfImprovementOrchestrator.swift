@@ -5,15 +5,6 @@ import PersistenceCore
 
 // MARK: - Result shapes
 
-public struct SnapshotResult: Sendable, Codable, Equatable {
-    public var ok: Bool
-    public var runId: String
-    public var error: String?
-    public init(ok: Bool, runId: String, error: String? = nil) {
-        self.ok = ok; self.runId = runId; self.error = error
-    }
-}
-
 public struct PromoteOpResult: Sendable, Codable, Equatable {
     public var ok: Bool
     public var runId: String
@@ -116,20 +107,6 @@ public actor SelfImprovementOrchestrator {
         pending[id] = run
         try await persistPending()
         return run
-    }
-
-    public func snapshot(runId: String) async throws -> SnapshotResult {
-        let (ok, reason) = selfImprovementAvailable()
-        if !ok { return SnapshotResult(ok: false, runId: runId, error: reason) }
-        try await rehydrateIfNeeded()
-        guard var run = pending[runId] else {
-            return SnapshotResult(ok: false, runId: runId, error: "not_found")
-        }
-        run.phase = "snapshotted"
-        run.status = "staged"
-        pending[runId] = run
-        try await persistPending()
-        return SnapshotResult(ok: true, runId: runId)
     }
 
     public func promote(runId: String) async throws -> PromoteOpResult {
@@ -309,18 +286,6 @@ public actor SelfImprovementOrchestrator {
         return Array(pending.values).sorted { ($0.createdAt ?? "") < ($1.createdAt ?? "") }
     }
 
-    /// Zero-arg wrapper for BackgroundLoopsManager.runTickOnce(loopId: "self_improvement_sweep").
-    public func runSweepOnce() async {
-        do {
-            let report = try await sweep()
-            if !report.ok {
-                FileHandle.standardError.write(Data("self_improvement_sweep: disabled (\(report.error ?? "unknown"))\n".utf8))
-            }
-        } catch {
-            FileHandle.standardError.write(Data("self_improvement_sweep: error \(error)\n".utf8))
-        }
-    }
-
     // MARK: - Internals
 
     private func pendingPath() -> URL {
@@ -340,8 +305,10 @@ public actor SelfImprovementOrchestrator {
         let raw = try await persistence.withFileLock(path) { [persistence] in
             try await persistence.readJSON(path, ifMissing: .array([]))
         }
+        guard case .array(let arr) = raw else {
+            throw SelfImprovementError.underlying("pending_actions.json is not an array; mutation was refused.")
+        }
         rehydrated = true
-        guard case .array(let arr) = raw else { return }
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         for entry in arr {
@@ -361,7 +328,7 @@ public actor SelfImprovementOrchestrator {
             NSLog("SelfImprovementOrchestrator: preserving %d undecodable pending_actions entrie(s) verbatim through rewrites",
                   undecodedPending.count)
         }
-        await expireStalePendingActions()
+        if expireStalePendingActions() { try await persistPending() }
     }
 
     /// U5 W-G (2026-06-11): pending_actions.json entries never expired —
@@ -371,7 +338,8 @@ public actor SelfImprovementOrchestrator {
     /// log exactly what was dropped — no silent eviction.
     private static let pendingActionExpirySeconds: TimeInterval = 14 * 86_400
 
-    private func expireStalePendingActions() async {
+    @discardableResult
+    private func expireStalePendingActions() -> Bool {
         let cutoff = Date().addingTimeInterval(-Self.pendingActionExpirySeconds)
         let fmt = ISO8601DateFormatter()
         var expiredIds: [String] = []
@@ -384,19 +352,15 @@ public actor SelfImprovementOrchestrator {
                 pending.removeValue(forKey: id)
             }
         }
-        guard !expiredIds.isEmpty else { return }
+        guard !expiredIds.isEmpty else { return false }
         NSLog("SelfImprovementOrchestrator: expired %d pending_actions entrie(s) past %dd retention: %@",
               expiredIds.count, Int(Self.pendingActionExpirySeconds / 86_400),
               expiredIds.joined(separator: ", "))
-        do {
-            try await persistPending()
-        } catch {
-            NSLog("SelfImprovementOrchestrator: failed to persist pending_actions expiry: %@",
-                  String(describing: error))
-        }
+        return true
     }
 
     private func persistPending() async throws {
+        expireStalePendingActions()
         let runs = Array(pending.values).sorted { ($0.createdAt ?? "") < ($1.createdAt ?? "") }
         let encoder = JSONEncoder()
         var entries: [JSONValue] = runs.compactMap { run in

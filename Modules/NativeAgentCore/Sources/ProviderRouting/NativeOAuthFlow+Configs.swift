@@ -114,6 +114,12 @@ struct ProviderOAuthConfig: @unchecked Sendable {
             // The app-owned candidate precedes the shared one in resolution,
             // so freshly written tokens win on the next turn.
             let authPath = NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot)
+            guard !OpenAIOAuthDirectAdapter.isUserCodexPath(authPath) else {
+                throw NSError(
+                    domain: "NativeOAuthFlow", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "ChatGPT sign-in cannot write to the shared Codex CLI folder."]
+                )
+            }
             try ProviderStateValidation.credential(tokens)
             try NativeOAuthSupport.updateProviderCredential(at: authPath) { existing in
                 if existing["auth_mode"] == nil { existing["auth_mode"] = "chatgpt" }

@@ -7,6 +7,7 @@ import Context
 import DreamREMCycle
 import NativeAgentCore
 import PersonaEngine
+import MemoryV2
 import PersistenceCore
 import Desk
 import ProviderRouting
@@ -334,6 +335,7 @@ extension NativeCognitionRuntime {
                 .value(snapshot.preferences, request.surface)?.model
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !resolved.isEmpty else {
+                await substrate.releaseReflectionReservation(request: request)
                 await substrate.recordReceipt(
                     kind: "reflection.model_unresolved",
                     payload: .object(["surface": .string(request.surface)])
@@ -342,6 +344,7 @@ extension NativeCognitionRuntime {
             }
             routedModel = resolved
         } catch {
+            await substrate.releaseReflectionReservation(request: request)
             await substrate.recordReceipt(
                 kind: "reflection.routing_unavailable",
                 payload: .object([
@@ -450,7 +453,12 @@ extension NativeCognitionRuntime {
         let persona = cognitionPersonaEngine()
         let packet: PersonalityPacket
         do {
-            packet = try await PersonaCompiler(engine: persona).compile(surface: surface)
+            let userMemoryCore = MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot)
+                ? await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
+                : []
+            packet = try await PersonaCompiler(engine: persona).compile(
+                surface: surface, userMemoryCore: userMemoryCore
+            )
         } catch {
             throw CognitiveReflectionPersonaError.compileFailed(String(describing: error))
         }

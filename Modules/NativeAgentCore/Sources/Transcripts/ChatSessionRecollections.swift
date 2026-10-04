@@ -104,6 +104,75 @@ public enum ChatSessionRecollections {
 
     /// `metadata.kind` marking a transcript row as a consolidated recollection.
     public static let rowKind = "compaction_summary"
+    package static let continuityProvenanceKey = "continuity_provenance"
+
+    package static func continuityProvenance(for rows: [JSONValue]) -> JSONValue {
+        var provenance: JSONValue?
+        for row in rows {
+            guard case .object(let fields) = row,
+                  case .string(let role)? = fields["role"] else { return .null }
+            let metadata: [String: JSONValue]?
+            if case .object(let value)? = fields["metadata"] { metadata = value }
+            else { metadata = nil }
+            guard ["user", "assistant"].contains(role) || metadata?["kind"] == .string(rowKind) else { continue }
+            guard let binding = continuityBinding(role: role, metadata: metadata) else { return .null }
+            if let provenance, provenance != binding { return .null }
+            provenance = binding
+        }
+        return provenance ?? .null
+    }
+
+    package static func admitsContinuity(
+        role: String,
+        metadata: [String: JSONValue]?,
+        participant: String,
+        source: String?,
+        scope: String?
+    ) -> Bool {
+        guard ["user", "assistant"].contains(role) || metadata?["kind"] == .string(rowKind) else { return true }
+        guard let actual = continuityBinding(role: role, metadata: metadata),
+              let expected = continuityBinding(participant: participant, source: source, scope: scope) else { return false }
+        return actual == expected
+    }
+
+    private static func continuityBinding(role: String, metadata: [String: JSONValue]?) -> JSONValue? {
+        guard let metadata, metadata["origin"] == nil else { return nil }
+        if metadata["kind"] == .string(rowKind) {
+            guard case .object(let recorded)? = metadata[continuityProvenanceKey],
+                  let participant = continuityString(recorded["participant"]),
+                  let binding = continuityBinding(
+                    participant: participant,
+                    source: continuityString(recorded["source"]),
+                    scope: continuityString(recorded["scope"])),
+                  binding == .object(recorded) else { return nil }
+            return binding
+        }
+        guard role != "user" || metadata["mechanicalKind"] == nil,
+              case .object(let envelope)? = metadata["envelope"],
+              envelope["agent"] == nil,
+              let surface = continuityString(envelope["surface"]) else { return nil }
+        if ["app", "chat", "mac", "default", "ios", "mobile", "iphone", "icloud"].contains(surface) {
+            return continuityBinding(participant: "local_operator", source: nil, scope: nil)
+        }
+        guard let user = continuityString(envelope["userId"]), !user.isEmpty,
+              let chat = continuityString(envelope["chatId"]) else { return nil }
+        return continuityBinding(
+            participant: surface + ":" + user,
+            source: surface,
+            scope: chat + "\u{1F}" + (continuityString(envelope["threadId"]) ?? ""))
+    }
+
+    private static func continuityBinding(participant: String, source: String?, scope: String?) -> JSONValue? {
+        if participant == "local_operator" { return .object(["participant": .string(participant)]) }
+        guard !participant.isEmpty, let source, !source.isEmpty, let scope, !scope.isEmpty else { return nil }
+        return .object(["participant": .string(participant), "source": .string(source), "scope": .string(scope)])
+    }
+
+    private static func continuityString(_ value: JSONValue?) -> String? {
+        guard case .string(let text)? = value else { return nil }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// `metadata` keys the writer stamps so a reader can tell WHICH stretch of
     /// life a recollection stands for without re-reading the backup.
     public static let coversFromKey = "covers_from"

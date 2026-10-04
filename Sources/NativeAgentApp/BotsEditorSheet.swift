@@ -226,7 +226,7 @@ struct BotsEditorSheet: View {
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .joined(separator: "\n\n")
         provider = bot.provider ?? ""; model = bot.model ?? ""; think = bot.reasoningEffort ?? ""; fast = bot.fast
-        tokens = String(bot.budget.tokens); seconds = String(Int(bot.budget.seconds)); daily = bot.dailyTokenCeiling.map(String.init) ?? ""
+        tokens = String(bot.budget.tokens); seconds = String(bot.budget.seconds); daily = bot.dailyTokenCeiling.map(String.init) ?? ""
         tell = bot.notificationCondition != nil; condition = bot.notificationCondition ?? ""
         if let trigger = bot.eventTrigger {
             eventSource = trigger.source; eventFilter = trigger.filter; eventKeyword = trigger.keyword ?? ""

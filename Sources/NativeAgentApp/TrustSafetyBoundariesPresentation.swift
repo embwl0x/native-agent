@@ -39,7 +39,7 @@ enum TrustSafetyBoundariesPresentation {
                 fileAccessRow(accessMode: accessMode),
                 toolsRow(policy.toolPolicy),
                 externalSendRow(policy.connectorPolicy, fullMacActive: AppModel.fullMacGrantIsActive(policy)),
-                macControlRow(policy.macControlPolicy),
+                macControlRow(TrustGuardrailSummary.effectiveMacControlPolicy(policy)),
                 receiptsRow(policy.workshopPolicy),
             ],
             unavailableMessage: nil
@@ -119,7 +119,7 @@ enum TrustSafetyBoundariesPresentation {
         if fullMacActive {
             return TrustSafetyBoundaryRow(
                 id: "external_send", title: "External messages",
-                detail: "Admitted Full Mac actions can send messages without an additional app approval. Your connected accounts' own limits still apply, and requests from other assistants still need your permission.",
+                detail: "Admitted Full Mac actions can send messages without an additional app approval. Your connected accounts' own limits still apply. Agents you enabled in Trust inherit your authority. Other agents do not, and their requests can require approval.",
                 systemImage: "paperplane.fill", tone: .caution
             )
         }

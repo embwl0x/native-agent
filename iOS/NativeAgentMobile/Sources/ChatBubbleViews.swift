@@ -216,7 +216,7 @@ struct InlineChatApprovalCard: View {
                 .font(.body.weight(.semibold))
                 .foregroundStyle(AlivePalette.text)
                 .lineLimit(2)
-            if let reason = approval.reason.map(ApprovalText.readable), !reason.isEmpty {
+            if let reason = ApprovalText.reason(approval), !reason.isEmpty {
                 Text(reason)
                     .font(.subheadline)
                     .foregroundStyle(AlivePalette.secondary)
@@ -386,14 +386,9 @@ struct ToolActivityView: View {
         }
     }
 
-    /// "calendar_read" reads as "Calendar read": the tool's own name, in
-    /// sentence case, not an identifier.
+    /// The same friendly tool phrases as Mac and Telegram.
     static func plainName(_ raw: String) -> String {
-        let spaced = raw.replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-            .trimmingCharacters(in: .whitespaces)
-        guard let first = spaced.first else { return raw }
-        return first.uppercased() + spaced.dropFirst()
+        ToolActivityPresentation.title(raw)
     }
 
     /// "Used 3 tools ›": one quiet line; tap to see which.

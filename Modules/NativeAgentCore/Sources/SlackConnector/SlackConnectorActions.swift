@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 
 public enum SlackConnectorActions {
+    public static let credentialKeys = ["access_token", "oauth_token", "token", "bot_token"]
     private static let baseURL = URL(string: "https://slack.com/api")!
     static let jsonContentType = "application/json; charset=utf-8"
 
@@ -422,7 +423,7 @@ public enum SlackConnectorActions {
             // derivation. Older imports and connector-local auth stores can use
             // `oauth_token` or `token`; reporting those credentials connected
             // while the sender rejects them creates a false-ready surface.
-            for key in ["access_token", "oauth_token", "token"] {
+            for key in credentialKeys {
                 guard let token = object[key] as? String else { continue }
                 let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { return trimmed }
@@ -450,8 +451,8 @@ public enum SlackConnectorActions {
             let fix: String? = switch error {
             case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The Slack token no longer works; reconnect Slack in Connectors."
             case "missing_scope": "The Slack app lacks the scope \((response["needed"] as? String) ?? "this needs"); add it in the Slack app settings and reconnect."
-            case "not_allowed_token_type": "Slack search is unavailable with the connected bot token."
-            case "channel_not_found": "No channel by that name or id; slack_list_channels shows them."
+            case "not_allowed_token_type": "Slack search requires a user token; bot tokens cannot search. Connect user OAuth with search:read for search. For channel reads, keep using the existing bot token."
+            case "channel_not_found": "No channel by that name or id; app {action:\"slack.channels\"} shows them."
             case "not_in_channel": "The bot isn't in that channel; invite it there with /invite first."
             case "ratelimited": "Slack is rate limiting; wait a minute before trying again."
             default: nil

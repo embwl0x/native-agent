@@ -345,13 +345,15 @@ final class MemoryStore: ObservableObject {
         self.syncErrorProvider = syncErrorProvider
     }
 
-    func refresh() async {
+    func refresh(preservingActionError: Bool = false) async {
         isLoading = true
-        error = nil
+        if !preservingActionError { error = nil }
         await refreshMemorySnapshot()
         let sync = iCloudSyncEngine.shared
         applySyncedState(from: sync)
-        error = MemoryErrorLinePresentation.visibleMessage(syncErrorProvider())
+        if !preservingActionError || error == nil {
+            error = MemoryErrorLinePresentation.visibleMessage(syncErrorProvider())
+        }
         isLoading = false
     }
 
@@ -401,7 +403,7 @@ final class MemoryStore: ObservableObject {
                         try await iCloudSyncEngine.shared.rejectMemoryProposal(proposalId: proposalID)
                     }
                 },
-                refresh: { await self.refresh() }
+                refresh: { await self.refresh(preservingActionError: true) }
             )
         }
     }
@@ -462,7 +464,7 @@ final class MemoryStore: ObservableObject {
                 // keep the row invisibly suppressed forever.
                 self.hiddenDeletedMemoryIDs.remove(memory.id)
             }
-            await refresh()
+            await refresh(preservingActionError: true)
             if deleteConfirmed,
                iCloudSyncEngine.shared.memories.contains(where: { $0.id == memory.id }) {
                 self.error = "Delete recorded; waiting for Mac/iCloud to remove this memory."
@@ -721,7 +723,6 @@ struct MemoryProposalRow: View {
                     .font(.system(.title3, design: .serif))
                     .foregroundStyle(AlivePalette.text)
                     .lineSpacing(3)
-                    .lineLimit(4)
                     .fixedSize(horizontal: false, vertical: true)
                 Text(MemoryWords.meta(kind: MemoryWords.kind(proposal.layer),
                                       pinned: false,

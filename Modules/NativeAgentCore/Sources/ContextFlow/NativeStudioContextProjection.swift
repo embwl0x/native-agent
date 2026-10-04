@@ -1,6 +1,7 @@
 import Context
 import Foundation
 import MemoryV2
+import NativeAgentCore
 import PersistenceCore
 import Studio
 
@@ -57,7 +58,7 @@ import Studio
 /// generation that also carries persona, memory and resident work.
 struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendable {
     static let owner = "nativeagent.studio"
-    static let schemaVersion = "studio-context-projection-v1"
+    static let schemaVersion = "studio-context-projection-v2"
     /// The invalidation namespace the studio tool lane publishes on after a
     /// journal append, so a just-filed entry is reachable on the NEXT turn
     /// rather than after the next launch.
@@ -78,6 +79,7 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     var projectionIdentifier: String { Self.owner }
     var invalidationNamespaces: Set<String> { [Self.invalidationNamespace] }
     let invalidationSourceURL: URL?
+    private let canonURL: URL
 
     private let loadEntries: @Sendable () async throws -> [StudioJournalEntry]
     /// The SECOND source kind (desk 903 phase 4): decided canon rows, reduced to
@@ -85,7 +87,7 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     /// pointer says a work holds and how to pull the argument, never the
     /// argument itself.
     private let loadCanon: @Sendable () async throws -> [StudioCanonMember]
-    private let loadShelfPointer: @Sendable () throws -> String?
+    private let loadShelfSlots: @Sendable () throws -> [StudioWorkingShelf.Slot]
     private let diagnostics: @Sendable (String) -> Void
 
     init(
@@ -94,18 +96,19 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
         maximumEntriesPerWork: Int = NativeStudioContextProjection.maximumEntriesPerWork,
         loadEntries: (@Sendable () async throws -> [StudioJournalEntry])? = nil,
         loadCanon: (@Sendable () async throws -> [StudioCanonMember])? = nil,
-        loadShelfPointer: (@Sendable () throws -> String?)? = nil,
+        loadShelfSlots: (@Sendable () throws -> [StudioWorkingShelf.Slot])? = nil,
         diagnostics: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }
     ) {
         let store = SwiftNativeStudioStore(dataRoot: dataRoot)
         self.invalidationSourceURL = store.journalPath.standardizedFileURL
+        self.canonURL = dataRoot.appendingPathComponent("studio/canon/canon.jsonl").standardizedFileURL
         self.diagnostics = diagnostics
-        if let loadShelfPointer {
-            self.loadShelfPointer = loadShelfPointer
+        if let loadShelfSlots {
+            self.loadShelfSlots = loadShelfSlots
         } else if loadEntries == nil {
-            self.loadShelfPointer = { try StudioWorkingShelf(dataRoot: dataRoot).pointerLine() }
+            self.loadShelfSlots = { try StudioWorkingShelf(dataRoot: dataRoot).selections() }
         } else {
-            self.loadShelfPointer = { nil }
+            self.loadShelfSlots = { [] }
         }
         self.totalCap = max(0, maximumPointers)
         self.perWorkCap = max(1, maximumEntriesPerWork)
@@ -122,10 +125,26 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     private let totalCap: Int
     private let perWorkCap: Int
 
+    func isInvalidated(by change: DerivedSourceChange) -> Bool {
+        guard change.semantic, invalidationNamespaces.contains(change.namespace) else { return false }
+        guard let locator = change.canonicalLocator else { return true }
+        let url = URL(fileURLWithPath: locator).standardizedFileURL
+        return url == invalidationSourceURL || url == canonURL
+    }
+
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
-        let shelfPointer = (try? loadShelfPointer()).flatMap(Self.prepareShelfPointer)
+        let shelfPointer: Prepared?
+        var shelfUnavailable = false
+        do { shelfPointer = Self.prepareShelfPointer(try loadShelfSlots()) }
+        catch is CancellationError { throw CancellationError() }
+        catch {
+            diagnostics("[context-studio] shelf read failed; keeping last good source: \(String(describing: error))")
+            shelfPointer = nil
+            shelfUnavailable = true
+        }
+        let shelfID = ContextStableID.source(owner: Self.owner, locator: "studio/working_shelf")
         let entries: [StudioJournalEntry]
         do {
             entries = try await loadEntries()
@@ -137,8 +156,8 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
             let changed = shelfPointer.flatMap { pointer in
                 previousSources[pointer.sourceID]?.sourceHash == pointer.sourceHash ? nil : pointer.compiledSource
             }
-            let shelfID = ContextStableID.source(owner: Self.owner, locator: "studio/working_shelf")
-            let removed: Set<ContextSourceID> = shelfPointer == nil && previousSources[shelfID] != nil ? [shelfID] : []
+            let removed: Set<ContextSourceID> = !shelfUnavailable && shelfPointer == nil
+                && previousSources[shelfID] != nil ? [shelfID] : []
             return ContextCompiledProjectionResult(changedSources: changed.map { [$0] } ?? [], removedSourceIDs: removed)
         }
 
@@ -159,6 +178,7 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
         }
         if let canonSource = Self.prepareCanon(canon) { prepared.append(canonSource) }
         var selectedIDs = Set(prepared.map(\.sourceID))
+        if shelfUnavailable { selectedIDs.insert(shelfID) }
         if canonUnavailable { selectedIDs.insert(Self.canonSourceID) }
         let previousOwnedIDs = Set(previousSources.values.lazy
             .filter { $0.descriptor.owner == Self.owner }
@@ -185,7 +205,9 @@ extension NativeStudioContextProjection {
 
     /// One line in the existing Studio projection, independent of journal availability.
     /// Keeping its own bounded atom preserves both the exact titles and journal pointers.
-    static func prepareShelfPointer(_ line: String) -> Prepared? {
+    static func prepareShelfPointer(_ slots: [StudioWorkingShelf.Slot]) -> Prepared? {
+        guard !slots.isEmpty else { return nil }
+        let line = "Working shelf: " + slots.map(\.title).joined(separator: "; ") + "; open with app studio.shelf"
         guard !line.isEmpty, line.utf8.count <= 512,
               !NativeContextProjectionText.containsDisallowedControl(line),
               !ContextSecretContentPolicy.containsSecretLikeContent(line) else { return nil }
@@ -197,7 +219,7 @@ extension NativeStudioContextProjection {
             authority: .inferred, privacy: .localPrivate, permittedSurfaces: surfaces,
             injectionPolicy: .adaptive
         )
-        let work = StudioWork(title: line)
+        let works = slots.map { StudioWork(title: $0.title) }
         let atom = ContextAtomDraft(
             id: ContextStableID.atom(sourceID: sourceID, kind: .evidence,
                                     headingPath: [], blockAnchor: "studio-working-shelf"),
@@ -206,7 +228,7 @@ extension NativeStudioContextProjection {
             sourceHash: sourceHash, body: line, authority: .inferred,
             confidence: pointerConfidence, freshness: ContextFreshness(updatedAt: .distantPast),
             privacy: .localPrivate, permittedSurfaces: surfaces, injectionPolicy: .adaptive,
-            contentRole: .fact, entities: entities(work), triggers: triggers(work),
+            contentRole: .fact, entities: works.flatMap(entities), triggers: works.flatMap(triggers),
             activation: 0, recentUsefulness: 0, decayState: 1, embedding: nil
         )
         return Prepared(sourceID: sourceID, sourceHash: sourceHash,
@@ -344,7 +366,7 @@ extension NativeStudioContextProjection {
         if !member.evidenceEntryIDs.isEmpty {
             parts.append("evidence \(member.evidenceEntryIDs.count) entries")
         }
-        parts.append("pull: studio_canon")
+        parts.append("pull: app studio.canon")
         return parts.joined(separator: " · ")
     }
 
@@ -421,7 +443,7 @@ extension NativeStudioContextProjection {
         if let ref = entry.artifactRefs.first.map(NativeContextProjectionText.clean), !ref.isEmpty {
             parts.append("ref \(NativeContextProjectionText.bounded(ref, to: 120))")
         }
-        parts.append("pull: studio_recall title=\"\(NativeContextProjectionText.bounded(title, to: 80))\"")
+        parts.append("pull: app studio.recall title=\"\(NativeContextProjectionText.bounded(title, to: 80))\"")
         return parts.joined(separator: " · ")
     }
 

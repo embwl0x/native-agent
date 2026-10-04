@@ -22,7 +22,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -51,20 +50,6 @@ enum ResearchSearchFailure: Error, Equatable {
             return "Enter a research query."
         case .requestFailed(let message):
             return message
-        }
-    }
-}
-
-enum WorkflowBuilderError: LocalizedError, Equatable {
-    case nameRequired
-    case persistenceUnconfirmed(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .nameRequired:
-            return "Enter a workflow name before creating it."
-        case .persistenceUnconfirmed(let id):
-            return "Workflow '\(id)' was returned but is not visible after reloading the registry."
         }
     }
 }
@@ -144,34 +129,6 @@ extension AppModel {
             routePresentation = .failed(failure)
             statusText = "Router failed: \(failure)"
             return false
-        }
-    }
-
-    /// Creates the smallest reviewable workflow through the canonical registry
-    /// writer. A create response alone is not presented as success: the
-    /// returned id must appear in a fresh registry read from the same root.
-    @MainActor
-    func createWorkflow(named name: String) async throws -> WorkflowRecord {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            statusText = WorkflowBuilderError.nameRequired.localizedDescription
-            throw WorkflowBuilderError.nameRequired
-        }
-        do {
-            let created = try await client.createWorkflow(.object([
-                "name": .string(trimmed),
-            ]))
-            let reloaded = try await client.getWorkflows()
-            guard let confirmed = reloaded.first(where: { $0.id == created.id }) else {
-                throw WorkflowBuilderError.persistenceUnconfirmed(created.id)
-            }
-            workflows = reloaded
-            disabledFeature = nil
-            statusText = "Workflow created: \(confirmed.name)"
-            return confirmed
-        } catch {
-            statusText = "Workflow creation failed: \(error.localizedDescription)"
-            throw error
         }
     }
 
@@ -277,11 +234,10 @@ extension AppModel {
             mcpResourceReadState = .current
             statusText = "Loaded MCP details for \(server.name)"
         } catch {
-            if selectedMCPServerId == pendingId {
-                mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
-                mcpResources = []
-                mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
-            }
+            guard selectedMCPServerId == pendingId else { return }
+            mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+            mcpResources = []
+            mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
             statusText = "MCP details failed: \(error.localizedDescription)"
         }
     }
@@ -298,7 +254,9 @@ extension AppModel {
             selectedMCPServerId = pendingId
             _ = try await client.warmMCPServer(serverId: pendingId)
             let fetchedSessions = (try? await engine.tools.listMCPSessions())
-            mcpToolReadState = .loading
+            if selectedMCPServerId == pendingId {
+                mcpToolReadState = .loading
+            }
             let fetchedTools: [MCPToolRecord]?
             do {
                 fetchedTools = try await client.getMCPTools(serverId: pendingId).tools
@@ -308,7 +266,9 @@ extension AppModel {
                     mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
                 }
             }
-            mcpResourceReadState = .loading
+            if selectedMCPServerId == pendingId {
+                mcpResourceReadState = .loading
+            }
             let fetchedResources: [MCPResourceRecord]?
             do {
                 fetchedResources = try await client.getMCPResources(serverId: pendingId).resources
@@ -330,8 +290,8 @@ extension AppModel {
                     mcpResourceReadState = .current
                 }
             }
-            disabledFeature = nil
             if selectedMCPServerId == pendingId {
+                disabledFeature = nil
                 if case .current = mcpResourceReadState {
                     statusText = "MCP warmed and details refreshed: \(server.name)"
                 } else {
@@ -339,9 +299,11 @@ extension AppModel {
                 }
             }
         } catch let err as NSError where AppModel.isNotImplemented(err) {
+            guard selectedMCPServerId == pendingId else { return }
             disabledFeature = AppModel.disabledBadge(for: "MCP warm", error: err)
             statusText = disabledFeature ?? "MCP warm disabled"
         } catch {
+            guard selectedMCPServerId == pendingId else { return }
             statusText = "MCP warm failed: \(error.localizedDescription)"
         }
     }
@@ -372,16 +334,34 @@ extension AppModel {
 
     @MainActor
     func refreshMCPCache(_ server: MCPServerRecord) async {
+        let pendingId = server.id
+        selectedMCPServerId = pendingId
+        mcpTools = []
+        mcpToolReadState = .loading
+        mcpResources = []
+        mcpResourceReadState = .loading
         do {
-            selectedMCPServerId = server.id
-            _ = try await client.refreshMCPCache(serverId: server.id)
+            _ = try await client.refreshMCPCache(serverId: pendingId)
             engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
+            guard selectedMCPServerId == pendingId else { return }
+            await loadMCPDetails(server)
+            guard selectedMCPServerId == pendingId else { return }
             disabledFeature = nil
-            statusText = "MCP cache refreshed: \(server.name)"
+            if case .current = mcpToolReadState, case .current = mcpResourceReadState {
+                statusText = "MCP cache and details refreshed: \(server.name)"
+            } else {
+                statusText = "MCP cache refreshed, but details could not refresh: \(server.name)"
+            }
         } catch let err as NSError where AppModel.isNotImplemented(err) {
+            guard selectedMCPServerId == pendingId else { return }
+            mcpToolReadState = .unavailable(String(err.localizedDescription.prefix(240)))
+            mcpResourceReadState = .unavailable(String(err.localizedDescription.prefix(240)))
             disabledFeature = AppModel.disabledBadge(for: "MCP cache refresh", error: err)
             statusText = disabledFeature ?? "MCP cache refresh disabled"
         } catch {
+            guard selectedMCPServerId == pendingId else { return }
+            mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+            mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
             statusText = "MCP cache refresh failed: \(error.localizedDescription)"
         }
     }

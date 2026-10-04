@@ -358,7 +358,7 @@ private actor ExternalSendApprovalExecutor {
             origin: SecurityOriginContext(
                 surface: request.surface,
                 sessionId: request.sessionID,
-                userId: nil,
+                userId: request.userID,
                 chatId: request.remoteChatID,
                 deviceId: nil,
                 source: "approved_external_send",

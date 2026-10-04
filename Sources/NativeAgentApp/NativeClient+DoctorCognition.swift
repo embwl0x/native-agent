@@ -233,24 +233,15 @@ extension NativeClient {
             if state.degradedSourceCount > 0 { causes.append("\(state.degradedSourceCount) degraded source(s)") }
             if state.lastError != nil { causes.append("owner error") }
             if state.arenaMetrics.pressure != .normal { causes.append("arena pressure: \(state.arenaMetrics.pressure.rawValue)") }
-            let fallback = await ContextFlowFallbackReader.load(
-                reader: TurnTraceRecentReader(dataRootOverride: dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            )
-            switch fallback {
-            case .unavailable: causes.append("recent fallback evidence unavailable")
-            case .summary(let summary) where summary.fallbackCount > 0:
-                causes.append("\(summary.fallbackCount)/\(summary.windowTurns) recent active turns used legacy context")
-            case .summary: break
-            }
             guard !causes.isEmpty else {
-                return CheckResult(id: id, title: title, status: "ok", detail: "Context Flow is started; sources and recent active turns are healthy.")
+                return CheckResult(id: id, title: title, status: "ok", detail: "Context Flow is started and its sources are healthy.")
             }
             let canReconcile = !state.started || state.degradedSourceCount > 0 || state.lastError != nil
             return CheckResult(id: id, title: title, status: "warn",
                                detail: "Context Flow: \(causes.joined(separator: ", ")).",
                                human_action: canReconcile
                                    ? "Open Diagnostics → Cognition → Context flow and inspect the source error; press Repair to reconcile the derived sources once."
-                                   : "Open Diagnostics → Cognition → Context flow and inspect the recent fallback or pressure evidence.",
+                                   : "Open Diagnostics → Cognition → Context flow and inspect the arena pressure.",
                                repair_available: canReconcile)
         }
     }

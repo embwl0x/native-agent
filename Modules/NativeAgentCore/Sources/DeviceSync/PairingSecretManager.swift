@@ -1,6 +1,7 @@
 // PATCH-2026-05-08: icloud-pairing-ui — single source of truth for the HMAC pairing secret
 // Both MacSyncEngine (HMAC validation) and MacPairingView (QR display) go through here.
 import Foundation
+import CryptoKit
 import Security
 import NativeAgentShared
 import PersistenceCore
@@ -84,6 +85,7 @@ public enum PairingSecretManager {
     // on every KVS publish. iOS uses it to detect when its cached secret has
     // gone stale relative to the Mac's authoritative copy and re-fetches.
     private static let secretVersionKey = "NativeAgent.pairing.secretVersionLocal"
+    private static let synchronizationCheckpointKey = "NativeAgent.pairing.synchronizationCheckpoint"
 
     static func currentSecretVersion() -> Int {
         UserDefaults.standard.integer(forKey: secretVersionKey)
@@ -112,30 +114,34 @@ public enum PairingSecretManager {
     ) async -> Bool {
         guard secret.count == 32 else { return false }
         let secretB64 = secret.base64EncodedString()
+        let secretDigest = SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
         guard await CloudKitHealth.shared.likelyHealthy() else {
             return false
         }
 
-        // gpt-5.5 review fix (MED-3): the old order set local KVS keys AND
-        // bumped secretVersionKey BEFORE synchronize(); a synchronize timeout
-        // left local state showing "published" and the next non-forced launch
-        // skipped the re-publish — iOS never saw the new secret. Fixed by:
-        // (a) only writing local KVS keys after synchronize() returns,
-        // (b) only bumping secretVersionKey on a confirmed sync,
-        // so a timeout = next launch re-tries. forceBumpVersion still wins.
+        // KVS reads include unsynchronized local writes. Only a checkpoint
+        // recorded after synchronization proves this secret/version was sent.
         let result = await withCKTimeout("PairingSecretManager.publishMaterialToKVS") {
             let kvs = NSUbiquitousKeyValueStore.default
+            let defaults = UserDefaults.standard
             let existingB64 = kvs.string(forKey: "NativeAgent.pairing.hmacSecret") ?? ""
-            if existingB64 == secretB64 && !forceBumpVersion {
+            let version = currentSecretVersion()
+            let checkpoint = defaults.dictionary(forKey: synchronizationCheckpointKey)
+            if !forceBumpVersion, existingB64 == secretB64, version > 0,
+               kvs.longLong(forKey: "NativeAgent.pairing.secretVersion") == Int64(version),
+               checkpoint?["digest"] as? String == secretDigest,
+               checkpoint?["version"] as? Int == version {
                 return PairingKVSPublishResult.skippedCurrent
             }
-            let nextVersion = currentSecretVersion() + 1
+            let nextVersion = version + 1
+            defaults.removeObject(forKey: synchronizationCheckpointKey)
             kvs.set(secretB64, forKey: "NativeAgent.pairing.hmacSecret")
             kvs.set(ISO8601DateFormatter().string(from: Date()), forKey: "NativeAgent.pairing.publishedAt")
             kvs.set(Int64(nextVersion), forKey: "NativeAgent.pairing.secretVersion")
             let synced = kvs.synchronize()
             if synced {
-                UserDefaults.standard.set(nextVersion, forKey: secretVersionKey)
+                defaults.set(nextVersion, forKey: secretVersionKey)
+                defaults.set(["digest": secretDigest, "version": nextVersion] as [String: Any], forKey: synchronizationCheckpointKey)
             }
             return PairingKVSPublishResult.published(version: nextVersion, synced: synced)
         }

@@ -70,6 +70,10 @@ public struct REMProposal: Sendable, Codable, Equatable {
     public var livedDates: [String]?
     /// `recurring` / `dwelt_on` / `provenance_unavailable`.
     public var support: REMSupportKind?
+    /// Phase 5 C1: what surprised her or what changed, in her words, at most
+    /// `whatChangedCap` characters. Never written to GROWTH: it is the
+    /// circumstance the slogan would otherwise lose.
+    public var whatChanged: String?
 
     public init(
         id: String,
@@ -80,8 +84,10 @@ public struct REMProposal: Sendable, Codable, Equatable {
         createdAt: String,
         supportingPassages: [REMSupportingPassage]? = nil,
         livedDates: [String]? = nil,
-        support: REMSupportKind? = nil
+        support: REMSupportKind? = nil,
+        whatChanged: String? = nil
     ) {
+        self.whatChanged = whatChanged
         self.id = id
         self.targetDoc = targetDoc
         self.proposalText = proposalText
@@ -271,6 +277,9 @@ public actor SwiftNativeREMConsolidator {
         /// older/sloppier reply still parses — a proposal with no verifiable
         /// passage simply carries none and is labelled accordingly.
         let supportingPassages: [LLMPassageDTO]?
+        /// Phase 5 C1: what surprised her / what changed. Optional, like the
+        /// passages: an older reply still parses.
+        let whatChanged: String?
     }
 
     /// Count of quotes dropped because they were not in the named entry
@@ -327,7 +336,7 @@ public actor SwiftNativeREMConsolidator {
             Current \(docName) doc:
             \(targetContext)
 
-            Distill candidate REM proposals as JSON array of objects with keys: targetDoc, proposalText, evidenceDates, confidence, supportingPassages.
+            Distill candidate REM proposals as JSON array of objects with keys: targetDoc, proposalText, evidenceDates, confidence, supportingPassages, whatChanged.
 
             Output contract (violations are dropped silently, so follow exactly):
             - Return ONLY the raw JSON array. No code fences, no prose before or \
@@ -340,6 +349,10 @@ public actor SwiftNativeREMConsolidator {
             on, copied verbatim. A quote that is not in that entry word for \
             word is discarded, so copy rather than paraphrase. Give one per \
             entry the proposal draws on.
+            - whatChanged: one sentence in her own voice, at most \(REMConstants.whatChangedCap) \
+            characters, naming what surprised her in that moment or what changed \
+            in her because of it. It keeps the experience behind the lesson and is \
+            never written to the doc.
             - Return `[]` if nothing this week earned a durable update.
             \(Self.guidance(forTargetDoc: docName))
             """
@@ -561,6 +574,10 @@ public actor SwiftNativeREMConsolidator {
                     continue
                 }
                 let normalized = Self.normalizeProposalText(dto.proposalText, targetDoc: dtoTarget)
+                guard normalized.unicodeScalars.count <= REMConstants._REM_PROPOSAL_TEXT_CAP else {
+                    lastParseErrors.append("proposal text exceeds \(REMConstants._REM_PROPOSAL_TEXT_CAP) characters")
+                    continue
+                }
                 // Empty text after normalize = a degenerate proposal that
                 // would stage a blank approval card (the 2026-06-21 denied
                 // empty-text row's class). Drop it HERE, loudly.
@@ -581,7 +598,8 @@ public actor SwiftNativeREMConsolidator {
                     // quote against the entry it names.
                     supportingPassages: (dto.supportingPassages ?? []).map {
                         REMSupportingPassage(dreamDate: $0.date, quote: $0.quote)
-                    }
+                    },
+                    whatChanged: Self.normalizedWhatChanged(dto.whatChanged)
                 ))
             }
             return result
@@ -676,11 +694,27 @@ public actor SwiftNativeREMConsolidator {
         text = stripLeadingDateStamp(text)
         text = text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return clampGrowthLesson(text, limit: REMConstants._REM_PROPOSAL_TEXT_CAP)
+        return text
     }
 
     public nonisolated static func normalizedTargetDoc(_ targetDoc: String) -> String {
         REMProposalStore.normalizedTargetDoc(targetDoc)
+    }
+
+    /// One line, at most `whatChangedCap` characters, cut at a sentence or a
+    /// word; nil when there is nothing in it.
+    nonisolated static func normalizedWhatChanged(_ raw: String?) -> String? {
+        let text = (raw ?? "").replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count >= 8 else { return nil }
+        let cap = REMConstants.whatChangedCap
+        guard text.count > cap else { return text }
+        let window = String(text.prefix(cap))
+        if let end = window.lastIndex(where: { ".!?".contains($0) }), window.distance(from: window.startIndex, to: end) >= cap / 2 {
+            return String(window[...end])
+        }
+        let words = window.split(separator: " ").dropLast().joined(separator: " ")
+        return words.isEmpty ? window : words + "…"
     }
 
     private nonisolated static func stripLearnedPrefix(_ text: String) -> String {
@@ -757,43 +791,6 @@ public actor SwiftNativeREMConsolidator {
             out = out.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
         }
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private nonisolated static func clampGrowthLesson(_ text: String, limit: Int = REMConstants._REM_PROPOSAL_TEXT_CAP) -> String {
-        guard text.count > limit else { return text }
-        let sentences = splitSentences(text)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        let lessonSignals = [
-            "learned", "teaches", "i ", "me ", "my ", "myself", "assistant",
-            "reflex", "voice", "trust", "need", "should", "must", "work is"
-        ]
-        if let preferred = sentences.reversed().first(where: { sentence in
-            let lower = sentence.lowercased()
-            return lessonSignals.contains { lower.contains($0) } && sentence.count <= limit
-        }) {
-            return preferred
-        }
-        if let last = sentences.last, last.count <= limit {
-            return last
-        }
-        return String(text.prefix(limit)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
-    }
-
-    private nonisolated static func splitSentences(_ text: String) -> [String] {
-        var out: [String] = []
-        var current = ""
-        for ch in text {
-            current.append(ch)
-            if ch == "." || ch == "!" || ch == "?" {
-                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { out.append(trimmed) }
-                current = ""
-            }
-        }
-        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty { out.append(tail) }
-        return out
     }
 
     private func isoNow() -> String {

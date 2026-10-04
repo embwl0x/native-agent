@@ -41,6 +41,20 @@ public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatabl
 /// prevents read failures and malformed rows from being collapsed into an
 /// empty index and overwritten by the next surface that creates a session.
 public enum ChatSessionIndexFile {
+    /// Unknown or mixed participants stay unavailable. Legacy transcripts are
+    /// not relabeled from their latest turn; only a new conversation binds.
+    public static func recordContinuityParticipant(
+        in row: inout [String: JSONValue], participant: String?, scope: String?, messageCount: Int
+    ) {
+        let incoming = participant.map(JSONValue.string) ?? .null
+        if row["continuityParticipant"] == nil {
+            row["continuityParticipant"] = messageCount == 1 ? incoming : .null
+            row["continuityScope"] = scope.map(JSONValue.string) ?? .null
+        } else if row["continuityParticipant"] != incoming
+                    || row["continuityScope"] != (scope.map(JSONValue.string) ?? .null) {
+            row["continuityParticipant"] = .null
+        }
+    }
     /// The last transcript generation containing conversational speech. Tool
     /// receipts still advance transcriptGeneration, but do not announce a new
     /// exchange to another open workspace.

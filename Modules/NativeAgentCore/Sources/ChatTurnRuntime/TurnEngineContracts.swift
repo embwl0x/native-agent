@@ -1,4 +1,5 @@
 import ChatTurnContracts
+import ApprovalInbox
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -9,11 +10,15 @@ import TrustCenter
 import DreamREMCycle
 import Context
 import CognitiveSubstrate
+import ToolRegistry
 
 // MARK: - TurnEngineError
 
 public enum TurnEngineError: Error, LocalizedError {
     case personaLoadFailed(underlying: Error)
+    /// Context Flow is on but could not prepare this turn's context. The turn
+    /// ends here with the cause and the way out, never on a stand-in prompt.
+    case contextLoadFailed(underlying: Error)
     /// Listing the turn's tool catalog threw. The turn ends here rather than
     /// running the model with no or partial tools.
     case toolCatalogLoadFailed(underlying: Error)
@@ -32,6 +37,11 @@ public enum TurnEngineError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .personaLoadFailed(let e): return "persona load failed: \(e)"
+        case .contextLoadFailed(let e):
+            return "I couldn't load my context for this reply: "
+                + ((e as? LocalizedError)?.errorDescription ?? String(describing: e))
+                + ". Open Diagnostics → Doctor and follow the Context Flow check, then send again."
+                + " To reply without it meanwhile, set Setup → Memory in every reply to Off."
         case .toolCatalogLoadFailed(let e):
             return "I couldn't load my tools: "
                 + ((e as? LocalizedError)?.errorDescription ?? String(describing: e))
@@ -136,6 +146,11 @@ public struct MemoryPromotionTelemetry: Sendable, Equatable {
     public let stagedProposalCount: Int64
     /// The moment pass's one-word outcome (see AdaptiveMemoryObservation).
     public var momentOutcome: String = "unreported"
+    public var savedCorrectionCount: Int = 0
+    public var pendingCorrectionCount: Int = 0
+    public var failedCorrectionCount: Int = 0
+    /// Phase 5A novelty gate: why the after-turn memory call was skipped.
+    public var noveltySkipReason: String?
     public let semanticStatus: MemorySemanticExtractionStatus
     public let semanticCandidateCount: Int64
     public let candidateCount: Int64
@@ -286,6 +301,10 @@ public struct SharedAdaptiveMemoryPromoter: MemoryPromotionTelemetryReporting, M
                 + observation.toolEvidenceCandidateCount
         )
         telemetry.momentOutcome = observation.momentOutcome
+        telemetry.savedCorrectionCount = observation.savedCorrectionCount
+        telemetry.pendingCorrectionCount = observation.pendingCorrectionCount
+        telemetry.failedCorrectionCount = observation.failedCorrectionCount
+        telemetry.noveltySkipReason = observation.noveltySkipReason
         return telemetry
     }
 }
@@ -299,12 +318,10 @@ public struct SharedAdaptiveMemoryPromoter: MemoryPromotionTelemetryReporting, M
 ///
 ///  * **Bounded.** ≤ `maxDispatches` evidence lines, ≤ `maxLineChars` each,
 ///    selected head+tail so a long tool turn contributes its opening moves AND
-///    its closing ones rather than only its opening. A turn whose window was
-///    not a contiguous verified run also carries one payload-free
-///    `sequenceBreakMarker` line — see below.
+///    its closing ones rather than only its opening.
 ///  * **Reused, not reinvented.** The per-result shape is
-///    `SessionHistoryPromptRenderer.toolResultProjection` — the exact head+tail
-///    projection SessionHistory already renders for later turns, which also
+///    `SessionHistoryPromptRenderer.toolEvidenceProjection` — the exact head+tail
+///    projection retained for durable fact evidence, which also
 ///    routes every byte through `ChatSecretRedactor`. Input values go through
 ///    the same redactor.
 ///  * **Quiet.** Only dispatches that SUCCEEDED (`exactResultClass ==
@@ -339,29 +356,6 @@ enum TurnToolEvidenceProjection {
     /// named source file (`Auth.swift`). Anything else is prose.
     private static let stableFactShape = #"(?:/[A-Za-z0-9._~@%+-]+){2,}|\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+\b|\b[A-Za-z0-9_-]+\.(?:swift|ts|tsx|js|jsx|py|rb|rs|go|java|kt|json|md|ya?ml|toml|sh|zsh|[hmc]|cpp|plist|sql|txt|log|csv)\b"#
 
-    /// Sequence-integrity marker (procedural lane, HIGH review finding
-    /// 2026-09-01).
-    ///
-    /// The lines above are SUCCESS-ONLY by construction, which is exactly what
-    /// the memory promoter wants and exactly what makes this array unsafe as
-    /// proof that a PROCEDURE ran. `read ok, write ok, swift_build failed`
-    /// projects to `read ok, write ok`; head+tail selection stitches an equally
-    /// contiguous-looking run out of a ten-dispatch turn. A consumer asking
-    /// "did these steps run start-to-finish, all verified" cannot tell either
-    /// case from the real thing.
-    ///
-    /// So the projection SAYS so, in the one channel every call site already
-    /// carries. When the turn contained a dispatch this projection could not
-    /// read as a verified success, or when the window was truncated, one
-    /// marker line is appended. Consumers that only want facts ignore it;
-    /// consumers that need contiguity refuse the turn.
-    ///
-    /// Two properties keep it inert for the promoter: it opens with a
-    /// character no tool name may contain, and it is SHORTER than
-    /// `AdaptiveToolEvidence.minLineChars` (12), the floor below which the
-    /// promoter drops a line before it can become a candidate. Keep it short.
-    static let sequenceBreakMarker = "!seq-break"
-
     /// Project one turn's dispatches. Empty in ⇒ empty out ⇒ the promoter sees
     /// exactly the prose-only turn it saw before this existed.
     static func project(_ dispatches: [TurnEngineResult.ToolDispatchRecord]) -> [String] {
@@ -369,26 +363,9 @@ enum TurnToolEvidenceProjection {
         let lines = dedupe(dispatches.compactMap(evidenceLine(for:)))
         guard !lines.isEmpty else { return [] }
         let truncated = lines.count > maxDispatches
-        var selected = lines
-        if truncated {
-            let head = maxDispatches - maxDispatches / 2
-            let tail = maxDispatches / 2
-            selected = Array(lines.prefix(head)) + Array(lines.suffix(tail))
-        }
-        if truncated || hasNonSuccessDispatch(dispatches) {
-            selected.append(sequenceBreakMarker)
-        }
-        return selected
-    }
-
-    /// True when the turn carries a dispatch this projection could not read as
-    /// a verified success — failed, cancelled, timed out, pending, or simply
-    /// unknown. `exactResultClass` never reads a missing status as success, so
-    /// "not `.succeeded`" is the honest whole-turn question.
-    static func hasNonSuccessDispatch(
-        _ dispatches: [TurnEngineResult.ToolDispatchRecord]
-    ) -> Bool {
-        dispatches.contains { ChatToolOutcome.exactResultClass($0.result) != .succeeded }
+        guard truncated else { return lines }
+        let head = maxDispatches - maxDispatches / 2
+        return Array(lines.prefix(head)) + Array(lines.suffix(maxDispatches / 2))
     }
 
     /// The rendered evidence for one dispatch, or nil when it is not eligible.
@@ -403,11 +380,12 @@ enum TurnToolEvidenceProjection {
            ["queued", "scheduled"].contains(status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
             return nil
         }
-        let name = dispatch.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An app call of a folded action is the tool it ran, over its args.
+        let name = ToolNameAliases.ranTool(dispatch.name, input: dispatch.input).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !transientReaders.contains(name.lowercased()) else { return nil }
 
-        let arguments = inputSummary(dispatch.input)
-        let result = SessionHistoryPromptRenderer.toolResultProjection(resultText(dispatch.result))
+        let arguments = inputSummary(ToolNameAliases.ranInput(dispatch.name, input: dispatch.input))
+        let result = SessionHistoryPromptRenderer.toolEvidenceProjection(resultText(dispatch.result))
         guard hasStableFactShape(arguments) || hasStableFactShape(result) else { return nil }
 
         var line = arguments.isEmpty ? "\(name) ok" : "\(name)(\(arguments)) ok"
@@ -561,23 +539,21 @@ public struct TurnContext: Sendable {
     public let naturalExpressionCue: String?
     /// v2Prefix (2026-09-01): prior turns replayed as REAL messages, oldest →
     /// newest, so a provider cache can match them byte-for-byte across turns.
-    /// Empty on `.v1Legacy` and on every non-history caller — where it is
-    /// empty, this context is byte-identical to the pre-v2 shape.
-    /// Produced by `SessionHistoryMessageProjection` from EXACTLY the rows the
-    /// v1 history block admitted.
+    /// Empty on non-history callers. Produced by
+    /// `SessionHistoryMessageProjection` from bounded transcript rows.
     public let historyMessages: [LLMMessage]
     /// v2Prefix: the per-turn volatile mass (packet, recall, digest, derived
     /// history blocks, clock/runtime, plan hint, capsule) AFTER it has been
     /// lifted out of `systemSegments.dynamic` — see `splittingVolatileBlock()`.
-    /// nil until that split runs; on `.v1Legacy` it stays nil forever and the
-    /// same bytes remain in `dynamic` exactly as before.
+    /// nil until that split runs.
     public let turnVolatileBlock: String?
     /// What the replayed-prefix window cursor did for this turn. Set by
     /// `buildTurnContextWithHistory` — the one place that runs the cursor — so
     /// every downstream receipt reports the same decision instead of re-reading
-    /// it from disk or guessing zero. nil on `.v1Legacy` and every non-history
-    /// caller.
+    /// it from disk or guessing zero. nil on non-history callers.
     public let historyWindowReceipt: HistoryWindowReceipt?
+    /// Frozen duration from the context preparation summary, absent if unmeasured.
+    public var preparationMs: Int64?
     /// The memory record identities behind THIS turn — legacy recall hits
     /// plus the ContextFlow packet's resolved provenance. On active turns
     /// memory arrives in the packet and `recalled` is empty, so without the
@@ -620,7 +596,8 @@ public struct TurnContext: Sendable {
         naturalExpressionCue: String? = nil,
         historyMessages: [LLMMessage] = [],
         turnVolatileBlock: String? = nil,
-        historyWindowReceipt: HistoryWindowReceipt? = nil
+        historyWindowReceipt: HistoryWindowReceipt? = nil,
+        preparationMs: Int64? = nil
     ) {
         self.surface = surface
         self.personaID = personaID
@@ -641,6 +618,7 @@ public struct TurnContext: Sendable {
         self.historyMessages = historyMessages
         self.turnVolatileBlock = turnVolatileBlock
         self.historyWindowReceipt = historyWindowReceipt
+        self.preparationMs = preparationMs
     }
 
     /// v2Prefix relocation, run ONCE per turn at the message-seeding boundary
@@ -695,7 +673,8 @@ public struct TurnContext: Sendable {
             naturalExpressionCue: naturalExpressionCue,
             historyMessages: historyMessages,
             turnVolatileBlock: volatileBlock,
-            historyWindowReceipt: historyWindowReceipt
+            historyWindowReceipt: historyWindowReceipt,
+            preparationMs: preparationMs
         )
     }
 }
@@ -703,6 +682,57 @@ public struct TurnContext: Sendable {
 // MARK: - TurnEngineResult
 
 public struct TurnEngineResult: Sendable {
+    public enum TerminalState: String, Sendable {
+        case completed, interrupted, waiting, braked, failed
+    }
+
+    public enum TerminalReason: String, Sendable {
+        case replyCompleted = "reply_completed"
+        case approvalRequired = "approval_required"
+        case interactionRequired = "interaction_required"
+        case cancelled
+        case providerInterrupted = "provider_interrupted"
+        case providerFailed = "provider_failed"
+        case executionFailed = "execution_failed"
+        case incomplete
+        case completionUnreported = "completion_unreported"
+        case iterationLimit = "iteration_limit"
+        case wallClockLimit = "wall_clock_limit"
+        case noProgress = "no_progress"
+        case protocolViolation = "protocol_violation"
+        case unfulfilledPromise = "unfulfilled_promise"
+        case emptyReply = "empty_reply"
+        case outputLimit = "output_limit"
+
+        public var state: TerminalState {
+            switch self {
+            case .replyCompleted: return .completed
+            case .approvalRequired, .interactionRequired: return .waiting
+            case .cancelled, .providerInterrupted, .incomplete, .completionUnreported: return .interrupted
+            case .providerFailed, .executionFailed: return .failed
+            case .iterationLimit, .wallClockLimit, .noProgress, .protocolViolation,
+                 .unfulfilledPromise, .emptyReply, .outputLimit: return .braked
+            }
+        }
+    }
+
+    public struct LoopCounters: Sendable {
+        public internal(set) var providerAttemptCount = 0
+        public internal(set) var failedProviderAttemptCount = 0
+        /// First issued attempt of each loop iteration; retries are separate.
+        public internal(set) var providerRoundCount = 0
+        /// Reissued attempts, excluding recovery plans cancelled before dispatch.
+        public internal(set) var providerRecoveryCount = 0
+        public internal(set) var providerReplayCount = 0
+        public internal(set) var providerContinuationCount = 0
+        public internal(set) var contextOverflowRecoveryCount = 0
+        public internal(set) var toolRoundCount = 0
+        public internal(set) var roundsAfterToolFailureCount = 0
+        public internal(set) var protocolViolationRoundCount = 0
+        public internal(set) var emptyReplyRoundCount = 0
+        public internal(set) var unfulfilledPromiseRoundCount = 0
+    }
+
     public enum CompletionState: Sendable, Equatable {
         case completed
         case incomplete
@@ -762,6 +792,8 @@ public struct TurnEngineResult: Sendable {
     /// Engine-owned terminal truth, independent of any nonempty fallback prose.
     /// Legacy paths that do not report this evidence leave it unknown.
     public let completionState: CompletionState?
+    public let terminalReason: TerminalReason?
+    public let loopCounters: LoopCounters?
     /// THIS turn's claim on the deferred memory promotion it captured (Astra
     /// comb 3 review, finding 1, 2026-09-12). The engine used to hold ONE
     /// replaceable pending slot, so while turn A awaited its assistant append
@@ -790,7 +822,9 @@ public struct TurnEngineResult: Sendable {
         terminalObservation: TerminalObservation? = nil,
         completionState: CompletionState? = nil,
         memoryPromotionTicket: UUID? = nil,
-        workingCommentaryCharacters: Int? = nil
+        workingCommentaryCharacters: Int? = nil,
+        terminalReason: TerminalReason? = nil,
+        loopCounters: LoopCounters? = nil
     ) {
         self.reply = reply
         self.modelUsed = modelUsed
@@ -801,7 +835,47 @@ public struct TurnEngineResult: Sendable {
         self.providerCallCount = providerCallCount
         self.terminalObservation = terminalObservation
         self.completionState = completionState
+        self.terminalReason = terminalReason
+        self.loopCounters = loopCounters
         self.memoryPromotionTicket = memoryPromotionTicket
         self.workingCommentaryCharacters = workingCommentaryCharacters
+    }
+
+    func resolvedTerminalReason(dataRoot: URL?) -> TerminalReason {
+        if let terminalReason { return terminalReason }
+        let approvalDispatches = toolDispatches.filter { ChatToolOutcome.isWaitingApproval($0.result) }
+        if !approvalDispatches.isEmpty {
+            // Receipts record filing, not whether the approval is still outstanding.
+            let approvalIDs = approvalDispatches.compactMap { dispatch -> String? in
+                guard case .object(let object) = dispatch.result,
+                      case .string(let rawID)? = object["approvalId"] ?? object["approval_id"] else { return nil }
+                let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+                return id.isEmpty ? nil : id
+            }
+            guard approvalIDs.count == approvalDispatches.count, let dataRoot,
+                  let rows = try? SwiftNativeApprovalInbox.loadApprovalRowsChecked(
+                    at: dataRoot.appendingPathComponent("workflows/approvals/requests.json")
+                  ) else { return .completionUnreported }
+            let pendingIDs = Set(rows.compactMap(ApprovalRecord.init(json:))
+                .filter { $0.status == "pending" }.map(\.id))
+            if approvalIDs.contains(where: pendingIDs.contains) { return .approvalRequired }
+        }
+        if toolDispatches.contains(where: { ChatToolOutcome.isWaitingInteraction($0.result) }) { return .interactionRequired }
+        switch completionState {
+        case .completed: return .replyCompleted
+        case .incomplete: return .incomplete
+        case nil: return .completionUnreported
+        }
+    }
+
+    func observingTerminal(reason: TerminalReason, counters: LoopCounters) -> Self {
+        Self(
+            reply: reply, modelUsed: modelUsed, recalledIds: recalledIds,
+            toolDispatches: toolDispatches, elapsedMs: elapsedMs, rawLLMResponse: rawLLMResponse,
+            providerCallCount: providerCallCount, terminalObservation: terminalObservation,
+            completionState: completionState, memoryPromotionTicket: memoryPromotionTicket,
+            workingCommentaryCharacters: workingCommentaryCharacters,
+            terminalReason: reason, loopCounters: counters
+        )
     }
 }

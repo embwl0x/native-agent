@@ -4,6 +4,7 @@ import ChatOrchestration
 import NativeAgentCore
 import MacControl
 import PersistenceCore
+import ApplicationServices
 
 /// Executes the SEND half of a desktop adapter beneath the conversation API.
 /// The short-lived operator uses the ordinary gated Mac tools; it owns no agent
@@ -173,6 +174,7 @@ actor DesktopConversationTools: ToolDispatchClient {
     private var submitted = false
     /// The submit action itself reported success (an attempt alone is `submitted`).
     private var submitConfirmed = false
+    private var selectionSucceeded = false
     /// Times the message was already visible before it was typed; delivery
     /// needs a post-submission read showing it more often than that.
     private var baseline = 0
@@ -201,10 +203,11 @@ actor DesktopConversationTools: ToolDispatchClient {
         calls += 1
         guard calls <= 24, Self.allowed.contains(tool) else { throw refusal("Desktop conversation tool budget or scope exceeded.") }
         var args = input.filter { $0.value != .null }
-        var typing = false, submitting = false
+        var typing = false, submitting = false, selecting = false
         if tool == "screen" {
             args["app"] = .string(bundle); args["pixels"] = .bool(false)
         } else if tool == "go" {
+            selectionSucceeded = false
             if await frontmostBundle() != bundle {
                 // go reads a dotted bundle id as a web address; hand it the app's name.
                 let appName = await MainActor.run {
@@ -252,19 +255,30 @@ actor DesktopConversationTools: ToolDispatchClient {
                 switch verb {
                 case "type":
                     guard !typed, string(args["text"]) == message else { throw refusal("Only the exact requested message may be typed once.") }
+                    guard selectionSucceeded, let composer = await Self.verifiedComposerTarget(bundle: bundle, label: label, content: "") else {
+                        throw refusal("The exact conversation and an empty message box could not be verified. Nothing was typed.")
+                    }
+                    args["target"] = .string(composer)
                     typed = true // before dispatch: uncertain attempts are never replayed
                     stage = "typing the message"; typing = true
                     baseline = occurrences(observed)
                 case "key":
                     guard typed, ["return", "enter"].contains(target.lowercased()) else { throw refusal("Only one message submission key is permitted.") }
+                    guard await Self.verifiedComposerTarget(bundle: bundle, label: label, content: message) != nil else {
+                        throw refusal("The conversation or composed message changed. Submission stopped.")
+                    }
                     submitted = true; stage = "verifying the sent message"; submitting = true
                 case "click":
                     if typed {
                         guard ["send", "send message"].contains(target.lowercased()) else { throw refusal("Only the send control may be clicked after composing.") }
+                        guard await Self.verifiedComposerTarget(bundle: bundle, label: label, content: message) != nil else {
+                            throw refusal("The conversation or composed message changed. Submission stopped.")
+                        }
                         submitted = true; stage = "verifying the sent message"; submitting = true
                     } else {
                         let decorated = target.hasPrefix(label + ", ") && observed.contains(target)
                         guard target == label || decorated else { throw refusal("Navigation may only select the exact saved conversation.") }
+                        selectionSucceeded = false; selecting = true
                     }
                 case "scroll": break
                 default: throw refusal("This operation is outside desktop conversation scope.")
@@ -280,6 +294,9 @@ actor DesktopConversationTools: ToolDispatchClient {
             observed = String(flatten(response).prefix(120_000))
         }
         if submitting, case .object(let reply) = response, reply["ok"] == .bool(true) { submitConfirmed = true }
+        if selecting, case .object(let reply) = response, reply["ok"] == .bool(true) {
+            selectionSucceeded = true
+        }
         if case .object(let reply) = response, reply["ok"] == .bool(false) {
             if case .string(let text)? = reply["text"] { problem = String(text.prefix { $0 != "\n" }.prefix(240)) }
             // MacControl touched nothing (no such target, ambiguous, disabled,
@@ -291,6 +308,33 @@ actor DesktopConversationTools: ToolDispatchClient {
             }
         }
         return response
+    }
+
+    @MainActor private static func verifiedComposerTarget(bundle: String, label: String, content: String) -> String? {
+        typealias AX = GrokRoutineAccessibility
+        guard AXIsProcessTrusted(), let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier == bundle else { return nil }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        guard let windows = AX.attribute(root, kAXWindowsAttribute) as? [AXUIElement],
+              let focused = AX.attribute(root, kAXFocusedWindowAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID(),
+              let window = windows.first(where: { CFEqual(focused, $0) }) else { return nil }
+        let tree = AX.nodes(window)
+        func named(_ node: AXUIElement) -> Bool {
+            AX.string(node, kAXTitleAttribute) == label || AX.string(node, kAXDescriptionAttribute) == label
+        }
+        guard !tree.contains(where: { AX.string($0, kAXRoleAttribute) == kAXSheetRole || AX.string($0, kAXSubroleAttribute) == kAXDialogSubrole }),
+              named(window) || tree.contains(where: {
+                  named($0) && (AX.string($0, kAXRoleAttribute) == "AXHeading"
+                      || AX.attribute($0, kAXSelectedAttribute) as? Bool == true)
+              }) else { return nil }
+        let boxes = tree.filter {
+            [kAXTextAreaRole, kAXTextFieldRole].contains(AX.string($0, kAXRoleAttribute))
+                && AX.string($0, kAXSubroleAttribute) != kAXSearchFieldSubrole
+                && AX.attribute($0, kAXEnabledAttribute) as? Bool != false
+        }
+        guard boxes.count == 1, let value = AX.attribute(boxes[0], kAXValueAttribute) as? String,
+              value.trimmingCharacters(in: .whitespacesAndNewlines) == content.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        return AX.string(boxes[0], kAXRoleAttribute) == kAXTextAreaRole ? "text area" : "text"
     }
     /// Send-only: the answer is delivery evidence for the outgoing message.
     /// No reply is looked for here — the recipient answers through the app's

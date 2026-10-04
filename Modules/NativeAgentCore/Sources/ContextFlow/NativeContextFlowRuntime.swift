@@ -25,6 +25,28 @@ private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider 
     }
 }
 
+private struct NativeContextMarkdownCompiler: ContextMarkdownCompiling {
+    let memory: SwiftNativeMemoryV2
+
+    func compile(
+        sourceData: Data,
+        descriptor: ContextSourceDescriptor,
+        previous: ContextCompiledSource?,
+        updatedAt: Date
+    ) async throws -> ContextCompiledSource {
+        guard let fingerprint = await memory.embeddingEpoch()?.rawValue else {
+            throw MemoryV2Error.storageUnavailable
+        }
+        let provider = NativeContextEmbeddingProvider(memory: memory, modelFingerprint: fingerprint)
+        return try await ContextMarkdownCompiler(embeddingProvider: provider).compile(
+            sourceData: sourceData,
+            descriptor: descriptor,
+            previous: previous,
+            updatedAt: updatedAt
+        )
+    }
+}
+
 actor PersonaContextFlowProvider:
     ContextRequiredDocumentMirrorProviding,
     ContextSourceRegistrationRefreshing
@@ -41,15 +63,12 @@ actor PersonaContextFlowProvider:
     ]
 
     private let compiler: PersonaCompiler
-    private let mode: ContextFlowMode
     private let personaOverride: @Sendable () -> String?
-    private let dataRoot: URL
     private var cachedBuild: Build?
 
     init(
         compiler: PersonaCompiler? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        mode: ContextFlowMode = .shadow,
         personaOverride: @escaping @Sendable () -> String? = {
             UserDefaults.standard.string(forKey: "chatPersona").flatMap {
                 let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -63,9 +82,7 @@ actor PersonaContextFlowProvider:
             ? SwiftNativePersonaEngine(dataRoot: standardizedRoot)
             : SwiftNativePersonaEngine.isolated(dataRoot: standardizedRoot)
         self.compiler = compiler ?? PersonaCompiler(engine: persona)
-        self.mode = mode
         self.personaOverride = personaOverride
-        self.dataRoot = standardizedRoot
     }
 
     func refreshContextSources(in registry: ContextSourceRegistry) async throws {
@@ -88,13 +105,6 @@ actor PersonaContextFlowProvider:
         let build = try await makeBuild()
         cachedBuild = build
         return build.mirrors
-    }
-
-    /// The chat persona picker is a process-local selection edge rather than a
-    /// filesystem event. Drop the derived snapshot before ContextFlow asks us
-    /// to refresh registrations and publish the replacement generation.
-    func invalidateCachedBuild() {
-        cachedBuild = nil
     }
 
     private func makeBuild() async throws -> Build {
@@ -145,31 +155,11 @@ actor PersonaContextFlowProvider:
             }
         }
 
-        for root in allowedRoots.sorted(by: { $0.path < $1.path }) {
-            // A complete owner inventory may retire prior sources. An unreadable
-            // or rejected catalog is not an empty inventory: fail before replacing
-            // any registrations or cached mirrors so reconciliation keeps its last
-            // good generation. A valid missing/empty directory still returns [].
-            let catalog = try NativeMarkdownContextSourceCatalog(personaRoot: root)
-            for catalogRoot in catalog.allowedRoots { allowedRoots.insert(catalogRoot) }
-            for registration in catalog.registrations {
-                registrations[registration.descriptor.id] = registration
-            }
-        }
-        // 2026-09-22: skills she saves live in data/skills/bodies, which was
-        // never scanned, so they never entered context flow.
-        let runtimeCatalog = try NativeMarkdownContextSourceCatalog.runtime(dataRoot: dataRoot)
-        for catalogRoot in runtimeCatalog.allowedRoots { allowedRoots.insert(catalogRoot) }
-        for registration in runtimeCatalog.registrations {
-            registrations[registration.descriptor.id] = registration
-        }
-
         let grouped = Dictionary(grouping: snapshots, by: { $0.packet.personaId })
         let mirrors = try grouped.keys.sorted().map { personaID in
             try Self.makeMirror(
                 personaID: personaID,
                 snapshots: grouped[personaID] ?? [],
-                mode: mode,
                 requestedPersonaOverride: selectedOverride
             )
         }
@@ -183,11 +173,18 @@ actor PersonaContextFlowProvider:
     static func makeMirror(
         personaID: String,
         snapshots: [PersonaContextSourceSnapshot],
-        mode: ContextFlowMode,
         requestedPersonaOverride: String? = nil
     ) throws -> RequiredDocumentMirror {
         guard let canonical = snapshots.first else {
             throw CocoaError(.fileReadNoSuchFile)
+        }
+        guard !snapshots.contains(where: { snapshot in
+            snapshot.documents.contains { ContextSecretContentPolicy.containsSecretLikeContent($0.content) }
+                || snapshot.packet.activeDocs.values.contains {
+                    ContextSecretContentPolicy.containsSecretLikeContent($0)
+                }
+        }) else {
+            throw ContextMarkdownCompilerError.secretLikeContent
         }
         let canonicalDocuments = canonical.documents
             .filter { !$0.surfaceOverride }
@@ -219,24 +216,21 @@ actor PersonaContextFlowProvider:
             let activeKernelDocuments = snapshot.documents.filter {
                 !$0.surfaceOverride && ($0.id == "SOUL" || $0.id == "VOICE")
             }.sorted { $0.canonicalOrder < $1.canonicalOrder }
-            let includedIDs = mode == .active
-                ? activeKernelDocuments.map { RequiredDocumentID(rawValue: "\($0.id).md") }
-                : documents.map(\.id)
-            let renderedPrompt: String
-            if mode == .active {
-                renderedPrompt = PersonaCompiler.renderPrompt(
-                    documents: snapshot.packet.activeDocs.filter {
-                        $0.key == "SOUL" || $0.key == "VOICE"
-                    },
-                    surface: snapshot.packet.surface
-                )
-            } else {
-                renderedPrompt = snapshot.packet.compiledSystemPrompt
-            }
-            let surfaceGuidance = mode == .active ? PersonaCompiler.renderPrompt(
+            let includedIDs = activeKernelDocuments.map { RequiredDocumentID(rawValue: "\($0.id).md") }
+            let renderedPrompt = PersonaCompiler.renderPrompt(
+                documents: snapshot.packet.activeDocs.filter {
+                    $0.key == "SOUL" || $0.key == "VOICE"
+                },
+                surface: snapshot.packet.surface
+            )
+            let surfaceGuidance = PersonaCompiler.renderPrompt(
                 documents: snapshot.packet.activeDocs.filter { $0.key == "surface:\(snapshot.packet.surface)" },
                 surface: snapshot.packet.surface
-            ) : ""
+            )
+            guard !ContextSecretContentPolicy.containsSecretLikeContent(renderedPrompt),
+                  !ContextSecretContentPolicy.containsSecretLikeContent(surfaceGuidance) else {
+                throw ContextMarkdownCompilerError.secretLikeContent
+            }
             let key = try StablePromptKernelKey(
                 personaID: contextPersonaID,
                 surfaceVariant: ContextSurfaceVariant(rawValue: snapshot.packet.surface),
@@ -326,7 +320,7 @@ public struct NativeContextFlowConfiguration: Sendable, Equatable {
             .flatMap { ContextFlowMode(rawValue: $0.lowercased()) }
             ?? defaults.string(forKey: modeDefaultsKey)
                 .flatMap { ContextFlowMode(rawValue: $0.lowercased()) }
-        let mode: ContextFlowMode = preOnboarding ? .off : (explicitMode ?? .shadow)
+        let mode: ContextFlowMode = preOnboarding ? .off : (explicitMode ?? .active)
         let budget = ContextArenaBudget(
             rawValue: defaults.integer(forKey: budgetDefaultsKey)
         ) ?? .default
@@ -338,6 +332,13 @@ public struct NativeContextFlowModeStatus: Sendable, Equatable {
     public let effectiveMode: ContextFlowMode
     public let environmentManaged: Bool
     public let setupForcedOff: Bool
+}
+
+/// A configured runtime that could not start. Carried to the turn that needs
+/// it, so the reply names the cause instead of going out without context.
+public struct NativeContextFlowStartupError: Error, LocalizedError {
+    public let detail: String
+    public var errorDescription: String? { "Context Flow could not start: \(detail)" }
 }
 
 /// The live runtime's health read has a distinct configured-off result: no
@@ -364,7 +365,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     private let publicSafeModeOverride: Bool?
     private let personaOverride: @Sendable () -> String?
     private var coordinator: ContextFlowCoordinator?
-    private var personaProvider: PersonaContextFlowProvider?
     private var memoryRuntime: SwiftNativeMemoryV2?
     private let memoryPressureObserver: (any NativeContextMemoryPressureObserving)?
     /// One kqueue-backed invalidation reader over the canonical Desk feed and
@@ -383,7 +383,11 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     private var semanticQueryTasks: [String: Task<Void, Never>] = [:]
     private var semanticQueryEpoch: UInt64 = 0
     private var startupFailedClosed = false
-    /// Packet provenance: filled by the memory projection on every compile,
+    /// Why the configured runtime has no coordinator. The next turn retries
+    /// startup and, if it fails again, stops with this instead of replying
+    /// without context.
+    private var startupFailure: String?
+    /// Packet provenance: accepted with each published memory generation,
     /// read at prepare time to resolve selected memory atoms → record IDs.
     private let memoryProvenanceIndex: MemoryAtomRecordIndex
     private var lastMemoryProvenanceResolution: NativeContextMemoryProvenanceResolution?
@@ -432,16 +436,13 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         guard coordinator == nil else { return }
         starting = true
         startupFailedClosed = false
+        startupFailure = nil
         lastMemoryPressureReceipt = nil
         let configuration = resolvedConfiguration()
         guard configuration.mode != .off else {
             NSLog("[context-flow] disabled until onboarding or explicit enablement")
             finishStartup()
             return
-        }
-
-        if let warning = ContextHintsFeed.inspect(dataRoot: dataRoot).warning {
-            NSLog("[context-hints] %@", warning)
         }
 
         do {
@@ -451,19 +452,14 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             } else {
                 memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
             }
-            guard let embeddingEpoch = await memory.embeddingEpoch()?.rawValue else {
+            guard await memory.embeddingEpoch() != nil else {
                 throw MemoryV2Error.storageUnavailable
             }
-            let embeddingProvider = NativeContextEmbeddingProvider(
-                memory: memory,
-                modelFingerprint: embeddingEpoch
-            )
             let store = try ContextSQLiteStore(dataRoot: dataRoot)
             let arena = try ContextArena(budget: configuration.budget)
             let registry = try ContextSourceRegistry()
             let provider = PersonaContextFlowProvider(
                 dataRoot: dataRoot,
-                mode: configuration.mode,
                 personaOverride: personaOverride
             )
             let coordinator = ContextFlowCoordinator(
@@ -471,7 +467,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                 store: store,
                 arena: arena,
                 registry: registry,
-                compiler: ContextMarkdownCompiler(embeddingProvider: embeddingProvider),
+                compiler: NativeContextMarkdownCompiler(memory: memory),
                 mirrorProvider: provider,
                 compiledProjectionProviders: [NativeMemoryContextProjection(
                     memory: memory,
@@ -483,7 +479,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                 NativeStudioContextProjection(dataRoot: dataRoot)]
             )
             memoryRuntime = memory
-            personaProvider = provider
             self.coordinator = coordinator
             startResidentWorkObservationIfNeeded()
             if usesLiveAppBody {
@@ -510,9 +505,9 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                 await ContextFlowInvalidationRelay.shared.set(nil)
             }
             coordinator = nil
-            personaProvider = nil
             memoryRuntime = nil
             startupFailedClosed = true
+            startupFailure = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             await memoryPressureObserver?.stop()
             residentWorkObservationTask?.cancel()
             residentWorkObservationTask = nil
@@ -537,7 +532,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         }
         await coordinator?.stop()
         coordinator = nil
-        personaProvider = nil
         memoryRuntime = nil
     }
 
@@ -598,7 +592,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     private func reconcilePersonaPickerIfNeeded() async {
-        guard let coordinator, let personaProvider else { return }
+        guard let coordinator else { return }
         // Only the immutable published kernel can acknowledge a selection.
         // Sampling preferences before/after an awaited build loses changes
         // (including ABA); a cached provider build may not have published yet.
@@ -611,7 +605,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         lease?.release()
         // Missing publication is not an acknowledged default/nil selection.
         guard !selectionPublished else { return }
-        await personaProvider.invalidateCachedBuild()
         _ = await coordinator.reconcileSourceChanges([DerivedSourceChange(
             namespace: "persona-picker",
             stableID: "chat",
@@ -642,7 +635,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     public func contextFlowMode() async -> ContextFlowMode {
         if starting { await waitForStartup() }
         if let coordinator { return await coordinator.mode }
-        if startupFailedClosed { return .off }
         return resolvedConfiguration().mode
     }
 
@@ -802,9 +794,14 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         await start()
         await reconcilePersonaPickerIfNeeded()
         guard let coordinator else {
+            if let startupFailure { throw NativeContextFlowStartupError(detail: startupFailure) }
             throw ContextTurnPreparationError.coordinatorNotStarted
         }
         let prepared = try await coordinator.prepareTurn(request)
+        guard request.surface != .chat
+            || prepared.kernel.requestedPersonaOverride == normalizedPersonaOverride() else {
+            throw ContextTurnPreparationError.personaSelectionUnavailable
+        }
         attachMemoryProvenance(to: prepared, surface: request.surface.rawValue)
         return prepared
     }
@@ -1044,43 +1041,9 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
 }
 
 extension NativeContextFlowRuntime {
-    /// Mind-into-circulation (2026-07-10): translation of a MEMORY RECORD id →
-    /// the ContextAtomID the memory projection assigns that record. This lives
-    /// beside the projection on purpose — its owner string
-    /// (`NativeMemoryContextProjection.owner`) must never be hardcoded in
-    /// Context or ChatOrchestration. The derivation MIRRORS `NativeMemoryContextProjection.prepare`
-    /// exactly (locatorDigest → locator → source → atom) so an activation weight
-    /// keyed here lands on the same atom Fluid Context selects.
-    ///
-    /// Kind is fixed to `.memory`: the substrate hands us record ids without the
-    /// correction flag, and correction atoms are already mandatory-included, so
-    /// an activation miss on a correction record is benign (it's injected anyway).
-    /// Reusable as a `@Sendable (String) -> ContextAtomID?` — no captured state.
-    public static func memoryRecordAtomID(forRecordID recordID: String) -> ContextAtomID? {
-        // Mirror the projection's EXACT id pipeline (gpt-5.5 MED, 2026-07-10):
-        // `normalizedID` precomposes Unicode before trimming — a decomposed
-        // record id hashed raw would derive a locator the projection never
-        // creates. Same validity gates (≤512 UTF-8 bytes, no control chars):
-        // an id the projection would reject translates to nil, never to a
-        // phantom atom id.
-        let normalized = NativeMemoryContextProjection.normalizedRecordID(recordID)
-        guard !normalized.isEmpty,
-              normalized.utf8.count <= 512,
-              !NativeMemoryContextProjection.recordIDContainsDisallowedControl(normalized) else {
-            return nil
-        }
-        let locatorDigest = ContextStableID.digest(parts: [normalized])
-        let locator = "memory-v2/records/\(locatorDigest)"
-        let sourceID = ContextStableID.source(
-            owner: NativeMemoryContextProjection.owner,
-            locator: locator
-        )
-        return ContextStableID.atom(
-            sourceID: sourceID,
-            kind: .memory,
-            headingPath: [],
-            blockAnchor: "memory-record"
-        )
+    /// Resolve the projection's actual atom, including correction records.
+    public nonisolated func memoryRecordAtomID(forRecordID recordID: String) -> ContextAtomID? {
+        memoryProvenanceIndex.atomID(forRecordID: recordID)
     }
 }
 

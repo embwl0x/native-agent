@@ -162,8 +162,8 @@ extension HerScreen {
             let place = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot",
                 input: bound.merging(["max_nodes": .int(150), "scope": .string("main_content")]) { a, _ in a }, title: "Browser tab")
             return .action(.window(AgentWorkspaceNavigation.windowAction(place)))
-        // This chat's tab, or a new one when that tab has closed (an idle tab lapses in about a minute).
-        case "go": return .action(.perform(tool: "browser.chrome_navigate", input: [:], title: "Go to an address", textField: "url", isEffect: true))
+        // An expired lease is refused by the browser owner; browser.go opens a new tab.
+        case "go": return .action(.perform(tool: "browser.chrome_navigate", input: bound, title: "Go to an address", textField: "url", isEffect: true))
         case "click": return .action(.perform(tool: "browser.chrome_click", input: bound, title: "Click in " + name, textField: "node_id", isEffect: true))
         case "fill": return .action(.perform(tool: "browser.chrome_fill", input: bound, title: "Fill in " + name, textField: "fields", isEffect: true))
         case "more":
@@ -186,7 +186,7 @@ extension HerScreen {
             .filter { $0.range(of: #"^\s*\d+  "#, options: .regularExpression) != nil }
         let cap = 24
         var shown = rows.prefix(cap).map { clip($0, 110) }
-        if rows.count > cap { shown.append("+\(rows.count - cap) more rows · browser.chrome_snapshot reads them all") }
+        if rows.count > cap { shown.append("+\(rows.count - cap) more rows · app chrome.snapshot reads them all") }
         if shown.isEmpty { shown = ["nothing readable in view"] }
         let lines = page.text.split(separator: "\n").map(String.init)
         let status = lines.dropFirst().first.map { $0.replacingOccurrences(of: #"^snapshot_id \S+ ?·? ?"#, with: "", options: .regularExpression) } ?? ""

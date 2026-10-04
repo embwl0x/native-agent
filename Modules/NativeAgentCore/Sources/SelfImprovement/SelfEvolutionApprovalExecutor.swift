@@ -78,19 +78,16 @@ public enum SelfEvolutionApprovalExecutor {
                         expectedHead: expectedHead, expectedDiffSHA256: diffSha)
                 },
                 rebuildGate: {
-                    // Mirror of SwiftNativeSystemRebuildClient's gate: the
-                    // factory (makeSystemRebuildClient) constructs with
-                    // daemonAutonomy=false (closed-fail default), so the
-                    // composite here uses the same value — if the factory is
-                    // ever seeded for real, update BOTH or the preflight lies.
+                    // Match the factory's unconditional in-process runtime
+                    // and read its current Trust authorization before staging.
                     let policy: AutonomyTrustPolicyView
                     do {
-                        policy = try await readAutonomyTrustPolicy()
+                        policy = try await readAutonomyTrustPolicy(dataRoot: dataRoot)
                     } catch {
                         return (false, error.localizedDescription)
                     }
                     switch checkTrustPolicyForAction(
-                        .systemRebuild, daemonAutonomy: false, policy: policy) {
+                        .systemRebuild, daemonAutonomy: true, policy: policy) {
                     case .allowed: return (true, "")
                     case .denied(let reason): return (false, reason)
                     }
@@ -114,7 +111,7 @@ public enum SelfEvolutionApprovalExecutor {
                     // exceeded + post-grace sha-mismatch.
                     do {
                         let checks = try await SwiftNativeDoctorChecks()
-                            .runAll(repair: false, checkLLM: false)
+                            .runAll(repair: false)
                         return checks.allSatisfy { $0.status == "ok" } ? .green : .degraded
                     } catch {
                         return .unknown
@@ -252,6 +249,16 @@ public enum SelfEvolutionApprovalExecutor {
         payload: JSONValue,
         deps: SelfEvolutionDeps
     ) async {
+        guard case .object(let object) = payload,
+              case .string(let proposalId)? = object["proposalId"], !proposalId.isEmpty else { return }
+        do {
+            _ = try await EvolutionProposalStore(dataRoot: deps.dataRoot).transition(
+                id: proposalId, to: .staged, require: [.candidateGreen],
+                receipt: "staged by active Full Mac authority")
+        } catch {
+            NSLog("[selfEvolution] Full Mac staging failed for %@: %@", proposalId, String(describing: error))
+            return
+        }
         let timestamp = SwiftNativeManifestSigner.isoTimestamp(Date())
         let record = ApprovalRecord(
             id: "full-mac-yolo-\(UUID().uuidString.lowercased())",
@@ -598,13 +605,13 @@ public enum SelfEvolutionApprovalExecutor {
             await appendEvolutionInboxCard(
                 deps: deps,
                 severity: "actionable",
-                title: "Self-evolution verify record is corrupt",
-                summary: "pending_verify.json could not be read — left in place for inspection.",
+                title: "NativeAgent could not check its update",
+                summary: "The saved update record could not be read. It has been kept for inspection.",
                 detail: detail)
         case .verified(let rec), .verifiedDegraded(let rec, _):
             var doctorNote = ""
-            if case .verifiedDegraded(_, let doctor) = decision {
-                doctorNote = " Doctor reported \(doctor.rawValue) — worth a glance."
+            if case .verifiedDegraded = decision {
+                doctorNote = " A health check needs attention."
             }
             // approved → installed → verified (the first hop covers a crash
             // before the executor's installed transition landed).
@@ -619,9 +626,8 @@ public enum SelfEvolutionApprovalExecutor {
                 deps: deps,
                 severity: "info",
                 title: "NativeAgent updated itself",
-                summary: "Evolution run \(rec.runId) installed and verified — bundle now at "
-                    + "\(String(rec.expectedSha.prefix(12))).\(doctorNote)",
-                detail: "proposal \(rec.proposalId); attempts \(rec.attempts)")
+                summary: "The update is installed and verified.\(doctorNote)",
+                detail: "proposal \(rec.proposalId); run \(rec.runId); bundle sha \(rec.expectedSha); attempts \(rec.attempts); decision \(decision)")
         case .revert(let rec, let reason):
             do {
                 let newHead = try await deps.revertCommit(rec.revertSha)
@@ -635,37 +641,38 @@ public enum SelfEvolutionApprovalExecutor {
                     receipt: "auto-reverted (\(reason.rawValue)) — revert commit \(String(newHead.prefix(12)))")
                 // Reinstall the reverted source through the same gate.
                 var reinstallNote: String
+                let reinstallSummary: String
                 let gate = await deps.rebuildGate()
                 if gate.allowed {
                     do {
                         let msg = try await deps.fireRebuild()
                         reinstallNote = "Reinstall of reverted source fired: \(msg)."
+                        reinstallSummary = "Reinstalling the previous version."
                     } catch {
                         reinstallNote = "Reinstall spawn FAILED (\(error.localizedDescription)) — "
                             + "rollback bundle at \(verifier.rollbackBundleDir(runId: rec.runId).path)."
+                        reinstallSummary = "The previous version could not be reinstalled; it needs attention."
                     }
                 } else {
                     reinstallNote = "Reinstall awaiting systemRebuild.enabled — "
                         + "rollback bundle at \(verifier.rollbackBundleDir(runId: rec.runId).path)."
+                    reinstallSummary = "Reinstalling the previous version is waiting for permission."
                 }
                 await appendEvolutionInboxCard(
                     deps: deps,
                     severity: "actionable",
-                    title: "Self-evolution auto-reverted",
-                    summary: "Run \(rec.runId) failed post-install verify (\(reason.rawValue)). "
-                        + "Source reverted at \(String(newHead.prefix(12))). \(reinstallNote)",
-                    detail: "proposal \(rec.proposalId); expected sha \(rec.expectedSha); attempts \(rec.attempts)")
+                    title: "NativeAgent rolled back its update",
+                    summary: "The update could not be verified, so its source changes were undone. \(reinstallSummary)",
+                    detail: "proposal \(rec.proposalId); run \(rec.runId); reason \(reason.rawValue); expected sha \(rec.expectedSha); revert commit \(newHead); attempts \(rec.attempts). \(reinstallNote)")
             } catch {
                 // Revert refused (conflict / non-ancestor): pending_verify is
                 // KEPT as the evidence record; surface for a human.
                 await appendEvolutionInboxCard(
                     deps: deps,
                     severity: "actionable",
-                    title: "Self-evolution revert FAILED — manual intervention",
-                    summary: "Run \(rec.runId) needs revert (\(reason.rawValue)) but git revert failed: "
-                        + "\(error.localizedDescription). Rollback bundle at "
-                        + "\(verifier.rollbackBundleDir(runId: rec.runId).path).",
-                    detail: "revert sha \(rec.revertSha); pending_verify kept as evidence")
+                    title: "NativeAgent needs help rolling back its update",
+                    summary: "The update could not be verified, and its source changes could not be undone. The saved recovery copy and update record have been kept.",
+                    detail: "proposal \(rec.proposalId); run \(rec.runId); reason \(reason.rawValue); error \(error.localizedDescription); rollback bundle \(verifier.rollbackBundleDir(runId: rec.runId).path); revert sha \(rec.revertSha); pending_verify kept as evidence")
             }
         }
     }

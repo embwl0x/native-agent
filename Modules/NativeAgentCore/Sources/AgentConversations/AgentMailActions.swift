@@ -36,6 +36,7 @@ public enum AgentMailActions {
                 ])
             }
             return completed(actionId: "agentmail.list_inbox", fields: [
+                "untrusted_remote_data": .bool(!rows.isEmpty),
                 "inbox": .string(config.inboxID),
                 "display_name": .string(config.displayName),
                 "messages": .array(rows),
@@ -65,6 +66,7 @@ public enum AgentMailActions {
             let text = string(data["text"]) ?? string(data["body_text"]) ?? ""
             let html = string(data["html"]) ?? string(data["body_html"]) ?? ""
             return completed(actionId: "agentmail.read", fields: [
+                "untrusted_remote_data": .bool(true),
                 "inbox": .string(config.inboxID),
                 "display_name": .string(config.displayName),
                 "message_id": .string(resolvedID),
@@ -297,9 +299,9 @@ public enum AgentMailActions {
         guard var components = URLComponents(url: config.apiBase, resolvingAgainstBaseURL: false) else {
             throw AgentMailError("invalid_url", detail: "Could not build AgentMail request URL.")
         }
-        let basePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let requestPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        components.path = "/" + [basePath, requestPath].filter { !$0.isEmpty }.joined(separator: "/")
+        components.percentEncodedPath = "/" + [basePath, requestPath].filter { !$0.isEmpty }.joined(separator: "/")
         if !query.isEmpty {
             components.queryItems = query.map { URLQueryItem(name: $0.0, value: $0.1) }
         }

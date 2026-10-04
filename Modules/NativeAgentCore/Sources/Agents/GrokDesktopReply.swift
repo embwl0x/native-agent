@@ -64,6 +64,11 @@ import Vision
 
     /// At send time: user turns already carrying exactly this text, and the
     /// transcript's place in the window (above the message box).
+    static func outgoingOccurrences(_ message: String, chat: String) -> Int? {
+        func normalized(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+        return scan(chat: chat).map { $0.turns.filter { $0.user && normalized($0.text) == normalized(message) }.count }
+    }
+
     static func layout(_ message: String, chat: String) -> Layout? {
         guard let scan = scan(chat: chat), let window = frame(scan.window), var transcript = frame(scan.log),
               let pid = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first?.processIdentifier else { return nil }
@@ -183,7 +188,7 @@ import Vision
                       observation: Observation) async -> Outcome {
         let hub = AgentConversationLiveHub.shared
         let deadline = Date().addingTimeInterval(replyTimeout)
-        var last = "", text = "", by = "", changedAt = Date()
+        var text = "", by = "", changedAt = Date()
         // On screen an older identical ask looks the same as ours. With one in
         // the chat (baseline > 0), a bubble is ours only once it has been seen
         // as the newest of theirs with nothing answering it yet: the post-send turn.
@@ -223,10 +228,11 @@ import Vision
             var activity = false, changed = false, answered = false
             if let reply {
                 if reply.active, observation.firstActivity == nil { observation.firstActivity = Date(); activity = true }
-                if bare(reply.text) != last {
-                    last = bare(reply.text); text = reply.text; by = reply.by; changedAt = Date()
+                if reply.text != text {
+                    changedAt = Date()
                     changed = true
                 }
+                text = reply.text; by = reply.by
                 answered = !text.isEmpty && Date().timeIntervalSince(changedAt) >= 4 && !reply.answering
             }
             observation.outcome = answered ? .answered(text, at: changedAt, by: by) : .unanswered(partial: text, blocker: blocker)

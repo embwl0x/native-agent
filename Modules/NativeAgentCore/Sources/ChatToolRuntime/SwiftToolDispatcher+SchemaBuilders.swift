@@ -21,7 +21,9 @@ extension SwiftToolDispatcher {
     /// NativeAgent's own MCP endpoint remains available to external MCP
     /// clients and the MCP UI, but advertising it back to NativeAgent's LLM
     /// duplicates native Swift tools and forces a needless self-protocol hop.
-    func modelVisibleMCPTools() -> [MCPToolDescriptor] {
+    func modelVisibleMCPTools() -> [MCPToolDescriptor] { Self.modelVisibleMCPTools(dataRoot: dataRoot) }
+
+    static func modelVisibleMCPTools(dataRoot: URL) -> [MCPToolDescriptor] {
         // PRODUCTION TRIGGER for the MCP tools-cache refresh. `listMCPTools`
         // reads `mcp/cache/tools.json` and nothing else; before this, the only
         // callers of `refreshAllToolsCaches` were manual/UI actions, so a
@@ -47,17 +49,19 @@ extension SwiftToolDispatcher {
                 .filter { $0.serverId == "nativeagent-internal" }
                 .map(\.bridgedName)
         )
-        // Subtract the four-verb cutover boundary here too. Every catalog field
-        // derived from this list — `tool_groups` among them — was one table
-        // entry away from advertising a name `tool_load` refuses; the callers
-        // that re-filter through modelVisibleCatalogToolNames were carrying the
-        // whole guarantee. Same set tool_load resolves against.
+        // Subtract the four-verb cutover boundary and every hidden name here
+        // too, so no manifest field derived from this list names a tool the
+        // model never sees.
         return all.filter {
-            !hidden.contains($0) && !Self.legacyMacModelToolNames.contains($0)
+            !hidden.contains($0) && !Self.isModelHidden($0)
         }
     }
 
-    func mcpToolSchemas() -> [LLMToolSchema] {
+    func mcpToolSchemas() -> [LLMToolSchema] { Self.mountedMCPToolSchemas(dataRoot: dataRoot) }
+
+    /// Each mounted MCP server's tools, also as the `app` door's generated
+    /// `mcp.<server>.<tool>` actions: their args, label and description.
+    package static func mountedMCPToolSchemas(dataRoot: URL) -> [LLMToolSchema] {
         // Permissive fallback for tools whose cache row carries no
         // inputSchema — the LLM has to guess argument names for those.
         let fallback = JSONValue.object([
@@ -66,7 +70,7 @@ extension SwiftToolDispatcher {
             "additionalProperties": .bool(true),
         ])
         let fallbackData = (try? fallback.serializedData(pretty: false)) ?? Data("{}".utf8)
-        return modelVisibleMCPTools().map { tool in
+        return modelVisibleMCPTools(dataRoot: dataRoot).map { tool in
             let paramsData = tool.inputSchema
                 .flatMap { try? $0.serializedData(pretty: false) }
                 ?? fallbackData
@@ -84,9 +88,13 @@ extension SwiftToolDispatcher {
         includeFullMacAccessibilityReadTools: Bool = false,
         includeFullMacAccessibilityInjectionTools: Bool = false,
         includeActivityQueryTool: Bool = false,
-        requestedNames: Set<String>? = nil
+        requestedNames: Set<String>? = nil,
+        standingBotMinimumInterval: TimeInterval
     ) -> [LLMToolSchema] {
-        BuiltInToolSchemaFactory(requestedNames: requestedNames).schemas(
+        BuiltInToolSchemaFactory(
+            requestedNames: requestedNames,
+            standingBotMinimumInterval: standingBotMinimumInterval
+        ).schemas(
             includeFullMacFileTools: includeFullMacFileTools,
             includeFullMacSystemTools: includeFullMacSystemTools,
             includeFullMacAccessibilityReadTools: includeFullMacAccessibilityReadTools,

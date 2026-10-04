@@ -54,9 +54,10 @@ final class SecurityCenterRefreshState {
     private(set) var isRefreshing = false
     private(set) var lastRefreshError: String?
     private let statusReader: SecurityCenterStatusReader
-    private var completedInitialRead = false
     private var appearanceRead = false
     private var readGate = LatestAsyncRequestGate()
+    private var refreshTask: Task<Void, Never>?
+    private var refreshRequested = false
 
     init(statusReader: @escaping SecurityCenterStatusReader) {
         self.statusReader = statusReader
@@ -75,40 +76,54 @@ final class SecurityCenterRefreshState {
     }
 
     func loadOnAppearance() async {
-        guard !completedInitialRead else { return }
         await refresh(isAppearanceRead: true)
     }
 
     func cancelAppearanceRead() {
         guard appearanceRead else { return }
         _ = readGate.begin()
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshRequested = false
         appearanceRead = false
         isRefreshing = false
     }
 
     private func refresh(isAppearanceRead: Bool) async {
         guard !Task.isCancelled else { return }
-        guard !isRefreshing else { return }
+        if let refreshTask {
+            refreshRequested = true
+            appearanceRead = appearanceRead && isAppearanceRead
+            await refreshTask.value
+            return
+        }
         let request = readGate.begin()
         appearanceRead = isAppearanceRead
         isRefreshing = true
-        lastRefreshError = nil
-        defer {
-            if readGate.accepts(request) {
-                isRefreshing = false
-                appearanceRead = false
+        let task = Task { @MainActor in
+            defer {
+                if readGate.accepts(request) {
+                    isRefreshing = false
+                    appearanceRead = false
+                    refreshTask = nil
+                }
             }
+            repeat {
+                guard !Task.isCancelled, readGate.accepts(request) else { return }
+                refreshRequested = false
+                lastRefreshError = nil
+                do {
+                    let loaded = try await statusReader(10)
+                    guard !Task.isCancelled, readGate.accepts(request) else { return }
+                    status = loaded
+                } catch {
+                    guard !Task.isCancelled, readGate.accepts(request) else { return }
+                    lastRefreshError = SecurityCenterRefreshPresentation.boundedDetail(error)
+                }
+            } while refreshRequested
         }
-        do {
-            let loaded = try await statusReader(10)
-            guard !Task.isCancelled, readGate.accepts(request) else { return }
-            status = loaded
-            completedInitialRead = true
-        } catch {
-            guard !Task.isCancelled, readGate.accepts(request) else { return }
-            lastRefreshError = SecurityCenterRefreshPresentation.boundedDetail(error)
-            completedInitialRead = true
-        }
+        refreshTask = task
+        await task.value
     }
 }
 
@@ -258,7 +273,11 @@ struct NativeSecurityCenterPanel: View {
         }
         .task {
             guard loadsOnAppear else { return }
-            await refreshModel.loadOnAppearance()
+            await ViewFileRefreshTask.run(paths: [
+                appModel.engine.trust.dataRoot.appendingPathComponent("trust/policy.json")
+            ]) {
+                await refreshModel.loadOnAppearance()
+            }
         }
         .onDisappear { refreshModel.cancelAppearanceRead() }
     }

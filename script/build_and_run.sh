@@ -166,6 +166,7 @@ BUILT_APP="$DERIVED_DATA/Build/Products/$XCODE_CONFIG/$APP_NAME.app"
 # previous dist bundle — and the running app — are still intact; a failure
 # anywhere exits nonzero with nothing killed and nothing half-replaced.
 BUNDLE_FINAL="$ROOT/dist/$APP_NAME.app"
+APP_PROCESS_PATTERN="$(printf '%s' "$BUNDLE_FINAL/Contents/MacOS/$PRODUCT" | sed 's/[][\.^$*+?(){}|]/\\&/g')([[:space:]].*)?"
 BUNDLE="$ROOT/dist/.$APP_NAME.app.staging.$$"
 rm -rf "$BUNDLE"
 # Sweep the staging dir on any exit; cleared after the swap below (once the
@@ -203,21 +204,43 @@ nativeagent_sign_development_bundle "$BUNDLE" "$ROOT" "$NATIVEAGENT_MAC_BUNDLE_I
 # The staged bundle is built, signed, and codesign-verified. Only now do we
 # kill the running app (never in --build-only) and swap dist/NativeAgent.app.
 if [[ "$MODE" != "--build-only" ]]; then
+  # Match the app's duplicate-instance rule: same bundle ID, current login session.
+  staged_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$BUNDLE/Contents/Info.plist")"
+  matching_app_pids="$(/usr/bin/osascript -l JavaScript - "$staged_bundle_id" <<'JAVASCRIPT'
+ObjC.import('AppKit');
+function run(argv) {
+  const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(argv[0]);
+  const pids = [];
+  for (let i = 0; i < apps.count; i++) {
+    const app = apps.objectAtIndex(i);
+    if (!app.isTerminated) pids.push(app.processIdentifier);
+  }
+  return pids.join('\n');
+}
+JAVASCRIPT
+)"
+  for app_pid in $matching_app_pids; do
+    if ! pgrep -fx "$APP_PROCESS_PATTERN" | grep -qx "$app_pid"; then
+      echo "[build_and_run.sh] ERROR: $PRODUCT (pid $app_pid) is running outside $BUNDLE_FINAL." >&2
+      echo "[build_and_run.sh] Use ./script/install_app.sh to replace the installed app." >&2
+      exit 1
+    fi
+  done
   # A running dist-launched instance must not have its bundle swapped
   # underneath it, and the launch below needs the old instance gone.
   # Skipped in --build-only: install_app.sh re-signs its own copy and quits
   # the app itself only after that copy passes codesign verification.
-  pkill -x "$PRODUCT" 2>/dev/null || true
+  pkill -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
   # Wait (up to ~5s) for the app to exit before touching the bundle, then
   # hard-kill any survivor.
   for _ in $(seq 1 25); do
-    if pgrep -x "$PRODUCT" >/dev/null 2>&1; then
+    if pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
       sleep 0.2
     else
       break
     fi
   done
-  pkill -9 -x "$PRODUCT" 2>/dev/null || true
+  pkill -9 -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
 fi
 
 # Swap with rollback: move the old dist bundle aside instead of rm -rf'ing
@@ -253,32 +276,29 @@ case "$MODE" in
     echo "Built + signed $BUNDLE (--build-only: no kill, no launch)"
     ;;
   --verify)
-    # HOTFIX 2026-06-03 Swift runtime cutover + launchd-163: the old /health
-    # curl-probe no longer answers and the strict probe after `pgrep` was
-    # forcing this --verify path to exit non-zero on every install. Combined
-    # with `/usr/bin/open` returning 1 on launchd-163 (an OS launchd-cache
-    # issue, not a bundle problem — the shared signing owner already proved
-    # the bundle is valid + signed), this killed install_app.sh BEFORE it
-    # could swap the bundle into ~/Applications/.
-    # New verify: signed-and-valid is the gate that matters. Try a non-fatal
-    # `open` for nicety, but don't gate the install on it.
     _verify_cleanup() {
-      osascript -e 'tell application "NativeAgent" to quit' >/dev/null 2>&1 || true
-      pkill -x NativeAgentApp >/dev/null 2>&1 || true
+      pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 || return 0
+      osascript - "$BUNDLE" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  tell application (item 1 of argv) to quit
+end run
+APPLESCRIPT
+      pkill -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 || true
     }
-    trap '_verify_cleanup' ERR INT TERM
-    if NATIVE_AGENT_SKIP_LOGIN_ITEM_REGISTER=1 /usr/bin/open -n "$BUNDLE" >/dev/null 2>&1; then
-      sleep 2
-      if pgrep -x "$PRODUCT" >/dev/null 2>&1; then
-        echo "Verified $APP_NAME launched OK"
-      else
-        echo "Verified $APP_NAME bundle (signed + valid; launchd refused spawn, OS cache — not a bundle problem)"
-      fi
-    else
-      echo "Verified $APP_NAME bundle (signed + valid; /usr/bin/open hit launchd-163 — OS cache, not a bundle problem)"
+    trap '_verify_cleanup' EXIT
+    trap 'exit 1' INT TERM
+    if ! NATIVE_AGENT_SKIP_LOGIN_ITEM_REGISTER=1 /usr/bin/open -n "$BUNDLE"; then
+      echo "[build_and_run.sh] ERROR: failed to launch $BUNDLE" >&2
+      exit 1
     fi
+    sleep 2
+    if ! pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
+      echo "[build_and_run.sh] ERROR: $BUNDLE is not running after launch" >&2
+      exit 1
+    fi
+    echo "Verified $APP_NAME launched OK"
     _verify_cleanup
-    trap - ERR INT TERM
+    trap - EXIT INT TERM
     ;;
   --logs)
     /usr/bin/open -n "$BUNDLE"

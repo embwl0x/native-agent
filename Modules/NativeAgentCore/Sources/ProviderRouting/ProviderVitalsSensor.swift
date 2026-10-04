@@ -510,6 +510,8 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
             let lastSampleAt = Self.optionalDate(row["lastSampleAt"])
             let degradedSince = Self.optionalDate(row["degradedSince"])
             guard lastSampleAt != .invalid,
+                  let sampledAt = lastSampleAt.value,
+                  now.timeIntervalSince(sampledAt) <= max(0, maxAge),
                   degradedSince != .invalid,
                   (lastSampleAt.value?.timeIntervalSince(now) ?? 0) <= max(0, futureSkewAllowance),
                   (degradedSince.value?.timeIntervalSince(now) ?? 0) <= max(0, futureSkewAllowance) else {

@@ -1,4 +1,6 @@
 import BackgroundWork
+import AttentionRouting
+import Privacy
 import ActivityWatch
 import Foundation
 import SchedulerExecution
@@ -65,12 +67,22 @@ extension BackgroundLoopsAssembly {
             // without this gate.
             let bots = BotRunnerScheduler(dataRoot: standardized,
                 session: NativeAgentEngine.live.standingBotSession(),
-                isAutonomyEnabled: { await unattendedWorkAllowed(dataRoot: standardized) })
+                isAutonomyEnabled: { await unattendedWorkAllowed(dataRoot: standardized) },
+                conditionMet: { bot, entry in
+                    // The Bots editor's "Tell me if", judged true by the run:
+                    // the person asked to hear this, through the one router.
+                    _ = try? await AttentionRouter.shared.route(
+                        eventId: "bot_condition:\(entry.id.uuidString)", importance: .requestedResult,
+                        title: NativeAppSecretRedactor.redactText(String("\(bot.name): \(bot.notificationCondition ?? "")".prefix(160))),
+                        body: NativeAppSecretRedactor.redactText(String(entry.headline.prefix(500))),
+                        userInfo: ["screen": "activity", "source": "bot_condition", "botId": bot.id.uuidString])
+                })
             let work = TriggerSchedulerBackgroundWork.makeJobWork(
                 runDueJobs: { await dueJobRunner.runDueJobs(maxJobs: $0) },
                 activityFailure: { await dueJobRunner.activityFeedError },
                 nextDeadline: { await dueJobRunner.nextMeaningfulDeadline(after: $0) },
-                bots: bots
+                bots: bots,
+                continuations: makeDeskContinuationScheduler(dataRoot: standardized)
             )
             runDueJobs = work.runDueJobs
             schedulerActivityFailure = work.activityFailure

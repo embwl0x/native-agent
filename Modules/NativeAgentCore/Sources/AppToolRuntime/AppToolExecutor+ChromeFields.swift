@@ -35,11 +35,14 @@ extension AppToolExecutor {
               let page = ChromePageMirror.page(lease: inputString(input["lease_id"]), session: ChatToolSessionContext.verifiedSessionId),
               let node = inputString(input["node_id"])?.trimmingCharacters(in: .whitespacesAndNewlines), !node.isEmpty else { return nil }
         let given = inputString(input["snapshot_id"]) ?? ""
+        guard given.isEmpty || given == page.snapshotID else {
+            return .object(["ok": .bool(false), "error": .string("snapshot_stale"),
+                "reason": .string("The supplied snapshot does not match the page last read. Read the page again with browser.chrome_snapshot. Nothing was sent.")])
+        }
         let byNumber = node.range(of: #"^n?\d+$"#, options: .regularExpression) != nil
         var row: ChromePageMirror.Row?
         if byNumber {
-            guard given.isEmpty || given == page.snapshotID else { return nil }
-            input["snapshot_id"] = .string(page.snapshotID)
+            if given.isEmpty { input["snapshot_id"] = .string(page.snapshotID) }
             row = ChromePageMirror.find(node, wants: wants, in: page).row
         } else if page.rows.contains(where: { $0.node == node }) {
             return nil
@@ -59,7 +62,7 @@ extension AppToolExecutor {
             }
             row = found
             input["node_id"] = .string(found.node)
-            input["snapshot_id"] = .string(page.snapshotID)
+            if given.isEmpty { input["snapshot_id"] = .string(page.snapshotID) }
         }
         if actionId == "browser.chrome_select", let row, case .array(let values)? = input["values"] {
             input["values"] = .array(values.map { value in
@@ -101,9 +104,6 @@ extension AppToolExecutor {
             }
         default: break
         }
-        if let index = fields.pairs.firstIndex(where: { $0.label.lowercased() == "submit" }) {
-            fields.submit = fields.pairs.remove(at: index).value
-        }
         switch input["submit"] {
         case .bool(true)?: fields.submit = "enter"
         case .some(let value): if let label = text(value), !label.isEmpty, label != "false" { fields.submit = label }
@@ -116,14 +116,13 @@ extension AppToolExecutor {
     /// fields, submit} after the page loads. Every label is found before
     /// anything is typed, so a missing field leaves the form untouched.
     public func runChromeFieldsCall(actionId: String, input: [String: JSONValue], fields: ChromeFields, direct: Bool,
-                             surface: String, host: any ToolLoading, run: ChromeRun) async throws -> JSONValue {
+                             surface: String, run: ChromeRun) async throws -> JSONValue {
         var lease = Self.inputString(input["lease_id"]) ?? ""
         var head: [String] = []
         if actionId == "browser.chrome_navigate" {
             var open = input
             open.removeValue(forKey: "fields"); open.removeValue(forKey: "submit")
             let opened = try await run(actionId, open)
-            await preloadBrowserTools(input, surface: surface, host: host)
             guard case .object(let row) = opened, row["outcome"] == .string("succeeded"),
                   case .string(let granted)? = row["leaseId"] else { return opened }
             lease = granted
@@ -184,8 +183,9 @@ extension AppToolExecutor {
         }
         plan.sort { $0.index < $1.index }
         var lines: [String] = [], ok = true, last: String?, lastTool = actionId
-        func act(_ tool: String, target: String, wants: Set<String>, extra: [String: JSONValue], shown: String) async -> Bool {
-            if tool != actionId, await !chromeFollowUpAllowed(tool, input: input, surface: surface) {
+        var takeover: [String: JSONValue]?
+        func act(_ tool: String, target: String, wants: Set<String>, extra: [String: JSONValue], shown: String, submission: Bool = false) async -> Bool {
+            if tool != actionId, await !chromeFollowUpAllowed(tool, input: input, surface: surface, enforceAutonomy: submission ? true : nil) {
                 lines.append("✗ " + shown + ": needs your approval here; call " + tool + " for it"); return false
             }
             for attempt in 0..<2 {
@@ -197,9 +197,13 @@ extension AppToolExecutor {
                 }
                 var call = extra
                 call["lease_id"] = .string(lease); call["snapshot_id"] = .string(page.snapshotID); call["node_id"] = .string(row.node)
+                call["expected_user_sequence"] = input["expected_user_sequence"]
                 do {
                     let result = try await run(tool, call)
                     let rowNumber = row.node.hasPrefix("n") ? String(row.node.dropFirst()) : row.node
+                    if case .object(let done) = result, done["status"] == .string("yielded_to_user") {
+                        takeover = done
+                    }
                     if case .object(let done) = result, done["outcome"] == .string("succeeded") {
                         lines.append("✓ " + shown + " (row " + rowNumber + ")"); lastTool = tool; return true
                     }
@@ -236,19 +240,29 @@ extension AppToolExecutor {
             if let fresh = try? await read() { page = fresh }
             if submit.lowercased() == "enter" || submit.lowercased() == "true" {
                 if let last {
-                    ok = await act("browser.chrome_keypress", target: last, wants: ["keypress", "fill", "type"], extra: ["key": .string("Enter")], shown: "Enter")
+                    ok = await act("browser.chrome_keypress", target: last, wants: ["keypress", "fill", "type"], extra: ["key": .string("Enter")], shown: "Enter", submission: true)
                 } else { lines.append("✗ Enter: no field was filled to press it in"); ok = false }
             } else {
-                ok = await act("browser.chrome_click", target: submit, wants: ["click"], extra: [:], shown: "click " + ChromePageText.safe(submit))
+                ok = await act("browser.chrome_click", target: submit, wants: ["click"], extra: [:], shown: "click " + ChromePageText.safe(submit), submission: true)
             }
         }
         let summary = (ok ? "" : "Stopped: ") + lines.joined(separator: " · ")
+        if var takeover {
+            takeover["ok"] = .bool(false)
+            takeover["text"] = .string((head + [summary]).joined(separator: "\n"))
+            return .object(takeover)
+        }
         guard direct else {
             return .object(["ok": .bool(ok), "outcome": .string(ok ? "succeeded" : "failed"), "leaseId": .string(lease),
                             "fields": .string(summary), "tool": .string(actionId)])
         }
         let fresh = await freshChromePage(after: lastTool, lease: lease, sequence: nil, input: input, surface: surface, run: run)
-        return .string((head + [summary, "", fresh]).joined(separator: "\n"))
+        let text = (head + [summary, "", fresh]).joined(separator: "\n")
+        guard ok else {
+            return .object(["ok": .bool(false), "outcome": .string("failed"), "leaseId": .string(lease),
+                            "fields": .string(summary), "tool": .string(actionId), "text": .string(text)])
+        }
+        return .string(text)
     }
 
     /// A main_content read of a page with no main or article region comes

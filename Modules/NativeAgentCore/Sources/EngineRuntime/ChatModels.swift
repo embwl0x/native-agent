@@ -121,6 +121,8 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
     // (audit finding #2, 2026-06-14).
     public var partial: Bool? = nil
     public var cancelled: Bool? = nil
+    /// Exact engine outcome of a persisted assistant turn.
+    public var completionState: String?
     // PATCH-2026-05-08: wave2-chat-ux Tool-use pill metadata (role=tool messages)
     public var kind: String?          // "tool_use" | `approvalPendingKind`
     public var toolName: String?      // e.g. "read_file"
@@ -152,6 +154,15 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
     public var isPendingApproval: Bool {
         kind == Self.approvalPendingKind
     }
+    /// Decode-only: a mirror of a card raised in another conversation
+    /// (`ApprovalChatCards.interactionMirrorKind`) — where the original is.
+    public var mirrorInteractionId: String?
+    public var mirrorInteractionSessionId: String?
+    public var interactionMirror: (sessionID: String, interactionID: String)? {
+        guard kind == "interaction_mirror", let mirrorInteractionId, let mirrorInteractionSessionId
+        else { return nil }
+        return (mirrorInteractionSessionId, mirrorInteractionId)
+    }
     // eval3/T3: attachments persisted under metadata.attachments by
     // ChatOrchestrationClient.appendMessage (NativeAgentCore). Round-tripped
     // here so the transcript read → MacSyncEngine snapshot → iOS refreshChatHistory
@@ -170,13 +181,15 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
     /// of leaving "I'll check… now I'll read… here's what I found" as one
     /// permanent answer. Absent on single-round turns and on every user row.
     public var workingCommentaryChars: Int?
+    /// Opaque identity of the turn that produced this assistant row.
+    public var turnTraceId: String?
     /// The engine's `mechanicalKind` stamp. Decode-only: `systemRow` marks a
     /// persisted turn-failure notice, which is not a reply.
     public var mechanicalKind: String?
 
     // Custom CodingKeys to map camelCase Swift properties → snake_case daemon keys
     enum CodingKeys: String, CodingKey {
-        case model, requestedModel, reasoningEffort, fileAccessMode, codexSandbox, error, partial, cancelled
+        case model, requestedModel, reasoningEffort, fileAccessMode, codexSandbox, error, partial, cancelled, completionState
         case providerRefusal = "provider_refusal"
         case providerRefusalDraft = "provider_refusal_draft"
         case kind
@@ -192,6 +205,7 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
         case attachments
         case origin
         case workingCommentaryChars
+        case turnTraceId
     }
 
     /// Empty metadata. Declaring `init(from:)` in the body suppresses the
@@ -242,6 +256,7 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
     /// returning a 500KB blob doesn't blow up SwiftUI rendering or memory.
     public init(fields o: [String: JSONValue]) {
         model = chatRowString(o["model"])
+        turnTraceId = chatRowString(o["turnTraceId"])
         requestedModel = chatRowString(o["requestedModel"])
         reasoningEffort = chatRowString(o["reasoningEffort"])
         fileAccessMode = chatRowString(o["fileAccessMode"])
@@ -251,6 +266,7 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
         providerRefusalDraft = chatRowBool(o["provider_refusal_draft"])
         partial = chatRowBool(o["partial"])
         cancelled = chatRowBool(o["cancelled"])
+        completionState = chatRowString(o["completionState"])
         kind = chatRowString(o["kind"])
         toolName = chatRowString(o["tool_name"]) ?? chatRowString(o["toolName"])
         resultSummary = Self._capString(
@@ -275,6 +291,8 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
         beforeContent = Self._capString(chatRowString(o["before_content"]), 16_000)
         afterContent = Self._capString(chatRowString(o["after_content"]), 16_000)
         approvalId = chatRowString(o["approval_id"]) ?? chatRowString(o["approvalId"])
+        mirrorInteractionId = chatRowString(o["interactionId"])
+        mirrorInteractionSessionId = chatRowString(o["interactionSessionId"])
         attachments = PersistedAttachment.list(o["attachments"])
         if case .object(let fields)? = o["envelope"] {
             envelope = ChatMessageOriginMetadata(fields: fields)
@@ -327,6 +345,7 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encodeIfPresent(model, forKey: .model)
+        try c.encodeIfPresent(turnTraceId, forKey: .turnTraceId)
         try c.encodeIfPresent(requestedModel, forKey: .requestedModel)
         try c.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
         try c.encodeIfPresent(fileAccessMode, forKey: .fileAccessMode)
@@ -421,6 +440,9 @@ public struct PersistedAttachment: Encodable, Hashable, Sendable {
 public struct ChatMessageOriginMetadata: Encodable, Hashable, Sendable {
     public var surface: String?
     public var agent: String?
+    public var authored: String?
+    public var peerSources: [String]?
+    public var elevatedPeerSources: [String]?
 
     public init(surface: String? = nil, agent: String? = nil) {
         self.surface = surface
@@ -437,6 +459,13 @@ public struct ChatMessageOriginMetadata: Encodable, Hashable, Sendable {
         }
         surface = chatRowString(o["surface"])
         agent = chatRowString(o["agent"])
+        authored = chatRowString(o["authored"])
+        if case .array(let values)? = o["peerSources"] {
+            peerSources = values.compactMap { chatRowString($0) }
+        }
+        if case .array(let values)? = o["elevatedPeerSources"] {
+            elevatedPeerSources = values.compactMap { chatRowString($0) }
+        }
     }
 }
 
@@ -465,6 +494,18 @@ private func chatRowInt(_ value: JSONValue?) -> Int? {
 extension ChatMessage: DeviceSyncTranscriptMessage {}
 
 extension ChatMessage: MacChatRetryMessage {
+    public var retryOrigin: ChatMessageOrigin? {
+        guard let recorded = metadata?.origin else { return nil }
+        var origin = ChatMessageOrigin(surface: recorded.surface ?? "unreadable", agent: recorded.agent,
+            authored: recorded.authored.flatMap(ChatMessageAuthorship.init(rawValue:))
+                ?? (recorded.agent == nil ? nil : .agent))
+        origin.peerSources = recorded.peerSources
+        origin.elevatedPeerSources = recorded.elevatedPeerSources
+        if origin.peerSources == nil, origin.authored == .agent, recorded.agent != "self" {
+            origin.peerSources = [recorded.agent ?? "an agent"]
+        }
+        return origin
+    }
     public var retryHasAttachments: Bool { metadata?.attachments?.isEmpty == false }
     public var retryUserRowPersisted: Bool? { metadata?.syntheticUserRowPersisted }
     public var retryInputHadAttachments: Bool? { metadata?.syntheticInputHadAttachments }
@@ -472,4 +513,8 @@ extension ChatMessage: MacChatRetryMessage {
 
 extension ChatMessage: FirstRunWelcomeMessage {
     public var firstRunMechanicalKind: String? { metadata?.mechanicalKind }
+    public var firstRunTurnCompleted: Bool {
+        metadata?.completionState == "completed"
+            && metadata?.partial != true && metadata?.cancelled != true
+    }
 }

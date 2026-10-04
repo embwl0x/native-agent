@@ -71,14 +71,19 @@ extension SwiftToolDispatcher {
                 if $0.item.updatedAt != $1.item.updatedAt { return $0.item.updatedAt > $1.item.updatedAt }
                 return $0.item.handle < $1.item.handle
             }
+            let items = matches.dropFirst(deskOffset).prefix(limit).map(\.item)
+            Self.latchDeskPeers(items)
+            for item in items {
+                Self.latchDeskPeers(Array(state.children(of: item.handle).prefix(5)))
+            }
             deskResult = .object([
                 "status": .string("ok"), "source": .string("canonical_current_desk"),
                 "as_of": .string(state.generatedTs),
                 "matched_count": .int(Int64(matches.count)),
                 "has_more": .bool(deskOffset + limit < matches.count),
                 "offset": .int(Int64(deskOffset)),
-                "items": .array(matches.dropFirst(deskOffset).prefix(limit).map {
-                    Self.workContextDeskItem($0.item, state: state, plan: sequencing.byHandle[$0.item.handle])
+                "items": .array(items.map {
+                    Self.workContextDeskItem($0, state: state, plan: sequencing.byHandle[$0.handle])
                 }),
                 "meaning": .string("Current recorded Desk state. Notes and receipts are attributed records, not fresh external verification."),
             ])
@@ -194,11 +199,13 @@ extension SwiftToolDispatcher {
                      "read_locator": workContextRead("desk_read", ["handle": .string($0.handle)])])
         })
         out["additional_children"] = .bool(children.count > 5)
-        if let attempt = item.workAttempts.last {
-            out["last_recorded_attempt"] = boundedWorkContextValue(attempt.toJSON())
+        if let attempt = item.workAttempts.last, case .object(var row) = attempt.toJSON() {
+            row.removeValue(forKey: "receiptHandedOff")
+            out["last_recorded_attempt"] = boundedWorkContextValue(.object(row))
         }
-        if let reservation = item.pursuit?.reservations.last {
-            out["last_recorded_work_session"] = boundedWorkContextValue(reservation.toJSON())
+        if let reservation = item.pursuit?.reservations.last, case .object(var row) = reservation.toJSON() {
+            row.removeValue(forKey: "receiptHandedOff")
+            out["last_recorded_work_session"] = boundedWorkContextValue(.object(row))
         }
         return .object(out)
     }

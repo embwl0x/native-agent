@@ -349,20 +349,3 @@ extension AgentWorkspaceNavigation {
             }, actions: [.init(label: "Start a workspace named…", action: .newWorkspace, needsText: true)])
     }
 }
-
-extension AgentWorkspaceNavigation {
-    package func currentToolGroup(key: String) -> String? { Self.placeToolGroup(current(key: key)) }
-
-    /// The tool group a place on her screen works with, if it has one.
-    static func placeToolGroup(_ location: AgentWorkspaceLocation) -> String? {
-        switch location {
-        case .page(let inner, _): return placeToolGroup(inner)
-        case .browserBookmark, .record("browser.chrome_snapshot", _, _): return "browser"
-        case .area(let id):
-            return ["browser": "browser", "research": "research", "mail": "mail", "calendar": "calendar",
-                    "today": "calendar", "messages": "messages", "gmail": "gmail", "agentmail": "agentmail", "notes": "notes", "contacts": "contacts"][id]
-        default: return nil
-        }
-    }
-
-}

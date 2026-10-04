@@ -24,11 +24,10 @@ public struct ContextPersonaID: RawRepresentable, Hashable, Comparable, Sendable
     /// ids ("canonical", or a custom subdir name like "Agent") — a DIFFERENT
     /// vocabulary from MemoryV2 record persona ids, which are agent names
     /// (MemoryV2Defaults.personaID, legacy display names). The two only meet
-    /// at the coordinator's memory-scope gate: the resident default persona
-    /// owns the whole MemoryV2 store, so that gate admits every memory scope
-    /// for this id, while custom personas see only their own scope + shared.
+    /// in context preparation: memory is shared across persona slots and
+    /// governed by record disclosure permissions, not by slot-id isolation.
     /// PersonaEngine cannot import Context, so it keeps its own "canonical"
-    /// literal; a conformance test pins the two together.
+    /// literal.
     public static let resident = ContextPersonaID(rawValue: "canonical")
 
     public static func < (lhs: Self, rhs: Self) -> Bool {

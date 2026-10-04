@@ -7,6 +7,9 @@ import PersistenceCore
 import Research
 import TriggerScheduler
 import WorkshopExecution
+import ApprovalInbox
+import NativeAgentShared
+import NotificationInbox
 
 /// `NativeAgentEngine.desk` (S10): the Desk for one data root, in core types —
 /// the board (desk items, executions, GitHub), the schedule, and research lab
@@ -41,7 +44,7 @@ public final class DeskFacade {
     /// - Parameter includeSequencing: build the classic page's sequencing plan
     ///   and alias map as well. Off by default: a page that does not render
     ///   them should not pay for them.
-    public nonisolated func loadBoard(includeSequencing: Bool = false) async -> DeskBoardRead {
+    public nonisolated func loadBoard(includeSequencing: Bool = false, includeOverview: Bool = false) async -> DeskBoardRead {
         var read = DeskBoardRead()
         do {
             read.deskState = try await store.liveState()
@@ -69,6 +72,19 @@ public final class DeskFacade {
             var aliases: [String: String] = [:]
             for item in read.items { aliases[item.handle] = item.alias }
             read.aliasByHandle = aliases
+        }
+        if includeOverview {
+            var unavailable: [String] = []
+            if let reason = read.deskError { unavailable.append("Desk: \(reason)") }
+            if let reason = read.executions.unavailableReason { unavailable.append("Executions: \(reason)") }
+            var approvals: [ApprovalRecord] = []
+            var inbox: [NotificationInbox.InboxItemRecord] = []
+            do { approvals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .init()) }
+            catch { unavailable.append("Approvals: \(Self.loadFailure(error))") }
+            do { inbox = try await InboxFacade(dataRoot: dataRoot).list() }
+            catch { unavailable.append("Inbox: \(Self.loadFailure(error))") }
+            read.overview = WorkOverviewRead.project(board: read, approvals: approvals,
+                inbox: inbox, unavailable: unavailable, now: Date())
         }
         return read
     }
@@ -301,6 +317,7 @@ public struct WorkshopTaskRow: Encodable, Hashable, Sendable {
     public var summary: String?
     public var createdAt: String
     public var updatedAt: String?
+    public var lastMovementAt: String?
     public var completedAt: String?
     public var receiptCount: Int?
 
@@ -346,6 +363,7 @@ public struct WorkshopTaskRow: Encodable, Hashable, Sendable {
         summary = text("summary")
         createdAt = text("createdAt", "created_at") ?? ""
         updatedAt = text("updatedAt", "updated_at")
+        lastMovementAt = text("lastMovementAt", "last_movement_at")
         completedAt = text("completedAt", "completed_at")
         receiptCount = count("receiptCount", "receipt_count")
         guard !malformed else { return nil }
@@ -354,7 +372,7 @@ public struct WorkshopTaskRow: Encodable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, deskHandle, projectSpaceId, title, objective, status, phase, priority
         case autonomyLevel, permissionProfile, summary
-        case createdAt, updatedAt, completedAt, receiptCount
+        case createdAt, updatedAt, lastMovementAt, completedAt, receiptCount
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -372,6 +390,7 @@ public struct WorkshopTaskRow: Encodable, Hashable, Sendable {
         try c.encodeIfPresent(summary, forKey: .summary)
         try c.encode(createdAt, forKey: .createdAt)
         try c.encodeIfPresent(updatedAt, forKey: .updatedAt)
+        try c.encodeIfPresent(lastMovementAt, forKey: .lastMovementAt)
         try c.encodeIfPresent(completedAt, forKey: .completedAt)
         try c.encodeIfPresent(receiptCount, forKey: .receiptCount)
     }

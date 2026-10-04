@@ -1,6 +1,7 @@
 import FeedPolicy
 import Privacy
 import Foundation
+import os
 import NativeAgentCore
 import PersistenceCore
 import WorkshopExecution
@@ -158,6 +159,7 @@ extension TriggerSchedulerError {
 // MARK: - Protocol extension
 
 /// The canonical scheduled-job read/write surface shared by every caller.
+/// Activity receipts are best-effort after a job mutation commits.
 public protocol SchedulerJobWriter: Sendable {
     /// Mirrors POST /v1/scheduler/jobs → create_job(body). `body` is the raw
     /// request dict (name/kind/interval_seconds/schedule/payload/run_at/...).
@@ -215,6 +217,32 @@ public extension SchedulerJobWriter {
 // MARK: - SwiftNative create-job impl
 
 extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
+    private static let jobActivityLogger = Logger(subsystem: "com.nativeagent.core", category: "scheduler-jobs")
+
+    // Jobs are already committed; a missing activity receipt must not invite
+    // a retry of the successful mutation.
+    private nonisolated static func appendJobActivity(
+        _ event: JSONValue,
+        to path: URL,
+        using persistence: any PersistenceCoreProtocol,
+        logLabel: String
+    ) async {
+        do {
+            try await persistence.withFileLock(path) {
+                try await appendJSONLCapped(
+                    event,
+                    to: path,
+                    using: persistence,
+                    maxLines: JSONLLineCaps.activityEvents,
+                    logLabel: logLabel,
+                    takeLock: false
+                )
+            }
+        } catch {
+            jobActivityLogger.error("Scheduled job mutation committed, but activity receipt failed (\(logLabel, privacy: .public)): \(String(describing: error))")
+        }
+    }
+
     public nonisolated var jobsPath: URL {
         root
             .appendingPathComponent("scheduler", isDirectory: true)
@@ -254,9 +282,17 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
             let work: @Sendable () async throws -> Void = {
                 // read-modify-write: append the new job (matches daemon).
                 var jobs = try Self.readJobsChecked(at: jobsPath)
+                if case .object(let newJob) = job,
+                   jobs.contains(where: { row in
+                       guard case .object(let existing) = row else { return false }
+                       return SchedulerJobNormalizer.pyStrForId(existing["id"])
+                           == SchedulerJobNormalizer.pyStrForId(newJob["id"])
+                   }) {
+                    throw TriggerSchedulerError.schedulerInvalid("A scheduled job with this id already exists.")
+                }
                 jobs.append(job)
                 do {
-                    try await persistence.writeJSON(.array(jobs), to: jobsPath)
+                    try await persistence.writeDataAtomicDurable(Self.jobsDataForWrite(jobs), to: jobsPath)
                 } catch {
                     throw TriggerSchedulerError.persistenceFailure(String(describing: error))
                 }
@@ -291,22 +327,10 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 ])),
                 "createdAt": .string(SwiftNativeTriggerScheduler.isoTimestamp(now())),
             ])
-            let activityWork: @Sendable () async throws -> Void = {
-                try await appendJSONLCapped(
-                    event,
-                    to: activityPath,
-                    using: persistence,
-                    maxLines: JSONLLineCaps.activityEvents,
-                    logLabel: "SchedulerJobs.create.activity",
-                    takeLock: false
-                )
-            }
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            try await persistence.withFileLock(activityPath, activityWork)
+            await Self.appendJobActivity(
+                event, to: activityPath, using: persistence,
+                logLabel: "SchedulerJobs.create.activity"
+            )
             return 0
         }
 
@@ -362,7 +386,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     status = "installed"
                 }
                 do {
-                    try await persistence.writeJSON(.array(jobs), to: jobsPath)
+                    try await persistence.writeDataAtomicDurable(Self.jobsDataForWrite(jobs), to: jobsPath)
                 } catch {
                     throw TriggerSchedulerError.persistenceFailure(String(describing: error))
                 }
@@ -387,16 +411,10 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
             ])
             let eventPath = activityPath
             let eventPersistence = persistence
-            try await eventPersistence.withFileLock(eventPath) {
-                try await appendJSONLCapped(
-                    event,
-                    to: eventPath,
-                    using: eventPersistence,
-                    maxLines: JSONLLineCaps.activityEvents,
-                    logLabel: "SchedulerJobs.blueprint.activity",
-                    takeLock: false
-                )
-            }
+            await Self.appendJobActivity(
+                event, to: eventPath, using: eventPersistence,
+                logLabel: "SchedulerJobs.blueprint.activity"
+            )
         }
         return .object([
             "status": .string(result.status),
@@ -469,7 +487,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 }
 
                 do {
-                    try await persistence.writeJSON(.array(jobs), to: jobsPath)
+                    try await persistence.writeDataAtomicDurable(Self.jobsDataForWrite(jobs), to: jobsPath)
                 } catch {
                     throw TriggerSchedulerError.persistenceFailure(String(describing: error))
                 }
@@ -504,22 +522,10 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 "payload": SchedulerSecretRedactor.redactValue(.object(["jobId": .string(jobId)])),
                 "createdAt": .string(SwiftNativeTriggerScheduler.isoTimestamp(now())),
             ])
-            let activityWork: @Sendable () async throws -> Void = {
-                try await appendJSONLCapped(
-                    event,
-                    to: activityPath,
-                    using: persistence,
-                    maxLines: JSONLLineCaps.activityEvents,
-                    logLabel: "SchedulerJobs.cancel.activity",
-                    takeLock: false
-                )
-            }
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            try await persistence.withFileLock(activityPath, activityWork)
+            await Self.appendJobActivity(
+                event, to: activityPath, using: persistence,
+                logLabel: "SchedulerJobs.cancel.activity"
+            )
             return 0
         }
 
@@ -561,7 +567,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     throw TriggerSchedulerError.schedulerInvalid("Unknown scheduled job: \(jobId)")
                 }
                 do {
-                    try await persistence.writeJSON(.array(jobs), to: jobsPath)
+                    try await persistence.writeDataAtomicDurable(Self.jobsDataForWrite(jobs), to: jobsPath)
                 } catch {
                     throw TriggerSchedulerError.persistenceFailure(String(describing: error))
                 }
@@ -590,17 +596,10 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 ])),
                 "createdAt": .string(SwiftNativeTriggerScheduler.isoTimestamp(now())),
             ])
-            let activityWork: @Sendable () async throws -> Void = {
-                try await appendJSONLCapped(
-                    event,
-                    to: activityPath,
-                    using: persistence,
-                    maxLines: JSONLLineCaps.activityEvents,
-                    logLabel: "SchedulerJobs.setEnabled.activity",
-                    takeLock: false
-                )
-            }
-            try await persistence.withFileLock(activityPath, activityWork)
+            await Self.appendJobActivity(
+                event, to: activityPath, using: persistence,
+                logLabel: "SchedulerJobs.setEnabled.activity"
+            )
             return 0
         }
 
@@ -608,45 +607,48 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
     }
 
     public func updateJob(jobId: String, changes: [String: JSONValue]) async throws -> JSONValue {
+        func invalid(_ message: String, path: String, accepted: String) -> ToolFailureError {
+            ToolFailureError(message, argumentPath: path, accepted: accepted, effects: .none)
+        }
         guard !jobId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw TriggerSchedulerError.schedulerInvalid("jobId is required")
+            throw invalid("jobId is required", path: "$.job_id", accepted: "An exact job id from scheduler_list_jobs.")
         }
         let changes = changes.filter { $0.value != .null }
         let allowed: Set<String> = ["name", "kind", "payload", "schedule", "interval_seconds"]
         guard !changes.isEmpty, Set(changes.keys).isSubset(of: allowed) else {
-            throw TriggerSchedulerError.schedulerInvalid("Supply at least one of name, kind, payload, schedule, interval_seconds; other fields cannot be edited.")
+            throw invalid("Supply at least one of name, kind, payload, schedule, interval_seconds; other fields cannot be edited.", path: "$", accepted: "At least one of name, kind, payload, schedule, interval_seconds; no other edit fields.")
         }
         if let name = changes["name"] {
             guard case .string(let value) = name,
                   !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   value.count <= 160 else {
-                throw TriggerSchedulerError.schedulerInvalid("name must contain 1-160 characters")
+                throw invalid("name must contain 1-160 characters", path: "$.name", accepted: "A nonblank string of 1-160 characters.")
             }
         }
         if let kind = changes["kind"] {
             guard case .string(let value) = kind,
                   SchedulerJobNormalizer.allowedKinds.contains(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
-                throw TriggerSchedulerError.schedulerInvalid("kind must name a supported scheduled job kind")
+                throw invalid("kind must name a supported scheduled job kind", path: "$.kind", accepted: SchedulerJobNormalizer.allowedKinds.sorted().joined(separator: ", "))
             }
         }
         if let payload = changes["payload"] {
             guard case .object = payload else {
-                throw TriggerSchedulerError.schedulerInvalid("payload must be an object")
+                throw invalid("payload must be an object", path: "$.payload", accepted: "An object containing parameters for the job kind.")
             }
         }
         if let schedule = changes["schedule"] {
             switch schedule {
             case .object, .string: break
             default:
-                throw TriggerSchedulerError.schedulerInvalid("schedule must be an object or ISO-8601 datetime string")
+                throw invalid("schedule must be an object or ISO-8601 datetime string", path: "$.schedule", accepted: "An ISO-8601 datetime string or an object with type once, every, hourly, daily, weekly, monthly or cron and its required fields.")
             }
         }
         if let interval = changes["interval_seconds"] {
             guard case .int(let seconds) = interval, seconds >= 60 else {
-                throw TriggerSchedulerError.schedulerInvalid("interval_seconds must be an integer of at least 60")
+                throw invalid("interval_seconds must be an integer of at least 60", path: "$.interval_seconds", accepted: "An integer of at least 60.")
             }
             guard changes["schedule"] == nil else {
-                throw TriggerSchedulerError.schedulerInvalid("Supply schedule or interval_seconds, not both.")
+                throw invalid("Supply schedule or interval_seconds, not both.", path: "$.schedule", accepted: "Supply schedule or interval_seconds, not both.")
             }
         }
 
@@ -658,7 +660,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     guard case .object(let row) = $0 else { return false }
                     return SchedulerJobNormalizer.pyStrForId(row["id"]) == jobId
                 }), case .object(var existing) = jobs[index] else {
-                    throw TriggerSchedulerError.schedulerInvalid("Unknown scheduled job: \(jobId)")
+                    throw ToolFailureError("Unknown scheduled job: \(jobId)", argumentPath: "$.job_id", accepted: "An exact job id from scheduler_list_jobs.", effects: .none)
                 }
                 var body = existing
                 for (key, value) in changes { body[key] = value }
@@ -666,7 +668,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 let kindChanged = newKind != nil && newKind != SchedulerJobNormalizer.string(existing["kind"])
                 if kindChanged, changes["payload"] == nil {
-                    throw TriggerSchedulerError.schedulerInvalid("Changing kind requires the complete payload for the new kind.")
+                    throw ToolFailureError("Changing kind requires the complete payload for the new kind.", argumentPath: "$.payload", accepted: "The complete payload for the new kind.", effects: .none)
                 }
                 if !kindChanged, case .object(let patch)? = changes["payload"],
                    case .object(var payload)? = existing["payload"] {
@@ -687,11 +689,16 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     body.removeValue(forKey: "run_at")
                     body.removeValue(forKey: "runAt")
                 }
-                guard case .object(let normalized) = try SchedulerJobNormalizer.normalize(
-                    body: body, now: now, uuid: uuid,
-                    displayNameFallback: Self.displayNameFallback,
-                    connectorActionIDs: connectorActionIDs
-                ) else {
+                let result: JSONValue
+                do {
+                    result = try SchedulerJobNormalizer.normalize(
+                        body: body, now: now, uuid: uuid,
+                        displayNameFallback: Self.displayNameFallback,
+                        connectorActionIDs: connectorActionIDs)
+                } catch TriggerSchedulerError.invalidRequest(let message) {
+                    throw ToolFailureError(message, argumentPath: "$", accepted: message, effects: .none)
+                }
+                guard case .object(let normalized) = result else {
                     throw TriggerSchedulerError.schedulerInvalid("scheduler update returned no job")
                 }
                 if changes["name"] != nil { existing["name"] = normalized["name"] }
@@ -705,7 +712,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                 }
                 jobs[index] = .object(existing)
                 do {
-                    try await persistence.writeJSON(.array(jobs), to: jobsPath)
+                    try await persistence.writeDataAtomicDurable(Self.jobsDataForWrite(jobs), to: jobsPath)
                 } catch {
                     throw TriggerSchedulerError.persistenceFailure(String(describing: error))
                 }
@@ -722,10 +729,14 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
         ])
         let eventPath = activityPath
         let eventPersistence = persistence
-        try await eventPersistence.withFileLock(eventPath) {
-            try await appendJSONLCapped(event, to: eventPath, using: eventPersistence,
-                                       maxLines: JSONLLineCaps.activityEvents,
-                                       logLabel: "SchedulerJobs.update.activity", takeLock: false)
+        do {
+            try await eventPersistence.withFileLock(eventPath) {
+                try await appendJSONLCapped(event, to: eventPath, using: eventPersistence,
+                                           maxLines: JSONLLineCaps.activityEvents,
+                                           logLabel: "SchedulerJobs.update.activity", takeLock: false)
+            }
+        } catch {
+            throw ToolFailureError("The job was updated, but recording its activity failed: \(error)", effects: .occurred)
         }
         return .object(["ok": .bool(true), "job": updated])
     }
@@ -772,6 +783,19 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
     /// APP constant from the daemon. Used as the
     /// notify-title / name fallback. See PARITY DIVERGENCES in the header.
     nonisolated static var displayNameFallback: String { "NativeAgent" }
+
+    /// Every writer, including occurrence settlement, must stay readable by
+    /// the canonical job reader. Validate the exact bytes before replacement.
+    public nonisolated static func jobsDataForWrite(_ rows: [JSONValue]) throws -> Data {
+        guard rows.count <= 1_024 else {
+            throw TriggerSchedulerError.persistenceFailure("scheduler jobs file exceeds 1024 rows")
+        }
+        let data = try JSONValue.array(rows).serializedData(pretty: true)
+        guard data.count <= 4 * 1_024 * 1_024 else {
+            throw TriggerSchedulerError.persistenceFailure("scheduler jobs file exceeds 4 MiB")
+        }
+        return data
+    }
 
     /// Scheduler jobs are authority state. Only a missing file means an empty
     /// schedule; malformed or wrongly typed existing bytes must not be
@@ -884,18 +908,18 @@ enum SchedulerJobNormalizer {
             throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
         }
 
-        if string(schedule["type"]) == "every" {
-            // max(60, int(schedule.interval_seconds or intervalSeconds or seconds or interval))
-            interval = try max(60, pyIntOr(
-                schedule["interval_seconds"], schedule["intervalSeconds"], schedule["seconds"],
-                default: interval
-            ))
+        let typeLower = (string(schedule["type"]) ?? string(schedule["kind"]) ?? "every")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if typeLower == "every" {
+            interval = try everyInterval(schedule, default: interval)
             schedule["seconds"] = .int(Int64(interval))
+            for key in ["minutes", "hours", "days", "interval_seconds", "intervalSeconds"] {
+                schedule.removeValue(forKey: key)
+            }
         }
 
         // one_shot = str(schedule.type or "").lower() == "once"
         //            OR bool(body.get("one_shot", body.get("oneShot", payload.get("one_shot", False))))
-        let typeLower = (string(schedule["type"]) ?? "").lowercased()
         let oneShotFallback = body["one_shot"]
             ?? body["oneShot"]
             ?? payload["one_shot"]
@@ -903,11 +927,12 @@ enum SchedulerJobNormalizer {
 
         // first_run = schedule.firstRunAt or body.run_at or body.runAt  (Python `or`)
         let firstRun = pyOr(schedule["firstRunAt"], body["run_at"], body["runAt"])
+        let scheduledRun = try nextFromSchedule(schedule, afterEpoch: nil, now: now)
         let nextRun: Double
         if let fr = firstRun, truthy(fr) {
             nextRun = try epochFromValue(fr, now: now)
         } else {
-            nextRun = try nextFromSchedule(schedule, afterEpoch: nil, now: now)
+            nextRun = scheduledRun
         }
 
         // name = str(body.name or payload.name or kind.replace("_"," ").title() or "Scheduled Job")[:160]
@@ -1065,21 +1090,24 @@ enum SchedulerJobNormalizer {
         // createdBy = str(body.get("createdBy") or "agent")
         let createdBy = string(pyOr(body["createdBy"], .string("agent"))) ?? "agent"
 
-        let job: [String: JSONValue] = [
+        var job: [String: JSONValue] = [
             "id": .string(id),
             "name": .string(name),
             "kind": .string(kind),
-            "intervalSeconds": .int(Int64(interval)),
+            "intervalSeconds": !oneShot && typeLower == "every" ? .int(Int64(interval)) : .null,
             "enabled": .bool(enabled),
             "oneShot": .bool(oneShot),
             "nextRunAt": .string(pyFloatString(nextRun)),
-            "nextRunAtEpoch": .int(Int64(nextRun)),
+            "nextRunAtEpoch": .int(try checkedEpoch(nextRun)),
             "lastRunAt": .null,
             "schedule": .object(schedule),
             "payload": .object(outPayload),
             "createdBy": .string(createdBy),
             "createdAt": .string(nowIso(now())),
         ]
+        if typeLower != "every", !oneShot {
+            job.removeValue(forKey: "intervalSeconds")
+        }
         return .object(job)
     }
 
@@ -1142,22 +1170,52 @@ enum SchedulerJobNormalizer {
     /// _scheduler_epoch_from_value (L43076)
     static func epochFromValue(_ raw: JSONValue, now: @Sendable () -> Date) throws -> Double {
         let nowEpoch = now().timeIntervalSince1970
+        let epoch: Double
         switch raw {
         case .int(let i):
-            return max(nowEpoch, Double(i))
+            epoch = Double(i)
         case .double(let d):
-            return max(nowEpoch, d)
+            epoch = d
         case .string(let s):
             let text = s.trimmingCharacters(in: .whitespacesAndNewlines)
             if text.isEmpty { throw TriggerSchedulerError.schedulerInvalid("run_at is required") }
-            if let d = Double(text) { return max(nowEpoch, d) }
-            if let parsed = parseISO(text) { return max(nowEpoch, parsed) }
-            throw TriggerSchedulerError.schedulerInvalid("run_at must be an epoch timestamp or ISO-8601 datetime")
+            if let d = Double(text) { epoch = d }
+            else if let parsed = parseISO(text) { epoch = parsed }
+            else { throw TriggerSchedulerError.schedulerInvalid("run_at must be an epoch timestamp or ISO-8601 datetime") }
         case .null:
             throw TriggerSchedulerError.schedulerInvalid("run_at is required")
         default:
             throw TriggerSchedulerError.schedulerInvalid("run_at must be an epoch timestamp or ISO-8601 datetime")
         }
+        _ = try checkedEpoch(epoch)
+        let resolved = max(nowEpoch, epoch)
+        _ = try checkedEpoch(resolved)
+        return resolved
+    }
+
+    static func checkedEpoch(_ epoch: Double) throws -> Int64 {
+        guard epoch.isFinite, let value = Int64(exactly: epoch.rounded(.towardZero)) else {
+            throw TriggerSchedulerError.schedulerInvalid("run_at must be a finite epoch timestamp within the supported range")
+        }
+        return value
+    }
+
+    static func everyInterval(_ schedule: [String: JSONValue], default defaultInterval: Int = 3600) throws -> Int {
+        var seconds = try pyIntOr(schedule["seconds"], default: 0)
+        for (key, multiplier) in [("minutes", 60), ("hours", 3600), ("days", 86400)] {
+            let value = try pyIntOr(schedule[key], default: 0)
+            let product = value.multipliedReportingOverflow(by: multiplier)
+            let sum = seconds.addingReportingOverflow(product.partialValue)
+            guard !product.overflow, !sum.overflow else {
+                throw TriggerSchedulerError.schedulerInvalid("schedule duration is too large")
+            }
+            seconds = sum.partialValue
+        }
+        return try max(60, pyIntOr(
+            schedule["interval_seconds"], schedule["intervalSeconds"],
+            seconds != 0 ? .int(Int64(seconds)) : nil,
+            default: defaultInterval
+        ))
     }
 
     /// _scheduler_next_from_schedule (L43176). `tz` handling: the daemon resolves
@@ -1181,19 +1239,11 @@ enum SchedulerJobNormalizer {
             // run_at or runAt or at  (Python `or`)
             return try epochFromValue(pyOr(schedule["run_at"], schedule["runAt"], schedule["at"]) ?? .null, now: now)
         case "every":
-            // seconds = int(seconds or 0) + int(minutes or 0)*60 + …
-            var seconds = try pyIntOr(schedule["seconds"], default: 0)
-            seconds += try pyIntOr(schedule["minutes"], default: 0) * 60
-            seconds += try pyIntOr(schedule["hours"], default: 0) * 3600
-            seconds += try pyIntOr(schedule["days"], default: 0) * 86400
-            // max(60, int(interval_seconds or intervalSeconds or seconds or 3600))
-            let resolved = try max(60, pyIntOr(
-                schedule["interval_seconds"], schedule["intervalSeconds"],
-                seconds != 0 ? .int(Int64(seconds)) : nil,
-                default: 3600
-            ))
+            let resolved = try everyInterval(schedule)
             // datetime.fromtimestamp(after_epoch or now, UTC) + seconds → epoch.
-            return nowEpoch + Double(resolved)
+            let nextRun = nowEpoch + Double(resolved)
+            _ = try checkedEpoch(nextRun)
+            return nextRun
         case "hourly":
             // minute = int(spec.get("minute", 0)) — present-default get, then int().
             let minute = try schedule["minute"].map { try pyInt($0) } ?? 0
@@ -1220,6 +1270,7 @@ enum SchedulerJobNormalizer {
             // expression = str(spec.expression or spec.cron or "")  (Python `or`)
             let expression = (string(pyOr(schedule["expression"], schedule["cron"], .string(""))) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            let cron = typ == "cron" ? try cronFields(expression) : nil
             // Advance candidate by ONE WALL-CLOCK MINUTE per iteration (mirrors
             // Python's `candidate += timedelta(minutes=1)` on a tz-aware
             // datetime — correct across DST, unlike adding raw 60s).
@@ -1240,7 +1291,7 @@ enum SchedulerJobNormalizer {
                 if typ == "monthly", cDay == monthDay, cHour == hour, cMinute == minute {
                     return candidate.timeIntervalSince1970
                 }
-                if typ == "cron", try cronMatches(candidate, expression: expression, cal: cal) {
+                if let cron, cronMatches(candidate, fields: cron, cal: cal) {
                     return candidate.timeIntervalSince1970
                 }
                 guard let nextCandidate = cal.date(byAdding: .minute, value: 1, to: candidate) else {
@@ -1342,12 +1393,11 @@ enum SchedulerJobNormalizer {
         var allowed: Set<Int> = []
         for partRaw in field.lowercased().split(separator: ",", omittingEmptySubsequences: false) {
             var part = String(partRaw).trimmingCharacters(in: .whitespaces)
-            if part.isEmpty { continue }
-            func namedOrInt(_ token: String, _ fallback: Int) -> Int {
+            func namedOrInt(_ token: String) throws -> Int {
                 let t = token.trimmingCharacters(in: .whitespaces)
                 if let n = names[t] { return n }
                 if t.allSatisfy({ $0.isNumber }), !t.isEmpty, let v = Int(t) { return v }
-                return fallback
+                throw TriggerSchedulerError.schedulerInvalid("invalid cron token: \(token)")
             }
             var step = 1
             if let slash = part.firstIndex(of: "/") {
@@ -1366,25 +1416,28 @@ enum SchedulerJobNormalizer {
             } else if let dash = part.firstIndex(of: "-") {
                 let left = String(part[..<dash])
                 let right = String(part[part.index(after: dash)...])
-                start = namedOrInt(left, minimum)
-                end = namedOrInt(right, maximum)
+                start = try namedOrInt(left)
+                end = try namedOrInt(right)
             } else {
-                let value = namedOrInt(part, minimum)
+                let value = try namedOrInt(part)
                 start = value; end = value
             }
-            if start <= end {
-                var value = start
-                while value <= end {
-                    if value >= minimum && value <= maximum { allowed.insert(value) }
-                    value += step
-                }
+            guard (minimum...maximum).contains(start), (minimum...maximum).contains(end), start <= end else {
+                throw TriggerSchedulerError.schedulerInvalid("cron value out of range: \(part)")
+            }
+            var value = start
+            while value <= end {
+                allowed.insert(value)
+                if step > end - value { break }
+                value += step
             }
         }
         return allowed
     }
 
-    /// _scheduler_cron_matches (L43163)
-    static func cronMatches(_ date: Date, expression: String, cal: Calendar) throws -> Bool {
+    typealias CronFields = (minute: Set<Int>, hour: Set<Int>, day: Set<Int>, month: Set<Int>, dow: Set<Int>)
+
+    static func cronFields(_ expression: String) throws -> CronFields {
         let fields = expression.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard fields.count == 5 else {
             throw TriggerSchedulerError.schedulerInvalid("cron expression must have 5 fields: minute hour day month weekday")
@@ -1395,15 +1448,20 @@ enum SchedulerJobNormalizer {
         let day = try cronValues(fields[2], minimum: 1, maximum: 31)
         let month = try cronValues(fields[3], minimum: 1, maximum: 12)
         let dow = try cronValues(fields[4], minimum: 0, maximum: 7, names: weekdayNames)
+        return (minute, hour, day, month, dow)
+    }
+
+    /// _scheduler_cron_matches (L43163)
+    static func cronMatches(_ date: Date, fields: CronFields, cal: Calendar) -> Bool {
         let c = cal.dateComponents([.minute, .hour, .day, .month, .weekday], from: date)
         // cron_dow = (dt.weekday() + 1) % 7; dt.weekday(): 0=Mon..6=Sun.
         let pyWeekday = ((c.weekday ?? 1) + 5) % 7   // Calendar 1=Sun → py 6; 2=Mon → py 0
         let cronDow = (pyWeekday + 1) % 7
-        let dowMatch = dow.contains(cronDow) || (cronDow == 0 && dow.contains(7))
-        return minute.contains(c.minute ?? -1)
-            && hour.contains(c.hour ?? -1)
-            && day.contains(c.day ?? -1)
-            && month.contains(c.month ?? -1)
+        let dowMatch = fields.dow.contains(cronDow) || (cronDow == 0 && fields.dow.contains(7))
+        return fields.minute.contains(c.minute ?? -1)
+            && fields.hour.contains(c.hour ?? -1)
+            && fields.day.contains(c.day ?? -1)
+            && fields.month.contains(c.month ?? -1)
             && dowMatch
     }
 
@@ -1564,9 +1622,22 @@ enum SchedulerJobNormalizer {
     /// non-object row is returned unchanged (Python `dict(j)` would raise on a
     /// non-mapping, but jobs.json only ever holds objects; we pass scalars
     /// through rather than crash, which is strictly safer and never reached in
-    /// practice). All OTHER keys (lastRunAt/createdAt/etc.) pass through untouched.
+    /// practice). One-off rows omit the recurring interval; history and other
+    /// metadata pass through untouched.
     static func decorateNextRunAt(_ row: JSONValue) -> JSONValue {
         guard case .object(var d) = row else { return row }
+        // Older one-off and calendar rows retained the default hourly interval.
+        let calendarTypes: Set<String> = ["once", "hourly", "daily", "weekly", "monthly", "cron"]
+        let scheduleType: String? = {
+            guard case .object(let schedule)? = d["schedule"] else { return nil }
+            return (string(schedule["type"]) ?? string(schedule["kind"]))?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }()
+        if d["oneShot"] == .bool(true) || scheduleType == "once" {
+            d["intervalSeconds"] = .null
+        } else if scheduleType.map(calendarTypes.contains) == true {
+            d.removeValue(forKey: "intervalSeconds")
+        }
         // raw = d.get("nextRunAt"); epoch = float(raw) if raw not in (None,"") else None
         let epoch = floatEpochForDecoration(d["nextRunAt"])
         if let epoch {

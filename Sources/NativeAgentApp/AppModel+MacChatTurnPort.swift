@@ -1,13 +1,53 @@
 import Foundation
 import ChatOrchestration
 import NativeAgentShared
+import AppKit
+import MacControl
+import TrustCenter
 
 extension AppModel: MacChatTurnPresentationPort {
     var macChatTurns: MacChatTurnRuntime { engine.turns.runtime }
     var knownChatSessionIDs: Set<String> { Set(engine.transcripts.sessions.map(\.id)) }
 
+    func captureMacWorkContinuation(_ text: String, taskReference: String) async -> MacWorkContinuation? {
+        let request = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard request.range(of: #"^(?:please )?(?:(?:can|could|will|would) you )?(?:please )?take over(?:$|[\s,:.!?])"#,
+                            options: .regularExpression) != nil else { return nil }
+        let front = NSWorkspace.shared.frontmostApplication
+        let app = front?.processIdentifier == getpid() ? (NSApp.delegate as? AppDelegate)?.previousWorkApp : front
+        do {
+            let snapshot = try await SwiftNativeTrustCenter(dataRoot: NativeAgentPaths.dataRoot).loadAuthorizationSnapshotChecked()
+            let authority = SwiftNativeSecurityCenter.fullMacYoloAuthority(tool: "mac_control",
+                surface: "chat", originTrusted: true, snapshot: snapshot)
+            let policy = MacControlGate.policyForAdmittedFullMac(
+                MacControlPolicy.fromTrustPolicyObject(snapshot.policy), admitted: authority.state == .admitted)
+            guard MacControlGate.fullMacActive(policy.trustPolicy ?? MacControlTrustPolicy()),
+                  MacControlGate.gate(policy, category: "accessibility", trigger: "user").allowed else {
+                return .unsupported("accessibility_read_not_authorized", taskReference: taskReference)
+            }
+        } catch {
+            return .unsupported("trust_policy_unavailable", taskReference: taskReference)
+        }
+        guard let app, !app.isTerminated else {
+            return .unsupported("previous_app_unavailable", taskReference: taskReference)
+        }
+        return MacAccessibilityReader.captureContinuation(pid: app.processIdentifier, taskReference: taskReference)
+    }
+
     func chatHasConversationRows(sessionId: String) -> Bool {
         Self.hasConversationRows(engine.transcripts.messages(for: sessionId))
+    }
+
+    func cancelICloudChatTurnForControlHandoff(sessionId: String) {
+        _ = NativeAgentEngine.liveDeviceSync.engine.cancelActiveChatTask(for: sessionId)
+    }
+
+    func recordMacControlHandoff(text: String, reply: String, sessionId: String) async throws {
+        try await engine.chatClient(profile: .mac).recordControlHandoff(
+            message: text, reply: reply, sessionId: sessionId, surface: "chat"
+        )
+        let messages = try await engine.transcripts.loadMessages(sessionId: sessionId)
+        engine.transcripts.setMessages(messages, for: sessionId)
     }
 
     func runMacChatTurnBody(

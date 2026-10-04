@@ -209,117 +209,6 @@ struct DeskActionNotice: Equatable {
     let isError: Bool
 }
 
-enum DeskRefreshPresentation {
-    static func receipt(accepted: Bool) -> DeskActionNotice {
-        accepted
-            ? DeskActionNotice(text: "Desk refreshed.", isError: false)
-            : DeskActionNotice(text: "Refresh superseded by newer Desk data.", isError: false)
-    }
-}
-
-/// One Desk mutation at a time, regardless of whether it came from a keyboard
-/// shortcut, palette, selection bar, or the nags popover.
-@MainActor @Observable
-final class DeskActionFlight {
-    private(set) var isInFlight = false
-
-    func begin() -> Bool {
-        guard !isInFlight else { return false }
-        isInFlight = true
-        return true
-    }
-
-    func finish() {
-        isInFlight = false
-    }
-
-    /// The actual Desk mutation path. A nil result means this invocation was
-    /// dropped because another action still owns the flight.
-    func perform(
-        _ action: DeskQuickAction,
-        via invoker: any DeskToolInvoking
-    ) async -> DeskActionOutcome? {
-        guard begin() else { return nil }
-        defer { finish() }
-        return await DeskActionRunner.perform(action, via: invoker)
-    }
-}
-
-/// The tiny local echo the view shows while it waits to re-read the canonical
-/// store. No derived Desk state is guessed here, and nag actions never edit a
-/// Desk row because their truth lives in the nag-config store.
-enum DeskOptimisticItemPatch {
-    static func applying(
-        _ action: DeskQuickAction,
-        to current: [DeskItem],
-        timestamp: String = DeskClock.nowISO()
-    ) -> [DeskItem] {
-        var items = current
-        let handle: String
-        switch action {
-        case let .close(value, _), let .closeIfCurrent(value, _, _),
-             let .setStatus(value, _), let .defer_(value, _), let .note(value, _):
-            handle = value
-        case .nagGlobal, .nagProject, .nagItem, .nagMute, .nagUnmute:
-            return items
-        }
-        guard let index = items.firstIndex(where: { $0.handle == handle }) else { return items }
-        switch action {
-        case .close, .closeIfCurrent:
-            items[index].status = .done
-            items[index].closedAt = timestamp
-            items[index].updatedAt = timestamp
-        case let .setStatus(_, status):
-            items[index].status = status
-            items[index].updatedAt = timestamp
-        case let .defer_(_, until):
-            items[index].deferUntil = until
-            items[index].updatedAt = timestamp
-        case let .note(_, text):
-            items[index].notes.append(DeskNote(ts: timestamp, text: text))
-            items[index].updatedAt = timestamp
-        case .nagGlobal, .nagProject, .nagItem, .nagMute, .nagUnmute:
-            break
-        }
-        return items
-    }
-
-    static func reconciled(
-        preAction: [DeskItem],
-        optimistic: [DeskItem],
-        reloaded: [DeskItem],
-        loadFailed: Bool,
-        outcome: DeskActionOutcome
-    ) -> [DeskItem] {
-        guard !outcome.ok, loadFailed || reloaded == optimistic else { return reloaded }
-        return preAction
-    }
-
-    /// A version-fenced palette close can be refused because another writer
-    /// performed the same terminal transition first. Its successful canonical
-    /// reload wins over the stale local snapshot even when it happens to look
-    /// exactly like the optimistic close.
-    static func reconciled(
-        preAction: [DeskItem],
-        optimistic: [DeskItem],
-        reloaded: [DeskItem],
-        loadFailed: Bool,
-        outcome: DeskActionOutcome,
-        action: DeskQuickAction
-    ) -> [DeskItem] {
-        if case .closeIfCurrent = action, !outcome.ok, !loadFailed {
-            return reloaded
-        }
-        return reconciled(
-            preAction: preAction,
-            optimistic: optimistic,
-            reloaded: reloaded,
-            loadFailed: loadFailed,
-            outcome: outcome
-        )
-    }
-}
-
 enum DeskActionResultReader {
     /// The desk tools answer in three shapes and ALL THREE must be surfaced:
     ///   status "ok"      → `confirmation`
@@ -405,26 +294,22 @@ enum DeskNagPanelModel {
         }
     }
 
-    /// The panel's one-line truth. Says the GLOBAL switch, the mute, and —
-    /// critically — the case where lanes are on but the master switch is off,
-    /// which is the state that silently pings nothing (the same honesty
-    /// `deskNagScopeConfirmation` keeps in the chat tool).
-    static func summary(_ config: DeskNagConfig, lanes: [DeskNagLane], now: Date) -> String {
+    /// Count live items using the owner's item-before-project scope decision.
+    static func summary(_ config: DeskNagConfig, items: [DeskItem], now: Date) -> String {
         if config.isMuted(now: now) {
             let phrase = config.mutedUntil == DeskNagConfig.indefiniteMuteSentinel
                 ? "indefinitely" : "until \(config.mutedUntil ?? "?")"
             return "Muted \(phrase) — still tracking, nothing will ping."
         }
+        let on = DeskBoardLayout.activeItems(items).filter { config.scopeEnabled(for: $0) }.count
         guard config.enabled else {
-            let on = lanes.filter(\.enabled).count
             return on > 0
-                ? "Nagging is OFF globally — \(on) lane\(on == 1 ? "" : "s") armed but silent."
+                ? "Nagging is OFF globally — \(on) live item\(on == 1 ? "" : "s") enabled but silent."
                 : "Nagging is OFF. Nothing will ping."
         }
-        let on = lanes.filter(\.enabled).count
         return on == 0
-            ? "Nagging is ON, but no lane is armed — nothing will ping until you pick one."
-            : "Nagging is ON for \(on) lane\(on == 1 ? "" : "s")."
+            ? "Nagging is ON, but no live item is enabled — nothing will ping until you enable one."
+            : "Nagging is ON for \(on) live item\(on == 1 ? "" : "s")."
     }
 
     /// Snooze choices, resolved against an injected `now` so the mapping is
@@ -465,12 +350,18 @@ struct DeskClickApprovalFiler: ApprovalFiler {
             "remoteResolvable": .bool(false),
         ])
         let record = try await inbox.create(body)
-        _ = try? await inbox.resolve(
+        _ = try await inbox.resolve(
             record.id, decision: .approved, decidedBy: "local_desk_click")
         return record.id
     }
 
     func awaitResolution(id: String) async throws -> ApprovalDecision {
-        .approved
+        let record = try await SwiftNativeApprovalInbox(root: dataRoot).get(id)
+        guard record.status == "resolved",
+              let rawDecision = record.decision,
+              let decision = ApprovalDecision(rawValue: rawDecision) else {
+            throw ApprovalInboxError.malformedResponse("Desk approval has no persisted resolution")
+        }
+        return decision
     }
 }

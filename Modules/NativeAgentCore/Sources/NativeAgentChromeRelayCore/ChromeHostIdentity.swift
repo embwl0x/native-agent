@@ -66,16 +66,6 @@ public enum ChromeHostIdentity {
 
     public static var browserSigningIdentifiers: [String] { browserSigningTeams.keys.sorted() }
 
-    /// The designated requirement a browser process must satisfy: an intact
-    /// signature chaining to Apple (so the vendor's Developer ID, not a local
-    /// re-sign) AND one of the identifiers above.
-    public static var browserCodeRequirement: String {
-        let identifiers = browserSigningIdentifiers
-            .map { "(identifier \"\($0)\" and certificate leaf[subject.OU] = \"\(browserSigningTeams[$0]!)\")" }
-            .joined(separator: " or ")
-        return "anchor apple generic and (\(identifiers))"
-    }
-
     public static func executablePath(ofProcess pid: pid_t) -> String? {
         guard pid > 0 else { return nil }
         var buffer = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
@@ -103,37 +93,32 @@ public enum ChromeHostIdentity {
         SecCSFlags(rawValue: kSecCSBasicValidateOnly)
     }
 
-    /// The signing identifier of the Chromium-family browser at `path`, or nil
+    /// The signing identifier of the running Chromium-family browser, or nil
     /// when the executable is not one: unsigned, re-signed by somebody who is
     /// not the vendor, tampered with since it was signed, an identifier this
     /// build does not list, or simply a different program.
-    public static func browserSigningIdentifier(forExecutablePath path: String) -> String? {
-        guard !path.isEmpty else { return nil }
-        var code: SecStaticCode?
-        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code)
+    public static func browserSigningIdentifier(forProcess pid: pid_t) -> String? {
+        guard pid > 0 else { return nil }
+        var code: SecCode?
+        let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code)
                 == errSecSuccess, let code else { return nil }
-        var requirement: SecRequirement?
-        guard SecRequirementCreateWithString(browserCodeRequirement as CFString, [], &requirement)
-                == errSecSuccess, let requirement else { return nil }
-        guard SecStaticCodeCheckValidity(code, validationFlags, requirement) == errSecSuccess
-        else { return nil }
-        var information: CFDictionary?
-        guard SecCodeCopySigningInformation(
-            code, SecCSFlags(rawValue: kSecCSSigningInformation), &information
-        ) == errSecSuccess,
-              let dictionary = information as? [String: Any],
-              let identifier = dictionary[kSecCodeInfoIdentifier as String] as? String
-        else { return nil }
-        return identifier
-    }
-
-    public static func isBrowserExecutable(path: String) -> Bool {
-        browserSigningIdentifier(forExecutablePath: path) != nil
+        // Check the kernel's running code, never the replaceable executable
+        // path. Matching each requirement also gives the sealed identifier.
+        for identifier in browserSigningIdentifiers {
+            let text = "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(browserSigningTeams[identifier]!)\""
+            var requirement: SecRequirement?
+            guard SecRequirementCreateWithString(text as CFString, [], &requirement)
+                    == errSecSuccess, let requirement else { return nil }
+            if SecCodeCheckValidity(code, validationFlags, requirement) == errSecSuccess {
+                return identifier
+            }
+        }
+        return nil
     }
 
     public static func isBrowserProcess(_ pid: pid_t) -> Bool {
-        guard let path = executablePath(ofProcess: pid) else { return false }
-        return isBrowserExecutable(path: path)
+        browserSigningIdentifier(forProcess: pid) != nil
     }
 
     /// Chrome passes the calling extension's origin as an argument (alongside

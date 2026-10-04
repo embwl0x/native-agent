@@ -10,13 +10,13 @@ enum AgentWorkspaceActivity {
         .init(id: "helpers", title: "My helpers", summary: "Talk to a helper, run its job, or adjust its settings.", tool: "bot_list", tools: ["bot_create", "shelf_read"]),
         .init(id: "replies", title: "Saved replies", summary: "Read helpers' newest saved answers and actual outcomes, including answers already read.", tool: "shelf_read", input: ["limit": .int(16), "include_read": .bool(true), "newest_first": .bool(true)]),
         .init(id: "calendar", title: "Calendar", summary: "Upcoming events and appointments.", tool: "mac_calendar_list_upcoming", input: ["limit": .int(16)], tools: ["mac_calendar_create_event"]),
-        .init(id: "reminders", title: "Reminders", summary: "Due today and overdue.", tool: "mac_reminders_list_due_today", input: ["limit": .int(16)], tools: ["mac_reminders_create"]),
+        .init(id: "reminders", title: "Reminders", summary: "Open tasks across all dates, including undated reminders.", tool: "mac_reminders_query", input: ["limit": .int(16)], tools: ["mac_reminders_create", "mac_reminders_query"]),
         .init(id: "mail", title: "Mail", summary: "Recent email, search, and compose.", tool: "mail_list_recent", input: ["limit": .int(16)], tools: ["mail_search", "mail_send"]),
         .init(id: "messages", title: "Messages", summary: "Recent messages and a new message to a chosen recipient.", tool: "messages_recent_threads", input: ["limit": .int(16)], tools: ["messages_send"]),
         .init(id: "connections", title: "Connections", summary: "Find an agent or set up a connection.", tool: "agent_contacts", tools: ["agent_contacts", "agent_connect"])
     ]
 
-    static let readTools: Set<String> = ["bot_list", "shelf_read", "shelf_entry", "desk_read", "task_ledger_list", "delegation_status", "mac_calendar_list_upcoming", "mac_reminders_list_due_today", "mail_list_recent", "mail_search", "messages_recent_threads"]
+    static let readTools: Set<String> = ["bot_list", "shelf_read", "shelf_entry", "desk_read", "task_ledger_list", "delegation_status", "mac_calendar_list_upcoming", "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mail_list_recent", "mail_read_batch", "mail_search", "messages_recent_threads", "mac_calendar_calendars", "mac_calendar_free_busy"]
 
     static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
         switch tool {
@@ -28,7 +28,23 @@ enum AgentWorkspaceActivity {
         case "task_ledger_list": return tasks(input: input, result: result)
         case "delegation_status": return .init(title: "Delegated work", content: result, items: [], actions: [])
         case "mac_calendar_list_upcoming": return calendar(result)
-        case "mac_reminders_list_due_today": return reminders(result)
+        case "mac_calendar_calendars", "mac_calendar_free_busy":
+            return list(title: "Calendar", result: result, key: "calendars", actions: [
+                read("Calendars", tool: "mac_calendar_calendars"),
+                configure("Check availability", tool: "mac_calendar_free_busy")
+            ]) { row in
+                guard let id = text(row["calendarId"]) else {
+                    return .init(title: text(row["title"]) ?? "Calendar", content: .object(row), actions: [])
+                }
+                var actions = [read("Events", tool: "mac_calendar_list_upcoming", input: ["calendar_id": .string(id)]),
+                    configure("Check availability", tool: "mac_calendar_free_busy", input: ["calendar_ids": .array([.string(id)])])]
+                if row["writable"] == .bool(true) {
+                    actions.append(configure("Create an event", tool: "mac_calendar_create_event", input: ["calendar_id": .string(id)]))
+                }
+                return .init(title: text(row["title"]) ?? id, content: .object(row), actions: actions)
+            }
+        case "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read":
+            return reminders(tool: tool, input: input, result)
         case "mail_list_recent", "mail_search": return AgentWorkspaceMail.project(input: input, result: result)
         case "messages_recent_threads": return AgentWorkspaceMessages.project(input: input, result: result)
         default: return nil
@@ -170,7 +186,8 @@ enum AgentWorkspaceActivity {
         // A day by name in one call (the old "choose" form ran the default read).
         let day = AgentWorkspaceButton(label: "One day", action: .perform(tool: "mac_calendar_list_upcoming", input: ["limit": .int(16)],
             title: "One day", textField: "day", isEffect: false), needsText: true)
-        var projection = list(title: "Calendar", result: result, key: "events", actions: [configure("Create an event", tool: "mac_calendar_create_event"), day]) { row in
+        var projection = list(title: "Calendar", result: result, key: "events", actions: [configure("Create an event", tool: "mac_calendar_create_event"),
+            read("Calendars", tool: "mac_calendar_calendars"), configure("Check availability", tool: "mac_calendar_free_busy"), day]) { row in
             let title = text(row["title"]) ?? "Calendar event"
             var actions = text(row["id"]).map { [configure("Edit event", tool: "mac_calendar_modify_event", input: ["id": .string($0)])] } ?? []
             if let id = text(row["id"]), let title = text(row["title"]), let start = text(row["startAt"]) {
@@ -189,43 +206,42 @@ enum AgentWorkspaceActivity {
         return projection
     }
 
-    private static func reminders(_ result: JSONValue) -> AgentWorkspaceProjection {
-        var projection = list(title: "Reminders", result: result, key: "reminders", actions: [configure("Create a reminder", tool: "mac_reminders_create")]) { row in
+    private static func reminders(tool: String, input: [String: JSONValue], _ result: JSONValue) -> AgentWorkspaceProjection {
+        var source = object(result)
+        if tool == "mac_reminders_read", let reminder = source["reminder"] { source["reminders"] = .array([reminder]) }
+        var buttons = [configure("Create a reminder", tool: "mac_reminders_create"),
+            configure("Find reminders", tool: "mac_reminders_query"),
+            read("Due today and overdue", tool: "mac_reminders_list_due_today", input: ["limit": .int(16)])]
+        if tool == "mac_reminders_query", case .int(let next)? = source["next_offset"] {
+            var arguments = input
+            arguments["offset"] = .int(next)
+            buttons.append(read("Next page", tool: tool, input: arguments))
+        }
+        var projection = list(title: "Reminders", result: .object(source), key: "reminders", actions: buttons) { row in
             var row = row
             let title = text(row["title"]) ?? "Reminder"
             if let due = text(row["dueAt"]), let date = ISO8601DateFormatter().date(from: due) {
-                row["due_status"] = .string(date < Calendar.current.startOfDay(for: Date()) ? "overdue" : "due_today")
+                let today = Calendar.current.startOfDay(for: Date())
+                row["due_status"] = .string(date < today ? "overdue" : Calendar.current.isDateInToday(date) ? "due_today" : "future")
+            } else {
+                row["due_status"] = .string("undated")
             }
             var actions: [AgentWorkspaceButton] = []
             // Some owner versions omit the identifier. Never guess it from a title.
-            if row["completed"] == .bool(false), let id = text(row["id"]) {
-                actions.append(effect("Done (mark complete)", tool: "mac_reminders_complete", input: ["id": .string(id)]))
+            if let id = text(row["id"]) {
+                if tool != "mac_reminders_read" {
+                    actions.append(read("Open reminder", tool: "mac_reminders_read", input: ["id": .string(id)], title: title))
+                }
+                actions.append(configure("Edit reminder", tool: "mac_reminders_update", input: ["id": .string(id)]))
+                if row["completed"] == .bool(false) {
+                    actions.append(effect("Done (mark complete)", tool: "mac_reminders_complete", input: ["id": .string(id)]))
+                }
             }
             return .init(title: title, content: .object(row), actions: actions)
         }
         if projection.items.isEmpty, object(result)["status"] == .string("completed"), case .object(var content) = projection.content {
-            content["message"] = .string("nothing due today or overdue (reminders access ok)")
-            projection.content = .object(content)
-        }
-        return projection
-    }
-
-    private static func mail(_ result: JSONValue) -> AgentWorkspaceProjection {
-        list(title: "Mail", result: result, key: "messages", actions: [configure("Find email", tool: "mail_search"), configure("Compose email", tool: "mail_send")]) { row in
-            // The current owner selects replies by subject and first match, not
-            // immutable message identity. A preview must not imply an exact reply.
-            .init(title: text(row["subject"]) ?? "Email", content: .object(row), actions: [])
-        }
-    }
-
-    private static func messages(_ result: JSONValue) -> AgentWorkspaceProjection {
-        var projection = list(title: "Messages", result: result, key: "threads", actions: [configure("Compose message", tool: "messages_send")]) { row in
-            // `handle` here is the AppleScript chat ID, whereas messages_send
-            // needs a recipient phone/email. They are not interchangeable.
-            .init(title: text(row["handle"]) ?? "Conversation", content: .object(row), actions: [])
-        }
-        if case .object(var content) = projection.content {
-            content["reply_context"] = .string("Choose a recipient when composing; these thread identifiers are not recipient addresses.")
+            content["message"] = .string(tool == "mac_reminders_list_due_today"
+                ? "nothing due today or overdue (reminders access ok)" : "no matching reminders (reminders access ok)")
             projection.content = .object(content)
         }
         return projection

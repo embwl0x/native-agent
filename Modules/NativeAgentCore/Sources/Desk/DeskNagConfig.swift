@@ -28,8 +28,8 @@ import PersistenceCore
 // `observed` is the evaluator's memory: the last snapshot it saw of each item.
 // A nag needs a DELTA against that snapshot (blockers cleared / defer elapsed /
 // content advanced while stale) — staleness alone never pings. Muted ticks
-// observe but never CONSUME: while muted the evaluator only records baselines
-// for items it has never seen, so accumulated drift is still visible when User
+// never CONSUME: while muted the evaluator freezes existing baselines and
+// leaves new items without one, so drift and new work stay visible when User
 // unmutes and asks what moved.
 
 /// What a scope entry addresses. Project scope is the common case ("stay on me
@@ -73,7 +73,10 @@ public struct DeskNagScope: Sendable, Equatable {
               case .string(let id)? = obj["id"],
               !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         var enabled = true
-        if case .bool(let b)? = obj["enabled"] { enabled = b }
+        if let value = obj["enabled"] {
+            guard case .bool(let b) = value else { return nil }
+            enabled = b
+        }
         return DeskNagScope(kind: kind, id: id, enabled: enabled)
     }
 }
@@ -85,8 +88,8 @@ public struct DeskNagScope: Sendable, Equatable {
 public struct DeskNagObservation: Sendable, Equatable {
     public var updatedAt: String
     public var effectiveBlockerCount: Int
-    /// True when the item was NOT deferred at snapshot time (i.e. its park, if
-    /// any, had already elapsed). Stored in the positive sense the delta reads:
+    /// True when neither the item nor an ancestor was deferred at snapshot
+    /// time. Stored in the positive sense the delta reads:
     /// false → true is "the defer date passed".
     public var deferElapsed: Bool
 
@@ -108,9 +111,15 @@ public struct DeskNagObservation: Sendable, Equatable {
         guard case .object(let obj) = value,
               case .string(let updatedAt)? = obj["updatedAt"] else { return nil }
         var blockers = 0
-        if case .int(let i)? = obj["effectiveBlockerCount"] { blockers = Int(i) }
+        if let value = obj["effectiveBlockerCount"] {
+            guard case .int(let i) = value else { return nil }
+            blockers = Int(i)
+        }
         var elapsed = true
-        if case .bool(let b)? = obj["deferElapsed"] { elapsed = b }
+        if let value = obj["deferElapsed"] {
+            guard case .bool(let b) = value else { return nil }
+            elapsed = b
+        }
         return DeskNagObservation(updatedAt: updatedAt, effectiveBlockerCount: blockers, deferElapsed: elapsed)
     }
 }
@@ -129,9 +138,8 @@ public enum DeskNagConfigSchema {
     ]
 
     /// Every emitted key outside the persisted config schema, including
-    /// nested scope/observation records. Values remain tolerant at load time;
-    /// this is an inspection contract so a writer drift is observable rather
-    /// than silently becoming a defaulted preference later.
+    /// nested scope/observation records. Checked loading also validates field
+    /// types before a saved preference can be decoded or replaced.
     public static func unexpectedKeys(in value: JSONValue) -> [String] {
         guard case .object(let object) = value else { return [] }
         var unexpected = object.keys
@@ -293,10 +301,8 @@ public struct DeskNagConfig: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// TOLERANT decode — a malformed row is dropped, never the file. This is
-    /// preference state, not the event log: the fail-loud rule that governs the
-    /// compaction base would here turn one bad scope row into "the nag lane is
-    /// dead and nobody said so".
+    /// Tolerant value decoder. The store validates saved settings first so
+    /// malformed preferences cannot be silently replaced by these defaults.
     public static func fromJSON(_ value: JSONValue) -> DeskNagConfig {
         guard case .object(let obj) = value else { return DeskNagConfig() }
         var cfg = DeskNagConfig()
@@ -360,6 +366,23 @@ public struct DeskNagConfigStore: Sendable {
               object["version"] == nil || object["version"] == .int(Int64(DeskNagConfigSchema.version)),
               DeskNagConfigSchema.unexpectedKeys(in: raw).isEmpty else {
             throw UnavailableSettings()
+        }
+        for (key, value) in object {
+            switch (key, value) {
+            case ("version", .int), ("enabled", .bool), ("windowId", .int),
+                 ("mutedUntil", .string), ("scopes", .array):
+                break
+            case ("ledger", .object(let rows)):
+                guard rows.values.allSatisfy({ if case .int = $0 { return true }; return false }) else {
+                    throw UnavailableSettings()
+                }
+            case ("observed", .object(let rows)):
+                guard rows.values.allSatisfy({ DeskNagObservation.fromJSON($0) != nil }) else {
+                    throw UnavailableSettings()
+                }
+            default:
+                throw UnavailableSettings()
+            }
         }
         if let scopes = object["scopes"] {
             guard case .array(let rows) = scopes,

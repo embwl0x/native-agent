@@ -1,4 +1,5 @@
 import AttentionRouting
+import Foundation
 import SlackConnector
 import TelegramBot
 
@@ -15,7 +16,12 @@ extension AttentionRouter {
             try await TelegramPollLoop.defaultSendMessage(token, destination, text)
         },
         slack: { input, dataRoot in
-            _ = try await SlackConnectorActions.postMessage(input: input, dataRoot: dataRoot)
+            let result = try await SlackConnectorActions.postMessage(input: input, dataRoot: dataRoot)
+            guard case .object(let envelope) = result, envelope["ok"] == .bool(true) else {
+                throw NSError(domain: "AttentionRouter", code: -502, userInfo: [
+                    NSLocalizedDescriptionKey: "Slack did not accept the notification."
+                ])
+            }
         }
     ))
 }

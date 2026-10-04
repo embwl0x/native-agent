@@ -82,7 +82,7 @@ public struct MemoryConsolidationHygieneRunner: LoopRunner {
         do {
             let report = try await MemoryConsolidationHygiene.runOnce(
                 dataRoot: dataRoot, approvedDirectRun: true, autoApproveSwap: true)
-            if report.status == "failed" {
+            if report.status == "failed" || report.status == "projection_failed" {
                 return .failed(error: "memory hygiene: \(report.reason ?? "swap not applied")")
             }
             if report.status == "staged" {

@@ -422,11 +422,8 @@ struct MacControlPermissionsView: View {
             await loadPolicy()
         }
         .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
-            // Guard mirrors TrainingPermissionsView: a mid-save trustPolicy
-            // refresh must not clobber unsaved toggle edits (2026-07-21 audit).
-            guard !isSaving else { return }
             if let mp = newPolicy?.macControlPolicy {
-                policy = mp
+                if !isSaving && !hasUnsavedChanges { policy = mp }
                 savedPolicy = mp
                 policyReadState = .available
             } else {
@@ -1449,6 +1446,10 @@ struct MacControlWorkbenchView: View {
                 resultTitle = "Pending Approval"
                 resultBody = pretty(json) ?? String(data: data, encoding: .utf8) ?? "Approval required."
                 NotificationCenter.default.post(name: .openApprovalsRequest, object: nil)
+            } else if (json?["timed_out"] as? Bool) == true
+                || ((json?["exit_code"] as? Int).map { $0 != 0 } ?? false) {
+                resultTitle = "Failed"
+                resultBody = pretty(json) ?? String(data: data, encoding: .utf8) ?? "Command failed."
             } else if (200..<300).contains(statusCode) {
                 resultTitle = "Done"
                 resultBody = pretty(json) ?? String(data: data, encoding: .utf8) ?? "Done."

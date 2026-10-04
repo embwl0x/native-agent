@@ -1,247 +1,87 @@
 # NativeAgent mobile companion
 
-*Screen and pairing instructions checked against the current source.*
-
-The NativeAgent iPhone/iPad app is a signed remote cockpit for the Mac-owned
-Swift runtime. It does not run a second agent and it does not use a LAN HTTP,
-Tailscale, or web-service fallback. The Mac remains the authority for provider
-calls, memory, tools, policy, Desk execution, and durable chat history.
+The iPhone/iPad app is a surface of the Mac-owned agent. Keep the Mac awake
+with NativeAgent open to process new work. The runtime is in
+`EngineRuntime` and `ChatTurnRuntime`; mobile sync does not create another
+brain. Agent's tool interface remains the single `app` tool:
+`app {}` opens their home, while `page`, `item`, `find`, `action` and
+`script` reach its contents and actions.
 
 ## What the mobile app exposes
 
-- streaming chat, progress events, cancellation, attachments, and sessions;
-- pinned conversations and transcript snapshots;
-- provider, model, Think, Fast, and permission controls;
-- Activity and notification inbox;
-- approval decisions;
-- **Desk tasks**, execution status, and **Show more history**;
-- memories and proposals;
-- a combined Skills & Tools surface: skill lifecycle plus the Mac's current
-  trust-aware tool catalog, load state, and effective autonomy;
-- connectors, runtime health, and recent runs;
-- organism living status and bounded turn summaries;
-- signed Mac actions with terminal response receipts;
-- APNS lock-screen notifications.
-- system-following, light, and dark appearance modes, with decorative motion
-  respecting the iOS Reduce Motion setting.
-
-The iOS app reads targeted snapshots for each surface instead of decoding one
-giant state bundle on every refresh.
-
 The main tabs are **Chat**, **Activity**, **Memories**, **Desk**, and **More**.
-Enable NativeAgent notifications in iOS Settings for lock-screen alerts;
-the Mac must stay available to carry out work. **More → Settings → Push deliveries**
-lists recent push receipts. **Check for Mac updates** refreshes pairing and
-settings when connected; **Connection diagnostics → Replace pairing…** opens
-the **Re-pair** confirmation.
+More includes Scheduler, Helpers, Agents, Desk tasks, Skills & Tools,
+Personality, Connectors, Trust, Telegram, Mac Integration, Providers and Settings.
 
-## Transport architecture
-
-NativeAgent has one shared `DeviceSyncTransport` seam with two Apple-native
-implementations.
-
-| Transport | Intended use | Data path |
-|---|---|---|
-| KVS + iCloud Drive | Personal/local builds and compatibility fallback | KVS wake/progress keys plus signed Drive messages, snapshots, inbox actions, responses, and transactions |
-| CloudKit private database | Entitled builds that select CloudKit | Lossless signed `BridgeMessage` records, pairing/status records, cursor-based drains, subscriptions, and silent-push wakeups |
-
-Selection order is:
-
-1. `NATIVE_AGENT_DEVICE_SYNC=cloudkit|kvs` runtime override;
-2. the build's `NativeAgentDeviceSync` Info.plist value;
-3. fail-safe default to `kvs`.
-
-CloudKit is touched only when the selected build's signed entitlements actually
-grant CloudKit. If preflight fails, NativeAgent stays on the legacy KVS/Drive
-transport instead of constructing `CKContainer` and risking a launch crash.
-
-The canonical direct-download public DMG lane uses a Developer ID distribution
-profile authorizing the same production CloudKit container as the App Store iOS
-app. The signed entitlement contract, production record schema, exact query
-subscriptions, same-account pairing, chat/snapshot continuity, and repeated
-locked-screen alerts have all been proven on the release family. A standalone
-build without iCloud entitlements remains available for source/local use, but
-it cannot pair with the App Store companion.
-
-## Signed message model
-
-Both transports carry the same `BridgeMessage` wire object:
-
-- unique message ID and timestamp;
-- sender and session identity;
-- message kind, text, attachments, and compact metadata;
-- HMAC-SHA256 signature generated from the paired secret.
-
-The receiver verifies the signature, deduplicates by message ID, rejects stale
-or malformed messages, and records delivery. CloudKit stores the complete
-encoded message as authoritative `payloadJSON` plus scalar fields for query and
-deduplication.
-
-## Chat flow
-
-```text
-iPhone accepts a user turn
-  -> signs BridgeMessage
-  -> sends through active device transport
-  -> Mac verifies and binds the exact iOS session
-  -> shared ChatOrchestration runs provider + Fluid Context + tools + policy
-  -> Mac emits signed received/thinking/tool/text_delta/final/error events
-  -> iPhone merges deltas transactionally into the same conversation
-```
-
-The Mac and iPhone do not maintain separate agent memories or provider policy.
-The phone is another surface over the same Mac-owned session and runtime.
-
-## Remote actions and transaction ledger
-
-iOS writes signed action envelopes for supported Mac operations. Each accepted
-action carries a transaction ID and moves through durable states. A send is not
-reported as successful merely because a file write was attempted:
-
-1. iOS acquires the action-send ownership gate.
-2. The signed envelope and pending transaction state are written.
-3. The Mac verifies, dispatches through the normal runtime/policy boundary, and
-   writes a response plus terminal transaction state.
-4. iOS reads the terminal state back before showing success.
-5. Write timeout or persistence failure releases ownership and reports failure.
-
-Repeated taps are idempotent. Remote actions do not bypass approval, connector,
-file, Mac Control, or external-send rules.
-
-## Snapshot plane
-
-The Mac publishes compact JSON snapshots for surfaces that need read-only
-state, including:
-
-- health, trust, providers, and model preferences;
-- sessions, pinned chats, and bounded transcripts;
-- Workshop, approvals, activity, and inbox;
-- memory, skills, connectors, and runs;
-- the current Mac-owned tool catalog for read-only phone inspection;
-- organism living status and turn summaries.
-
-KVS `snapshot_updated` is a wake hint; iCloud Drive remains the durable source
-for the KVS/Drive mode. Snapshot writers are digest-aware and separate light
-updates from heavier state so the phone does not create constant Mac I/O.
-The tool snapshot is produced from the same dispatcher and TrustCenter-aware
-catalog used by Mac chat. It is presentation data only: the phone does not own
-tool registration, autonomy, approval, or execution authority.
-
-## Appearance and privacy packaging
-
-The app defaults to the system appearance and lets the user select System,
-Light, or Dark in Settings. The preference is applied at the app root, including
-pairing and onboarding. Shared decorative animation observes Reduce Motion.
-
-The iOS bundle includes `PrivacyInfo.xcprivacy` for the required-reason APIs
-NativeAgent actually uses. The generated `Info.plist` declares only active
-protected capabilities; obsolete camera and local-network usage descriptions
-are intentionally absent. Before App Store submission, validate the final
-Apple-signed archive's privacy report and App Store Connect privacy answers
-against the shipped binary and production services.
-
-## APNS
-
-The phone registers its APNS token and sends the token metadata to the Mac over
-the signed pairing channel. The Mac sends APNS directly from Swift; there is no
-external notification daemon.
-
-- The registered token carries the iOS bundle ID and development/production
-  environment.
-- The Mac derives topic and environment from that signed registration by
-  default.
-- Urgent notifications can use the time-sensitive interruption level.
-- Successful sends append local receipts under
-  `data/mobile_push/receipts.jsonl`.
-
-The public credential-free lane uses CloudKit query subscriptions for sync and
-lock-screen alerts. Ordinary chat is stored as `NAChatMessage` and matches one
-broad silent subscription. Explicit alerts are stored as `NANotification` and
-match one visual subscription. The record-type split prevents CloudKit from
-coalescing a notification's visual projection with a competing silent
-projection. iOS registers the visual subscription first and removes the retired
-overlapping subscription on upgrade. A same-iCloud-account Mac/iPhone pair
-therefore needs no hosted APNS provider. Direct APNS remains an optional
-private/self-hosted parallel route.
-
-The visual subscription is capped at CloudKit's three-key `desiredKeys` limit.
-The iPhone publishes a versioned visual-capability status only after exact
-registration succeeds and retries on foreground activation after a failure.
-The Mac may report the visual lane eligible only after receiving that
-paired-phone status; successful record persistence alone proves durable
-delivery, not lock-screen readiness.
-
-Before the first production release for a subscription contract, create the
-exact query subscription from a Development-signed client and deploy the
-Development schema to Production in CloudKit Console. A TestFlight/App Store
-client cannot create a brand-new subscription shape directly in Production.
-Record-type parity alone does not prove that this deployment happened.
-
-See [apns-push.md](apns-push.md) for the untracked local credential file and
-live verification flag.
+Chat supports sessions, streaming replies, queued sends and attachments.
+Skills & Tools reads Mac-published snapshots; its Tools view does not load
+tools into Agent's context. Settings offers System, Light and Dark appearance.
+The [Share extension](ios-sharing.md) adds items from other apps to Chat.
 
 ## Pairing and setup
 
-For installed apps, open **Connectors → iPhone** on the Mac and **Pair with Mac**
-on the phone, using the same Apple Account. Pairing details arrive automatically;
-choose **Connect via iCloud** when ready. If waiting, tap **Check for Mac**.
-**Correct pairing key manually** appears only after the Mac's published details
-arrive. Copy the key from **Pairing hasn't connected?** on the Mac, paste it in
-**Paste pairing key** on the phone, and choose **Save Pairing Key**. A pasted key
-must match the published record; it cannot bypass missing iCloud material.
+Use the same Apple Account on the Mac and phone:
 
-For source builds:
+1. Open the Mac pairing page, available under **Connectors → iPhone** in the
+   Mac rail, and **Pair with Mac** on the phone.
+2. Wait for the pairing key to arrive through iCloud. Tap **Check for Mac** if
+   it has not arrived; tap **Connect** when available.
+3. Match **This phone’s code** to the waiting device on the Mac and choose
+   **Pair** there. Then tap **Connect** on the phone again.
+4. Keep both apps open until the Mac confirms the connection.
 
-1. Sign the Mac and iOS apps under compatible Apple identities and configure
-   the same iCloud container.
-2. Enable the required iCloud services in both entitlements. CloudKit mode also
-   requires the CloudKit service grant, deployed private-database schema, and
-   any exact query-subscription contracts promoted from Development.
-3. Enable iCloud Drive on the Mac and phone for KVS/Drive mode.
-4. Run `xcodegen --spec iOS/NativeAgentMobile/project.yml`, then build
-   `iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj`.
-5. In NativeAgent on the Mac, open the pairing surface and pair the phone. The
-   secret is transferred through the configured Apple-native pairing plane.
-6. Confirm the phone reports signed transport ready before sending actions.
+`PairingSecretManager` owns the shared secret; `PairedPhoneStore` owns the
+Mac's device records. The phone also has a signing identity for device approval
+decisions. See [iPhone approval pairing](ios-device-pairing.md).
 
-Example simulator build:
+For source builds, generate `iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj`
+from `iOS/NativeAgentMobile/project.yml` with XcodeGen, then build and install
+the app with compatible signing and container configuration. The Release
+configuration requests production CloudKit and APNS. Public Mac release
+configuration is covered in [Release setup](release_setup.md).
 
-```bash
-command -v xcodegen >/dev/null 2>&1 || { echo 'Install XcodeGen: brew install xcodegen' >&2; exit 1; }
-xcodegen --spec iOS/NativeAgentMobile/project.yml &&
-xcodebuild \
-  -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
-  -project iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj \
-  -scheme NativeAgentMobile \
-  -destination 'platform=iOS Simulator,name=<installed simulator>' \
-  build
-```
+## Transport architecture
 
-Use an installed destination from `xcrun simctl list devices available`; do not
-hardcode a simulator that is not present.
+The shared `DeviceSyncTransport` contract supports CloudKit private-database
+transport and KVS/iCloud Drive compatibility transport. Selection uses
+`NATIVE_AGENT_DEVICE_SYNC=cloudkit|kvs`, then the build's
+`NativeAgentDeviceSync` Info.plist value, then `kvs`. The iOS project selects
+CloudKit. `DeviceCloudKitPreflight` checks entitlement availability before
+constructing a CloudKit transport.
 
-## Failure behavior
+`BridgeMessage` carries message/session identity, text, attachments, metadata
+and an HMAC signature. CloudKit stores the complete encoded object in
+`payloadJSON`. The bridges handle signed chat and delivery; `MacSyncEngine`
+handles snapshots and remote actions.
 
-| Failure | Expected behavior |
-|---|---|
-| iCloud account unavailable | Surface reports the account state; messages/actions remain unsent rather than changing transports silently. |
-| CloudKit selected without entitlement | Preflight refuses CloudKit and stays on KVS/Drive; `CKContainer` is never touched. |
-| Pairing secret missing or invalid | Signed chat/actions pause and the UI asks the user to pair again. |
-| Snapshot/message not downloaded | The item is requested and retried through the active sync lane. |
-| Action ledger write times out | Send ownership is released and failure is shown; success is not fabricated. |
-| Mac unavailable | Phone retains honest pending/offline state until transport and Mac runtime recover. |
-| APNS unavailable | Durable iCloud state remains; push failure is receipted and does not imply message loss. |
+## Remote actions and snapshots
+
+The phone sends signed action envelopes and waits for Mac responses.
+`iCloudSyncEngine+Actions.swift` owns send serialization and transaction
+recovery; `MacSyncEngine+Security.swift` verifies the action signature before
+dispatch. Pairing does not replace action-specific authority checks.
+
+The Mac publishes separate snapshots for sessions, trust/providers, approvals,
+memory, skills, tools and other mobile views.
+`iCloudSyncEngine+Snapshots.swift` reads them on the phone. The phone displays
+Mac-owned state rather than maintaining a separate tool or policy authority.
+
+## Notifications
+
+The phone sends its APNS registration to the Mac. Direct APNS owns remote
+alerts; CloudKit subscriptions wake sync silently. When the phone processes a
+signed bridge notification, it may post a local alert unless direct APNS
+already accepted that event for the device. Delivery receipts do not establish
+that a banner appeared. See [APNS push](apns-push.md) for configuration and
+the current notification contract.
 
 ## Source map
 
 | Area | Owner |
 |---|---|
-| Shared wire and transport | `Modules/NativeAgentShared/Sources/NativeAgentShared/` |
-| CloudKit implementation and crash guard | `CloudKitDeviceTransport.swift`, `DeviceCloudKitPreflight.swift` |
-| Mac chat transport | `Sources/NativeAgentApp/iCloudBridge.swift` |
-| Mac snapshots/actions | `MacSyncEngine+*.swift`, `AppDelegate+ICloudRuntimeForwarding.swift` |
-| iOS transport | `iOS/NativeAgentMobile/Sources/iCloudBridge.swift` |
-| iOS snapshot/actions | `iCloudSyncEngine+*.swift` |
-| iOS chat state | `ChatStore+*.swift` |
-| iOS app/APNS callbacks | `NativeAgentMobileApp.swift` |
-| Mac APNS sender | `SwiftNativeAPNS.swift` |
+| Shared transport and wire format | `Modules/NativeAgentShared/Sources/NativeAgentShared/DeviceSyncTransport.swift` |
+| CloudKit transport/preflight | `CloudKitDeviceTransport.swift`, `DeviceCloudKitPreflight.swift` in the same shared directory |
+| Mac chat bridge | `Modules/NativeAgentCore/Sources/DeviceSync/iCloudBridge.swift` |
+| Mac pairing, snapshots and actions | `Modules/NativeAgentCore/Sources/DeviceSync/` |
+| iOS bridge and snapshot/action engine | `iOS/NativeAgentMobile/Sources/iCloudBridge.swift`, `iCloudSyncEngine+*.swift` |
+| iOS chat and share import | `iOS/NativeAgentMobile/Sources/ChatStore+*.swift` |

@@ -4,6 +4,55 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 
+struct WorkActivityPushRegistration: Codable, Equatable, Sendable {
+    enum StartOutcome: String, Codable, Sendable {
+        case unknown, accepted, observed, notObserved
+    }
+    struct StartReservation: Codable, Equatable, Sendable {
+        var retainedAt: Date
+        var expiresAt: Date
+    }
+    var pairing: String
+    var environment: String
+    var bundleID: String
+    var enabled = false
+    var startToken: String?
+    var activityTokens: [String: String] = [:]
+    var lastContents: [String: MobileWorkActivity.ContentState] = [:]
+    var startedIDs: Set<String> = []
+    // Optional so registrations saved before start reservations remain readable.
+    var startOutcomes: [String: StartOutcome]?
+    var startReservations: [String: StartReservation]?
+
+    mutating func retireInactiveStarts(activeIDs: Set<String>, now: Date) {
+        if startReservations == nil { startReservations = [:] }
+        // Adopt legacy reservations into retention once; their start time is unknown.
+        for id in startedIDs where startReservations?[id] == nil {
+            startReservations?[id] = StartReservation(retainedAt: now,
+                                                     expiresAt: lastContents[id]?.updatedAt.addingTimeInterval(5 * 60) ?? now)
+        }
+        let retired = (startReservations ?? [:]).filter {
+            activityTokens[$0.key] == nil && !activeIDs.contains($0.key)
+                && $0.value.retainedAt < now.addingTimeInterval(-86400) && $0.value.expiresAt < now
+        }.map(\.key)
+        for id in retired {
+            lastContents.removeValue(forKey: id)
+            startedIDs.remove(id)
+            startOutcomes?.removeValue(forKey: id)
+            startReservations?.removeValue(forKey: id)
+        }
+    }
+
+    static func fingerprint(_ pairing: String) -> String {
+        SHA256.hash(data: Data(pairing.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func read(_ value: JSONValue?) throws -> Self? {
+        guard let value else { return nil }
+        return try JSONDecoder().decode(Self.self, from: Data(value.serialize(pretty: false).utf8))
+    }
+}
+
 public struct MobileNotificationDeliveryReceipt: Sendable {
     public let bridgeMessageID: String?
     public let bridgeError: String?
@@ -258,6 +307,175 @@ public actor SwiftNativeAPNSSender {
         return reason
     }
 
+    func workActivityConfiguration(dataRoot: URL) -> (configured: Bool, usable: Bool, error: String?) {
+        guard FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("config/apns.json").path) else {
+            return (false, false, nil)
+        }
+        do { _ = try APNSConfig.load(from: dataRoot); return (true, true, nil) }
+        catch {
+            let failure = error as NSError
+            let missingKey = failure.domain == "NativeAgentAPNS" && [-2, -3, -4].contains(failure.code)
+            return (!missingKey, false, error.localizedDescription)
+        }
+    }
+
+    func sendWorkActivities(_ rows: [MobileWorkActivity], dataRoot: URL) async -> [String] {
+        do {
+            let config = try APNSConfig.load(from: dataRoot)
+            guard let pairing = try PairingSecretManager.existingSecretBase64() else { return [] }
+            let fingerprint = WorkActivityPushRegistration.fingerprint(pairing)
+            let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
+            let lock = dataRoot.appendingPathComponent("notifications/push-token-registration")
+            let value = try await persistence.readJSON(path, ifMissing: .object([:]))
+            guard case .object(let root) = value else { throw CocoaError(.propertyListReadCorrupt) }
+            let jwt = try providerToken(keyId: config.keyId, teamId: config.teamId, keyPath: config.keyPath)
+            var errors: [String] = []
+            for (deviceID, value) in root.sorted(by: { $0.key < $1.key }) {
+                guard case .object(let entry) = value,
+                      let original = try WorkActivityPushRegistration.read(entry["workActivity"]),
+                      original.pairing == fingerprint else { continue }
+                let ids = Set(rows.map(\.id))
+                let eligibleStartIDs = Set(rows.filter { !$0.content.state.isTerminal && $0.staleDate > Date() }.map(\.id))
+                // Cleanup also runs with no current rows or with opt-in revoked.
+                try await persistence.withFileLock(lock) {
+                    let latest = try await self.persistence.readJSON(path, ifMissing: .object([:]))
+                    guard case .object(var root) = latest, case .object(var entry)? = root[deviceID],
+                          var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
+                          registration.pairing == fingerprint else { return }
+                    registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
+                    entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                    root[deviceID] = .object(entry)
+                    try await self.persistence.writeJSON(.object(root), to: path)
+                }
+                guard original.enabled else { continue }
+                let removed = original.activityTokens.keys.filter { !ids.contains($0) }.compactMap { id -> MobileWorkActivity? in
+                    guard var content = original.lastContents[id] else { return nil }
+                    content.state = .unknown
+                    content.status = "Tracking ended — open the app"
+                    content.updatedAt = Date()
+                    return MobileWorkActivity(id: id, sessionID: nil, startedAt: content.updatedAt, content: content)
+                }
+                for row in rows + removed {
+                    if Task.isCancelled { return errors }
+                    let failure: String? = try await persistence.withFileLock(lock) {
+                        let latest = try await self.persistence.readJSON(path, ifMissing: .object([:]))
+                        guard case .object(var root) = latest, case .object(var entry)? = root[deviceID],
+                              var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
+                              registration.enabled, registration.pairing == fingerprint,
+                              let currentPairing = try PairingSecretManager.existingSecretBase64(),
+                              WorkActivityPushRegistration.fingerprint(currentPairing) == fingerprint else { return nil }
+                        if registration.lastContents[row.id] == row.content { return nil }
+                        if let previous = registration.lastContents[row.id], previous.updatedAt > row.content.updatedAt { return nil }
+                        let token: String
+                        let event: String
+                        if let activityToken = registration.activityTokens[row.id] {
+                            token = activityToken
+                            event = row.content.state.isTerminal || !ids.contains(row.id) ? "end" : "update"
+                        } else {
+                            guard ids.contains(row.id), !row.content.state.isTerminal, row.staleDate > Date(),
+                                  !registration.startedIDs.contains(row.id), let startToken = registration.startToken else { return nil }
+                            token = startToken; event = "start"
+                        }
+                        if event == "start" {
+                            // Reserve before the external effect. A lost response or failed
+                            // final write leaves an unknown start that must not be replayed.
+                            registration.startedIDs.insert(row.id)
+                            if registration.startOutcomes == nil { registration.startOutcomes = [:] }
+                            registration.startOutcomes?[row.id] = .unknown
+                            if registration.startReservations == nil { registration.startReservations = [:] }
+                            registration.startReservations?[row.id] = .init(retainedAt: Date(), expiresAt: row.staleDate)
+                            entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                            root[deviceID] = .object(entry)
+                            try await self.persistence.writeJSON(.object(root), to: path)
+                        }
+                        let failure = try await self.sendWorkActivity(row, event: event, token: token, registration: registration, jwt: jwt)
+                        if let failure {
+                            if event == "start" {
+                                // Only an explicit provider rejection permits another start.
+                                registration.startedIDs.remove(row.id)
+                                registration.startOutcomes?.removeValue(forKey: row.id)
+                                registration.startReservations?.removeValue(forKey: row.id)
+                                entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                                root[deviceID] = .object(entry)
+                                try await self.persistence.writeJSON(.object(root), to: path)
+                            } else if failure.tokenIsInvalid {
+                                registration.activityTokens.removeValue(forKey: row.id)
+                                // Keep the start reservation: an invalid update
+                                // token does not authorize a duplicate start.
+                                entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                                root[deviceID] = .object(entry)
+                                try await self.persistence.writeJSON(.object(root), to: path)
+                            }
+                            return failure.message
+                        }
+                        registration.lastContents[row.id] = row.content
+                        if event == "start" { registration.startOutcomes?[row.id] = .accepted }
+                        if event == "end" { registration.activityTokens.removeValue(forKey: row.id) }
+                        registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
+                        entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+                        root[deviceID] = .object(entry)
+                        try await self.persistence.writeJSON(.object(root), to: path)
+                        return nil
+                    }
+                    if let failure { errors.append(failure) }
+                }
+            }
+            return errors
+        } catch { return [error.localizedDescription] }
+    }
+
+    private struct WorkActivityRejection: Sendable {
+        let message: String
+        let tokenIsInvalid: Bool
+    }
+
+    private func sendWorkActivity(
+        _ row: MobileWorkActivity, event: String, token: String,
+        registration: WorkActivityPushRegistration, jwt: String
+    ) async throws -> WorkActivityRejection? {
+        let content = try JSONValue.parse(JSONEncoder().encode(row.content))
+        var aps: [String: JSONValue] = [
+            "timestamp": .int(Int64(Date().timeIntervalSince1970)), "event": .string(event),
+            "content-state": content, "stale-date": .int(Int64(row.staleDate.timeIntervalSince1970)),
+        ]
+        if event == "start" {
+            aps["attributes-type"] = .string("PhoneTurnAttributes")
+            aps["attributes"] = .object([
+                "workID": .string(row.id), "sessionID": row.sessionID.map(JSONValue.string) ?? .null,
+                "pairingFingerprint": .string(registration.pairing),
+                "agentName": .string(NativeAgentNotificationDefaults.agentDisplayName()),
+                "startedAt": .double(row.startedAt.timeIntervalSinceReferenceDate),
+            ])
+            aps["input-push-token"] = .int(1)
+            aps["alert"] = .object(["title": .string(row.content.title), "body": .string(row.content.status)])
+        } else if event == "end" {
+            aps["dismissal-date"] = .int(Int64(Date().addingTimeInterval(30).timeIntervalSince1970))
+        }
+        let host = Self.normalizedEnvironment(registration.environment) == "production"
+            ? "api.push.apple.com" : "api.sandbox.push.apple.com"
+        guard let url = URL(string: "https://\(host)/3/device/\(token)") else { throw URLError(.badURL) }
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.httpMethod = "POST"
+        request.setValue("bearer \(jwt)", forHTTPHeaderField: "authorization")
+        request.setValue(registration.bundleID + ".push-type.liveactivity", forHTTPHeaderField: "apns-topic")
+        request.setValue("liveactivity", forHTTPHeaderField: "apns-push-type")
+        request.setValue(event == "start" ? "10" : "5", forHTTPHeaderField: "apns-priority")
+        request.setValue(String(Int(row.staleDate.timeIntervalSince1970)), forHTTPHeaderField: "apns-expiration")
+        request.httpBody = try JSONValue.object(["aps": .object(aps)]).serializedData(pretty: false)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        let status = response.statusCode
+        guard status == 200 else {
+            let reason = Self.rejectionReason(fromResponseBody: data)
+            noteRejection(reason: reason)
+            return WorkActivityRejection(
+                message: "\(event): \(reason ?? "HTTP \(status)")",
+                tokenIsInvalid: status == 410 || ["BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"].contains(reason ?? "")
+            )
+        }
+        return nil
+    }
+
     public func sendNotification(
         title: String,
         body: String,
@@ -367,8 +585,9 @@ public actor SwiftNativeAPNSSender {
             request.httpMethod = "POST"
             request.setValue("bearer \(jwt)", forHTTPHeaderField: "authorization")
             request.setValue(target.topic, forHTTPHeaderField: "apns-topic")
-            request.setValue("alert", forHTTPHeaderField: "apns-push-type")
-            request.setValue("10", forHTTPHeaderField: "apns-priority")
+            let resultWake = userInfo["source"] == "requested_result"
+            request.setValue(resultWake ? "background" : "alert", forHTTPHeaderField: "apns-push-type")
+            request.setValue(resultWake ? "5" : "10", forHTTPHeaderField: "apns-priority")
             request.setValue(apnsId, forHTTPHeaderField: "apns-id")
             // iOS uses this as the remote UNNotificationRequest identifier,
             // matching CloudKit and the local request for the same reply.
@@ -522,7 +741,12 @@ public actor SwiftNativeAPNSSender {
             "content-available": 1,
             "mutable-content": 1,
         ]
-        if urgency?.lowercased() == "urgent" {
+        // Requested results alert from their signed, idempotent iCloud record.
+        // APNS only wakes that reader, so even a timeout-after-acceptance retry
+        // cannot repeat an already displayed banner.
+        if userInfo["source"] == "requested_result" {
+            aps = ["content-available": 1]
+        } else if urgency?.lowercased() == "urgent" {
             aps["interruption-level"] = "time-sensitive"
         }
 

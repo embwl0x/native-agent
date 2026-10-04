@@ -135,6 +135,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             return .skipped(reason: "autonomy disabled")
         }
         do {
+            try Task.checkCancellation()
             let now = clock()
             // Weekly idempotency: BOTH the BGTask and the in-app scheduler can
             // drive this loop. Without a marker a same-week double-tick would
@@ -175,25 +176,29 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
                 rollback = rb
             }
             var passSucceeded = false
+            var stagingStarted = false
             // Inner do/catch replaces the old sync defer: the rollback is now
             // an async flock'd compare-and-restore (2026-07-21 audit), which a
-            // defer cannot await. Any throw before passSucceeded restores the
-            // marker so the next tick retries; the error then propagates to
-            // the outer catch unchanged.
+            // defer cannot await. Failure before staging restores the marker
+            // so the next tick retries; cancellation after staging keeps it.
             do {
+            try Task.checkCancellation()
             var signals = try gatherSignals(now: now)
             // MEASURE leg: fold in the real Workshop execution-outcome trend (async — reads
             // mission.json off disk). Empty when there's no history, so the
             // prompt is unchanged on a fresh install.
             let outcomes = await workshopOutcomes()
+            try Task.checkCancellation()
             if !outcomes.isEmpty { signals += "\n\n" + outcomes }
             let pickedModel = await router.modelStringForSurface("self_improvement")
+            try Task.checkCancellation()
             let raw = try await llm.complete(
                 prompt: Self.analysisPrompt(signals: signals, now: now),
                 system: Self.systemPrompt,
                 model: pickedModel,
                 surface: "self_improvement"
             )
+            try Task.checkCancellation()
             // Non-JSON output is a FAILED pass, not "nothing found" — the old
             // collapse to (summary: prefix, proposals: []) consumed the weekly
             // window on garbage. Throwing here lets the restore-marker catch
@@ -205,16 +210,23 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
                 ])
             }
             for proposal in result.proposals where proposal.kind == .runtime {
+                try Task.checkCancellation()
+                stagingStarted = true
                 try await stageProposal(proposal)
+                try Task.checkCancellation()
             }
             // U2b wave 2: code findings get a lane instead of a dead end.
             // Same crash-window exposure as the runtime staging above (a
             // restored marker re-runs the whole pass): acceptable parity.
             if let fileCodeFinding {
                 for proposal in result.proposals where proposal.kind == .code {
+                    try Task.checkCancellation()
+                    stagingStarted = true
                     try await fileCodeFinding(proposal)
+                    try Task.checkCancellation()
                 }
             }
+            try Task.checkCancellation()
             // The pass IS the staging — mark success BEFORE the digest write.
             // A digest throw after staging used to restore the marker, so the
             // next tick re-ran the whole pass and DOUBLE-STAGED every
@@ -232,9 +244,15 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             ))
             return .completed(result: "weekly proposals staged")
             } catch {
-                if !passSucceeded { await rollback() }
+                // Once staging begins, cancellation cannot unstage its effects.
+                // Keep the reservation then so a retry cannot duplicate them.
+                if !passSucceeded && !(stagingStarted && (Task.isCancelled || error is CancellationError)) {
+                    await rollback()
+                }
                 throw error
             }
+        } catch is CancellationError {
+            return .skipped(reason: "weekly pass cancelled")
         } catch {
             FileHandle.standardError.write(Data(
                 "WeeklySelfImprovementLoop: tick failed: \(error)\n".utf8
@@ -288,19 +306,19 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
                           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                     else { continue }
                     let stamp = (obj["createdAt"] as? String).flatMap(Self.parseISO)
-                    if let stamp, stamp < weekAgo { continue }
+                    let at = stamp ?? mtime
+                    if at < weekAgo { continue }
                     totalMessages += 1
                     sessionHadRecent = true
-                    if (obj["role"] as? String) == "user",
+                    if Self.isHumanMessage(obj),
                        let content = obj["content"] as? String, !content.isEmpty {
-                        let at = stamp ?? mtime
                         let messageId = obj["id"] as? String ?? ""
                         candidates.append(SampledUserMessage(
                             at: at,
                             day: Self.todayString(at),
                             sessionId: sessionId,
                             messageId: messageId,
-                            content: content.prefix(280).description,
+                            content: TurnSecretRedactor.redactText(content).prefix(280).description,
                             weight: Self.weight(
                                 sessionId: sessionId, messageId: messageId, in: feltWeights)
                         ))
@@ -318,11 +336,12 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         """)
 
         // 2. Errors logged this week.
-        sections.append(Self.recentLines(
-            at: dataRoot.appendingPathComponent("logs", isDirectory: true)
-                .appendingPathComponent("errors.jsonl"),
-            since: weekAgo, label: "Error log (last 7 days)", limit: 30, fm: fm
-        ))
+        for feed in SelfHealingHook.errorFeeds {
+            sections.append(Self.recentLines(
+                at: feed.url(dataRoot: dataRoot),
+                since: weekAgo, label: "\(feed.label) error log (last 7 days)", limit: 30, fm: fm
+            ))
+        }
 
         // 3. Doctor health.
         let doctorPath = dataRoot.appendingPathComponent("doctor", isDirectory: true)
@@ -342,6 +361,26 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     }
 
     // MARK: - Week sampling
+
+    private static func isHumanMessage(_ row: [String: Any]) -> Bool {
+        guard row["role"] as? String == "user" else { return false }
+        if row["metadata"] != nil, !(row["metadata"] is [String: Any]) { return false }
+        let metadata = row["metadata"] as? [String: Any] ?? [:]
+        guard metadata["mechanicalKind"] == nil,
+              metadata["kind"] as? String != "compaction_summary" else { return false }
+        if let kind = metadata["turnKind"] as? String, kind != "live" { return false }
+        let humanSurfaces = ["app", "chat", "mac", "default", "telegram", "slack", "ios", "iphone", "mobile", "icloud"]
+        for key in ["origin", "envelope"] {
+            if let recorded = metadata[key] {
+                guard let provenance = recorded as? [String: Any], provenance["agent"] == nil,
+                      let surface = provenance["surface"] as? String,
+                      humanSurfaces.contains(surface) else { return false }
+                if key == "origin", ["app", "chat", "mac", "default"].contains(surface) { return false }
+            }
+        }
+        guard let source = row["source"] as? String else { return false }
+        return humanSurfaces.contains(source)
+    }
 
     /// One user turn inside the week's window, carrying the ids that make it
     /// citable back to the conversation it came from.
@@ -467,11 +506,11 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             if kept.count >= limit { break }
             if let data = line.data(using: .utf8),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let ts = (obj["createdAt"] as? String ?? obj["at"] as? String
+                let ts = (obj["lastAt"] as? String ?? obj["createdAt"] as? String ?? obj["at"] as? String
                     ?? obj["ts"] as? String ?? obj["timestamp"] as? String).flatMap(parseISO)
                 if let ts, ts < since { continue }
             }
-            kept.append(line.prefix(280).description)
+            kept.append(TurnSecretRedactor.redactText(String(line)).prefix(280).description)
         }
         return "## \(label)\n\(kept.isEmpty ? "(none)" : kept.reversed().joined(separator: "\n"))"
     }

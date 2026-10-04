@@ -19,16 +19,13 @@ import PersistenceCore
 // after a push the `updatedAt > lastNotifiedAt` gate is closed until the NEXT real
 // content change. The cooldown is a second floor against rapid re-fire.
 //
-// v1 scope: fires on ANY content change to a direct/urgent active item. The
-// notify.on event filter (blocked/unblocked/due/…) is captured on the item but
-// not yet fully enforced here — a documented refinement, not a silent gap —
-// with ONE enforced exception (2026-08-08, the "opened a self-pursuit" storm):
-// an item whose `on` is exactly ["explicit"] is a one-time announcement. It
-// pings once and never again from bare updatedAt churn — the Workshop pump's
-// own work-session ops advance updatedAt every couple of hours, and before
-// this rule each advance replayed the frozen open-time notifyReason at the
-// user (28 pushes for 2 pursuits in 4 days). Re-pings on OTHER filters also
-// stop replaying the open-time reason: a re-ping describes the change.
+// notify.on filters are enforced against the current snapshot: empty or
+// state_change allows content changes; blocked matches a blocked item; done
+// matches a terminal close (done or canceled). Exactly ["explicit"] permits
+// one announcement. Unblocked, user_next and due do not match on their own
+// because the evaluator has no transition history for them. Inherited policies
+// only match blocked or terminal items. Re-pings describe the change rather
+// than replaying the open-time reason.
 
 public enum DeskNotifyEvaluator {
 
@@ -71,7 +68,10 @@ public enum DeskNotifyEvaluator {
     /// The items that should ping User NOW, in desk (alias) order.
     public static func decisions(_ state: DeskState, now: Date) -> [Decision] {
         let inherited = inheritedNotify(state, now: now)
-        return state.items.compactMap { decision(for: $0, now: now, inherited: inherited[$0.handle]) }
+        return state.items.compactMap { item in
+            guard !parking(item, in: state, now: now).parked else { return nil }
+            return decision(for: item, now: now, inherited: inherited[item.handle])
+        }
     }
 
     // MARK: - Cascade: a quiet child under a direct parent (2026-08-18)
@@ -109,7 +109,7 @@ public enum DeskNotifyEvaluator {
 
     /// Per-handle inherited policy for items that carry none of their own.
     /// Cycle-safe (visited set + depth cap, same contract as DeskSequencing).
-    static func inheritedNotify(_ state: DeskState, now: Date) -> [String: InheritedNotify] {
+    static func inheritedNotify(_ state: DeskState, now: Date, includeDeferred: Bool = false) -> [String: InheritedNotify] {
         let byHandle = Dictionary(state.items.map { ($0.handle, $0) }, uniquingKeysWith: { a, _ in a })
         var out: [String: InheritedNotify] = [:]
         for item in state.items {
@@ -132,27 +132,32 @@ public enum DeskNotifyEvaluator {
             var seen: Set<String> = [item.handle]
             var current = item.parent
             var depth = 0
+            var donor: InheritedNotify?
+            var donorChosen = false
+            var parked = false
             while let cur = current, depth < deskMaxGraphDepth, seen.insert(cur).inserted {
                 depth += 1
                 guard let ancestor = byHandle[cur] else { break }
                 // A PARKED ancestor silences its subtree: "not now" means the
                 // same thing on every desk lane (audit 2026-08-02, finding 4),
                 // and it must not be escapable by pinging through a child.
-                if DeskSequencing.isDeferred(ancestor, now: now) { break }
-                if ancestor.notify.level == .direct || ancestor.notify.level == .urgent {
+                if DeskSequencing.isDeferred(ancestor, now: now) { parked = true }
+                if !donorChosen, ancestor.notify.level == .direct || ancestor.notify.level == .urgent {
                     // A one-time announcement is the ancestor's own single tap;
                     // it never becomes a standing subscription to its children.
-                    if isExplicitOnly(ancestor) { break }
-                    out[item.handle] = InheritedNotify(
-                        level: ancestor.notify.level,
-                        filters: normalizedFilters(ancestor),
-                        cooldown: ancestor.notify.cooldown,
-                        donorTitle: ancestor.title
-                    )
-                    break
+                    donorChosen = true
+                    if !isExplicitOnly(ancestor) {
+                        donor = InheritedNotify(
+                            level: ancestor.notify.level,
+                            filters: normalizedFilters(ancestor),
+                            cooldown: ancestor.notify.cooldown,
+                            donorTitle: ancestor.title
+                        )
+                    }
                 }
                 current = ancestor.parent
             }
+            if !parked || includeDeferred, current == nil { out[item.handle] = donor }
         }
         return out
     }
@@ -169,15 +174,20 @@ public enum DeskNotifyEvaluator {
     /// startup reconciliation pass; returning only a future date prevents an
     /// exact-deadline owner from spinning on corrupt/unchanged state.
     public static func nextMeaningfulDeadline(_ state: DeskState, after now: Date) -> Date? {
-        let inherited = inheritedNotify(state, now: now)
+        let inherited = inheritedNotify(state, now: now, includeDeferred: true)
         return state.items.compactMap { item -> Date? in
             // Effective level: a quiet child under a direct ancestor schedules
             // wake-ups too, or its cooldown crossing would only be noticed the
             // next time some unrelated event happened to wake the loop.
             let level = inherited[item.handle]?.level ?? item.notify.level
-            guard level == .direct || level == .urgent,
-                  !item.status.isTerminal
-            else { return nil }
+            guard level == .direct || level == .urgent else { return nil }
+            let parked = parking(item, in: state, now: now)
+            if item.status.isTerminal {
+                guard parked.parked, let until = parked.until,
+                      terminalDecision(for: item, now: until, inherited: inherited[item.handle]) != nil
+                else { return nil }
+                return until
+            }
             // A one-time announcement that already fired can never ping again,
             // so it must not generate wake deadlines either (a deadline for a
             // ping `decision` will refuse would spin the loop).
@@ -186,10 +196,8 @@ public enum DeskNotifyEvaluator {
             // ending — but wake for it ONLY if a ping actually follows, so the
             // park end is a deadline for items with something to say, not for
             // every parked row on the desk.
-            if DeskSequencing.isDeferred(item, now: now) {
-                guard let raw = item.deferUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      let until = DeskSequencing.parseDeferStamp(raw), until > now
-                else { return nil }
+            if parked.parked {
+                guard let until = parked.until else { return nil }
                 guard let lastRaw = item.notify.lastNotifiedAt,
                       let last = DeskClock.parseISO(lastRaw)
                 else { return until }   // never pinged ⇒ eligible the moment the park lifts
@@ -215,6 +223,24 @@ public enum DeskNotifyEvaluator {
             let due = last.addingTimeInterval(cooldown)
             return due > now ? due : nil
         }.min()
+    }
+
+    /// A subtree stays quiet until every defer in its parent chain has lifted.
+    static func parking(_ item: DeskItem, in state: DeskState, now: Date) -> (parked: Bool, until: Date?) {
+        var current: DeskItem? = item
+        var seen: Set<String> = []
+        var until: Date?
+        while let row = current, seen.count < deskMaxGraphDepth, seen.insert(row.handle).inserted {
+            if DeskSequencing.isDeferred(row, now: now) {
+                guard let raw = row.deferUntil, let end = DeskSequencing.parseDeferStamp(raw), end > now else {
+                    return (true, nil)
+                }
+                until = max(until ?? end, end)
+            }
+            current = row.parent.flatMap { parent in state.items.first { $0.handle == parent } }
+        }
+        if current != nil { return (true, nil) }
+        return (until != nil, until)
     }
 
     static func decision(for item: DeskItem, now: Date, inherited: InheritedNotify? = nil) -> Decision? {

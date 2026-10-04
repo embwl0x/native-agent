@@ -44,6 +44,10 @@ public extension MacChatTurnPresentationPort {
                 if !reduced.replyTextSettled {
                     macChatTurns.streamProgressAppliedAt[sessionId] = nil
                 }
+            }
+            if reduced.presentation.lastMovementAt != state.presentation.lastMovementAt
+                || reduced.presentation.phase != state.presentation.phase
+                || reduced.replyTextSettled != state.replyTextSettled {
                 macChatTurns.activityDidChange?()
             }
         }

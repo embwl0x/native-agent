@@ -30,6 +30,7 @@ public struct VisionImageCrop {
 
 private struct VisionLinearIndicatorRender {
     let values: [MacScreenRender.Value]
+    let effectValueTexts: [String]
     let claimedReadoutHandles: Set<String>
     let claimedRecognizedKeys: Set<String>
 }
@@ -258,6 +259,14 @@ extension VisionPercept {
                 return label
             }()
             let reason = abstainReason(row)
+            let states = [
+                ("selected", "not selected", row.state.selected),
+                ("checked", "not checked", row.state.checked),
+                ("disabled", "enabled", row.state.disabled),
+            ].compactMap { positive, negative, flag -> String? in
+                guard let flag else { return nil }
+                return "\(flag.value ? positive : negative) guess \(Int((flag.confidence * 100).rounded()))%"
+            }
             // Saliency can pin a bounded, prominent place while honestly
             // knowing nothing about its semantic role. Publish that place as
             // a numbered physical region, never as an invented button.
@@ -320,7 +329,7 @@ extension VisionPercept {
                 controls.append(MacScreenRender.Control(
                     label: renderedLabel ?? MacScreenText("unnamed \(kind)", redacted: .string("unnamed \(kind)")),
                     kind: kind,
-                    states: reason == nil ? [] : (spatiallyAddressable ? ["spatial", "role uncertain"] : ["uncertain"]),
+                    states: states + (reason == nil ? [] : ["uncertain"]),
                     provenance: .vision(renderedConfidence),
                     abstain: spatiallyAddressable ? nil : reason
                 ))
@@ -345,7 +354,8 @@ extension VisionPercept {
                 contentRows.append(MacScreenRender.Row(
                     label: renderedLabel,
                     detail: [MacScreenText(physicalKind, redacted: .string(physicalKind))]
-                        + spatialDescription,
+                        + spatialDescription
+                        + states.map { MacScreenText($0, redacted: .string($0)) },
                     provenance: .vision(renderedConfidence),
                     abstain: motorAddressable ? nil : (spatiallyAddressable
                         ? "physical point confidence too low; observe again" : reason),
@@ -431,14 +441,8 @@ extension VisionPercept {
                     }
                     .min { $0.distance < $1.distance }?.row
                 if let base, let nearest {
-                    let dx = nearest.rect.centerX - row.rect.centerX
-                    let dy = nearest.rect.centerY - row.rect.centerY
-                    let overlaps = row.rect.iou(nearest.rect) >= 0.05
-                        || row.rect.coverage(by: nearest.rect) >= 0.15
-                        || nearest.rect.coverage(by: row.rect) >= 0.15
-                    let relation = overlaps ? "overlapping"
-                        : abs(dx) >= abs(dy) ? (dx >= 0 ? "left of" : "right of")
-                        : (dy >= 0 ? "above" : "below")
+                    let direction = Self.spatialDirection(from: row.rect, to: nearest.rect, frameSize: frameSize)
+                    let relation = direction == "overlaps" ? "overlapping" : direction
                     let otherBase = nearest.visualColor.map { "\($0) object" }
                         ?? nearest.visualShape.map { "\($0) object" }
                     if let otherBase {
@@ -483,7 +487,8 @@ extension VisionPercept {
                 motionUncertain: motorAddressable
                     && (liveRegionIdentities[row.rect]?.needsMotionConfirmation == true
                         || (liveRegionIdentities[row.rect]?.motion != "stationary"
-                            && liveRegionIdentities[row.rect]?.motion?.hasPrefix("moving ") != true))
+                            && liveRegionIdentities[row.rect]?.motion?.hasPrefix("moving ") != true)),
+                enabled: row.state.disabled?.value != true
             ))
         }
 
@@ -574,7 +579,8 @@ extension VisionPercept {
         // Only HUD/readout/OCR values may prove that an action had a visible
         // effect. Occlusion memory and scene relations naturally change while
         // objects move, even when an input did nothing.
-        let effectValueTexts = values.compactMap(\.text.display)
+        let effectValueTexts = indicatorRender.effectValueTexts
+            + values.dropFirst(indicatorRender.values.count).compactMap(\.text.display)
         for occluded in liveOccludedRegions.prefix(max(0, 16 - values.count)) {
             let appearance = [occluded.shapeName, occluded.colorName]
                 .compactMap { $0 }
@@ -803,6 +809,7 @@ extension VisionPercept {
         }
 
         var values: [MacScreenRender.Value] = []
+        var effectValueTexts: [String] = []
         var claimedReadoutHandles: Set<String> = []
         var claimedRecognizedKeys: Set<String> = []
         for group in groups {
@@ -882,15 +889,20 @@ extension VisionPercept {
                 }
                 : nil
             let text: String
+            let valueText: String
             if let nearbyReadout, let display = nearbyReadout.text.display {
                 claimedReadoutHandles.insert(nearbyReadout.handle)
                 text = "\(display) — \(geometry)"
+                valueText = "\(display) — \(prefix), length \(length)%"
             } else if let nearbyRecognized, let display = nearbyRecognized.text.display {
                 claimedRecognizedKeys.insert(display.lowercased())
                 text = "\(display) — \(geometry)"
+                valueText = "\(display) — \(prefix), length \(length)%"
             } else {
                 text = geometry
+                valueText = "\(prefix), length \(length)%"
             }
+            effectValueTexts.append(valueText)
             let confidence = ordered.map { Self.physicalPointConfidence(rows[$0]) }.max() ?? 0
             values.append(MacScreenRender.Value(
                 text: MacScreenText(text, redacted: .string(text)),
@@ -899,6 +911,7 @@ extension VisionPercept {
         }
         return VisionLinearIndicatorRender(
             values: values,
+            effectValueTexts: effectValueTexts,
             claimedReadoutHandles: claimedReadoutHandles,
             claimedRecognizedKeys: claimedRecognizedKeys
         )
@@ -969,19 +982,8 @@ extension VisionPercept {
             guard let best else { break }
             let source = nodes[best.from]
             let target = nodes[best.to]
-            let dx = (target.rect.centerX - source.rect.centerX) / frameSize.width
-            let dy = (target.rect.centerY - source.rect.centerY) / frameSize.height
-            let overlap = source.rect.iou(target.rect) >= 0.05
-                || source.rect.coverage(by: target.rect) >= 0.15
-                || target.rect.coverage(by: source.rect) >= 0.15
-            let direction: String
-            if overlap {
-                direction = "overlaps"
-            } else if abs(dx) >= abs(dy) {
-                direction = dx >= 0 ? "left of" : "right of"
-            } else {
-                direction = dy >= 0 ? "above" : "below"
-            }
+            let direction = spatialDirection(from: source.rect, to: target.rect, frameSize: frameSize)
+            let overlap = direction == "overlaps"
             let proximity = !overlap && best.distance <= 0.18 ? "near and " : ""
             func label(_ node: VisionSpatialNode) -> String {
                 let appearance = [node.shape, node.color].compactMap { $0 }.joined(separator: " ")
@@ -999,6 +1001,16 @@ extension VisionPercept {
             remaining.remove(best.to)
         }
         return values
+    }
+
+    private static func spatialDirection(from source: VisionRect, to target: VisionRect, frameSize: VisionSize) -> String {
+        if source.iou(target) >= 0.05
+            || source.coverage(by: target) >= 0.15
+            || target.coverage(by: source) >= 0.15 { return "overlaps" }
+        let dx = (target.centerX - source.centerX) / max(1, frameSize.width)
+        let dy = (target.centerY - source.centerY) / max(1, frameSize.height)
+        return abs(dx) >= abs(dy) ? (dx >= 0 ? "left of" : "right of")
+            : (dy >= 0 ? "above" : "below")
     }
 
     /// Confidence shown for a role-uncertain physical object answers the only

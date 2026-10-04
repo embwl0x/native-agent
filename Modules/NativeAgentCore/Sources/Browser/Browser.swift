@@ -124,10 +124,15 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
     }
 
     public func browserStatus() async throws -> JSONValue? {
-        // runs = read_json(self.browser_runs_path, [])  (default [] on missing/torn)
+        // Only a missing run feed is empty; malformed content is unavailable.
         let runsRaw = try await persistence.readJSON(runsPath, ifMissing: .array([]))
-        let runs: [JSONValue]
-        if case .array(let arr) = runsRaw { runs = arr } else { runs = [] }
+        guard case .array(let runs) = runsRaw,
+              runs.allSatisfy({
+                  if case .object(let row) = $0, case .string? = row["status"] { return true }
+                  return false
+              }) else {
+            throw PersistenceCoreError.ioFailure("The browser run feed is malformed.")
+        }
 
         // active = [run for run in runs if run.get("status") in {"running","waiting_approval"}]
         let activeRuns: [JSONValue] = runs.filter { run in
@@ -148,7 +153,13 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
         // Passing maxBytes:nil would (a) read the whole file unbounded and (b)
         // diverge on receiptCount/latestReceipt for >1 MiB logs. 1_048_576 is the
         // exact daemon default (and the Swift tailJSONL(_:) convenience default).
-        var receipts: [JSONValue] = (try? await persistence.tailJSONL(receiptsPath, limit: 20, maxBytes: 1_048_576)) ?? []
+        let receiptRead = try await persistence.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
+        guard receiptRead.malformedJSONRowCount == 0,
+              receiptRead.rows.allSatisfy({ if case .object = $0 { return true }; return false }),
+              receiptRead.physicalRowsScanned > 0 || receiptRead.bytesRead == 0 else {
+            throw PersistenceCoreError.ioFailure("The browser receipt feed is malformed.")
+        }
+        var receipts = receiptRead.rows
         receipts.reverse()
 
         let approved = try await approvedBrowserDomains()

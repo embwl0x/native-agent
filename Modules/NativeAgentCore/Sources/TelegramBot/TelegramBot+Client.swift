@@ -10,7 +10,7 @@ import ApprovalInbox
 public actor SwiftNativeTelegramBot: TelegramBotProtocol {
     private let dataRoot: URL
     private let backgroundLoopsManager: BackgroundLoopsManager
-    private let lifecycleObserver: (any LLMCallLifecycleObserving)?
+    private let compactionHandler: TelegramCompactionHandler?
     let completenessDeps: TelegramBotCompletenessDeps?
     // 2026-09-07: An address can be reused before asynchronous deinit cleanup runs.
     nonisolated let completenessRegistryToken = UUID()
@@ -19,12 +19,12 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         backgroundLoopsManager: BackgroundLoopsManager = .shared,
         completenessDeps: TelegramBotCompletenessDeps? = nil,
-        lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
+        compactionHandler: TelegramCompactionHandler? = nil
     ) {
         self.dataRoot = dataRoot
         self.backgroundLoopsManager = backgroundLoopsManager
         self.completenessDeps = completenessDeps
-        self.lifecycleObserver = lifecycleObserver
+        self.compactionHandler = compactionHandler
     }
 
     deinit {
@@ -70,7 +70,16 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
     }
 
     public func getStatus() async throws -> TelegramStatus {
-        let cfg = TelegramConfig.loadFromDisk(dataRoot: dataRoot)
+        let cfg: TelegramConfig?
+        let configurationError: String?
+        do {
+            try TelegramConfig.validateSavedConfiguration(dataRoot: dataRoot)
+            cfg = TelegramConfig.loadFromDisk(dataRoot: dataRoot)
+            configurationError = nil
+        } catch {
+            cfg = nil
+            configurationError = "Saved Telegram settings are invalid or unreadable. Repair or remove telegram/config.json before setting up Telegram again."
+        }
         let pollerRunning = await backgroundLoopsManager.isRunning(loopId: "telegram_poll")
         let persistence = SwiftNativePersistenceCore()
         let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
@@ -131,7 +140,7 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
             lastSeenUpdateId: _tgJSONInt(stateObj["lastSeenUpdateId"]) ?? _tgJSONInt(stateObj["lastUpdateId"]),
             lastSeenAt: _tgJSONString(stateObj["lastSeenAt"]),
             lastReplyAt: _tgJSONString(stateObj["lastReplyAt"]),
-            lastError: _tgJSONString(stateObj["lastError"])
+            lastError: configurationError ?? _tgJSONString(stateObj["lastError"])
                 ?? (cfg == nil ? "No bot token saved - paste one to enable." : nil),
             extras: .object(extras)
         )
@@ -351,7 +360,7 @@ extension SwiftNativeTelegramBot {
     }
 
     /// 2026-09-06: the topic-aware entry point. Session commands (/new,
-    /// /reset, /clear, /compact, /session, /resume, /persona, /scratch) act on
+    /// /compact, /session, /resume, /persona, /scratch) act on
     /// the conversation the command was said in, which for a forum topic is
     /// that topic and not the whole supergroup.
     public func dispatchSwiftSlashCommandDetailed(
@@ -366,7 +375,7 @@ extension SwiftNativeTelegramBot {
         // Strip @botname suffix if present (Telegram appends it in groups).
         if let atIdx = cmd.firstIndex(of: "@") { cmd = String(cmd[..<atIdx]) }
         let lower = TelegramCommandRegistry.canonicalName(for: cmd) ?? cmd.lowercased()
-        if let baseReply = try await dispatchBaseSlashCommand(lower, args: args, destination: destination) {
+        if let baseReply = try await dispatchBaseSlashCommand(lower, args: args, destination: destination, fromUserId: fromUserId) {
             return TelegramSlashDispatchOutcome(reply: baseReply)
         }
         // chatId/fromUserId/chatType ride along for owner-gated completeness
@@ -384,7 +393,8 @@ extension SwiftNativeTelegramBot {
     private func dispatchBaseSlashCommand(
         _ lower: String,
         args: [String],
-        destination: TelegramDestination
+        destination: TelegramDestination,
+        fromUserId: Int?
     ) async throws -> String? {
         switch lower {
         case "status":
@@ -403,26 +413,27 @@ extension SwiftNativeTelegramBot {
         case "new":
             let sessionId = try await TelegramSessionStore(dataRoot: dataRoot).startNewSession(destination: destination)
             return "Started new Telegram session: \(sessionId)"
-        case "reset":
-            let result = try await TelegramSessionStore(dataRoot: dataRoot).resetSession(destination: destination)
-            return "Reset Telegram session \(result.sessionId) (\(result.messagesBefore) message(s) cleared)."
         case "session":
             return try await dispatchSessionCommand(args: args, destination: destination)
-        case "clear":
-            let result = try await TelegramSessionStore(dataRoot: dataRoot).clearSession(destination: destination)
-            return "Cleared Telegram session \(result.sessionId) (\(result.messagesBefore) message(s) removed)."
         case "compact":
-            let result = try await TelegramSessionStore(dataRoot: dataRoot, lifecycleObserver: lifecycleObserver).compactSession(destination: destination, force: true)
-            if result.compacted {
-                return "Compacted Telegram session \(result.sessionId): \(result.messagesBefore) -> \(result.messagesAfter) messages."
+            guard let compactionHandler else { return "Compaction is unavailable here." }
+            let sessionId = try await TelegramSessionStore(dataRoot: dataRoot).activeSessionId(destination: destination)
+            do {
+                let result = try await compactionHandler(sessionId)
+                if result.compacted {
+                    return "Compacted Telegram session \(result.sessionId): \(result.messagesBefore) -> \(result.messagesAfter) messages."
+                }
+                return "Telegram session \(result.sessionId) not compacted: \(result.reason)."
+            } catch {
+                return "Telegram session \(sessionId) not compacted: \(error.localizedDescription)."
             }
-            return "Telegram session \(result.sessionId) not compacted: \(result.reason)."
         case "stop":
             return "No Telegram turn is running for this chat."
         case "retry":
             return "Retry is handled by the live Telegram poll loop."
         case "sessions":
-            let sessions = try await TelegramSessionStore(dataRoot: dataRoot).recentSessions(limit: 8)
+            let sessions = try await TelegramSessionStore(dataRoot: dataRoot)
+                .recentSessions(destination: destination, fromUserId: fromUserId, limit: 8)
             if sessions.isEmpty {
                 return "No chat sessions found."
             }
@@ -435,7 +446,7 @@ extension SwiftNativeTelegramBot {
         case "resume":
             let requested = args.first ?? ""
             let status = try await TelegramSessionStore(dataRoot: dataRoot)
-                .bindSession(destination: destination, requestedSessionId: requested)
+                .bindSession(destination: destination, requestedSessionId: requested, fromUserId: fromUserId)
             return """
             Resumed Telegram session: \(status.sessionId)
             Persona: \(status.persona)
@@ -500,12 +511,11 @@ extension SwiftNativeTelegramBot {
         let store = TelegramSessionStore(dataRoot: dataRoot)
         let subcommand = args.first?.lowercased() ?? "status"
         switch subcommand {
-        case "new":
+        // `reset`/`clear` start a new session too: the old transcript is
+        // shared with the Mac and phone, so nothing here may wipe it.
+        case "new", "reset", "clear":
             let sessionId = try await store.startNewSession(destination: destination)
             return "Started new Telegram session: \(sessionId)"
-        case "reset", "clear":
-            let result = try await store.resetSession(destination: destination)
-            return "Reset Telegram session \(result.sessionId) (\(result.messagesBefore) message(s) cleared)."
         case "status", "current":
             let status = try await store.status(destination: destination)
             return """

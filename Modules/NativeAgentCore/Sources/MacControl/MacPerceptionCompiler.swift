@@ -469,13 +469,15 @@ public struct MacLookFocus: Sendable, Equatable {
     public let handle: String?
     public let path: [Int]
     public let labelJSON: JSONValue?
+    public let selectionRange: NSRange?
 
-    public init(role: String, label: String?, handle: String?, path: [Int], labelJSON: JSONValue? = nil) {
+    public init(role: String, label: String?, handle: String?, path: [Int], labelJSON: JSONValue? = nil, selectionRange: NSRange? = nil) {
         self.role = role
         self.label = label
         self.handle = handle
         self.path = path
         self.labelJSON = labelJSON
+        self.selectionRange = selectionRange
     }
 
     public var displayLabel: String? { MacPerceptionCompiler.displayText(label, json: labelJSON) }
@@ -486,6 +488,13 @@ public struct MacLookFocus: Sendable, Equatable {
             "path": .array(path.map { .int(Int64($0)) }),
         ]
         if let handle { object["handle"] = .string(handle) }
+        if let selectionRange {
+            object["selection_range"] = .object([
+                "location": .int(Int64(selectionRange.location)),
+                "length": .int(Int64(selectionRange.length)),
+                "unit": .string("utf16"),
+            ])
+        }
         if let label {
             object["label"] = labelJSON
                 ?? MacScreenViewTextRedaction.redactedLegendString(label, valueChars: valueChars)
@@ -884,7 +893,7 @@ public enum MacPerceptionCompiler {
     ]
 
     public static let modalSubroles: Set<String> = [
-        "AXDialog", "AXSystemDialog", "AXStandardWindow", "AXSheet",
+        "AXDialog", "AXSystemDialog", "AXSheet",
     ]
 
     /// A display string that is safe for the PROSE grade: nil when the redactor
@@ -938,7 +947,8 @@ public enum MacPerceptionCompiler {
             changed = true
             return MacAXNode(attributes: MacAXAttributes(
                 role: a.role, subrole: a.subrole, title: caption, value: a.value, enabled: a.enabled,
-                selected: a.selected, frame: a.frame, actions: a.actions
+                selected: a.selected, frame: a.frame, actions: a.actions,
+                placeholder: a.placeholder, selectionRange: a.selectionRange
             ), path: node.path)
         }
         guard changed else { return snapshot }
@@ -971,8 +981,15 @@ public enum MacPerceptionCompiler {
         // it). Every text channel below is redacted HERE, at compile time, so
         // glance and look can never disagree and no renderer needs the tree.
         let secretContext = MacScreenViewTextRedaction.nodeSecretContext(snapshot.nodes)
-        func redacted(_ text: String, of node: MacAXNode, under caption: String?) -> JSONValue {
-            MacScreenViewTextRedaction.redactedNodeString(
+        func redacted(_ text: String, of node: MacAXNode, under caption: String?, isValue: Bool = false) -> JSONValue {
+            if isValue, MacScreenViewBuilder.isSecretField(
+                role: node.attributes.role,
+                subrole: node.attributes.subrole,
+                label: node.attributes.title
+            ) {
+                return MacInjectionResultRedaction.redactedSecret(text)
+            }
+            return MacScreenViewTextRedaction.redactedNodeString(
                 text,
                 valueChars: affordanceValueChars,
                 frame: node.attributes.frame,
@@ -1248,10 +1265,10 @@ public enum MacPerceptionCompiler {
                 path: node.path,
                 // A value-derived label IS a value: redact it as one (under no
                 // caption of its own). A title is redacted as a title.
-                labelJSON: redacted(label, of: node, under: nil),
+                labelJSON: redacted(label, of: node, under: nil, isValue: labelSource == "value"),
                 // The control's own title is the value's caption — the "CVV"
                 // box showing `123`, the "API key" field showing the key.
-                valueJSON: shownValue.map { redacted($0, of: node, under: title) },
+                valueJSON: shownValue.map { redacted($0, of: node, under: title, isValue: true) },
                 handleAmbiguity: ambiguity(at: node.path),
                 placeholder: cleaned(attributes.placeholder),
                 placeholderJSON: cleaned(attributes.placeholder).map { redacted($0, of: node, under: nil) }
@@ -1334,8 +1351,9 @@ public enum MacPerceptionCompiler {
                 // A focused field's VALUE is the thing most likely to be the
                 // secret (the cursor is in the password box). When the label
                 // fell back to the value, the node has no title to caption it,
-                // so the enclosing/beside geometry and the shape test decide.
-                labelJSON: label.map { redacted($0, of: node, under: nil) }
+                // so its secure role and the surrounding context decide.
+                labelJSON: label.map { redacted($0, of: node, under: nil, isValue: title == nil) },
+                selectionRange: node.attributes.selectionRange
             )
         }
 
@@ -1390,7 +1408,12 @@ public enum MacPerceptionCompiler {
                 // the caption beside/above) as every affordance channel — a
                 // readout channel that bypassed this would ship the password
                 // the login sheet is displaying.
-                textJSON: redacted(candidate.text, of: candidate.node, under: nil),
+                textJSON: redacted(
+                    candidate.text,
+                    of: candidate.node,
+                    under: candidate.source == "value" ? candidate.node.attributes.title : nil,
+                    isValue: candidate.source == "value"
+                ),
                 handleAmbiguity: ambiguity(at: candidate.node.path)
             ))
         }
@@ -1683,13 +1706,11 @@ public struct MacLookFrame: Sendable, Equatable {
     ///   she saw, not rows dropped on the way out (gpt-5.5 SHOULD-FIX
     ///   2026-08-22). nil ⇒ every affordance (a glance mints them all; its
     ///   output says how many are addressable and that `look` lists them).
-    /// Did the compile decline to emit this text verbatim? Anything other than
-    /// the raw string back means the redactor acted, and that verdict is what
-    /// the post-act read (which has no context of its own) must inherit.
-    static func withheld(_ json: JSONValue?, raw: String?) -> Bool {
-        guard let json else { return false }
-        guard let raw else { return json != .null }
-        return json != .string(raw)
+    /// A redaction object carries a secret verdict; a shortened string does not.
+    /// The post-act read must inherit only the secret verdict.
+    static func withheld(_ json: JSONValue?) -> Bool {
+        if case .object = json { return true }
+        return false
     }
 
     public static func entries(
@@ -1712,8 +1733,8 @@ public struct MacLookFrame: Sendable, Equatable {
                 labelJSON: affordance.labelJSON,
                 valueJSON: affordance.valueJSON,
                 secret: affordance.secret
-                    || withheld(affordance.labelJSON, raw: affordance.label)
-                    || withheld(affordance.valueJSON, raw: affordance.value)
+                    || withheld(affordance.labelJSON)
+                    || withheld(affordance.valueJSON)
             )
         }
         if let focus = percept.focus, let handle = focus.handle, out[handle] == nil {
@@ -1729,7 +1750,7 @@ public struct MacLookFrame: Sendable, Equatable {
                 // clear through `affordances_removed` — the CVV field the whole
                 // look correctly withheld, leaked by focusing it.
                 labelJSON: focus.labelJSON,
-                secret: withheld(focus.labelJSON, raw: focus.label)
+                secret: withheld(focus.labelJSON)
             )
         }
         return out
@@ -1751,7 +1772,7 @@ public struct MacLookFrame: Sendable, Equatable {
                 // diff has no snapshot context of its own, so this is the only
                 // place the "CVV two rows up" judgement still exists.
                 textJSON: readout.textJSON,
-                secret: withheld(readout.textJSON, raw: readout.text)
+                secret: withheld(readout.textJSON)
             )
             if out[record.key] == nil { out[record.key] = record }
         }
@@ -1809,6 +1830,14 @@ public extension MacPerceptionCompiler {
         var out: [[Int]: JSONValue] = [:]
         for node in snapshot.nodes {
             guard let text = node.attributes.title ?? node.attributes.value else { continue }
+            if node.attributes.title == nil, MacScreenViewBuilder.isSecretField(
+                role: node.attributes.role,
+                subrole: node.attributes.subrole,
+                label: node.attributes.title
+            ) {
+                out[node.path] = MacInjectionResultRedaction.redactedSecret(text)
+                continue
+            }
             out[node.path] = MacScreenViewTextRedaction.redactedNodeString(
                 text,
                 valueChars: affordanceValueChars,
@@ -2076,25 +2105,6 @@ public extension SystemMacAXElementSource {
                 _ = AXUIElementSetAttributeValue(app, flag.rawValue as CFString, value)
             }
             return readsEnhancedAccessibility(app: app)
-        }
-    }
-
-    /// fable51 item 33 (gpt-5.5 review) — bound EVERY AX round trip to ONE app
-    /// for the duration of a heavy read, and put it back afterwards.
-    ///
-    /// Deliberately the APPLICATION element, never `AXUIElementCreateSystemWide`:
-    /// per `AXUIElement.h` the system-wide form retunes the timeout for the
-    /// WHOLE PROCESS, and exactly one organ in this app is allowed to do that
-    /// (`ActivityWatcher`, pinned by its architecture test). Scoped here, an
-    /// unresponsive app being read cannot wedge anything but its own read.
-    ///
-    /// `seconds: 0` restores the system default, which is what the caller's
-    /// `defer` passes — the bound belongs to the read, not to the app.
-    static func setMessagingTimeout(pid: Int32, seconds: Float) {
-        MacAXExecutionLane.sync {
-            // Same self-process fence as the flags above.
-            guard pid != getpid() else { return }
-            _ = AXUIElementSetMessagingTimeout(AXUIElementCreateApplication(pid), seconds)
         }
     }
 

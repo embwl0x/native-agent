@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import PersistenceCore
 
 public enum OrganismPredictiveBody {
@@ -40,7 +41,7 @@ public enum OrganismPredictiveBody {
         // stamped expiry, not a silent removal.
         let resolvesOwnRow: Bool
         switch signal.kind {
-        case .toolSucceeded, .toolFailed,
+        case .userSpoke, .toolSucceeded, .toolFailed,
              .providerSucceeded, .providerFailed,
              .phoneDeliveryReceived, .phoneDeliveryFailed,
              .approvalResolved, .deskItemClosed, .deskItemBlocked:
@@ -172,6 +173,9 @@ public enum OrganismPredictiveBody {
             // shadow (modulate reads it) disagreed with the body about whether a
             // miss just happened. One clock, both readers.
             ledger.lastViolationAt = date
+            if OrganismProspectiveAffect.carriesFeeling(prediction.kind) {
+                ledger.lastFeltViolationAt = max(ledger.lastFeltViolationAt ?? .distantPast, date)
+            }
             applyViolationEffect(
                 kind: prediction.kind,
                 intensity: 0.55,
@@ -324,6 +328,9 @@ public enum OrganismPredictiveBody {
         prediction.lastUpdatedAt = signal.occurredAt
         ledger.predictions[prediction.id] = prediction
         ledger.lastViolationAt = signal.occurredAt
+        if OrganismProspectiveAffect.carriesFeeling(kind) {
+            ledger.lastFeltViolationAt = max(ledger.lastFeltViolationAt ?? .distantPast, signal.occurredAt)
+        }
         applyViolationEffect(
             kind: kind,
             intensity: signal.intensity,
@@ -349,7 +356,7 @@ public enum OrganismPredictiveBody {
         signal: SomaticSignal
     ) -> OrganismPrediction {
         OrganismPrediction(
-            id: "terminal:\(kind.rawValue):\(OrganismToken.canonicalToken(signal.sourceOrgan)):\(Int(signal.occurredAt.timeIntervalSince1970))",
+            id: pendingID(kind: kind, signal: signal),
             kind: kind,
             sourceOrgan: OrganismToken.canonicalToken(signal.sourceOrgan),
             createdAt: signal.occurredAt,
@@ -433,7 +440,7 @@ public enum OrganismPredictiveBody {
     /// conversation can no longer resolve, or punish, an expectation formed in
     /// another. A turn is also never the reaction to itself (the same guard the
     /// substrate's completion reconsolidation makes).
-    private static func resolveSemanticExpectations(
+    static func resolveSemanticExpectations(
         signal: SomaticSignal,
         ledger: inout OrganismPredictionLedger,
         chemicalState: inout ChemicalState
@@ -512,6 +519,7 @@ public enum OrganismPredictiveBody {
             row.confidence = OrganismBodyConfidence.clamp(row.confidence - 0.20 * i)
             row.uncertainty = OrganismBodyConfidence.clamp(row.uncertainty + 0.22 * i)
             ledger.lastViolationAt = date
+            ledger.lastFeltViolationAt = max(ledger.lastFeltViolationAt ?? .distantPast, date)
         }
         row.evidenceCount += 1
         row.lastUpdatedAt = date
@@ -529,22 +537,50 @@ public enum OrganismPredictiveBody {
         }
     }
 
-    /// Deterministic and collision-proof: organ, scope, concern label, and the
-    /// turn's own second. Public so the appraisal owner's tests can address a
-    /// row they minted without reaching into the ledger's private keying.
+    /// Bounded deterministic identity from the organ, scope, concern and second.
     public static func semanticExpectationID(
         signal: SomaticSignal,
         label: String,
         scope: OrganismSemanticScope
     ) -> String {
-        [
-            OrganismSemanticExpectation.idPrefix,
-            OrganismToken.canonicalToken(signal.sourceOrgan),
-            OrganismToken.canonicalToken(scope.sessionID),
-            OrganismToken.canonicalToken(scope.turnID),
-            OrganismToken.canonicalToken(label),
+        let components = [
+            signal.sourceOrgan,
+            scope.sessionID,
+            scope.turnID,
+            label,
             String(Int(signal.occurredAt.timeIntervalSince1970)),
-        ].joined(separator: ":")
+        ]
+        let identity = components.map { "\($0.utf8.count):\($0)" }.joined()
+        let digest = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "\(OrganismSemanticExpectation.idPrefix):\(digest)"
+    }
+
+    /// Rows the incoming terminal signal can settle, before wall-time expiry.
+    static func resolvingPredictionIDs(signal: SomaticSignal, in ledger: OrganismPredictionLedger) -> Set<String> {
+        let kind: OrganismPredictionKind
+        switch signal.kind {
+        case .toolSucceeded, .toolFailed: kind = .toolCompletion
+        case .providerSucceeded, .providerFailed: kind = .providerCompletion
+        case .phoneDeliveryReceived, .phoneDeliveryFailed: kind = .phoneDelivery
+        case .approvalResolved: kind = .approvalResolution
+        case .deskItemClosed, .deskItemBlocked: kind = .workflowAdvance
+        case .userSpoke:
+            guard OrganismSemanticExpectation.field(
+                OrganismSemanticExpectation.reactionField, in: signal.metadata,
+                key: OrganismSemanticExpectation.reactionMetadataKey) != nil,
+                  let scope = OrganismSemanticExpectation.scope(
+                    in: signal.metadata, key: OrganismSemanticExpectation.reactionMetadataKey) else { return [] }
+            return Set(ledger.predictions.values.filter {
+                $0.kind == .semanticExpectation && $0.status == .pending
+                    && $0.semanticScope == scope && signal.occurredAt > $0.createdAt
+                    && signal.occurredAt >= $0.lastUpdatedAt
+            }.map(\.id))
+        default: return []
+        }
+        let id = pendingID(kind: kind, signal: signal)
+        guard let row = ledger.predictions[id], row.status == .pending,
+              signal.occurredAt >= row.lastUpdatedAt else { return [] }
+        return [id]
     }
 
     /// Relief gain: a satisfied outcome the body was fully braced for

@@ -3,6 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import ToolRegistry
+import Desk
+import CryptoKit
 
 // MARK: - Errors
 
@@ -392,18 +394,47 @@ public actor SwiftNativeToolExecution: ToolExecutionProtocol {
             ?? record.codeFingerprint
             ?? Self.stringField(manifest, "codeFingerprint")
         let actualFingerprint = computeToolCodeFingerprint(toolRoot: toolRoot, entrypointName: entrypoint)
+        guard case .array(let declared)? = manifest["permissions"],
+              declared.allSatisfy({ if case .string = $0 { return true }; return false }) else {
+            throw ToolExecutionError.underlying("active tool permissions are missing or malformed: \(trimmed)")
+        }
+        let permissions = Set(declared.compactMap { if case .string(let permission) = $0 { return permission }; return nil })
+        guard let registeredPermissions = record.permissions,
+              permissions == Set(registeredPermissions) else {
+            throw ToolExecutionError.underlying("active tool permissions do not match its registry: \(trimmed)")
+        }
         let runner = ToolRunSandboxRunner()
-        let result = try await runner.runTool(
-            sandbox: ToolRunSandbox(
-                toolRoot: toolRoot,
-                entrypoint: entrypoint,
-                timeoutSeconds: timeoutSeconds
-            ),
-            input: input,
-            expectedFingerprint: expectedFingerprint,
-            actualFingerprint: actualFingerprint
-        )
-        return Self.runEnvelope(toolId: trimmed, result: result)
+        let result: ToolRunResult
+        do {
+            result = try await runner.runTool(
+                sandbox: ToolRunSandbox(
+                    toolRoot: toolRoot,
+                    entrypoint: entrypoint,
+                    timeoutSeconds: timeoutSeconds,
+                    dataRoot: root,
+                    permissions: permissions
+                ),
+                input: input,
+                expectedFingerprint: expectedFingerprint,
+                actualFingerprint: actualFingerprint
+            )
+        } catch {
+            await noteCall(trimmed, failed: true)
+            throw error
+        }
+        let envelope = Self.runEnvelope(toolId: trimmed, result: result)
+        let failed = result.timedOut || result.exitCode != 0 || Self.parsedToolStatus(result.parsedOutput ?? .null) == "failed"
+        await noteCall(trimmed, failed: failed, clean: failed ? nil
+            : (try? String(contentsOf: toolRoot.appendingPathComponent(entrypoint), encoding: .utf8)).map(Self.sha))
+        return envelope
+    }
+
+    /// A call is a use (`CapabilityLifecycle`), a clean one names its code;
+    /// failing twice in a row asks, as one quiet MY QUEUE line, whether to improve it.
+    private func noteCall(_ id: String, failed: Bool, clean: String? = nil) async {
+        guard let line = try? await ToolRegistryActions.recordCall(id: id, failed: failed, cleanCode: clean, dataRoot: root)
+        else { return }
+        _ = try? await MyQueue.add(DeskStep(words: line, when: "quiet"), store: SwiftNativeDeskStore(dataRoot: root))
     }
 
     @discardableResult
@@ -568,6 +599,168 @@ public actor SwiftNativeToolExecution: ToolExecutionProtocol {
             return result
         }
         return parsed
+    }
+}
+
+// MARK: - Her authoring surface
+
+extension SwiftNativeToolExecution {
+    /// `tool.propose`: a tool she wrote, filed as a proposal (manifest,
+    /// tool.swift, tests.json), validated as promote validates it, and listed
+    /// on the Tools page as proposed, where activating it is User's Approve.
+    /// A tool that runs now is changed under a new id or after quarantine, so
+    /// proposing never stops one that works. Proposing over a version keeps
+    /// that one (`tool.rollback`); approval starts over.
+    public func propose(id: String, description: String, code: String, tests: [JSONValue],
+                        permissions: [String], inputSchema: JSONValue?) async throws -> ProposalValidationResult {
+        guard id.range(of: #"^[a-z][a-z0-9_]{1,47}$"#, options: .regularExpression) != nil else {
+            throw ToolExecutionError.invalidProposal(
+                "tool_id is 2 to 48 lowercase letters, digits and underscores, starting with a letter")
+        }
+        guard !description.isEmpty, !code.isEmpty else {
+            throw ToolExecutionError.invalidProposal("description and code are both required")
+        }
+        let existing = try await unlessActive(id)
+        try keepVersion(id)
+        var manifest: [String: JSONValue] = [
+            "id": .string(id), "name": .string(id), "description": .string(description), "triggers": .array([]),
+            "permissions": .array(permissions.map(JSONValue.string)), "entrypoint": .string("tool.swift"),
+            "language": .string("swift"),
+        ]
+        if let inputSchema { manifest["inputSchema"] = inputSchema }
+        _ = try await createProposal(.object(manifest))
+        let dir = proposalsDir.appendingPathComponent(id, isDirectory: true)
+        try Data(code.utf8).write(to: dir.appendingPathComponent("tool.swift"), options: .atomic)
+        try JSONValue.array(tests).serializedData(pretty: true).write(to: dir.appendingPathComponent("tests.json"), options: .atomic)
+        var result = try await validateProposal(id: id, promote: false)
+        // Promote activates only permissions that are all app data, or that
+        // include one User acknowledges as risky; say so now, not at Approve.
+        if result.valid, !result.autoPromotable, Set(permissions).isDisjoint(with: ToolPromoteEngine.riskyToolPermissions) {
+            result.valid = false
+            result.errors.append("Approve can't activate these permissions: a tool that reads declares app_data_read, "
+                + "one that changes app state app_data_write; past that, add the one it needs (shell, network_public)")
+        }
+        let stamp = Self.isoTimestamp(clock())
+        var row = manifest
+        row["status"] = .string("proposed")
+        row["phase"] = .string("proposed")
+        row["validationStatus"] = .string(result.valid ? "valid" : "invalid")
+        row["validationErrors"] = .array(result.errors.map(JSONValue.string))
+        row["proposalPath"] = .string(dir.path)
+        row["createdAt"] = .string(existing?.createdAt ?? stamp)
+        row["updatedAt"] = .string(stamp)
+        row["failuresInARow"] = .int(0)
+        try await ToolRegistryActions.upsertProposal(.object(row), dataRoot: root)
+        return result
+    }
+
+    /// Its row, refused while active: a tool that runs now is changed under a
+    /// new id or after quarantine.
+    private func unlessActive(_ id: String) async throws -> ToolRecord? {
+        let existing = try await SwiftNativeToolRegistry(root: root, persistence: persistence, clock: clock).getTool(id: id)
+        if existing?.status == "active" {
+            throw ToolExecutionError.invalidProposal(
+                "\(id) is active. Propose the change under a new tool_id, or tool.quarantine \(id) first")
+        }
+        return existing
+    }
+
+    /// `tool.rollback`: the version she wrote before this one (its last clean
+    /// one when kept), proposed again, drafted and waiting for approval; the
+    /// one it replaces is kept in turn. Refused while active, as proposing is.
+    public func rollback(id: String) async throws -> ProposalValidationResult {
+        guard case .object(let version) = try rollbackTarget(id).row, case .string(let code)? = version["code"] else {
+            throw ToolExecutionError.invalidProposal("\(id) has no earlier version to roll back to")
+        }
+        let manifest: [String: JSONValue] = if case .object(let given)? = version["manifest"] { given } else { [:] }
+        let tests: [JSONValue] = if case .array(let given)? = version["tests"] { given } else { [] }
+        let permissions: [String] = if case .array(let given)? = manifest["permissions"] {
+            given.compactMap { if case .string(let p) = $0 { p } else { nil } }
+        } else { [] }
+        let description = if case .string(let text)? = manifest["description"] { text } else { id }
+        return try await propose(id: id, description: description, code: code, tests: tests, permissions: permissions,
+                                 inputSchema: manifest["inputSchema"])
+    }
+
+    /// `tool.rollback`'s preview: the digest of the version it would land on,
+    /// refused as the rollback would be. Writes nothing.
+    public func rollbackPreview(id: String) async throws -> String {
+        let target = try rollbackTarget(id)
+        _ = try await unlessActive(id)
+        return target.sha
+    }
+
+    /// The version rollback lands on: the last clean earlier one, else the previous.
+    private func rollbackTarget(_ id: String) throws -> (sha: String, row: JSONValue) {
+        let earlier = earlierVersions(id)
+        guard let target = earlier.clean ?? earlier.previous else {
+            throw ToolExecutionError.invalidProposal("\(id) has no earlier version to roll back to")
+        }
+        return target
+    }
+
+    /// The code on disk now, and of the kept earlier versions the previous
+    /// and the last clean one; `cleanSha` is the last clean call's code.
+    private func earlierVersions(_ id: String) -> (current: String?, previous: (sha: String, row: JSONValue)?,
+                                                   clean: (sha: String, row: JSONValue)?, cleanSha: String?) {
+        let current = (try? String(contentsOf: proposalsDir.appendingPathComponent("\(id)/tool.swift"), encoding: .utf8)).map(Self.sha)
+        let earlier = keptVersions(id).filter { $0.sha != current }
+        let clean = ToolRegistryActions.lastCleanCode(id: id, dataRoot: root)
+        return (current, earlier.last, earlier.last { $0.sha == clean }, clean)
+    }
+
+    /// A tool's current, previous and last clean versions (`CapabilityLifecycle`),
+    /// each its code's digest (12), when it was made and the status it lands
+    /// in (a rollback lands proposed); null when not kept.
+    public func versions(id: String) async -> JSONValue {
+        let earlier = earlierVersions(id)
+        let row = try? await SwiftNativeToolRegistry(root: root, persistence: persistence, clock: clock).getTool(id: id)
+        func version(_ sha: String?, _ at: String?, _ lands: String) -> JSONValue {
+            guard let sha else { return .null }
+            return .object(["digest": .string(String(sha.prefix(12))), "at": at.map(JSONValue.string) ?? .null,
+                            "lands": .string(lands)])
+        }
+        func kept(_ entry: (sha: String, row: JSONValue)?) -> JSONValue {
+            guard let entry else { return .null }
+            let at: String? = if case .object(let fields) = entry.row, case .string(let text)? = fields["at"] { text } else { nil }
+            return version(entry.sha, at, "proposed")
+        }
+        let current = version(earlier.current, row?.updatedAt ?? row?.createdAt, row?.status ?? "proposed")
+        return .object(["current": current, "previous": kept(earlier.previous),
+                        "last_clean": earlier.cleanSha != nil && earlier.cleanSha == earlier.current ? current : kept(earlier.clean)])
+    }
+
+    private func historyFile(_ id: String) -> URL {
+        root.appendingPathComponent("tools/history/\(id).json")
+    }
+
+    private func keptVersions(_ id: String) -> [(sha: String, row: JSONValue)] {
+        guard case .array(let rows)? = try? JSONValue.parse(Data(contentsOf: historyFile(id))) else { return [] }
+        return rows.compactMap { row in
+            guard case .object(let fields) = row, case .string(let code)? = fields["code"] else { return nil }
+            return (Self.sha(code), row)
+        }
+    }
+
+    /// The proposal on disk now, kept as a version before a new one replaces
+    /// it. With the one on disk, a tool has its current, previous and last
+    /// clean versions, never more (`CapabilityLifecycle`).
+    private func keepVersion(_ id: String) throws {
+        let dir = proposalsDir.appendingPathComponent(id, isDirectory: true)
+        guard let code = try? String(contentsOf: dir.appendingPathComponent("tool.swift"), encoding: .utf8) else { return }
+        let read = { (name: String) in (try? JSONValue.parse(Data(contentsOf: dir.appendingPathComponent(name)))) ?? .null }
+        let kept = keptVersions(id) + [(Self.sha(code), JSONValue.object([
+            "at": .string(Self.isoTimestamp(clock())), "code": .string(code), "tests": read("tests.json"), "manifest": read("manifest.json"),
+        ]))]
+        let held = CapabilityLifecycle.keptVersions(kept.map { ($0.sha, $0.sha) }, recent: 1,
+                                                    clean: ToolRegistryActions.lastCleanCode(id: id, dataRoot: root))
+        try FileManager.default.createDirectory(at: historyFile(id).deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONValue.array(held.map { kept[$0].row }).serializedData(pretty: true).write(to: historyFile(id), options: .atomic)
+    }
+
+    /// SHA-256 of a tool's code: the key its versions and clean calls share.
+    static func sha(_ code: String) -> String {
+        SHA256.hash(data: Data(code.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 }
 

@@ -21,6 +21,7 @@ extension HerScreen {
         switch location {
         case .record("agent_read", let input, _):
             guard case .string(let agent)? = input["agent"], Set(input.keys).isSubset(of: ["agent", "conversation"]) else { return nil }
+            if let issue { return screen([agent, "unavailable"], [[clip(issue, 100)]], verbs: []) }
             if agent.lowercased().hasPrefix("bot:"), let id = UUID(uuidString: String(agent.dropFirst(4))) {
                 return helperRoom(id, dataRoot: dataRoot, person: person, issue: issue, now: now)
             }
@@ -28,10 +29,11 @@ extension HerScreen {
             return await personRoom(agent, label: label, dataRoot: dataRoot, person: person, scope: scope, issue: issue, now: now)
         case .record("desk_read", let input, _):
             guard case .string(let handle)? = input["handle"], Set(input.keys).isSubset(of: ["handle", "structured"]) else { return nil }
+            if let issue { return screen([handle, "unavailable"], [[clip(issue, 100)]], verbs: []) }
             return await deskItemRoom(handle, dataRoot: dataRoot, person: person, now: now)
         case .record("chat_conversations", let input, let title):
             guard case .string(let id)? = input["conversation_session_id"], input.count == 1 else { return nil }
-            return await chatRoom(id, title: title, dataRoot: dataRoot, person: person, scope: scope, issue: issue, now: now)
+            return await chatRoom(id, title: title, dataRoot: dataRoot, person: person, scope: scope, issue: issue, value: value, now: now)
         case .area("ongoing"):
             return await deskRoom(dataRoot: dataRoot, person: person, now: now)
         case .area("computer"):
@@ -61,7 +63,7 @@ extension HerScreen {
     }
 
     /// The agent's name and her person's, from the persona profile.
-    static func names(_ dataRoot: URL) -> (agent: String, person: String) {
+    package static func names(_ dataRoot: URL) -> (agent: String, person: String) {
         let profile = (try? Data(contentsOf: dataRoot.appendingPathComponent("memory/profile.json")))
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
         return (clip(nonEmpty(profile["name"] as? String) ?? "Agent", 40), clip(nonEmpty(profile["userName"] as? String) ?? "Your person", 40))
@@ -121,7 +123,7 @@ extension HerScreen {
         let runs = entries.filter { !asked($0) }, talk = entries.filter(asked)
         return screen([bot.name.uppercased(), "helper", state] + (state.contains(cadence) ? [] : [cadence]),
             [section("ABOUT", [clip(firstLine(bot.brief), 90)]),
-             section("RUNS", runs.isEmpty ? ["no runs yet"] : rows(runs, { marks[$0.runHealth] ?? "·" }, more: "earlier runs · action \"replies\"")),
+             section("RUNS", runs.isEmpty ? ["no runs yet"] : rows(runs, { marks[$0.runHealth] ?? "·" }, more: "earlier runs · item \"replies\"")),
              section("TALK", rows(talk, { _ in "↩" }, more: "earlier replies")),
              issue.map { section("READ", [clip($0, 100)]) } ?? []],
             verbs: [(slug + ".say", "ask it something (text)"), (slug + ".run", "run it once now"), (slug + ".settings", "change how it works")]
@@ -132,25 +134,32 @@ extension HerScreen {
 
     private static func personRoom(_ agent: String, label: String?, dataRoot: URL, person: String, scope: String, issue: String?, now: Date) async -> String? {
         let world = await readWorld(dataRoot, now: now)
-        let (records, chats, everyone) = (world.records, world.chats, world.contacts)
-        let oldName = records.first { $0.agent == agent }?.name
+        let (records, chats) = (world.records, world.chats)
+        // Identity merging is for list rows. A room retains its selected route.
+        let everyone = contacts(dataRoot: dataRoot, records: records, chats: chats, mergeIdentities: false)
         let contact = everyone.first { $0.id.caseInsensitiveCompare(agent) == .orderedSame }
-            ?? everyone.first { !$0.builtIn && oldName.map($0.name.caseInsensitiveCompare) == .orderedSame }
             ?? Contact(id: agent, name: records.first { $0.agent == agent }?.name ?? agent, builtIn: builtIns.contains(agent), kind: nil)
-        let record = latest(contact, records: records, contacts: everyone, label: label)
+        let record = try? AgentWorkspaceConversationReader(dataRoot: dataRoot).find(scopeSessionID: scope, agent: agent, label: label)
         let theirs = chats.filter { $0.who == contact.id || $0.who == contact.name.lowercased() }
         let bare = Contact(id: contact.id, name: contact.name, builtIn: contact.builtIn, kind: nil)
-        let state = state(bare, record: record, chat: theirs.first { $0.id != scope }, answered: world.answered, now: now).text
+        let health = world.health[record?.agent ?? contact.id] ?? world.health[contact.id]
+        let state = state(bare, record: record, chat: theirs.first { $0.id != scope }, answered: world.answered, now: now, health: health).text
         let slug = withNames(dataRoot) { $0.slug(id: contact.id, name: contact.name) }
 
-        var talk: [String] = []
-        if let chat = theirs.first(where: { $0.id != scope }), chat.at > (record?.updatedAt ?? .distantPast) {
+        let owner = contact.builtIn ? contact.id : String(contact.id.dropFirst(5))
+        let mainThread = (label ?? record?.label ?? "Main").caseInsensitiveCompare("Main") == .orderedSame
+        let thread = mainThread ? ContactThread.lines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536) : []
+        if thread.contains(where: { !$0.mine }) { AgentWorkspacePorts.current.tools.markConsumed(peer: contact.id) }
+        var talk = thread.suffix(6).map {
+            line($0.at, ($0.byPerson ? person : $0.mine ? "me" : slug) + ($0.door.map { " · " + $0 } ?? ""), $0.text, now: now)
+        }
+        if mainThread, talk.isEmpty, let chat = theirs.first(where: { $0.id != scope }), chat.at > (record?.updatedAt ?? .distantPast) {
             // Its newest bridge chat other than the one she is in: that one is
             // already in front of her, so quoting it back only sent her on to
             // open the chat before it (chat.N) for what was actually going on.
             talk = chatTail(chat.id, dataRoot: dataRoot).suffix(6).map { line($0.at, $0.mine ? "me" : slug, $0.text, now: now) }
         }
-        if talk.isEmpty, contact.kind == "routine" {
+        if mainThread, talk.isEmpty, contact.kind == "routine" {
             // Its answers come back as chat turns, not in the send record:
             // her asks from the record, its replies from the chat, by time.
             let asks = (record?.exchanges ?? []).compactMap { exchange in exchange.prompt.map { (at: Optional(exchange.sentAt), text: $0, who: exchange.byPerson == true ? person : "me") } }
@@ -166,7 +175,7 @@ extension HerScreen {
             if let prompt = exchange.prompt, !prompt.isEmpty { talk.append(line(exchange.sentAt, exchange.byPerson == true ? person : "me", prompt, now: now)) }
             if let reply = exchange.reply, !reply.isEmpty { talk.append(line(nil, slug, reply, now: now)) }
         }
-        if talk.isEmpty, exchanges.isEmpty, contact.builtIn { talk = laneTalk(contact.id, slug: slug, now: now) }
+        if mainThread, talk.isEmpty, exchanges.isEmpty, contact.builtIn { talk = laneTalk(contact.id, slug: slug, now: now) }
         if talk.isEmpty, exchanges.isEmpty, let record, let reply = replyText(unwrap(record.receipt)) {
             // An older record kept only the answer; say so rather than show a reply to nothing.
             talk.append(line(record.operationStartedAt, "me", "(my message isn't kept in this older record)", now: now, talk: false))
@@ -178,7 +187,7 @@ extension HerScreen {
         // grok read only "send unconfirmed 2d"; omp's two 403s read as "no reply").
         var outcome: [String] = []
         // A live hand-off saved before 09-25 reads as attention; it landed.
-        if let record, record.phase == "attention", (unwrap(record.receipt)["run_status"] ?? unwrap(record.receipt)["status"]) != .string("delivered_live") {
+        if let record, health?.resolves(record) != true, record.phase == "attention", (unwrap(record.receipt)["run_status"] ?? unwrap(record.receipt)["status"]) != .string("delivered_live") {
             let receipt = unwrap(record.receipt)
             let peer = contact.id.hasPrefix("peer:") ? (try? AgentWorkspacePeerReader(dataRoot: dataRoot).list())?.first { "peer:" + $0.id == contact.id } : nil
             let ago = age(now.timeIntervalSince(record.updatedAt))
@@ -191,7 +200,7 @@ extension HerScreen {
             }
             if peer?.canAnswerBack == false { outcome.append("Replies from \(contact.name) aren't connected: one comes only as an ordinary message, if it comes.") }
             outcome.append(AgentWorkspaceConversationProjection.unsettledAttention(record)
-                ? slug + ".say queues a new message behind it; it goes once that one settles or agent_cancel releases it."
+                ? slug + ".say queues a new message behind it; it goes once that one settles or app agent.cancel releases it."
                 : slug + ".say sends a new message in this same thread; the earlier one is not repeated.")
         }
 
@@ -204,7 +213,7 @@ extension HerScreen {
                 return pad("chat.\(book.number("chat", id: chat.id) { Set(chats.map(\.id)) })", 10)
                     + clip(chat.title, 50) + " · " + age(now.timeIntervalSince(chat.at))
             }
-        } + (theirs.count > listed.count ? ["+\(theirs.count - listed.count) more · action \"conversations\""] : [])
+        } + (theirs.count > listed.count ? ["+\(theirs.count - listed.count) more · item \"conversations\""] : [])
         var verbs = [(slug + ".say", "send a message (text)")]
         if listed.contains(where: { $0.id != scope }) { verbs.append(("chat.N", "open one of those chats")) }
         let kind = contact.builtIn ? "built-in agent" : contact.kind ?? "agent"
@@ -214,10 +223,16 @@ extension HerScreen {
 
     // MARK: Chat
 
-    /// One chat (chat.N): its last six lines in the person room's TALK
-    /// format and an honest count of the rest. The chat she is in is named,
+    /// One chat (chat.N): six lines from the owner's checked read in the
+    /// person room's TALK format. The chat she is in is named,
     /// never quoted back.
-    private static func chatRoom(_ id: String, title: String, dataRoot: URL, person: String, scope: String, issue: String?, now: Date) async -> String? {
+    private static func chatRoom(_ id: String, title: String, dataRoot: URL, person: String, scope: String, issue: String?, value: JSONValue?, now: Date) async -> String? {
+        if let issue {
+            return screen([clip(title, 40), "unavailable"], [section("READ", [clip(issue, 100)])],
+                          verbs: [("conversations", "every chat, both directions")])
+        }
+        guard case .object(let result)? = value, result["conversation_session_id"] == .string(id),
+              case .array(let messages)? = result["messages"] else { return nil }
         let world = await readWorld(dataRoot, now: now)
         let chat = world.chats.first { $0.id == id }
         let who = withNames(dataRoot) { book in
@@ -228,12 +243,12 @@ extension HerScreen {
         if id == scope {
             talk = ["this is the chat you are in"]
         } else {
-            let tail = chatTail(id, dataRoot: dataRoot)
-            let size = (try? FileManager.default.attributesOfItem(atPath: dataRoot.appendingPathComponent("chat/messages/\(id).jsonl").path)[.size] as? Int) ?? 0
-            let earlier = max(0, tail.count - 6)
-            talk = (earlier > 0 || size > 98_304 ? ["+\(earlier) earlier" + (size > 98_304 ? ", older not counted" : "")] : [])
-                + tail.suffix(6).map { line($0.at, $0.mine ? "me" : who, $0.text, now: now) }
-            if tail.isEmpty { talk = ["no messages yet"] }
+            talk = messages.suffix(6).compactMap { message in
+                guard case .object(let row) = message, case .string(let text)? = row["text"] else { return nil }
+                let at = if case .string(let timestamp)? = row["timestamp"] { date(timestamp) } else { Optional<Date>.none }
+                return line(at, row["role"] == .string("assistant") ? "me" : who, text, now: now)
+            }
+            if messages.isEmpty { talk = ["no messages yet"] }
         }
         let header = [clip(chat?.title ?? title, 40), who] + (chat.map { [age(now.timeIntervalSince($0.at))] } ?? [])
         return screen(header, [section("TALK", talk), issue.map { section("READ", [clip($0, 100)]) } ?? []],
@@ -257,7 +272,7 @@ extension HerScreen {
         return tail
     }
 
-    static func logTail(_ url: URL, bytes: UInt64) -> [(mine: Bool, text: String, at: Date?, run: String?)] {
+    static func logTail(_ url: URL, bytes: UInt64, humanOnly: Bool = false) -> [(mine: Bool, text: String, at: Date?, run: String?)] {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
@@ -269,6 +284,15 @@ extension HerScreen {
             guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
                   let role = row["role"] as? String, ["user", "assistant"].contains(role),
                   let content = row["content"] as? String else { return nil }
+            if humanOnly {
+                let metadata = row["metadata"] as? [String: Any] ?? [:]
+                let origin = metadata["origin"] as? [String: Any] ?? [:]
+                let envelope = metadata["envelope"] as? [String: Any] ?? [:]
+                let bridge = [origin["surface"], envelope["surface"], row["source"]].compactMap { $0 as? String }.contains { $0.hasSuffix("-bridge") }
+                    || origin["agent"] as? String != nil || envelope["agent"] as? String != nil
+                guard role == "user", metadata["mechanicalKind"] == nil, origin["authored"] as? String != "agent",
+                      !bridge || origin["authored"] as? String == "human" || metadata["byPerson"] as? Bool == true else { return nil }
+            }
             var said = content.split(separator: "\n", omittingEmptySubsequences: false)[...]
             while let first = said.first?.trimmingCharacters(in: .whitespaces),
                   first.isEmpty || (first.hasPrefix("[") && first.hasSuffix("]")) { said = said.dropFirst() }
@@ -345,7 +369,7 @@ extension HerScreen {
         if let summary = nonEmpty(item.summary) { about.append(clip(summary, 160)) }
         if let reason = nonEmpty(item.blockedReason) { about.append("blocked: " + clip(reason, 100)) }
         var notes = item.notes.suffix(3).map { line(date($0.ts), "", $0.text, now: now, talk: false) }
-        if item.notes.count > 3 { notes.insert("+\(item.notes.count - 3) earlier notes · workspace query \"\(name)\"", at: 0) }
+        if item.notes.count > 3 { notes.insert("+\(item.notes.count - 3) earlier notes · app {page:\"home\", item:\"\(name).more\"}", at: 0) }
         let children = state.children(of: handle).sorted { ($0.status.isTerminal ? 1 : 0, $1.updatedAt) < ($1.status.isTerminal ? 1 : 0, $0.updatedAt) }
         var parts = children.prefix(6).map { deskRow($0, person: person, now: now) }
         if children.count > 6 { parts.append("+\(children.count - 6) more parts") }
@@ -357,13 +381,17 @@ extension HerScreen {
     }
 
     private static func deskRoom(dataRoot: URL, person: String, now: Date) async -> String? {
-        let split = await readWorld(dataRoot, now: now).split
+        let world = await readWorld(dataRoot, now: now)
+        guard world.desk != nil else {
+            return screen(["DESK", "unavailable"], [["Desk could not be read. Item counts are unavailable."]], verbs: [])
+        }
+        let split = world.split
         func rows(_ items: [DeskItem], _ cap: Int) -> [String] {
             items.prefix(cap).map { deskRow($0, person: person, now: now) }
-                + (items.count > cap ? ["+\(items.count - cap) more · workspace query \"<words>\" finds one"] : [])
+                + (items.count > cap ? ["+\(items.count - cap) more · app {page:\"home\", find:\"<words>\"} finds one"] : [])
         }
-        let parked = split.parked.isEmpty ? [] : ["\(split.parked.count) · untouched \(split.quietDays ?? DeskParking.quietDays)d+ · workspace query \"<words>\" finds one"]
-        return screen(["DESK", "\(split.active.count) active", "\(split.parked.count) parked", "\(split.open) open of \(split.total)"]
+        let parked = split.parked.isEmpty ? [] : ["\(split.parked.count) · untouched \(split.quietDays ?? DeskParking.quietDays)d+ · app {page:\"home\", find:\"<words>\"} finds one"]
+        return screen(["DESK", "\(split.active.count) active", "\(split.parked.count) parked", "\(split.open) of \(split.total) top-level items open", "MY QUEUE separate"]
                 + (split.waiting.isEmpty ? [] : ["\(split.waiting.count) wait on \(person)"]),
             [section("WAITING", rows(split.waiting, 5)), section("ACTIVE", rows(split.active, 10)), section("PARKED", parked)],
             verbs: [("desk.N", "open an item"), ("desk.N.note", "add a note (text)"), ("desk.N.done", "mark one done"), ("desk.add", "add work (form)")])
@@ -417,7 +445,7 @@ extension HerScreen {
         let (cells, needs, _) = peopleRows(world, dataRoot: dataRoot, now: now, scope: scope, limit: .max)
         let width = min(20, (cells.map(\.name.count).max() ?? 0) + 2)
         return screen(["PEOPLE", "\(cells.count) contact\(cells.count == 1 ? "" : "s")"] + (needs.isEmpty ? [] : ["\(needs.count) ask for input"]),
-            [cells.isEmpty ? ["no one yet · action \"connections\" adds someone"] : cells.map { pad(clip($0.name, 30), width) + clip($0.state, 80) }],
+            [cells.isEmpty ? ["no one yet · item \"connections\" adds someone"] : cells.map { pad(clip($0.name, 30), width) + clip($0.state, 80) }],
             verbs: [("<name>", "open their conversation"), ("<name>.say", "send a message (text)"), ("conversations", "every chat, both directions")])
     }
 
@@ -475,7 +503,7 @@ extension HerScreen {
         }
         if page > 0 { named["conversations.previous"] = .open(.conversations(page: page - 1)) }
         if order.count > (page + 1) * 12 { named["conversations.more"] = .open(.conversations(page: page + 1)) }
-        HerNamed.shared.keep(dataRoot, named)
+        HerNamed.shared.keep(dataRoot, named, room: "conversations")
         let width = min(20, (rows.map(\.0.count).max() ?? 0) + 2)
         var verbs = [("<name>", "open the conversation"), ("<name>.say", "send a message (text)")]
         if order.count > (page + 1) * 12 { verbs.append(("conversations.more", "the next \(min(12, order.count - (page + 1) * 12)) older")) }
@@ -616,7 +644,8 @@ extension HerScreen {
     /// stable name, or the action id it was offered under), the place's own
     /// verbs, "Back: home." Nothing is read here that the owner didn't return.
     static func textRoom(_ room: String, place: AgentWorkspaceLocation, projection: AgentWorkspaceProjection,
-                         frame: JSONValue, dataRoot: URL, now: Date = Date()) -> String {
+                         frame: JSONValue, dataRoot: URL, scope: String = "", now: Date = Date()) -> String {
+        let projection = AgentWorkspaceReadiness.filter(projection)
         guard case .object(let shown) = frame else { return room.uppercased() + " · unavailable\nBack: home." }
         func text(_ value: JSONValue?) -> String? {
             switch value {
@@ -655,20 +684,18 @@ extension HerScreen {
         let content: [String: JSONValue] = if case .object(let row) = projection.content { row } else { [:] }
         func fieldsOf(_ item: AgentWorkspaceItem) -> [String: JSONValue] { if case .object(let row) = item.content { row } else { [:] } }
 
-        // Done items off (a completed reminder, a "✅" nag); near-identical
-        // titles in a row fold into one ("Codex reset ×4").
+        // Only owner completion state and matching owner identities can fold rows.
         var items: [(item: AgentWorkspaceItem, times: Int)] = []
-        func fold(_ title: String) -> String {
-            String(title.lowercased().unicodeScalars.filter { CharacterSet.letters.contains($0) || $0 == " " }.map(Character.init))
-                .split(separator: " ").joined(separator: " ")
-        }
         for item in projection.items.dropFirst(projection.page * 8).prefix(8) {
             let row = fieldsOf(item)
-            // A ✅ in a title means done only where the owner gives no state (a
-            // reminder says completed:false, so it stays and the count matches).
-            if row["completed"] == .bool(true) || (row["completed"] == nil && (item.title.contains("✅") || item.title.contains("✔"))) { continue }
-            // Two emails or notes alike are still two things to act on: never folded.
-            if let last = items.last, !commsRooms.contains(room), !fold(item.title).isEmpty, fold(last.item.title) == fold(item.title) { items[items.count - 1].times += 1 }
+            let showCompletedReminder = room == "reminders" && (content["includeCompleted"] == .bool(true) || content["reminder"] != nil)
+            if row["completed"] == .bool(true) && !showCompletedReminder { continue }
+            // Emails, notes and reminders alike still have distinct identities.
+            if let last = items.last, let first = item.actions.first, let prior = last.item.actions.first,
+               case .open(.record) = first.action, case .open(.record) = prior.action,
+               identity(first.action, label: first.label) == identity(prior.action, label: prior.label) {
+                items[items.count - 1].times += 1
+            }
             else { items.append((item, 1)) }
         }
         // Every row and verb gets a stable name; the action behind it is kept
@@ -681,17 +708,17 @@ extension HerScreen {
             return agent
         }, dataRoot: dataRoot, now: now)
         let lines: [(String, String)] = withNames(dataRoot) { book in
-            // Windows come and go: number them as shown (windows.1 is the top row).
-            if room == "windows" { book.numbers["item." + room] = [:]; book.next["item." + room] = projection.page * 8 + 1 }
             let present = Set(items.compactMap { $0.item.actions.first.map { identity($0.action, label: $0.label) } })
-            return items.map { entry in
+            return items.enumerated().map { offset, entry in
                 let item = entry.item
                 var name = "·"
                 // A name opens, like a window: a row whose first action changes
                 // something opens as a short page of its verbs instead (User).
                 let opens = item.actions.first.map { opening($0.action) } ?? true
                 if let first = item.actions.first {
-                    name = room + ".\(book.number("item." + room, id: identity(first.action, label: first.label)) { present })"
+                    let number = room == "windows" ? projection.page * 8 + offset + 1
+                        : book.number("item." + room, id: identity(first.action, label: first.label)) { present }
+                    name = room + ".\(number)"
                     if opens { names[name] = first.action }
                 }
                 // A row's own further verbs, not ones the whole room already offers.
@@ -718,14 +745,31 @@ extension HerScreen {
                 return (name, clip(item.title, 60) + (entry.times > 1 ? " ×\(entry.times)" : "") + (about.isEmpty ? "" : " · " + about) + more)
             }
         }
-        if !previewing { HerItemPages.shared.keep(dataRoot, pages) }
+        let cacheRoom = room == "windows" ? scope + "\u{0}" + room : room
+        if !previewing {
+            HerItemPages.shared.keep(dataRoot, pages, room: cacheRoom, scope: room == "windows" ? scope : nil)
+        }
         var taken: Set<String> = [], verbs: [(String, String)] = []
         if items.contains(where: { !$0.item.actions.isEmpty }) { verbs.append((room + ".N", "open one")) }
         if let rowVerb { verbs.append(rowVerb) }
         if room != "mail" || (!items.isEmpty && items.allSatisfy({
-            if case .string(let expectedID)? = fieldsOf($0.item)["expected_message_id"] { !expectedID.isEmpty } else { false }
-        })) { verbs += commsItemVerbs[room] ?? [] }
-        var buttons = projection.actions.filter { !chrome.contains($0.label) }
+            guard (fieldsOf($0.item)["scope"] ?? content["scope"] ?? .string("inbox")) == .string("inbox") else { return false }
+            if case .string(let expectedID)? = fieldsOf($0.item)["expected_message_id"] { return !expectedID.isEmpty } else { return false }
+        })) { verbs += (commsItemVerbs[room] ?? []).filter { AgentWorkspaceReadiness.allows(tool: $0.tool) }.map { ($0.name, $0.about) } }
+        if room == "mail", !items.isEmpty {
+            if AgentWorkspaceReadiness.allows(tool: "mail_read_batch") {
+                verbs.append(("mail.read-batch", "read 1–10 messages (append mail.N names)"))
+            }
+            if content["scope"] != .string("sent"), AgentWorkspaceReadiness.allows(tool: "mail_triage_batch") {
+                verbs += [("mail.mark-read-batch", "mark selected messages read (append mail.N names)"),
+                          ("mail.flag-batch", "flag selected messages (append mail.N names)"),
+                          ("mail.unflag-batch", "unflag selected messages (append mail.N names)"),
+                          ("mail.archive-batch", "archive selected messages (append mail.N names)")]
+            }
+        }
+        var buttons = projection.actions.filter {
+            !chrome.contains($0.label) || (room == "work" && ["Keep this workspace as…", "Saved workspaces"].contains($0.label))
+        }
         let source: AgentWorkspaceLocation = if case .page(let inner, _) = place { inner } else { place }
         // One "more": the room's own pages first, the owner's older ones after the last.
         if (projection.page + 1) * 8 < projection.items.count {
@@ -738,7 +782,7 @@ extension HerScreen {
             names[name] = button.action
             verbs.append((name, clip(button.label, 56) + (button.needsText ? " (text)" : "")))
         }
-        if !previewing { HerNamed.shared.keep(dataRoot, names) }
+        if !previewing { HerNamed.shared.keep(dataRoot, names, room: cacheRoom, scope: room == "windows" ? scope : nil) }
 
         let width = min(22, (lines.map(\.0.count).max() ?? 0) + 2)
         let count = projection.items.count
@@ -752,6 +796,9 @@ extension HerScreen {
         // price, said on every numbered list so it doesn't read as a bug.
         if room != "windows", lines.contains(where: { $0.0 != "·" }) { header.append(numbersNote) }
         var about = ["message", "detail", "about", "note", "error"].compactMap { text(content[$0]) }.prefix(2).map { clip($0, 110) }
+        if room == "mail", let coverage = text(content["search_coverage"]) {
+            about.append(coverage)
+        }
         // Not connected: its search/unread/status verbs cannot work, so none are offered (desk walk 3).
         if notConnected(content) { header = [room.uppercased(), "not connected"]; about = [notConnectedLine]; verbs = [] }
         return screen(header, [lines.isEmpty && about.isEmpty ? ["nothing here"] : lines.map { pad(clip($0.0, 24), width) + $0.1 },
@@ -790,7 +837,8 @@ extension HerScreen {
 
     /// A name from a text room back to its action: kept in memory, then (for
     /// a plain owner read) from names.json.
-    static func namedAction(_ name: String, dataRoot: URL) -> AgentWorkspaceAction? {
+    static func namedAction(_ name: String, dataRoot: URL, scope: String = "") -> AgentWorkspaceAction? {
+        if name.hasPrefix("windows.") { return HerNamed.shared.action(dataRoot, scope + "\u{0}" + name) }
         if let action = HerNamed.shared.action(dataRoot, name) { return action }
         guard let dot = name.lastIndex(of: "."), let n = Int(name[name.index(after: dot)...]),
               let place = itemPlace(String(name[..<dot]), n, dataRoot: dataRoot) else { return nil }
@@ -806,9 +854,12 @@ extension HerScreen {
     /// This is the early check; the app dispatcher refuses the self route
     /// again at execution (WorkspaceMacCall), whatever came to the front since.
     package static func ownAppRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
-        if ["app_page_read", "app_page_screenshot"].contains(tool) {
+        // The app door: a read of Chat or of the page on screen, and a script
+        // (which can read either), stay out of the workspace too.
+        if tool == "app" {
             let page: String = if case .string(let text)? = input["page"] { text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } else { "" }
-            return page.isEmpty || page == "current" || page.hasPrefix("chat") ? WorkspaceMacCall.refusal : nil
+            let script: Bool = if case .string(let text)? = input["script"] { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } else { false }
+            return script || page == "current" || page.hasPrefix("chat") ? WorkspaceMacCall.refusal : nil
         }
         guard ["screen", "go", "act"].contains(tool) else { return nil }
         let value = tool == "go" ? input["name"] ?? input["target"] : input["app"]
@@ -834,28 +885,70 @@ public enum WorkspaceMacCall {
     public static var active: Bool { AgentWorkspaceArrivals.insideWorkspaceDispatch }
 
     public static let refusal: JSONValue = .object(["ok": .bool(false), "status": .string("unavailable"), "error": .string("own_app"),
-        "detail": .string("That's my own app; the workspace does not read it or its chat. Name another app: mac.look <app>.")])
+        "detail": .string("That's my own app; home does not read it or its chat. Name another app: mac.look <app>.")])
 }
 
-/// Names a text room showed (`today.3`, `mail.find`) and the actions behind
-/// them, per data root, for the life of the app. Replaced room by room.
+/// Recent room bindings, replaced together and expired with their session.
+final class HerRoomCache<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rooms: [String: (at: Date, values: [String: Value])] = [:]
+
+    private func prune(_ now: Date) {
+        rooms = rooms.filter { now.timeIntervalSince($0.value.at) <= 1800 }
+        while rooms.count > 128, let oldest = rooms.min(by: { $0.value.at < $1.value.at }) {
+            rooms.removeValue(forKey: oldest.key)
+        }
+    }
+
+    func keep(_ root: URL, _ values: [String: Value], room: String? = nil, scope: String? = nil) {
+        lock.withLock {
+            let prefix = root.standardizedFileURL.path + "\u{0}"
+            let bound = Dictionary(uniqueKeysWithValues: values.map { name, value in
+                (scope.map { $0 + "\u{0}" + name } ?? name, value)
+            })
+            let groups = room.map { [$0: bound] } ?? Dictionary(grouping: bound.keys, by: { String($0.split(separator: ".").first ?? "") })
+                .mapValues { keys in bound.filter { keys.contains($0.key) } }
+            let now = Date()
+            for (name, entries) in groups { rooms[prefix + name] = (now, entries) }
+            prune(now)
+        }
+    }
+
+    func value(_ root: URL, _ name: String) -> Value? {
+        lock.withLock {
+            prune(Date())
+            let prefix = root.standardizedFileURL.path + "\u{0}"
+            return rooms.filter { $0.key.hasPrefix(prefix) && $0.value.values[name] != nil }
+                .max(by: { $0.value.at < $1.value.at })?.value.values[name]
+        }
+    }
+
+    func removeSession(_ key: String) {
+        lock.withLock { rooms = rooms.filter { !$0.key.hasPrefix(key + "\u{0}") } }
+    }
+}
+
+/// Names a text room showed (`today.3`, `mail.find`) and their actions.
 final class HerNamed: @unchecked Sendable {
     static let shared = HerNamed()
-    private let lock = NSLock()
-    private var byRoot: [String: [String: AgentWorkspaceAction]] = [:]
+    private let cache = HerRoomCache<AgentWorkspaceAction>()
+    private let drawn = HerRoomCache<Bool>()
 
-    func keep(_ root: URL, _ names: [String: AgentWorkspaceAction]) {
-        lock.withLock { byRoot[root.standardizedFileURL.path, default: [:]].merge(names) { _, new in new } }
+    func keep(_ root: URL, _ names: [String: AgentWorkspaceAction], room: String? = nil, scope: String? = nil) {
+        cache.keep(root, names, room: room, scope: scope)
     }
 
     func action(_ root: URL, _ name: String) -> AgentWorkspaceAction? {
-        lock.withLock { byRoot[root.standardizedFileURL.path]?[name] }
+        cache.value(root, name)
     }
 
-    /// True the first time a room is drawn unseen for its verbs this app run.
-    private var drawn: Set<String> = []
+    func removeSession(_ key: String) { cache.removeSession(key); drawn.removeSession(key) }
+
+    /// True when this room has no recent unseen draw.
     func firstDraw(_ root: URL, _ room: String) -> Bool {
-        lock.withLock { drawn.insert(root.standardizedFileURL.path + "\u{0}" + room).inserted }
+        if drawn.value(root, room) != nil { return false }
+        drawn.keep(root, [room: true])
+        return true
     }
 }
 

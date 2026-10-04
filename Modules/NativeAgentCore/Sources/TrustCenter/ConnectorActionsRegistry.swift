@@ -601,7 +601,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mobile.notify", connectorId: "mobile", connector: "mobile",
             name: "iPhone Push Notification",
-            description: "Send the user a real APNS push notification on the paired iPhone when attention is useful. Check readiness through /v1/mobile/push/status or tool_catalog connector_actions runtimeStatus; do not inspect raw APNS config files.",
+            description: "Send the user a real APNS push notification on the paired iPhone when attention is useful. Check readiness on app {page:\"pairing\"}; do not inspect raw APNS config files.",
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "notifications",
             statusEndpoint: "/v1/mobile/push/status",

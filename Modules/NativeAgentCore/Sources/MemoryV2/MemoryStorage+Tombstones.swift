@@ -64,6 +64,21 @@ extension MemoryStorage {
         }
     }
 
+    static func requireNotTombstoned(_ memory: StoredMemory, in db: Database) throws {
+        let exactMatch = try Int.fetchOne(
+            db, sql: "SELECT COUNT(*) FROM tombstones WHERE content_hash = ?",
+            arguments: [contentHash(memory.content)]
+        ) ?? 0 > 0
+        if exactMatch { throw MemoryStorageError.tombstoned(memory.id) }
+        if let embedding = memory.embedding,
+           try tombstoneMatch(
+               db: db, query: embedding, queryEpoch: memory.embeddingEpoch,
+               threshold: memoryTombstoneMatchThreshold
+           ) {
+            throw MemoryStorageError.tombstoned(memory.id)
+        }
+    }
+
     /// Semantic tombstone gate (wave1 T3): does this candidate embedding match
     /// any tombstoned claim at/above the threshold? Agent's canon: a deletion is
     /// the CLAIM — only true paraphrases block; contradictions score below the

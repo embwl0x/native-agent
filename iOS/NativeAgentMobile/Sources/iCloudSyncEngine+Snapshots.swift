@@ -16,15 +16,22 @@ import NativeAgentShared
 /// that was retained because iCloud is not ready from a usable model list.
 enum ProviderControlsRefreshOutcome: Equatable, Sendable {
     case refreshed
+    case partial
     case unavailable
     case superseded
+
+    static let filenames: Set<String> = ["providers.json", "trust_policy.json", "model_preferences.json"]
 
     var feedbackMessage: String? {
         switch self {
         case .refreshed:
-            nil
+            SnapshotHealthLog.damageSentence(for: Self.filenames)
+        case .partial:
+            SnapshotHealthLog.damageSentence(for: Self.filenames)
+                ?? "Couldn't fully refresh models. Some model settings are still downloading from iCloud. Try again in a moment."
         case .unavailable:
-            "Couldn't refresh models. Provider snapshots are still downloading from iCloud. Try again in a moment."
+            SnapshotHealthLog.damageSentence(for: Self.filenames)
+                ?? "Couldn't refresh models. Provider snapshots are still downloading from iCloud. Try again in a moment."
         case .superseded:
             "Couldn't refresh models because iCloud sync was reconfigured. Try again."
         }
@@ -66,8 +73,12 @@ enum SnapshotHealthLog {
 
     /// One sentence naming the views that could not update and why, or nil when
     /// every failure this pass is simply an absent or still-arriving file.
-    static func damageSentence() -> String? {
-        let damaged = damagedFilenames()
+    static func damageSentence(for filename: String? = nil) -> String? {
+        damageSentence(for: filename.map { Set([$0]) })
+    }
+
+    static func damageSentence(for filenames: Set<String>?) -> String? {
+        let damaged = damagedFilenames().filter { filenames?.contains($0) ?? true }
         guard !damaged.isEmpty else { return nil }
         let names = damaged.map(viewName(for:))
         let list = names.count == 1
@@ -79,11 +90,12 @@ enum SnapshotHealthLog {
 
     static func viewName(for filename: String) -> String {
         let known = [
-            "desk.json": "Desk", "scheduler.json": "Scheduler", "memories.json": "Memories", "inbox.json": "Inbox",
+            "desk.json": "Desk", "work_overview.json": "Work overview", "scheduler.json": "Scheduler", "memories.json": "Memories", "inbox.json": "Inbox",
             "approvals.json": "Approvals", "workshop_tasks.json": "Workshop",
             "providers.json": "Providers", "connectors.json": "Connectors",
             "health.json": "Health", "trust_policy.json": "Trust",
-            "chat_sessions.json": "Chats", "memory_proposals.json": "Memory proposals"
+            "chat_sessions.json": "Chats", "memory_proposals.json": "Memory proposals",
+            "organism_living_status.json": "Status"
         ]
         if let name = known[filename] { return name }
         return filename
@@ -101,6 +113,8 @@ enum AdvancedSnapshotRefreshOutcome: Equatable, Sendable {
 }
 
 struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
+    static let filenames: Set<String> = ["trust_policy.json", "personality.json", "connectors.json", "health.json"]
+
     enum Field: CaseIterable, Hashable, Sendable {
         case trustPolicy, personality, connectors, health
     }
@@ -121,11 +135,11 @@ struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
     var feedbackMessage: String? {
         switch state {
         case .refreshed:
-            nil
+            SnapshotHealthLog.damageSentence(for: Self.filenames)
         case .partial:
-            "Some Settings snapshots are still downloading from iCloud."
+            SnapshotHealthLog.damageSentence(for: Self.filenames) ?? "Some Settings snapshots are still downloading from iCloud."
         case .unavailable:
-            "Settings snapshots are still downloading from iCloud. Try again in a moment."
+            SnapshotHealthLog.damageSentence(for: Self.filenames) ?? "Settings snapshots are still downloading from iCloud. Try again in a moment."
         case .superseded:
             "Settings refresh was interrupted by an iCloud reconfiguration. Try again."
         }
@@ -140,11 +154,10 @@ extension iCloudSyncEngine {
     /// (health `.partial`) and arrives at a success branch. Assigning
     /// `syncError = nil` there hid that warning, and the targeted refreshes
     /// each did it on their own. Re-project the damage sentence instead, from
-    /// one place, so a still-damaged snapshot keeps its warning no matter which
-    /// refresh succeeded last.
-    func noteRefreshSucceeded() {
+    /// one place, limited to the requested files for targeted controls.
+    func noteRefreshSucceeded(files: Set<String>? = nil) {
         lastSyncAt = Date()
-        syncError = SnapshotHealthLog.damageSentence()
+        syncError = SnapshotHealthLog.damageSentence(for: files)
         PhoneRequestCoordinator.shared.syncDidSucceed()
     }
 
@@ -203,29 +216,60 @@ extension iCloudSyncEngine {
         }
     }
 
-    // PATCH-2026-06-06: cross-device-picker-cue — surfaceModels comes from the
-    // Mac's surfaces.json via iCloud snapshot. iOS has no local writer for
-    // these (the Mac picker is the only source of truth today), so every
-    // change here is by definition REMOTE. Diff against the previous in-memory
-    // value and toast on per-surface changes so the user notices when the Mac
-    // flips a model. We deliberately do NOT toast on the FIRST load (previous
-    // empty) — that's the cold-start hydration, not a remote change event.
+    // Phone selections return through the same Mac-owned snapshot as remote
+    // changes. A matching pending selection is an acknowledgement, not a toast.
     private func applyRemoteSurfaceModels(_ next: [String: SurfaceModelPref]) {
         let previous = surfaceModels
-        if !previous.isEmpty {
-            for (surface, newPref) in next {
-                guard let prev = previous[surface] else { continue }
-                if prev.model != newPref.model {
-                    iOSSystemToastCenter.shared.push(
-                        info: "Mac changed \(surface) model to \(newPref.model)"
-                    )
-                }
+        for (surface, newPref) in next {
+            let acknowledged = pendingPhoneSurfaceModels.filter { _, selection in
+                let pending = selection.preference
+                return selection.surface == surface && pending.model == newPref.model
+                    && (pending.providerId == nil || newPref.providerId == nil || pending.providerId == newPref.providerId)
+                    && (pending.reasoningEffort == nil || newPref.reasoningEffort == nil || pending.reasoningEffort == newPref.reasoningEffort)
+                    && (pending.serviceTier == nil || newPref.serviceTier == nil || pending.serviceTier == newPref.serviceTier)
+            }
+            if !acknowledged.isEmpty {
+                for id in acknowledged.keys { pendingPhoneSurfaceModels.removeValue(forKey: id) }
+                continue
+            }
+            guard let prev = previous[surface], prev.model != newPref.model else { continue }
+            let changeMessage = switch MobileProviderSurfaceLabelPresentation.presentation(for: surface) {
+            case .named(let surfaceName): "Mac changed the model for \(surfaceName)"
+            default: "Mac changed a model"
+            }
+            let modelName = providers
+                .filter { newPref.providerId == nil || $0.provider_id == newPref.providerId }
+                .flatMap(\.models).first { $0.id == newPref.model }?
+                .name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let modelName, !modelName.isEmpty, modelName != newPref.model {
+                iOSSystemToastCenter.shared.push(info: "\(changeMessage) to \(modelName).")
+            } else {
+                iOSSystemToastCenter.shared.push(info: "\(changeMessage).")
             }
         }
         surfaceModels = next
     }
 
     // MARK: - Snapshot refresh
+
+    private func finishSnapshotRefresh(lifecycle: UInt64) {
+        guard lifecycle == lifecycleGeneration else { return }
+        refreshInFlight = false
+        guard refreshQueued else { return }
+        let full = fullRefreshQueued
+        let recordDelivery = transportDeliveryQueued
+        refreshQueued = false
+        fullRefreshQueued = false
+        transportDeliveryQueued = false
+        Task { @MainActor in
+            guard lifecycle == self.lifecycleGeneration else { return }
+            if full {
+                await self.refreshSnapshots(recordTransportDelivery: recordDelivery)
+            } else {
+                await self.refreshLightweightSnapshots()
+            }
+        }
+    }
 
     /// 2026-05-09: was synchronously reading 11 JSON files on @MainActor — when
     /// any of them needed an iCloud Drive download, the read blocked the UI
@@ -240,14 +284,15 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         if refreshInFlight {
             refreshQueued = true
+            fullRefreshQueued = true
+            transportDeliveryQueued = transportDeliveryQueued || recordTransportDelivery
             return false
         }
         snapshotRefreshGeneration &+= 1
-        // 2026-07-21 audit fix: a full/lightweight refresh WRITES inboxItems,
-        // so it must also invalidate any in-flight targeted refresh —
-        // otherwise a targeted read that STARTED before still passes its
-        // targetedRefreshGeneration guard afterward and clobbers the fresher
-        // full-refresh data with its older read.
+        approvalsRefreshGeneration &+= 1
+        deskRefreshGeneration &+= 1
+        // Every writer of Activity, approvals, transcripts and sessions shares its lane's
+        // generation, so a later targeted read also supersedes these fields.
         targetedRefreshGeneration &+= 1
         // refreshSnapshots() also writes chatTranscripts — invalidate the
         // transcripts lane's in-flight reads too.
@@ -258,51 +303,63 @@ extension iCloudSyncEngine {
         // restores an older list over the fresher one written here.
         chatSessionListRefreshGeneration &+= 1
         let generation = snapshotRefreshGeneration
+        let activityGeneration = targetedRefreshGeneration
+        let deskGeneration = deskRefreshGeneration
+        let approvalsGeneration = approvalsRefreshGeneration
+        let personalityPairing = pairingStore?.iCloudPairingSecret
+        let transcriptsGeneration = chatTranscriptsRefreshGeneration
+        let sessionsGeneration = chatSessionListRefreshGeneration
         refreshInFlight = true
-        defer {
-            if lifecycle == lifecycleGeneration {
-                refreshInFlight = false
-            }
-            if lifecycle == lifecycleGeneration, refreshQueued {
-                refreshQueued = false
-                Task { @MainActor in
-                    await self.refreshSnapshots()
-                }
-            }
-        }
+        defer { finishSnapshotRefresh(lifecycle: lifecycle) }
         let schedulerLoaded = await refreshSchedulerSnapshot()
         let bundle = await Self.loadAllSnapshots(snapshotDir: snapshotDir)
+        let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
+        await MacIntegrationPermissionsSync.shared.refreshProjection()
         // Resumption of an @MainActor async func is back on the main actor.
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
-        if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
-        if let v = bundle.deskItems { deskItems = v }
-        if let v = bundle.deskBounds { deskBounds = v }
-        if let v = bundle.deskReadingCopies {
-            deskReadingCopies = Dictionary(v.map { ($0.handle, $0) }, uniquingKeysWith: { _, newer in newer })
+        let transcriptsCurrent = transcriptsGeneration == chatTranscriptsRefreshGeneration
+        let sessionsCurrent = sessionsGeneration == chatSessionListRefreshGeneration
+        if let workActivity { PhoneTurnActivity.shared.receive(workActivity) }
+        if activityGeneration == targetedRefreshGeneration {
+            if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
+            if let v = bundle.memories { memories = v }
+            if let v = bundle.memoryProposals {
+                memoryProposalsSnapshotLoaded = true
+                memoryProposals = v.filter(\.isPending)
+            }
+            if let v = bundle.trainingProposals { trainingProposals = v }
+            if let v = bundle.promotionCandidates { promotionCandidates = v }
+            if bundle.trainingProposals != nil, bundle.promotionCandidates != nil {
+                selfImprovementSnapshotPublishedAt = Date()
+            }
+            if let v = bundle.inboxItems {
+                inboxSnapshotLoaded = true
+                inboxItems = v
+            }
+        }
+        if deskGeneration == deskRefreshGeneration {
+            if let v = bundle.deskItems { deskItems = v }
+            applyWorkOverview(bundle.workOverview)
+            if let v = bundle.deskBounds { deskBounds = v }
+            if let v = bundle.deskReadingCopies {
+                deskReadingCopies = Dictionary(v.map { ($0.handle, $0) }, uniquingKeysWith: { _, newer in newer })
+            }
         }
         if let v = bundle.skills { skills = v }
-        if let v = bundle.memories { memories = v }
-        if let v = bundle.memoryProposals {
-            memoryProposalsSnapshotLoaded = true
-            memoryProposals = v.filter(\.isPending)
-        }
-        if let v = bundle.trainingProposals { trainingProposals = v }
-        if let v = bundle.promotionCandidates { promotionCandidates = v }
-        if bundle.trainingProposals != nil, bundle.promotionCandidates != nil {
-            selfImprovementSnapshotPublishedAt = Date()
-        }
         if let v = bundle.trustPolicy { trustPolicy = v }
-        if let v = bundle.personality { personality = v }
+        if let v = bundle.personality { applyPersonality(v, pairing: personalityPairing) }
         if let v = bundle.health { health = v }
         // This status has an explicit ABSENT presentation. Retaining a prior
         // value when its file disappears would turn a missing projection into
         // a false current posture.
         organismLivingStatus = bundle.organismLivingStatus
-        if let v = bundle.sessions { sessions = v }
-        if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
-        if let v = bundle.chatAnchor { chatAnchor = v }
-        if let v = bundle.chatTranscripts { chatTranscripts = Self.transcriptMap(v) }
+        if sessionsCurrent {
+            if let v = bundle.sessions { sessions = v }
+            if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
+            if let v = bundle.chatAnchor { chatAnchor = v }
+        }
+        if transcriptsCurrent, let v = bundle.chatTranscripts { chatTranscripts = Self.transcriptMap(v) }
         if let v = bundle.connectors { connectors = v }
         if let v = bundle.providers { providers = v }
         if let v = bundle.providerSignIns { providerSignIns = v }
@@ -310,10 +367,9 @@ extension iCloudSyncEngine {
         // snapshot (Mac wiped all surface picks) should still propagate so
         // the in-memory map matches the source of truth.
         if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
-        if let v = bundle.approvals { approvalsSnapshotLoaded = true; approvals = v }
-        if let v = bundle.inboxItems {
-            inboxSnapshotLoaded = true
-            inboxItems = v
+        if approvalsGeneration == approvalsRefreshGeneration, let v = bundle.approvals {
+            approvalsSnapshotLoaded = true
+            approvals = v
         }
         if let v = bundle.turnSummaries { turnSummaries = v }
         await refreshSnapshotStaleness()
@@ -321,15 +377,35 @@ extension iCloudSyncEngine {
               lifecycle == lifecycleGeneration else { return false }
         // Scheduler is an independent, optional projection on older Macs.
         // Its failure stays on the Scheduler page, not on unrelated groups.
-        if recordTransportDelivery, schedulerLoaded {
-            noteTransportDelivery(groups: [.scheduler])
+        if recordTransportDelivery {
+            // This pass never reads all of Core, Catalog or Advanced. Only
+            // groups whose required files landed can renew a delivery clock.
+            var delivered: Set<NAMobileSnapshotGroup> = []
+            if schedulerLoaded { delivered.insert(.scheduler) }
+            if workActivity != nil { delivered.insert(.work) }
+            if transcriptsGeneration == chatTranscriptsRefreshGeneration, bundle.chatTranscripts != nil { delivered.insert(.chat) }
+            if deskGeneration == deskRefreshGeneration,
+               bundle.deskItems != nil, bundle.deskBounds != nil, bundle.workOverview != nil { delivered.insert(.desk) }
+            if activityGeneration == targetedRefreshGeneration,
+               bundle.workshopTasks != nil, bundle.memories != nil, bundle.memoryProposals != nil,
+               bundle.trainingProposals != nil, bundle.promotionCandidates != nil, bundle.inboxItems != nil {
+                delivered.insert(.activity)
+            }
+            let stale = Set(staleSnapshotGroups.keys)
+            let damaged = Set(SnapshotHealthLog.damagedFilenames())
+            noteTransportDelivery(groups: delivered.filter { group in
+                !group.filenames.contains {
+                    damaged.contains($0) || stale.contains(URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent)
+                }
+            })
         }
         if bundle.loadedAllSnapshots {
-            if recordTransportDelivery {
-                noteTransportDelivery(groups: Set(NAMobileSnapshotGroup.allCases).subtracting([.scheduler]))
-            }
             noteRefreshSucceeded()
-            return true
+            return activityGeneration == targetedRefreshGeneration
+                && deskGeneration == deskRefreshGeneration
+                && approvalsGeneration == approvalsRefreshGeneration
+                && transcriptsGeneration == chatTranscriptsRefreshGeneration
+                && sessionsGeneration == chatSessionListRefreshGeneration
         } else if bundle.loadedAnySnapshot {
             // Damaged bytes are named; only genuinely absent ones are called
             // "downloading" (2026-09-13, first-failure pass).
@@ -355,43 +431,44 @@ extension iCloudSyncEngine {
             return false
         }
         snapshotRefreshGeneration &+= 1
-        // 2026-07-21 audit fix: see refreshSnapshots() — full-refresh writes
-        // must invalidate in-flight targeted refreshes.
-        targetedRefreshGeneration &+= 1
+        approvalsRefreshGeneration &+= 1
         // 2026-09-06: this pass writes sessions/pins/anchor too (see
         // refreshSnapshots()).
         chatSessionListRefreshGeneration &+= 1
         let generation = snapshotRefreshGeneration
+        let approvalsGeneration = approvalsRefreshGeneration
+        let personalityPairing = pairingStore?.iCloudPairingSecret
+        let sessionsGeneration = chatSessionListRefreshGeneration
         refreshInFlight = true
-        defer {
-            if lifecycle == lifecycleGeneration {
-                refreshInFlight = false
-            }
-            if lifecycle == lifecycleGeneration, refreshQueued {
-                refreshQueued = false
-                Task { @MainActor in
-                    await self.refreshLightweightSnapshots()
-                }
-            }
-        }
+        defer { finishSnapshotRefresh(lifecycle: lifecycle) }
+        await settleUnobservedActionResponses()
         let bundle = await Self.loadLightweightSnapshots(snapshotDir: snapshotDir)
+        let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
+        await MacIntegrationPermissionsSync.shared.refreshProjection()
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         if let v = bundle.trustPolicy { trustPolicy = v }
-        if let v = bundle.personality { personality = v }
+        if let workActivity { PhoneTurnActivity.shared.receive(workActivity) }
+        if let v = bundle.personality { applyPersonality(v, pairing: personalityPairing) }
         if let v = bundle.health { health = v }
         organismLivingStatus = bundle.organismLivingStatus
-        if let v = bundle.sessions { sessions = v }
-        if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
-        if let v = bundle.chatAnchor { chatAnchor = v }
+        if sessionsGeneration == chatSessionListRefreshGeneration {
+            if let v = bundle.sessions { sessions = v }
+            if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
+            if let v = bundle.chatAnchor { chatAnchor = v }
+        }
         if let v = bundle.connectors { connectors = v }
         if let v = bundle.providers { providers = v }
         if let v = bundle.providerSignIns { providerSignIns = v }
         if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
-        if let v = bundle.approvals { approvalsSnapshotLoaded = true; approvals = v }
+        if approvalsGeneration == approvalsRefreshGeneration, let v = bundle.approvals {
+            approvalsSnapshotLoaded = true
+            approvals = v
+        }
         if bundle.loadedAllSnapshots {
             noteRefreshSucceeded()
-            return true
+            return sessionsGeneration == chatSessionListRefreshGeneration
+                && approvalsGeneration == approvalsRefreshGeneration
         } else if bundle.loadedAnySnapshot {
             syncError = SnapshotHealthLog.damageSentence()
                 ?? "Some lightweight iCloud snapshots are still downloading."
@@ -434,8 +511,11 @@ extension iCloudSyncEngine {
     func refreshApprovalsSnapshot() async {
         guard let snapshotDir else { return }
         let lifecycle = lifecycleGeneration
+        approvalsRefreshGeneration &+= 1
+        let generation = approvalsRefreshGeneration
         if let latest: [ApprovalRequest] = await Self.loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir) {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard generation == approvalsRefreshGeneration,
+                  lifecycle == lifecycleGeneration else { return }
             approvalsSnapshotLoaded = true
             approvals = latest
             noteRefreshSucceeded()
@@ -455,7 +535,6 @@ extension iCloudSyncEngine {
         guard generation == targetedRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
-        if let v = bundle.deskItems { deskItems = v }
         if let v = bundle.memories { memories = v }
         if let v = bundle.inboxItems {
             inboxSnapshotLoaded = true
@@ -473,13 +552,22 @@ extension iCloudSyncEngine {
         if bundle.loadedAllSnapshots {
             noteRefreshSucceeded()
             return true
-        } else if bundle.loadedAnySnapshot {
-            syncError = "Some Activity snapshots are still downloading."
+        } else {
+            syncError = SnapshotHealthLog.damageSentence() ?? "Some Activity snapshots are still downloading."
         }
         return false
     }
 
     @discardableResult
+    func refreshWorkActivitySnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
+        let lifecycle = lifecycleGeneration
+        guard let snapshot: MobileWorkActivitySnapshot = await Self.loadSnapshotObjectOnly(
+            named: "work_activity.json", in: snapshotDir), lifecycle == lifecycleGeneration else { return false }
+        PhoneTurnActivity.shared.receive(snapshot)
+        return true
+    }
+
     func refreshCatalogSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
@@ -514,9 +602,9 @@ extension iCloudSyncEngine {
         if memoryRows != nil && proposalRows != nil {
             noteRefreshSucceeded()
         } else if memoryRows != nil || proposalRows != nil {
-            syncError = "Some Memory snapshots are still downloading from iCloud."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Some Memory snapshots are still downloading from iCloud."
         } else {
-            syncError = "Memory snapshots are still downloading from iCloud. Try again in a moment."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Memory snapshots are still downloading from iCloud. Try again in a moment."
         }
     }
 
@@ -530,7 +618,7 @@ extension iCloudSyncEngine {
             noteRefreshSucceeded()
         } else {
             guard lifecycle == lifecycleGeneration else { return }
-            syncError = "Workshop snapshot is still downloading from iCloud. Try again in a moment."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Workshop snapshot is still downloading from iCloud. Try again in a moment."
         }
     }
 
@@ -538,6 +626,9 @@ extension iCloudSyncEngine {
     func refreshDeskSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
+        deskRefreshGeneration &+= 1
+        let generation = deskRefreshGeneration
+        async let latestOverview: WorkOverview? = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
         async let latestBounds: MobileDeskProjectionReport? = Self.loadSnapshotObjectOnly(
             named: "desk_bounds.json",
             in: snapshotDir
@@ -549,8 +640,11 @@ extension iCloudSyncEngine {
         if let latest: [MobileDeskItem] = await Self.loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir) {
             let bounds = await latestBounds
             let readingCopies = await latestReadingCopies
-            guard lifecycle == lifecycleGeneration else { return false }
+            let overview = await latestOverview
+            guard generation == deskRefreshGeneration,
+                  lifecycle == lifecycleGeneration else { return false }
             deskItems = latest
+            applyWorkOverview(overview)
             if let bounds { deskBounds = bounds }
             // Absent (an older Mac) is not the same as empty: only a delivered
             // file replaces what the phone already carries.
@@ -563,10 +657,22 @@ extension iCloudSyncEngine {
             noteRefreshSucceeded()
             return true
         } else {
-            guard lifecycle == lifecycleGeneration else { return false }
-            syncError = "Desk is still syncing from the Mac. Try again in a moment."
+            let overview = await latestOverview
+            guard generation == deskRefreshGeneration,
+                  lifecycle == lifecycleGeneration else { return false }
+            applyWorkOverview(overview)
+            syncError = SnapshotHealthLog.damageSentence() ?? "Desk is still syncing from the Mac. Try again in a moment."
             return false
         }
+    }
+
+    /// A missing or unreadable file is a failed read, not an empty overview:
+    /// it never replaces a newer copy another group already delivered.
+    private func applyWorkOverview(_ overview: WorkOverview?) {
+        guard let overview, let incomingDate = DeskActivityState.movementDate(overview.capturedAt) else { return }
+        if let currentDate = DeskActivityState.movementDate(workOverview?.capturedAt),
+           incomingDate <= currentDate { return }
+        workOverview = overview
     }
 
     @discardableResult
@@ -575,12 +681,14 @@ extension iCloudSyncEngine {
             return SettingsSnapshotRefreshOutcome(availableFields: [])
         }
         let lifecycle = lifecycleGeneration
+        let personalityPairing = pairingStore?.iCloudPairingSecret
         async let latestTrust: TrustPolicy? = Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
         async let latestPersonality: PersonalityProfile? = Self.loadSnapshotObjectOnly(named: "personality.json", in: snapshotDir)
         async let latestConnectors: [ConnectorRecord]? = Self.loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let latestHealth: RuntimeHealth? = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
         let (trustRow, personalityRow, connectorRows, healthRow) = await (latestTrust, latestPersonality, latestConnectors, latestHealth)
-        guard lifecycle == lifecycleGeneration else {
+        guard lifecycle == lifecycleGeneration,
+              personalityPairing == pairingStore?.iCloudPairingSecret else {
             return SettingsSnapshotRefreshOutcome(availableFields: [], wasSuperseded: true)
         }
         var availableFields: Set<SettingsSnapshotRefreshOutcome.Field> = []
@@ -590,11 +698,11 @@ extension iCloudSyncEngine {
         if healthRow != nil { availableFields.insert(.health) }
         let outcome = SettingsSnapshotRefreshOutcome(availableFields: availableFields)
         if let trustRow { trustPolicy = trustRow }
-        if let personalityRow { personality = personalityRow }
+        if let personalityRow { applyPersonality(personalityRow, pairing: personalityPairing) }
         if let connectorRows { connectors = connectorRows }
         if let healthRow { health = healthRow }
         if outcome.state == .refreshed {
-            noteRefreshSucceeded()
+            noteRefreshSucceeded(files: SettingsSnapshotRefreshOutcome.filenames)
         } else {
             syncError = outcome.feedbackMessage
         }
@@ -622,10 +730,10 @@ extension iCloudSyncEngine {
             noteRefreshSucceeded()
             return .refreshed
         } else if latest != nil || organism != nil {
-            syncError = "Some Health snapshots are still downloading from iCloud."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Some Health snapshots are still downloading from iCloud."
             return .partial
         } else {
-            syncError = "Health snapshot is still downloading from iCloud. Try again in a moment."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Health snapshot is still downloading from iCloud. Try again in a moment."
             return .unavailable
         }
     }
@@ -642,9 +750,9 @@ extension iCloudSyncEngine {
             runs = latest
             noteRefreshSucceeded()
             return .refreshed
-        } else if runs.isEmpty {
+        } else {
             guard lifecycle == lifecycleGeneration else { return .superseded }
-            syncError = "Runs snapshot is still downloading from iCloud. Try again in a moment."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Runs snapshot is still downloading from iCloud. Try again in a moment."
         }
         return .unavailable
     }
@@ -660,7 +768,7 @@ extension iCloudSyncEngine {
             return true
         } else {
             guard lifecycle == lifecycleGeneration else { return false }
-            syncError = "Trust snapshot is still downloading from iCloud. Try again in a moment."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Trust snapshot is still downloading from iCloud. Try again in a moment."
             return false
         }
     }
@@ -680,13 +788,13 @@ extension iCloudSyncEngine {
         // we don't gate on !isEmpty.
         if let surfaceModelRows { applyRemoteSurfaceModels(surfaceModelRows) }
         if providerRows != nil && trustRow != nil && surfaceModelRows != nil {
-            noteRefreshSucceeded()
-        } else if providerRows != nil || trustRow != nil || surfaceModelRows != nil {
-            syncError = "Some Provider snapshots are still downloading from iCloud."
-        } else {
-            syncError = "Provider snapshots are still downloading from iCloud. Try again in a moment."
+            noteRefreshSucceeded(files: ProviderControlsRefreshOutcome.filenames)
+            return .refreshed
         }
-        return providerRows == nil ? .unavailable : .refreshed
+        let outcome: ProviderControlsRefreshOutcome = providerRows != nil || trustRow != nil || surfaceModelRows != nil
+            ? .partial : .unavailable
+        syncError = outcome.feedbackMessage
+        return outcome
     }
 
     func refreshChatSessionListSnapshot() async {
@@ -716,9 +824,9 @@ extension iCloudSyncEngine {
         if sessionRows != nil && pinnedRows != nil {
             noteRefreshSucceeded()
         } else if sessionRows != nil || pinnedRows != nil {
-            syncError = "Some Chat session snapshots are still downloading from iCloud."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Some Chat session snapshots are still downloading from iCloud."
         } else {
-            syncError = "Chat session snapshots are still downloading from iCloud. Try again in a moment."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Chat session snapshots are still downloading from iCloud. Try again in a moment."
         }
     }
 
@@ -768,7 +876,7 @@ extension iCloudSyncEngine {
         let generation = targetedRefreshGeneration
         if let latest: [InboxItemRecord] = await Self.loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir) {
             guard generation == targetedRefreshGeneration,
-                  lifecycle == lifecycleGeneration else { return true }
+                  lifecycle == lifecycleGeneration else { return false }
             inboxSnapshotLoaded = true
             inboxItems = latest
             noteRefreshSucceeded()
@@ -776,7 +884,7 @@ extension iCloudSyncEngine {
         } else {
             guard generation == targetedRefreshGeneration,
                   lifecycle == lifecycleGeneration else { return false }
-            syncError = "Inbox snapshot is still downloading from iCloud. Try again in a moment."
+            syncError = SnapshotHealthLog.damageSentence() ?? "Inbox snapshot is still downloading from iCloud. Try again in a moment."
             return false
         }
     }
@@ -784,6 +892,7 @@ extension iCloudSyncEngine {
     private struct SnapshotBundle: Sendable {
         var workshopTasks: [WorkshopTaskRecord]?
         var deskItems: [MobileDeskItem]?
+        var workOverview: WorkOverview?
         // Additive: deliberately absent from the completeness checks below, so
         // an older Mac that publishes no report cannot pin a "downloading" banner.
         var deskBounds: MobileDeskProjectionReport?
@@ -849,7 +958,6 @@ extension iCloudSyncEngine {
 
     private struct ActivitySnapshotBundle: Sendable {
         var workshopTasks: [WorkshopTaskRecord]?
-        var deskItems: [MobileDeskItem]?
         var memories: [MemoryRecord]?
         var inboxItems: [InboxItemRecord]?
         var memoryProposals: [MemoryProposalRecord]?
@@ -858,7 +966,6 @@ extension iCloudSyncEngine {
 
         var loadedAnySnapshot: Bool {
             workshopTasks != nil ||
-                deskItems != nil ||
                 memories != nil ||
                 inboxItems != nil ||
                 memoryProposals != nil ||
@@ -867,7 +974,7 @@ extension iCloudSyncEngine {
         }
 
         var loadedAllSnapshots: Bool {
-            workshopTasks != nil && deskItems != nil && memories != nil && inboxItems != nil
+            workshopTasks != nil && memories != nil && inboxItems != nil
                 && memoryProposals != nil && trainingProposals != nil
                 && promotionCandidates != nil
         }
@@ -912,6 +1019,7 @@ extension iCloudSyncEngine {
     private nonisolated static func loadAllSnapshots(snapshotDir: URL) async -> SnapshotBundle {
         async let workshopTasks: [WorkshopTaskRecord]? = loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
         async let deskItems: [MobileDeskItem]? = loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir)
+        async let workOverview: WorkOverview? = loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
         async let deskBounds: MobileDeskProjectionReport? = loadSnapshotObjectOnly(named: "desk_bounds.json", in: snapshotDir)
         async let deskReadingCopies: [MobileDeskItemReadingCopy]? = loadSnapshotArrayOnly(named: "desk_details.json", in: snapshotDir)
         async let skills: [SkillRecord]? = loadSnapshotArrayOnly(named: "skills_snapshot.json", in: snapshotDir)
@@ -937,6 +1045,7 @@ extension iCloudSyncEngine {
         return await SnapshotBundle(
             workshopTasks: workshopTasks,
             deskItems: deskItems,
+            workOverview: workOverview,
             deskBounds: deskBounds,
             deskReadingCopies: deskReadingCopies,
             skills: skills,
@@ -1014,7 +1123,6 @@ extension iCloudSyncEngine {
 
     private nonisolated static func loadActivitySnapshots(snapshotDir: URL) async -> ActivitySnapshotBundle {
         async let workshopTasks: [WorkshopTaskRecord]? = loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
-        async let deskItems: [MobileDeskItem]? = loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir)
         async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
         async let inboxItems: [InboxItemRecord]? = loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
         async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
@@ -1022,7 +1130,6 @@ extension iCloudSyncEngine {
         async let promotionCandidates: [PromotionCandidateSummary]? = loadSnapshotArrayOnly(named: "promotion_candidates.json", in: snapshotDir)
         return await ActivitySnapshotBundle(
             workshopTasks: workshopTasks,
-            deskItems: deskItems,
             memories: memories,
             inboxItems: inboxItems,
             memoryProposals: memoryProposals,
@@ -1076,7 +1183,8 @@ extension iCloudSyncEngine {
         }
         var out: [T] = []
         for item in raw {
-            if let itemData = try? JSONSerialization.data(withJSONObject: item),
+            if JSONSerialization.isValidJSONObject(item),
+               let itemData = try? JSONSerialization.data(withJSONObject: item),
                let one = try? decoder.decode(T.self, from: itemData) {
                 out.append(one)
             }

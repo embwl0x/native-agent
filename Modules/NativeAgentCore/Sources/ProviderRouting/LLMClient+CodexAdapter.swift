@@ -341,7 +341,7 @@ public final class CodexAdapter: LLMAdapter {
     }
 
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
-        let args = Self.arguments(model: model)
+        let args = arguments(model: model)
         let terminator = CodexTerminator()
         let invocation = CodexProcessInvocation(
             executable: codexBin,
@@ -475,7 +475,7 @@ public final class CodexAdapter: LLMAdapter {
         system: String?,
         model: String
     ) -> AsyncThrowingStream<String, Error> {
-        let args = Self.arguments(model: model)
+        let args = arguments(model: model)
         let terminator = CodexTerminator()
         let invocation = CodexProcessInvocation(
             executable: codexBin,
@@ -662,12 +662,22 @@ public final class CodexAdapter: LLMAdapter {
     /// `--color never` keeps ANSI escapes out of the streamed stdout. Verified
     /// against codex v0.153.2 (`codex exec --help`); its stdout carries only
     /// the agent's final message, all banners go to stderr.
-    private static func arguments(model: String) -> [String] {
+    private func arguments(model: String) -> [String] {
         var args: [String] = ["exec", "--color", "never", "--skip-git-repo-check"]
+        let cacheURL = CodexAccountModelCatalog.cacheCandidate(
+            environment: processEnvironmentOverride ?? ProcessInfo.processInfo.environment
+        )
         if let effort = OpenAIExecutionControls.reasoningEffort(
             model: model,
             requested: LLMCallContext.reasoningEffort,
-            transport: .codexCLI
+            transport: .codexCLI,
+            supportedEfforts: CodexAccountModelCatalog.load(
+                cacheURL: CodexAccountModelCatalog.matchingCacheCandidate(
+                    oauthAuthURL: cacheURL.deletingLastPathComponent().appendingPathComponent("auth.json"),
+                    fallbackCacheURL: cacheURL
+                ),
+                useDefaultCacheWhenNil: false
+            ).first { $0.id == model }?.supportedReasoningEfforts
         ) {
             args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(effort)\""])
         }

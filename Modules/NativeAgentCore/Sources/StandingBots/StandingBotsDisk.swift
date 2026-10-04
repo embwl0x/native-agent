@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import Darwin
 import PersistenceCore
 import TriggerScheduler
@@ -105,7 +106,8 @@ struct StandingBotsDisk: Sendable {
         case .interval(let seconds):
             let floor = validateCron ? BotRunLimits.minimumInterval : 60
             guard seconds.isFinite, seconds >= floor else {
-                throw StandingBotsError.invalidValue("The agent's bot cadence must be at least \(floor / 60) minutes.")
+                throw ToolFailureError("The agent's bot cadence must be at least \(floor / 60) minutes.",
+                    argumentPath: "$.cadence.interval.seconds", accepted: "A finite number of seconds at least \(floor).", effects: .none)
             }
         case .cron(let expression, let zone):
             guard !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -115,6 +117,7 @@ struct StandingBotsDisk: Sendable {
     }
 
     static func nextOccurrence(_ bot: BotDefinition, after date: Date,
+                               lastRunAt: Date? = nil,
                                minimumInterval: TimeInterval = BotRunLimits.minimumInterval) throws -> Date {
         switch bot.cadence {
         case .manual: return .distantFuture
@@ -124,8 +127,13 @@ struct StandingBotsDisk: Sendable {
                 "type": .string("cron"), "expression": .string(expression), "timezone": .string(zone)
             ])])
             do {
+                // Configuration time is not a run. Space cron occurrences only
+                // against a run that actually happened, including the floor itself.
+                let after = max(date.timeIntervalSince1970,
+                    lastRunAt.map { $0.addingTimeInterval(minimumInterval).timeIntervalSince1970.nextDown }
+                        ?? date.timeIntervalSince1970)
                 guard let epoch = try SchedulerJobRuntime.nextRunEpoch(for: value,
-                    afterEpoch: date.addingTimeInterval(minimumInterval).timeIntervalSince1970) else {
+                    afterEpoch: after) else {
                     throw StandingBotsError.invalidValue("cron has no next occurrence")
                 }
                 return Date(timeIntervalSince1970: epoch)

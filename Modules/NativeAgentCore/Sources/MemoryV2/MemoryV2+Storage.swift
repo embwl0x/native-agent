@@ -161,7 +161,9 @@ public actor MemoryStorage {
         }
         let boundedLimit = max(1, memoryLimit)
         let startupEvictions = try pool.write { db in
-            try Self.pruneMemoriesToBound(in: db, limit: boundedLimit)
+            let evicted = try Self.pruneMemoriesToBound(in: db, limit: boundedLimit)
+            try Self.pruneTerminalProposals(in: db)
+            return evicted
         }
         self.dbPool = pool
         self.memoryLimit = boundedLimit
@@ -194,7 +196,9 @@ public actor MemoryStorage {
         }
         let boundedLimit = max(1, memoryLimit)
         let startupEvictions = try pool.write { db in
-            try Self.pruneMemoriesToBound(in: db, limit: boundedLimit)
+            let evicted = try Self.pruneMemoriesToBound(in: db, limit: boundedLimit)
+            try Self.pruneTerminalProposals(in: db)
+            return evicted
         }
         self.dbPool = pool
         self.memoryLimit = boundedLimit
@@ -220,7 +224,12 @@ public actor MemoryStorage {
         let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memories") ?? 0
         let overflow = count - boundedLimit
         guard overflow > 0 else { return [] }
-        let rows = try Row.fetchAll(db, sql: "SELECT * FROM memories").map(Self.decodeMemory)
+        // Supersession is history, never capacity eviction. Refuse admission
+        // when retaining that history leaves too few disposable rows.
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT * FROM memories
+            WHERE json_extract(metadata_json, '$.superseded_by') IS NULL
+        """).map(Self.decodeMemory)
 
         let ordered = rows.sorted { lhs, rhs in
             let lhsRank = retentionEvictionRank(lhs)
@@ -236,6 +245,14 @@ public actor MemoryStorage {
         if evicted.count < overflow {
             let already = Set(evicted.map(\.id))
             evicted += ordered.filter { !already.contains($0.id) }.prefix(overflow - evicted.count)
+        }
+        guard evicted.count == overflow else { throw MemoryStorageError.capacityExceeded }
+        // Admission must not trade protected tissue for a lower-priority row.
+        if evicted.contains(where: { retentionEvictionRank($0) == 4 }),
+           rows.contains(where: {
+               preservingIDs.contains($0.id) && retentionEvictionRank($0) < 4
+           }) {
+            throw MemoryStorageError.capacityExceeded
         }
         guard !evicted.isEmpty else { return [] }
         let placeholders = Array(repeating: "?", count: evicted.count).joined(separator: ",")
@@ -334,9 +351,103 @@ public actor MemoryStorage {
 
     // MARK: - Memory CRUD
 
+    /// Duplicate matching and evidence accumulation share the insertion write
+    /// transaction, so simultaneous stores cannot lose counts or provenance.
+    public func admitMemory(
+        _ memory: StoredMemory, insertIfMissing: Bool, preserveID: Bool
+    ) async throws -> StoredMemory? {
+        let result = try await dbPool.write { db -> (StoredMemory?, [StoredMemory]) in
+            try Self.requireNotTombstoned(memory, in: db)
+            let incoming = MemoryRecord(stored: memory)
+            let scope = MemoryRecordDisclosurePolicy.classify(incoming)
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT * FROM memories WHERE status = 'active'
+                    AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                    AND (? = 0 OR id = ?)
+                ORDER BY rowid
+            """, arguments: [preserveID, memory.id]).map(Self.decodeMemory)
+            let key = MemoryConsolidator.normalizedContentKey(memory.content)
+            var duplicate = rows.sorted { $0.createdAt > $1.createdAt }.first {
+                scope != nil && MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0)) == scope
+                    && MemoryConsolidator.normalizedContentKey($0.content) == key
+            }
+            if duplicate == nil, MemoryRecallScoring.kind(of: memory.metadata) != "correction",
+               let vector = memory.embedding, let epoch = memory.embeddingEpoch, !epoch.isEmpty {
+                let activeEpoch = try Self.embeddingEpochState(in: db).activeEpoch
+                if activeEpoch == nil || activeEpoch == epoch {
+                    let nearest = rows.filter { $0.embeddingEpoch == epoch && $0.embedding != nil }
+                        .map { (row: $0, cosine: VectorMath.cosine(vector, $0.embedding)) }
+                        .max { $0.cosine < $1.cosine }
+                    if let nearest, nearest.cosine >= MemoryManagerLane.duplicateSimilarity,
+                       MemoryRecallScoring.kind(of: nearest.row.metadata) != "correction",
+                       scope != nil,
+                       MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: nearest.row)) == scope,
+                       MemorySemanticDuplicateGuard.sameQuantityAndNegation(nearest.row.content, memory.content),
+                       let created = MemoryRecallScoring.parseTimestamp(nearest.row.createdAt),
+                       Date().timeIntervalSince(created) < 24 * 3600 {
+                        duplicate = nearest.row
+                    }
+                }
+            }
+            if var row = duplicate {
+                if memory.embedding == nil {
+                    try Self.requireNotTombstoned(row, in: db)
+                }
+                var metadata: [String: JSONValue] = [:]
+                if case .object(let existing)? = row.metadata { metadata = existing }
+                var count: Int64 = 0
+                if case .int(let value)? = metadata["recall_count"] { count = value }
+                if case .double(let value)? = metadata["recall_count"] {
+                    guard let value = Int64(exactly: value.rounded(.towardZero)) else {
+                        throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count is outside Int64 range")
+                    }
+                    count = value
+                }
+                let (next, overflow) = count.addingReportingOverflow(1)
+                guard !overflow else {
+                    throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count overflow")
+                }
+                let patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
+                    existing: MemoryRecord(stored: row), newSource: memory.source, newMetadata: memory.metadata)
+                for (key, value) in patch {
+                    if key == "observed_at", case .string(let observed) = value {
+                        row.observedAt = observed
+                    } else {
+                        metadata[key] = value
+                    }
+                }
+                metadata["recall_count"] = .int(next)
+                row.metadata = .object(metadata)
+                row.updatedAt = Self.nowISO8601()
+                try Self.validateTemporalEvidence(row)
+                try db.execute(sql: """
+                    UPDATE memories SET metadata_json = ?, observed_at = ?, updated_at = ? WHERE id = ?
+                """, arguments: [Self.encodeMetadata(row.metadata), row.observedAt, row.updatedAt, row.id])
+                return (row, [])
+            }
+            guard insertIfMissing else { return (nil, []) }
+            try Self.validateTemporalEvidence(memory)
+            try Self.requireWritableEpoch(in: db, vector: memory.embedding, epoch: memory.embeddingEpoch)
+            try Self.executeMemoryInsert(memory, in: db)
+            let evicted = try Self.pruneMemoriesToBound(in: db, limit: memoryLimit, preservingIDs: [memory.id])
+            return (memory, evicted)
+        }
+        if let row = result.0 {
+            invalidateRecallCache()
+            pokeUserMDRegen(persona: row.personaId)
+            await pokeProjectionHooks(row)
+        }
+        await handleBoundEvictions(result.1, reason: "insert")
+        return result.0
+    }
+
     @discardableResult
-    public func insertMemory(_ memory: StoredMemory) async throws -> StoredMemory {
-        let evicted = try await dbPool.write { db -> [StoredMemory] in
+    public func insertMemory(
+        _ memory: StoredMemory,
+        superseding: [SupersedingAcceptance] = []
+    ) async throws -> StoredMemory {
+        let (demoted, evicted) = try await dbPool.write { db -> ([StoredMemory], [StoredMemory]) in
+            try Self.requireNotTombstoned(memory, in: db)
             try Self.validateTemporalEvidence(memory)
             try Self.requireWritableEpoch(
                 in: db,
@@ -344,15 +455,24 @@ public actor MemoryStorage {
                 epoch: memory.embeddingEpoch
             )
             try Self.executeMemoryInsert(memory, in: db)
-            return try Self.pruneMemoriesToBound(
+            let demoted = try superseding.map { try Self.demoteSuperseded($0, by: memory, in: db) }
+            let evicted = try Self.pruneMemoriesToBound(
                 in: db,
                 limit: memoryLimit,
                 preservingIDs: [memory.id]
             )
+            if !superseding.isEmpty, evicted.contains(where: { $0.id == memory.id }) {
+                throw MemoryStorageError.capacityExceeded
+            }
+            return (demoted, evicted)
         }
         invalidateRecallCache()
         pokeUserMDRegen(persona: memory.personaId)
         await pokeProjectionHooks(memory)
+        for predecessor in demoted {
+            pokeUserMDRegen(persona: predecessor.personaId)
+            await pokeProjectionHooks(predecessor)
+        }
         await handleBoundEvictions(evicted, reason: "insert")
         return memory
     }
@@ -413,6 +533,7 @@ public actor MemoryStorage {
                 guard existing.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     return (.skippedExisting, [])
                 }
+                try Self.validateTemporalEvidence(memory)
                 try Self.requireWritableEpoch(
                     in: db,
                     vector: memory.embedding,
@@ -420,14 +541,17 @@ public actor MemoryStorage {
                 )
                 try db.execute(sql: """
                     UPDATE memories SET
-                      content = ?, source = ?, confidence = ?, updated_at = ?,
-                      embedding = ?, embedding_epoch = ?, status = ?, metadata_json = ?
+                      content = ?, persona_id = ?, source = ?, confidence = ?, updated_at = ?,
+                      embedding = ?, embedding_epoch = ?, status = ?, lifecycle = ?,
+                      valid_from = ?, valid_to = ?, observed_at = ?, evidence_json = ?, metadata_json = ?
                     WHERE id = ?
                 """, arguments: [
-                    memory.content, memory.source, memory.confidence, memory.updatedAt,
+                    memory.content, memory.personaId, memory.source, memory.confidence, memory.updatedAt,
                     Self.encodeEmbedding(memory.embedding),
                     memory.embeddingEpoch,
                     memory.status,
+                    memory.lifecycle, memory.validFrom, memory.validTo, memory.observedAt,
+                    Self.encodeMetadata(memory.evidence),
                     Self.encodeMetadata(memory.metadata),
                     memory.id
                 ])
@@ -486,10 +610,21 @@ public actor MemoryStorage {
             if let merge = patch.metadataMerge, !merge.isEmpty {
                 var metadata: [String: JSONValue] = [:]
                 if case .object(let current)? = existing.metadata { metadata = current }
+                if merge["pinned"] == .bool(true), metadata["pinned"] != .bool(true) {
+                    let last = try Int64.fetchOne(db, sql: """
+                        SELECT MAX(CAST(json_extract(metadata_json, '$.pinned_order') AS INTEGER)) FROM memories
+                    """) ?? 0
+                    let (next, overflow) = last.addingReportingOverflow(1)
+                    guard !overflow else { throw MemoryStorageError.capacityExceeded }
+                    metadata["pinned_order"] = .int(next)
+                }
                 for (key, value) in merge { metadata[key] = value }
                 existing.metadata = .object(metadata)
             }
             existing.updatedAt = Self.nowISO8601()
+            if patch.content != nil || patch.embedding != nil {
+                try Self.requireNotTombstoned(existing, in: db)
+            }
             try Self.validateTemporalEvidence(existing)
             try Self.requireWritableEpoch(
                 in: db,
@@ -575,20 +710,54 @@ public actor MemoryStorage {
         }
     }
 
-    /// Archive a memory ONLY if it is still active and still has use_count == 0
-    /// at write time. Closes the TOCTOU between the consolidator's snapshot
-    /// read and its archive write: a recall bump landing in that window must
-    /// veto the eviction (gpt-5.5 review finding 1). recall_count needs no
-    /// re-check here — it is only mutated by the consolidator itself, which is
-    /// single-flighted; use_count is the only concurrent writer.
+    /// Read pinned rows in chosen order, or disclosure-filtered user facts
+    /// before the first pin. An empty result never restores unfiltered USER.md.
+    public func userPromptCore(surface: String) async throws -> [String]? {
+        try await dbPool.read { db in
+            let chosen = try Bool.fetchOne(db, sql: """
+                SELECT EXISTS(SELECT 1 FROM memory_metadata
+                    WHERE key = 'user_core_chosen' AND value = 1)
+            """) ?? false
+            if !chosen {
+                let rows = try Row.fetchAll(db, sql: """
+                    SELECT * FROM memories WHERE status = 'active' AND persona_id = ?
+                        AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                    ORDER BY created_at DESC
+                """, arguments: [MemoryV2Defaults.personaID]).map(Self.decodeMemory).filter {
+                    MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0))?
+                        .permits(surface: surface, personaID: nil) == true
+                }
+                return UserMDGenerator.userFacts(memories: rows)
+            }
+            return try Row.fetchAll(db, sql: """
+                SELECT * FROM memories WHERE status = 'active'
+                    AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                    AND json_extract(metadata_json, '$.pinned') = 1
+                ORDER BY COALESCE(json_extract(metadata_json, '$.pinned_order'), 0), created_at, id
+            """).map(Self.decodeMemory).map(MemoryRecord.init(stored:)).filter {
+                MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: nil) == true
+            }.map(\.text)
+        }
+    }
+
+    /// Archive only while the row remains stale, unused and uncorroborated
+    /// inside the write transaction.
+    /// A concurrent pin also vetoes eviction.
     /// Returns true when the row was actually archived.
     @discardableResult
-    public func archiveIfStillUnused(id: String) async throws -> Bool {
+    public func archiveIfStillUnused(id: String, updatedBefore cutoff: Date) async throws -> Bool {
         let archivedRow = try await dbPool.write { db -> StoredMemory? in
+            guard let row = try Row.fetchOne(db, sql: """
+                SELECT * FROM memories WHERE id = ? AND status = 'active' AND use_count = 0
+                    AND COALESCE(json_extract(metadata_json, '$.recall_count'), 0) = 0
+                """, arguments: [id]).map(Self.decodeMemory),
+                  let updated = MemoryRecallScoring.parseTimestamp(row.updatedAt),
+                  updated < cutoff else { return nil }
             try db.execute(
                 sql: """
                     UPDATE memories SET status = 'archived', updated_at = ?
                     WHERE id = ? AND status = 'active' AND use_count = 0
+                      AND COALESCE(json_extract(metadata_json, '$.pinned'), 0) != 1
                 """,
                 arguments: [Self.nowISO8601(), id]
             )
@@ -631,13 +800,24 @@ public actor MemoryStorage {
     /// Wave1 S-lane: archive an older single-valued fact superseded by a newer
     /// one. ARCHIVE, never delete — supersession is demotion, not erasure
     /// (Agent's canon). Provenance {superseded_by, superseded_at} lands in
-    /// metadata. Conditional on still-active so a concurrent change vetoes.
+    /// metadata. Both endpoints must remain eligible with the snapshot content.
     @discardableResult
-    public func archiveSuperseded(id: String, by newerId: String) async throws -> Bool {
+    public func archiveSuperseded(
+        id: String, by newerId: String,
+        expectedContentHash: String, expectedReplacementContentHash: String
+    ) async throws -> Bool {
+        guard id != newerId else { return false }
         let archivedRow = try await dbPool.write { db -> StoredMemory? in
-            guard var row = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ? AND status = 'active'", arguments: [id]).map(Self.decodeMemory) else {
+            guard let replacement = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [newerId]).map(Self.decodeMemory),
+                  Self.projectionEligible(replacement),
+                  Self.contentFingerprint(replacement.content) == expectedReplacementContentHash,
+                  var row = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory),
+                  Self.projectionEligible(row),
+                  Self.contentFingerprint(row.content) == expectedContentHash else {
                 return nil
             }
+            if case .object(let meta)? = replacement.metadata, meta["owner_restored"] != nil { return nil }
+            if case .object(let meta)? = row.metadata, meta["owner_restored"] != nil { return nil }
             var meta: [String: JSONValue] = [:]
             if case .object(let existing)? = row.metadata { meta = existing }
             meta["superseded_by"] = .string(newerId)
@@ -678,7 +858,9 @@ public actor MemoryStorage {
         id: String,
         by newerId: String,
         reason: String? = nil,
-        supersededBy: String? = nil
+        supersededBy: String? = nil,
+        expectedContentHash: String? = nil,
+        expectedReplacementContentHash: String? = nil
     ) async throws -> Bool {
         // A deduplicated reassertion can resolve to the original record. It
         // must not retire that sole fact or create a self-referential lineage.
@@ -699,6 +881,12 @@ public actor MemoryStorage {
             """, arguments: [id]).map(Self.decodeMemory) else {
                 return nil
             }
+            if let expectedContentHash,
+               Self.contentFingerprint(row.content) != expectedContentHash { return nil }
+            if let expectedReplacementContentHash,
+               Self.contentFingerprint(replacement.content) != expectedReplacementContentHash { return nil }
+            if supersededBy != nil,
+               !MemorySupersessionLint.sameDisclosureScope(row, replacement) { return nil }
             let now = Self.nowISO8601()
             var meta: [String: JSONValue] = [:]
             if case .object(let existing)? = row.metadata { meta = existing }

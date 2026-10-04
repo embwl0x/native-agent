@@ -1,7 +1,7 @@
 import SwiftUI
 
 public enum SystemHealthSummary: Sendable, Equatable {
-    case unknown          // PATCH-2026-06-06: cold-launch — no Doctor run yet.
+    case unknown
     case ok
     case warn(count: Int)
     case error(count: Int)
@@ -12,21 +12,20 @@ extension AppModel {
         // Prefer an explicit Doctor run. Otherwise reuse the health card that
         // Chat already keeps current instead of launching a second full Doctor
         // pass from this always-mounted toolbar control.
-        if let checks = engine.doctor.report?.checks {
-            let failCount = checks.filter { $0.status.lowercased() == "fail" }.count
-            let warnCount = checks.filter { $0.status.lowercased() == "warn" }.count
+        func summarize(_ statuses: [String]) -> SystemHealthSummary {
+            let buckets = statuses.map { DoctorPlainCopy.bucket(for: $0) }
+            let failCount = buckets.filter { $0 == "failing" }.count
+            let warnCount = buckets.filter { $0 == "warning" }.count
             if failCount > 0 { return .error(count: failCount) }
             if warnCount > 0 { return .warn(count: warnCount) }
+            if buckets.isEmpty || buckets.contains("unclear") { return .unknown }
             return .ok
         }
+        if let checks = engine.doctor.report?.checks {
+            return summarize(checks.map(\.status))
+        }
         guard let subsystems = engine.doctor.healthCard?.subsystems else { return .unknown }
-        let failCount = subsystems.filter {
-            ["fail", "error"].contains($0.status.lowercased())
-        }.count
-        let warnCount = subsystems.filter { $0.status.lowercased() == "warn" }.count
-        if failCount > 0 { return .error(count: failCount) }
-        if warnCount > 0 { return .warn(count: warnCount) }
-        return .ok
+        return summarize(subsystems.map(\.status))
     }
 }
 
@@ -78,7 +77,7 @@ enum HealthPillPopoverPresentation: Equatable {
         if isChecking { return "Looking things over…" }
         switch summary {
         case .unknown:
-            return "Nothing has been looked at yet"
+            return "The app's health isn't clear yet"
         case .ok:
             return "Everything looks fine"
         case .warn(let count):
@@ -215,7 +214,7 @@ public struct HealthPill: View {
             // actually running, so a machine that never ran a check displayed
             // a permanent progress claim. "Checking" now belongs to a real
             // in-flight run; a cold pill says it has no answer yet.
-            appModel.engine.doctor.isRunning ? "Checking" : "Not checked"
+            appModel.engine.doctor.isRunning ? "Checking" : "Unknown"
         case .ok:
             "OK"
         case .warn(let count):

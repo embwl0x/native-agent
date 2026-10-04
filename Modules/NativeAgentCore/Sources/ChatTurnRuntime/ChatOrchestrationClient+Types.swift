@@ -200,6 +200,11 @@ public protocol ChatOrchestrationClient: Sendable {
         mechanicalRow: CognitiveMechanicalRowKind?
     ) async throws -> EnqueuedUserMessage
 
+    /// Her answer from a turn in a contact's own conversation, shown in the
+    /// chat that asked for it. Once per `deliveryID`.
+    func appendAnswerForAskingChat(sessionID: String, text: String, attachments: [MultimodalAttachment],
+                                   surface: String, deliveryID: String) async throws
+
     /// Non-streaming chat turn.
     func chat(
         message: String,
@@ -211,18 +216,9 @@ public protocol ChatOrchestrationClient: Sendable {
         suppressUserAppend: Bool
     ) async throws -> ChatResponse
 
-    // Wave 16 cutover overloads (2026-06-01): accept a `persona` parameter so
-    // the Mac UI's per-chat persona pick (UserDefaults["chatPersona"]) can be
-    // forwarded into the chat turn. The SwiftNative impl currently SHORT-CIRCUITS
-    // this — the compiled persona is baked per-surface and we do NOT merge a
-    // caller-supplied persona on top of it (that lived in persona_runtime.py
-    // and didn't survive the cutover). The persona value is RECORDED into the
-    // persisted assistant turn's `metadata.persona` for future consolidation
-    // and downstream filters, but it does NOT change which persona the LLM
-    // sees on this turn.
-    // PersonaCompiler.loadProfile() is the source-of-truth for the active
-    // persona in the SwiftNative path. Default-persona users see no
-    // regression.
+    // The per-chat persona pick is forwarded to PersonaCompiler to select the
+    // persona compiled for this turn, and recorded in metadata.persona.
+    // Without an override, PersonaCompiler selects the active persona.
     func chat(
         message: String,
         sessionId: String?,

@@ -130,30 +130,6 @@ public protocol PersonaEngineWriting: Sendable {
     @discardableResult
     func scaffoldMissingDocs() async throws -> [String]
 
-    // MARK: - Growth + Voice MUTATION writers (wave 35 W13)
-    //
-    // Native twins of the three persona-MUTATION writers wave-34 W02 flocked on
-    // the Python side. They are the GROWTH-append + voice/section doc-mutation
-    // surfaces that, until now, had ONLY a Python impl -- the wave-32 W19
-    // savePersonality/savePersonalityDoc ports covered the two HTTP routes but
-    // NOT the agent-tool persona_write/persona_append_section nor the structured
-    // append_personality_growth journal append. With all three now flock-symmetric
-    // on disk (<path>.lock), the native side closes the coverage gap so
-    // .personaEngineWrites has a native impl for every persona-file writer the
-    // daemon exposes. DORMANT: no NativeClient seam routes through these yet.
-
-    /// Mirror of `Runtime.append_personality_growth(kind, text, source_run_id)`
-    ///: append one structured journal line to
-    /// GROWTH.md. Strips a leading transport-context envelope, word-collapses
-    /// to ONE LINE + caps `text` at 280 CODE POINTS, NO-OPs on
-    /// empty cleaned text, enforces the SOUL.md onboarding gate (pre-onboarding
-    /// -> silent NO-OP), scaffolds a missing GROWTH.md from
-    /// `default_personality_doc_content` BEFORE the append, and holds the whole
-    /// read-scaffold-append under a cross-process flock on GROWTH.md. Returns
-    /// `true` if a line was appended, `false` on the NO-OP paths.
-    @discardableResult
-    func appendPersonalityGrowth(kind: String, text: String, sourceRunId: String?) async throws -> Bool
-
     /// Mirror of the agent tool `_exec_persona_write` (builtin_tools.py
     /// L3613-3703): full-doc REPLACE of a persona file with a timestamped
     /// `.pre-<ts>-<uid>.bak` backup of the prior content, atomic temp+rename,
@@ -195,23 +171,10 @@ public struct PersonaToolWriteResult: Sendable, Equatable {
 
 // MARK: - SwiftNative impl
 
-/// Read-only persona doc loader.
-///
-/// HARD SCOPE CARVE-OUT — Swift impl deliberately does NOT do:
-///   - any write/mutation (USER.md cap eviction, GROWTH.md size cap,
-///     REM-cycle writes, memory consolidation) — those stay with the
-///     daemon and migrate as part of subsystems #10 (DreamREMCycle) and
-///     #11 (SelfImprovement).
-///   - hot-reload watching. Instantiating a new engine re-reads the dir;
-///     long-lived engines see a snapshot from first read. Deferred to a
-///     future phase if cache-invalidation pressure surfaces.
-///   - REM-pin retrieval / pinned-doc subset selection — that belongs to
-///     subsystem #10.
-///
-/// `actor` isolation makes the lazy-resolver-cache field safe across
-/// concurrent calls. File IO inside actor methods does block the actor
-/// thread briefly, but persona dirs are small (single-digit MB at most)
-/// so it isn't worth detaching.
+/// Native persona document reader and write owner. Each read loads current
+/// disk contents; document snapshots are not cached. Write extensions own
+/// locked persona mutations, while MemoryV2 owns the USER.md projection.
+/// Actor isolation serializes access to this engine's state.
 public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriting {
     private let root: URL
     private let fileManager: FileManager
@@ -291,7 +254,7 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
 
             let content: String
             do {
-                content = try String(contentsOf: entry, encoding: .utf8)
+                content = try Self.readPersonaDocument(at: entry)
             } catch {
                 // Unreadable file (perms / encoding) — skip silently rather
                 // than fail the whole listing. The daemon does the same.
@@ -315,6 +278,21 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
     public func getPersonaDoc(id: String) async throws -> PersonaDoc? {
         let all = try await listPersonaDocs()
         return all.first { $0.id == id }
+    }
+
+    /// Every persona reader excludes legacy episodic logs from GROWTH context.
+    static func readPersonaDocument(at url: URL) throws -> String {
+        let body = try String(contentsOf: url, encoding: .utf8)
+        guard url.lastPathComponent == "GROWTH.md" else { return body }
+        return filterEpisodicGrowthLines(body)
+    }
+
+    public static func filterEpisodicGrowthLines(_ body: String) -> String {
+        body.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { line in
+                line.range(of: #"^- \S+\s+·\s+(feedback|dream_candidate)\s+·"#, options: .regularExpression) == nil
+            }
+            .joined(separator: "\n")
     }
 
     // MARK: - Wire-shape adapter for /v1/personality/docs
@@ -378,9 +356,7 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
             var content: String = ""
             var updatedAt: String? = nil
             if exists {
-                if let body = try? String(contentsOf: url, encoding: .utf8) {
-                    content = body
-                }
+                content = try Self.readPersonaDocument(at: url)
                 if let values = try? url.resourceValues(
                     forKeys: [.contentModificationDateKey]
                 ),
@@ -536,7 +512,7 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
 
             ## Helping the user set up
             - For each capability the user wants, look up the live status before claiming it's ready.
-            - Set the capability up yourself: open the page (app_page_read), change what you can (app_setting_set, interaction_act), and fill in every field you already have. Ask the user only for a token or a grant you cannot obtain on your own, and verify it works before saying it is set up.
+            - Set the capability up yourself: open the page (app {page}), change what you can (its actions, such as setting.set), and fill in every field you already have. Ask the user only for a token or a grant you cannot obtain on your own, and verify it works before saying it is set up.
             - When the user grants a new permission or pastes a key, verify it actually works (read-back, status endpoint, or a small probe call) before saying "you're set."
 
             ## Autonomy

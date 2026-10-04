@@ -98,66 +98,20 @@ public enum DeskObservationApplier {
                 deferred.append(drift)
                 continue
             }
-            let state = try await store.liveState()
-            guard let item = state.items.first(where: { $0.handle == drift.handle }) else {
-                outcome.missingHandles.append(drift.handle)
-                continue
-            }
-            // Same CAS discipline as the close, for the same reason: a card whose
-            // GitHub ref was just removed, or that just had `github` added to its
-            // refresh sources, is no longer the card this verdict judged, and
-            // flagging it would announce a contradiction that no longer exists.
-            // The fingerprint excludes notes, so the applier's OWN earlier
-            // appends in this same pass stay transparent.
-            if let expected = drift.materialFingerprint,
-               DeskObservationEvaluator.verdictFingerprint(item, in: state) != expected {
-                outcome.skippedRaced.append(drift.handle)
-                continue
-            }
-            let marker = "\(DeskObservationEvaluator.driftMarker)[\(drift.signature)]"
-            // Dedupe against the TRAILING RUN of drift notes, not the whole
-            // history. The surface derives its flag from the tail, so a drift
-            // buried behind a later human note is invisible — and a
-            // whole-history dedupe would then refuse to re-raise it, leaving a
-            // contradiction that is still true and permanently unsayable. The
-            // run, rather than just `notes.last`, is what keeps two drifts on
-            // one item from re-appending each other every single poll.
-            //
-            // `hasPrefix`, not `contains`: a note that merely QUOTES a drift
-            // marker (a paste of a previous digest, Agent summarizing the board
-            // back to User) must not suppress a real flag. Only a note the
-            // applier itself authored starts with the marker.
-            let trailingDrifts = item.notes
-                .reversed()
-                .prefix { DeskObservationEvaluator.driftKind(inNote: $0.text) != nil }
-            if trailingDrifts.contains(where: { $0.text.hasPrefix(marker) }) {
-                outcome.flagsDeduped += 1
-                continue
-            }
-            _ = try await store.appendNote(drift.handle, text: drift.noteText)
-            outcome.flagged.append("\(drift.handle):\(drift.signature)")
+            try await appendDrift(drift, to: store, outcome: &outcome)
         }
 
         // Withdrawals. Re-checked against LIVE state rather than trusted from the
         // verdict: the tail must still be the drift note we are withdrawing, or
         // something already moved it and there is nothing to clear.
         for clear in verdict.driftClears {
-            let state = try await store.liveState()
-            guard let item = state.items.first(where: { $0.handle == clear.handle }) else {
-                outcome.missingHandles.append(clear.handle)
-                continue
+            switch try await store.appendObservationNote(clear.handle, fingerprint: clear.materialFingerprint,
+                signature: clear.clearedSignature, text: clear.noteText, clearing: true) {
+            case .appended: outcome.cleared.append("\(clear.handle):\(clear.clearedSignature)")
+            case .unchanged: break
+            case .raced: outcome.skippedRaced.append(clear.handle)
+            case .missing: outcome.missingHandles.append(clear.handle)
             }
-            if let expected = clear.materialFingerprint,
-               DeskObservationEvaluator.verdictFingerprint(item, in: state) != expected {
-                outcome.skippedRaced.append(clear.handle)
-                continue
-            }
-            guard let last = item.notes.last,
-                  DeskObservationEvaluator.signature(inNote: last.text) == clear.clearedSignature else {
-                continue
-            }
-            _ = try await store.appendNote(clear.handle, text: clear.noteText)
-            outcome.cleared.append("\(clear.handle):\(clear.clearedSignature)")
         }
 
         for resolve in verdict.autoResolves {
@@ -238,26 +192,18 @@ public enum DeskObservationApplier {
                 outcome.premiseFailed.append(drift.handle)
                 continue
             }
-            let state = try await store.liveState()
-            guard let item = state.items.first(where: { $0.handle == drift.handle }) else {
-                outcome.missingHandles.append(drift.handle)
-                continue
-            }
-            if let expected = drift.materialFingerprint,
-               DeskObservationEvaluator.verdictFingerprint(item, in: state) != expected {
-                outcome.skippedRaced.append(drift.handle)
-                continue
-            }
-            let marker = "\(DeskObservationEvaluator.driftMarker)[\(drift.signature)]"
-            let trailingDrifts = item.notes
-                .reversed()
-                .prefix { DeskObservationEvaluator.driftKind(inNote: $0.text) != nil }
-            if trailingDrifts.contains(where: { $0.text.hasPrefix(marker) }) {
-                outcome.flagsDeduped += 1
-                continue
-            }
-            _ = try await store.appendNote(drift.handle, text: drift.noteText)
-            outcome.flagged.append("\(drift.handle):\(drift.signature)")
+            try await appendDrift(drift, to: store, outcome: &outcome)
+        }
+    }
+
+    private static func appendDrift(_ drift: DeskDrift, to store: SwiftNativeDeskStore,
+                                    outcome: inout DeskObservationOutcome) async throws {
+        switch try await store.appendObservationNote(drift.handle, fingerprint: drift.materialFingerprint,
+            signature: drift.signature, text: drift.noteText) {
+        case .appended: outcome.flagged.append("\(drift.handle):\(drift.signature)")
+        case .unchanged: outcome.flagsDeduped += 1
+        case .raced: outcome.skippedRaced.append(drift.handle)
+        case .missing: outcome.missingHandles.append(drift.handle)
         }
     }
 }

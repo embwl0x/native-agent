@@ -79,37 +79,47 @@ import PersistenceCore
             try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? JSONEncoder().encode(firsts).write(to: file, options: .atomic)
         }
+        var submissionConfirmed = false
         // An uncertain send keeps its chat, so the thread resumes instead of being orphaned.
         func uncertain(_ detail: String) -> JSONValue {
             var result: [String: JSONValue] = ["status": .string("outcome_unknown"), "completed": .bool(false), "detail": .string(detail)]
+            if submissionConfirmed { result["sent"] = .bool(true) }
             let matchingNewChat = thread == nil && (try? opensWith(turns(), first)) == true ? openTitle() : nil
             let chat = matchingNewChat ?? lastChat
             if let chat, chat != untitled { result["conversation_id"] = .string(chat); remember(chat) }
             return .object(result)
         }
         do {
-            let (reply, title) = try await send(message, thread: thread, first: first)
+            let (reply, title) = try await send(message, thread: thread, first: first) { submissionConfirmed = true }
             remember(title)
             store.recordProof(peerID: peerID, inbound: true, outbound: true)
             store.recordRoundTrip(peerID: peerID, workspace: title)
             return .object(["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
                             "sent": .bool(true), "completed": .bool(true), "reply": .string(reply),
                             "conversation_id": .string(title), "continued": .bool(thread != nil), "untrusted_remote_data": .bool(true)])
-        } catch let covered as MacScreenLock.Covered {
-            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(covered.detail + " Nothing was sent.")])
-        } catch let blocker as Blocker {
-            if [.moved, .timeout, .submission].contains(blocker) { return uncertain(blocker.detail(name)) }
-            // Say what Muse shows instead of its chat (09-25: a forced-update alert over its login window).
-            let detail = blocker == .window ? showing().map { "Muse isn't showing its chat; it shows \($0). Nothing was sent." } : nil
-            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail ?? blocker.detail(name))])
         } catch {
+            if submissionConfirmed {
+                if let blocker = error as? Blocker, [.moved, .timeout].contains(blocker) {
+                    return uncertain(blocker.detail(name))
+                }
+                return uncertain("Muse's answer couldn't be read. The message was sent; check \(name)'s chat in Muse. It won't be resent automatically.")
+            }
+            if let covered = error as? MacScreenLock.Covered {
+                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(covered.detail + " Nothing was sent.")])
+            }
+            if let blocker = error as? Blocker {
+                if [.moved, .timeout, .submission].contains(blocker) { return uncertain(blocker.detail(name)) }
+                // Say what Muse shows instead of its chat (09-25: a forced-update alert over its login window).
+                let detail = blocker == .window ? showing().map { "Muse isn't showing its chat; it shows \($0). Nothing was sent." } : nil
+                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail ?? blocker.detail(name))])
+            }
             return uncertain(Blocker.submission.detail(name))
         }
     }
 
     // MARK: - One exchange
 
-    static func send(_ message: String, thread: String?, first: String?) async throws -> (String, String) {
+    static func send(_ message: String, thread: String?, first: String?, didSubmit: () -> Void) async throws -> (String, String) {
         try await unlocked()
         guard AXIsProcessTrusted() else { throw Blocker.permission }
         guard await ensureRunning() else { throw Blocker.offline }
@@ -119,10 +129,15 @@ import PersistenceCore
         let key = String(flat(message).prefix(40))
         func mine(_ turns: [Turn]) -> Int? { turns.lastIndex { $0.user && flat($0.text).hasPrefix(key) } }
         func sent() throws -> Int { try turns().filter { $0.user && flat($0.text).hasPrefix(key) }.count }
-        let before = try await typeAndSubmit(message, chat: chat ?? untitled, reopen: reopen, count: sent)
+        func ownsChat() throws -> Bool {
+            let all = try turns()
+            return thread == nil ? all.isEmpty : opensWith(all, first)
+        }
+        let before = try await typeAndSubmit(message, chat: chat ?? untitled, reopen: reopen, ownsChat: ownsChat, count: sent)
         do {
             try await until(seconds: 15) { try sent() > before }
         } catch { throw Blocker.submission }
+        didSubmit()
         var last = "", stableSince = Date()
         let deadline = Date().addingTimeInterval(120)
         while Date() < deadline {
@@ -139,7 +154,7 @@ import PersistenceCore
             let reply = all[(index + 1)...].filter { !$0.user }.map(\.text).joined(separator: "\n\n")
             if reply != last { last = reply; stableSince = Date(); continue }
             if !reply.isEmpty, Date().timeIntervalSince(stableSince) >= 3, !generating() {
-                return (reply, try await settledTitle(chat))
+                return (reply, try await settledTitle(chat, first: first))
             }
         }
         throw Blocker.timeout
@@ -153,7 +168,10 @@ import PersistenceCore
     /// one it marks current is hers only if its first user turn is exactly her saved first message.
     static func openThread(_ thread: String?, first: String?) async throws -> (reopen: Bool, chat: String?) {
         let open = openTitle()
-        if let thread, open == thread { return (false, thread) }
+        if let thread, open == thread {
+            guard try opensWith(turns(), first) else { throw Blocker.thread }
+            return (false, thread)
+        }
         let openIsHers = thread != nil && (try? opensWith(turns(), first)) == true
         try await showSideChats()
         if let thread {
@@ -183,7 +201,7 @@ import PersistenceCore
     /// Type with the app in front (its composer only takes real input), then
     /// give the front back to whoever had it.
     /// Returns `count` as read in her verified-open chat just before input.
-    static func typeAndSubmit(_ message: String, chat: String, reopen: Bool, count: () throws -> Int) async throws -> Int {
+    static func typeAndSubmit(_ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool, count: () throws -> Int) async throws -> Int {
         // Muse's box label never shows its text and drops "Send" in some states
         // (09-22: User's main chat read "Message Attach file Dictate a message"),
         // so no draft check here: select-all + paste in her own chat replaces it.
@@ -199,7 +217,7 @@ import PersistenceCore
         configuration.activates = true
         let app = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         let before: Int
-        do { before = try await typeInFront(message, chat: chat, reopen: reopen, count: count, app: app) } catch { await restore(previous, from: app); throw error }
+        do { before = try await typeInFront(message, chat: chat, reopen: reopen, ownsChat: ownsChat, count: count, app: app) } catch { await restore(previous, from: app); throw error }
         await restore(previous, from: app)
         return before
     }
@@ -213,7 +231,7 @@ import PersistenceCore
         _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
     }
 
-    private static func typeInFront(_ message: String, chat: String, reopen: Bool, count: () throws -> Int, app: NSRunningApplication) async throws -> Int {
+    private static func typeInFront(_ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool, count: () throws -> Int, app: NSRunningApplication) async throws -> Int {
         func front() -> Bool { NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier }
         func click(_ node: AXUIElement) throws {
             let frame = try frame(of: node)
@@ -238,8 +256,8 @@ import PersistenceCore
             // 09-22: wait for her log too, so the baseline below counts her rows, not a half-loaded log's.
             do { try await until(seconds: 5) { try openTitle() == chat && !turns().isEmpty } } catch { throw Blocker.thread }
         }
-        // Activation can change the window: recheck her chat and an empty box before any input.
-        guard openTitle() == chat else { throw Blocker.thread }
+        // Activation can change the window: verify her opening message before any input.
+        guard openTitle() == chat, try ownsChat() else { throw Blocker.thread }
         // 09-22: baseline taken here, in her chat; counted in whatever chat was open
         // before the reopen, an older same-prefix row of hers could confirm as new.
         let before = try count()
@@ -272,11 +290,11 @@ import PersistenceCore
         }
         guard wrote else { throw Blocker.typing }
         // User can switch chats during the pauses: recheck hers before select-all and before Return.
-        guard openTitle() == chat else { throw Blocker.thread }
+        guard openTitle() == chat, try ownsChat() else { throw Blocker.thread }
         try keys(0, flags: .maskCommand)   // select all in her box
         try keys(9, flags: .maskCommand)   // paste
         try await Task.sleep(for: .milliseconds(400))
-        guard openTitle() == chat else { throw Blocker.thread }
+        guard openTitle() == chat, try ownsChat() else { throw Blocker.thread }
         try keys(36)
         try await Task.sleep(for: .milliseconds(300))
         return before
@@ -285,9 +303,11 @@ import PersistenceCore
     /// First use: wait briefly for Muse to name the new chat. Every exchange
     /// returns the title the chat shows now (2026-09-22: Muse renames chats
     /// after the first minutes, and a stale saved title broke the next send).
-    static func settledTitle(_ thread: String?) async throws -> String {
+    static func settledTitle(_ thread: String?, first: String?) async throws -> String {
         if thread == nil { try? await until(seconds: 8) { (openTitle() ?? untitled) != untitled } }
-        return openTitle() ?? thread ?? untitled
+        let title = openTitle()
+        guard (try? opensWith(turns(), first)) == true else { throw Blocker.moved }
+        return title ?? thread ?? untitled
     }
 
     // MARK: - Reading the window

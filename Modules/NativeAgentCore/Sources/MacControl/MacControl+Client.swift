@@ -55,9 +55,8 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// item 3's verbs can resolve a handle back to a path. Like a mark, a
     /// handle is a REFERENCE ONLY and grants no authority.
     let lookFrameStore: MacLookFrameStore
-    /// Explicit, bounded continuity over fused views. The source installs no
-    /// observers until `mac_attention start`; the store is shared because the
-    /// dispatcher constructs a short-lived MacControl client per tool call.
+    /// Driver authority plus bounded fused-view continuity. Acts automatically
+    /// start passive observation; every tool client shares the physical Mac.
     let attentionEventSource: any MacAttentionEventSource
     let attentionStore: MacAttentionSessionStore
     /// W6 — the login-session probe `wake` refuses on. Injectable so the
@@ -79,7 +78,6 @@ public actor SwiftNativeMacControl: MacControlClient {
     private let operationStore: MacControlOperationStore?
 
     public init(
-        http: any HTTPClient = URLSessionHTTPClient(),
         now: @escaping @Sendable () -> Date = { Date() },
         notificationCenterAdapter: (any NotificationCenterAdapter)? = nil,
         appleScriptAdapter: AppleScriptAdapter = SystemAppleScriptAdapter(),
@@ -104,7 +102,6 @@ public actor SwiftNativeMacControl: MacControlClient {
         auditAppendPath: URL? = nil,
         operationStore: MacControlOperationStore? = nil
     ) {
-        _ = http
         self.now = now
         self.notificationCenterAdapter = notificationCenterAdapter
         self.appleScriptAdapter = appleScriptAdapter
@@ -113,7 +110,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.appControlAdapter = appControlAdapter
         self.openTargetAdapter = openTargetAdapter
         self.accessibilitySource = accessibilitySource
-        self.eventSink = eventSink
+        self.eventSink = DriverCheckedMacEventSink(base: eventSink)
         self.accessibilityActSource = accessibilityActSource
         self.effectObserverSource = effectObserverSource
         self.screenCaptureSource = screenCaptureSource
@@ -130,25 +127,17 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.operationStore = operationStore
     }
 
-    /// THE PUBLIC API — and deliberately the UNPRIVILEGED one.
-    ///
-    /// W2/W3-FIX 1: this signature has no parameter that can carry an injection
-    /// authorization, and it refuses every injection action outright. That is
-    /// the whole point: the HTTP / iOS bridge, the app's direct MacControl
-    /// callers, the model's own tool arguments and any raw
-    /// `SwiftToolDispatcher` all reach the executor through here, so making the
-    /// refusal a property of the SIGNATURE means none of them can inject no
-    /// matter what they put in `body`. Approved injection has its own entry
-    /// point, `dispatchApprovedInjection(action:body:capability:)`, which needs
-    /// a `MacInjectionCapability` — a type with a private init that cannot be
-    /// parsed from JSON.
+    /// Public dispatch automatically mints a body-bound, single-use capability
+    /// for injection actions. No per-call human approval is required here.
+    /// Policy, Full Mac, category, TCC and driver checks still apply; a JSON
+    /// approval marker has no authority.
     public func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
         try await dispatchCore(action: action, body: body, capability: nil)
     }
 
-    /// The ONLY path that synthesizes input. `capability` must be a live,
-    /// unspent `MacInjectionCapability` minted from a resolved human approval
-    /// and bound to this exact action and body.
+    /// Dispatch with an explicit capability, including an approved replay.
+    /// It must be live, unspent and bound to this exact action and body.
+    /// Public `dispatch` can also synthesize input by automatically minting one.
     ///
     /// Every gate the read/act path already had still runs underneath
     /// (master + accessibility category, ACTIVE Full Mac window, TCC): the
@@ -162,6 +151,46 @@ public actor SwiftNativeMacControl: MacControlClient {
     }
 
     private func dispatchCore(
+        action: String,
+        body rawBody: [String: JSONValue],
+        capability: MacInjectionCapability?
+    ) async throws -> MacControlResult {
+        if MacDriverContext.binding == nil {
+            let binding = await attentionStore.bindDriver(eventSource: attentionEventSource)
+            return try await withTaskCancellationHandler {
+                defer { binding.releaseHeldInputs() }
+                return try await MacDriverContext.$binding.withValue(binding) {
+                    try await dispatchCore(action: action, body: rawBody, capability: capability)
+                }
+            } onCancel: { binding.cancel() }
+        }
+        return try await MacDriverContext.$inputStartCount.withValue(MacDriverContext.binding?.inputCount ?? 0) {
+            driverCheckedResult(try await dispatchBound(action: action, body: rawBody, capability: capability), action: action)
+        }
+    }
+
+    private func driverCheckedResult(_ reply: MacControlResult, action: String) -> MacControlResult {
+        let motor = macControlAccessibilityInjectionActions.contains(action)
+            || macControlAccessibilityNudgeActions.contains(action)
+            || ["focus_app", "quit_app", "open_target"].contains(action)
+        guard motor, MacDriverContext.binding?.takenOver == true else { return reply }
+        var output: [String: JSONValue] = [:]
+        if case .object(let existing) = reply.output { output = existing }
+        output["status"] = .string("yielded_to_user")
+        output["error"] = .string(MacAttentionSessionStore.driverRefusal)
+        output["verification"] = .string("unverified")
+        let emitted = max(0, (MacDriverContext.binding?.inputCount ?? 0) - MacDriverContext.inputStartCount)
+        output["posted_events"] = .int(Int64(emitted))
+        if output["requested_events_emitted"] != nil { output["requested_events_emitted"] = .int(Int64(emitted)) }
+        return MacControlResult(
+            ok: false, action: reply.action, output: .object(output),
+            error: MacAttentionSessionStore.driverRefusal, durationMs: reply.durationMs,
+            viaSwift: reply.viaSwift, httpStatus: 409, operationId: reply.operationId,
+            operationState: reply.operationState, verification: .unverified
+        )
+    }
+
+    private func dispatchBound(
         action: String,
         body rawBody: [String: JSONValue],
         capability: MacInjectionCapability?
@@ -343,7 +372,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         switch signal {
         case .result(let result):
             return try await finishKnownOperationResult(
-                result,
+                result.map { driverCheckedResult($0, action: normalized) },
                 action: normalized,
                 operationId: operationId,
                 trigger: .ordinary
@@ -351,7 +380,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         case .deadline:
             if let result = await Self.boundedResult(of: task) {
                 return try await finishKnownOperationResult(
-                    result,
+                    result.map { driverCheckedResult($0, action: normalized) },
                     action: normalized,
                     operationId: operationId,
                     trigger: .deadline
@@ -365,7 +394,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         case .cancellationRequested:
             if let result = await Self.boundedResult(of: task) {
                 return try await finishKnownOperationResult(
-                    result,
+                    result.map { driverCheckedResult($0, action: normalized) },
                     action: normalized,
                     operationId: operationId,
                     trigger: .cancellation
@@ -430,6 +459,26 @@ public actor SwiftNativeMacControl: MacControlClient {
         try await operationStore?.motorActionReadModel(actionId: actionId)
     }
 
+    private struct WakeAttentionRefusal: Error {
+        let result: MacControlResult
+    }
+
+    public func wakeScreenIfCovered(
+        action: String,
+        body: [String: JSONValue]
+    ) async throws -> MacControlResult? {
+        do {
+            try await MacScreenLock.wakeIfCovered {
+                if let refusal = await self.attentionActionRefusal(action: action, body: body) {
+                    throw WakeAttentionRefusal(result: refusal)
+                }
+            }
+            return nil
+        } catch let refusal as WakeAttentionRefusal {
+            return refusal.result
+        }
+    }
+
     private func executeAction(
         _ normalized: String,
         body: [String: JSONValue],
@@ -457,15 +506,34 @@ public actor SwiftNativeMacControl: MacControlClient {
         // priority. Check once at tool entry; handlers recheck at the exact
         // effect boundary (and between multi-event gestures) so a mouse move
         // arriving after this line still stops the action.
-        // fable51 item 33 — `read` is here too, and it is the one READ that
-        // belongs in this list: the accumulate route moves the user's scroll
-        // position, and a human scrolling their own document must not have it
-        // yanked out from under them mid-gesture.
+        // Document reads check this boundary only before their scroll effects,
+        // so reading the visible text remains available while the person drives.
         if macControlAccessibilityInjectionActions.contains(normalized)
             || macControlAccessibilityNudgeActions.contains(normalized)
-            || macControlDocumentReadActions.contains(normalized),
+            || ["focus_app", "quit_app", "open_target"].contains(normalized),
            let refusal = await attentionActionRefusal(action: normalized, body: body) {
             return refusal
+        }
+        // Perception and hands share the desktop-send wake: an inert nudge
+        // only while the saver covers the screen and the person is idle.
+        if ["look", "view", "act", "hand", "menu", "menu_press"].contains(normalized) {
+            let started = now()
+            do {
+                if let refusal = try await wakeScreenIfCovered(action: normalized, body: body) {
+                    return refusal
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let covered = error as? MacScreenLock.Covered
+                let code = covered?.code ?? "display_obstructed"
+                let message = covered?.detail ?? error.localizedDescription
+                return MacControlResult(
+                    ok: false, action: normalized,
+                    output: .object(["status": .string(code), "message": .string(message), "guidance": .string(message)]),
+                    error: code, durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true
+                )
+            }
         }
         switch normalized {
         case "notify":      return try await handleNotify(body)
@@ -491,9 +559,8 @@ public actor SwiftNativeMacControl: MacControlClient {
         // the screen (AX structure + pixels) and changes nothing.
         case "view":        return await handleView(body)
         case "attention":   return await handleAttention(body)
-        // W2/W3 — INJECTION. Every one of these is behind the three-gate
-        // predicate in `gatePreflightOutcome` (category + active Full Mac +
-        // approval attestation) before control ever arrives here.
+        // Injection has already consumed an explicit or automatically minted
+        // capability and passed the policy preflight before reaching a handler.
         case "keystroke":   return await handleKeystroke(body)
         case "click":       return await handleClick(body)
         case "scroll":      return await handleScroll(body)
@@ -740,13 +807,9 @@ public actor SwiftNativeMacControl: MacControlClient {
         action: String,
         body: [String: JSONValue]
     ) async -> GatePreflightOutcome {
-        // GATE 3 of 3 for injection — the APPROVAL tier — is enforced at the
-        // ENTRY POINT (`dispatchCore`), not here, because it is now a property
-        // of which function you called and what capability you held, not of the
-        // body's contents. By the time an injection action reaches this
-        // pre-flight it has already presented a live, body-bound, single-use
-        // `MacInjectionCapability`. The remaining two gates below still apply
-        // to it in full.
+        // The entry point validates and consumes an explicit or automatically
+        // minted injection capability. This preflight applies policy regardless
+        // of how that capability was minted.
         //
         // No provider configured: tests and direct library callers can exercise
         // handlers in isolation. Production wires a Swift TrustCenter provider.
@@ -1184,6 +1247,11 @@ public actor SwiftNativeMacControl: MacControlClient {
         action: String,
         body: [String: JSONValue]
     ) async -> MacControlResult? {
+        if let refusal = MacWorkContinuation.current?.refusal() {
+            return MacControlResult(ok: false, action: action,
+                output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
+                durationMs: 0, viaSwift: true)
+        }
         let sessionId = body.stringValue("attention_session")
         let userSequence = Self.intValue(body, "attention_user_sequence").map(Int64.init)
         switch await attentionStore.permissionForAction(
@@ -1209,7 +1277,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                     "ok": .bool(false),
                     "status": .string(status),
                     "error": .string(reason),
-                    "attention": current.toJSON(),
+                    "attention": current?.toJSON() ?? .null,
                 ]),
                 error: reason,
                 durationMs: 0,
@@ -1225,7 +1293,6 @@ public actor SwiftNativeMacControl: MacControlClient {
 // MARK: - Factory
 
 public func makeMacControl(
-    http: any HTTPClient = URLSessionHTTPClient(),
     policyProvider: (any MacControlPolicyProvider)? = nil,
     auditAppendPath: URL? = nil,
     operationDataRoot: URL? = nil,
@@ -1233,7 +1300,6 @@ public func makeMacControl(
 ) -> any MacControlClient {
     let dataRoot = operationDataRoot ?? auditAppendPath?.deletingLastPathComponent()
     return SwiftNativeMacControl(
-        http: http,
         notificationCenterAdapter: notificationCenterAdapter,
         policyProvider: policyProvider,
         auditAppendPath: auditAppendPath,

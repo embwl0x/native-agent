@@ -1,5 +1,57 @@
 import Foundation
+import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
+
+/// Checked paired-phone authority shared by pairing and security status.
+public enum PairedPhoneAuthority {
+    public struct Phone: Codable, Identifiable, Sendable {
+        public enum Status: String, Codable, Sendable { case pending, paired, removed }
+        public let id: String
+        public let publicKey: Data
+        public var status: Status
+
+        public init(id: String, publicKey: Data, status: Status) {
+            self.id = id
+            self.publicKey = publicKey
+            self.status = status
+        }
+    }
+
+    public static func pairedCountChecked(at url: URL) throws -> Int {
+        try read(at: url).filter { $0.status == .paired }.count
+    }
+
+    public static func read(at url: URL) throws -> [Phone] {
+        let fm = FileManager.default
+        let attributes: [FileAttributeKey: Any]
+        do { attributes = try fm.attributesOfItem(atPath: url.path) }
+        catch let error as NSError {
+            if error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return [] }
+            throw error
+        }
+        guard attributes[.type] as? FileAttributeType == .typeRegular else { throw unavailable }
+        guard let size = attributes[.size] as? NSNumber, size.int64Value <= 128 * 1024 else {
+            throw unavailable
+        }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: 128 * 1024 + 1) ?? Data()
+        guard data.count <= 128 * 1024 else { throw unavailable }
+        let rows = try JSONDecoder().decode([Phone].self, from: data)
+        guard Set(rows.map(\.id)).count == rows.count,
+              rows.allSatisfy({ $0.publicKey.count == 32 && $0.id == DeviceApprovalSignature.deviceID(publicKey: $0.publicKey) }) else {
+            throw unavailable
+        }
+        return rows
+    }
+
+    private static var unavailable: NSError {
+        NSError(domain: "NativeAgentPairing", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "I couldn’t read the paired phones. I haven’t accepted this decision.",
+        ])
+    }
+}
 
 public enum SecurityToolDecision: String, Codable, Sendable, Equatable {
     case allow
@@ -34,6 +86,29 @@ public struct FullMacYoloAuthorityAssessment: Codable, Sendable, Equatable {
     }
 
     public var admitted: Bool { state == .admitted }
+}
+
+/// How an agent NativeAgent drives (Codex, Claude Code) is launched for one
+/// request. Only `SwiftNativeSecurityCenter.drivenAgentLaunchPermission`
+/// produces it, and every launch sends its values explicitly — a restricted
+/// launch never inherits a thread default or a saved CLI setting, so a Trust
+/// downgrade governs the very next turn.
+public enum DrivenAgentLaunchPermission: Sendable, Equatable {
+    case fullMac
+    case restricted
+    /// No launch at all.
+    case denied(reason: String)
+
+    public var codexSandbox: String { self == .fullMac ? "danger-full-access" : "workspace-write" }
+    /// Unattended: nobody is there to answer an approval either way.
+    public var codexApprovalPolicy: String { "never" }
+
+    /// The same values as command-line arguments for that CLI.
+    public func arguments(_ flags: AgentHostCommandLine.PermissionFlags) -> [String] {
+        switch flags {
+        case .codex: return ["-c", "sandbox_mode=\"\(codexSandbox)\"", "-c", "approval_policy=\"\(codexApprovalPolicy)\""]
+        }
+    }
 }
 
 public struct SecurityOriginContext: Codable, Sendable, Equatable {
@@ -173,7 +248,9 @@ public enum SecurityCapabilityClassifier {
         "agent_delegate",
         "approval_stage",
         "app_data_write",
+        "ax_injection",
         "browser_interaction",
+        "clipboard_write",
         "destructive",
         "evolution_apply_trigger",
         "evolution_write",

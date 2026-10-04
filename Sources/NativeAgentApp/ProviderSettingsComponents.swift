@@ -92,6 +92,8 @@ struct ProviderRowView: View {
 enum ProviderCredentialVerification: Equatable {
     /// Nothing written or tested in this sheet session.
     case idle
+    /// Credential removed or confirmed unavailable.
+    case disconnected
     /// Credential written to disk, never checked against the service.
     case savedUnverified
     /// Credential written, and this provider has no live probe to check it
@@ -109,18 +111,19 @@ enum ProviderCredentialVerification: Equatable {
 
     /// Test Connection is the only transition that can claim the key works —
     /// and only a probe that actually RAN can claim it failed.
-    static func afterTest(_ result: ProviderTestResult) -> ProviderCredentialVerification {
+    static func afterTest(_ result: ProviderTestResult, credentialReady: Bool) -> ProviderCredentialVerification {
         if result.tested {
             return result.status == "ok" ? .verified : .verificationFailed
         }
         // No live probe ran. "error" means the attempt itself found something
         // wrong before probing (no key on disk) — a real failure. Anything
         // else means the provider is untestable, which must not read as failed.
-        return result.status == "error" ? .verificationFailed : .savedNoProbe
+        if result.status == "error" { return .verificationFailed }
+        return credentialReady ? .savedNoProbe : .disconnected
     }
 
     /// Clearing credentials drops any earlier claim.
-    static func afterClear() -> ProviderCredentialVerification { .idle }
+    static func afterClear() -> ProviderCredentialVerification { .disconnected }
 
     /// Short plain-English line shown under the panels. `providerNote` is an
     /// optional provider-specific addendum; it must never claim the key works.
@@ -129,14 +132,16 @@ enum ProviderCredentialVerification: Equatable {
         switch self {
         case .idle:
             base = ""
+        case .disconnected:
+            base = "Not connected."
         case .savedUnverified:
             base = "Saved to this Mac. Not checked yet — press Test Connection to confirm it works."
         case .savedNoProbe:
-            base = "Saved to this Mac. This provider has no connection test — the key is checked on your first real request."
+            base = "Saved to this Mac. This sign-in method has no connection test — it is checked on your first real request."
         case .verified:
             base = "Saved and tested. This provider is working."
         case .verificationFailed:
-            base = "Saved, but the test failed. Check the key, then test again."
+            base = "The test failed. Check the credentials, then test again."
         }
         guard let note = providerNote, !note.isEmpty else { return base }
         return base.isEmpty ? note : "\(base) \(note)"
@@ -147,6 +152,7 @@ enum ProviderCredentialVerification: Equatable {
     var badge: (text: String, status: String)? {
         switch self {
         case .idle: return nil
+        case .disconnected: return ("Disconnected", "warn")
         case .savedUnverified: return ("saved · not tested", "warn")
         case .savedNoProbe: return ("saved · no test available", "ok")
         case .verified: return ("tested · working", "ok")
@@ -591,10 +597,20 @@ struct ProviderConfigSheet: View {
         let draftKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let testsDraft = authMode == "api_key" && !draftKey.isEmpty
         do {
-            let result = try await appModel.testProvider(
-                provider.provider_id,
-                apiKeyOverride: testsDraft ? draftKey : nil
-            )
+            let current = try await appModel.engine.providers.list().first { $0.provider_id == provider.provider_id }
+            let credentialReady = current?.auth_status.state == "ready"
+                && (current?.auth_mode == testedAuthMode || (current?.auth_mode == nil && provider.auth_modes.count == 1))
+            let result: ProviderTestResult
+            if testedAuthMode != "api_key" {
+                result = ProviderTestResult(provider_id: provider.provider_id, status: "unknown", tested: false,
+                    response: nil, model_used: nil,
+                    detail: "No connection test is available for this sign-in method. It was not checked.", error: nil)
+            } else {
+                result = try await appModel.testProvider(
+                    provider.provider_id,
+                    apiKeyOverride: testsDraft ? draftKey : nil
+                )
+            }
             guard credentialRevision == revision, apiKey == testedInput, authMode == testedAuthMode else { return }
             testResult = result
             if testsDraft {
@@ -608,9 +624,9 @@ struct ProviderConfigSheet: View {
             } else {
                 // FIRSTRUN-2: Test Connection is the only thing that can clear
                 // the saved-but-unverified state.
-                verification = .afterTest(result)
+                verification = .afterTest(result, credentialReady: credentialReady)
                 statusText = verification.statusText(
-                    providerNote: "This tested the key saved on this Mac."
+                    providerNote: result.tested ? "This tested the credential saved on this Mac." : result.detail
                 )
             }
         } catch {
@@ -633,48 +649,13 @@ struct ProviderConfigSheet: View {
         isSaving = true
         defer { isSaving = false }
         invalidateTestFeedback()
-        do {
-            _ = try await appModel.clearProvider(provider.provider_id)
-            // User, 2026-09-06: for an OAuth provider the credential does not
-            // live in providers/<id>.json — ChatGPT's is in codex_home/auth.json
-            // and the others in their adapters' own token files — so removing
-            // the registry row left the account connected while the sheet said
-            // it had been disconnected. Go through the same path the OAuth
-            // "Sign out" button uses; it no-ops for non-OAuth providers.
-            let clearedOAuth = NativeOAuthFlow.clearTokens(
-                providerId: provider.provider_id,
-                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            )
-            let oauthID = NativeOAuthFlow.normalizedOAuthProviderId(provider.provider_id)
-            if ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].contains(oauthID),
-               !clearedOAuth {
-                statusText = "Clear failed: the OAuth credential could not be removed."
-                await appModel.loadProvidersForChat()
-                return
-            }
+        let outcome = await appModel.disconnectProvider(provider.provider_id)
+        if outcome.ok {
             apiKey = ""
             verification = .afterClear()
             testResult = nil
-            // The shared ~/.codex/auth.json belongs to the Codex CLI and is
-            // never deleted here, so say so rather than claiming a removal
-            // that did not happen (same wording the Sign out button uses).
-            // User, 2026-09-06: this asked `isSignedIn`, which reads the auth
-            // path chat will USE — and the removal just flipped CLI adoption to
-            // declined, so the normal case answered false and reported
-            // "Credentials removed" with the shared file still on disk. The
-            // disclosure now keys off the shared file itself.
-            statusText = NativeOAuthFlow.sharedCodexCLISessionRemains(
-                providerId: provider.provider_id
-            )
-                ? "Shared Codex auth is still signed in. Sign out from Codex to remove it."
-                : "Credentials removed."
-            // S.5: propagate cleared credentials to the provider list so the
-            // parent ProviderSettingsView and the chat brain bar reflect the
-            // new auth_status (needs_key / needs_oauth) immediately.
-            await appModel.loadProvidersForChat()
-        } catch {
-            statusText = "Clear failed: \(error.localizedDescription)"
         }
+        statusText = outcome.detail
     }
 
     private func authModeLabel(_ mode: String) -> String {

@@ -38,44 +38,15 @@ enum CognitionObservatoryActions {
         return ReflectionOutcome(status: status, detail: detail)
     }
 
-    static func settleBody(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> CognitiveObservatoryDetail {
-        _ = await runtime.settleOrganismContinuity()
-        return await refresh(runtime: runtime)
-    }
-
     static func settleBodyChecked(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> (outcome: OrganismContinuityApplyOutcome, detail: CognitiveObservatoryDetail) {
         let outcome = await runtime.settleOrganismContinuityChecked()
         return (outcome, await refresh(runtime: runtime))
-    }
-
-    static func resetBody(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> CognitiveObservatoryDetail {
-        _ = await runtime.resetOrganismContinuity()
-        return await refresh(runtime: runtime)
     }
 
     static func resetBodyChecked(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> (outcome: OrganismContinuityApplyOutcome, detail: CognitiveObservatoryDetail) {
         let outcome = await runtime.resetOrganismContinuityChecked()
         return (outcome, await refresh(runtime: runtime))
     }
-
-    static func reviewReflex(
-        runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition,
-        id: String,
-        decision: OrganismReflexReviewDecision,
-        note: String,
-        reviewedBy: String,
-        source: String
-    ) async -> (outcome: OrganismReflexReviewApplyOutcome, detail: CognitiveObservatoryDetail) {
-        let outcome = await runtime.applyOrganismReflexReview(
-            id: id,
-            decision: decision,
-            note: note,
-            reviewedBy: reviewedBy,
-            source: source
-        )
-        return (outcome, await refresh(runtime: runtime))
-    }
-
 }
 
 /// The shared standing-view action used by the full Cognition Proposals screen
@@ -85,24 +56,13 @@ enum CognitionProposalActions {
     enum ResolveStatus: Sendable, Equatable {
         case applied(CognitiveStandingView.Status)
         case unavailable(String)
-        /// The transition happened in memory but its store write failed
-        /// (2026-09-06) — it will not survive a restart, and a click must never
-        /// report that as saved.
+        /// The store write failed; a click must never report it as saved.
         case notSaved(String)
     }
 
     struct ResolveOutcome: Sendable {
         var status: ResolveStatus
         var detail: CognitiveObservatoryDetail
-    }
-
-    static func resolve(
-        runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition,
-        id: UUID,
-        approved: Bool
-    ) async -> CognitiveObservatoryDetail {
-        _ = await runtime.resolveStandingView(id: id, approved: approved)
-        return await runtime.observatoryDetail()
     }
 
     /// Recheck the candidate at the mutation boundary and report a maintenance
@@ -121,6 +81,9 @@ enum CognitionProposalActions {
         }
         let resolved = await runtime.resolveStandingViewChecked(id: id, approved: approved)
         let detail = await runtime.observatoryDetail()
+        if let failure = resolved.persistenceFailure {
+            return ResolveOutcome(status: .notSaved(failure), detail: detail)
+        }
         let expected: CognitiveStandingView.Status = approved ? .active : .retired
         guard resolved.view?.status == expected,
               detail.standingViews.first(where: { $0.id == id })?.status == expected else {
@@ -128,12 +91,6 @@ enum CognitionProposalActions {
                 status: .unavailable("The standing view changed before the review could be saved."),
                 detail: detail
             )
-        }
-        // The in-memory recheck above cannot see a failed store write, so the
-        // review used to report success and then reappear as pending on the
-        // next launch (2026-09-06).
-        if let failure = resolved.persistenceFailure {
-            return ResolveOutcome(status: .notSaved(failure), detail: detail)
         }
         return ResolveOutcome(status: .applied(expected), detail: detail)
     }
@@ -233,7 +190,8 @@ enum CognitionObservatoryPresentation {
     static func standingViewStatus(_ view: CognitiveStandingView) -> String {
         switch view.status {
         case .active:
-            return "active lens since \(view.updatedAt.formatted(date: .abbreviated, time: .omitted)) — \(view.evidenceNodeIds.count) felt moments"
+            // Phase 5 D: independent occurrences, not nodes re-reading dragged along.
+            return "active lens since \(view.updatedAt.formatted(date: .abbreviated, time: .omitted)) — \(view.independentOccurrenceCount) independent occurrence(s)"
         case .held:
             // Named for what it IS: the agent's, unsigned, and yours to end.
             return "held by \(AgentVoice.live.object) since \(view.updatedAt.formatted(date: .abbreviated, time: .omitted)) — no signature needed, retire any time"
@@ -241,6 +199,11 @@ enum CognitionObservatoryPresentation {
             return "retired"
         case .proposed:
             return "proposed — waiting for your call"
+        case .opinion:
+            // Phase 5 D1: formed on independent recurrence, with its reasons. Hers.
+            return "\(AgentVoice.live.possessive) opinion — because \(view.because)"
+        case .interest:
+            return "\(AgentVoice.live.possessive) interest — fades unless revisited"
         }
     }
 

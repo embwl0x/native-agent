@@ -202,42 +202,6 @@ public enum NativeAgentA2AWire {
         guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return false }
         return n.doubleValue >= 0 && n.doubleValue <= Double(Int32.max) && n.doubleValue.rounded() == n.doubleValue
     }
-    static func acknowledgement(_ send: Send, status: Int, body: [String: Any]) -> [String: Any] {
-        guard status == 200, body["ack"] as? String == "enqueued",
-              let request = body["requestId"] as? String, UUID(uuidString: request) != nil,
-              let context = body["sessionId"] as? String, validContext(context) else {
-            return error(send.rpcID, -32603, "Enqueue not confirmed; outcome unknown. Do not automatically resend. Task ID: \(send.taskID)")
-        }
-        return result(send.rpcID, ["kind": "task", "id": "na3.\(context).\(request)", "contextId": context,
-                                  "status": ["state": "submitted"],
-                                  "metadata": ["receiptRetention": "Best effort; absent receipts do not prove failure or authorize replay"]])
-    }
-    static func receipt(id: Any, task: String, context: String, request: String, body: [String: Any]) -> [String: Any] {
-        guard body["status"] as? String == "ok", body["request_id"] as? String == request,
-              body["session_id"] as? String == context else {
-            return error(id, -32001, "No exact retained task receipt is available. The task may still be running, or evidence may be unavailable. Do not resend based on absence.")
-        }
-        guard body["has_more"] as? Bool != true else {
-            return error(id, -32603, "Reply exceeds this endpoint's 16000-character output limit; recover through /agent/reply using the task's request and context IDs")
-        }
-        let original = body["original_status"] as? String ?? "unknown"
-        let state: String
-        switch original {
-        case "ok": state = "completed"
-        case "chat_failed", "no_reply": state = "failed"
-        default: return error(id, -32603, "Retained receipt has an unrecognized terminal state")
-        }
-        var taskBody: [String: Any] = ["kind": "task", "id": task, "contextId": context, "status": ["state": state]]
-        if original == "no_reply" {
-            taskBody["status"] = ["state": state, "message": ["kind": "message", "role": "agent",
-                "messageId": request + "-no-reply", "contextId": context, "taskId": task,
-                "parts": [["kind": "text", "text": "The turn ended without an answer. Work may have occurred; this does not authorize automatic replay."]]]]
-        }
-        if let reply = body["reply"] as? String, !reply.isEmpty {
-            taskBody["artifacts"] = [["artifactId": request, "parts": [["kind": "text", "text": reply]]]]
-        }
-        return result(id, taskBody)
-    }
     public static func card(port: UInt16, version: String = "1.0", agentName: String? = nil, extended: Bool = false,
                      grpcPort: UInt16? = nil) -> [String: Any] {
         let agent = agentName ?? PeerFacingIdentity.agentName

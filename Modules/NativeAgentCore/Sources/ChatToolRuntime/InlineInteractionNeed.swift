@@ -32,6 +32,8 @@ public enum InlineInteractionNeed {
     /// Setup is skipped without blocking unrelated work; questions still
     /// carry needs_input. Both retain the typed card for durable persistence.
     public static func envelope(_ interaction: InlineInteraction) -> JSONValue {
+        // A skill's step never raises a card: it hands back to her.
+        if SkillRunContext.handsBack { return SkillRunContext.handBack(interaction.title) }
         var object: [String: JSONValue] = [
             "status": .string(blocksTurn(interaction) ? InlineInteractionWire.waitingStatus : "skipped"),
             "kind": .string(interaction.kind.rawValue),

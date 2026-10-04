@@ -30,6 +30,7 @@ public protocol MaintenanceBackgroundWorkPort: BackgroundWorkNotificationPort {
 }
 
 public protocol DelegationBackgroundWorkPort: BackgroundWorkEventPort, BackgroundWorkNotificationPort {
+    func retryRequestedResults(dataRoot: URL) async
     var agentSubject: String { get }
     func observeMotorActionState(_ model: MotorActionReadModel) async
     func reconcileAgentConversations() async throws

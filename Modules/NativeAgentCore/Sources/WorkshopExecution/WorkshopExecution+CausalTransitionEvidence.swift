@@ -42,7 +42,9 @@ public extension SwiftNativeWorkshopRunner {
         default: "high_risk"
         }
         let inputClass: String = {
-            if record.triggerSource == "manual" { return "manual" }
+            // workshop_submit's "agent" is the same directed input as before
+            // it was told apart from the person's own, so procedures stay one family.
+            if record.triggerSource == "manual" || record.triggerSource == "agent" { return "manual" }
             if record.triggerSource.hasPrefix("trigger:") { return "scheduled" }
             if record.triggerSource == "golden_eval" { return "evaluation" }
             return "background"
@@ -165,7 +167,12 @@ public extension SwiftNativeWorkshopRunner {
             let occurredAt: String
             if case .string(let timestamp)? = row["ts"] { occurredAt = timestamp }
             else { occurredAt = "unknown" }
-            let afterState = workshopState(after: event, prior: priorState)
+            let interruptedState: String? = {
+                guard event == "execution_interrupted" else { return nil }
+                if case .string(let status)? = row["status"] { return status }
+                return "blocked_on_reconciliation"
+            }()
+            let afterState = interruptedState ?? workshopState(after: event, prior: priorState)
             let step: WorkshopExecutionStep? = {
                 guard case .string(let stepID)? = row["step_id"] else { return nil }
                 return planByStepID[stepID]
@@ -225,7 +232,9 @@ public extension SwiftNativeWorkshopRunner {
                 kind: recognizedWorkshopEvent(event),
                 beforeState: priorState,
                 afterState: afterState,
-                expectedNextEvidence: expectedWorkshopEvidence(after: event),
+                expectedNextEvidence: event == "execution_interrupted"
+                    ? (afterState == "queued" ? "execution_start" : "domain_reconciliation")
+                    : expectedWorkshopEvidence(after: event),
                 outcome: outcome,
                 trajectoryID: itemIdentity,
                 parentOperationID: priorOperationID,
@@ -245,10 +254,12 @@ public extension SwiftNativeWorkshopRunner {
                 actionKind: procedureActionKind(event: event, tool: step?.toolOrAction),
                 evidenceKind: procedureEvidenceKind(event: event, row: row),
                 checkpointClass: procedureCheckpointClass(event: event),
-                retryClass: event == "execution_interrupted" ? "deterministic_resume" : nil,
+                retryClass: event == "execution_interrupted"
+                    ? (afterState == "queued" ? "deterministic_resume" : "reconciliation_required") : nil,
                 retryCount: terminalClass == nil ? nil : record?.rerunCount,
                 cancellationClass: event == "cancelled" ? "canonical_user_cancellation" : nil,
-                externalEffectClass: procedureExternalEffectClass(
+                externalEffectClass: event == "execution_interrupted" && afterState != "queued"
+                    ? "unknown" : procedureExternalEffectClass(
                     event: event,
                     tool: step?.toolOrAction
                 ),
@@ -303,7 +314,6 @@ public extension SwiftNativeWorkshopRunner {
         case "completed": return "completed"
         case "failed": return "failed"
         case "cancelled": return "cancelled"
-        case "execution_interrupted": return "queued"
         default: return prior
         }
     }

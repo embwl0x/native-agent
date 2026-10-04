@@ -629,7 +629,7 @@ public enum MacScreenRender {
         if hidden > 0 {
             // Spoken, in place, with the recourse. A silent cap is the exact
             // thing this renderer exists to stop.
-            let recourse = content.scrollable ? "scrollable" : "raise maxRows"
+            let recourse = content.scrollable ? "scrollable" : "inspect this section using part or name the target"
             block.lines.append(indentedNote("… \(hidden) more below (\(recourse))"))
         }
         return block
@@ -652,15 +652,18 @@ public enum MacScreenRender {
             if let value = control.value {
                 detail += " = " + (value.display ?? redactedMarker)
             }
-            if !control.states.isEmpty {
+            if !control.states.isEmpty, !control.provenance.isVision {
                 detail += " (" + control.states.joined(separator: ", ") + ")"
             }
+            let details = [MacScreenText(detail, redacted: .string(detail))]
+                + (control.provenance.isVision
+                    ? control.states.map { MacScreenText($0, redacted: .string($0)) } : [])
             block.lines.append(rowLine(
                 ordinal: nil,
                 roleAddress: control.ordinal.map { "\(control.kind) \($0)" },
                 row: Row(
                     label: control.label,
-                    detail: [MacScreenText(detail, redacted: .string(detail))],
+                    detail: details,
                     provenance: control.provenance,
                     abstain: control.abstain
                 ),
@@ -670,7 +673,7 @@ public enum MacScreenRender {
         if hidden > 0 {
             let observedHidden = max(0, screen.controls.count - kept.count)
             if observedHidden > 0 {
-                block.lines.append(indentedNote("… \(observedHidden) observed controls not shown (screen part: controls, or name a control)"))
+                block.lines.append(indentedNote("… \(observedHidden) observed controls not shown (look again with part: controls, or name a control)"))
             }
             let unavailable = max(0, hidden - observedHidden)
             if unavailable > 0 {
@@ -714,7 +717,7 @@ public enum MacScreenRender {
         if hidden > 0 {
             let observedHidden = max(0, screen.values.count - kept.count)
             if observedHidden > 0 {
-                block.lines.append(indentedNote("… \(observedHidden) observed readouts not shown (screen part: hud, or name a readout)"))
+                block.lines.append(indentedNote("… \(observedHidden) observed readouts not shown (look again with part: hud, or name a readout)"))
             }
             let unavailable = max(0, hidden - observedHidden)
             if unavailable > 0 {
@@ -950,7 +953,9 @@ public enum MacScreenRender {
                 if !affordance.enabled { states.append("disabled") }
                 if affordance.selected == true { states.append("selected") }
                 if affordance.secret { states.append("secure") }
-                if isTextEntry(affordance.role), affordance.value == nil { states.append("empty") }
+                if isTextEntry(affordance.role), affordance.value == nil, affordance.labelSource != "value" {
+                    states.append("empty")
+                }
                 controls.append(Control(
                     label: label,
                     kind: kind,

@@ -86,7 +86,7 @@ public enum AgentHostConnection {
 
     public static func propose(name: String, store: AgentPeerStore, dataRoot: URL, workspace: String? = nil, workingDirectory: String? = nil) throws -> Proposal {
         guard var row = AgentHostDirectory.row(named: name) else { throw Refusal.unknownHost(name) }
-        guard row.settingsSupported || row.acp != nil || row.route == .grokBot else { throw Refusal.unknownHost(name) }
+        guard row.settingsSupported || row.format == .shellEnvironment || row.acp != nil || row.route == .grokBot else { throw Refusal.unknownHost(name) }
         let folder = try workspaceFolder(row: row, workspace: workspace)
         if let folder { row.configPath = folder + "/" + row.configPath }
         guard row.isInstalled else { throw Refusal.notInstalled(row.displayName) }
@@ -141,7 +141,7 @@ public enum AgentHostConnection {
 
     static func settingsPath(contact: AgentPeerContact) -> String? {
         guard let row = AgentHostDirectory.rows.first(where: { $0.id == AgentPeerStore.hostRowID(contact.endpoint) }) else { return nil }
-        guard row.settingsSupported else { return nil }
+        guard row.settingsSupported || row.format == .shellEnvironment else { return nil }
         return row.requiresWorkspace ? contact.hostWorkspace.map { $0 + "/" + row.configPath } : row.expandedConfigPath
     }
 
@@ -152,6 +152,15 @@ public enum AgentHostConnection {
     /// reads.
     public static func cardText(_ proposal: Proposal, appName: String) -> String {
         let row = proposal.row
+        if row.format == .shellEnvironment {
+            return """
+            Connect \(row.displayName) to \(appName)?
+            I'll create this contact's own messaging key and a private (0600) environment file at \(row.expandedConfigPath). No ChatGPT settings are edited.
+            Dot can message me through this Mac's installed nativeagent-link command and read my answer in the same command, or use reply if the answer is enqueued. I can message Dot in its current ChatGPT conversation after checking the running app and conversation.
+            Dot is an outside agent. Its Trust switch starts off; requests use the normal per-agent permission checks.
+            Disconnect removes the environment file, revokes the key and removes the contact. This does not open network access.
+            """
+        }
         if row.route == .grokBot {
             return """
             Connect to Grok Bot?
@@ -260,7 +269,7 @@ public enum AgentHostConnection {
             guard proposal.existing == nil else { throw Refusal.alreadyConnected(proposal.row.displayName) }
         }
         let row = proposal.row
-        guard row.settingsSupported || row.acp != nil else { throw Refusal.unknownHost(row.displayName) }
+        guard row.settingsSupported || row.format == .shellEnvironment || row.acp != nil else { throw Refusal.unknownHost(row.displayName) }
         guard let endpoint = URL(string: (row.acp == nil ? "mcp://" : "acp://") + row.id) else { throw Refusal.unknownHost(row.id) }
         var contact = AgentPeerContact(id: proposal.contactID, name: row.displayName, endpoint: endpoint, transport: row.acp == nil ? .mcpHost : .acp)
         if row.acp != nil {
@@ -271,6 +280,10 @@ public enum AgentHostConnection {
         }
         contact.hostWorkspace = proposal.workspace
         contact.approvedExecutablePath = proposal.executable?.path ?? proposal.executablePath
+        // A command contact's receipt: the file a Full Mac launch of it may run.
+        if row.acp == nil, row.commandLine != nil, let path = contact.approvedExecutablePath {
+            contact.acpExecutable = try? AgentACPExecutable.capture(path: path)
+        }
         contact.credentialKey = AgentPeerContact.credentialKey(for: contact.id)
         try AgentPeerStore.validate(contact)
 
@@ -282,6 +295,9 @@ public enum AgentHostConnection {
                 outcome = AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false)
             } else {
             switch row.format {
+            case .shellEnvironment:
+                outcome = try AgentHostConfigWriter.writeEnvironment(path: row.expandedConfigPath,
+                    descriptorPath: proposal.descriptorPath, peerID: contact.id, secret: secret)
             case .sessionMCP:
                 outcome = AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false)
             case .jsonMCPServers, .jsonBareMCPServers, .jsonContextServers, .jsonServers:
@@ -332,6 +348,25 @@ public enum AgentHostConnection {
         }
     }
 
+    package static func ensureEnvironment(proposal: Proposal, store: AgentPeerStore) throws
+        -> (contact: AgentPeerContact, repaired: Bool) {
+        guard let contact = proposal.existing, proposal.row.format == .shellEnvironment else {
+            throw Refusal.unknownHost(proposal.row.displayName)
+        }
+        let saved = try AgentPeerCredentials.read(peerID: contact.id)
+        let secret = try saved ?? mintKey()
+        if saved == nil { try AgentPeerCredentials.write(secret, peerID: contact.id) }
+        do {
+            let repaired = try AgentHostConfigWriter.ensureEnvironment(path: proposal.row.expandedConfigPath,
+                descriptorPath: proposal.descriptorPath, peerID: contact.id, secret: secret)
+            let settled = saved == nil ? try store.upsert(contact, resetProof: true) : contact
+            return (settled, repaired || saved == nil)
+        } catch {
+            if saved == nil { try? AgentPeerCredentials.delete(peerID: contact.id) }
+            throw error
+        }
+    }
+
     /// Disconnect removes exactly our entry and revokes that connection's key.
     public static func disconnect(contact: AgentPeerContact, store: AgentPeerStore) throws
         -> AgentHostConfigWriter.Outcome? {
@@ -342,7 +377,7 @@ public enum AgentHostConnection {
             _ = try store.remove(contact.id)
             return AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: true)
         }
-        guard row.settingsSupported else { throw Refusal.unknownHost(row.displayName) }
+        guard row.settingsSupported || row.format == .shellEnvironment else { throw Refusal.unknownHost(row.displayName) }
         if let path = settingsPath(contact: contact) { row.configPath = path }
         // Keep the contact and ownership receipt until revocation succeeds,
         // so a failed removal or key deletion can be retried.
@@ -350,8 +385,10 @@ public enum AgentHostConnection {
         let outcome = try removeEntry(row: row, store: store, peerID: contact.id)
         try AgentPeerCredentials.delete(peerID: contact.id)
         _ = try store.remove(contact.id)
-        try AgentHostConfigWriter.removeBackups(path: row.expandedConfigPath,
-            recordURL: backupRecordURL(row: row, store: store))
+        if row.format != .shellEnvironment {
+            try AgentHostConfigWriter.removeBackups(path: row.expandedConfigPath,
+                recordURL: backupRecordURL(row: row, store: store))
+        }
         return outcome
     }
 
@@ -382,6 +419,9 @@ public enum AgentHostConnection {
 
     private static func removeEntry(row: AgentHostRow, store: AgentPeerStore, peerID: String? = nil) throws -> AgentHostConfigWriter.Outcome {
         switch row.format {
+        case .shellEnvironment:
+            guard let peerID else { throw Refusal.unknownHost(row.displayName) }
+            return try AgentHostConfigWriter.removeEnvironment(path: row.expandedConfigPath, peerID: peerID)
         case .sessionMCP:
             return AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: true)
         case .jsonMCPServers, .jsonBareMCPServers, .jsonContextServers, .jsonServers:

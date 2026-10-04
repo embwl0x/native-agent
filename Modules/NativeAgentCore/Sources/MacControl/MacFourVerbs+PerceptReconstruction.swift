@@ -34,7 +34,14 @@ extension MacFourVerbs {
                     label: label,
                     handle: string(focus["handle"]),
                     path: path(focus["path"]),
-                    labelJSON: labelJSON
+                    labelJSON: labelJSON,
+                    selectionRange: {
+                        let range = object(focus["selection_range"])
+                        guard let rawLocation = int(range["location"]), let rawLength = int(range["length"]),
+                              let location = Int(exactly: rawLocation), let length = Int(exactly: rawLength),
+                              location >= 0, length >= 0, location <= Int.max - length else { return nil }
+                        return NSRange(location: location, length: length)
+                    }()
                 )
             },
             modal: string(modal["role"]).map { role in

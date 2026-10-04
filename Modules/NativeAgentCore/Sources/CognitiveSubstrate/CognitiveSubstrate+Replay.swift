@@ -292,7 +292,12 @@ extension CognitiveSubstrate {
     }
 
     public func developmentalTimelineSnapshot(limit: Int = 40) async -> [CognitiveDevelopmentalTimelineEvent] {
-        developmentalTimeline.values.sorted { lhs, rhs in
+        // Phase 5 D: flag off, opinion and interest history is hidden too.
+        let hidden: Set<UUID> = configuration.viewsExperimentEnabled ? [] : Set(standingViews.values
+            .filter { $0.status == .opinion || $0.status == .interest }.map(\.id))
+        return developmentalTimeline.values
+            .filter { event in event.artifactId.map { !hidden.contains($0) } ?? true }
+            .sorted { lhs, rhs in
             if lhs.occurredAt != rhs.occurredAt { return lhs.occurredAt > rhs.occurredAt }
             return lhs.id.uuidString < rhs.id.uuidString
         }

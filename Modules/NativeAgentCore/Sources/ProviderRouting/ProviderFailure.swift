@@ -4,6 +4,7 @@ import Foundation
 /// consume a failure, never adapter wording. Cancellation is not a failure.
 public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable {
     case authExpired
+    case codexCLISessionExpired
     case rateLimited(retryAfter: Int?)
     case overloaded
     case contextTooLong
@@ -16,6 +17,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     public var errorDescription: String? {
         switch self {
         case .authExpired: return "Your model connection needs attention; reconnect it in Settings."
+        case .codexCLISessionExpired: return "Your Codex CLI sign-in needs updating. Run codex once, or sign in in NativeAgent."
         case .rateLimited: return "The usage limit was reached; wait a while or choose another model."
         case .overloaded: return "The model is busy; try again in a moment."
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
@@ -232,9 +234,22 @@ extension ProviderFailure {
     public struct Report: Error, Codable, Equatable, Sendable, LocalizedError, ProviderFailureWrapping {
         public let cause: ProviderFailure
         public let work: WorkState
-        public init(cause: ProviderFailure, work: WorkState) { self.cause = cause; self.work = work }
+        public let permitsWholeTurnRetry: Bool
+        public init(cause: ProviderFailure, work: WorkState, permitsWholeTurnRetry: Bool = true) {
+            self.cause = cause
+            self.work = work
+            self.permitsWholeTurnRetry = permitsWholeTurnRetry && work == .nothingRan
+        }
+        private enum CodingKeys: String, CodingKey { case cause, work, permitsWholeTurnRetry }
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(
+                cause: try values.decode(ProviderFailure.self, forKey: .cause),
+                work: try values.decode(WorkState.self, forKey: .work),
+                permitsWholeTurnRetry: try values.decodeIfPresent(Bool.self, forKey: .permitsWholeTurnRetry) ?? true
+            )
+        }
         public var providerFailureCause: Error { cause }
-        public var permitsWholeTurnRetry: Bool { work == .nothingRan }
         public var providerWorkState: WorkState? { work }
         public var errorDescription: String? {
             (cause.errorDescription ?? "The reply could not be completed.") + " Work: " + work.rawValue + "."
@@ -252,6 +267,10 @@ extension ProviderFailure {
             guard let wrapper = error as? any ProviderFailureWrapping else { return nil }
             return wrapper.providerWorkState ?? observed(wrapper.providerFailureCause)
         }
-        return Report(cause: cause, work: work ?? observed(error) ?? (cause == .network ? .outcomeUnknown : .nothingRan))
+        return Report(
+            cause: cause,
+            work: work ?? observed(error) ?? (cause == .network ? .outcomeUnknown : .nothingRan),
+            permitsWholeTurnRetry: ProviderRecoveryPolicy.permitsWholeTurnRetry(error)
+        )
     }
 }

@@ -2,9 +2,9 @@ import Foundation
 
 public enum MemoryCandidateQuality {
     /// The reason string the mid-thought fragment gate emits. Named because
-    /// hygiene has to be able to single this one rule out: it archived
-    /// "user's dyslexia is a bitch sometimes" (use_count 477) on 2026-08-24,
-    /// and the usage-protection veto keys off exactly this reason.
+    /// hygiene has to be able to single this one rule out (for example, the
+    /// synthetic fragment "the project could"). The usage-protection
+    /// veto keys off exactly this reason.
     public static let midThoughtFragmentReason = "mid-thought fragment is not durable memory"
 
     public static func rejectionReason(text: String, source: String? = nil, kind: String? = nil) -> String? {
@@ -16,13 +16,13 @@ public enum MemoryCandidateQuality {
         if isToolTranscriptNoise(normalized) {
             return "tool transcript/status output is not durable memory"
         }
-        if isIncompleteSemanticFragment(normalized, kind: kind) {
+        if isAutomaticExtractionSource(source), isIncompleteSemanticFragment(normalized, kind: kind) {
             return "incomplete semantic fragment is not durable memory"
         }
         if isIncompleteThought(normalized, source: source) {
             return midThoughtFragmentReason
         }
-        if isConversationalVapor(normalized, kind: kind) {
+        if isAutomaticExtractionSource(source), isConversationalVapor(normalized, kind: kind) {
             return "low-quality conversational fragment is not durable memory"
         }
         if isAutomaticExtractionSource(source),
@@ -110,13 +110,9 @@ public enum MemoryCandidateQuality {
     /// patterns only catch preposition/verb stubs — so word-safe but
     /// meaning-dead captures like "user wants agent", "user likes how
     /// sometimes she", and "user's design review is now" all reached the
-    /// review queue. A durable fact never ENDS on a function word, and a
-    /// verb-form capture whose object is a single bare token is a clipped
-    /// sentence, not a fact — whatever its kind claims.
-    /// Closed-class words that essentially never end a durable sentence, for
-    /// ANY source — articles, prepositions, conjunctions, aux/copulas,
-    /// wh-words, possessive determiners. "user's design review is" or
-    /// "user wants out of" is clipped no matter who wrote it.
+    /// review queue. These ambiguous word-tail heuristics apply only to
+    /// automatic extraction: deliberate facts can end in function words,
+    /// including titles such as "Catch Me If You Can".
     private static let hardTailStopwords: Set<String> = [
         "a", "an", "the", "this", "these", "those", "some", "any",
         "my", "your", "their", "our",
@@ -131,10 +127,6 @@ public enum MemoryCandidateQuality {
         "when", "where", "how", "which", "whom", "why",
         "whether",
     ]
-    // "his"/"her"/"who" are deliberately NOT hard tails: pronoun records
-    // ("user's pronouns are she/her") and proper names ("The Who") are
-    // legitimate deliberate stores. They reject only for automatic sources.
-
     /// Additional tails rejected only for AUTOMATIC extraction sources: bare
     /// pronouns and dangling adverbs. Deliberate stores may legitimately end
     /// on these ("...and User loved it"); a regex capture ending there is a
@@ -162,17 +154,16 @@ public enum MemoryCandidateQuality {
     ]
 
     private static func isIncompleteThought(_ text: String, source: String?) -> Bool {
+        guard isAutomaticExtractionSource(source) else { return false }
         let words = text.split { !($0.isLetter || $0.isNumber || $0 == "'") }
             .map(String.init)
         guard let last = words.last?.lowercased() else { return true }
         if hardTailStopwords.contains(last) { return true }
         // A copula followed by a bare adverb/yes/no is a missing complement
-        // for any source ("user's design review is now", "user's answer is
-        // no") — the adverb alone is only suspicious after the copula.
+        // in automatic captures ("user's design review is now").
         if matches(text, #"\b(?:is|are|was|were|be|been|being)\s+(?:now|then|still|yet|often|sometimes|always|never|really|very|quite|too|also|no|yes)$"#) {
             return true
         }
-        guard isAutomaticExtractionSource(source) else { return false }
         if automaticTailStopwords.contains(last) { return true }
         // Verb-form captures need a real object: after the lead-in, a single
         // remaining token ("agent", "coffee") is a clipped sentence.

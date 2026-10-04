@@ -5,7 +5,6 @@ import NativeAgentCore
 // MARK: - Data root resolution
 
 /// Marker files that prove a directory is a NativeAgent source repo.
-/// Keep in sync with `NativeAgentPaths.isValidRepoStamp` in the app layer.
 private let repoMarkerFiles: [String] = [
     "persona/SOUL.template.md",
     "script/init_persona.sh",

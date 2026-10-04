@@ -224,6 +224,9 @@ public struct MacScreenViewMark: Sendable, Equatable {
     /// captions its CVV box by ENCLOSING it, not by sitting left of it, and the
     /// mark has no other way to know.
     public let enclosingCaption: MacScreenViewTextRedaction.EnclosingCaptionKinds
+    /// Redaction objects judged against the complete captured node context.
+    public let labelRedaction: JSONValue?
+    public let valueRedaction: JSONValue?
 
     public init(
         mark: Int,
@@ -237,7 +240,9 @@ public struct MacScreenViewMark: Sendable, Equatable {
         frame: MacAXFrame,
         path: [Int],
         actions: [String] = [],
-        enclosingCaption: MacScreenViewTextRedaction.EnclosingCaptionKinds = .none
+        enclosingCaption: MacScreenViewTextRedaction.EnclosingCaptionKinds = .none,
+        labelRedaction: JSONValue? = nil,
+        valueRedaction: JSONValue? = nil
     ) {
         self.mark = mark
         self.role = role
@@ -251,6 +256,8 @@ public struct MacScreenViewMark: Sendable, Equatable {
         self.path = path
         self.actions = actions
         self.enclosingCaption = enclosingCaption
+        self.labelRedaction = labelRedaction
+        self.valueRedaction = valueRedaction
     }
 
     /// The legend row the model sees.
@@ -277,7 +284,7 @@ public struct MacScreenViewMark: Sendable, Equatable {
             // the text beside a code field is frequently the code itself; a
             // title can also literally be the code. Same shape test as the
             // prose channel, applied here so no channel is the weak one.
-            object["label"] = MacScreenViewTextRedaction.redactedLegendString(
+            object["label"] = labelRedaction ?? MacScreenViewTextRedaction.redactedLegendString(
                 label,
                 valueChars: valueChars,
                 // W3.5-FIX-R4 — an untitled field's inferred label is very
@@ -295,7 +302,7 @@ public struct MacScreenViewMark: Sendable, Equatable {
                 // `under: label` — W3.5-FIX-R2 3. A legend row carries its own
                 // caption, so a non-secure field captioned "CVV" showing three
                 // digits is the labeled shape, not a bare number.
-                : MacScreenViewTextRedaction.redactedLegendString(
+                : valueRedaction ?? MacScreenViewTextRedaction.redactedLegendString(
                     value,
                     valueChars: valueChars,
                     under: label,
@@ -688,11 +695,29 @@ public enum MacScreenViewBuilder {
         marks.reserveCapacity(kept.count)
         // W3.5-FIX-R4 — built once from the WHOLE node set (an enclosing group
         // is never itself markable, so it is not in `candidates`).
-        let captions = MacScreenViewTextRedaction.enclosingCaptions(nodes)
+        let context = MacScreenViewTextRedaction.nodeSecretContext(nodes)
         for (index, candidate) in kept.enumerated() {
             let attributes = candidate.node.attributes
             let named = inferLabel(for: candidate.node, frame: candidate.frame, among: nodes)
             let label = named.label
+            let enclosing = MacScreenViewTextRedaction.enclosingKinds(
+                forNodeAt: candidate.frame,
+                path: candidate.node.path,
+                among: context.enclosingCaptions
+            )
+            func redaction(_ text: String?, under caption: String?) -> JSONValue? {
+                guard let text else { return nil }
+                let json = MacScreenViewTextRedaction.redactedNodeString(
+                    text,
+                    valueChars: MacAXLimits.hardValueChars,
+                    frame: candidate.frame,
+                    under: caption,
+                    enclosing: enclosing,
+                    context: context
+                )
+                if case .object = json { return json }
+                return nil
+            }
             marks.append(MacScreenViewMark(
                 mark: index + 1,
                 role: attributes.role,
@@ -709,11 +734,9 @@ public enum MacScreenViewBuilder {
                 frame: candidate.frame,
                 path: candidate.node.path,
                 actions: attributes.actions,
-                enclosingCaption: MacScreenViewTextRedaction.enclosingKinds(
-                    forNodeAt: candidate.frame,
-                    path: candidate.node.path,
-                    among: captions
-                )
+                enclosingCaption: enclosing,
+                labelRedaction: redaction(label, under: nil),
+                valueRedaction: redaction(attributes.value, under: label)
             ))
         }
         return Selection(
@@ -879,20 +902,20 @@ public enum MacScreenViewBuilder {
             if lhs.frame.x != rhs.frame.x { return lhs.frame.x < rhs.frame.x }
             return pathIsBefore(lhs.path, rhs.path)
         }
-        let kept = candidates.prefix(cap)
         // W3.5-FIX 1 — the prose channel is a SECRET CHANNEL too. Marking the
         // secure FIELD's value was only half the job: a 2FA code, a recovery
         // code or a revealed API key is usually STATIC TEXT on the page, not a
         // field value, and this array is persisted in the turn trace and can
         // sync to iOS/Telegram. Redaction happens HERE, at the source, so no
         // caller can construct an un-redacted text channel.
+        let redacted = MacScreenViewTextRedaction.applied(
+            to: candidates.map { VisibleText(text: $0.text, frame: $0.frame) },
+            paths: candidates.map(\.path),
+            context: MacScreenViewTextRedaction.nodeSecretContext(nodes)
+        )
         return TextSelection(
-            items: MacScreenViewTextRedaction.applied(
-                to: kept.map { VisibleText(text: $0.text, frame: $0.frame) },
-                paths: kept.map(\.path),
-                enclosing: MacScreenViewTextRedaction.enclosingCaptions(nodes)
-            ),
-            omitted: max(0, candidates.count - kept.count)
+            items: Array(redacted.prefix(cap)),
+            omitted: max(0, candidates.count - cap)
         )
     }
 
@@ -1109,18 +1132,15 @@ public enum MacScreenViewTextRedaction {
     ///     with `items`. Needed only for the enclosing-caption geometry, which
     ///     is an ANCESTOR relationship and cannot be decided from frames alone.
     ///     Empty (the default) keeps the beside/above behaviour unchanged.
-    ///   - enclosing: the secret-naming groups on this screen.
+    ///   - context: secret captions from the full node set, before output caps.
     public static func applied(
         to items: [MacScreenViewBuilder.VisibleText],
         paths: [[Int]] = [],
-        enclosing: [EnclosingCaption] = []
+        context: NodeSecretContext
     ) -> [MacScreenViewBuilder.VisibleText] {
-        let labels = items.filter { looksLikeSecretLabel($0.text) }
-        let cvvLabels = items.filter { isCardVerificationLabel($0.text) }
-        let seedLabels = items.filter { isSeedPhraseLabel($0.text) }
-        func near(_ candidates: [MacScreenViewBuilder.VisibleText], _ item: MacScreenViewBuilder.VisibleText) -> Bool {
-            candidates.contains { label in
-                label.frame != item.frame && isLabel(label.frame, forValueAt: item.frame)
+        func near(_ frames: [MacAXFrame], _ item: MacScreenViewBuilder.VisibleText) -> Bool {
+            frames.contains { frame in
+                frame != item.frame && isLabel(frame, forValueAt: item.frame)
             }
         }
         return items.enumerated().map { index, item in
@@ -1137,7 +1157,7 @@ public enum MacScreenViewTextRedaction {
             // prints under a "Recovery Phrase" heading are static text).
             if index < paths.count {
                 let kinds = enclosingKinds(
-                    forNodeAt: item.frame, path: paths[index], among: enclosing
+                    forNodeAt: item.frame, path: paths[index], among: context.enclosingCaptions
                 )
                 if let reason = enclosingSecretReason(item.text, kinds: kinds) {
                     return darkened(reason)
@@ -1146,12 +1166,12 @@ public enum MacScreenViewTextRedaction {
             // W3.5-FIX-R2 3 — same two labeled shapes as the inline path, by
             // POSITION: a form puts the CVV box right of its caption and the
             // recovery words directly under theirs.
-            if isShortCodeValue(item.text), near(cvvLabels, item) { return darkened("labeled_cvv") }
-            if isRecoveryPhrase(item.text, minWords: labeledSeedMinWords), near(seedLabels, item) {
+            if isShortCodeValue(item.text), near(context.cvvLabelFrames, item) { return darkened("labeled_cvv") }
+            if isRecoveryPhrase(item.text, labeled: true), near(context.seedLabelFrames, item) {
                 return darkened("labeled_recovery_phrase")
             }
             guard isLabeledSecretValue(item.text) else { return item }
-            guard near(labels, item) else { return item }
+            guard near(context.secretLabelFrames, item) else { return item }
             return darkened("labeled_secret_nearby")
         }
     }
@@ -1184,7 +1204,7 @@ public enum MacScreenViewTextRedaction {
             if isCardVerificationLabel(label), isShortCodeValue(text) {
                 return redactedText(text, reason: "labeled_cvv")
             }
-            if isSeedPhraseLabel(label), isRecoveryPhrase(text, minWords: labeledSeedMinWords) {
+            if isSeedPhraseLabel(label), isRecoveryPhrase(text, labeled: true) {
                 return redactedText(text, reason: "labeled_recovery_phrase")
             }
             if looksLikeSecretLabel(label), isLabeledSecretValue(text) {
@@ -1279,8 +1299,7 @@ public enum MacScreenViewTextRedaction {
         )
     }
 
-    /// The proximity context the prose channel gets for free from `visibleText`:
-    /// which frames on this screen are CAPTIONS naming a secret. Built from the
+    /// Which frames on this screen are CAPTIONS naming a secret. Built from the
     /// WHOLE snapshot — including nodes a `find` query did not match — because a
     /// caption two rows away still names the value beside it.
     public static func nodeSecretContext(_ nodes: [MacAXNode]) -> NodeSecretContext {
@@ -1325,7 +1344,7 @@ public enum MacScreenViewTextRedaction {
             if isCardVerificationLabel(label), isShortCodeValue(text) {
                 return redactedText(text, reason: "labeled_cvv")
             }
-            if isSeedPhraseLabel(label), isRecoveryPhrase(text, minWords: labeledSeedMinWords) {
+            if isSeedPhraseLabel(label), isRecoveryPhrase(text, labeled: true) {
                 return redactedText(text, reason: "labeled_recovery_phrase")
             }
             if looksLikeSecretLabel(label), isLabeledSecretValue(text) {
@@ -1339,7 +1358,7 @@ public enum MacScreenViewTextRedaction {
             if isShortCodeValue(text), near(context.cvvLabelFrames) {
                 return redactedText(text, reason: "labeled_cvv")
             }
-            if isRecoveryPhrase(text, minWords: labeledSeedMinWords), near(context.seedLabelFrames) {
+            if isRecoveryPhrase(text, labeled: true), near(context.seedLabelFrames) {
                 return redactedText(text, reason: "labeled_recovery_phrase")
             }
             if isLabeledSecretValue(text), near(context.secretLabelFrames) {
@@ -1377,7 +1396,11 @@ public enum MacScreenViewTextRedaction {
             )
         }
         if let value = node.attributes.value {
-            object["value"] = redactedNodeString(
+            object["value"] = MacScreenViewBuilder.isSecretField(
+                role: node.attributes.role,
+                subrole: node.attributes.subrole,
+                label: node.attributes.title
+            ) ? MacInjectionResultRedaction.redactedSecret(value) : redactedNodeString(
                 value,
                 valueChars: valueChars,
                 frame: frame,
@@ -1600,7 +1623,7 @@ public enum MacScreenViewTextRedaction {
     static func enclosingSecretReason(_ text: String, kinds: EnclosingCaptionKinds) -> String? {
         guard kinds.any else { return nil }
         if kinds.cvv, isShortCodeValue(text) { return "enclosing_cvv" }
-        if kinds.seed, isRecoveryPhrase(text, minWords: labeledSeedMinWords) {
+        if kinds.seed, isRecoveryPhrase(text, labeled: true) {
             return "enclosing_recovery_phrase"
         }
         if kinds.secret, looksLikeRedactableValue(text) { return "enclosing_secret_caption" }
@@ -1714,7 +1737,7 @@ public enum MacScreenViewTextRedaction {
             if isCardVerificationLabel(label), isShortCodeValue(value) {
                 return "labeled_cvv"
             }
-            if isSeedPhraseLabel(label), isRecoveryPhrase(value, minWords: labeledSeedMinWords) {
+            if isSeedPhraseLabel(label), isRecoveryPhrase(value, labeled: true) {
                 return "labeled_recovery_phrase"
             }
             guard looksLikeSecretLabel(label) else { continue }
@@ -1722,7 +1745,7 @@ public enum MacScreenViewTextRedaction {
             // number or a word run after a secret caption needs its own shape.
             guard looksLikeRedactableValue(value)
                 || isPaymentCardNumber(value)
-                || isRecoveryPhrase(value, minWords: labeledSeedMinWords) else { continue }
+                || isRecoveryPhrase(value, labeled: true) else { continue }
             return "labeled_inline_secret"
         }
         return nil
@@ -1784,16 +1807,16 @@ public enum MacScreenViewTextRedaction {
     /// word may appear. A phrase that happens to contain one of those words is
     /// MISSED rather than a sentence being darkened; that direction of error is
     /// the deliberate one, and a LABELED phrase is caught regardless (see
-    /// `minWords`, dropped to 6 under a seed/recovery caption).
-    static func isRecoveryPhrase(_ raw: String, minWords: Int = 12) -> Bool {
+    /// `labeled`, which also drops the minimum to 6 under that caption).
+    static func isRecoveryPhrase(_ raw: String, labeled: Bool = false) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.count <= 400 else { return false }
         let words = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        guard words.count >= minWords else { return false }
+        guard words.count >= (labeled ? labeledSeedMinWords : 12) else { return false }
         for word in words {
             guard word.count >= 3, word.count <= 8 else { return false }
             guard word.allSatisfy({ $0.isLetter && $0.isLowercase }) else { return false }
-            if proseFunctionWords.contains(word) { return false }
+            if !labeled, proseFunctionWords.contains(word) { return false }
         }
         return true
     }
@@ -1864,13 +1887,13 @@ public enum MacScreenViewTextRedaction {
     /// carrying a known key prefix.
     static func isHighEntropyToken(_ text: String) -> Bool {
         guard !text.contains(where: { $0.isWhitespace }) else { return false }
-        guard text.count <= maxValueChars else { return false }
         let allowed = text.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "." }
         guard allowed else { return false }
         let lowered = text.lowercased()
         if knownSecretPrefixes.contains(where: { lowered.hasPrefix($0) }), text.count >= 12 {
             return true
         }
+        guard text.count <= maxValueChars else { return false }
         guard text.count >= 20 else { return false }
         // A dotted word run (a hostname, a filename, a version) is not a token.
         guard !text.contains(".") else { return false }

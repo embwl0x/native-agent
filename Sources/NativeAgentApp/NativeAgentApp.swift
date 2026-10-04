@@ -14,6 +14,7 @@ import WorkshopExecution
 import SelfImprovement
 import ChatOrchestration
 import MCPDispatcher
+import MacControl
 import BackgroundLoops
 import MemoryV2
 import KnowledgeGraph
@@ -21,6 +22,7 @@ import DreamREMCycle
 import PersistenceCore
 import PersonaEngine
 import OSLog
+import os
 #if canImport(BackgroundTasks)
 import BackgroundTasks
 import DeviceSync
@@ -89,6 +91,7 @@ private final class NativeAgentHotkeyBootstrap {
                         : (voice.errorMessage ?? "Voice capture could not start.")
                 },
                 stopCapture: { await voice.stopListening() },
+                discardCapture: { voice.discardListening() },
                 captureFailureMessage: { voice.errorMessage },
                 submitTurn: { transcript in
                     await appModel.sendChat(transcript)
@@ -127,6 +130,7 @@ private final class NativeAgentHotkeyBootstrap {
                 _ = await voiceTurn.endVoiceTurn()
             }
         }
+        hotkeyManager.onVoiceCancel = { voiceTurn.cancelVoiceTurn() }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             // Re-read at execution time: Settings may change during launch.
@@ -155,6 +159,15 @@ private final class NativeAgentHotkeyBootstrap {
 enum NativeAgentAppMain {
     @MainActor
     static func main() {
+        // A GUI app starts with a soft limit of 256 open files. Launch opens
+        // stores, transcripts and watchers all at once; when the count touched
+        // 256 as RenderBox opened its Metal library, SwiftUI aborted the launch
+        // (RB::load_library precondition, 2026-10-01). Lift the soft limit first.
+        var files = rlimit()
+        if getrlimit(RLIMIT_NOFILE, &files) == 0, files.rlim_cur < 10_240 {
+            files.rlim_cur = min(files.rlim_max, 10_240)
+            _ = setrlimit(RLIMIT_NOFILE, &files)
+        }
         guard !NativeAgentLaunchPreflight.shouldSuppressGUIStart() else {
             NativeAgentLaunchPreflight.writeSuppressedLaunchReceipt()
             return
@@ -190,6 +203,34 @@ enum NativeAgentAppMain {
             if !missing.isEmpty, !AppDelegate.confirmLaunchWithMissingRoots(missing) {
                 return
             }
+        }
+        // Recover the entire Mac action store once, before SwiftUI constructs
+        // any owner that can accept in-process actions. Bridge rebinds recover
+        // only bridge_exec so they cannot interrupt live in-process operations.
+        let dataRoot = NativeAgentPaths.dataRoot
+        let recoveryFinished = DispatchSemaphore(value: 0)
+        let recoveryError = OSAllocatedUnfairLock<String?>(initialState: nil)
+        Task.detached(priority: .userInitiated) {
+            defer { recoveryFinished.signal() }
+            do {
+                let recovered = try await MacControlOperationStore(dataRoot: dataRoot)
+                    .recoverInterruptedOperations()
+                NSLog("[mac-control] startup recovered interrupted operations: %d", recovered)
+            } catch {
+                recoveryError.withLock { $0 = error.localizedDescription }
+            }
+        }
+        recoveryFinished.wait()
+        if let detail = recoveryError.withLock({ $0 }) {
+            NSLog("[mac-control] refusing startup after operation recovery failure: %@", detail)
+            NSApp.setActivationPolicy(.regular)
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "NativeAgent could not recover interrupted Mac actions."
+            alert.informativeText = "NativeAgent stopped before accepting actions. \(detail)"
+            alert.addButton(withTitle: "Quit")
+            alert.runModal()
+            return
         }
         // memory.sqlite has one owner: the graph reaches its kg_* tables
         // through MemoryStorage's pool. Installed before any view or loop can
@@ -269,10 +310,18 @@ struct NativeAgentApp: App {
         // to reach the resolver, or the durable "resumed" claim stands over a
         // turn that never ran and the card is stranded for good.
         InlineInteractionResolver.startTurn = { prompt, sessionID, hideUserBubble in
-            let acceptance = await appModel.sendChat(
-                prompt, sessionId: sessionID, hideUserBubble: hideUserBubble
+            let envelope = ChatToolSessionContext.envelope
+            var origin = ChatMessageOrigin(surface: envelope?.surface ?? "chat", agent: envelope?.agent)
+            origin.peerSources = PeerDataTaint.current?.checkpointSources ?? []
+            origin.elevatedPeerSources = PeerDataTaint.current?.elevatedSources ?? []
+            // Queue admission must retain the steer after task-locals end.
+            let started = await appModel.startChatTurn(
+                prompt, attachments: [], sessionId: sessionID, hideUserBubble: hideUserBubble,
+                requireActiveSession: false, origin: origin
             )
-            switch acceptance {
+            if !hideUserBubble { appModel.publishConversationAnchor(for: started.acceptance) }
+            await started.task?.value
+            switch started.acceptance {
             case .accepted, .queued: return true
             case .rejected: return false
             }
@@ -410,7 +459,7 @@ struct NativeAgentApp: App {
         // single-instance — clicking the menu-bar "Open NativeAgent" item or
         // calling openWindow(id: "main") reuses the existing window instead
         // of stacking new copies on top.
-        Window("NativeAgent", id: "main") {
+        Window("NativeAgent", id: NativeAgentAppCoordinator.mainSceneID) {
             // PATCH-2026-05-29: restart-controls — MainWindowContent wraps
             // ContentView to add the ever-present top toolbar (runtime health dot +
             // Restart App).
@@ -615,6 +664,7 @@ private struct ActivityCaptureMenuBarContent: View {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var approvalNotificationTask: Task<Void, Never>?
+    @MainActor var previousWorkApp: NSRunningApplication?
 
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,

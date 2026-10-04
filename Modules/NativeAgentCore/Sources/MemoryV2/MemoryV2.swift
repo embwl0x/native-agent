@@ -377,18 +377,9 @@ public struct MemoryRecallResult: Sendable, Codable, Equatable {
 
 // MARK: - DeleteMemoryResult
 
-/// Envelope returned by `deleteMemory(id:)`. Mirrors the daemon's two-shape
-/// reply at `/v1/memory/delete`:
-///   - 200 `{"status":"ok", ...}` → `.ok` (file removed, tombstone written)
-///   - 202 `{"status":"pending_approval","approval_id":"..."}` → `.pendingApproval`
-///
-/// The daemon's gate (the retired daemon
-/// `execute_or_queue_memory_admin_action`) is HTTP-caller-context based,
-/// NOT per-memory origin/tag based: only `caller_is_loopback && !via_icloud`
-/// executes directly; every other path queues an approval. SwiftNative
-/// preserves this by parsing whichever envelope the daemon returns —
-/// approval policy stays in one place (Python) and the Swift layer doesn't
-/// fork its own gate.
+/// Result returned by `deleteMemory(id:)`. The Swift implementation deletes
+/// directly and returns `.ok`; Trust authorizes the caller upstream before
+/// invoking the mutation. This storage result does not queue approvals.
 public struct DeleteMemoryResult: Sendable, Equatable {
     public enum Status: String, Sendable, Equatable {
         case ok
@@ -396,12 +387,9 @@ public struct DeleteMemoryResult: Sendable, Equatable {
     }
 
     public var status: Status
-    /// Set when `status == .pendingApproval`. Matches the daemon's
-    /// `approval_id` field so callers can correlate against
-    /// ApprovalInbox records.
+    /// ApprovalInbox identifier when a caller supplies a pending result.
     public var approvalId: String?
-    /// Human-readable message from the daemon ("Memory admin changes
-    /// require approval ..."). Optional on the .ok path.
+    /// Optional human-readable result message.
     public var message: String?
 
     public init(status: Status, approvalId: String? = nil, message: String? = nil) {
@@ -411,56 +399,6 @@ public struct DeleteMemoryResult: Sendable, Equatable {
     }
 
     public static let ok = DeleteMemoryResult(status: .ok)
-}
-
-// MARK: - UpdateMemoryResult
-
-/// Envelope returned by `updateMemoryAdmin(id:update:)`. Mirrors the daemon's
-/// two-shape reply at `/v1/memory/update`, which runs through the SAME
-/// `execute_or_queue_memory_admin_action` gate as `/v1/memory/delete`
-///:
-///   - 200 `{"status":"ok", ...}` → `.ok`
-///   - 202 `{"status":"pending_approval","approval_id":"..."}` → `.pendingApproval`
-///
-/// This is DISTINCT from `MemoryV2Protocol.updateMemory(id:update:)`, which
-/// returns a fully-decoded `MemoryRecord` and is used by the replay/embedding
-/// paths that expect the daemon to echo back the mutated record. The admin
-/// path (pin/unpin/correct from the Mac UI) needs the approval envelope
-/// instead, because the gate may queue the change for approval rather than
-/// apply it — and a 202 envelope has NO `record` field to decode. Keeping the
-/// two methods separate means the SwiftNative gate preserves the daemon's
-/// approval policy verbatim (policy stays in Python) without the UI path
-/// silently throwing on a queued-for-approval response.
-public struct UpdateMemoryResult: Sendable, Equatable {
-    public enum Status: String, Sendable, Equatable {
-        case ok
-        case pendingApproval = "pending_approval"
-    }
-
-    public var status: Status
-    /// Set when `status == .pendingApproval`. Matches the daemon's
-    /// `approval_id` field so callers can correlate against ApprovalInbox.
-    public var approvalId: String?
-    /// Human-readable message from the daemon, when present.
-    public var message: String?
-    /// The full daemon envelope, kept for forward-compat so callers that
-    /// want the echoed record (when the gate applied the change directly)
-    /// can reach it without a second method.
-    public var rawResponse: JSONValue
-
-    public init(
-        status: Status,
-        approvalId: String? = nil,
-        message: String? = nil,
-        rawResponse: JSONValue = .null
-    ) {
-        self.status = status
-        self.approvalId = approvalId
-        self.message = message
-        self.rawResponse = rawResponse
-    }
-
-    public static let ok = UpdateMemoryResult(status: .ok)
 }
 
 // MARK: - Errors
@@ -497,10 +435,6 @@ public protocol MemoryV2Protocol: Sendable {
     func listMemory(kind: String?) async throws -> [MemoryRecord]
     func recallMemory(_ query: MemoryRecallQuery) async throws -> MemoryRecallResult
     func updateMemory(id: String, update: JSONValue) async throws -> MemoryRecord
-    /// Admin-gated update that preserves the daemon's ok / pending_approval
-    /// envelope (used by the Mac UI pin/unpin/correct path). See
-    /// ``UpdateMemoryResult`` for why this is distinct from `updateMemory`.
-    func updateMemoryAdmin(id: String, update: JSONValue) async throws -> UpdateMemoryResult
     func deleteMemory(id: String) async throws -> DeleteMemoryResult
     func v2Status() async throws -> JSONValue
 }
@@ -603,7 +537,18 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
 
     public func updateMemory(id: String, update: JSONValue) async throws -> MemoryRecord {
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        let update = Self.sanitizedMemoryUpdate(update)
+        let existingKind: String?
+        if case .object(let patch) = update, Self.patchKind(patch) == nil,
+           patch["text"] != nil || patch["content"] != nil {
+            guard let lookup = storage as? any MemoryRecordLookupStorage,
+                  let existing = try await lookup.lookupMemoryRecord(id: id) else {
+                throw MemoryV2Error.recordNotFound
+            }
+            existingKind = existing.memoryKind ?? MemoryRecallScoring.kind(of: existing.extras)
+        } else {
+            existingKind = nil
+        }
+        let update = Self.sanitizedMemoryUpdate(update, existingKind: existingKind)
         let newEmbedding = try await reembedIfContentChanged(update: update)
         try await gateUpdatedContentAgainstTombstones(update: update, embedding: newEmbedding, storage: storage)
         let updated = try await storage.updateMemory(
@@ -614,21 +559,6 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         )
         await flushDerivedMemoryChanges()
         return updated
-    }
-
-    public func updateMemoryAdmin(id: String, update: JSONValue) async throws -> UpdateMemoryResult {
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        let update = Self.sanitizedMemoryUpdate(update)
-        let newEmbedding = try await reembedIfContentChanged(update: update)
-        try await gateUpdatedContentAgainstTombstones(update: update, embedding: newEmbedding, storage: storage)
-        _ = try await storage.updateMemory(
-            id: id,
-            patch: update,
-            newEmbedding: newEmbedding?.vector,
-            embeddingEpoch: newEmbedding?.epoch
-        )
-        await flushDerivedMemoryChanges()
-        return .ok
     }
 
     /// Edits go through the same denylist gates as inserts: without this, a
@@ -696,6 +626,12 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     public func embedderDimensions() -> Int? { embedder?.dimensions }
 
     public func embeddingEpoch() -> MemoryEmbeddingEpoch? { embedder?.embeddingEpoch }
+
+    /// Phase 5 D: vectors from the already-resident model, or nil. Never loads.
+    public func embedIfWarm(_ texts: [String]) async -> [[Float]]? {
+        guard let managed = embedder as? ManagedEmbeddingProvider else { return nil }
+        return await managed.embedIfResident(texts)
+    }
 
     public func embeddingRuntimeSnapshot() -> EmbeddingRuntimeSnapshot? {
         guard let embedder else { return nil }
@@ -912,9 +848,9 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         return nil
     }
 
-    private static func sanitizedMemoryUpdate(_ update: JSONValue) -> JSONValue {
+    private static func sanitizedMemoryUpdate(_ update: JSONValue, existingKind: String?) -> JSONValue {
         guard case .object(var obj) = update else { return update }
-        let kind = patchKind(obj)
+        let kind = patchKind(obj) ?? existingKind
         if case .string(let s)? = obj["text"] {
             obj["text"] = .string(MemoryTextClip.memoryDisplayText(s, kind: kind))
         }

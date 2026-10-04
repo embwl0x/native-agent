@@ -278,6 +278,11 @@ public actor ContextSourceMonitor {
         watches.keys.sorted { $0.path < $1.path }
     }
 
+    public func invalidateWatch(for directory: URL) {
+        let directory = directory.standardizedFileURL
+        watches.removeValue(forKey: directory)?.cancel()
+    }
+
     public func stop() {
         for watch in watches.values { watch.cancel() }
         watches.removeAll()

@@ -47,7 +47,7 @@ public actor HumanConversationReplyService {
         // Known setup failures happen before a claim or transcript mutation.
         do {
             let artifacts = try AgentBridgeCompletionRouter.artifacts(deliveryId: deliveryID,
-                surface: deliverySurface, text: text, attachments: [])
+                surface: deliverySurface, text: text, attachments: [], notifyRequestedResult: false)
             try await sender.preflight(surface: deliverySurface, route: route, artifacts: artifacts)
         } catch {
             return failure("unavailable", "This conversation's delivery connection is unavailable. Nothing was saved or sent.")
@@ -70,7 +70,7 @@ public actor HumanConversationReplyService {
             try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: requestDigest)
             let delivery = await AgentBridgeCompletionRouter.deliver(deliveryId: deliveryID,
                 requestDigest: requestDigest, text: text, attachments: [], route: route,
-                sender: sender, lifecycle: lifecycle)
+                sender: sender, lifecycle: lifecycle, notifyRequestedResult: false)
             return .object(["status": .string(delivery.status), "conversation_session_id": .string(id),
                 "title": .string(snapshot.title), "delivery": .string(delivery.delivery),
                 "message": .string(delivery.status == "completed" ? "Reply delivered to this conversation."

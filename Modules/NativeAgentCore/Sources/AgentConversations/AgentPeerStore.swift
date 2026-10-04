@@ -110,7 +110,8 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// transport is. A handshake, an entry, a saved endpoint: all of them are
     /// `setUp`. Only a reply that actually arrived makes a contact `connected`.
     public var state: AgentPeerContactState {
-        if transport == .mcpHost && !canStartTurn { return .setUp }
+        if transport == .mcpHost && !canStartTurn,
+           AgentPeerStore.hostRowID(endpoint).flatMap({ AgentHostDirectory.row(named: $0)?.format }) != .shellEnvironment { return .setUp }
         // Inbound credentials prove a contact's return path. Local command
         // and ACP routes still need their own completed round-trip proof.
         let inboundContact = transport != .acp && transport != .desktop
@@ -125,7 +126,15 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
         return receipt
     }
 
+    /// The exact program approved for this contact, re-verified now — what a
+    /// Full Mac launch runs. nil: none was approved, or it changed since.
+    public var verifiedExecutablePath: String? {
+        guard let receipt = acpExecutable, receipt.isCurrent else { return nil }
+        return receipt.path
+    }
+
     public var canStartTurn: Bool {
+        if ChatGPTDotIPCTransport.owns(self) { return ChatGPTDotIPCTransport.available }
         if transport == .acp { return approvedACPExecutable?.isCurrent == true }
         if transport == .mcpHost {
             return AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.commandLine } != nil
@@ -277,6 +286,21 @@ public struct AgentPeerStore: Sendable {
             peers[index].allowElevation = allowed ? true : nil
             try write(peers)
             return peers[index]
+        }
+    }
+
+    /// Re-approve the program behind a command contact's approved path. Under
+    /// the store lock, so a contact disconnected meanwhile is never written
+    /// back; false when the contact or its approved path is no longer that.
+    @discardableResult public func approveExecutable(peerID: String, path: String) throws -> Bool {
+        try prepareDirectory()
+        return try CredentialFileLock.withLock(fileURL) {
+            var peers = try read()
+            guard let index = peers.firstIndex(where: { $0.id == peerID && $0.transport == .mcpHost }) else { return false }
+            peers[index].approvedExecutablePath = path
+            peers[index].acpExecutable = try AgentACPExecutable.capture(path: path)
+            try write(peers)
+            return true
         }
     }
 

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ToolRegistry
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -22,38 +23,101 @@ public enum MacInjectionArgRedaction {
     /// `keys` is the only place to add one — every sink calls through here.
     static let secretKeysByTool: [String: [String]] = [
         "keystroke": ["text"],
+        "clipboard_write": ["text"],
         "ax_act": ["value"],
         // The closed-loop act action can carry literal typed characters.
         "act": ["text"],
-        // `interaction_act {value:"…"}` is the literal secret the card asked
-        // for — a Notion or GitHub token, a provider API key — and the tool
-        // receipt is persisted to the transcript, which every surface reads
-        // back and syncs. Same class of secret, same count+digest.
-        //
-        // Registering here also nils the card's exact-replay arguments
-        // (`safeInputJSON == inputJSON` in the tool-receipt writer), which is
-        // the point: a replay must never re-send a secret.
-        "interaction_act": ["value"],
-        "app.interaction_act": ["value"],
-        "card_act": ["value"],
-        "answer_card": ["value"],
+        "browser.chrome_type": ["text", "value", "fields"],
+        "browser.chrome_fill": ["text", "value", "fields"],
+        "browser.chrome_navigate": ["text", "value", "fields"],
+        // Retired card names a model may still call from memory: whatever
+        // token it wrote must never reach a receipt or trace in the clear.
+        "interaction_act": ["value"], "card_act": ["value"], "answer_card": ["value"],
     ]
 
     public static func carriesSecretArgs(tool: String) -> Bool {
         secretKeysByTool[normalized(tool)] != nil
     }
 
-    /// Replace every secret-bearing string argument with count + digest.
+    /// The secret args an `app` call carries, by its action.
+    public static func appDoorSecretKeys(_ input: [String: JSONValue]) -> [String] {
+        let keys = AppActionPolicy.action(input: input)?.secretArgs ?? []
+        let foldedTool = ToolNameAliases.ranTool("app", input: input)
+        return Array(Set(keys + (secretKeysByTool[normalized(foldedTool)] ?? []))).sorted()
+    }
+
+    /// Script source that names an action taking a key or token, by its id or
+    /// by its two words apart (`app.card["answer"]`), each a whole word
+    /// ("contacts" does not name act). The runner refuses such a call, but the
+    /// source itself is never kept.
+    public static func namesAppDoorSecretAction(_ source: String) -> Bool {
+        let text = source.lowercased()
+        let words = Set(text.split { !($0.isLetter || $0.isNumber || $0 == "_") }.map(String.init))
+        let actions = AppActionPolicy.secretActionIDs
+            + secretKeysByTool.keys.compactMap { ToolNameAliases.appAction($0) }
+        return actions.contains { id in
+            text.contains(id) || id.split(separator: ".").allSatisfy { words.contains(String($0)) }
+        }
+    }
+
+    public static let appDoorScriptPlaceholder =
+        "[redacted: this script names an action that takes a key or token]"
+
+    /// An `app` call whose args or script could carry a key or token.
+    public static func appDoorCarriesSecret(_ input: [String: JSONValue]) -> Bool {
+        if !appDoorSecretKeys(input).isEmpty { return true }
+        if case .string(let script)? = input["script"] { return namesAppDoorSecretAction(script) }
+        return false
+    }
+
+    /// Replace literal text and form fields with count + digest.
     /// Non-secret arguments and non-injection tools pass through untouched.
     public static func redacted(tool: String, input: [String: JSONValue]) -> [String: JSONValue] {
+        if normalized(tool) == "app" {
+            var out = input
+            if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) {
+                out["script"] = .string(appDoorScriptPlaceholder)
+            }
+            let keys = appDoorSecretKeys(input)
+            if !keys.isEmpty, case .object(let args)? = input["args"] {
+                let safeArgs = redacting(keys, in: args)
+                let foldedTool = ToolNameAliases.ranTool("app", input: input)
+                out["args"] = .object(foldedTool == "app" ? safeArgs : redacted(tool: foldedTool, input: safeArgs))
+            }
+            return out
+        }
         guard let keys = secretKeysByTool[normalized(tool)] else { return input }
+        var out = redacting(keys, in: input)
+        if normalized(tool) == "act", case .array(let steps)? = input["steps"] {
+            out["steps"] = .array(steps.map { step in
+                guard case .object(let args) = step else { return step }
+                return .object(redacting(keys, in: args))
+            })
+        }
+        return out
+    }
+
+    // Keep a form's labels and typed values together in memory for exact replay.
+    // Serializing the whole fields value also covers numeric and boolean inputs.
+    private static func secret(_ key: String, in input: [String: JSONValue]) -> String? {
+        if key == "fields", let fields = input[key], fields != .null {
+            return try? fields.serialize(pretty: false)
+        }
+        guard case .string(let value)? = input[key] else { return nil }
+        return value
+    }
+
+    private static func redacting(_ keys: [String], in input: [String: JSONValue]) -> [String: JSONValue] {
         var out = input
         for key in keys {
-            guard case .string(let secret)? = input[key] else { continue }
+            let secret = secret(key, in: input)
+            guard secret != nil || (key == "fields" && input[key] != nil && input[key] != .null) else { continue }
             out.removeValue(forKey: key)
-            out["\(key)_character_count"] = .int(Int64(secret.count))
-            if let digest = sha256(secret) {
-                out["\(key)_sha256"] = .string(digest)
+            if let secret {
+                out["\(key)_character_count"] = .int(Int64(secret.count))
+                if let digest = sha256(secret) {
+                    out["\(key)_sha256"] = .string(digest)
+                }
             }
             out["\(key)_redacted"] = .bool(true)
         }
@@ -63,29 +127,82 @@ public enum MacInjectionArgRedaction {
     /// The secrets stripped by `redacted`, keyed by argument name. The caller
     /// holds these in memory only — never on disk, never over a wire.
     public static func extractSecrets(tool: String, input: [String: JSONValue]) -> [String: String] {
-        guard let keys = secretKeysByTool[normalized(tool)] else { return [:] }
+        if normalized(tool) == "app" {
+            guard case .object(let args)? = input["args"] else { return [:] }
+            return extractSecrets(
+                tool: ToolNameAliases.ranTool("app", input: input),
+                input: args,
+                keys: appDoorSecretKeys(input)
+            )
+        }
+        return extractSecrets(tool: tool, input: input, keys: secretKeysByTool[normalized(tool)] ?? [])
+    }
+
+    private static func extractSecrets(tool: String, input: [String: JSONValue], keys: [String]) -> [String: String] {
         var out: [String: String] = [:]
         for key in keys {
-            if case .string(let secret)? = input[key] { out[key] = secret }
+            if let secret = secret(key, in: input) { out[key] = secret }
+        }
+        if normalized(tool) == "act", case .array(let steps)? = input["steps"] {
+            for (index, step) in steps.enumerated() {
+                guard case .object(let args) = step else { continue }
+                for (key, secret) in extractSecrets(tool: "keystroke", input: args) {
+                    out["steps.\(index).\(key)"] = secret
+                }
+            }
         }
         return out
     }
 
     /// Put previously-extracted secrets back, dropping the redaction markers.
-    /// Used only on the approved-replay path, and only after the digest check.
+    /// The approved-replay caller verifies the reconstructed count and digest.
     public static func rehydrated(
         tool: String,
         input: [String: JSONValue],
         secrets: [String: String]
     ) -> [String: JSONValue] {
-        guard let keys = secretKeysByTool[normalized(tool)] else { return input }
+        if normalized(tool) == "app" {
+            guard case .object(let args)? = input["args"] else { return input }
+            var out = input
+            out["args"] = .object(rehydrated(
+                tool: ToolNameAliases.ranTool("app", input: input),
+                input: args,
+                secrets: secrets,
+                keys: appDoorSecretKeys(input)
+            ))
+            return out
+        }
+        return rehydrated(tool: tool, input: input, secrets: secrets, keys: secretKeysByTool[normalized(tool)] ?? [])
+    }
+
+    private static func rehydrated(
+        tool: String,
+        input: [String: JSONValue],
+        secrets: [String: String],
+        keys: [String]
+    ) -> [String: JSONValue] {
         var out = input
         for key in keys {
             guard let secret = secrets[key] else { continue }
-            out[key] = .string(secret)
+            if key == "fields" {
+                guard let fields = try? JSONValue.parse(Data(secret.utf8)) else { continue }
+                out[key] = fields
+            } else {
+                out[key] = .string(secret)
+            }
             out.removeValue(forKey: "\(key)_character_count")
             out.removeValue(forKey: "\(key)_sha256")
             out.removeValue(forKey: "\(key)_redacted")
+        }
+        if normalized(tool) == "act", case .array(let steps)? = input["steps"] {
+            out["steps"] = .array(steps.enumerated().map { index, step in
+                guard case .object(let args) = step else { return step }
+                var stepSecrets: [String: String] = [:]
+                for key in keys {
+                    stepSecrets[key] = secrets["steps.\(index).\(key)"]
+                }
+                return .object(rehydrated(tool: "keystroke", input: args, secrets: stepSecrets))
+            })
         }
         return out
     }
@@ -102,9 +219,27 @@ public enum MacInjectionArgRedaction {
     /// True when `input` is the redacted FORM of a secret-bearing call — i.e.
     /// the characters were removed and have to be rehydrated before it can run.
     public static func isRedacted(tool: String, input: [String: JSONValue]) -> Bool {
-        guard let keys = secretKeysByTool[normalized(tool)] else { return false }
+        if normalized(tool) == "app" {
+            if input["script"] == .string(appDoorScriptPlaceholder) { return true }
+            guard case .object(let args)? = input["args"] else { return false }
+            return isRedacted(
+                tool: ToolNameAliases.ranTool("app", input: input),
+                input: args,
+                keys: appDoorSecretKeys(input)
+            )
+        }
+        return isRedacted(tool: tool, input: input, keys: secretKeysByTool[normalized(tool)] ?? [])
+    }
+
+    private static func isRedacted(tool: String, input: [String: JSONValue], keys: [String]) -> Bool {
         for key in keys {
             if case .bool(true)? = input["\(key)_redacted"] { return true }
+        }
+        if normalized(tool) == "act", case .array(let steps)? = input["steps"] {
+            return steps.contains { step in
+                guard case .object(let args) = step else { return false }
+                return isRedacted(tool: "keystroke", input: args)
+            }
         }
         return false
     }
@@ -118,7 +253,7 @@ public enum MacInjectionArgRedaction {
     }
 
     public static func normalized(_ tool: String) -> String {
-        tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        ToolNameAliases.canonical(tool).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 }
 

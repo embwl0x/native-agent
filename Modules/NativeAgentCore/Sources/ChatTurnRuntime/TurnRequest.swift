@@ -1,6 +1,7 @@
 import Foundation
 import CognitiveSubstrate
 import NativeAgentCore
+import TrustCenter
 
 /// Everything one ingress decides about a turn, in one value: what was said,
 /// where it goes, who sent it, and the per-turn facts the engine reads from
@@ -101,7 +102,40 @@ public struct TurnRequest: Sendable {
     /// The binder: this request's task-locals, bound in one place with the
     /// async overload for the whole of `operation`. Anything `operation`
     /// spawns inherits them for its life.
-    public func bind<T>(_ operation: () async throws -> T) async rethrows -> T {
+    ///
+    /// A turn an agent's words start is peer-steered from its first line
+    /// (Agent, 10-02): a named lane (Claude, Codex, OMP) latches the taint
+    /// with its line. The generic peer lane unelevated is the peer's by its
+    /// surface and keeps its line; elevated, it marks the peer as elevated,
+    /// so only the floor acts card.
+    public func bind<T>(isolation: isolated (any Actor)? = #isolation,
+                        _ operation: () async throws -> T) async rethrows -> T {
+        if case .some(.some(let origin)) = origin, let sources = origin.peerSources {
+            let taint = PeerDataTaint.current ?? PeerDataTaint()
+            for source in sources { taint.mark(peer: source, attested: false) }
+            for source in origin.elevatedPeerSources ?? [] { taint.markElevated(peer: source, attested: false) }
+            // Recorded steering, including an empty record, is authoritative.
+            return try await Self.bound(PeerDataTaint.$current, taint) {
+                try await bindContext(operation)
+            }
+        }
+        guard case .some(.some(let origin)) = origin, origin.authored == .agent,
+              let agent = origin.agent, agent != "self", !agent.hasPrefix("bot:") else {
+            return try await bindContext(operation)
+        }
+        let taint = PeerDataTaint.current ?? PeerDataTaint()
+        if agent != "agent" {
+            taint.mark(peer: agent, line: message)
+        } else if PeerTurnEffectPolicy.isPeerBridge(surface: surface) {
+            taint.keep(line: message)
+        } else {
+            taint.markElevated(peer: (envelope ?? nil)?.verifiedUserId.map { "peer:" + $0 } ?? "a peer", line: message)
+        }
+        return try await Self.bound(PeerDataTaint.$current, taint) { try await bindContext(operation) }
+    }
+
+    private func bindContext<T>(isolation: isolated (any Actor)? = #isolation,
+                               _ operation: () async throws -> T) async rethrows -> T {
         try await Self.bound(ChatToolSessionContext.$envelope, envelope) {
             try await Self.bound(ChatToolSessionContext.$verifiedSessionId, verifiedSessionID) {
                 try await Self.bound(ChatToolSessionContext.$verifiedChatId, verifiedChatID) {
@@ -165,6 +199,7 @@ public struct TurnRequest: Sendable {
     private static func bound<V: Sendable, T>(
         _ local: TaskLocal<V?>,
         _ value: V??,
+        isolation: isolated (any Actor)? = #isolation,
         _ operation: () async throws -> T
     ) async rethrows -> T {
         guard let value else { return try await operation() }

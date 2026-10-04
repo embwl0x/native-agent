@@ -47,6 +47,8 @@ public actor MCPSubprocessPool {
     /// wiping the winner from the pool. We coalesce: the first cold caller
     /// installs a Task here, every subsequent caller joins via `.value`.
     private var spawnTasks: [String: Task<MCPSubprocess, Error>] = [:]
+    /// Stop retires checkouts too, so their retries cannot resurrect a child.
+    private var checkoutGenerations: [String: UUID] = [:]
     /// Test/telemetry counter for actual spawn bodies entered per server.
     /// This intentionally increments in `_performSpawn`, not `get()`, so it
     /// proves concurrent cold callers joined the same spawn task.
@@ -161,6 +163,7 @@ public actor MCPSubprocessPool {
         for id in specs.keys where !newIDs.contains(id) {
             // 2026-09-06: removal must retire in-flight ownership as well.
             spawnTasks.removeValue(forKey: id)?.cancel()
+            checkoutGenerations.removeValue(forKey: id)
             crashes.removeValue(forKey: id)
             processGenerations.removeValue(forKey: id)
             spawnAttemptCounts.removeValue(forKey: id)
@@ -214,9 +217,13 @@ public actor MCPSubprocessPool {
     /// spawn is detected via `isRunning` and converted into the same crash
     /// backoff flow — otherwise a crashloop would respawn on every request.
     public func get(serverId: String) async throws -> MCPSubprocess {
+        guard specs[serverId] != nil else { throw MCPDispatcherError.serverNotFound(serverId) }
+        let checkoutGeneration = checkoutGenerations[serverId] ?? UUID()
+        checkoutGenerations[serverId] = checkoutGeneration
         if let existing = processes[serverId] {
             let existingRunning = await existing.isRunning
             if let hook = _getPostAwaitHook { await hook() }
+            guard checkoutGenerations[serverId] == checkoutGeneration else { throw CancellationError() }
             if existingRunning {
                 // `isRunning` is an actor hop. Spec replacement, stop, or a
                 // reap may have evicted this child while we were suspended.
@@ -273,7 +280,9 @@ public actor MCPSubprocessPool {
         // a Task here; every subsequent cold caller awaits the same Task.
         if let inflight = spawnTasks[serverId] {
             let proc = try await inflight.value
+            if inflight.isCancelled { throw CancellationError() }
             if let hook = _getPostAwaitHook { await hook() }
+            guard checkoutGenerations[serverId] == checkoutGeneration else { throw CancellationError() }
             guard let pooled = processes[serverId], pooled === proc else {
                 if let current = spawnTasks[serverId], current == inflight {
                     spawnTasks[serverId] = nil
@@ -288,7 +297,9 @@ public actor MCPSubprocessPool {
         spawnTasks[serverId] = task
         do {
             let proc = try await task.value
+            if task.isCancelled { throw CancellationError() }
             if let hook = _getPostAwaitHook { await hook() }
+            guard checkoutGenerations[serverId] == checkoutGeneration else { throw CancellationError() }
             if let current = spawnTasks[serverId], current == task {
                 spawnTasks[serverId] = nil
             }
@@ -349,13 +360,12 @@ public actor MCPSubprocessPool {
         // and clobber the crash record with crashes.removeValue".
         let captured = serverId
         let capturedGen = newGen
-        let capturedProc = proc
-        await proc.onUnexpectedTermination { [weak self] status, reason in
-            guard let self = self else { return }
+        await proc.onUnexpectedTermination { [weak self, weak proc] status, reason in
+            guard let self, let proc else { return }
             Task {
                 await self._recordTermination(
                     serverId: captured,
-                    process: capturedProc,
+                    process: proc,
                     generation: capturedGen,
                     status: status,
                     reason: reason
@@ -609,13 +619,18 @@ public actor MCPSubprocessPool {
 
     /// Stop a server's subprocess if one is running, leaving the spec in place.
     public func stop(serverId: String) async {
+        checkoutGenerations.removeValue(forKey: serverId)
+        let pending = spawnTasks.removeValue(forKey: serverId)
+        pending?.cancel()
+        processGenerations.removeValue(forKey: serverId)
         // An intentional stop ends any carried crash streak — a later
         // user-initiated respawn shouldn't inherit escalated backoff.
         carriedFailures.removeValue(forKey: serverId)
         lastSpawnAt.removeValue(forKey: serverId)
         lastCheckedOutAt.removeValue(forKey: serverId)
-        guard let proc = processes.removeValue(forKey: serverId) else { return }
-        await proc.stop()
+        let proc = processes.removeValue(forKey: serverId)
+        await proc?.stop()
+        if let pending { _ = await pending.result }
         await rescheduleReapDeadline()
     }
 
@@ -630,6 +645,11 @@ public actor MCPSubprocessPool {
         reapScheduleGeneration &+= 1
         scheduledReapDeadline = nil
         let stopped = Array(processes.values)
+        let pending = Array(spawnTasks.values)
+        spawnTasks.removeAll()
+        checkoutGenerations.removeAll()
+        for task in pending { task.cancel() }
+        processGenerations.removeAll()
         processes.removeAll()
         carriedFailures.removeAll()
         lastSpawnAt.removeAll()
@@ -637,6 +657,7 @@ public actor MCPSubprocessPool {
         for proc in stopped {
             await proc.stop()
         }
+        for task in pending { _ = await task.result }
         await rescheduleReapDeadline()
     }
 

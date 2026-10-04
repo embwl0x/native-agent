@@ -210,36 +210,24 @@ public final class TurnsFacade {
         })
     }
 
-    /// `streamingSessions` filtered to markers young enough to still belong to
-    /// a live turn.
-    ///
-    /// `finishRuntime` returns early when the generation no longer matches —
-    /// correctly, since clearing there would wipe a NEWER turn's marker — so a
-    /// turn that dies between the generation bump and its own cleanup leaves
-    /// its id in `streamingSessions` forever, and the "other sessions running"
-    /// banner never comes down. Ids are stamped on first observation and
-    /// un-stamped the moment they leave the set, so a re-started session
-    /// always starts a fresh clock. Live turns are untouched: nothing
-    /// legitimate outlives the provider guard's ceiling.
+    /// Task-backed turns remain live regardless of age. Only orphaned runtime
+    /// markers expire; the provider guard bounds one stream, not the whole turn.
     public var liveStreamingSessionIDs: Set<String> {
         let current = streamingSessions
-        if streamingSeenAt.count != current.count {
-            streamingSeenAt = streamingSeenAt.filter { current.contains($0.key) }
-        }
+        streamingSeenAt = streamingSeenAt.filter { current.contains($0.key) }
         let ceiling = Self.streamingMarkerCeilingSeconds
         let now = Date()
         var live: Set<String> = []
         for id in current {
             let seenAt = streamingSeenAt[id] ?? now
             streamingSeenAt[id] = seenAt
-            if ceiling <= 0 || now.timeIntervalSince(seenAt) <= ceiling { live.insert(id) }
+            if tasks[id] != nil || ceiling <= 0 || now.timeIntervalSince(seenAt) <= ceiling { live.insert(id) }
         }
         return live.filter { !isReplyTextSettled($0) }
     }
 
-    /// Seconds a `streamingSessions` marker may stand before it is treated as
-    /// a ghost: the provider stream guard's own hard wall ceiling, since a
-    /// turn cannot outlive it. Zero (guard disabled) means never expire.
+    /// Seconds an orphaned streaming marker may stand before it expires.
+    /// Zero (guard disabled) means never expire.
     public nonisolated static let streamingMarkerCeilingSeconds: TimeInterval =
         ProviderStreamGuardConfig.fromEnvironment().wallTimeout
 

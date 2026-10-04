@@ -1,5 +1,6 @@
 import Foundation
 import Cognition
+import Desk
 import NativeAgentShared
 
 // The app's names for the NativeAgentShared variants, kept in the moved code
@@ -23,7 +24,7 @@ public final class DeviceSync {
     public lazy var engine = MacSyncEngine(sync: self, stateDataRootOverride: nil)
     public lazy var relay = MacSyncMobileNotificationRelay(sync: self)
     public lazy var pairedPhones = PairedPhoneStore(url: dataRoot.appendingPathComponent("paired_phones.json"))
-    public lazy var macIntegrationPermissions = MacIntegrationICloudBridge()
+    public lazy var macIntegrationPermissions = MacIntegrationICloudBridge(sync: self)
 
     public nonisolated init(dataRoot: URL, host: any DeviceSyncHost, cognition: NativeCognitionRuntime) {
         self.dataRoot = dataRoot
@@ -32,6 +33,12 @@ public final class DeviceSync {
         self.needsUser = NeedsUserEdgeNotifier(dataRoot: dataRoot) { title, body, userInfo in
             try await host.knockNeedsUser(title: title, body: body, userInfo: userInfo)
         }
+    }
+
+    /// The needs-you push runs off the app's overview read, never the phone
+    /// snapshot pass, so it fires whether or not phone sync is on.
+    public nonisolated func evaluateNeedsUser(items: [DeskItem]) async {
+        await needsUser.evaluate(items: items)
     }
 }
 

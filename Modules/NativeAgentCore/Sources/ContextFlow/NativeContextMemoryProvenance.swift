@@ -32,7 +32,9 @@ enum NativeContextMemoryProvenance {
                 return nil
             }
         }
-        let mapping = index.recordMap(for: memoryAtomIDs)
+        let mapping = index.recordMap(
+            for: memoryAtomIDs, generationID: packetBeforeAttachment.generationID
+        )
         let recordIDs = Array(mapping.values)
         if !recordIDs.isEmpty {
             prepared.attachMemoryRecordProvenance(recordIDs, atomRecords: mapping)

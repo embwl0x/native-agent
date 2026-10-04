@@ -81,7 +81,6 @@ struct CognitionObservatoryView: View {
         let agentDisplayName: String
         let systemToasts: SystemToastCenter
         let contextFlowHealth: () async -> ContextFlowObservatoryHealthState
-        let contextFlowFallback: () async -> ContextFlowFallbackState
         let organismToggleDidRender: @MainActor (Bool) -> Void
 
         @MainActor
@@ -91,7 +90,6 @@ struct CognitionObservatoryView: View {
                 agentDisplayName: appModel.agentDisplayName,
                 systemToasts: appModel.systemToasts,
                 contextFlowHealth: { await appModel.engine.contextFlow.observatoryHealthState() },
-                contextFlowFallback: { await ContextFlowFallbackReader.load(reader: TurnTraceRecentReader(dataRootOverride: appModel.engine.dataRoot)) },
                 organismToggleDidRender: { _ in }
             )
         }
@@ -111,10 +109,6 @@ struct CognitionObservatoryView: View {
     private var contextFlowHealth: ContextFlowObservatoryHealthState {
         get { cognition.contextFlowHealth }
         nonmutating set { cognition.contextFlowHealth = newValue }
-    }
-    private var contextFlowFallback: ContextFlowFallbackState? {
-        get { cognition.contextFlowFallback }
-        nonmutating set { cognition.contextFlowFallback = newValue }
     }
     private var workshop: WorkshopObservatorySnapshot? {
         get { cognition.workshop }
@@ -152,7 +146,6 @@ struct CognitionObservatoryView: View {
     @State private var isRunningReflection = false
     @State private var isRunningEvaluationSamplers = false
     @State private var evaluationSamplerOutcome: CognitiveEvaluationSamplerOutcome?
-    @State var reflexReviewsInFlight: Set<String> = []
     private var lastRefresh: Date? {
         get { cognition.lastRefresh }
         nonmutating set { cognition.lastRefresh = newValue }
@@ -270,6 +263,8 @@ struct CognitionObservatoryView: View {
                                         dependencies.systemToasts.push(success: "Thinking and body state cleared.")
                                     case .persistenceFailed(let detail):
                                         dependencies.systemToasts.push(error: "Nothing was cleared; the state was kept: \(detail)")
+                                    case .bodyPersistenceFailed:
+                                        dependencies.systemToasts.push(error: "Thinking state cleared. Body state cleared in memory, but was not saved; its previous state may return after a restart.")
                                     }
                                     await refresh()
                                 }
@@ -378,15 +373,12 @@ struct CognitionObservatoryView: View {
                         tint: .cyan,
                         hint: contextFlowHint(contextFlowHealth)
                     ) {
-                        ContextFlowObservatoryPanel(
-                            healthState: contextFlowHealth,
-                            fallback: contextFlowFallback
-                        )
+                        ContextFlowObservatoryPanel(healthState: contextFlowHealth)
                     }
                     // L11 (Desk→Workshop): the workshop's counts, cadence and
                     // session receipts. Sourced from STORE QUERIES (liveState),
                     // never the capped Desk projection. The VETO control and the
-                    // per-pursuit list it sat on moved to DeskView's pursuits
+                    // per-pursuit list it sat on moved to the primary Desk's item
                     // row (item 36) — owner authority does not live behind the
                     // developer gate.
                     collapsible(
@@ -471,8 +463,8 @@ struct CognitionObservatoryView: View {
                     )
                 }
 
-                // B2.6 (g): DeskView's debug disclosures (agent projection +
-                // raw all-items table) moved here — DeskView keeps zero debug
+                // The agent projection and raw all-items table belong here;
+                // the primary Desk keeps zero debug
                 // chrome. Self-contained; loads its own desk state.
                 DeskDebugPanels(
                     dataRoot: dependencies.dataRoot,
@@ -562,7 +554,6 @@ struct CognitionObservatoryView: View {
         }
         let next = nextRead.detail
         let nextContextFlowHealth = await dependencies.contextFlowHealth()
-        let nextContextFlowFallback = await dependencies.contextFlowFallback()
         let deskRoot = dependencies.dataRoot
         let nextWorkshop = await WorkshopObservatorySnapshot.load(
             store: SwiftNativeDeskStore(dataRoot: deskRoot),
@@ -574,7 +565,6 @@ struct CognitionObservatoryView: View {
         detail = next
         detailEvidenceStatus = nextRead.evidenceStatus
         contextFlowHealth = nextContextFlowHealth
-        contextFlowFallback = nextContextFlowFallback
         workshop = nextWorkshop
         enabled = next.configuration.enabled
         capsuleEnabled = next.configuration.capsuleInjectionEnabled

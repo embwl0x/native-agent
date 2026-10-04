@@ -9,6 +9,7 @@ import CommonCrypto
 import CryptoKit
 import AppKit
 import Cognition
+import DeviceSyncState
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -46,10 +47,13 @@ extension MacSyncEngine {
             )
         }
         isActive = true
+        startArchiveRetentionWatcher()
+        pruneOldArchiveFiles()
         startSnapshotIntegrityFallback()
         startCognitionSnapshotObservation()
         startSchedulerSnapshotObservation()
         startHelpersSnapshotObservation()
+        startWorkActivityObservation()
         startChatTranscriptSnapshotObservation()
         let generation = snapshotLifecycleGeneration
         Task {
@@ -69,6 +73,12 @@ extension MacSyncEngine {
         if isActive, activeDocsURL == docsURL {
             return
         }
+        let secret: Data
+        do { secret = try pairingSecret() }
+        catch {
+            syncError = "Snapshot pairing unavailable: \(error.localizedDescription)"
+            return
+        }
         if isActive {
             stop()
         }
@@ -80,7 +90,13 @@ extension MacSyncEngine {
         // re-writing unchanged snapshots instead of triggering an iOS read-storm.
         loadSnapshotDigests()
         let fm = FileManager.default
+        // Same pairing fingerprint/path as the phone's cachedSnapshotDirectory.
+        // Unscoped legacy snapshots are never copied into a new pairing.
+        let fingerprint = SHA256.hash(data: secret).prefix(8)
+            .map { String(format: "%02x", $0) }.joined()
         snapshotDir = docsURL.appendingPathComponent(Folder.snapshots)
+            .appendingPathComponent("pairings", isDirectory: true)
+            .appendingPathComponent(fingerprint, isDirectory: true)
         inboxDir = docsURL.appendingPathComponent(Folder.inbox)
         responsesDir = docsURL.appendingPathComponent(Folder.responses)
         transactionDir = docsURL.appendingPathComponent(Folder.transactions)
@@ -112,6 +128,7 @@ extension MacSyncEngine {
         startCognitionSnapshotObservation()
         startSchedulerSnapshotObservation()
         startHelpersSnapshotObservation()
+        startWorkActivityObservation()
         startChatTranscriptSnapshotObservation()
 
         // Watch inbox for iOS-deposited action files
@@ -130,6 +147,11 @@ extension MacSyncEngine {
     func stop() {
         snapshotLifecycleGeneration &+= 1
         isActive = false
+        workActivityObservationTask?.cancel()
+        workActivityObservationTask = nil
+        workActivityPublicationTask?.cancel()
+        workActivityPublicationTask = nil
+        workActivities.removeAll()
         activeDocsURL = nil
         snapshotIntegrityTask?.cancel()
         snapshotIntegrityTask = nil
@@ -153,6 +175,7 @@ extension MacSyncEngine {
         snapshotWriteInFlight = false
         snapshotWriteQueued = false
         snapshotWriteQueuedNeedsHeavy = false
+        snapshotWriteQueuedNeedsMemories = false
         snapshotWriteQueuedNeedsChatTranscripts = false
         snapshotWriteQueuedNeedsStandardPass = false
         // fix-snapshot-digest-persist: do NOT clear the digest map on stop().
@@ -171,6 +194,7 @@ extension MacSyncEngine {
         lastHeavySnapshotAt = nil
         pruneDeadlineTask?.cancel()
         pruneDeadlineTask = nil
+        archiveRetentionRetryAfter = nil
         archiveRetentionWatcher?.cancel()
         archiveRetentionWatcher = nil
         inboxQuery?.stop()
@@ -197,8 +221,22 @@ extension MacSyncEngine {
         guard isActive, let snapshotDir else { return }
         let lifecycleGeneration = snapshotLifecycleGeneration
         let digests = snapshotFileDigests
-        let report = await Task.detached(priority: .utility) {
-            MacSyncSnapshotIntegrity.reconcile(digests: digests, in: snapshotDir)
+        let dataRoot = stateDataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let (report, hasSkippedGroups) = await Task.detached(priority: .utility) {
+            let report = MacSyncSnapshotIntegrity.reconcile(digests: digests, in: snapshotDir)
+            let skipsURL = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
+            let hasSkippedGroups: Bool
+            if FileManager.default.fileExists(atPath: skipsURL.path) {
+                if let data = try? Data(contentsOf: skipsURL),
+                   let skips = try? JSONDecoder().decode([String: String].self, from: data) {
+                    hasSkippedGroups = skips.keys.contains { $0 != "_observedAt" }
+                } else {
+                    hasSkippedGroups = true
+                }
+            } else {
+                hasSkippedGroups = false
+            }
+            return (report, hasSkippedGroups)
         }.value
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
 
@@ -212,6 +250,9 @@ extension MacSyncEngine {
             // transcripts). A standard pass would retain that bad file forever,
             // so the bounded 15-minute integrity owner explicitly rebuilds all
             // active projections once.
+            await writeSnapshots(forceHeavy: true)
+        } else if hasSkippedGroups {
+            // Failed publications may have no cached digest left to reconcile.
             await writeSnapshots(forceHeavy: true)
         } else {
             await writeSnapshots()
@@ -317,17 +358,17 @@ extension MacSyncEngine {
             || change.reason == "residual_repair:completed"
     }
 
-    /// Arms retention observation only after every canonical archive directory
-    /// is a real directory. Kept internal for hermetic lifecycle proof of the
-    /// failure state; production still invokes it only from `start(docsURL:)`.
+    /// Observe the active transport's archive and transaction directories.
     func startArchiveRetentionWatcher() {
         archiveRetentionWatcher?.cancel()
         let paths = MacSyncArchiveRetentionWatchPaths.resolve(
             inboxDirectory: inboxDir,
-            responsesDirectory: responsesDir
+            responsesDirectory: responsesDir,
+            transactionDirectory: transactionDir,
+            dataRoot: stateDataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
-        guard paths.count == 3 else {
-            syncError = "Archive retention watcher unavailable — iCloud inbox paths are unresolved"
+        guard paths.count == (inboxDir == nil ? 4 : 6) else {
+            syncError = "Archive retention unavailable: sync directories could not be opened."
             return
         }
         archiveRetentionWatcher = FileChangeWatcher(paths: paths) { [weak self] _ in

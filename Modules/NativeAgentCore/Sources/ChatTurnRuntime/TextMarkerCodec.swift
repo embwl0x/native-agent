@@ -13,8 +13,8 @@ import ProviderRouting
 /// The loop owns counts, caps and where a bounce is placed; the codec owns
 /// detection and the exact words the model reads.
 struct TextMarkerCodec: Sendable {
-    /// The turn's catalog. Typed-argument repair and undeclared-field
-    /// dropping read the declared parameters from it.
+    /// The turn's catalog. Typed-argument repair and the undeclared-field
+    /// refusal read the declared parameters from it.
     let schemas: [LLMToolSchema]
     /// The catalog's names — what the turn can call at all.
     let catalogNames: Set<String>
@@ -34,21 +34,11 @@ struct TextMarkerCodec: Sendable {
     /// The round's marker calls in wire order, `<tool_use>` and `<invoke>`.
     func calls(in text: String) -> [ParsedToolCall] {
         ToolCallParser.parse(text, parseInvoke: true).map { call in
-            let properties = schemas.first(where: { $0.name == call.name })
+            guard call.undeclaredKeys.isEmpty else { return call }
+            let schema = schemas.first(where: { $0.name == call.name })
                 .flatMap { try? JSONSerialization.jsonObject(with: $0.parametersJSON) as? [String: Any] }
-                .flatMap { $0["properties"] as? [String: Any] }
+            let properties = schema?["properties"] as? [String: Any]
             var input = call.input
-            // 2026-09-25 desk-walk3: a call block carried an `output`
-            // field holding an invented notes list. Results come only
-            // from tools, so a result-shaped field the tool does not
-            // declare is dropped before dispatch, receipts or cards.
-            // An unknown schema leaves the arguments alone.
-            let written = properties.map { declared in
-                input.keys.filter {
-                    Self.modelWrittenResultKeys.contains($0.lowercased()) && declared[$0] == nil
-                }
-            } ?? []
-            for key in written { input.removeValue(forKey: key) }
             // 2026-09-22: <invoke> text "42"/"true" parses as a number/
             // bool; a string-schema param gets back the text as written.
             if let properties {
@@ -61,14 +51,20 @@ struct TextMarkerCodec: Sendable {
                 }
             }
             var parsed = ParsedToolCall(id: call.id, name: call.name, input: input)
-            parsed.wroteResult = !written.isEmpty
+            // 2026-10-01/02: she wrote results as call blocks, `<invoke
+            // name="app">` holding `result`, or a page read's about/status,
+            // and they ran as `app {}`. A block carrying a field its tool
+            // does not declare is not a call; it never dispatches. An open
+            // or unknown schema takes anything, as does one that lists no
+            // properties or declares more through a root oneOf/anyOf/allOf.
+            let composed = ["oneOf", "anyOf", "allOf"].contains { schema?[$0] != nil }
+            if let properties, !properties.isEmpty, !composed,
+               schema?["additionalProperties"] as? Bool != true {
+                parsed.undeclaredKeys = input.keys.filter { properties[$0] == nil }.sorted()
+            }
             return parsed
         }
     }
-
-    static let modelWrittenResultKeys: Set<String> = ["output", "result", "response"]
-    static let modelWrittenResultNote =
-        "\nResults come only from tools; the output you wrote in this call was ignored."
 
     /// A round that called tools, cut after its last marker. Bare
     /// `<tool_use>`/`<invoke>` calls have no outer block for the API to stop
@@ -121,19 +117,18 @@ struct TextMarkerCodec: Sendable {
     // MARK: - Result carrier
 
     /// One tool result, appended to the round's result message the way this
-    /// protocol returns it. A call that wrote its own result field says so.
+    /// protocol returns it.
     func appendResult(
         index: Int,
         toolName: String,
         ok: Bool,
         content: String,
-        wroteResult: Bool,
         to carrier: inout String
     ) {
         carrier += """
 
         NativeAgent tool result #\(index + 1) for \(toolName)\(ok ? "" : " (failed)"):
-        \(content)\(wroteResult ? Self.modelWrittenResultNote : "")
+        \(content)
         """
     }
 
@@ -166,7 +161,8 @@ struct TextMarkerCodec: Sendable {
     /// The tools the unfulfilled-promise bounce names as ready.
     var readyTools: String {
         let readySource = turnActiveTools.isEmpty ? catalogNames : turnActiveTools
-        return readySource.sorted().prefix(8).joined(separator: ", ")
+        // A tool folded into app is ready as its app action, not by name.
+        return readySource.filter { !SwiftToolDispatcher.isModelHidden($0) }.sorted().prefix(8).joined(separator: ", ")
     }
 
     /// The unfulfilled-promise bounce; `bounce` is 1 or 2.
@@ -191,84 +187,32 @@ struct TextMarkerCodec: Sendable {
 
     // MARK: - Catalog carrier
 
-    /// The catalog as it rides the system prompt: the floor always, in
-    /// `stable` (a tool the model is told it always has must not be something
-    /// the provider can clear); the session-loaded run in `stableSuffix`,
-    /// except on the v2 seed, where it leaves the prefix for the per-turn
-    /// volatile block (`volatileCatalogAppendix`).
-    ///
-    /// The task-local is the exact gate: the streaming loop binds the shape
-    /// the seed RESOLVED around this read, so it is `.v2Prefix` precisely
-    /// when the seed relocated the run, and `.v1Legacy` (unbound, or a seed
-    /// that fell back for want of history) precisely when it did not.
-    static func systemCatalog(for context: TurnContext) -> (floor: String, sessionLoaded: String) {
-        let sections = catalogSections(
-            schemas: context.toolSchemas,
-            names: context.toolsAvailable
-        )
-        let ridesVolatileBlock = ConversationPrefixShape.override == .v2Prefix
-        return (
-            renderFloor(rows: sections.floor),
-            ridesVolatileBlock ? "" : sections.appended
-        )
-    }
-
     /// Places the lazy tool contract ahead of volatile recall/history so the
     /// provider can reuse one honest stable prefix across ordinary turns.
     ///
-    /// THREE segments (2026-09-01):
-    ///   stable       persona + pins + protocol prose + the always-on FLOOR
-    ///                catalog — bytes that do not move for the life of the
-    ///                session.
-    ///   stableSuffix the "Also loaded this session:" run — append-only within
-    ///                the session, so growing it cannot disturb `stable`.
-    ///   dynamic      per-turn recall/history, unchanged.
-    ///
-    /// With no session-loaded tools the suffix is empty and the combined bytes
-    /// are identical to the old two-segment shape. No tool, memory, or
-    /// conversation content is removed by this split — it is a cache layout,
-    /// and `reassembles(into:)` is what proves that to the adapters.
-    ///
-    /// v2Prefix, 2026-09-01 (live measurement on c83a39b8): even in
-    /// `stableSuffix` the catalog run sits INSIDE the cached prefix, ahead of
-    /// the replayed messages — so one promoted preload growing the contract
-    /// 65 → 66 invalidated 19,737 tokens of history on the very next turn.
-    /// `systemCatalog` decides where each part rides: the floor in `stable`,
-    /// the session-loaded run here on v1 and in the per-turn volatile block on
-    /// v2 (empty here then).
     static func systemLayout(
         baseSystem: String?,
         segments: SystemPromptSegments?,
         context: TurnContext
     ) -> (system: String, segments: SystemPromptSegments?) {
-        let (floorBlock, systemAppendedBlock) = systemCatalog(for: context)
+        let floorBlock = renderFloor(rows: catalogSections(
+            schemas: context.toolSchemas, names: context.toolsAvailable
+        ).floor, appDoor: context.toolSchemas.contains { $0.name == "app" })
         guard let segments,
               let baseSystem,
               segments.reassembles(into: baseSystem) else {
-            // No usable segments: one flat block, catalog run included or not
-            // by the same rule as the segmented arm.
-            let toolBlock = systemAppendedBlock.isEmpty
-                ? floorBlock
-                : floorBlock + "\n\n" + systemAppendedBlock
             guard let base = baseSystem?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !base.isEmpty else {
-                return (toolBlock, nil)
+                return (floorBlock, nil)
             }
-            return (base + "\n\n" + toolBlock, nil)
+            return (base + "\n\n" + floorBlock, nil)
         }
         let stable = segments.stable.isEmpty
             ? floorBlock
             : segments.stable + "\n\n" + floorBlock
-        // An incoming suffix (another builder's session-stable text) keeps its
-        // place ahead of the catalog run; both stay inside the cached prefix.
-        // On v2 `systemAppendedBlock` is empty, so with no other builder
-        // contributing this field goes empty.
-        let stableSuffix = [segments.stableSuffix, systemAppendedBlock]
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n\n")
         let reordered = SystemPromptSegments(
             stable: stable,
-            stableSuffix: stableSuffix,
+            stableSuffix: segments.stableSuffix,
             dynamic: segments.dynamic
         )
         return (reordered.combined, reordered)
@@ -287,8 +231,7 @@ struct TextMarkerCodec: Sendable {
     /// is the tail of the cacheable stable block.
     ///
     /// `appended` renders what THIS session has loaded, in load order, never
-    /// re-sorted. It only ever grows within a session, so it can ride in
-    /// `stableSuffix` without moving a byte of what precedes it. The bounded
+    /// re-sorted. It rides the per-turn volatile block. The bounded
     /// prefix(80) applies to this run alone: truncating the floor would drop a
     /// tool the model is told it always has.
     struct CatalogSections {
@@ -329,7 +272,7 @@ struct TextMarkerCodec: Sendable {
         }
         let omittedToolCount = max(0, appendedTotal - appendedRows.count)
         let disclosure = omittedToolCount > 0
-            ? "\n- \(omittedToolCount) more tools not listed in this bounded catalog; use tool_load to expose a needed capability."
+            ? "\n- \(omittedToolCount) more tools not listed in this bounded catalog."
             : ""
         return CatalogSections(
             floor: floorRows.isEmpty
@@ -344,13 +287,22 @@ struct TextMarkerCodec: Sendable {
     /// Everything up to and including the always-on catalog. With no
     /// session-loaded tools this is byte-identical to the pre-2026-09-01
     /// single-block renderer.
+    /// `appDoor`: this request offers app, so a folded tool is named by its
+    /// action; a lane that declares the tools themselves keeps their names.
     private static func renderFloor(
-        rows renderedRows: String
+        rows renderedRows: String,
+        appDoor: Bool
     ) -> String {
+        let findLine = appDoor
+            ? "open its page with app {\"page\": \"<page>\"} or find its action with app {\"find\": \"<what you want done>\"}."
+            : "call a known tool name directly (calling loads it)."
+        let gitLine = appDoor
+            ? "For recent commits use app git.log, for repo state app git.status, and for diffs app git.diff. Do not ask for raw shell/git commands when those answer it."
+            : "For recent commits use git_log, for repo state use git_status, and for diffs use git_diff. Do not ask for raw shell/git commands unless a shell tool is explicitly listed."
         return """
         \(AnthropicOAuthDirectAdapter.textToolProtocolHeader)
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.
-        - Every tool in Available Swift tools is ready to call directly. A capability not listed: open its place by name in workspace (mail, music, github…) for its tools and arguments, or call a known tool name directly (calling loads it).
+        - Every tool in Available Swift tools is ready to call directly. A capability not listed: \(findLine)
         - To use a Swift tool, output only one or more exact markers, with a JSON object body, all wrapped in ONE block per reply:
           <function_calls>
           <tool_use name="tool_name">{"arg":"value"}</tool_use>
@@ -361,7 +313,7 @@ struct TextMarkerCodec: Sendable {
         - COMPLETION CONTRACT: every reply must be EITHER tool_use marker(s) OR your complete final answer. You have no background execution — work you describe but do not call never happens. A reply that only announces or narrates in-progress work ("checking now", "reading the files now", "going through it") is invalid and NativeAgent bounces it back to you. Do the work in THIS reply: emit the next tool call, or deliver the finished answer.
         \(DelegatedCampaignGuidance.rendered)
         - After NativeAgent returns a tool result, use the result to answer or emit another exact marker.
-        - For recent commits use git_log, for repo state use git_status, and for diffs use git_diff. Do not ask for raw shell/git commands unless a shell tool is explicitly listed.
+        - \(gitLine)
         - Skills provide guidance only. They never grant tools, permissions, approval bypasses, or safety authority.
         Available Swift tools:
         \(renderedRows)

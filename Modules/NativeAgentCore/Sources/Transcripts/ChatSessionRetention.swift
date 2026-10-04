@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
@@ -224,6 +225,60 @@ public enum ChatSessionRetention {
         }
     }
 
+    /// The row a door (Telegram, Slack) should re-create for `sessionId` when
+    /// its map points at a session retention archived: the newest archived
+    /// row with its transcript copied back into the hot tier. The archive copy
+    /// stays where it is. Nil when nothing restorable is archived under that
+    /// id. Caller holds the `chat/sessions.json` lock (lock order is sessions
+    /// first, transcript second).
+    public static func restoreArchivedRow(
+        sessionId: String,
+        dataRoot: URL
+    ) async throws -> [String: JSONValue]? {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            return nil
+        }
+        let chat = dataRoot.appendingPathComponent("chat", isDirectory: true)
+        let archiveIndex = chat
+            .appendingPathComponent("archive", isDirectory: true)
+            .appendingPathComponent("sessions.jsonl")
+        guard let data = try? Data(contentsOf: archiveIndex) else { return nil }
+        var archived: [String: JSONValue]?
+        for line in data.split(separator: 10) {
+            guard case .object(let row)? = try? JSONValue.parse(Data(line)),
+                  row["id"] == .string(sessionId) else { continue }
+            archived = row
+        }
+        guard var row = archived,
+              case .string(let relative)? = row["messagesArchivePath"] else { return nil }
+        let archivedBytes: Data
+        do { archivedBytes = try Data(contentsOf: dataRoot.appendingPathComponent(relative)) }
+        // The archive prune (180 days) took the transcript but kept the row:
+        // nothing is left to restore, so the door starts an empty row.
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        let messagesPath = chat
+            .appendingPathComponent("messages", isDirectory: true)
+            .appendingPathComponent("\(safeSessionId).jsonl")
+        try await SwiftNativePersistenceCore().withFileLock(messagesPath) {
+            let hot: Data
+            do { hot = try Data(contentsOf: messagesPath) }
+            catch CocoaError.fileReadNoSuchFile { hot = Data() }
+            // The atomic copy may have succeeded before the caller's index
+            // commit failed. Its exact prefix also survives later appends.
+            if !archivedBytes.isEmpty, hot.starts(with: archivedBytes) { return }
+            try FileManager.default.createDirectory(
+                at: messagesPath.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try (archivedBytes + hot).write(to: messagesPath, options: .atomic)
+        }
+        for key in ["archivedBy", "retentionArchivedAt", "retentionReason", "messagesArchivePath"] {
+            row.removeValue(forKey: key)
+        }
+        row["archived"] = .bool(false)
+        return row
+    }
+
     public static func saveMacPinnedChatSessionIds(
         _ ids: [String],
         dataRoot: URL = defaultDataRoot()
@@ -294,7 +349,58 @@ public enum ChatSessionRetention {
         // lock `ConversationAnchor.publish` writes under, so this read cannot
         // see a half-written pin.
         protected.formUnion(ConversationAnchor.protectedSessionIds(dataRoot: dataRoot))
+        // A session a door (Telegram chat, Slack channel/thread) is bound to is
+        // where that door's next message lands; archiving it would restart
+        // that door with an empty conversation.
+        protected.formUnion(try doorMappedSessionIds(dataRoot: dataRoot))
+        // A contact's conversations (a saved contact's, a built-in lane's) are
+        // what its pane reads; archiving one would blank that pane.
+        protected.formUnion(try contactSessionIds(dataRoot: dataRoot))
         return protected
+    }
+
+    /// Every session a contact owns starts with this: its id, hashed.
+    public static func contactSessionPrefix(owner: String) -> String {
+        let digest = SHA256.hash(data: Data(owner.utf8))
+        return "agent-" + digest.map { String(format: "%02x", $0) }.joined().prefix(12) + "-"
+    }
+
+    private static func contactSessionIds(dataRoot: URL) throws -> Set<String> {
+        var owners = ["codex", "claude", "omp"]
+        let path = dataRoot.appendingPathComponent("agents/peers.json")
+        do {
+            // Unknown protection stops retention, as with pins above.
+            guard case .array(let peers) = try JSONValue.parse(Data(contentsOf: path)) else {
+                throw PersistenceCoreError.ioFailure("I couldn’t read your agent contacts. I’ve left your conversations in place.")
+            }
+            for case .object(let peer) in peers { if case .string(let id)? = peer["id"] { owners.append(id) } }
+        } catch CocoaError.fileReadNoSuchFile {}
+        // Each contact's one conversation (ContactThread.session), not every
+        // session it opened: a peer starting a context per task stays bounded.
+        return Set(owners.map { contactSessionPrefix(owner: $0) + "mcp-" + $0 })
+    }
+
+    private static func doorMappedSessionIds(dataRoot: URL) throws -> Set<String> {
+        var ids = Set<String>()
+        for (door, key) in [("telegram", "chats"), ("slack", "sessions")] {
+            let path = dataRoot
+                .appendingPathComponent(door, isDirectory: true)
+                .appendingPathComponent("session_map.json")
+            let data: Data
+            do { data = try Data(contentsOf: path) }
+            catch CocoaError.fileReadNoSuchFile { continue }
+            // Unknown protection stops retention, as with pins above.
+            guard case .object(let root) = try JSONValue.parse(data),
+                  case .object(let entries)? = root[key] else {
+                throw PersistenceCoreError.ioFailure("I couldn’t read the \(door) conversation map. I’ve left your conversations in place.")
+            }
+            for case .object(let entry) in entries.values {
+                if case .string(let id)? = entry["activeSessionId"] {
+                    ids.insert(id.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }
+        }
+        return ids
     }
 
     private static func macPinnedChatSessionIds(dataRoot: URL) throws -> Set<String> {
@@ -552,8 +658,7 @@ public enum ChatSessionRetention {
     }
 
     /// Prune the archive tier: age-drop transcripts and line-cap the archived
-    /// sessions index. Mirrors `InstalledPhysiologySoak.pruneOldDayFiles` (list,
-    /// filter, drop) and never throws — pruning is opportunistic cleanup.
+    /// sessions index. Never throws — pruning is opportunistic cleanup.
     ///
     /// PERF (wave 2): `enforce` runs inside the sessions lock on EVERY message
     /// append, and this pass used to `contentsOfDirectory` + per-file

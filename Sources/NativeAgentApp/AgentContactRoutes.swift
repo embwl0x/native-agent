@@ -114,7 +114,8 @@ extension ClaudeBridge {
                 let response = await endpoint.handleREST(method: method, target: path, body: body,
                     principal: principal, version: headers["a2a-version"])
                 switch response {
-                case .json(let status, let value): Self.writeA2AJSON(conn, status: status, object: value)
+                case .json(let status, let value, let onSent):
+                    Self.writeA2AJSON(conn, status: status, object: value, onSent: { Task { await onSent?() } })
                 case .stream(let events): AgentContactSSE.write(conn, id: "rest", events: events, version: "1.0", rest: true)
                 }
             }
@@ -151,8 +152,10 @@ extension ClaudeBridge {
                               responseProjection: project, mcpWait: mcpWait)
             case .reply(let request, let session, let offset, let project):
                 Task {
-                    writeJSON(conn, status: 200, obj: project(await peerReplyReceipt(requestID: request, sessionID: session,
-                        offset: offset, principal: principal, tasks: tasks ?? NativeAgentEngine.live.agents.tasks)))
+                    let tasks = tasks ?? NativeAgentEngine.live.agents.tasks
+                    let receipt = await peerReplyReceipt(requestID: request, sessionID: session,
+                        offset: offset, principal: principal, tasks: tasks)
+                    writeJSON(conn, status: 200, obj: project(receipt), onSent: Self.fetched(receipt, principal: principal, tasks: tasks))
                 }
             case .immediate(let status, let response): writeJSON(conn, status: status, obj: response)
             case .acceptedNotification:
@@ -177,7 +180,8 @@ extension ClaudeBridge {
                     grpcPort: advertisedGRPCPort ?? NativeAgentA2AGRPCListener.shared.port)
                     .handle(body, principal: principal, version: headers["a2a-version"])
                 switch response {
-                case .json(let object): writeJSON(conn, status: 200, obj: object)
+                case .json(let object, let onSent):
+                    writeJSON(conn, status: 200, obj: object, onSent: { Task { await onSent?() } })
                 case .stream(let id, let events, let version): AgentContactSSE.write(conn, id: id, events: events, version: version)
                 }
             }
@@ -204,10 +208,12 @@ extension ClaudeBridge {
                 return
             }
             Task {
+                let tasks = tasks ?? NativeAgentEngine.live.agents.tasks
                 let result = await peerReplyReceipt(requestID: requestID, sessionID: sessionID,
                     offset: Self.peerInteger(json["offset"]) ?? 0, maxChars: Self.peerInteger(json["max_chars"]) ?? 8000,
-                    principal: principal, tasks: tasks ?? NativeAgentEngine.live.agents.tasks)
-                writeJSON(conn, status: result["status"] as? String == "invalid_request" ? 400 : 200, obj: result)
+                    principal: principal, tasks: tasks)
+                writeJSON(conn, status: result["status"] as? String == "invalid_request" ? 400 : 200, obj: result,
+                          onSent: Self.fetched(result, principal: principal, tasks: tasks))
             }
         case "/agent/message":
             guard method == "POST" else {
@@ -274,6 +280,16 @@ extension ClaudeBridge {
         return receipt
     }
 
+    private static func fetched(_ receipt: [String: Any], principal: AgentBridgePrincipal,
+                                tasks: AgentContactTasks) -> (@Sendable () -> Void)? {
+        guard receipt["status"] as? String == "ok", let reply = receipt["reply"] as? String, !reply.isEmpty,
+              let session = receipt["session_id"] as? String, let request = receipt["request_id"] as? String,
+              let run = receipt["run_id"] as? String, !run.isEmpty else { return nil }
+        let stored = NativeAgentMCPWire.validSession(session) || NativeAgentA2AWire.validContext(session)
+            ? principal.storedConversation(session) : session
+        return { Task { await tasks.recordReplyFetch(session: stored, request: request, run: run) } }
+    }
+
     /// The peer doors share A2A's retained execution; the legacy builder handler stays separate.
     private func handleContactMessage(conn: NWConnection, body: Data,
                                       tasks: AgentContactTasks, peer: PeerTurnContext,
@@ -326,9 +342,37 @@ extension ClaudeBridge {
                                          sessionID: String, owner: String, tasks: AgentContactTasks,
                                          wait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?),
                                          project: @escaping @Sendable (Int, [String: Any]) -> [String: Any]) async {
+        guard let ackData = try? JSONSerialization.data(withJSONObject: ack) else { conn.cancel(); return }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await writeWaitedReplyBody(conn: conn, ackData: ackData, taskID: taskID, requestID: requestID,
+                    sessionID: sessionID, owner: owner, tasks: tasks, wait: wait, project: project)
+            }
+            group.addTask {
+                // Bound all writes, with one second to send the result after the wait expires.
+                try? await Task.sleep(for: .seconds(wait.seconds + 1))
+            }
+            await group.next()
+            group.cancelAll()
+        }
+        conn.cancel()
+    }
+
+    private static func writeWaitedReplyBody(conn: NWConnection, ackData: Data, taskID: String, requestID: String,
+                                             sessionID: String, owner: String, tasks: AgentContactTasks,
+                                             wait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?),
+                                             project: @escaping @Sendable (Int, [String: Any]) -> [String: Any]) async {
+        guard let ack = try? JSONSerialization.jsonObject(with: ackData) as? [String: Any] else { return }
         @Sendable func send(_ data: Data) async -> Bool {
-            await withCheckedContinuation { done in
-                conn.send(content: data, completion: .contentProcessed { done.resume(returning: $0 == nil) })
+            let write = ContactStreamWrite()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { done in
+                    guard write.start(done) else { return }
+                    conn.send(content: data, completion: .contentProcessed { write.finish($0 == nil) })
+                }
+            } onCancel: {
+                write.finish(false)
+                conn.cancel()
             }
         }
         @Sendable func frame(_ object: [String: Any]) -> Data {
@@ -352,7 +396,7 @@ extension ClaudeBridge {
                         case .status(let current, let final):
                             if final { return }
                             task = current
-                        case .snapshot(let current), .artifact(let current, _, _, _): task = current
+                        case .snapshot(let current), .artifact(let current, _, _, _, _): task = current
                         }
                         guard let token, Date().timeIntervalSince(last) >= 0.5 else { continue }
                         let message = task.state == .inputRequired ? (task.detail ?? "Waiting for the person")
@@ -367,18 +411,27 @@ extension ClaudeBridge {
             }
         }
         var receipt = ack
+        var fetchedTask: AgentContactTask?
         if let task = try? await tasks.get(taskID, owner: owner) {
             receipt.merge(contactReply(task, requestID: requestID, sessionID: sessionID, offset: 0, maxChars: 8000)) { ack, _ in ack }
+            if let reply = receipt["reply"] as? String, !reply.isEmpty { fetchedTask = task }
         }
         let response = project(200, receipt)
-        guard token != nil else { BridgeCore.writeJSON(conn, status: 200, obj: response); return }
-        _ = await send(frame(response))
-        conn.cancel()
+        let sent: Bool
+        if token != nil {
+            sent = await send(frame(response))
+        } else {
+            guard let body = try? JSONSerialization.data(withJSONObject: response) else { return }
+            var data = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+            data.append(body)
+            sent = await send(data)
+        }
+        if sent, let fetchedTask { await tasks.recordReplyFetch(fetchedTask) }
     }
 
     static func contactReply(_ task: AgentContactTask, requestID: String, sessionID: String,
                              offset: Int, maxChars: Int) -> [String: Any] {
-        let reply = task.state == .failed ? (task.detail ?? "The reply could not be completed. Work: outcome unknown.") : task.text
+        let reply = task.state == .failed ? (task.detail ?? "The reply could not be completed. Work: outcome unknown.") : task.replyText
         guard offset >= 0, offset <= reply.count, (1...16000).contains(maxChars) else { return ["status": "invalid_request"] }
         let slice = String(reply.dropFirst(offset).prefix(maxChars))
         var receipt: [String: Any] = ["status": task.state.terminal ? "ok" : "pending",
@@ -386,6 +439,12 @@ extension ClaudeBridge {
             "run_id": task.canonicalRunID ?? "", "reply": slice, "offset": offset,
             "next_offset": offset + slice.count, "has_more": offset + slice.count < reply.count]
         if let detail = task.detail { receipt["detail"] = detail }
+        if let result = task.toolResult { receipt["result"] = AgentContactPart.object(result) }
+        if let completions = task.delegatedCompletions {
+            receipt["delegated_completions"] = completions.sorted { $0.key < $1.key }.map {
+                ["artifact_id": $0.key, "parts": [$0.value.wire03]]
+            }
+        }
         if let failure = task.failure, let data = try? JSONEncoder().encode(failure),
            let object = try? JSONSerialization.jsonObject(with: data) {
             receipt["provider_failure"] = object
@@ -402,12 +461,43 @@ extension ClaudeBridge {
 
 }
 
+private final class ContactStreamWrite: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var result: Bool?
+
+    func start(_ continuation: CheckedContinuation<Bool, Never>) -> Bool {
+        lock.lock()
+        if let result {
+            lock.unlock()
+            continuation.resume(returning: result)
+            return false
+        }
+        self.continuation = continuation
+        lock.unlock()
+        return true
+    }
+
+    func finish(_ result: Bool) {
+        lock.lock()
+        guard self.result == nil else { lock.unlock(); return }
+        self.result = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: result)
+    }
+}
+
 extension ClaudeBridge {
-    static func writeA2AJSON(_ connection: NWConnection, status: Int, object: [String: Any]) {
+    static func writeA2AJSON(_ connection: NWConnection, status: Int, object: [String: Any], onSent: (@Sendable () -> Void)? = nil) {
         guard let body = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { connection.cancel(); return }
         let reason = status == 200 ? "OK" : (status == 404 ? "Not Found" : (status == 500 ? "Internal Server Error" : "Bad Request"))
         var bytes = Data("HTTP/1.1 \(status) \(reason)\r\nContent-Type: application/a2a+json\r\nCache-Control: no-store\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
         bytes.append(body)
-        connection.send(content: bytes, completion: .contentProcessed { _ in connection.cancel() })
+        connection.send(content: bytes, completion: .contentProcessed { error in
+            if error == nil { onSent?() }
+            connection.cancel()
+        })
     }
 }

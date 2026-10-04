@@ -227,11 +227,7 @@ final class VoiceInputController {
         let current = SFSpeechRecognizer.authorizationStatus()
         guard current == .notDetermined else { return current }
         NSApp.activate(ignoringOtherApps: true)
-        return await withCheckedContinuation { cont in
-            SFSpeechRecognizer.requestAuthorization { status in
-                cont.resume(returning: status)
-            }
-        }
+        return await SystemPermissionPreflight.awaitSpeechAuthorization()
     }
 
     nonisolated private static func requestMicrophoneAuthorization() async -> VoiceInputPermissionResult {
@@ -386,6 +382,11 @@ final class VoiceInputController {
     /// than sending a partial transcript as a completed utterance.
     func stopListening() async -> String {
         await stopListeningResult().transcriptForSubmission
+    }
+
+    func discardListening() {
+        cleanupRecognition(result: .partial(""))
+        transcript = ""
     }
 
     /// Exposes whether a stop was final, incomplete, or failed. The visible

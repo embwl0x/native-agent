@@ -5,9 +5,11 @@ import MacIntegration
 /// Synchronous projections over the existing conversation owner. The lower
 /// target shares values, never the store, settlement, or send authority.
 package protocol AgentWorkspaceConversationPort: Sendable {
+    func refreshHealth(dataRoot: URL)
     func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord]
     func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord?
     func peers(dataRoot: URL) throws -> [AgentWorkspacePeer]
+    func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue
     func presentation(_ row: AgentConversationRecord) -> JSONValue
     func liveHandOff(_ row: AgentConversationRecord) -> Bool
     func unsettledAttention(_ row: AgentConversationRecord) -> Bool
@@ -30,6 +32,8 @@ package struct AgentWorkspacePeer: Sendable {
 /// Chat-owned catalog and provenance decisions remain at the dispatch boundary.
 package protocol AgentWorkspaceToolPort: Sendable {
     func modelVisibleCatalogToolNames(_ names: Set<String>) -> Set<String>
+    /// The `app` action a tool folded into, nil for a tool of its own.
+    func appAction(_ tool: String) -> String?
     func macIntegrationGate(_ name: String) -> (integration: String, mode: MacIntegrationPermissionMode)?
     func markConsumed(peer: String)
     func normalizeWorkspaceAlias(_ path: String, workspaceRoot: URL) -> String

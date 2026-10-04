@@ -104,11 +104,7 @@ final class CapabilitiesStore {
 
     init(
         manifestLoader: @escaping @Sendable () async throws -> JSONValue = {
-            try await NativeAgentEngine.live.toolDispatchClient().dispatch(
-                tool: "tool_catalog",
-                input: [:],
-                surface: "chat"
-            )
+            try await NativeAgentEngine.live.tools.loadManifest()
         }
     ) {
         self.manifestLoader = manifestLoader

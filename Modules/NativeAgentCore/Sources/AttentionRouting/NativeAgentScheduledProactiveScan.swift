@@ -79,17 +79,6 @@ public enum NativeAgentScheduledProactiveScan {
     /// definition and asking about them would be nagging.
     static let deskOpportunityStatuses: Set<DeskStatus> = [.now, .next]
 
-    // MARK: - W6/G9 — reading the outcome ledger
-
-    /// Times a kind must be dismissed inside the window before the scan stops
-    /// surfacing it.
-    static let outcomeSuppressionThreshold = 3
-    static let outcomeWindowDays = 30
-    /// Applied to a kind with dismissals below the drop threshold. Enough to
-    /// lose a tie against a kind User has never rejected, not enough to bury a
-    /// genuinely urgent card.
-    static let outcomeScorePenalty = 0.15
-
     public static func evaluate(
         dataRoot: URL,
         payload: [String: JSONValue],
@@ -103,10 +92,6 @@ public enum NativeAgentScheduledProactiveScan {
             return Result(scannedCount: 0, eligibleCount: 0, skippedAlreadySurfacedCount: 0, surfaced: [])
         }
 
-        let opportunitiesPath = dataRoot
-            .appendingPathComponent("nextgen", isDirectory: true)
-            .appendingPathComponent("proactive", isDirectory: true)
-            .appendingPathComponent("opportunities.jsonl")
         let inboxPath = dataRoot
             .appendingPathComponent("notifications", isDirectory: true)
             .appendingPathComponent("inbox.jsonl")
@@ -118,19 +103,9 @@ public enum NativeAgentScheduledProactiveScan {
             .appendingPathComponent("approvals", isDirectory: true)
             .appendingPathComponent("requests.json")
 
-        let outcomesPath = dataRoot
-            .appendingPathComponent("nextgen", isDirectory: true)
-            .appendingPathComponent("proactive", isDirectory: true)
-            .appendingPathComponent("outcomes.jsonl")
-
-        let opportunityRows = (try? await persistence.readJSONL(opportunitiesPath)) ?? []
         let inboxRows = (try? await persistence.readJSONL(inboxPath)) ?? []
         let schedulerRaw = try await persistence.readJSON(schedulerPath, ifMissing: .array([]))
         let approvalsRaw = try await persistence.readJSON(approvalsPath, ifMissing: .array([]))
-        // G9: the ledger has been write-only since the learning loop that read
-        // it went down with the daemon. This is the one reader.
-        let outcomeRows = (try? await persistence.readJSONL(outcomesPath)) ?? []
-        let feedback = outcomeFeedback(rows: outcomeRows, now: now)
 
         let deskStaleDays = max(1, int(payload["staleDays"] ?? payload["stale_days"], default: defaultDeskStaleDays))
         let deskItems: [DeskItem]
@@ -141,7 +116,6 @@ public enum NativeAgentScheduledProactiveScan {
         }
 
         let surfacedIDs = alreadySurfacedOpportunityIDs(inboxRows)
-        var opportunities = latestLedgerOpportunities(opportunityRows, opportunitiesPath: opportunitiesPath)
         var live = liveOpportunities(
             inboxRows: inboxRows,
             schedulerRaw: schedulerRaw,
@@ -154,72 +128,24 @@ public enum NativeAgentScheduledProactiveScan {
             now: now,
             dataRoot: dataRoot
         ))
-        opportunities.append(contentsOf: live)
-        opportunities = latestByID(opportunities)
-
-        let eligible = opportunities
-            .filter { isEligible($0) && !feedback.dropped.contains($0.kind.lowercased()) }
-            .map { feedback.applyingPenalty(to: $0) }
+        let eligible = latestByID(live)
+            .filter(isEligible)
             .sorted { lhs, rhs in
                 if lhs.score != rhs.score { return lhs.score > rhs.score }
                 return lhs.title < rhs.title
             }
-            .prefix(limit)
         let skipped = eligible.filter { surfacedIDs.contains($0.id) }.count
         let surfaced = eligible
             .filter { !surfacedIDs.contains($0.id) }
+            .prefix(limit)
             .prefix(surfaceLimit)
 
         return Result(
-            scannedCount: opportunityRows.count + live.count,
+            scannedCount: live.count,
             eligibleCount: eligible.count,
             skippedAlreadySurfacedCount: skipped,
             surfaced: Array(surfaced)
         )
-    }
-
-    private static func latestLedgerOpportunities(_ rows: [JSONValue], opportunitiesPath: URL) -> [Opportunity] {
-        latestByID(rows.compactMap { row in
-            guard case .object(let obj) = row,
-                  let id = nonEmptyString(obj["id"]),
-                  let title = nonEmptyString(obj["title"]) else {
-                return nil
-            }
-            let kind = nonEmptyString(obj["kind"]) ?? "proactive_idea"
-            let summary = nonEmptyString(obj["summary"]) ?? "The assistant found a proactive opportunity."
-            let score = double(obj["score"])
-            let status = (nonEmptyString(obj["status"]) ?? "scored").lowercased()
-            let decision = (nonEmptyString(obj["decision"]) ?? status).lowercased()
-            let surfaceSuppressed: Bool = {
-                guard case .object(let feedback)? = obj["feedback"] else { return false }
-                return bool(feedback["surfaceSuppressed"] ?? feedback["surface_suppressed"])
-            }()
-            let shouldSurface = !surfaceSuppressed
-                && decision != "shadow"
-                && status != "shadow"
-                && (["notify", "act"].contains(decision) || ["notify", "act"].contains(status) || score >= 0.55)
-            guard shouldSurface else { return nil }
-            let suggestedAction = nonEmptyString(obj["suggestedAction"]) ?? nonEmptyString(obj["suggested_action"])
-            let whyNow = nonEmptyString(obj["whyNow"]) ?? nonEmptyString(obj["why_now"])
-            let readouts = readoutStrings(obj["lazyContext"])
-            var detailLines: [String] = [
-                "Score: \(scoreString(score)). Decision: \(decision)."
-            ]
-            if let suggestedAction { detailLines.append("Suggested action: \(suggestedAction).") }
-            if let whyNow { detailLines.append("Why now: \(whyNow)") }
-            if !readouts.isEmpty { detailLines.append("Readouts: \(readouts.prefix(5).joined(separator: ", "))") }
-            return Opportunity(
-                id: id,
-                kind: kind,
-                title: title,
-                summary: summary,
-                detail: detailLines.joined(separator: "\n\n"),
-                source: source(kind: kind, id: id),
-                severity: severity(score: score, decision: decision),
-                score: score,
-                relatedPaths: [opportunitiesPath.path]
-            )
-        })
     }
 
     private static func liveOpportunities(
@@ -393,67 +319,6 @@ public enum NativeAgentScheduledProactiveScan {
         return formatter.string(from: updated)
     }
 
-    // MARK: - G9: the outcome-ledger reader
-
-    /// What the ledger tail says about each kind. Pure over the rows — no
-    /// store, no loop, one predicate applied at the eligibility filter.
-    struct OutcomeFeedback: Sendable, Equatable {
-        /// Kinds dismissed at or past the threshold inside the window. Dropped
-        /// outright: User has said no three times, the scan stops asking.
-        var dropped: Set<String> = []
-        /// Kinds with SOME dismissals but below the threshold — scored down so
-        /// they lose ties, not silenced.
-        var penalized: Set<String> = []
-
-        func applyingPenalty(to opportunity: Opportunity) -> Opportunity {
-            guard penalized.contains(opportunity.kind.lowercased()) else { return opportunity }
-            return Opportunity(
-                id: opportunity.id,
-                kind: opportunity.kind,
-                title: opportunity.title,
-                summary: opportunity.summary,
-                detail: opportunity.detail,
-                source: opportunity.source,
-                severity: opportunity.severity,
-                score: max(0, opportunity.score - NativeAgentScheduledProactiveScan.outcomeScorePenalty),
-                relatedPaths: opportunity.relatedPaths,
-                relatedGroups: opportunity.relatedGroups
-            )
-        }
-    }
-
-    static func outcomeFeedback(rows: [JSONValue], now: Date) -> OutcomeFeedback {
-        let cutoff = now.addingTimeInterval(-Double(outcomeWindowDays) * 86_400)
-        var dismissalsByKind: [String: Int] = [:]
-        for row in rows {
-            guard case .object(let obj) = row,
-                  let kind = nonEmptyString(obj["kind"])?.lowercased() else { continue }
-            // `useful == false` is precisely the dismiss write
-            // (ProactiveOutcomeLedger: archive => true, dismiss => false).
-            // A null `useful` is an observation, not a judgement — it must not
-            // count against the kind.
-            guard case .bool(false)? = obj["useful"] else { continue }
-            // A row with an unparseable stamp is counted: the alternative is
-            // letting a malformed timestamp launder a dismissal out of the
-            // window. Only rows PROVABLY older than 30 days are excluded.
-            if let created = nonEmptyString(obj["createdAt"]),
-               let stamp = parseDeskInstant(created),
-               stamp < cutoff {
-                continue
-            }
-            dismissalsByKind[kind, default: 0] += 1
-        }
-        var feedback = OutcomeFeedback()
-        for (kind, count) in dismissalsByKind {
-            if count >= outcomeSuppressionThreshold {
-                feedback.dropped.insert(kind)
-            } else {
-                feedback.penalized.insert(kind)
-            }
-        }
-        return feedback
-    }
-
     private static func isAttentionWorthyInboxBacklogItem(_ obj: [String: JSONValue]) -> Bool {
         let status = (nonEmptyString(obj["status"]) ?? "unread").lowercased()
         guard status == "unread" else { return false }
@@ -524,12 +389,6 @@ public enum NativeAgentScheduledProactiveScan {
         !opportunity.id.isEmpty
     }
 
-    private static func severity(score: Double, decision: String) -> String {
-        if decision == "act" || score >= 0.8 { return "actionable" }
-        if score >= 0.55 { return "important" }
-        return "info"
-    }
-
     private static func source(kind: String, id: String) -> String {
         "proactive_autonomy:\(sourceComponent(kind)):\(sourceComponent(id))"
     }
@@ -558,14 +417,6 @@ public enum NativeAgentScheduledProactiveScan {
         return "opp-\(sourceComponent(kind))-\(digest)"
     }
 
-    private static func readoutStrings(_ raw: JSONValue?) -> [String] {
-        guard case .object(let obj)? = raw,
-              case .array(let values)? = obj["readouts"] else {
-            return []
-        }
-        return values.compactMap { nonEmptyString($0) }
-    }
-
     private static func int(_ raw: JSONValue?, default defaultValue: Int) -> Int {
         switch raw {
         case .int(let value): return Int(value)
@@ -575,34 +426,9 @@ public enum NativeAgentScheduledProactiveScan {
         }
     }
 
-    private static func double(_ raw: JSONValue?) -> Double {
-        switch raw {
-        case .double(let value): return value
-        case .int(let value): return Double(value)
-        case .string(let value): return Double(value) ?? 0
-        default: return 0
-        }
-    }
-
-    private static func bool(_ raw: JSONValue?) -> Bool {
-        switch raw {
-        case .bool(let value): return value
-        case .int(let value): return value != 0
-        case .double(let value): return value != 0
-        case .string(let value):
-            return ["1", "true", "yes", "y"].contains(value.lowercased())
-        default:
-            return false
-        }
-    }
-
     private static func nonEmptyString(_ raw: JSONValue?) -> String? {
         guard case .string(let value)? = raw else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func scoreString(_ score: Double) -> String {
-        String(format: "%.3f", score)
     }
 }

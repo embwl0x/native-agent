@@ -9,9 +9,8 @@ public struct BotTurnReply: Sendable {
     public var artifacts: [BotArtifact]
     public var status: BotRunStatus
     public var detail: String?
-    /// What the turn actually ran on, as the route resolved it. A bot with no
-    /// model choice runs on the agent's own route, and only the client knows
-    /// which model that was.
+    /// What the turn actually ran on. A bot requires a saved provider, model
+    /// and Think level; the runner refuses an incomplete or unavailable choice.
     public var model: String?
     /// Set when the turn stopped on an approval, so the shelf entry can be
     /// reconciled against that approval's own resolution later.
@@ -99,11 +98,47 @@ public actor BotRunner {
     private let shelf: ShelfStore
     private let session: BotRunnerSession
     private let dataRoot: URL
-    public init(dataRoot: URL, session: @escaping BotRunnerSession) {
+    /// The Bots editor's "Tell me if": called after a standing run the helper
+    /// itself judged to meet its condition. The app owns the notification.
+    private let conditionMet: @Sendable (BotDefinition, ShelfEntry) async -> Void
+    public init(dataRoot: URL, session: @escaping BotRunnerSession,
+                conditionMet: @escaping @Sendable (BotDefinition, ShelfEntry) async -> Void = { _, _ in }) {
         queue = BotRunQueue(dataRoot: dataRoot)
         shelf = ShelfStore(dataRoot: dataRoot)
         self.dataRoot = dataRoot
         self.session = session
+        self.conditionMet = conditionMet
+    }
+
+    /// The last line the helper is asked to end a conditioned run with.
+    static let conditionMarker = "TELL:"
+
+    /// The ordinary chat client consumes the verdict before saving the reply.
+    @TaskLocal package static var conditionVerdict: ConditionVerdict?
+    package final class ConditionVerdict: @unchecked Sendable {
+        let sessionID: String
+        private let lock = NSLock()
+        private var verdict: Bool?
+        init(sessionID: String) { self.sessionID = sessionID }
+        var met: Bool? { lock.lock(); defer { lock.unlock() }; return verdict }
+
+        func consume(_ reply: String) -> String {
+            var lines = reply.components(separatedBy: "\n")
+            while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
+            let decoration = CharacterSet(charactersIn: " \t*_`")
+            let line = lines.last?.trimmingCharacters(in: decoration).uppercased() ?? ""
+            guard line.hasPrefix(BotRunner.conditionMarker) else { return reply }
+            lock.lock()
+            verdict = line.dropFirst(BotRunner.conditionMarker.count).trimmingCharacters(in: decoration).hasPrefix("YES")
+            lock.unlock()
+            lines.removeLast()
+            return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    package static func conditionReply(_ reply: String, sessionID: String) -> String {
+        guard let verdict = conditionVerdict, verdict.sessionID == sessionID else { return reply }
+        return verdict.consume(reply)
     }
 
     /// `holdUnattended` is the caller's unattended gate, re-read AFTER the claim
@@ -128,11 +163,21 @@ public actor BotRunner {
         // An event-woken run sees what woke it, from the request this run
         // claimed. Outside text: input for the brief, never an instruction.
         let woke = claimed.context.map { "\n\nWhat woke \(bot.name):\n" + $0 } ?? ""
-        let message = bot.brief + woke + (bot.outputFormat.map { "\n\n" + $0 } ?? "")
+        // "Tell me if": the helper that did the work judges its own result —
+        // no second model call — and the app reads one marked line back.
+        let condition = bot.notificationCondition?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ask = condition.flatMap { $0.isEmpty ? nil : $0 }.map {
+            "\n\nTell me if: \($0)\nEnd your reply with one last line on its own: \(Self.conditionMarker) yes if this run's result meets that condition, otherwise \(Self.conditionMarker) no. The app reads that line to decide whether to notify the person, and removes it."
+        } ?? ""
+        let message = bot.brief + woke + (bot.outputFormat.map { "\n\n" + $0 } ?? "") + ask
         // This run is now on the task's stack: anything it reaches that asks
         // for THIS bot again is refused rather than parked on its own claim.
         return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
-            try await perform(bot, message: message, requestID: requestID)
+            try await BotRunQueue.$eventProvenance.withValue(claimed.provenance) {
+                try await BotRunQueue.$eventContext.withValue(claimed.context) {
+                    try await perform(bot, message: message, requestID: requestID, judgesCondition: !ask.isEmpty)
+                }
+            }
         }
     }
 
@@ -154,7 +199,22 @@ public actor BotRunner {
         }
     }
 
-    private func perform(_ bot: BotDefinition, message: String, requestID: UUID?, asked: Bool = false) async throws -> ShelfEntry {
+    public func resume(bot saved: BotDefinition, message: String,
+                       holdUnattended: @Sendable (BotDefinition) async -> Bool) async throws -> ShelfEntry {
+        let bot = try await queue.claimWhenAvailable(bot: saved.id, requestID: nil).bot
+        defer { queue.finish(bot: saved.id) }
+        guard bot == saved, !bot.paused, !(await holdUnattended(bot)) else { throw BotRunnerError.notPermitted }
+        guard await BotRunGate.isReady() else { throw BotRunnerError.cannotRun("Provider check is not ready yet.") }
+        if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
+            throw BotRunnerError.cannotRun(problem)
+        }
+        return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([bot.id])) {
+            try await perform(bot, message: message, requestID: nil)
+        }
+    }
+
+    private func perform(_ bot: BotDefinition, message: String, requestID: UUID?, asked: Bool = false,
+                         judgesCondition: Bool = false) async throws -> ShelfEntry {
         let start = Date()
         let clock = ContinuousClock.now
         // A refused daily reservation means the turn never started: it is a run
@@ -162,17 +222,24 @@ public actor BotRunner {
         // appending a shelf entry. The scheduler records the occurrence missed.
         try queue.reserveDailySpend(tokens: bot.budget.tokens, bot: bot.id,
             ceiling: bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens)
-        let outcome: BotTurnReply
+        var outcome: BotTurnReply
+        let verdict = judgesCondition ? ConditionVerdict(sessionID: bot.sessionID) : nil
         do {
             let session = self.session
             // Cancellation settles the ordinary client's transcript before the
             // claim is released. Never abandon a still-writing session task.
             outcome = try await BotRunnerDeadline.settled(seconds: bot.budget.seconds) {
-                try await session(bot, message)
+                try await Self.$conditionVerdict.withValue(verdict) {
+                    try await session(bot, message)
+                }
             }
         } catch {
             outcome = BotTurnReply(reply: "", status: error is CancellationError || error is BotRunnerError ? .interrupted : .failed,
                 detail: String(describing: error))
+        }
+        let met = outcome.status == .completed && verdict?.met == true
+        if judgesCondition, outcome.status == .completed, verdict?.met == nil {
+            outcome.detail = outcome.detail ?? "Tell me if: the run did not say whether its condition was met, so no notification was sent."
         }
         let elapsed = clock.duration(to: .now)
         let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
@@ -209,6 +276,7 @@ public actor BotRunner {
         entry.approvalID = outcome.approvalID
         if asked { entry.asked = true }
         try shelf.append(entry)
+        if met { await conditionMet(bot, entry) }
         return entry
     }
 }

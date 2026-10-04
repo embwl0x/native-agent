@@ -92,31 +92,6 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             : nil
     }
 
-    /// Rides ONLY on requests that actually carry a `tool_addition` /
-    /// `tool_removal` block.
-    static let midConversationToolChangesBeta =
-        "mid-conversation-tool-changes-2026-07-01"
-
-    /// Same rule as `clearAtBeta`, for the tool-change blocks: present IFF a
-    /// message in THIS request carries one. A body with tool-change blocks and
-    /// no header is a 400; a header with no blocks would opt every ordinary
-    /// request into a beta it does not use.
-    static func toolChangeBeta(for messages: [LLMMessage]) -> String? {
-        messages.contains { !$0.toolChanges.isEmpty }
-            ? midConversationToolChangesBeta
-            : nil
-    }
-
-    /// The full comma-joined `anthropic-beta` value the MID-CONVERSATION
-    /// features need for this request, or nil when it needs none. One
-    /// assembly rule for every Anthropic transport: both api-key lanes send
-    /// this header ONLY when it is non-nil, so a request that uses neither
-    /// feature stays byte-identical to the pre-2026-09 wire.
-    static func midConversationBetas(for messages: [LLMMessage]) -> String? {
-        let betas = [clearAtBeta(for: messages), toolChangeBeta(for: messages)]
-            .compactMap { $0 }
-        return betas.isEmpty ? nil : betas.joined(separator: ",")
-    }
     // Anthropic gates newer models (Fable 5.1: "version 2.1.251 or newer is
     // required", error_code claude_code_version_too_old) on this version. Keep it
     // at the Claude Code release actually installed on this Mac.
@@ -168,7 +143,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         messages: [LLMMessage] = []
     ) -> [String: String] {
         var betas = oauthBetaFeatures
-        if let midConversation = midConversationBetas(for: messages) {
+        if let midConversation = clearAtBeta(for: messages) {
             betas.append(midConversation)
         }
         return [
@@ -397,6 +372,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             if status == 401, attempt == 0 { continue }
             try Self.validateCompletionResponse(status: status, data: data, response: response)
             let (obj, pieces) = try completionPieces(data: data, status: status)
+            let reachedLengthLimit = obj["stop_reason"] as? String == "max_tokens"
             // U1 step 1: capture provider usage (incl. cache counters) into
             // the llm.call trace feed. Non-fatal; numbers only. Recorded
             // AFTER the pieces validation so a 200 with unsupported/empty
@@ -411,9 +387,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
                 ttftMs: nil,
                 durationMs: durationMs,
+                status: reachedLengthLimit ? "incomplete" : "ok",
                 substitutedFrom: substitutedFrom,
-                cacheMarkers: Self.cacheMarkers(in: body)
+                cacheMarkers: Self.cacheMarkers(in: body),
+                stopReason: reachedLengthLimit ? "max_tokens" : nil
             )
+            if reachedLengthLimit {
+                throw LLMError.outputLengthLimit(partial: pieces.joined(separator: "\n"))
+            }
             return pieces.joined(separator: "\n")
         }
         throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
@@ -489,6 +470,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             if status == 401, attempt == 0 { continue }
             try Self.validateCompletionResponse(status: status, data: data, response: response)
             let (obj, pieces) = try completionPieces(data: data, status: status)
+            let reachedLengthLimit = obj["stop_reason"] as? String == "max_tokens"
             // U1 step 1: token/cache usage telemetry. Recorded AFTER the
             // pieces validation so a 200 with unsupported/empty content
             // throws WITHOUT leaving a misleading "ok" row (gpt-5.5 review
@@ -502,9 +484,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
                 ttftMs: nil,
                 durationMs: durationMs,
+                status: reachedLengthLimit ? "incomplete" : "ok",
                 substitutedFrom: substitutedFrom,
-                cacheMarkers: Self.cacheMarkers(in: body)
+                cacheMarkers: Self.cacheMarkers(in: body),
+                stopReason: reachedLengthLimit ? "max_tokens" : nil
             )
+            if reachedLengthLimit {
+                throw LLMError.outputLengthLimit(partial: pieces.joined(separator: "\n"))
+            }
             return pieces.joined(separator: "\n")
         }
         throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
@@ -524,7 +511,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 pieces.append(t)
             }
         }
-        if pieces.isEmpty {
+        if pieces.isEmpty && obj["stop_reason"] as? String != "max_tokens" {
             throw FirstPartyExecutionControls.anthropicEmptyStreamError(
                 providerID: providerId,
                 stopReason: obj["stop_reason"] as? String,

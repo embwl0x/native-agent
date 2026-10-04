@@ -42,6 +42,17 @@ enum ConnectorUIState: Equatable {
         if health == ConnectorHealthDecay.unverifiedHealth {
             return .unverified
         }
+        if auth == "connected_unverified"
+            || auth == "not_connected"
+            || auth == "needs_auth"
+            || health == "needs_auth"
+            || health == "needs_probe"
+            || health == "needs_permission"
+            || health == "probe_needed"
+            || health == "needs_config"
+            || health == "needs_setup" {
+            return .needsAuth
+        }
         if auth == "connected" || auth == "configured" || health == "ok" {
             return .live
         }
@@ -50,15 +61,6 @@ enum ConnectorUIState: Equatable {
         }
         if auth == "not_required" {
             return .ready
-        }
-        if auth == "connected_unverified"
-            || auth == "not_connected"
-            || auth == "needs_auth"
-            || health == "needs_auth"
-            || health == "needs_probe"
-            || health == "needs_permission"
-            || health == "probe_needed" {
-            return .needsAuth
         }
         return .unknown
     }
@@ -627,7 +629,13 @@ struct ConnectorsView: View {
             return "Ready"
         case .comingSoon:
             return "Coming soon"
-        case .needsAuth: return "Needs sign-in"
+        case .needsAuth:
+            switch health?.lowercased() {
+            case "needs_permission": return "Needs permission"
+            case "needs_probe", "probe_needed": return "Needs a check"
+            case "needs_config", "needs_setup": return "Needs setup"
+            default: return "Needs sign-in"
+            }
         case .live: return "Connected"
         case .unknown: return plainStatus(health ?? auth ?? "unknown")
         }

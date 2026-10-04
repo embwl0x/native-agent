@@ -1,5 +1,6 @@
 import AppToolRuntime
 import AppKit
+import ChatOrchestration
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -10,39 +11,13 @@ import Desk
 import ProviderRouting
 import StandingBots
 import SwiftUI
+import MacIntegration
 import MemoryV2
 
-/// Looking at a page without anyone else looking at it.
-///
-/// The page is built a SECOND time, offscreen, from the same live `AppModel`
-/// the visible window is bound to. The window on screen is never read, never
-/// touched, and never asked to change what it is showing — which is what makes
-/// a read of Providers safe while the person is reading Chat.
-///
-/// The only AppKit window this file creates is an unordered, borderless host
-/// used to give the hosting view a layout context so accessibility resolves.
-/// It is never ordered front, never made key, never given a level, and is torn
-/// down in the same call. `NSApp.activate`, `makeKeyAndOrderFront`, `orderFront`,
-/// `NSWindow.level` and every synthesized-event API (`CGEvent`,
-/// `CGWarpMouseCursorPosition`) appear nowhere in this file, in
-/// `QuietSelfAdmin.swift`, in `QuietSelfAdminSettings.swift`, or in
-/// `AppToolExecutor+QuietSelfAdmin.swift` — that absence is the whole
-/// guarantee, and a grep over those four files is how to check it.
-/// True for the offscreen copy a quiet read mounts, false for the window the
-/// person is looking at.
-///
-/// A read must not be a write. The pages carry lifecycle work — `.task` loads,
-/// `onAppear` state writes — that is right for a page someone opened and wrong
-/// for a page nobody opened: `TodayView` clearing the waiting-memories badge is
-/// the one that gave this away. Pages honour the flag through `liveTask` /
-/// `liveOnAppear`, which are `.task` / `.onAppear` that stay asleep for the
-/// offscreen copy.
-///
-/// A read must also BE a read. Stopping every `.task` left the offscreen copy
-/// with nothing on it — Providers came back as its own title on an empty field
-/// — so a load that only fetches and assigns runs through `quietReadTask`
-/// instead, which does run offscreen and is counted, and the render waits for
-/// those loads and gives the host a layout and display pass before it draws.
+/// Only screenshots mount an offscreen copy of a page. Text reads load owner
+/// state directly. The screenshot's unordered host never touches the visible
+/// window; this flag suppresses lifecycle writes while allowing read-only
+/// `quietReadTask` loads to finish before capture.
 private struct QuietOffscreenReadKey: EnvironmentKey {
     static let defaultValue = false
 }
@@ -80,8 +55,8 @@ private struct LiveAppearModifier: ViewModifier {
 }
 
 extension View {
-    /// `.task`, except that it does not run for the offscreen copy a quiet
-    /// read mounts. Use it wherever appearing starts work or writes state.
+    /// `.task`, except that it does not run for an offscreen screenshot.
+    /// Use it wherever appearing starts work or writes state.
     func liveTask(
         @_inheritActorContext _ action: @escaping @Sendable () async -> Void
     ) -> some View {
@@ -95,7 +70,7 @@ extension View {
         modifier(LiveTaskModifier(id: id, action: action))
     }
 
-    /// `.onAppear`, except that it does not run for a quiet read.
+    /// `.onAppear`, except that it does not run for an offscreen screenshot.
     func liveOnAppear(_ action: @escaping () -> Void) -> some View {
         modifier(LiveAppearModifier(action: action))
     }
@@ -170,9 +145,8 @@ enum QuietSelfAdminRender {
     /// gets measured, small enough that one PNG stays well inside the eight-MiB
     /// tool-image ceiling.
     static let defaultSize = CGSize(width: 1280, height: 860)
-    /// Rows returned from one tree read. A page with more says so and truncates
-    /// rather than handing the model a transcript-sized wall.
-    static let maxTreeRows = 400
+    /// Keep the compatibility outline bounded independently of `content`.
+    static let maxElementRows = 400
 
     // MARK: - The page, built offscreen
 
@@ -182,6 +156,10 @@ enum QuietSelfAdminRender {
             if QuietPages.drawOnly.contains(page) {
                 SimpleShellView()
                     .environment(\.simpleSettingsMenuDrawnOpen, page.id == "simple_settings_menu")
+            } else if page.tab == "iphone" {
+                MacPairingView()
+            } else if page.tab == "agents" {
+                ShellRailPage(title: "Agents", alive: true) { AgentContactsSection() }
             } else {
             switch page.item {
             case .chat: ChatView()
@@ -197,6 +175,9 @@ enum QuietSelfAdminRender {
             case .capabilities: ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle, alive: true) { CapabilitiesView() }
             case .diagnostics: DiagnosticsRailPage()
             case .settings: SetupView()
+            case .telegram: TelegramView()
+            case .mcp: MCPHubView()
+            case .macIntegration: MacIntegrationView()
             default: EmptyView()
             }
             }
@@ -221,7 +202,7 @@ enum QuietSelfAdminRender {
 
     // MARK: - Giving the offscreen copy its content
 
-    /// Longest a quiet read waits for a page's own read-only loads. A page
+    /// Longest a screenshot waits for a page's own read-only loads. A page
     /// whose fetches are slower than this is drawn as far as it got, which is
     /// still the page, rather than holding the tool call open.
     static let loadBudget: TimeInterval = 4
@@ -244,8 +225,8 @@ enum QuietSelfAdminRender {
     /// loaded first and awaited; the copy is then mounted in an unordered host
     /// so its own read-only loads (`quietReadTask`) start; the run loop is
     /// given turns until those loads finish or the budget runs out; and only
-    /// then is the tree read and the bitmap taken. Before this, both were taken
-    /// from a host that had never been through a display pass, which is why a
+    /// then is the bitmap taken. Previously the capture came from a host
+    /// that had never been through a display pass, which is why a
     /// screenshot came back as a title on an empty page.
     private static func withPreparedHost<T>(
         for page: QuietPage, appModel: AppModel, size: CGSize = defaultSize,
@@ -304,7 +285,7 @@ enum QuietSelfAdminRender {
             if idleTurns >= 6 { break }
         }
         // The loads landed; give their state one more layout and display pass
-        // so the tree and the bitmap are of a page that has actually drawn.
+        // so the bitmap is of a page that has actually drawn.
         hosting.layoutSubtreeIfNeeded()
         hosting.displayIfNeeded()
     }
@@ -333,105 +314,6 @@ enum QuietSelfAdminRender {
         }
     }
 
-    // MARK: - Words and state
-
-    /// The page's accessibility tree — the same rows a screen reader would
-    /// read, which is also the closest thing the app has to "what the page
-    /// says". Read from the same prepared offscreen host the picture comes
-    /// from, so the two describe one loaded page and nothing on screen moves.
-    static func pageTree(
-        for page: QuietPage, appModel: AppModel
-    ) async -> (rows: [JSONValue], truncated: Bool) {
-        await withPreparedHost(for: page, appModel: appModel) { hosting in
-            var rows: [JSONValue] = []
-            var truncated = false
-            collect(element: hosting, depth: 0, rows: &rows, truncated: &truncated)
-            return (rows, truncated)
-        }
-    }
-
-    private static func collect(
-        element: Any, depth: Int, rows: inout [JSONValue], truncated: inout Bool
-    ) {
-        guard !truncated else { return }
-        guard rows.count < maxTreeRows else {
-            truncated = true
-            return
-        }
-        // `NSAccessibility` is the protocol every AppKit element answers —
-        // real views and the synthetic elements SwiftUI builds alike.
-        guard depth <= 24, let node = element as? NSAccessibilityProtocol else { return }
-
-        let role = (node.accessibilityRole()?.rawValue).map(shortRole) ?? ""
-        // SwiftUI answers in whichever of these four it happens to fill: a
-        // shelf card puts its words in the label, a static text in the value,
-        // an AppKit control in the title, and a decorated row only in the help.
-        // Taking one of them and stopping was why the Bots page came back as
-        // rows with a role and no words at all.
-        let label = trimmed(node.accessibilityLabel())
-        let title = trimmed(node.accessibilityTitle())
-        let help = trimmed(node.accessibilityHelp())
-        let value = describe(node.accessibilityValue())
-
-        // A row with no role, no words and no value says nothing; the layout
-        // containers SwiftUI builds are mostly these. Its children still count.
-        if !(role.isEmpty && label.isEmpty && title.isEmpty && help.isEmpty && value.isEmpty) {
-            var row: [String: JSONValue] = ["depth": .int(Int64(depth))]
-            if !role.isEmpty { row["role"] = .string(role) }
-            let words = [label, title, help].first { !$0.isEmpty } ?? ""
-            if !words.isEmpty { row["label"] = .string(bounded(words)) }
-            if !value.isEmpty { row["value"] = .string(bounded(value)) }
-            // Only worth saying when it is false — everything else is enabled.
-            if node.isAccessibilityEnabled() == false {
-                row["enabled"] = .bool(false)
-            }
-            rows.append(.object(row))
-        }
-
-        let children = node.accessibilityChildren() ?? []
-        guard children.isEmpty else {
-            for child in children {
-                collect(element: child, depth: depth + 1, rows: &rows, truncated: &truncated)
-            }
-            return
-        }
-        // A container that answers the accessibility protocol with no children
-        // is not necessarily empty. The Bots shelf came back as one disabled
-        // group and nothing else — no title, no cards, no run history — while
-        // its real subviews held the whole page; a SwiftUI subtree that has not
-        // been asked for by a screen reader can report itself that way offscreen.
-        // Where the element IS a view, the view hierarchy is the ground truth,
-        // so the walk keeps going down it rather than stopping at the group.
-        if let view = element as? NSView {
-            for subview in view.subviews {
-                // A SwiftUI backing view is usually AX-ignored: asked directly
-                // it answers with no role and no words — the eleven "unknown"
-                // rows the Bots read came back with. Its unignored descendant
-                // IS the element a screen reader would land on, so ask that.
-                let reachable = NSAccessibility.unignoredDescendant(of: subview) ?? subview
-                collect(element: reachable, depth: depth + 1, rows: &rows, truncated: &truncated)
-            }
-        }
-    }
-
-    /// Plain words over AX constants: "button", not "AXButton".
-    private static func shortRole(_ raw: String) -> String {
-        raw.hasPrefix("AX") ? String(raw.dropFirst(2)).lowercased() : raw.lowercased()
-    }
-
-    private static func trimmed(_ raw: String?) -> String {
-        (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func describe(_ value: Any?) -> String {
-        switch value {
-        case let text as String: return text.trimmingCharacters(in: .whitespacesAndNewlines)
-        case let flag as Bool: return flag ? "on" : "off"
-        case let number as NSNumber: return number.stringValue
-        default: return ""
-        }
-    }
-
     private static func bounded(_ raw: String) -> String {
         let collapsed = raw
             .components(separatedBy: .whitespacesAndNewlines)
@@ -444,35 +326,47 @@ enum QuietSelfAdminRender {
 
 // MARK: - The page in words, from the page's own data
 
-/// Agent, 2026-09-13: `app_page_read(page: bots)` came back as twelve elements,
-/// ten of them role "unknown", with no label, value or text on any of them —
-/// only the settings block had anything in it. Three passes at the offscreen
-/// accessibility tree (unignored descendants, the view hierarchy under an
-/// AX-silent group, four attributes instead of one) each moved it a little and
-/// none of them made the page READABLE. A SwiftUI subtree nobody has asked for
-/// with a screen reader does not have to publish its words, and no amount of
-/// walking it changes that.
-///
-/// So the content half of a page read stops going through the tree. Every rail
-/// page has a text PROJECTION built from the same records the page renders —
-/// the store rows, the AppModel state, the derived lines the cards print —
-/// emitted as `content`. The tree stays, as `elements`, for the rows that do
-/// carry words; the projection is what the model reads.
-///
-/// The rules are the same as everywhere else in a quiet read: main actor, read
-/// only, no store the page would not have read itself, and no write of any
-/// kind. It runs AFTER `pageTree`, which has already awaited the page's own
-/// loaders, so `AppModel` is as fresh as the copy that was just drawn.
+/// The same records and formatters the pages draw, without creating a second
+/// SwiftUI tree. `content` owns the words; `elements` is a bounded outline of
+/// that projection, not a claim about rendered controls or their enabled state.
 extension QuietSelfAdminRender {
-    /// One page read: the tree, and the words.
     static func pageRead(
         for page: QuietPage, appModel: AppModel
     ) async -> (rows: [JSONValue], truncated: Bool, content: [JSONValue]) {
-        // The tree first: `withPreparedHost` inside it awaits the page's own
-        // read-only loaders, so the projection below reads loaded state.
-        let tree = await pageTree(for: page, appModel: appModel)
+        await loadPageData(for: page, appModel: appModel)
+        // These page tasks load shared owner state in addition to the rail's
+        // refresh. Other view tasks only populate local presentation state or
+        // repeat reads the rail/projection already performs.
+        if page.tab == "iphone" {
+            appModel.engine.sync.observeStatus()
+            await appModel.engine.sync.loadSecret(quiet: true)
+        } else if page.item == .telegram {
+            await appModel.refreshTelegram()
+        }
         let content = await pageProjection(for: page, appModel: appModel)
-        return (tree.rows, tree.truncated, content)
+        let outline = projectionElements(content)
+        return (outline.rows, outline.truncated, content)
+    }
+
+    private static func projectionElements(_ content: [JSONValue]) -> (rows: [JSONValue], truncated: Bool) {
+        var rows: [JSONValue] = []
+        var truncated = false
+        func append(_ text: String, depth: Int64, role: String) {
+            guard rows.count < maxElementRows else { truncated = true; return }
+            rows.append(.object([
+                "depth": .int(depth), "role": .string(role), "label": .string(bounded(text)),
+            ]))
+        }
+        for case .object(let section) in content {
+            if case .string(let heading)? = section["heading"] {
+                append(heading, depth: 0, role: "heading")
+            }
+            if case .array(let lines)? = section["lines"] {
+                for case .string(let line) in lines { append(line, depth: 1, role: "text") }
+            }
+            if truncated { break }
+        }
+        return (rows, truncated)
     }
 
     /// One section of the projection: a heading and the lines under it.
@@ -493,6 +387,7 @@ extension QuietSelfAdminRender {
 
     /// The page, in the words of the records it draws from.
     static func pageProjection(for page: QuietPage, appModel: AppModel) async -> [JSONValue] {
+        if let service = servicePages[page.id] { return await serviceProjection(page, service, appModel: appModel) }
         switch page.item {
         case .chat: return await chatProjection(appModel: appModel)
         case .bots: return await botsProjection(appModel: appModel)
@@ -504,7 +399,16 @@ extension QuietSelfAdminRender {
         case .inboxPolicy: return notificationsProjection(appModel: appModel)
         case .diagnostics: return diagnosticsProjection(appModel: appModel)
         case .capabilities: return capabilitiesProjection(appModel: appModel)
+        case .connectors where page.tab == "iphone": return pairingProjection(appModel: appModel)
+        case .connectors where page.tab == "agents": return agentsProjection(appModel: appModel)
         case .connectors: return connectorsProjection(appModel: appModel)
+        case .telegram: return telegramProjection(appModel: appModel)
+        case .mcp: return mcpProjection(appModel: appModel)
+        case .macIntegration:
+            return [section("Mac Integration", [
+                "Each app's access is a setting below (off, read, write, read_write). Under Full Mac an app "
+                + "left untouched is allowed anyway; one set off here stays off.",
+            ])]
         case .personality: return personalityProjection(appModel: appModel)
         case .settings: return settingsProjection(appModel: appModel)
         default: return []
@@ -583,7 +487,7 @@ extension QuietSelfAdminRender {
             line("Trust", "trust_word") ?? "",
             line("Context used", "ring_percent").map { $0 + "%" } ?? "Context used: unknown",
             line("Open pane", "open_card") ?? "",
-            "interaction_act target=composer works this row in process.",
+            "The chat.* actions work this row in process.",
         ].filter { !$0.isEmpty } + paneRows))
 
         // The folds, in transcript order, by the row the fold stands on.
@@ -633,7 +537,7 @@ extension QuietSelfAdminRender {
         sections.append(section(
             "Cards",
             [collapsed.heading
-                + " in this conversation. interaction_act answers one by its id."]
+                + " in this conversation. card.answer answers one by its id."]
         ))
         for pair in pairs {
             let descriptor = InlineInteractionResolver.descriptor(
@@ -746,7 +650,7 @@ extension QuietSelfAdminRender {
         let unattended = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
         let loaded = try? await Task.detached(priority: .userInitiated) {
             (records: try BotsShelfView.readRecords(root: root, unattended: unattended),
-             active: (try? BotRunQueue(dataRoot: root).activeOrQueuedIDs()) ?? [])
+             runs: try BotRunQueue(dataRoot: root).activeAndQueuedIDs())
         }.value
         guard let loaded else {
             return [section("Bots", ["The shelf could not be read."])]
@@ -756,7 +660,8 @@ extension QuietSelfAdminRender {
         if !unattended { header.append(BotsShelfUnattended.pageLine) }
         sections.append(section("Bots", header))
         for record in loaded.records {
-            let state = BotState(record: record, running: loaded.active.contains(record.id))
+            let state = BotState(record: record, running: loaded.runs.active.contains(record.id),
+                                 queued: loaded.runs.queued.contains(record.id))
             var lines: [String] = ["State: \(state.word)"]
             let brief = record.definition.brief
                 .split(whereSeparator: \.isNewline)
@@ -830,7 +735,9 @@ extension QuietSelfAdminRender {
         }
         let accounts = snapshot.providers.map { info -> String in
             let mode = info.auth_mode.map { " via \($0)" } ?? ""
-            return "\(info.display_name): \(info.auth_status.state) — \(info.auth_status.detail)\(mode)"
+            let line = ProviderAccountStateLinePresentation.pageLine(state: info.auth_status.state,
+                detail: info.auth_status.detail, failedTest: snapshot.failedTests[info.provider_id])
+            return "\(info.display_name): \(line)\(mode)"
         }
         sections.append(section("Accounts", accounts.isEmpty ? ["No providers listed."] : accounts))
         return sections
@@ -905,7 +812,7 @@ extension QuietSelfAdminRender {
             }
         }
         var sections = [section("Desk", [
-            countLine(active.count, "item in play", "items in play"),
+            countLine(active.count, "open item, including parts; MY QUEUE separate", "open items, including parts; MY QUEUE separate"),
             countLine(waiting.count, "item waiting on you", "items waiting on you"),
             countLine(blocked.count, "item blocked", "items blocked"),
         ])]
@@ -949,7 +856,16 @@ extension QuietSelfAdminRender {
         head.append(countLine(appModel.runs.count, "run recorded", "runs recorded"))
         var sections = [section("Diagnostics", head)]
         if !appModel.runs.isEmpty {
-            sections.append(section("Runs", appModel.runs.prefix(15).map { "\($0.id) · \($0.status)" }))
+            // The Run history row's own words: kind, badge, when, how long,
+            // model, and the error, output or prompt it previews.
+            sections.append(section("Runs", appModel.runs.prefix(15).map { run in
+                ([run.id, RunKindVocabulary.displayName(run.kind, on: .mac),
+                  RunStatusBadgePresentation.badge(for: run.status).label,
+                  RunDetailPresentation.createdAtText(for: run)]
+                    + [run.durationSeconds.map(UserDisplayFormatters.humanizeDuration), run.model].compactMap { $0 }
+                        .filter { !$0.isEmpty })
+                    .joined(separator: " · ") + ": " + RunPreviewPresentation.preview(for: run).text
+            }))
         }
         return sections
     }
@@ -975,6 +891,103 @@ extension QuietSelfAdminRender {
             sections.append(section("Connected", appModel.connectors.map {
                 "\($0.name)\($0.kind.isEmpty ? "" : " (\($0.kind))"): \($0.enabled ? "on" : "off")"
             }))
+        }
+        return sections
+    }
+
+    private static func telegramProjection(appModel: AppModel) -> [JSONValue] {
+        guard let status = appModel.engine.telegram.status else {
+            return [section("Telegram", ["Telegram's status has not loaded."])]
+        }
+        var lines = [
+            "Telegram: \(status.enabled ? "on" : "off") · bot token \(status.tokenConfigured ? "saved" : "not saved")",
+            "Only answers when mentioned in a group: \(status.requireMention ? "yes" : "no")",
+            countLine(status.allowedChatIds.count, "allowed chat", "allowed chats")
+                + ", " + countLine(status.allowedUserIds.count, "allowed user", "allowed users"),
+            "Model: \(status.model ?? "same as Chat") · Think \(status.reasoningEffort ?? "default")",
+        ]
+        if let at = status.lastReplyAt { lines.append("Last reply: \(at)") }
+        if let error = status.lastError, !error.isEmpty { lines.append("Last error: \(error)") }
+        return [section("Telegram", lines)]
+    }
+
+    private static func mcpProjection(appModel: AppModel) -> [JSONValue] {
+        var sections = [section("MCP", [
+            countLine(appModel.mcpServers.count, "server", "servers"),
+            countLine(appModel.mcpConsent.count, "consent", "consents"),
+        ])]
+        if !appModel.mcpServers.isEmpty {
+            sections.append(section("Servers", appModel.mcpServers.map {
+                "\($0.name) [\($0.id)]: \($0.status ?? $0.healthStatus ?? "status unknown") · \($0.toolCount ?? 0) tools"
+            }))
+        }
+        if !appModel.mcpConsent.isEmpty {
+            sections.append(section("Consents", appModel.mcpConsent.prefix(30).map {
+                "\($0.toolName ?? "a tool") on \($0.serverId ?? "a server"): \($0.status ?? "unknown") (\($0.risk ?? "risk unknown"))"
+            }))
+        }
+        return sections
+    }
+
+    private static func pairingProjection(appModel: AppModel) -> [JSONValue] {
+        let sync = appModel.engine.sync
+        var head = ["iCloud: \(sync.status)"]
+        if let error = sync.pairingError { head.append("Problem: \(error)") }
+        let phones = sync.phones.filter { $0.status != .removed }
+        head.append(countLine(phones.count, "phone", "phones"))
+        var sections = [section("iPhone pairing", head)]
+        if !phones.isEmpty {
+            sections.append(section("Phones", phones.map { "\($0.id): \($0.status.rawValue)" }))
+        }
+        return sections
+    }
+
+    /// A Mac app's or connector's page: the Mac app whose access it shows,
+    /// and the connectors behind its actions.
+    static let servicePages: [String: (mac: String?, connectors: [String])] = [
+        "mail": (MacIntegrationID.mail, ["local_mail", "gmail", "agentmail"]),
+        "calendar": (MacIntegrationID.calendar, ["local_calendar", "google_calendar"]),
+        "reminders": (MacIntegrationID.reminders, ["local_reminders"]),
+        "notes": (MacIntegrationID.notes, []), "contacts": (MacIntegrationID.contacts, []),
+        "messages": (MacIntegrationID.messages, []), "music": (MacIntegrationID.music, []),
+        "github": (nil, ["github"]), "slack": (nil, ["slack"]), "notion": (nil, ["notion"]), "x": (nil, ["x"]),
+        "markets": (nil, ["markets"]),
+    ]
+
+    private static func serviceProjection(_ page: QuietPage, _ service: (mac: String?, connectors: [String]),
+                                          appModel: AppModel) async -> [JSONValue] {
+        var lines: [String] = []
+        if let mac = service.mac {
+            let store = MacIntegrationPermissionStore.shared
+            let admitted = await appModel.fullMacYoloAuthorityAdmitted(tool: "mac_integration",
+                surface: ChatToolSessionContext.envelope?.surface ?? "chat")
+            let storedRead = await store.allows(mac, mode: .read), storedWrite = await store.allows(mac, mode: .write)
+            let read = await store.allows(mac, mode: .read, fullMacAdmitted: admitted)
+            let write = await store.allows(mac, mode: .write, fullMacAdmitted: admitted)
+            let access = read && write ? "read and write" : read ? "read" : write ? "write" : "off"
+            let stored = storedRead && storedWrite ? "read and write" : storedRead ? "read" : storedWrite ? "write" : "off"
+            lines.append("\(MacIntegrationID.displayName(for: mac)) effective permission: \(access); stored permission: \(stored) "
+                + "(Full Mac \(admitted ? "admitted" : "not admitted"); macOS permissions still apply; "
+                + "setting trust.mac_integration_\(mac), on mac_integration)")
+        }
+        for connector in appModel.connectors where service.connectors.contains(connector.id) {
+            lines.append("\(connector.name.isEmpty ? connector.id : connector.name): \(connector.enabled ? "on" : "off")"
+                + (connector.authState.map { " · \($0)" } ?? ""))
+        }
+        if lines.isEmpty { lines.append("\(page.title) is not set up in Connectors.") }
+        return [section(page.title, lines)]
+    }
+
+    /// The Agents tab's rows, as its own reload builds them.
+    private static func agentsProjection(appModel: AppModel) -> [JSONValue] {
+        let root = dataRoot(appModel)
+        let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
+        let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
+        let peers = (try? AgentPeerStore(dataRoot: root).list()) ?? []
+        let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: usable, dataRoot: root)
+        var sections = [section("Agents", [countLine(rows.count, "contact", "contacts")])]
+        if !rows.isEmpty {
+            sections.append(section("Contacts", rows.map { "\($0.displayName): \($0.pillWord)" }))
         }
         return sections
     }

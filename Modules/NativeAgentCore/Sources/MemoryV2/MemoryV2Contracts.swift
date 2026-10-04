@@ -55,6 +55,7 @@ public struct MemoryV2RecallResponse: Sendable, Equatable {
 public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
     public var id: String
     public var content: String
+    public var personaId: String?
     public var source: String?
     /// "pending" | "accepted" | "rejected".
     public var status: String
@@ -73,6 +74,7 @@ public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
     public init(
         id: String,
         content: String,
+        personaId: String? = nil,
         source: String? = nil,
         status: String = "pending",
         createdAt: String,
@@ -82,6 +84,7 @@ public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
     ) {
         self.id = id
         self.content = content
+        self.personaId = personaId
         self.source = source
         self.status = status
         self.createdAt = createdAt
@@ -116,12 +119,14 @@ public enum MemoryPatchContract {
     /// `recall_count` — `store()`'s duplicate guard bumps it (2026-07-24).
     /// `source_history` / `duplicate_occurrences` — byte-identical collapse
     /// provenance (2026-08-02).
+    /// `owner_restored` — stamped when the agent restores an archived row; the
+    /// hygiene duplicate pass leaves such a row alone (2026-10-01).
     ///
     /// `kind` is deliberately ABSENT: it is semantics-owned (kind-scoped decay)
     /// and no UI path patches it.
     public static let untypedPassthroughKeys: Set<String> = [
         "pinned", "tags", "importance", "recall_count",
-        "source_history", "duplicate_occurrences",
+        "source_history", "duplicate_occurrences", "owner_restored",
     ]
 }
 
@@ -224,6 +229,8 @@ public protocol MemoryStorageProtocol: Sendable {
     func getProposal(id: String) async throws -> ProposalRecord?
     func acceptProposal(id: String) async throws -> MemoryRecord
     func acceptReviewedMoment(id: String, review: ReviewedMomentAcceptance) async throws -> MemoryRecord
+    /// Check pending state, record lineage and retire without denial under one write lock.
+    func supersedeProposal(id: String, by successorId: String) async throws -> Bool
     func updateProposalStatus(id: String, status: String, rejectionReason: String?) async throws
     /// 2026-07-21 audit fix: metadata merge target for propose()'s
     /// pending-proposal content-hash dedup. Pending-only semantics — a
@@ -282,6 +289,26 @@ public protocol AtomicSupersedingAcceptanceStorage: MemoryStorageProtocol {
     func acceptProposal(
         id: String,
         superseding: SupersedingAcceptance
+    ) async throws -> MemoryRecord
+}
+
+/// Match duplicates and accumulate their evidence atomically with admission.
+public protocol AtomicMemoryAdmissionStorage: MemoryStorageProtocol {
+    /// Match and reassert a duplicate, or insert if requested, in one transaction.
+    /// Caller-owned IDs may match only their own row.
+    func admit(
+        record: MemoryRecord, embedding: [Float]?, embeddingEpoch: MemoryEmbeddingEpoch?,
+        insertIfMissing: Bool, preserveID: Bool
+    ) async throws -> MemoryRecord?
+}
+
+/// Insert the replacement and retire every named predecessor atomically.
+public protocol AtomicSupersedingMemoryStorage: MemoryStorageProtocol {
+    func insert(
+        record: MemoryRecord,
+        embedding: [Float]?,
+        embeddingEpoch: MemoryEmbeddingEpoch?,
+        superseding: [SupersedingAcceptance]
     ) async throws -> MemoryRecord
 }
 

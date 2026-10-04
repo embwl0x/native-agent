@@ -7,6 +7,7 @@ public enum ProcedureArtifactStoreError: String, Error, Sendable, Equatable {
     case immutableConflict = "immutable_conflict"
     case artifactNotFound = "artifact_not_found"
     case corruptArtifact = "corrupt_artifact"
+    case legacyArtifactRequiresRevalidation = "legacy_artifact_requires_revalidation"
     /// The installed-artifact directory crossed the hard discovery ceiling —
     /// NOT a corrupt row. Added 2026-07-21 (audit): the ceiling guard used to
     /// throw `corruptArtifact`, mislabeling capacity as damage. Existing raw
@@ -179,7 +180,9 @@ public actor ProcedureArtifactStore {
 
     @discardableResult
     public func install(_ artifact: DeclarativeProcedureArtifact) async throws -> URL {
-        guard Self.valid(artifact) else { throw ProcedureArtifactStoreError.invalidArtifact }
+        guard Self.valid(artifact), !artifact.requiresLegacyRevalidation else {
+            throw ProcedureArtifactStoreError.invalidArtifact
+        }
         let path = artifactPath(artifact.id)
         let value = try JSONValue.parse(JSONEncoder().encode(artifact))
         try await persistence.withFileLock(path) {
@@ -217,6 +220,60 @@ public actor ProcedureArtifactStore {
             throw ProcedureArtifactStoreError.corruptArtifact
         }
         return artifact
+    }
+
+    /// Recompile the original reviewed evidence and compare every field before
+    /// binding v1 bytes to a full digest. IDs and activation pointers stay intact;
+    /// migrating either would require a new exact activation approval.
+    public func revalidateLegacyArtifact(
+        _ artifactID: String,
+        candidate: ProcedureCandidate
+    ) async throws {
+        let artifact = try await load(artifactID)
+        guard artifact.requiresLegacyRevalidation,
+              try DeclarativeProcedureCompiler.compile(candidate).withLegacyIdentity() == artifact else {
+            throw ProcedureArtifactStoreError.invalidArtifact
+        }
+        let receipt = try legacyRevalidationReceipt(artifact)
+        let path = legacyRevalidationPath(artifactID)
+        try await persistence.withFileLock(path) {
+            if FileManager.default.fileExists(atPath: path.path) {
+                guard await legacyRevalidationMatches(artifact) else {
+                    throw ProcedureArtifactStoreError.immutableConflict
+                }
+                return
+            }
+            try await persistence.writeJSON(receipt, to: path)
+        }
+    }
+
+    func loadForInvocation(_ artifactID: String) async throws -> DeclarativeProcedureArtifact {
+        let artifact = try await load(artifactID)
+        if artifact.requiresLegacyRevalidation && !legacyRevalidationMatches(artifact) {
+            throw ProcedureArtifactStoreError.legacyArtifactRequiresRevalidation
+        }
+        return artifact
+    }
+
+    private func legacyRevalidationMatches(_ artifact: DeclarativeProcedureArtifact) -> Bool {
+        let path = legacyRevalidationPath(artifact.id)
+        guard let data = Self.checkedRegularFile(path, maximumBytes: 64 * 1_024),
+              let receipt = try? JSONValue.parse(data),
+              let expected = try? legacyRevalidationReceipt(artifact) else { return false }
+        return receipt == expected
+    }
+
+    private func legacyRevalidationPath(_ artifactID: String) -> URL {
+        root.appendingPathComponent("legacy_revalidations", isDirectory: true)
+            .appendingPathComponent("\(artifactID).json")
+    }
+
+    private func legacyRevalidationReceipt(_ artifact: DeclarativeProcedureArtifact) throws -> JSONValue {
+        .object([
+            "schema": .string("declarative-procedure-revalidation.v1"),
+            "artifactID": .string(artifact.id),
+            "canonicalIdentity": .string(try artifact.canonicalIdentity()),
+        ])
     }
 
     /// Checked bounded discovery for callers that already have an explicit
@@ -358,8 +415,8 @@ public actor ProcedureArtifactStore {
         )[.size]) as? NSNumber, size.intValue <= 8 * 1_024 * 1_024 else {
             throw ProcedureArtifactStoreError.corruptInvocationLedger
         }
-        let rows = try await persistence.readJSONL(path)
-        guard rows.count <= 10_000 else {
+        let (rows, report) = try await persistence.readJSONLReporting(path)
+        guard report.isClean, report.physicalLineCount <= 10_000 else {
             throw ProcedureArtifactStoreError.corruptInvocationLedger
         }
         return try rows.compactMap { row in
@@ -464,7 +521,7 @@ public actor ProcedureArtifactStore {
         guard Self.digest(opaqueInputReference) else {
             throw ProcedureArtifactStoreError.invalidInputReference
         }
-        let artifact = try await load(artifactID)
+        let artifact = try await loadForInvocation(artifactID)
         guard context.invocationMode == .manual,
               artifact.domain == "workshop_execution",
               artifact.authorityClass == "low_risk",
@@ -603,17 +660,23 @@ public actor ProcedureArtifactStore {
         // undecodable pointer aborts the sweep (fail-safe).
         var referenced = Set<String>()
         let activeDirectory = root.appendingPathComponent("active", isDirectory: true)
-        if let pointerURLs = try? fm.contentsOfDirectory(
-            at: activeDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
-        ) {
-            for url in pointerURLs where url.pathExtension == "json" {
-                guard let data = try? Data(contentsOf: url),
-                      let pointer = try? JSONDecoder().decode(
-                          ProcedureExactActivationPointer.self, from: data
-                      ),
-                      pointer.validates else { return 0 }
-                referenced.insert(pointer.artifactID)
-            }
+        let pointerURLs: [URL]
+        do {
+            pointerURLs = try fm.contentsOfDirectory(
+                at: activeDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+            )
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            pointerURLs = []
+        } catch {
+            return 0
+        }
+        for url in pointerURLs where url.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: url),
+                  let pointer = try? JSONDecoder().decode(
+                      ProcedureExactActivationPointer.self, from: data
+                  ),
+                  pointer.validates else { return 0 }
+            referenced.insert(pointer.artifactID)
         }
 
         // Recency-referenced set (F3-M2): manual invocations leave no pointer,
@@ -679,6 +742,7 @@ public actor ProcedureArtifactStore {
                       DeclarativeProcedureArtifact.self, from: data
                   ),
                   Self.valid(artifact),
+                  !artifact.requiresLegacyRevalidation || legacyRevalidationMatches(artifact),
                   artifact.id == id else { continue }
             candidates.append(Candidate(
                 url: url, modified: values.contentModificationDate ?? now
@@ -823,7 +887,8 @@ public actor ProcedureArtifactStore {
         }
         let terminalCount = value.transitionTable.filter { $0.terminalClass != nil }.count
         let expectedAbandonConditions = Set(ProcedureCandidateCompiler.deterministicAbandonConditions)
-        return value.schema == DeclarativeProcedureArtifact.schema
+        return (value.schema == DeclarativeProcedureArtifact.schema
+                || value.schema == DeclarativeProcedureArtifact.legacySchema)
             && digest(value.id)
             && compilerIdentityMatches(value)
             && digest(value.procedureShapeIdentity)
@@ -881,28 +946,19 @@ public actor ProcedureArtifactStore {
             && value.rollbackDeclaration == "delete_artifact_restore_fallback_no_data_migration"
     }
 
-    /// Verify the content-addressed identity emitted by
-    /// `DeclarativeProcedureCompiler`. This prevents a decoded artifact from
-    /// retaining an approved-looking ID while changing its domain, authority,
-    /// action, transition, effect, or accepted input schema.
+    /// Verify the versioned compiler identity. Original v1 fingerprints admit
+    /// discovery only; execution also requires a full-digest revalidation receipt.
     private static func compilerIdentityMatches(_ value: DeclarativeProcedureArtifact) -> Bool {
-        let fingerprint = [
-            value.procedureShapeIdentity,
-            value.domain,
-            value.inputContract.taskFamily,
-            value.inputContract.inputClass,
-            value.authorityClass,
-            value.inputContract.acceptedParameterSchemaIdentities.joined(separator: ","),
-            value.transitionTable.map {
-                "\($0.sequence)|\($0.beforeState ?? "nil")|\($0.onTransitionKind)|"
-                    + "\($0.actionKind ?? "nil")|\($0.requiredEvidenceKind ?? "nil")|"
-                    + "\($0.externalEffectClass)|\($0.afterState ?? "nil")|"
-                    + "\($0.terminalClass?.rawValue ?? "nil")"
-            }.joined(separator: ">"),
-            value.reviewerDecision.reviewerIdentity,
-            value.reviewerDecision.decidedAt,
-        ].joined(separator: "||")
-        return value.id == CausalTransitionEvidence.opaqueIdentity(fingerprint)
+        guard let identity = try? value.canonicalIdentity() else { return false }
+        switch value.schema {
+        case DeclarativeProcedureArtifact.schema:
+            return value.id == identity
+        case DeclarativeProcedureArtifact.legacySchema:
+            // Full-digest v1 artifacts were produced before the schema bump.
+            return value.id == identity || value.id == value.legacyIdentity()
+        default:
+            return false
+        }
     }
 
     private static func digest(_ raw: String) -> Bool {
@@ -958,11 +1014,18 @@ public actor ProcedureArtifactStore {
             throw ProcedureArtifactStoreError.corruptInvocationLedger
         }
         let rows: [JSONValue]
-        do { rows = try await persistence.readJSONL(path) }
+        do {
+            let scan = try await persistence.readJSONLReporting(path)
+            guard scan.report.isClean, scan.report.physicalLineCount <= 10_000 else {
+                throw ProcedureArtifactStoreError.corruptInvocationLedger
+            }
+            rows = scan.rows
+        }
         catch { throw ProcedureArtifactStoreError.corruptInvocationLedger }
         guard rows.count <= 10_000 else {
             throw ProcedureArtifactStoreError.corruptInvocationLedger
         }
+        var existing: ProcedureInvocationReceipt?
         for row in rows.reversed() {
             guard let data = try? row.serializedData(pretty: false),
                   let receipt = try? JSONDecoder().decode(ProcedureInvocationReceipt.self, from: data) else {
@@ -985,10 +1048,10 @@ public actor ProcedureArtifactStore {
                       receipt.fallback == expectedFallback else {
                     throw ProcedureArtifactStoreError.corruptInvocationLedger
                 }
-                return receipt
+                if existing == nil { existing = receipt }
             }
         }
-        return nil
+        return existing
     }
 
     private static func validExecutionReceipt(_ receipt: ProcedureInvocationReceipt) -> Bool {

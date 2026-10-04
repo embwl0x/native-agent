@@ -120,6 +120,8 @@ public enum DeskRefKind: Sendable, Equatable {
     case approval(id: String, status: String?)
     case trace(id: String, kind: String?)
     case note(text: String)
+    /// A MY QUEUE step (`MyQueue`): when it is ready and where it came from.
+    case step(DeskStep)
 
     /// Wire token written as the ref's `kind` field.
     public var token: String {
@@ -133,6 +135,7 @@ public enum DeskRefKind: Sendable, Equatable {
         case .approval: return "approval"
         case .trace: return "trace"
         case .note: return "note"
+        case .step: return "step"
         }
     }
 
@@ -149,6 +152,7 @@ public enum DeskRefKind: Sendable, Equatable {
         case .approval: return 6
         case .trace: return 7
         case .note: return 8
+        case .step: return 9
         }
     }
 
@@ -180,6 +184,8 @@ public enum DeskRefKind: Sendable, Equatable {
             return .trace(id: id, kind: str("traceKind") ?? kind)
         case let .note(text):
             return .note(text: str("text") ?? text)
+        case .step:
+            return self
         }
     }
 }
@@ -225,6 +231,8 @@ public struct DeskRef: Sendable, Equatable {
             obj["id"] = .string(id); put("traceKind", kind)
         case let .note(text):
             obj["text"] = .string(text)
+        case let .step(step):
+            obj.merge(step.fields) { _, new in new }
         }
         return .object(obj)
     }
@@ -266,10 +274,56 @@ public struct DeskRef: Sendable, Equatable {
         case "note":
             guard let text = jsonString(obj, "text") else { return nil }
             kind = .note(text: text)
+        case "step":
+            guard let step = DeskStep(fields: obj) else { return nil }
+            kind = .step(step)
         default:
             return nil // tolerant: unknown ref kinds skipped
         }
         return DeskRef(refId: refId, kind: kind)
+    }
+}
+
+/// What makes a Desk item a step in her queue (Wave 2 #7): her words when it
+/// was queued, when it becomes ready, the card it follows and the call she
+/// means to make there, the sentence it was inferred from (nil when she queued
+/// it herself), and the peers who steered the turn it was born on.
+public struct DeskStep: Sendable, Equatable {
+    public var words: String
+    /// `next_turn`, `own_turn`, `when_user_messages[ <door>]`, `after_card`, `at <ISO time>`.
+    public var when: String
+    public var card: String?
+    public var action: String?
+    public var source: String?
+    public var peers: [String]
+    public var elevated: [String]
+    /// The conversation that queued it: a wake that works it carries that conversation's context.
+    public var session: String?
+    /// When the current readiness condition was filed.
+    public var filedAt: String?
+
+    public init(words: String, when: String, card: String? = nil, action: String? = nil, source: String? = nil,
+                peers: [String] = [], elevated: [String] = [], session: String? = nil, filedAt: String? = nil) {
+        self.words = words; self.when = when; self.card = card; self.action = action; self.source = source
+        self.peers = peers; self.elevated = elevated; self.session = session
+        self.filedAt = filedAt
+    }
+
+    init?(fields obj: [String: JSONValue]) {
+        guard let words = jsonString(obj, "words"), let when = jsonString(obj, "when") else { return nil }
+        self.init(words: words, when: when, card: jsonString(obj, "card"), action: jsonString(obj, "action"),
+                  source: jsonString(obj, "source"), peers: jsonStringArray(obj, "peers"),
+                  elevated: jsonStringArray(obj, "elevated"), session: jsonString(obj, "session"), filedAt: jsonString(obj, "filedAt"))
+    }
+
+    var fields: [String: JSONValue] {
+        var obj: [String: JSONValue] = ["words": .string(words), "when": .string(when)]
+        for (key, value) in [("card", card), ("action", action), ("source", source), ("session", session), ("filedAt", filedAt)] {
+            if let value, !value.isEmpty { obj[key] = .string(value) }
+        }
+        if !peers.isEmpty { obj["peers"] = .array(peers.map(JSONValue.string)) }
+        if !elevated.isEmpty { obj["elevated"] = .array(elevated.map(JSONValue.string)) }
+        return obj
     }
 }
 
@@ -325,7 +379,7 @@ public struct Cadence: Sendable, Equatable {
 
 public struct NotifyPolicy: Sendable, Equatable {
     public var level: NotifyLevel
-    public var on: [String]               // state_change, user_next, blocked, unblocked, big_diff, due, explicit
+    public var on: [String]               // state_change, blocked, done, explicit
     public var cooldown: String?
     public var lastNotifiedAt: String?
     public var notifyReason: String?
@@ -438,9 +492,9 @@ public enum DossierSource: Sendable, Equatable {
             // one day) can't masquerade as two days (2026-07-11 review MED).
             return Set(clean.compactMap { DeskClock.normalizedDay($0) }).count >= 2 ? nil : "felt_salience: needs ≥2 distinct calendar days"
         case .chatObservation(let noteIds, let distinctDays):
-            let clean = noteIds.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            let clean = Set(noteIds.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
             guard !clean.isEmpty else { return "chat_observation: noteIds is empty" }
-            // distinctDays is a CLAIM; it can't exceed the number of cited notes,
+            // distinctDays is a CLAIM; it can't exceed the number of distinct cited notes,
             // and ≥2 days needs ≥2 notes — so one self-authored note can't forge
             // "recurred across days" (2026-07-11 review MED).
             guard distinctDays >= 2 else { return "chat_observation: needs distinctDays ≥ 2" }
@@ -561,18 +615,20 @@ public struct WorkReservation: Sendable, Equatable {
     public var reservedAt: String
     public var receipt: String?       // set by completeWorkSession
     public var completedAt: String?
+    public var receiptHandedOff: Bool
     public var disposition: DeskWorkDisposition?
     /// Handle-relative Workshop artifacts only. These are durable references,
     /// never copied into Memory or Fluid Context and never auto-injected.
     public var artifactRefs: [String]
 
-    public init(reservationId: String, day: String, slot: String, reservedAt: String, receipt: String? = nil, completedAt: String? = nil, disposition: DeskWorkDisposition? = nil, artifactRefs: [String] = []) {
+    public init(reservationId: String, day: String, slot: String, reservedAt: String, receipt: String? = nil, completedAt: String? = nil, receiptHandedOff: Bool = false, disposition: DeskWorkDisposition? = nil, artifactRefs: [String] = []) {
         self.reservationId = reservationId
         self.day = day
         self.slot = slot
         self.reservedAt = reservedAt
         self.receipt = receipt
         self.completedAt = completedAt
+        self.receiptHandedOff = receiptHandedOff
         self.disposition = disposition
         self.artifactRefs = artifactRefs
     }
@@ -588,6 +644,7 @@ public struct WorkReservation: Sendable, Equatable {
         ]
         if let receipt, !receipt.isEmpty { obj["receipt"] = .string(receipt) }
         if let completedAt, !completedAt.isEmpty { obj["completedAt"] = .string(completedAt) }
+        if receiptHandedOff { obj["receiptHandedOff"] = .bool(true) }
         if let disposition { obj["disposition"] = .string(disposition.rawValue) }
         if !artifactRefs.isEmpty { obj["artifactRefs"] = .array(artifactRefs.map(JSONValue.string)) }
         return .object(obj)
@@ -599,9 +656,13 @@ public struct WorkReservation: Sendable, Equatable {
               let day = jsonString(obj, "day"),
               let slot = jsonString(obj, "slot"),
               let reservedAt = jsonString(obj, "reservedAt") else { return nil }
+        if let value = obj["receiptHandedOff"] {
+            guard case .bool = value else { return nil }
+        }
         return WorkReservation(
             reservationId: reservationId, day: day, slot: slot, reservedAt: reservedAt,
             receipt: jsonString(obj, "receipt"), completedAt: jsonString(obj, "completedAt"),
+            receiptHandedOff: obj["receiptHandedOff"] == .bool(true),
             disposition: jsonString(obj, "disposition").flatMap(DeskWorkDisposition.init(rawValue:)),
             artifactRefs: jsonStringArray(obj, "artifactRefs")
         )
@@ -624,6 +685,7 @@ public struct DeskWorkAttempt: Sendable, Equatable {
     public var reservedAt: String
     public var receipt: String?
     public var completedAt: String?
+    public var receiptHandedOff: Bool
 
     public init(
         attemptId: String,
@@ -632,7 +694,8 @@ public struct DeskWorkAttempt: Sendable, Equatable {
         slot: String,
         reservedAt: String,
         receipt: String? = nil,
-        completedAt: String? = nil
+        completedAt: String? = nil,
+        receiptHandedOff: Bool = false
     ) {
         self.attemptId = attemptId
         self.lane = lane
@@ -641,6 +704,7 @@ public struct DeskWorkAttempt: Sendable, Equatable {
         self.reservedAt = reservedAt
         self.receipt = receipt
         self.completedAt = completedAt
+        self.receiptHandedOff = receiptHandedOff
     }
 
     public func toJSON() -> JSONValue {
@@ -653,6 +717,7 @@ public struct DeskWorkAttempt: Sendable, Equatable {
         ]
         if let receipt, !receipt.isEmpty { object["receipt"] = .string(receipt) }
         if let completedAt, !completedAt.isEmpty { object["completedAt"] = .string(completedAt) }
+        if receiptHandedOff { object["receiptHandedOff"] = .bool(true) }
         return .object(object)
     }
 
@@ -664,6 +729,9 @@ public struct DeskWorkAttempt: Sendable, Equatable {
               let day = jsonString(object, "day"),
               let slot = jsonString(object, "slot"),
               let reservedAt = jsonString(object, "reservedAt") else { return nil }
+        if let value = object["receiptHandedOff"] {
+            guard case .bool = value else { return nil }
+        }
         return DeskWorkAttempt(
             attemptId: attemptId,
             lane: lane,
@@ -671,7 +739,8 @@ public struct DeskWorkAttempt: Sendable, Equatable {
             slot: slot,
             reservedAt: reservedAt,
             receipt: jsonString(object, "receipt"),
-            completedAt: jsonString(object, "completedAt")
+            completedAt: jsonString(object, "completedAt"),
+            receiptHandedOff: object["receiptHandedOff"] == .bool(true)
         )
     }
 }
@@ -701,6 +770,13 @@ public struct Pursuit: Sendable, Equatable {
     public var workSessionsToday: Int        // derived from the reservation ledger
     public var lastWorkedAt: String?
     public var reservations: [WorkReservation]
+    public var retiredSessionsByDay: [String: Int]
+    public var retiredSessions: Int { retiredSessionsByDay.values.reduce(0, +) }
+    public var sessionsUsed: Int { retiredSessions + reservations.count }
+
+    public func workSessions(on day: String) -> Int {
+        (retiredSessionsByDay[day] ?? 0) + reservations.filter { $0.day == day }.count
+    }
 
     public init(
         why: String,
@@ -712,7 +788,8 @@ public struct Pursuit: Sendable, Equatable {
         privateName: String? = nil,
         workSessionsToday: Int = 0,
         lastWorkedAt: String? = nil,
-        reservations: [WorkReservation] = []
+        reservations: [WorkReservation] = [],
+        retiredSessionsByDay: [String: Int] = [:]
     ) {
         self.why = why
         self.evidence = evidence
@@ -725,6 +802,7 @@ public struct Pursuit: Sendable, Equatable {
         self.workSessionsToday = workSessionsToday
         self.lastWorkedAt = lastWorkedAt
         self.reservations = reservations
+        self.retiredSessionsByDay = retiredSessionsByDay
     }
 
     /// The required-field gate (structural). Trimmed-empty required strings are
@@ -751,6 +829,9 @@ public struct Pursuit: Sendable, Equatable {
         if let privateName, !privateName.isEmpty { obj["privateName"] = .string(privateName) }
         if let lastWorkedAt, !lastWorkedAt.isEmpty { obj["lastWorkedAt"] = .string(lastWorkedAt) }
         if !reservations.isEmpty { obj["reservations"] = .array(reservations.map { $0.toJSON() }) }
+        if !retiredSessionsByDay.isEmpty {
+            obj["retiredSessionsByDay"] = .object(retiredSessionsByDay.mapValues { .int(Int64($0)) })
+        }
         return .object(obj)
     }
 
@@ -763,6 +844,14 @@ public struct Pursuit: Sendable, Equatable {
         }
         var reservations: [WorkReservation] = []
         if case .array(let arr)? = obj["reservations"] { reservations = arr.compactMap { WorkReservation.fromJSON($0) } }
+        var retiredSessionsByDay: [String: Int] = [:]
+        if case .object(let days)? = obj["retiredSessionsByDay"] {
+            for (day, value) in days {
+                if case .int(let count) = value, count > 0, let count = Int(exactly: count) {
+                    retiredSessionsByDay[day] = count
+                }
+            }
+        }
         return Pursuit(
             why: jsonString(obj, "why") ?? "",
             evidence: obj["evidence"].map { PromotionDossier.fromJSON($0) } ?? PromotionDossier(citations: []),
@@ -773,7 +862,8 @@ public struct Pursuit: Sendable, Equatable {
             privateName: jsonString(obj, "privateName"),
             workSessionsToday: jsonInt(obj, "workSessionsToday") ?? 0,
             lastWorkedAt: jsonString(obj, "lastWorkedAt"),
-            reservations: reservations
+            reservations: reservations,
+            retiredSessionsByDay: retiredSessionsByDay
         )
     }
 }
@@ -813,6 +903,7 @@ public struct DeskProgress: Sendable, Equatable {
 }
 
 public struct DeskItem: Sendable, Equatable {
+    public var continuation: DeskContinuation?
     public var handle: String           // stable
     public var alias: String            // view number "2" / "2.1" — stable, never renumbered
     public var parent: String?
@@ -855,21 +946,12 @@ public struct DeskItem: Sendable, Equatable {
     /// work-session ops and the open-pursuit cap key on exactly this shape.
     public var isPursuit: Bool { origin == .agent && kind == .project && pursuit != nil }
 
-    /// True only when canonical Desk state explicitly names the human owner as
-    /// the party that must unblock a nonterminal item. A generic `blocked`
-    /// status is not enough: verification failures, unavailable external
-    /// systems, and domain-owned reconciliation can all be blocked without
-    /// requiring user action.
-    public var requiresOwnerInput: Bool {
-        guard !status.isTerminal,
-              let waiting = waitingOn?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased(),
-              !waiting.isEmpty else {
-            return false
-        }
-        return waiting == "owner" || waiting == "user" || waiting == "human"
-    }
+    /// True only when canonical Desk state names the human owner as the party
+    /// that must unblock a nonterminal item (`OwnerAttentionPolicy`). A generic
+    /// `blocked` status is not enough: verification failures, unavailable
+    /// external systems, and domain-owned reconciliation can all be blocked
+    /// without requiring user action.
+    public var requiresOwnerInput: Bool { OwnerAttentionPolicy.waitsOnOwner(self) }
 
     public init(
         handle: String,
@@ -897,9 +979,11 @@ public struct DeskItem: Sendable, Equatable {
         pursuit: Pursuit? = nil,
         blockedOn: [String] = [],
         deferUntil: String? = nil,
-        workAttempts: [DeskWorkAttempt] = []
+        workAttempts: [DeskWorkAttempt] = [],
+        continuation: DeskContinuation? = nil
     ) {
         self.handle = handle
+        self.continuation = continuation
         self.alias = alias
         self.parent = parent
         self.kind = kind
@@ -966,6 +1050,7 @@ public struct DeskItem: Sendable, Equatable {
         if origin != .owner { obj["origin"] = .string(origin.rawValue) }
         if let pursuit { obj["pursuit"] = pursuit.toJSON() }
         if !workAttempts.isEmpty { obj["workAttempts"] = .array(workAttempts.map { $0.toJSON() }) }
+        if let continuation { obj["continuation"] = continuation.toJSON() }
         return .object(obj)
     }
 
@@ -1025,6 +1110,16 @@ public struct DeskItem: Sendable, Equatable {
             // shrink the reservation cap ledger or the dossier.
             guard case .object(let pursuitObj) = pursuitValue else { return nil }
             let decoded = Pursuit.fromJSON(pursuitValue)
+            if let value = pursuitObj["retiredSessionsByDay"] {
+                guard case .object(let days) = value,
+                      decoded.retiredSessionsByDay.count == days.count else { return nil }
+                var total = decoded.reservations.count
+                for count in decoded.retiredSessionsByDay.values {
+                    let addition = total.addingReportingOverflow(count)
+                    guard !addition.overflow else { return nil }
+                    total = addition.partialValue
+                }
+            }
             if let reservationsValue = pursuitObj["reservations"] {
                 guard case .array(let rows) = reservationsValue,
                       decoded.reservations.count == rows.count else { return nil }
@@ -1037,6 +1132,8 @@ public struct DeskItem: Sendable, Equatable {
                 }
             }
         }
+        let continuation = obj["continuation"].flatMap(DeskContinuation.fromJSON)
+        if obj["continuation"] != nil && continuation == nil { return nil }
         return DeskItem(
             handle: handle, alias: alias, parent: jsonString(obj, "parent"),
             kind: kind, status: status, project: project, title: title,
@@ -1057,7 +1154,8 @@ public struct DeskItem: Sendable, Equatable {
             pursuit: obj["pursuit"].map { Pursuit.fromJSON($0) },
             blockedOn: blockedOn,
             deferUntil: jsonString(obj, "deferUntil"),
-            workAttempts: workAttempts
+            workAttempts: workAttempts,
+            continuation: continuation
         )
     }
 }
@@ -1072,56 +1170,67 @@ public struct DeskItem: Sendable, Equatable {
 /// on screen. One of them had to be wrong, and the honest one is the narrow
 /// one: he is needed only when a DECISION OF HIS is what's missing.
 ///
-/// The definition, stated once:
-///   - waiting on him  = an approval parked at a consent boundary, a Desk row
-///     whose `waitingOn` names him (`requiresOwnerInput`), or an external item
-///     explicitly routed to him (a needs-you GitHub item).
-///   - blocked         = everything else that can't move: CI, a provider, a
-///     sibling item, a verification run. Real, worth showing, NOT his to clear.
-///
-/// Both numbers stay visible — the label carries the distinction ("Waiting on
-/// you · N" vs "Blocked · M") instead of one number quietly meaning both.
+/// The definition, stated once. Waiting on him:
+///   - an approval parked at a consent boundary (`approvalWaits`);
+///   - a Desk row whose `waitingOn` names him (`waitsOnOwner`);
+///   - an inbox card that asks him to choose (`inboxAsks`);
+///   - an execution stopped at an approval step with no approval of its own.
+/// Memories she would like to keep are hers to review (User, 2026-10-01): they
+/// stay on the Memories page and never wait on him.
+/// `WorkOverviewRead` applies these once and every Mac and phone surface
+/// reads its Needs you: the Desk, Today, the widget, the Simple card, Living
+/// Status, the phone. Her home applies the same rules to the same owners.
+/// Blocked = everything else that can't move: CI, a
+/// provider, a sibling item, a verification run. Real, worth showing, NOT
+/// his to clear.
 public enum OwnerAttentionPolicy {
-    /// The row-level predicate. Deliberately identical to
-    /// `DeskItem.requiresOwnerInput`: a nonterminal row that names the human
-    /// as the party it waits on.
     /// An approval waits on him while it is pending, whatever the case of
-    /// its saved status. The Today page and the agent's home share this.
+    /// its saved status.
     public static func approvalWaits(status: String) -> Bool {
         status.lowercased() == "pending"
     }
 
+    /// A nonterminal row whose `waitingOn` starts with the owner: "owner",
+    /// "user", "human" or his first name. "User: approve the DDL" and "User to
+    /// unlock the Mac" wait on him; "Claude provenance reply" does not.
     public static func waitsOnOwner(_ item: DeskItem) -> Bool {
-        item.requiresOwnerInput
+        guard !item.status.isTerminal, let waitingOn = item.waitingOn else { return false }
+        let party = String(waitingOn.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().prefix { $0.isLetter })
+        guard !party.isEmpty else { return false }
+        return ["owner", "user", "human"].contains(party) || party == OwnerName.shared.first()
     }
 
-    public static func ownerDecisionCount(in items: [DeskItem]) -> Int {
-        items.lazy.filter(waitsOnOwner).count
+    /// A card asks him while it is pending, is not a system-health notice,
+    /// and offers a choice: a linked approval, or an action beyond reading
+    /// and filing it. A note that only tells him something (severity info,
+    /// e.g. what she decided as boss) never waits.
+    public static func inboxAsks(pending: Bool, systemLane: Bool, severity: String, linkedApproval: Bool,
+                                 actionIDs: [String]) -> Bool {
+        guard pending, !systemLane, severity.lowercased() != "info" else { return false }
+        return linkedApproval || actionIDs.contains { !["view", "read", "archive", "dismiss"].contains($0.lowercased()) }
     }
+}
 
-    /// The headline number. `externalOwnerItems` is for surfaces that route
-    /// non-Desk work to the owner (GitHub items in the `needsUser` bucket);
-    /// surfaces without such a lane pass 0 and get the same arithmetic.
-    public static func waitingOnOwnerCount(
-        approvalsWaiting: Int,
-        ownerDecisionItems: Int,
-        externalOwnerItems: Int = 0
-    ) -> Int {
-        max(0, approvalsWaiting) + max(0, ownerDecisionItems) + max(0, externalOwnerItems)
-    }
+/// The owner's first name, lowercased, from onboarding's `userName` in
+/// `memory/profile.json` under the process data root. Kept once read; a
+/// rename shows after relaunch.
+private final class OwnerName: @unchecked Sendable {
+    static let shared = OwnerName()
+    private let lock = NSLock()
+    private var name: String?
 
-    /// The boolean the Living Status panel speaks aloud. Same inputs, same
-    /// rule — it can never disagree with the Desk's count again.
-    public static func needsOwner(
-        approvalsWaiting: Int,
-        ownerDecisionItems: Int,
-        externalOwnerItems: Int = 0
-    ) -> Bool {
-        waitingOnOwnerCount(
-            approvalsWaiting: approvalsWaiting,
-            ownerDecisionItems: ownerDecisionItems,
-            externalOwnerItems: externalOwnerItems
-        ) > 0
+    func first() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let name { return name }
+        let url = PersistenceCore.defaultDataRoot().appendingPathComponent("memory/profile.json")
+        guard let data = try? Data(contentsOf: url),
+              let profile = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let full = profile["userName"] as? String else { return nil }
+        let first = String(full.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().prefix { $0.isLetter })
+        guard !first.isEmpty else { return nil }
+        name = first
+        return first
     }
 }
 
@@ -1205,10 +1314,43 @@ public struct DeskState: Sendable, Equatable {
     /// seq, each immediately followed by its children in child-seq order.
     public var items: [DeskItem]
     public var generatedTs: String
+    public var workSlotsByDay: [String: [String: [String]]]
 
-    public init(items: [DeskItem], generatedTs: String) {
+    public init(items: [DeskItem], generatedTs: String, workSlotsByDay: [String: [String: [String]]]? = nil) {
         self.items = items
         self.generatedTs = generatedTs
+        if let workSlotsByDay {
+            self.workSlotsByDay = workSlotsByDay
+        } else {
+            self.workSlotsByDay = [:]
+            for item in items {
+                for reservation in item.pursuit?.reservations ?? [] {
+                    chargeWorkSlot(handle: item.handle, day: reservation.day, id: reservation.reservationId)
+                }
+                for attempt in item.workAttempts {
+                    chargeWorkSlot(handle: item.handle, day: attempt.day, id: attempt.attemptId)
+                }
+            }
+        }
+    }
+
+    public func workSessions(on day: String, handle: String? = nil) -> Int {
+        guard let slots = workSlotsByDay[day] else { return 0 }
+        if let handle { return slots[handle]?.count ?? 0 }
+        return slots.values.reduce(0) { $0 + $1.count }
+    }
+
+    public func hasWorkSlot(handle: String, day: String, id: String) -> Bool {
+        workSlotsByDay[day]?[handle]?.contains(id) == true
+    }
+
+    public func hasWorkSlot(handle: String, id: String) -> Bool {
+        workSlotsByDay.values.contains { $0[handle]?.contains(id) == true }
+    }
+
+    mutating func chargeWorkSlot(handle: String, day: String, id: String) {
+        guard !hasWorkSlot(handle: handle, day: day, id: id) else { return }
+        workSlotsByDay[day, default: [:]][handle, default: []].append(id)
     }
 
     public var topLevel: [DeskItem] { items.filter { $0.parent == nil } }
@@ -1216,9 +1358,12 @@ public struct DeskState: Sendable, Equatable {
 
     public func toJSON() -> JSONValue {
         .object([
-            "version": .int(1),
+            "version": .int(2),
             "generatedTs": .string(generatedTs),
             "items": .array(items.map { $0.toJSON() }),
+            "workSlotsByDay": .object(workSlotsByDay.mapValues { handles in
+                .object(handles.mapValues { .array($0.map(JSONValue.string)) })
+            }),
         ])
     }
 
@@ -1229,14 +1374,55 @@ public struct DeskState: Sendable, Equatable {
     /// from a partial base.
     public static func fromJSON(_ value: JSONValue) -> DeskState? {
         guard case .object(let obj) = value,
+              case .int(let version)? = obj["version"], version == 1 || version == 2,
               case .string(let generatedTs)? = obj["generatedTs"],
               case .array(let rows)? = obj["items"] else { return nil }
+        if version == 2, obj["workSlotsByDay"] == nil { return nil }
         var items: [DeskItem] = []
         items.reserveCapacity(rows.count)
         for row in rows {
             guard let item = DeskItem.fromJSON(row, strictCollections: true) else { return nil }
             items.append(item)
         }
-        return DeskState(items: items, generatedTs: generatedTs)
+        var workSlotsByDay: [String: [String: [String]]]? = nil
+        if let value = obj["workSlotsByDay"] {
+            guard case .object(let days) = value else { return nil }
+            var decoded: [String: [String: [String]]] = [:]
+            for (day, value) in days {
+                guard case .object(let handles) = value else { return nil }
+                var slots: [String: [String]] = [:]
+                for (handle, value) in handles {
+                    guard case .array(let rows) = value else { return nil }
+                    var ids: [String] = []
+                    for row in rows {
+                        guard case .string(let id) = row, !id.isEmpty, !ids.contains(id) else { return nil }
+                        ids.append(id)
+                    }
+                    slots[handle] = ids
+                }
+                decoded[day] = slots
+            }
+            workSlotsByDay = decoded
+        }
+        let state = DeskState(items: items, generatedTs: generatedTs, workSlotsByDay: workSlotsByDay)
+        for item in items {
+            for reservation in item.pursuit?.reservations ?? [] {
+                guard state.hasWorkSlot(handle: item.handle, day: reservation.day, id: reservation.reservationId) else { return nil }
+            }
+            for attempt in item.workAttempts {
+                guard state.hasWorkSlot(handle: item.handle, day: attempt.day, id: attempt.attemptId) else { return nil }
+            }
+            if let pursuit = item.pursuit {
+                for (day, count) in pursuit.retiredSessionsByDay {
+                    let liveCount = pursuit.reservations.filter { $0.day == day }.count
+                    let slots = state.workSessions(on: day, handle: item.handle)
+                    let ledgerDay = DeskClock.parseISO(generatedTs).map(DeskClock.dayStamp)
+                    // Historical charges may have been pruned; retained receipts still require their slots above.
+                    guard slots == count + liveCount
+                        || (ledgerDay.map { day < $0 } == true && slots == liveCount) else { return nil }
+                }
+            }
+        }
+        return state
     }
 }

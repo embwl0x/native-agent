@@ -188,17 +188,10 @@ extension SwiftToolDispatcher {
         "dmg", "pkg", "app", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "key", "pages", "numbers", "mov", "mp3", "mp4",
         "wav", "yaml", "yml", "toml", "xml", "plist", "sql", "db", "rtf", "ipynb"]
 
-    /// Test seam (2026-07-31) for the lazy-load gate's catalog enumeration.
-    /// `listAvailableTools()` on the concrete dispatcher has no natural throw
-    /// path, so the fail-closed `catalog_unavailable` branch below is
-    /// unreachable from a real dataRoot. Task-local (not a global var) so
-    /// parallel test execution can't race it; always nil in production.
-    @TaskLocal static var lazyGateCatalogOverrideForTests: (@Sendable () async throws -> [String])?
-
     public func dispatch(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
         ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: requestedTool, input: rawInput) { input in
             try await dispatchNormalized(tool: requestedTool, input: input, surface: surface)
-        })
+        }, tool: CanonicalToolNameDispatcher.canonical(requestedTool))
     }
 
     private func dispatchNormalized(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -243,31 +236,13 @@ extension SwiftToolDispatcher {
                 "replacement": .array(Self.fourVerbToolNames.map { .string($0) }),
             ])
         }
-        // Lazy-load gate (gpt-5.5 review-2 NEEDS_FIX 1): a tool requires
-        // explicit tool_load UNLESS it's:
-        //   - in alwaysOnCoreNames (the measured working set)
-        //   - an MCP server tool (mcp__*)
-        //   - not in the catalog at all (then the dispatch switch's default
-        //     case handles it as not_in_dispatch_table)
-        //
-        // Previous version only checked builtInToolNames, so Full Mac tools
-        // (shell, bash, git, apply_patch, swift_build,
-        // swift_test, legacy app focus tool, etc.)
-        // bypassed the gate entirely once Full Mac was on — defeating the
-        // whole token-saving + safety-deferring point of lazy load.
-        //
-        // A lazy tool always needs a concrete session. Without one there is
-        // no active-tool set to check, and treating that absence as a
-        // non-chat exception would silently turn the whole catalog on for
-        // whichever caller forgot to carry its session through dispatch.
-        // The always-on core and external MCP namespace retain their explicit
-        // exceptions above; every catalogued native lazy tool fails closed.
-        if let refusal = await lazyToolLoadingRefusal(tool: tool, input: input) {
-            return refusal
+        // An item another conversation is working is theirs (desk.3402).
+        if Self.deskItemTools.contains(tool), let taskSession, let held = await deskHeld(input, session: taskSession) {
+            return held
         }
-        // A contributed tool runs in its owner's executor, after the same gate.
+        // A contributed tool runs in its owner's executor.
         if let appTools, executorOwnedToolNames.contains(tool) {
-            return try await appTools.execute(tool: tool, input: input, surface: surface, host: self)
+            return try await appTools.execute(tool: tool, input: input, surface: surface)
         }
         switch tool {
         case "read_page":
@@ -318,17 +293,15 @@ extension SwiftToolDispatcher {
                 return need
             }
         case "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete":
-            return try await impl_standingBots(tool: tool, input: input)
+            return try await impl_standingBots(tool: tool, input: input, surface: surface)
         case "recall_memory":   return try await impl_recall_memory(input: input, surface: surface)
         case "recall_search":   return try await impl_recall_memory(input: input, surface: surface)
         case "commit_memory":   return try await impl_commit_memory(input: input)
         // The moments lane (2026-09-02): her review seat over the moment
         // proposals the post-turn promoter stages. Both refuse any id whose
         // lane is not "moment".
-        case "memory_moments_pending": return try await impl_memory_moments_pending()
-        case "memory_moment_review": return try await impl_memory_moment_review(input: input)
-        case "list_memories":   return try await impl_list_memories(input: input)
-        case "rewrite_memory":  return try await impl_rewrite_memory(input: input)
+        case "memory_moments_pending": return try await impl_memory_moments_pending(input: input, surface: surface)
+        case "memory_moment_review": return try await impl_memory_moment_review(input: input, surface: surface)
         case "forget_memory":   return try await impl_forget_memory(input: input)
         case "rebuild_knowledge_graph": return try await impl_rebuild_knowledge_graph(input: input)
         case "workshop_submit": return try await impl_workshop_submit(input: input)
@@ -380,7 +353,7 @@ extension SwiftToolDispatcher {
             return await impl_hold_view(input: input, surface: surface)
         case "release_view":
             return await impl_release_view(input: input, surface: surface)
-        case "search_kg":       return try await impl_search_kg(input: input)
+        case "search_kg":       return try await impl_search_kg(input: input, surface: surface)
         case "search_chat_history": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "workspace":
             // The outer verified-session facade consumes this preparation;
@@ -390,32 +363,26 @@ extension SwiftToolDispatcher {
         case "artifact_find": return try await impl_artifact_find(input: input)
         case "session_search": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "read_chat_message": return try await impl_read_chat_message(input: input, invokedAs: tool)
-        case "chat_conversations": return try await impl_chat_conversations(input: input)
         case "get_persona_doc": return try await impl_get_persona_doc(input: input)
         case "persona_read": return try await impl_persona_read(input: input)
         case "persona_write": return try await impl_persona_write(input: input)
         case "persona_append_section": return try await impl_persona_append_section(input: input)
         case "agent_introspect": return try await impl_agent_introspect(input: input, invokedAs: tool)
         case "daemon_introspect": return try await impl_agent_introspect(input: input, invokedAs: tool)
-        case "tool_catalog": return try await impl_tool_catalog(input: input, surface: surface)
-        case "list_tools": return try await impl_tool_catalog(input: input, surface: surface)
-        case "tool_load": return try await impl_tool_load(input: input, surface: surface)
-        case "tool_unload": return try await impl_tool_unload(input: input, surface: surface)
         case "tool_result_page": return await impl_tool_result_page(input: input)
         case "request_interaction": return await impl_request_interaction(input: input)
         case "list_skills":     return try await impl_list_skills(input: input)
         case "read_skill":      return try await impl_read_skill(input: input)
-        case "craft_run":       return try await impl_craft_run(input: input)
-        case "save_skill":      return try await impl_save_skill(input: input)
+        case "save_skill":      return try await impl_save_skill(input: input, surface: surface)
         case "context_lookup": return try await impl_context_lookup(input: input)
-        case "context_expand": return try impl_context_expand(input: input, surface: surface)
+        case "context_expand": return try await impl_context_expand(input: input, surface: surface)
         case "scratchpad_read": return try await impl_scratchpad_read(input: input)
         case "recent_trace_summary": return try await impl_recent_trace_summary(input: input)
         case "time_now": return Self.impl_time_now()
         // Personality depth item 3 (2026-09-02): a PURE read of her own inner
         // state. No mutation, no persistence, no provider call — reading never
         // changes what it reads (substrate design law 5).
-        case "inner_state": return await impl_inner_state(input: input)
+        case "inner_state": return await impl_inner_state(input: input, surface: surface)
         // ── Builder tools (2026-06-08 agent-builder-tools) ──
         // Process-based CLI execution. Trust Center Full Mac file_ops_allowed
         // REQUIRED upstream; default autonomy is `confirm` so every call
@@ -557,6 +524,14 @@ extension SwiftToolDispatcher {
             return await impl_google_calendar_status(input: input)
         case "google_calendar_list":
             return await impl_google_calendar_list(input: input)
+        case "google_calendar_calendars":
+            return await impl_google_calendar_calendars(input: input)
+        case "google_calendar_free_busy":
+            return await impl_google_calendar_free_busy(input: input)
+        case "google_calendar_read":
+            return await impl_google_calendar_read(input: input)
+        case "google_calendar_send_invitations":
+            return await impl_google_calendar_send_invitations(input: input)
         case "notion_status":
             return await impl_notion_status(input: input)
         case "notion_search":
@@ -650,6 +625,42 @@ extension SwiftToolDispatcher {
                 input: input,
                 run: { bridge, input in HerLifePulse.noted("calendar", try await bridge.calendarListUpcoming(input: input)) }
             )
+        case "mac_calendar_calendars", "mac_calendar_free_busy":
+            return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface, integration: MacIntegrationID.calendar, mode: .read,
+                fixHint: "Enable Calendar Read permission.", input: input,
+                run: { bridge, input in
+                    if tool == "mac_calendar_calendars" { return try await bridge.calendarCalendars(input: input) }
+                    return try await bridge.calendarFreeBusy(input: input)
+                }
+            )
+        case "mac_reminders_query":
+            return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
+                integration: MacIntegrationID.reminders,
+                mode: .read,
+                fixHint: "Toggle Read ON for Reminders in Settings → Mac Integration.",
+                input: input,
+                run: { bridge, input in try await bridge.remindersQuery(input: input) }
+            )
+        case "mac_reminders_read":
+            return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
+                integration: MacIntegrationID.reminders,
+                mode: .read,
+                fixHint: "Toggle Read ON for Reminders in Settings → Mac Integration.",
+                input: input,
+                run: { bridge, input in try await bridge.remindersRead(input: input) }
+            )
+        case "mac_reminders_update":
+            return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
+                integration: MacIntegrationID.reminders,
+                mode: .write,
+                fixHint: "Toggle Write ON for Reminders in Settings → Mac Integration.",
+                input: input,
+                run: { bridge, input in try await bridge.remindersUpdate(input: input) }
+            )
         case "mac_reminders_list_due_today":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
@@ -673,11 +684,7 @@ extension SwiftToolDispatcher {
             // calls this when she wants to flag something to Claude for
             // follow-up. Appends a JSONL entry to
             // ~/.config/claude-bridge/claude-inbox.jsonl (mode 0600 dir +
-            // file). Claude's Claude Code UserPromptSubmit hook reads
-            // unread entries at session start and surfaces them as context.
-            // 2026-07-25: the append is followed by a real session wakeup
-            // (script/claude_thread_wakeup.js) so the message no longer waits
-            // for User to open a terminal; receipt rides under "wakeup".
+            // file), which her live session reads. Nothing is launched.
             return try await runClaudeMessage(
                 input: input,
                 surface: surface,
@@ -690,21 +697,14 @@ extension SwiftToolDispatcher {
             return try await runCodexMessage(input: input, surface: surface)
         case "omp_message":
             return try await runOMPMessage(input: input, surface: surface)
-        case "invoke_claude":
-            // 2026-06-08 her→me REAL-TIME invocation channel. Spawns
-            // `claude -p "<context+question>"` as a subprocess, blocks
-            // until exit (or timeout), returns stdout. This is the wild
-            // pattern from last night's spec: Agent invokes a fresh
-            // Claude session in parallel when she's stuck — Claude
-            // arrives with full file/git/bash, works the problem, exits,
-            // Agent continues with the answer. No push infrastructure.
-            return try await Self.runInvokeClaude(input: input, dataRoot: dataRoot)
         case "invoke_codex":
             // 2026-06-08 Agent -> Codex real-time invocation. Spawns
             // `codex exec` as a bounded subprocess and audits the reply at
-            // data/from_codex/<uuid>.json. Defaults to workspace-write rather
-            // than full-Mac danger mode.
-            return try await Self.runInvokeCodex(input: input, dataRoot: dataRoot)
+            // data/from_codex/<uuid>.json. Trust decides its sandbox.
+            return PeerDataTaintDispatcher.labelled(try await Self.runInvokeCodex(input: input, dataRoot: dataRoot,
+                launch: await Self.drivenAgentLaunch(
+                tool: tool, surface: surface, contact: Self.drivenAgentContact(host: "codex", dataRoot: dataRoot),
+                name: "Codex", dataRoot: dataRoot)), agent: "codex", dataRoot: dataRoot)
         case "phone_request":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
@@ -765,6 +765,18 @@ extension SwiftToolDispatcher {
             )
             HerMailStatus.shared.note(inbox) // home's mail count, no read of its own
             return inbox
+        case "mail_read_batch", "mail_triage_batch":
+            return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
+                integration: MacIntegrationID.mail,
+                mode: tool == "mail_read_batch" ? .read : .write,
+                fixHint: "Grant Mail access for the selected batch.",
+                input: AgentWorkspace.bindMailBatch(input, dataRoot: dataRoot),
+                run: { bridge, input in
+                    if tool == "mail_read_batch" { return try await bridge.mailReadBatch(input: input) }
+                    return try await bridge.mailTriageBatch(input: input)
+                }
+            )
         case "mail_search":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
@@ -1114,6 +1126,8 @@ extension SwiftToolDispatcher {
             }
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' is not in the dispatch table"
+                    + (ToolNameAliases.retiredAppTools.union(ToolNameAliases.mergedTools).contains(tool)
+                        ? ". " + ToolNameAliases.retiredAppToolHint : "")
             )
         }
     }
@@ -1121,118 +1135,8 @@ extension SwiftToolDispatcher {
 }
 
 extension SwiftToolDispatcher: PreApprovalToolValidating {
-    /// The lazy-load gate of docs/TOOL_LOADING.md, as a check any caller can run
-    /// on its own: nil when the call may proceed, the refusal otherwise.
-    /// `dispatch` runs it where it always did; the approval membrane runs it
-    /// before it files a card. A known tool loads here and continues through
-    /// the same argument, approval, and execution gates as a loaded call.
-    func lazyToolLoadingRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
-        guard enforcesLazyToolLoading,
-              !Self.alwaysOnCoreNames.contains(tool),
-              !tool.hasPrefix("mcp__") else { return nil }
-        let sessionId = Self.extractSessionId(from: input)
-        guard !sessionId.isEmpty else {
-            return JSONValue.object([
-                "status": .string("failed"),
-                "reason": .string("missing_session_id"),
-                "tool": .string(tool),
-                "fix": .string("Pass the current chat session id as session_id or __session_id."),
-            ])
-        }
-        // Build the "exists in catalog" set from listAvailableTools()
-        // (the FULL accessible catalog, including Full-Mac additions).
-        // 2026-07-31 fail-closed fix: this used to be
-        // `if let names = try? await listAvailableTools() { ... } else
-        // { allAvailable = [] }`. Because gate enforcement lives
-        // INSIDE `allAvailable.contains(tool)`, an empty substitute set
-        // made every catalogued tool skip the not_loaded gate — a
-        // thrown enumeration silently opened the whole lazy-load gate.
-        // Enumeration failure now fails the CALL, not the gate.
-        let allAvailable: Set<String>
-        do {
-            if let override = Self.lazyGateCatalogOverrideForTests {
-                allAvailable = Set(try await override())
-            } else {
-                allAvailable = Set(try await listAvailableTools())
-            }
-        } catch {
-            return JSONValue.object([
-                "status": .string("failed"),
-                "reason": .string("catalog_unavailable"),
-                "tool": .string(tool),
-                "session_id": .string(sessionId),
-                "detail": .string(String(describing: error)),
-                "fix": .string("The tool catalog could not be enumerated, so the lazy-load gate cannot verify '\(tool)'. Retry; if it persists, check data/tools/registry.json and the MCP server config."),
-            ])
-        }
-        // The outer facade router preserves both permission names. Its loaded
-        // facade authorizes using only the corresponding local implementation,
-        // without requiring the model to separately discover legacy names.
-        let facade: String?
-        if let raw = GatedToolNameContext.rawSpelling(of: tool),
-           (raw == "agent_message" && ["codex_message", "claude_message", "omp_message", "bot_ask"].contains(tool))
-            || (raw == "agent_read" && ["delegation_status", "shelf_read", "shelf_entry"].contains(tool)) {
-            facade = raw
-        } else { facade = nil }
-        if let facade, !allAvailable.contains(tool) || !allAvailable.contains(facade) {
-            return .object(["status": .string("failed"), "reason": .string("tool_unavailable"),
-                            "tool": .string(tool), "detail": .string("The requested agent route is not available in this tool catalog.")])
-        }
-        if allAvailable.contains(tool) {
-            let loadedName = facade ?? tool
-            let persisted: Set<String>
-            do {
-                persisted = try await activeToolsStore.load(sessionId: sessionId).activeTools
-            } catch {
-                return .object([
-                    "status": .string("failed"), "reason": .string("state_unavailable"),
-                    "tool": .string(tool), "detail": .string(error.localizedDescription),
-                ])
-            }
-            // CURRENT-TURN UNLOADS (2026-09-13): `turnActiveTools` is frozen at
-            // turn start, so unioning it re-admitted a tool `tool_unload` had
-            // just retracted (and everything after `tool_unload(all:)`) for the
-            // rest of the turn. An explicit `tool_load` clears the exclusion.
-            let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
-            if unloadedThisTurn.contains(loadedName) {
-                return .object([
-                    "status": .string("failed"), "reason": .string("not_loaded"),
-                    "tool": .string(tool), "detail": .string("This tool was unloaded for this turn."),
-                ])
-            }
-            let active = persisted
-                .union(LLMCallContext.turnActiveTools ?? [])
-                .subtracting(unloadedThisTurn)
-            // USAGE STAMP (2026-09-01): a session-loaded tool that is being
-            // CALLED stays advertised. This is the only signal feeding
-            // beginTurn's idle drop — without it the drop would be a timer,
-            // not "she's done with it".
-            if persisted.contains(loadedName) {
-                await activeToolsStore.markUsed(sessionId: sessionId, names: [loadedName])
-            }
-            if !active.contains(loadedName) {
-                do {
-                    let receipt = try await impl_tool_load(input: [
-                        "session_id": .string(sessionId),
-                        "names": .array([.string(loadedName)]),
-                    ])
-                    guard case .object(let object) = receipt,
-                          case .array(let loaded)? = object["loaded"],
-                          loaded.contains(.string(loadedName)) else { return receipt }
-                    await activeToolsStore.markUsed(sessionId: sessionId, names: [loadedName])
-                } catch {
-                    return .object([
-                        "status": .string("failed"), "reason": .string("tool_load_failed"),
-                        "tool": .string(tool), "detail": .string(String(describing: error)),
-                    ])
-                }
-            }
-        }
-        return nil
-    }
-
     /// Everything that must be true before a tool call is worth a person's
-    /// attention: it is loaded for this turn, and its arguments are ones the
+    /// attention: its arguments are ones the
     /// implementation will accept. Returns the tool error to hand back to the
     /// model, or nil to go on and file the approval.
     public func preApprovalRefusal(
@@ -1244,17 +1148,9 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
             .first { !$0.isEmpty }
         if let taskSession { input["__session_id"] = .string(taskSession) }
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        if let refusal = await lazyToolLoadingRefusal(tool: tool, input: input) { return refusal }
         if let refusal = await argumentRefusal(tool: tool, input: input) { return refusal }
         if let refusal = agentHostSetupRefusal(tool: tool, input: input) { return refusal }
-        if let problem = await standingBotsArgumentProblem(tool: tool, input: input) {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("invalid_arguments"),
-                "tool": .string(tool),
-                "detail": .string(problem),
-            ])
-        }
+        if let refusal = await standingBotsArgumentRefusal(tool: tool, input: input) { return refusal }
         return nil
     }
 

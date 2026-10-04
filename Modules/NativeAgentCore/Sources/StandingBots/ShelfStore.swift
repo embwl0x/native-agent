@@ -32,27 +32,6 @@ public struct ShelfStore: Sendable {
         }
     }
 
-    /// Finalize only this run's provisional receipt, preserving append order.
-    /// Sample after all run IO and lock acquisition; only receipt persistence
-    /// itself follows the sample. A crash leaves an honest partial receipt.
-    func finish(_ id: UUID, receipt: () -> ShelfEntry) throws -> ShelfEntry {
-        try disk.locked {
-            var index = try loadIndex()
-            guard let book = try disk.read(Book.self, at: indexedPath(id)),
-                  book.entry.uncertainties.contains("Run receipt pending finalization.") else {
-                throw StandingBotsError.invalidValue("run receipt already finalized")
-            }
-            let final = receipt()
-            guard final.id == id, final.botId == book.entry.botId else {
-                throw StandingBotsError.invalidValue("final receipt identity")
-            }
-            let completed = Book(sequence: book.sequence, entry: final)
-            try disk.write(completed, at: pendingPath)
-            try apply(completed, index: &index)
-            return final
-        }
-    }
-
     /// The approval this entry stopped on has been decided. The shelf is
     /// append-only for RUNS; this rewrites one settled fact on an existing
     /// book, in place and at its own sequence, so the reconciliation outlives

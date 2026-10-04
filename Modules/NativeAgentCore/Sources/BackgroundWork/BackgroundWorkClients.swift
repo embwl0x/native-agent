@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import ChatOrchestration
 import PersonaEngine
+import MemoryV2
 import PersistenceCore
 import ProviderRouting
 import Cognition
@@ -44,6 +45,7 @@ public func makeWorkshopPlannerConnectorActionsProvider(
             JSONValue.object([
                 "id": .string(schema.name),
                 "description": .string(workshopPlannerToolDescription(schema)),
+                "parameters": (try? JSONValue.parse(schema.parametersJSON)) ?? .null,
             ])
         }
     }
@@ -191,7 +193,12 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
             == PersistenceCore.defaultDataRoot().standardizedFileURL
             ? SwiftNativePersonaEngine(dataRoot: dataRoot)
             : SwiftNativePersonaEngine.isolated(dataRoot: dataRoot)
-        let packet = try await PersonaCompiler(engine: persona).compile(surface: surface)
+        let userMemoryCore = MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot)
+            ? await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
+            : []
+        let packet = try await PersonaCompiler(engine: persona).compile(
+            surface: surface, userMemoryCore: userMemoryCore
+        )
         let compiled = packet.compiledSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !compiled.isEmpty else {
             throw BackgroundPersonaContextError.emptyCompiledPrompt(surface: surface)

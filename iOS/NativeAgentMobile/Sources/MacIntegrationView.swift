@@ -117,7 +117,7 @@ struct MacIntegrationView: View {
     }
 
     private func refreshMacIntegrationProjection() async {
-        sync.refreshProjection()
+        await sync.refreshProjection()
         await identity.refreshTrustSnapshot()
     }
 }

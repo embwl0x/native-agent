@@ -62,7 +62,7 @@ extension MacFourVerbs {
             let name = Self.string(Self.object(output["app"])["name"]) ?? "The app"
             return MacFourVerbsReply(
                 ok: true,
-                text: "\(name)'s menus, read without opening anything (press one with menu_press)"
+                text: "\(name)'s menus, read without opening anything (press one with app mac.menu_press, or menu_press where that is your tool)"
                     + (output["enabled_state"] != nil ? "; which are greyed out is unknown until it's in front" : "")
                     + ":\n"
                     + rows.joined(separator: "\n"),
@@ -282,6 +282,7 @@ extension MacFourVerbs {
         /// state such as keyboard focus name the element already in the model.
         let aliases: [String]
         let kind: String
+        let secret: Bool
         /// The content-row ordinal the render printed.
         let ordinal: Int?
         /// A stable one-based ordinal within this target's visible kind. This
@@ -313,6 +314,7 @@ extension MacFourVerbs {
             label: String?,
             aliases: [String] = [],
             kind: String,
+            secret: Bool = false,
             ordinal: Int?,
             roleOrdinal: Int? = nil,
             enabled: Bool,
@@ -331,6 +333,7 @@ extension MacFourVerbs {
             self.label = label
             self.aliases = aliases
             self.kind = kind
+            self.secret = secret || MacCrossAppDrag.isSecureKind(kind)
             self.ordinal = ordinal
             self.roleOrdinal = roleOrdinal
             self.enabled = enabled
@@ -350,14 +353,8 @@ extension MacFourVerbs {
     /// `seek`: a name the caller is about to act on. When the ordinary walk
     /// stops short of it, the look searches deeper and frames it (`seekScoped`).
     func sight(part: String?, app: String? = nil, seek: String? = nil) async -> Sighted {
-        await sight(part: part, app: app, seek: seek, wakeAttemptsRemaining: 2)
-    }
-
-    /// A screen saver is an obstruction to perception, not a destination Agent
-    /// should reason about. Clear it with the already-gated wake organ and then
-    /// start the read again. Two attempts cover the observed macOS teardown
-    /// delay without creating an unbounded input loop.
-    private func sight(part: String?, app: String?, seek: String? = nil, wakeAttemptsRemaining: Int) async -> Sighted {
+        let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
+        let app = continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app
         let result: MacControlResult
         do {
             // fable51 item 32a — when `app` is named, the look is ANCHORED to
@@ -380,17 +377,6 @@ extension MacFourVerbs {
         if result.error == "self_inspection_unsupported" {
             return .blind(Self.ownAppRoute())
         }
-        // Her-screen 09-24 — "locked" is usually just the screensaver. Nudge it
-        // (pointer move + bare shift, types nothing) and read again, twice at
-        // most (~1.4 s); only then say it couldn't be woken.
-        if result.error == "mac_locked" {
-            if wakeAttemptsRemaining > 0,
-               let wake = try? await host.dispatch(action: "wake", body: ["settle_ms": .int(700)]),
-               wake.ok || Self.object(Self.object(wake.output)["wake"])["still_obstructed"] == .bool(true) {
-                return await sight(part: part, app: app, seek: seek, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
-            }
-            MacScreenLock.wakeFailed = true
-        }
         guard result.ok, let frameId = Self.string(output["frame_id"]) else {
             let why = Self.string(output["message"])
                 ?? Self.lookRefusalWords(result.error ?? Self.string(output["status"]) ?? "unknown")
@@ -407,39 +393,12 @@ extension MacFourVerbs {
             ))
         }
 
-        MacScreenLock.wakeFailed = false
         let percept = Self.percept(from: output)
         if percept.app?.bundleIdentifier == MacWakeGuard.loginWindowBundleID {
-            guard wakeAttemptsRemaining > 0 else {
-                return .blind(MacFourVerbsReply(
-                    ok: false,
-                    text: "The screensaver is still covering the desktop after I nudged it, so I can't see or use the apps underneath yet.",
-                    detail: ["error": .string("display_obstructed")]
-                ))
-            }
-
-            let wake: MacControlResult
-            do {
-                wake = try await host.dispatch(action: "wake", body: ["settle_ms": .int(1_000)])
-            } catch {
-                return .blind(MacFourVerbsReply(
-                    ok: false,
-                    text: "The screensaver is covering the desktop, and I couldn't send the safe wake nudge: \(error).",
-                    detail: ["error": .string("display_obstructed")]
-                ))
-            }
-
-            let wakeOutput = Self.object(wake.output)
-            let wakeReceipt = Self.object(wakeOutput["wake"] ?? .null)
-            if wake.ok || wakeReceipt["still_obstructed"] == .bool(true) {
-                return await sight(part: part, app: app, seek: seek, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
-            }
             return .blind(MacFourVerbsReply(
                 ok: false,
-                text: "The screensaver is covering the desktop, and the safe wake nudge was refused before anything moved.",
-                detail: Self.operationDetail(wake).merging([
-                    "error": .string("display_obstructed")
-                ]) { current, _ in current }
+                text: MacScreenLock.reply,
+                detail: ["error": .string("display_obstructed")]
             ))
         }
 
@@ -470,6 +429,7 @@ extension MacFourVerbs {
                 handle: row.handle,
                 label: MacScreenText(row.label, redacted: row.labelJSON).display,
                 kind: kind,
+                secret: row.secret,
                 ordinal: index + 1,
                 roleOrdinal: roleOrdinal,
                 enabled: row.enabled,
@@ -489,6 +449,7 @@ extension MacFourVerbs {
                 handle: control.handle,
                 label: display,
                 kind: kind,
+                secret: control.secret,
                 ordinal: nil,
                 roleOrdinal: roleOrdinal,
                 enabled: control.enabled,
@@ -574,6 +535,7 @@ extension MacFourVerbs {
                             if !$0.contains($1) { $0.append($1) }
                         },
                         kind: existing.kind,
+                        secret: existing.secret || candidate.secret,
                         ordinal: existing.ordinal,
                         roleOrdinal: existing.roleOrdinal,
                         enabled: existing.enabled,
@@ -604,6 +566,7 @@ extension MacFourVerbs {
                     label: display,
                     aliases: candidate.aliases,
                     kind: candidate.kind,
+                    secret: candidate.secret,
                     ordinal: rows.isEmpty ? candidate.ordinal : nil,
                     roleOrdinal: roleOrdinal,
                     enabled: candidate.enabled,
@@ -670,6 +633,7 @@ extension MacFourVerbs {
                             ? Self.focusedEditableAliases(kind: kind)
                             : [],
                         kind: existing.kind,
+                        secret: existing.secret,
                         ordinal: existing.ordinal,
                         roleOrdinal: existing.roleOrdinal,
                         enabled: existing.enabled,
@@ -699,6 +663,7 @@ extension MacFourVerbs {
                         label: existing.label,
                         aliases: Self.focusedEditableAliases(kind: kind),
                         kind: existing.kind,
+                        secret: existing.secret,
                         ordinal: existing.ordinal,
                         roleOrdinal: existing.roleOrdinal,
                         enabled: existing.enabled,
@@ -722,6 +687,7 @@ extension MacFourVerbs {
                         ? Self.focusedEditableAliases(kind: kind)
                         : [],
                     kind: kind,
+                    secret: MacScreenViewBuilder.isSecretField(role: focus.role, subrole: nil, label: focus.label),
                     ordinal: nil,
                     roleOrdinal: Self.nextRoleOrdinal(for: kind, among: targets),
                     enabled: true,
@@ -790,7 +756,6 @@ extension MacFourVerbs {
             zoomNote: zoom?.note,
             controls: .object([
                 "frame_id": .string(frameId),
-                "craft_document": output["craft_document"] ?? .null,
                 "app": output["app"] ?? .null,
                 "front": output["front"] ?? .bool(false),
                 "affordances": output["affordances"] ?? .array([]),
@@ -838,35 +803,31 @@ extension MacFourVerbs {
     }
 
     static func ownAppRoute(verb: String? = nil, target: String = "", text: String? = nil) -> MacFourVerbsReply {
-        var tool = "app_page_read"
         var input: [String: JSONValue] = ["page": .string("current")]
         let verb = verb?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let target = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         var executable = verb == nil
         if verb == "type", ["composer", "message", "message box", "draft"].contains(target), let text {
-            tool = "interaction_act"
-            input = ["target": .string("composer"), "verb": .string("set_draft"), "value": .string(text)]
+            input = ["action": .string("chat.draft"), "args": .object(["value": .string(text)])]
             executable = true
         } else if let verb, ["click", "navigate", "open"].contains(verb) {
             // The app resolves page names against its canonical rail catalog.
-            tool = "interaction_act"
-            input = ["target": .string("composer"), "verb": .string("set_page"), "value": .string(target)]
+            input = ["action": .string("page.show"), "args": .object(["page": .string(target)])]
             executable = true
             if ["send", "send button"].contains(target) {
-                input = ["target": .string("composer"), "verb": .string("send")]
+                input = ["action": .string("chat.send")]
             } else if let card = ["trust", "model", "think", "context"].first(where: {
                 target == $0 || target == "\($0) card"
             }) {
-                input["verb"] = .string("open_card")
-                input["value"] = .string(card)
+                input = ["action": .string("chat.open_card"), "args": .object(["card": .string(card)])]
             }
         }
         return MacFourVerbsReply(
             ok: false,
-            text: "This is my own app. Use \(tool) with the input in next_action to \(executable ? "work in process" : "inspect its available controls; this gesture has no in-process equivalent").",
+            text: "This is my own app. Use app with the input in next_action to \(executable ? "work in process" : "inspect its available controls; this gesture has no in-process equivalent").",
             detail: ["status": .string("in_process_route"),
                      "execute_in_process": .bool(executable),
-                     "next_action": .object(["tool": .string(tool), "input": .object(input)])]
+                     "next_action": .object(["tool": .string("app"), "input": .object(input)])]
         )
     }
 

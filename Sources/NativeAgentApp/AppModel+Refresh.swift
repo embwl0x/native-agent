@@ -22,7 +22,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -85,6 +84,26 @@ extension AppModel {
         }
 
         let api = client
+        let telegramReadID = UUID()
+        telegramSettingsReadID = telegramReadID
+        let telegramBefore = telegramSettingsDraftSnapshot
+        let telegramBaseline = telegramSettingsDraftBaseline
+        func applyTelegramDraft(
+            _ saved: TelegramSettingsDraftSnapshot,
+            before: TelegramSettingsDraftSnapshot,
+            baseline: TelegramSettingsDraftSnapshot?
+        ) {
+            guard !Task.isCancelled, telegramSettingsReadID == telegramReadID else { return }
+            func mayUpdate<T: Equatable>(_ key: KeyPath<TelegramSettingsDraftSnapshot, T>) -> Bool {
+                telegramSettingsDraftSnapshot[keyPath: key] == before[keyPath: key]
+                    && (baseline.map { before[keyPath: key] == $0[keyPath: key] } ?? true)
+            }
+            if mayUpdate(\.enabled) { telegramEnabled = saved.enabled }
+            if mayUpdate(\.chats) { telegramAllowedChats = saved.chats }
+            if mayUpdate(\.users) { telegramAllowedUsers = saved.users }
+            if mayUpdate(\.requireMention) { telegramRequireMention = saved.requireMention }
+            telegramSettingsDraftBaseline = saved
+        }
         // Start a fresh, complete failure set for this pass. Individual lanes
         // append their detail through `recordRefreshFailure`; a successful
         // empty result remains a real empty projection rather than looking
@@ -182,7 +201,9 @@ extension AppModel {
                     setIfChanged(\.mcpToolReadState, .unavailable(String(error.localizedDescription.prefix(240))))
                 }
             }
-            setIfChanged(\.mcpResourceReadState, .loading)
+            if selectedMCPServerId == pendingId {
+                setIfChanged(\.mcpResourceReadState, .loading)
+            }
             let fetchedResources: [MCPResourceRecord]?
             do {
                 fetchedResources = try await api.getMCPResources(serverId: pendingId).resources
@@ -222,7 +243,6 @@ extension AppModel {
         let fetchedCapabilityTrust = await decodeLogged("getCapabilityTrust") { try await engine.trust.loadCapabilityNetwork() }
         let fetchedNextGenPhases = await refreshPreserving("getNextGenPhases", current: nextGenPhases) { try await api.getNextGenPhases() }
         let fetchedPersonalityGrowth = await decodeLogged("getPersonalityGrowth") { try await api.getPersonalityGrowth() }
-        let fetchedNativePower = await decodeLogged("getNativePower") { try await api.getNativePower() }
         let fetchedNativeActions = await refreshPreserving("getNativeActionRegistry", current: nativeActions) { try await api.getNativeActionRegistry().actions }
         let fetchedNativeActionReceipts = await refreshPreserving("getNativeActionReceipts", current: nativeActionReceipts) { try await api.getNativeActionReceipts() }
         let fetchedNotificationStatus = await decodeLogged("getNotificationStatus") { try await api.getNotificationStatus() }
@@ -269,7 +289,6 @@ extension AppModel {
         setIfChanged(\.nextGenPhases, fetchedNextGenPhases)
         setIfChanged(\.nextGenReceipts, [])
         setIfChanged(\.personalityGrowth, fetchedPersonalityGrowth)
-        setIfChanged(\.nativePower, fetchedNativePower)
         // DAEMON-KILL refreshAll: /v1/native-actions retired; the Swift
         // registry below exposes only dispatcher actions that have live native
         // handlers wired through this app.
@@ -316,26 +335,15 @@ extension AppModel {
         if fetchedTelegramStatus != nil {
             telegramStatusRefreshError = nil
         }
-        if let st = engine.telegram.status {
+        if let st = fetchedTelegramStatus {
             // Swift-native cutover: drive the UI vars straight from the native status
             // so the Bot-token-configured badge + allowed list don't depend on
             // the legacy config.json[telegram] overlay path decoding cleanly.
             setIfChanged(\.telegramTokenConfigured, st.tokenConfigured)
-            setIfChanged(\.telegramEnabled, st.enabled)
-            // NOT gated (here and in the config block below): every one of
-            // these settings fields carries a `didSet` that persists it to
-            // UserDefaults (AppModel.swift:88-139). Skipping the in-memory
-            // write also skips the persistence side effect, which matters on
-            // the first run when the defaults key does not exist yet — and
-            // `chatModel`/`telegramModel` gate their own re-seed on exactly
-            // that key being nil. These are a handful of writes inside
-            // already-conditional blocks; they are not the render cost.
-            if !st.allowedChatIds.isEmpty || !st.allowedUserIds.isEmpty || st.tokenConfigured {
-                telegramAllowedChats = st.allowedChatIds.joined(separator: ",")
-                telegramAllowedUsers = st.allowedUserIds.joined(separator: ",")
-                telegramRequireMention = st.requireMention
-            }
-            telegramSettingsDraftBaseline = telegramSettingsDraftSnapshot
+            applyTelegramDraft(TelegramSettingsDraftSnapshot(
+                enabled: st.enabled, chats: st.allowedChatIds.joined(separator: ","),
+                users: st.allowedUserIds.joined(separator: ","), requireMention: st.requireMention
+            ), before: telegramBefore, baseline: telegramBaseline)
         }
         setIfChanged(\.engine.providers.catalog, await decodeLogged("getModelCatalog") { try await engine.providers.modelCatalog(refresh: false) })
         // PATCH-2026-05-07: chat-provider-picker Populate providers list at
@@ -353,6 +361,8 @@ extension AppModel {
         let fetchedPrivacyMap = await decodeLogged("getPrivacyMap") {
             try await api.getPrivacyMap(includeInventory: false)
         }
+        let telegramBeforeConfig = telegramSettingsDraftSnapshot
+        let telegramBaselineConfig = telegramSettingsDraftBaseline
         let fetchedConfig = await decodeLogged("getConfig", { try await api.getConfig() })
         // Apply the fetched UI state in one MainActor turn before publishing the widget.
         setIfChanged(\.compiledPersonality, fetchedCompiledPersonality)
@@ -362,13 +372,12 @@ extension AppModel {
             _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
             if let telegram = config.telegram {
                 setIfChanged(\.telegramTokenConfigured, telegram.tokenConfigured)
-                setIfChanged(\.telegramEnabled, telegram.enabled)
-                telegramAllowedChats = telegram.allowedChatIds.joined(separator: ",")
-                telegramAllowedUsers = telegram.allowedUserIds.joined(separator: ",")
-                telegramRequireMention = telegram.requireMention
+                applyTelegramDraft(TelegramSettingsDraftSnapshot(
+                    enabled: telegram.enabled, chats: telegram.allowedChatIds.joined(separator: ","),
+                    users: telegram.allowedUserIds.joined(separator: ","), requireMention: telegram.requireMention
+                ), before: telegramBeforeConfig, baseline: telegramBaselineConfig)
                 telegramModel = telegram.model ?? telegramModel
                 telegramReasoningEffort = telegram.reasoningEffort ?? telegramReasoningEffort
-                telegramSettingsDraftBaseline = telegramSettingsDraftSnapshot
             }
             if let routing = config.modelRouting {
                 // PATCH-2026-05-07: model-autosave Don't clobber the user's
@@ -395,6 +404,6 @@ extension AppModel {
             }
         }
         setIfChanged(\.statusText, engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable")
-        if #available(macOS 27, *) { await publishWidgetStatus() }
+        await publishWorkStatus()
     }
 }

@@ -386,9 +386,24 @@ else
   echo "[install_app.sh] LaunchServices could not start the replacement bundle; refusing a direct executable launch because it can lose macOS TCC attribution." >&2
 fi
 echo "Swift runtime install — verifying authenticated readiness and source identity..."
-if [[ "$INSTALL_LAUNCH_OK" == "1" ]] \
-  && "$ROOT/script/verify_installed_runtime_ready.sh" \
-    "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 45; then
+_verify_ready() {
+  [[ "$INSTALL_LAUNCH_OK" == "1" ]] && "$ROOT/script/verify_installed_runtime_ready.sh" \
+    "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 45
+}
+# 2026-10-01: macOS can abort a fresh launch inside RenderBox (SwiftUI's
+# renderer failing to load its own Metal library) before any app code runs —
+# 4 crash reports that day, every one within 3s of launch, old and new builds
+# alike. A process that died is relaunched once before blaming the build.
+INSTALL_READY=0
+if _verify_ready; then
+  INSTALL_READY=1
+elif ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1; then
+  echo "[install_app.sh] the replacement exited during launch; relaunching once"
+  INSTALL_LAUNCH_OK=0
+  _launch_nativeagent_bundle && INSTALL_LAUNCH_OK=1
+  _verify_ready && INSTALL_READY=1
+fi
+if [[ "$INSTALL_READY" == "1" ]]; then
   APP_PID="$(pgrep -fxn "$APP_DEST/Contents/MacOS/NativeAgentApp" || true)"
   echo "OK — NativeAgentApp ready (pid=$APP_PID)."
   # Agent, 2026-09-02: a bridge note is not a receipt. The install itself

@@ -6,10 +6,14 @@ import PersistenceCore
 
 extension GitHubApprovalEdgeNotifier {
     static let shared = GitHubApprovalEdgeNotifier { eventId, title, body, userInfo in
-        _ = try await AttentionRouter.shared.route(
+        let outcome = try await AttentionRouter.shared.route(
             eventId: eventId, importance: .informational,
             title: title, body: body, userInfo: userInfo
         )
+        let delivery = outcome.deliveryProjection
+        if delivery.reachedAChannel { return .delivered }
+        if delivery == .previouslyHandled { return .previouslyHandled }
+        return .undelivered
     }
 }
 
@@ -44,19 +48,20 @@ extension GitHubCommandRuntime {
                         "dedupKey": intent.dedupKey,
                     ]
                 )
-                guard let receipt = outcome.receipt else {
-                    // Routed away from the phone (Telegram) or already
-                    // delivered under this exact dedup key. Either way the
-                    // knock happened; there is no APNS receipt to report.
-                    return (
-                        outcome.suppressed ? "duplicate" : "delivered_\(outcome.delivery.rawValue)",
-                        outcome.suppressed
-                            ? "already delivered under \(intent.dedupKey)"
-                            : "routed to \(outcome.delivery.rawValue)"
-                    )
+                let delivery = outcome.deliveryProjection
+                if let receipt = outcome.receipt {
+                    let fields = JSONValue.object(receipt.deliveryFields())
+                    return (delivery.rawValue, Self.failureDetail(fields))
                 }
-                let fields = JSONValue.object(receipt.deliveryFields())
-                return (receipt.status, Self.failureDetail(fields))
+                let detail: String
+                switch delivery {
+                case .accepted, .queued: detail = "routed to \(outcome.delivery.rawValue)"
+                case .previouslyHandled: detail = "already delivered under \(intent.dedupKey)"
+                case .deferred: detail = "Not sent during quiet hours."
+                case .noChannel: detail = "No notification channel was used."
+                case .failed: detail = "Notification delivery failed."
+                }
+                return (delivery.rawValue, detail)
             },
             outcomeObserver: { model in
                 guard usesLiveAppBody else { return }

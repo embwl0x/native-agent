@@ -1,4 +1,3 @@
-import CommandPalette
 import AppKit
 import Foundation
 
@@ -6,17 +5,6 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
     case sidebar(SidebarItem)
     case activity(ActivitySection)
     case skillsTools(SkillsToolsSection)
-
-    static func commandEntry(_ entry: CommandPaletteEntry) -> Self? {
-        switch entry.id {
-        case "approvals":
-            return .activity(.approvals)
-        case "self-improvement-scoreboard":
-            return .activity(.selfImprovement)
-        default:
-            return route(entry.route)
-        }
-    }
 
     static func route(_ rawRoute: String?) -> Self? {
         guard var route = rawRoute?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -97,6 +85,8 @@ enum NativeAgentNavigationRequestReceipt: Equatable, Sendable {
 
 @MainActor
 final class NativeAgentAppCoordinator {
+    static let mainSceneID = "main"
+
     struct ProcessBootstrapDependencies {
         var restoreDetachedChats: () -> Void
         var startPermissionSync: () -> Void
@@ -114,40 +104,8 @@ final class NativeAgentAppCoordinator {
                 activateApplication: {
                     NSApp.activate(ignoringOtherApps: true)
                 },
-                openMainWindow: {
-                    if !presentLiveMainWindow() {
-                        // Activation can materialize a closed SwiftUI Window on the
-                        // next run-loop turn. Retry once before leaving the typed
-                        // route queued for ContentView's eventual mount.
-                        Task { @MainActor in
-                            _ = presentLiveMainWindow()
-                        }
-                    }
-                }
+                openMainWindow: {}
             )
-        }
-
-        @MainActor
-        private static func presentLiveMainWindow() -> Bool {
-            if let window = NSApp.windows.first(where: {
-                !($0 is NSPanel) && $0.title == "NativeAgent"
-            }) {
-                if window.isMiniaturized {
-                    window.deminiaturize(nil)
-                }
-                window.makeKeyAndOrderFront(nil)
-                return true
-            }
-
-            // A closed SwiftUI Window may no longer have an NSWindow to order
-            // directly, but its system-provided Window-menu item remains the
-            // supported user entry point. Dispatch that same action so SwiftUI
-            // recreates the single "main" scene rather than constructing a
-            // parallel AppKit window.
-            guard let item = NSApp.windowsMenu?.items.first(where: {
-                $0.title == "NativeAgent"
-            }), let action = item.action else { return false }
-            return NSApp.sendAction(action, to: item.target, from: item)
         }
     }
 
@@ -157,7 +115,7 @@ final class NativeAgentAppCoordinator {
     )
 
     private let notificationCenter: NotificationCenter
-    private let windowActions: WindowActions
+    private var windowActions: WindowActions
     private var processDependencies: ProcessBootstrapDependencies?
     private var didFinishLaunching = false
     private var didBootstrapProcessServices = false
@@ -181,6 +139,15 @@ final class NativeAgentAppCoordinator {
         guard !didBootstrapProcessServices else { return }
         processDependencies = dependencies
         bootstrapProcessServicesIfReady()
+    }
+
+    /// Retain the scene's opening action so routing can reopen a closed window.
+    func configureMainWindowOpening(_ open: @escaping @MainActor () -> Void) {
+        windowActions.openMainWindow = open
+        if !pendingDestinations.isEmpty {
+            windowActions.activateApplication()
+            open()
+        }
     }
 
     func applicationDidFinishLaunching() {
@@ -229,11 +196,6 @@ final class NativeAgentAppCoordinator {
         guard let deliver = mountedScene?.deliver else { return false }
         deliver(destination)
         return true
-    }
-
-    func request(commandEntry: CommandPaletteEntry) {
-        guard let destination = NativeAgentNavigationDestination.commandEntry(commandEntry) else { return }
-        request(destination)
     }
 
     private func bootstrapProcessServicesIfReady() {

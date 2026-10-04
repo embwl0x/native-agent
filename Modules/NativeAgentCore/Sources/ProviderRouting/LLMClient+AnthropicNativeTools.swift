@@ -222,12 +222,6 @@ extension AnthropicAdapter {
                 "name": schema.name,
                 "description": schema.description,
             ]
-            // `defer_loading` (mid-conversation tool changes, beta
-            // 2026-07-01): the tool is DECLARED here — so it rides the cached
-            // prefix and can be referenced by name — but stays withheld from
-            // the model until a `tool_addition` block offers it. Only the
-            // always-on floor ships without the flag.
-            if schema.deferLoading { tool["defer_loading"] = true }
             if strict, schemaIsRecursivelyClosed(inputSchema) {
                 // The contract pairs `additionalProperties: false` with a
                 // present `required` list. A closed schema that simply has no
@@ -355,19 +349,6 @@ extension AnthropicAdapter {
                     blocks.append(b)
                 }
             }
-            // Mid-conversation TOOL CHANGES (beta 2026-07-01). These are
-            // content blocks of a `role: "system"` message that REFERENCE a
-            // tool declared in the request's `tools` array rather than
-            // defining one; the array itself never changes, so the cached
-            // prefix survives. `LLMMessage`'s initializer already guarantees
-            // these only ride a non-turn-scoped `.system` message (a
-            // `clear_at` message is text-only and 400s with one).
-            for change in m.toolChanges {
-                blocks.append([
-                    "type": change.kind == .addition ? "tool_addition" : "tool_removal",
-                    "tool": ["type": "tool_reference", "name": change.name],
-                ])
-            }
             guard !blocks.isEmpty else { continue }
             // Three-way role — see the api-key adapter's note. A `.system`
             // message stays a mid-conversation system message on the native
@@ -457,13 +438,16 @@ extension AnthropicAdapter {
     /// exactly as `joinedTextBlocks` skips them — they are not tool calls and
     /// never reply text. They are NOT discarded, though: `nativeThinkingBlocks`
     /// captures them for the replay the next round requires.
-    static func nativeToolCalls(_ content: [[String: Any]]) -> [LLMStreamToolCall] {
-        content.compactMap { block -> LLMStreamToolCall? in
-            guard (block["type"] as? String) == "tool_use",
-                  let id = block["id"] as? String,
-                  let name = block["name"] as? String else { return nil }
-            let input = block["input"] as? [String: Any] ?? [:]
-            let data = (try? JSONSerialization.data(withJSONObject: input)) ?? Data("{}".utf8)
+    static func nativeToolCalls(_ content: [[String: Any]]) throws -> [LLMStreamToolCall] {
+        try content.filter { ($0["type"] as? String) == "tool_use" }.map { block in
+            guard let id = block["id"] as? String,
+                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let name = block["name"] as? String,
+                  !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let input = block["input"] as? [String: Any],
+                  let data = try? JSONSerialization.data(withJSONObject: input) else {
+                throw LLMError.failure(.malformedResponse)
+            }
             return LLMStreamToolCall(id: id, name: name, inputJSON: data)
         }
     }
@@ -496,10 +480,8 @@ extension AnthropicAdapter {
         req.setValue(key, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        // clear_at AND tool_addition/tool_removal in the body each REQUIRE
-        // their beta header (see the api-key messages lane) — present iff a
-        // message in this request actually carries the feature.
-        if let beta = AnthropicOAuthDirectAdapter.midConversationBetas(for: messages) {
+        // clear_at requires its beta header only when a message carries it.
+        if let beta = AnthropicOAuthDirectAdapter.clearAtBeta(for: messages) {
             req.setValue(beta, forHTTPHeaderField: "anthropic-beta")
         }
 
@@ -526,8 +508,22 @@ extension AnthropicAdapter {
             throw malformedSuccessBodyError(data)
         }
 
-        let toolCalls = Self.nativeToolCalls(content)
         let text = Self.joinedTextBlocks(content)
+        if obj["stop_reason"] as? String == "max_tokens" {
+            await telemetry.record(
+                requestBody: req.httpBody,
+                provider: providerId,
+                model: model,
+                streaming: false,
+                usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
+                ttftMs: nil,
+                durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
+                status: "incomplete",
+                stopReason: "max_tokens"
+            )
+            throw LLMError.outputLengthLimit(partial: text)
+        }
+        let toolCalls = try Self.nativeToolCalls(content)
         // Extended thinking is always on for claude-fable-5-1: bank this
         // response's thinking blocks against its own tool_use ids so the
         // assistant turn can replay them, signed and in order, when the
@@ -716,7 +712,7 @@ extension AnthropicAdapter {
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
         req.setValue("text/event-stream", forHTTPHeaderField: "accept")
-        if let beta = AnthropicOAuthDirectAdapter.midConversationBetas(for: messages) {
+        if let beta = AnthropicOAuthDirectAdapter.clearAtBeta(for: messages) {
             req.setValue(beta, forHTTPHeaderField: "anthropic-beta")
         }
         req.httpBody = try JSONSerialization.data(withJSONObject: await makeNativeToolsBody(
@@ -830,13 +826,14 @@ extension AnthropicAdapter {
                         return (call.id, call.name, parsesAsObject ? bytes : nil)
                     }
                     let unparsableToolCalls = decodedToolCalls.filter { $0.bytes == nil }.count
+                    let incompleteToolReason = cutByTokenLimit
+                        ? "max_tokens cut \(decodedToolCalls.count) tool call(s)"
+                        : "\(unparsableToolCalls) of \(decodedToolCalls.count) tool call(s) had unparsable arguments"
                     if cutByTokenLimit || unparsableToolCalls > 0 {
                         if !decodedToolCalls.isEmpty {
                             continuation.yield(.textDelta(
                                 "\n\n" + OpenAIOAuthDirectAdapter.incompleteNote(
-                                    cutByTokenLimit
-                                        ? "max_tokens cut \(decodedToolCalls.count) tool call(s)"
-                                        : "\(unparsableToolCalls) of \(decodedToolCalls.count) tool call(s) had unparsable arguments"
+                                    cutByTokenLimit ? "max_tokens" : incompleteToolReason
                                 )
                             ))
                             yieldedSemanticOutput = true
@@ -872,8 +869,12 @@ extension AnthropicAdapter {
                         usage: usage.isEmpty ? nil : usage,
                         ttftMs: ttftMs,
                         durationMs: durationMs,
-                        stopReason: lastStopReason
+                        status: cutByTokenLimit || unparsableToolCalls > 0 ? "incomplete" : "ok",
+                        stopReason: (cutByTokenLimit || unparsableToolCalls > 0) && !decodedToolCalls.isEmpty
+                            ? incompleteToolReason : lastStopReason
                     )
+                    // Prose is truncated even when no tool calls were buffered.
+                    if cutByTokenLimit { throw runaway.stopError }
                     if !yieldedSemanticOutput {
                         throw FirstPartyExecutionControls.anthropicEmptyStreamError(
                             providerID: providerId,

@@ -3,10 +3,27 @@ import PersistenceCore
 import Desk
 import GitHubConnector
 import WorkshopExecution
+import NativeAgentShared
+
+enum DeskMovementPresentation {
+    static func evidence(_ executions: [WorkshopExecution.WorkshopExecutionRecord]) -> [String: DeskExecutionEvidence] {
+        Dictionary(grouping: executions.filter { $0.deskHandle != nil }, by: { $0.deskHandle! })
+            .compactMapValues { rows in
+                rows.max { $0.updatedAt < $1.updatedAt }.map {
+                    DeskExecutionEvidence(deskHandle: $0.deskHandle, status: $0.status, updatedAt: $0.updatedAt, lastMovementAt: $0.lastMovementAt)
+                }
+            }
+    }
+
+    static func activity(_ item: DeskItem, evidence: DeskExecutionEvidence?, now: Date) -> DeskActivityState {
+        DeskActivityState.item(status: item.status.rawValue, kind: item.kind.rawValue,
+            deferred: item.deferUntil != nil, updatedAt: item.updatedAt, evidence: evidence, now: now)
+    }
+}
 
 // MARK: - Desk presentation facts
 //
-// These are deliberately value-only descriptions of the state that DeskView
+// These are deliberately value-only descriptions of the state that DeskPageView
 // renders.  Store and runner code retain ownership of truth; this layer makes
 // the final translation into a human claim executable without inspecting a
 // SwiftUI body in tests.
@@ -17,22 +34,6 @@ enum DeskPresentationTone: Sendable, Equatable {
     case success
     case warning
     case danger
-}
-
-/// One semantic color vocabulary for every status-bearing Desk row. The view
-/// translates these tones to SwiftUI colors once; board items, delegation
-/// lanes, directed executions, and GitHub watcher rows never keep independent
-/// color switches that can drift apart.
-enum DeskStatusTonePresentation {
-    static func tone(for status: DeskStatus) -> DeskPresentationTone {
-        switch status {
-        case .now, .next: .info
-        case .blocked: .danger
-        case .flag: .warning
-        case .done: .success
-        case .todo, .watch, .canceled: .neutral
-        }
-    }
 }
 
 /// Shared relative-time vocabulary for every timestamp rendered on Desk rows.
@@ -47,7 +48,16 @@ enum DeskRelativeTimePresentation {
     }
 
     static func text(for date: Date, now: Date) -> String {
-        let seconds = max(0, now.timeIntervalSince(date))
+        let seconds = now.timeIntervalSince(date)
+        if seconds < 0 {
+            let remaining = -seconds
+            switch remaining {
+            case ..<60: return "in less than a minute"
+            case ..<3_600: return "in \(Int(ceil(remaining / 60)))m"
+            case ..<86_400: return "in \(Int(ceil(remaining / 3_600)))h"
+            default: return "in \(Int(ceil(remaining / 86_400)))d"
+            }
+        }
         switch seconds {
         case ..<90: return "just now"
         case ..<3_600: return "\(Int(seconds / 60))m ago"
@@ -55,114 +65,48 @@ enum DeskRelativeTimePresentation {
         default: return "\(Int(seconds / 86_400))d ago"
         }
     }
-}
 
-/// Counts are glance aids, not zero-state metrics. A quiet section keeps its
-/// plain title; a populated section uses the same compact label everywhere.
-enum DeskSectionHeaderPresentation {
-    static func label(_ title: String, count: Int?) -> String {
-        guard let count, count > 0 else { return title }
-        return "\(title) · \(count)"
+    /// The next change in this vocabulary, rather than a periodic clock tick.
+    static func nextRefreshAt(for date: Date, now: Date) -> Date {
+        let remaining = date.timeIntervalSince(now)
+        if remaining > 0 {
+            let unit: TimeInterval
+            switch remaining {
+            case ..<60: return date
+            case ..<3_600: unit = 60
+            case ..<86_400: unit = 3_600
+            default: unit = 86_400
+            }
+            let boundary = max(unit, (ceil(remaining / unit) - 1) * unit)
+            return date.addingTimeInterval(-boundary + 0.001)
+        }
+        let seconds = max(0, now.timeIntervalSince(date))
+        let boundary: TimeInterval
+        switch seconds {
+        case ..<90: boundary = 90
+        case ..<3_600: boundary = (floor(seconds / 60) + 1) * 60
+        case ..<86_400: boundary = (floor(seconds / 3_600) + 1) * 3_600
+        default: boundary = (floor(seconds / 86_400) + 1) * 86_400
+        }
+        return date.addingTimeInterval(boundary)
     }
 }
 
-/// The Desk's reader-facing truth state.  This is deliberately separate from
-/// row layout: a successful empty read is quiet, while an unavailable read is
-/// a visible uncertainty and prevents the whole board from claiming it is
-/// clear.  DeskView consumes this projection directly so the wording and the
-/// no-silent-zero rule are testable without mounting SwiftUI.
 enum DeskHonestyPresentation {
     struct UnavailableNotice: Equatable, Sendable {
         let title: String
         let detail: String
     }
 
-    enum LaneBody: Equatable, Sendable {
-        case unavailable(UnavailableNotice)
-        case quiet(String)
-        case rows
-    }
-
-    enum BoardBody: Equatable, Sendable {
-        case loading
-        case clear
-        case populated
-    }
-
-    static let githubQuietCopy =
-        "The watcher is quiet. Tracked GitHub changes appear here and notify you when attention is needed; nothing starts automatically."
-    static let executionQuietCopy = "Quiet right now — nothing running."
-
-    static func githubLane(_ lane: DeskLaneState<GitHubCommandItem>) -> LaneBody {
-        if let reason = lane.unavailableReason {
-            return .unavailable(UnavailableNotice(
-                title: "GitHub Watcher state unavailable",
-                detail: reason))
-        }
-        return lane.items.isEmpty ? .quiet(githubQuietCopy) : .rows
-    }
-
-    static func executionLane(
-        _ lane: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>,
-        hasRenderedBenchRows: Bool
-    ) -> LaneBody {
-        if let reason = lane.unavailableReason {
-            return .unavailable(UnavailableNotice(
-                title: "Task progress unavailable",
-                detail: reason))
-        }
-        return hasRenderedBenchRows ? .rows : .quiet(executionQuietCopy)
-    }
-
-    /// "In progress" is fed by both Workshop executions and Desk program
-    /// families. A failed read from either owner makes the combined section
-    /// unknown; rendering the other owner's empty result as "Quiet" would be
-    /// the same silent-zero failure `DeskLaneState` exists to prevent.
-    static func inProgressLane(
-        executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>,
-        deskItems: DeskLaneState<DeskItem>,
-        hasRenderedRows: Bool
-    ) -> LaneBody {
-        if let reason = executions.unavailableReason {
-            return .unavailable(UnavailableNotice(
-                title: "Task progress unavailable",
-                detail: reason))
-        }
-        if let reason = deskItems.unavailableReason {
-            return .unavailable(UnavailableNotice(
-                title: "Desk program state unavailable",
-                detail: reason))
-        }
-        return hasRenderedRows ? .rows : .quiet(executionQuietCopy)
-    }
-
-    static func boardBody(
-        itemCount: Int,
-        executionCount: Int,
-        githubItemCount: Int,
-        loadError: String?,
-        hasLoadedOnce: Bool,
-        hasUnavailableLane: Bool
-    ) -> BoardBody {
-        guard itemCount == 0,
-              executionCount == 0,
-              githubItemCount == 0,
-              loadError == nil,
-              !hasUnavailableLane
-        else {
-            return .populated
-        }
-        return hasLoadedOnce ? .clear : .loading
-    }
 }
 
 // MARK: - Live Activity
 
 /// The pure, value-only model behind Desk's glancing Live Activity header.
-/// Canonical Desk rows remain the sole truth; this projection neither writes
+/// Canonical Desk and execution rows supply the evidence; this projection neither writes
 /// status nor promotes `laneOf` into the real `parent` hierarchy.
 enum DeskLiveActivityPresentation {
-    static let defaultActiveWindow: TimeInterval = 30 * 60
+    static let defaultActiveWindow: TimeInterval = DeskActivityState.movementWindow
     static let staleAfter: TimeInterval = 5 * 60
     static let visibleRowCap = 4
     private static let boundaryEpsilon: TimeInterval = 0.001
@@ -212,6 +156,7 @@ enum DeskLiveActivityPresentation {
 
     static func make(
         deskItems: DeskLaneState<DeskItem>,
+        executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>,
         generatedTs: String?,
         now: Date,
         activeWindow: TimeInterval = defaultActiveWindow,
@@ -221,14 +166,17 @@ enum DeskLiveActivityPresentation {
         if let reason = deskItems.unavailableReason {
             return .unavailable(.init(title: "Live Activity unavailable", detail: reason))
         }
+        if let reason = executions.unavailableReason {
+            return .unavailable(.init(title: "Live Activity unavailable", detail: reason))
+        }
 
         let window = max(0, activeWindow)
+        let evidence = DeskMovementPresentation.evidence(executions.items)
         let candidates = deskItems.items.compactMap { item -> (DeskItem, Date)? in
-            guard item.status == .now,
-                  let updated = UserDisplayFormatters.parseISOTimestamp(item.updatedAt)
+            guard !item.requiresOwnerInput,
+                  DeskMovementPresentation.activity(item, evidence: evidence[item.handle], now: now) == .working,
+                  let updated = DeskActivityState.movementDate(evidence[item.handle]?.lastMovementAt)
             else { return nil }
-            // Future stamps are treated as zero-age rather than being allowed
-            // to manufacture a negative relative time.
             guard max(0, now.timeIntervalSince(updated)) <= window else { return nil }
             return (item, updated)
         }.sorted { left, right in
@@ -336,12 +284,13 @@ enum DeskProgramFamilyPresentation {
         fileprivate let newestUpdate: Date?
     }
 
-    static func families(from deskItems: DeskLaneState<DeskItem>) -> [Family] {
-        guard deskItems.unavailableReason == nil else { return [] }
-        return families(from: deskItems.items)
+    static func families(from deskItems: DeskLaneState<DeskItem>, executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>, now: Date) -> [Family] {
+        guard deskItems.unavailableReason == nil, executions.unavailableReason == nil else { return [] }
+        return families(from: deskItems.items, executions: executions.items, now: now)
     }
 
-    static func families(from items: [DeskItem]) -> [Family] {
+    static func families(from items: [DeskItem], executions: [WorkshopExecution.WorkshopExecutionRecord], now: Date) -> [Family] {
+        let evidence = DeskMovementPresentation.evidence(executions)
         // A canonical store cannot produce duplicate handles, but this is a UI
         // projection over durable bytes: retaining the first row is safer than
         // trapping if a damaged/manual fixture reaches the presentation seam.
@@ -360,7 +309,9 @@ enum DeskProgramFamilyPresentation {
 
         return items.compactMap { parent -> Family? in
             guard let lanes = lanesByParent[parent.handle], !lanes.isEmpty,
-                  parent.status == .now || lanes.contains(where: { $0.status == .now })
+                  ([parent] + lanes).contains(where: {
+                      !$0.requiresOwnerInput && DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .working
+                  })
             else { return nil }
             let newest = ([parent] + lanes)
                 .compactMap { UserDisplayFormatters.parseISOTimestamp($0.updatedAt) }
@@ -466,17 +417,6 @@ enum DeskItemPresentation {
         let targetHandle: String
     }
 
-    static func statusLabel(_ status: DeskStatus) -> String {
-        status.displayLabel
-    }
-
-    static func nagBellSymbol(config: DeskNagConfig, now: Date) -> String {
-        if config.isMuted(now: now) { return "bell.slash" }
-        return config.enabled ? "bell.fill" : "bell"
-    }
-
-    /// A blocker with no live alias is not actionable UI.  The rendered pill
-    /// and its navigation target therefore come from the same resolved list.
     static func blockedPill(
         plan: DeskSequencing.ItemPlan,
         aliases: [String: String],
@@ -493,8 +433,9 @@ enum DeskItemPresentation {
             targetHandle: first.handle)
     }
 
-    static func visiblePrefix<T>(_ values: [T], showingAll: Bool, cap: Int = 8) -> [T] {
-        showingAll ? values : Array(values.prefix(max(cap, 0)))
+    static func nagBellSymbol(config: DeskNagConfig, now: Date) -> String {
+        if config.isMuted(now: now) { return "bell.slash" }
+        return config.enabled ? "bell.fill" : "bell"
     }
 
     /// The one Desk-wide definition of a row requiring attention. An explicit
@@ -502,14 +443,6 @@ enum DeskItemPresentation {
     /// nor flagged, so summaries and the attention strip must share this rule.
     static func needsEyes(_ item: DeskItem) -> Bool {
         item.status == .blocked || item.status == .flag || (item.waitingOn?.isEmpty == false)
-    }
-
-    static func githubProjectNeedsEyes(_ items: [DeskItem]) -> Int {
-        items.lazy.filter(needsEyes).count
-    }
-
-    static func paletteTargetIsActionable(_ handle: String, activeHandles: Set<String>) -> Bool {
-        activeHandles.contains(handle)
     }
 
     /// The whole-board store failure is rendered next to lane failures, so it
@@ -538,100 +471,16 @@ enum DeskItemPresentation {
         return Freshness(text: stale ? "\(days)d stale" : plain, isStale: stale, isKnown: true)
     }
 
-    struct PursuitCard: Sendable, Equatable {
-        let title: String
-        let sessionLabel: String
-        let holdLabel: String?
-        let doneLabel: String
-    }
-
-    /// The pursuits lane includes every self-authored project, including a
-    /// legacy/corrupt row whose optional `pursuit` payload could not decode.
-    /// The latter gets an explicit integrity card instead of disappearing
-    /// behind a section count.
-    enum PursuitCardState: Sendable, Equatable {
-        case rendered(PursuitCard)
-        case payloadUnreadable
-        case notPursuit
-    }
-
-    static func pursuitCardState(for item: DeskItem) -> PursuitCardState {
-        guard DeskBoardLayout.isPursuitLaneItem(item) else { return .notPursuit }
-        guard let card = pursuitCard(for: item) else { return .payloadUnreadable }
-        return .rendered(card)
-    }
-
-    static func pursuitCard(for item: DeskItem) -> PursuitCard? {
-        guard let pursuit = item.pursuit else { return nil }
-        let holdLabel: String?
-        if item.status == .blocked, let reason = item.blockedReason, !reason.isEmpty {
-            holdLabel = reason
-        } else if let waiting = item.waitingOn, !waiting.isEmpty {
-            holdLabel = "waiting on \(waiting)"
-        } else {
-            holdLabel = nil
-        }
-        return PursuitCard(
-            title: pursuit.privateName ?? item.title,
-            sessionLabel: "\(pursuit.reservations.count)/\(pursuit.maxSessions) sessions",
-            holdLabel: holdLabel,
-            doneLabel: pursuit.doneLooksLike)
-    }
 }
 
-/// The exact rows an Agent pursuits header counts and renders. A row that
-/// survived the Desk state decoder but lost its optional pursuit payload still
-/// appears here as a visible integrity warning, so the count cannot claim a
-/// card that the section drops.
 enum DeskPursuitSectionPresentation {
     static let unreadablePayloadLabel = "Project details unavailable"
     static let unreadablePayloadDetail = "The saved details of this project could not be read. They need to be repaired before you can act on it."
 
-    struct Row: Identifiable, Sendable, Equatable {
-        let item: DeskItem
-        let cardState: DeskItemPresentation.PursuitCardState
-
-        var id: String { item.handle }
-    }
-
-    static func rows(from activeItems: [DeskItem]) -> [Row] {
-        DeskBoardLayout.pursuits(activeItems).map { item in
-            Row(item: item, cardState: DeskItemPresentation.pursuitCardState(for: item))
-        }
-    }
-
-    static func headerCount(for rows: [Row]) -> Int? {
-        rows.isEmpty ? nil : rows.count
-    }
 }
 
-/// The owner's Veto control on a Desk pursuit row (Fable 5.1 sweep item 36).
-///
-/// Veto is owner authority over something the agent opened for herself, so it
-/// belongs on the row User already reads — not behind the developer gate in
-/// Diagnostics ▸ Cognition ▸ Desk, where it used to live beside a second copy
-/// of this same pursuit list. The store-side mutation is unchanged
-/// (`WorkshopObservatoryVetoHandler` → `SwiftNativeDeskStore.vetoPursuit`);
-/// only the surface moved.
-///
-/// The action closure is required at construction — the same rule the mounted
-/// observatory button held: an enabled Veto control can never silently discard
-/// an owner decision because an embedding route forgot to wire it.
-struct DeskPursuitVetoControl {
-    /// Handles whose veto is awaiting its durable outcome.
-    let pendingHandles: Set<String>
-    let onVeto: (String) -> Void
-
+enum DeskPursuitVetoControl {
     static let help = "Close this pursuit (canceled) with a user-vetoed note."
-
-    func isDisabled(_ handle: String) -> Bool {
-        WorkshopObservatoryVetoPresentation.buttonIsDisabled(
-            handle: handle, pendingHandles: pendingHandles)
-    }
-
-    func trigger(_ handle: String) {
-        onVeto(handle)
-    }
 }
 
 /// What the Desk says after a veto settles. Every outcome gets a line — a
@@ -817,24 +666,5 @@ enum DeskSequencingPillPresentation {
             result.append(Pill(kind: .nextUp, text: "start here", targetHandle: nil))
         }
         return result
-    }
-}
-
-enum DeskActionPresentation {
-    struct Notice: Sendable, Equatable {
-        let symbol: String
-        let tone: DeskPresentationTone
-    }
-
-    static func notice(isError: Bool) -> Notice {
-        isError
-            ? Notice(symbol: "exclamationmark.triangle", tone: .warning)
-            : Notice(symbol: "checkmark.circle", tone: .success)
-    }
-}
-
-enum DeskFinishedPresentation {
-    static func sectionCount(groupCount: Int, recentExecutionCount: Int) -> Int {
-        max(groupCount, 0) + max(recentExecutionCount, 0)
     }
 }

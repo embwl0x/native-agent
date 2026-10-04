@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
@@ -47,12 +48,26 @@ private func loadObjectRowsChecked(
     at path: URL,
     recordKind: String
 ) throws -> [[String: JSONValue]] {
-    let fileManager = FileManager.default
-    guard fileManager.fileExists(atPath: path.path) else { return [] }
+    var metadata = stat()
+    if lstat(path.path, &metadata) != 0 {
+        guard errno == ENOENT else {
+            throw CapabilityCatalogPersistenceError.unreadable(
+                path: path.path, detail: "store cannot be inspected"
+            )
+        }
+        return []
+    }
 
     let data: Data
     do {
-        data = try Data(contentsOf: path)
+        let fd = Darwin.open(path.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? handle.close() }
+        guard fstat(fd, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG else {
+            throw POSIXError(.EIO)
+        }
+        data = try handle.readToEnd() ?? Data()
     } catch {
         throw CapabilityCatalogPersistenceError.unreadable(
             path: path.path,
@@ -208,29 +223,9 @@ private func mergeID(_ item: [String: JSONValue]) -> String {
     return ""
 }
 
-/// Resolve the capability pack signing key from the Swift-native canonical
-/// store:
-///   1. A present key must be readable and exactly 64 hexadecimal characters.
-///   2. A missing key is generated once, atomically persisted with mode 0600,
-///      and read back before it can be used.
-/// Existing invalid state is never silently rotated and persistence failures
-/// never return an ephemeral in-memory secret.
-private func checkedExistingPackSigningKey(at keyPath: URL) throws -> String? {
-    let fileManager = FileManager.default
-    guard fileManager.fileExists(atPath: keyPath.path) else { return nil }
-    let data: Data
-    do {
-        data = try Data(contentsOf: keyPath)
-    } catch {
-        throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-            path: keyPath.path,
-            detail: "existing key cannot be read: \(error.localizedDescription)"
-        )
-    }
-    guard let existing = String(data: data, encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines),
-          existing.count == 64,
-          existing.unicodeScalars.allSatisfy({ scalar in
+private func validatedPackSigningKey(_ data: Data, at keyPath: URL) throws -> String {
+    guard let secret = String(data: data, encoding: .utf8),
+          secret.unicodeScalars.allSatisfy({ scalar in
               switch scalar.value {
               case 0x30...0x39, 0x41...0x46, 0x61...0x66: return true
               default: return false
@@ -241,98 +236,30 @@ private func checkedExistingPackSigningKey(at keyPath: URL) throws -> String? {
             detail: "existing key must contain exactly 64 hexadecimal characters"
         )
     }
-    let attributes: [FileAttributeKey: Any]
-    do {
-        attributes = try fileManager.attributesOfItem(atPath: keyPath.path)
-    } catch {
-        throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-            path: keyPath.path,
-            detail: "existing key permissions cannot be verified: \(error.localizedDescription)"
-        )
-    }
-    guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-          (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600 else {
-        throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-            path: keyPath.path,
-            detail: "existing key must be a regular file with mode 0600"
-        )
-    }
-    return existing
+    return secret
 }
 
-private func resolvePackSigningKey(
-    dataRoot: URL,
-    persistence: any PersistenceCoreProtocol
-) async throws -> String {
-    let keyPath = dataRoot
-        .appendingPathComponent("catalog", isDirectory: true)
-        .appendingPathComponent(".pack_signing_key")
-    let work: @Sendable () async throws -> String = {
-        let fileManager = FileManager.default
-        if let existing = try checkedExistingPackSigningKey(at: keyPath) {
-            return existing
-        }
+private func checkedExistingPackSigningKey(at keyPath: URL) throws -> String? {
+    guard let data = try CheckedFixedSizeSecretFile.peekExisting(at: keyPath, byteCount: 64) else { return nil }
+    return try validatedPackSigningKey(data, at: keyPath)
+}
 
-        do {
-            try fileManager.createDirectory(
-                at: keyPath.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-        } catch {
-            throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-                path: keyPath.path,
-                detail: "cannot create key directory: \(error.localizedDescription)"
-            )
+/// Only genuine absence may create a signing identity. Existing damaged keys
+/// remain untouched and unavailable.
+private func resolvePackSigningKey(dataRoot: URL) throws -> String {
+    let keyPath = dataRoot.appendingPathComponent("catalog/.pack_signing_key")
+    do {
+        let data = try CheckedFixedSizeSecretFile.loadOrCreate(at: keyPath, byteCount: 64) {
+            let secret = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            return Data(secret.utf8)
         }
-
-        let secret = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-            + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        do {
-            try Data(secret.utf8).write(to: keyPath, options: [.atomic])
-            try fileManager.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: keyPath.path
-            )
-            let persisted = try String(contentsOf: keyPath, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard persisted == secret else {
-                throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-                    path: keyPath.path,
-                    detail: "generated key failed durable read-back verification"
-                )
-            }
-            let attributes = try fileManager.attributesOfItem(atPath: keyPath.path)
-            guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-                  (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600 else {
-                throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-                    path: keyPath.path,
-                    detail: "generated key failed mode 0600 verification"
-                )
-            }
-        } catch {
-            // A failed permission/read-back step must not strand valid-looking
-            // bytes that a later invocation could adopt. Remove only the exact
-            // secret generated by this invocation; never rotate unrelated state.
-            if (try? Data(contentsOf: keyPath)) == Data(secret.utf8) {
-                try? fileManager.removeItem(at: keyPath)
-            }
-            if let persistenceError = error as? CapabilityCatalogPersistenceError {
-                throw persistenceError
-            }
-            throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
-                path: keyPath.path,
-                detail: "cannot persist generated key: \(error.localizedDescription)"
-            )
-        }
-        return secret
+        return try validatedPackSigningKey(data, at: keyPath)
+    } catch {
+        throw CapabilityCatalogPersistenceError.signingKeyUnavailable(
+            path: keyPath.path, detail: error.localizedDescription
+        )
     }
-
-    // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-    // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-    // every conformer already has it. The old downcast to
-    // SwiftNativePersistenceCore only had the effect of running this critical
-    // section UNLOCKED for any other conformer.
-    return try await persistence.withFileLock(keyPath, work)
 }
 
 /// SHA-256 hex of `s` (UTF-8 bytes), truncated to the first 32 chars —
@@ -408,9 +335,7 @@ public actor SwiftNativeCapabilityTrustRoots {
         // surface untouched, even when the key is also missing.
         let saved = try CapabilityCatalogStoreReader.loadCapabilityTrustRootsChecked(at: trustPath)
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
-        let signingKey = try await resolvePackSigningKey(
-            dataRoot: dataRoot, persistence: persistence
-        )
+        let signingKey = try resolvePackSigningKey(dataRoot: dataRoot)
         let fingerprint = sha256HexPrefix32(signingKey)
         let defaults: [[String: JSONValue]] = [[
             "id": .string("local-trusted"),
@@ -555,7 +480,7 @@ public struct SwiftNativeCapabilityPackSigner: Sendable {
     /// keyed by the UTF-8 bytes of the pack signing key.
     /// Mirrors `capability_pack_signature()`.
     public func signature(for pack: [String: JSONValue]) async throws -> String {
-        let key = try await resolvePackSigningKey(dataRoot: dataRoot, persistence: persistence)
+        let key = try resolvePackSigningKey(dataRoot: dataRoot)
         return try Self.signature(for: pack, signingKey: key)
     }
 
@@ -649,25 +574,17 @@ public struct SwiftNativeCapabilityPackSigner: Sendable {
             .appendingPathComponent("trust", isDirectory: true)
             .appendingPathComponent("roots.json")
         let roots = try CapabilityCatalogStoreReader.loadCapabilityTrustRootsChecked(at: trustPath)
-        // Python: root_ids = {str(item.get("id")) for item in roots} (:6475) —
-        // stringifies non-string ids. Use pyStr for byte-faithful membership.
-        var rootIDs: Set<String> = []
-        for r in roots {
-            rootIDs.insert(pyStr(r["id"]))
-        }
-
-        // signing_identity = str(pack.get("signingIdentity") or "") — non-string
-        // scalars stringify, falsy -> "".
-        let signingIdentity = pyStrOr([pack["signingIdentity"]], default: "")
+        let signingIdentity = pyStrOr([pack["signingIdentity"]], default: "local-trusted")
         // The bootstrap root is deliberately machine-local: it is keyed by
         // the same local signing secret used to create demo packs.  It proves
         // integrity against that local key, not third-party attestation.
         var trustTier = signingIdentity == "local-trusted" ? "self_issued" : "local"
-        if !signingIdentity.isEmpty
-            && !rootIDs.contains(signingIdentity)
-            && signingIdentity != "local-trusted" {
+        let savedRoot = roots.first { $0["id"] == .string(signingIdentity) }
+        let rootTrusted = savedRoot.map { $0["status"] == .string("trusted") }
+            ?? (signingIdentity == "local-trusted")
+        if !rootTrusted {
             trustTier = "unknown"
-            errors.append("Signing identity is not in trusted roots.")
+            errors.append("Signing identity is not trusted.")
             status = "invalid"
         }
 
@@ -686,8 +603,7 @@ public struct SwiftNativeCapabilityPackSigner: Sendable {
             "valid": .bool(errors.isEmpty),
             "errors": .array(errors.map { .string($0) }),
             "expectedSignature": .string(expected),
-            // str(pack.get("signingIdentity") or "") or "local-trusted" (:6490).
-            "signingIdentity": .string(signingIdentity.isEmpty ? "local-trusted" : signingIdentity),
+            "signingIdentity": .string(signingIdentity),
             "trustTier": .string(trustTier),
             "provenance": provenance,
             "createdAt": .string(nowISO),
@@ -839,51 +755,13 @@ public actor SwiftNativeCatalogWrites {
         return record
     }
 
-    /// Port of `check_capability_updates()`. Reads the
-    /// installs list (lock-free), builds a "current" update row per install,
-    /// then stamps lastCheckedAt on every source under the sources flock.
+    /// No source-version comparison is implemented, so no source was checked.
     public func checkCapabilityUpdates() async throws -> [String: JSONValue] {
-        let installs = try await listCapabilityPackInstalls()
-        var updates: [JSONValue] = []
-        for install in installs {
-            let packId = install["packId"] ?? .null
-            let version = install["version"] ?? .null
-            // f"update:{install.get('packId')}" — numeric -> "update:123",
-            // string -> raw. (Python's missing -> "update:None" is unreachable
-            // now: loadCapabilityPackInstallsChecked rejects packId-less rows
-            // before this loop runs.)
-            updates.append(.object([
-                "id": .string("update:\(pyStr(install["packId"]))"),
-                "packId": packId,
-                "installedVersion": version,
-                "availableVersion": version,
-                "status": .string("current"),
-                "sourceId": .string("local-catalog"),
-            ]))
-        }
-
-        let sourcesPathLocal = sourcesPath
-        let packsPathLocal = packsPath
-        let persistenceLocal = persistence
-        let now = SwiftNativeManifestSigner.isoTimestamp(clock())
-        let sourceCount: Int = try await withSourcesLock {
-            var merged = try Self.mergedSourcesChecked(
-                sourcesPath: sourcesPathLocal,
-                packsPath: packsPathLocal,
-                nowISO: now
-            )
-            for i in merged.indices {
-                merged[i]["lastCheckedAt"] = .string(now)
-            }
-            try await persistenceLocal.writeJSON(.array(merged.map { .object($0) }), to: sourcesPathLocal)
-            return merged.count
-        }
-
         return [
-            "status": .string("checked"),
-            "updates": .array(updates),
-            "sourceCount": .int(Int64(sourceCount)),
-            "createdAt": .string(now),
+            "status": .string("unavailable"),
+            "reason": .string("Update checking is unavailable because source versions are not compared."),
+            "updates": .array([]),
+            "createdAt": .string(SwiftNativeManifestSigner.isoTimestamp(clock())),
         ]
     }
 

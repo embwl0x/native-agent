@@ -19,10 +19,12 @@ const https = require("https");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
-const { nowISO: now, jsonOut: out, ensureDir: ensure, claimWakeJob: claim, readWakeJSON: readJSON, postBridgeRequest, missingWakeCompletionOrigin, processTreeOrder, safeFilePart, createWakeLivePoster, processStartIdentity } = require("./wake_worker_common.js");
+const { nowISO: now, jsonOut: out, ensureDir: ensure, claimWakeJob: claim, readWakeJSON: readJSON, postWakeCompletion, missingWakeCompletionOrigin, processTreeOrder, safeFilePart, createWakeLivePoster, createWakeEventWaiter, processStartIdentity, writeSyncedAndClose, fsyncDirectorySync } = require("./wake_worker_common.js");
 
 const ROOT = process.env.NATIVE_AGENT_OMP_BRIDGE_DIR || path.join(os.homedir(), ".config", "omp-bridge");
 const JOBS = path.join(ROOT, "wake-jobs");
+const RETIRED = path.join(ROOT, "wake-retired");
+const UNANSWERED = path.join(ROOT, "wake-unanswered");
 const SESSIONS = path.join(ROOT, "wake-sessions");
 const DELIVERIES = path.join(ROOT, "wake-deliveries.jsonl");
 const RETURN_ROOT = process.env.NATIVE_AGENT_RETURN_BRIDGE_DIR || path.join(os.homedir(), ".config", "claude-bridge");
@@ -32,6 +34,9 @@ const DEFAULT_TIMEOUT = 900;
 const DEFAULT_IDLE = 900;
 const MAX_OUTPUT = 2 * 1024 * 1024;
 const DEFAULT_TOPIC = "general";
+const TERMINAL_HISTORY_LIMIT = 100;
+const DELIVERY_HISTORY_LIMIT = 1000;
+const DELIVERY_HISTORY_BYTES = 8 * 1024 * 1024;
 
 function ensureAll() { ensure(ROOT); ensure(JOBS); ensure(SESSIONS); }
 function safe(value) {
@@ -49,17 +54,119 @@ function tail(value, limit = 2000) {
   const text = redact(value).trim();
   return text.length <= limit ? text : `…${text.slice(-limit)}`;
 }
-function atomicWrite(file, value) {
+function atomicWrite(file, value, raw = false) {
   ensure(path.dirname(file));
   const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(value, null, 2), { mode: 0o600 });
-  fs.renameSync(temp, file);
-  try { fs.chmodSync(file, 0o600); } catch {}
+  try {
+    const fd = fs.openSync(temp, "wx", 0o600);
+    writeSyncedAndClose(fd, () => raw ? value : JSON.stringify(value, null, 2));
+    fs.renameSync(temp, file);
+    fsyncDirectorySync(path.dirname(file));
+    try { fs.chmodSync(file, 0o600); } catch {}
+  } finally {
+    try { fs.rmSync(temp, { force: true }); } catch {}
+  }
 }
-function appendJSONL(file, value) {
-  ensure(path.dirname(file));
-  fs.appendFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  try { fs.chmodSync(file, 0o600); } catch {}
+async function appendJSONL(file, value) {
+  await withHistoryLock(() => compactDeliveryLedger(value));
+}
+
+async function withHistoryLock(fn, waitMs = 2000) {
+  const deadline = Date.now() + waitMs;
+  while (true) {
+    let lock = acquireLock(".history", "retention");
+    if (lock.acquired) {
+      try { return fn(); } finally { lock.release(); }
+    }
+    if (waitMs === 0) return { status: "skipped", reason: "omp_history_busy" };
+    if (Date.now() >= deadline) throw new Error("omp_history_busy");
+    const waiter = createWakeEventWaiter();
+    try {
+      const watcher = fs.watch(SESSIONS, { persistent: false }, (_event, name) => {
+        if (name == null || String(name) === ".history.lock") waiter.signal({ source: "history_lock_changed" });
+      });
+      waiter.cleanup.push(() => watcher.close());
+      // Close the release-before-registration race.
+      lock = acquireLock(".history", "retention");
+      if (lock.acquired) {
+        try { return fn(); } finally { lock.release(); }
+      }
+      waiter.startTimeout({ source: "history_lock_deadline" }, Math.max(0, deadline - Date.now()));
+      await waiter.promise;
+    } finally { waiter.close(); }
+  }
+}
+
+function retainUnansweredSession(receipt) {
+  if (!receipt || receipt.status !== "failed" || !receipt.topicSlug
+      || typeof receipt.sessionId !== "string" || !receipt.sessionId.trim()) return;
+  const file = path.join(UNANSWERED, `${topicSlug(receipt.topicSlug)}.json`);
+  let saved;
+  try { saved = JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (saved && saved.createdAt >= receipt.createdAt) return;
+  // History owns this compact identity; it never takes a conversation lock.
+  atomicWrite(file, { sessionId: receipt.sessionId, model: receipt.model || null,
+    reason: receipt.reason, assistantError: receipt.assistantError || null, createdAt: receipt.createdAt });
+}
+
+function compactDeliveryLedger(receipt = null) {
+  let raw;
+  try { raw = fs.readFileSync(DELIVERIES, "utf8"); }
+  catch (error) { if (error.code !== "ENOENT") throw error; raw = ""; }
+  const lines = raw.split("\n").filter((line) => line.trim());
+  // Decode before replacing the ledger: malformed retained evidence stays put.
+  for (const line of lines) retainUnansweredSession(JSON.parse(line));
+  if (receipt) {
+    retainUnansweredSession(receipt);
+    lines.push(JSON.stringify(receipt));
+  }
+  const kept = lines.slice(-DELIVERY_HISTORY_LIMIT);
+  let bytes = kept.reduce((sum, line) => sum + Buffer.byteLength(line) + 1, 0);
+  while (kept.length > 1 && bytes > DELIVERY_HISTORY_BYTES) bytes -= Buffer.byteLength(kept.shift()) + 1;
+  if (bytes > DELIVERY_HISTORY_BYTES) throw new Error("omp_delivery_receipt_too_large");
+  if (receipt || kept.length !== lines.length) atomicWrite(DELIVERIES, `${kept.join("\n")}\n`, true);
+}
+
+function retiredJob(messageId) {
+  const file = path.join(RETIRED, `${safe(messageId)}.json`);
+  let record;
+  try { record = JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  if (!record || record.messageId !== messageId) throw new Error("retired_message_id_conflict");
+  return { status: "skipped", reason: "duplicate", messageId, existingState: "settled", jobPath: file };
+}
+
+function prunableJob(job) {
+  return job && job.state === "settled" && !job.completionText && !knownUnstartedJob(job)
+    && job.bridge && ["delivered", "dry_run"].includes(job.bridge.status)
+    && typeof job.messageId === "string" && Number.isFinite(Date.parse(job.completedAt));
+}
+
+async function pruneTerminalHistory() {
+  return await withHistoryLock(() => {
+    compactDeliveryLedger();
+    const terminal = fs.readdirSync(JOBS).filter((name) => name.endsWith(".json"))
+      .map((name) => ({ file: path.join(JOBS, name), job: readJSON(path.join(JOBS, name)) }))
+      .filter(({ job }) => prunableJob(job))
+      .sort((a, b) => Date.parse(b.job.completedAt) - Date.parse(a.job.completedAt));
+    for (const { file, job } of terminal.slice(TERMINAL_HISTORY_LIMIT)) {
+      const lock = acquireLock(topicSlug(job.payload && job.payload.topic), job.messageId);
+      if (!lock.acquired) continue;
+      try {
+        const current = readJSON(file);
+        if (!prunableJob(current) || current.claimId !== job.claimId
+            || [current.runnerPid, current.claimantPid].some((pid) => processAlive(pid))) continue;
+        // Keep a compact permanent replay marker OUTSIDE the enumerated jobs.
+        // Publish it first; a crash or concurrent admission cannot reopen work.
+        atomicWrite(path.join(RETIRED, `${safe(job.messageId)}.json`), {
+          messageId: job.messageId, completedAt: job.completedAt, deliveryId: job.deliveryId || null,
+        });
+        fs.unlinkSync(file);
+        fsyncDirectorySync(JOBS);
+      } finally { lock.release(); }
+    }
+  }, 0);
 }
 function processAlive(pid) {
   if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return false;
@@ -104,18 +211,10 @@ function writePointer(slug, sessionId, cwd, model) {
   atomicWrite(pointerPath(slug), { schemaVersion: 1, sessionId, cwd, ...(model ? { model } : {}), updatedAt: now() });
   return pointerPath(slug);
 }
-/// The newest OMP session this topic ran in, from the delivery receipts, for a
+/// The newest OMP session this topic ran in, retained from delivery receipts, for a
 /// conversation that has no pointer because no turn of it was ever answered.
 function unansweredSession(slug) {
-  let lines;
-  try { lines = fs.readFileSync(DELIVERIES, "utf8").split("\n"); } catch { return null; }
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    let receipt;
-    try { receipt = JSON.parse(lines[i]); } catch { continue; }
-    if (receipt && receipt.topicSlug === slug && receipt.status === "failed"
-        && typeof receipt.sessionId === "string" && receipt.sessionId.trim()) return receipt;
-  }
-  return null;
+  return readJSON(path.join(UNANSWERED, `${slug}.json`));
 }
 function lockPath(slug) { return path.join(SESSIONS, `${slug}.lock`); }
 function acquireLock(slug, messageId) {
@@ -298,11 +397,13 @@ function runOMP({ payload, pointer, cwd, timeout, idle, onActivity, live }) {
     };
     try { child = spawn(bin, args, { cwd, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (error) { return finish({ exitCode: null, signal: null, spawnError: String(error && error.message || error) }); }
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     let liveLine = "";
     const capture = (kind, chunk) => {
       lastActivityAt = Date.now();
       if (typeof onActivity === "function") onActivity(new Date(lastActivityAt).toISOString());
-      const text = chunk.toString("utf8");
+      const text = chunk;
       if (kind === "stdout") stdout = (stdout + text).slice(-MAX_OUTPUT);
       else stderr = (stderr + text).slice(-MAX_OUTPUT);
       if (!live || kind !== "stdout") return;
@@ -403,7 +504,7 @@ function missingCompletionOrigin(sessionId) {
   return missingWakeCompletionOrigin(sessionId, AGENT_NAME);
 }
 
-function postBridge(text, sessionId) {
+function postBridge(text, sessionId, payload, deliveryId = `omp:${payload.messageId}`) {
   const missingOrigin = missingCompletionOrigin(sessionId);
   if (missingOrigin) return Promise.resolve(missingOrigin);
   sessionId = sessionId.trim();
@@ -416,19 +517,16 @@ function postBridge(text, sessionId) {
   if (!token) return Promise.resolve({ status: "failed", reason: "bridge_token_empty" });
   let url;
   try { url = new URL(target); } catch { return Promise.resolve({ status: "failed", reason: "bridge_url_invalid" }); }
-  const body = JSON.stringify({ text, sender: "omp", ackMode: "enqueue", ...(sessionId ? { sessionId } : {}) });
+  const body = JSON.stringify({
+    text, sender: "omp", sessionId,
+    origin: payload.origin,
+    deliveryId,
+    completion: { messageIds: [payload.messageId] },
+  });
   const transport = url.protocol === "https:" ? https : http;
-  return postBridgeRequest(transport, {
+  return postWakeCompletion(transport, {
     hostname: url.hostname, port: url.port, path: `${url.pathname}${url.search}`, timeout: 30_000,
-  }, token, body, ({ res, parsed, httpOK }, resolve) => {
-    const delivered = httpOK && parsed && parsed.status === "ok";
-    resolve({ status: delivered ? "delivered" : "unknown", reason: delivered ? null : `http_${res.statusCode}`, httpStatus: res.statusCode });
-  }, (request, resolve) => {
-    resolve({ status: "unknown", reason: "bridge_reply_timeout" });
-    request.destroy();
-  }, (error, resolve) => {
-    resolve({ status: error.code === "ECONNREFUSED" ? "failed" : "unknown", reason: String(error.message || error) });
-  }, { acceptJSON: false, endWithBody: true });
+  }, token, body, sessionId, true);
 }
 
 async function runJob(payload, file, claimId) {
@@ -443,10 +541,16 @@ async function runJob(payload, file, claimId) {
     }
     const result = { status: "failed", reason: lock.reason, durationMs: 0, stderrTail: "", reply: "", timedOut: false, stalled: false };
     const text = completionText(result, payload);
-    const bridge = await postBridge(text, payload.sessionId || "");
+    // A later explicit same-ID retry must keep its result's completion identity.
+    const deliveryId = `omp-rejected:${claimId}`;
+    if (!updateJob(file, { state: "delivering", ...result, runEndedAt: now(), completionText: text,
+      deliveryId, bridge: { status: "unknown", reason: "completion_delivery_in_flight" } }, claimId)) {
+      return { status: "failed", reason: "completion_checkpoint_failed", messageId: payload.messageId, jobPath: file };
+    }
+    const bridge = await postBridge(text, payload.sessionId || "", payload, deliveryId);
     updateJob(file, { state: "settled", ...result, bridge,
-      completionText: bridge.reason === "missing_origin_session" ? text : null, completedAt: now() }, claimId);
-    appendJSONL(DELIVERIES, { createdAt: now(), messageId: payload.messageId, topicSlug: slug, ...result, bridge, inFlightMessageId: lock.owner && lock.owner.messageId || null });
+      completionText: bridge.status === "delivered" || bridge.status === "dry_run" ? null : text, completedAt: now() }, claimId);
+    await appendJSONL(DELIVERIES, { createdAt: now(), messageId: payload.messageId, topicSlug: slug, ...result, bridge, inFlightMessageId: lock.owner && lock.owner.messageId || null });
     return { ...result, delivery: "omp_thread_wakeup", messageId: payload.messageId, topicSlug: slug, bridge, jobPath: file };
   }
   try {
@@ -455,7 +559,7 @@ async function runJob(payload, file, claimId) {
     // answered turn writes one), yet OMP kept the session. Continue that
     // session rather than refusing the explicit follow-up.
     const unanswered = payload.requireExistingConversation === true && !fs.existsSync(pointerPath(slug))
-      ? unansweredSession(slug) : null;
+      ? await withHistoryLock(() => unansweredSession(slug)) : null;
     const pointer = saved || (unanswered && { sessionId: unanswered.sessionId });
     const continuationUnavailable = payload.requireExistingConversation === true
       && (!pointer || !pointer.sessionId.trim());
@@ -487,10 +591,15 @@ async function runJob(payload, file, claimId) {
     let pointerFile = null;
     if (result.status === "completed" && result.sessionId) pointerFile = writePointer(slug, result.sessionId, cwd, result.model);
     const text = completionText(result, payload);
-    const bridge = await postBridge(text, payload.sessionId || "");
     const sessionMode = continuationUnavailable ? "resume_unavailable" : pointer ? "resume" : "new";
+    if (!updateJob(file, { state: "delivering", ...result, sessionMode, pointerPath: pointerFile,
+      runEndedAt: now(), completionText: text, deliveryId: `omp:${payload.messageId}`,
+      bridge: { status: "unknown", reason: "completion_delivery_in_flight" } }, claimId)) {
+      return { status: "failed", reason: "completion_checkpoint_failed", messageId: payload.messageId, jobPath: file };
+    }
+    const bridge = await postBridge(text, payload.sessionId || "", payload);
     const receipt = { createdAt: now(), messageId: payload.messageId, topicSlug: slug, sessionMode, pointerPath: pointerFile, ...result, bridge };
-    appendJSONL(DELIVERIES, receipt);
+    await appendJSONL(DELIVERIES, receipt);
     updateJob(file, { state: "settled", ...result, bridge, sessionMode, pointerPath: pointerFile, completionText: bridge.status === "delivered" || bridge.status === "dry_run" ? null : text, completedAt: now() }, claimId);
     const envelope = { ...result, delivery: "omp_thread_wakeup", messageId: payload.messageId, topicSlug: slug, sessionMode, pointerPath: pointerFile, bridge, jobPath: file, receiptPath: DELIVERIES };
     if (bridge.status === "dry_run") envelope.wouldSendText = bridge.text;
@@ -548,8 +657,11 @@ async function recoverExistingJob(file, payload, record, claimId) {
       return { status: "blocked", reason: "missing_origin_session", messageId: payload.messageId,
         bridge: job.bridge, jobPath: file, note: job.bridge.note };
     }
-    if (job.state === "settled" && typeof job.completionText === "string" && job.completionText) {
-      if (!job.bridge || job.bridge.status !== "failed") {
+    if (["settled", "delivering"].includes(job.state) && typeof job.completionText === "string" && job.completionText) {
+      const routedDelivery = job.payload && (job.deliveryId === `omp:${job.payload.messageId}`
+        || job.deliveryId === `omp-rejected:${job.claimId}`
+        || job.deliveryId === `omp:${job.payload.messageId}:rejected:${job.claimId}`);
+      if (!routedDelivery && (!job.bridge || job.bridge.status !== "failed")) {
         return { status: "skipped", reason: "delivery_outcome_unknown", messageId: payload.messageId, bridge: job.bridge || { status: "unknown" }, jobPath: file, note: "Completion retained. Reconcile the original delivery before any resend; a timeout is not proof of non-delivery." };
       }
       const missingOrigin = missingCompletionOrigin(job.payload && job.payload.sessionId);
@@ -560,12 +672,13 @@ async function recoverExistingJob(file, payload, record, claimId) {
       }
       // Persist uncertainty BEFORE POST. If this process dies, a later retry
       // cannot mistake the previous proven-unsent state for the new attempt.
-      if (!updateJob(file, { bridge: { status: "unknown", reason: "completion_replay_in_flight" } }, job.claimId)) {
+      if (!updateJob(file, { state: "delivering", bridge: { status: "unknown", reason: "completion_replay_in_flight" } }, job.claimId)) {
         return { status: "failed", reason: "claim_lost", messageId: payload.messageId, jobPath: file };
       }
-      const bridge = await postBridge(job.completionText, job.payload && job.payload.sessionId || "");
-      updateJob(file, { bridge, completionText: bridge.status === "delivered" || bridge.status === "dry_run" ? null : job.completionText, replayedAt: now() }, job.claimId);
-      appendJSONL(DELIVERIES, { createdAt: now(), kind: "delivery_replay", messageId: payload.messageId, status: job.status || "unknown", reason: job.reason || null, bridge });
+      const bridge = await postBridge(job.completionText, job.payload && job.payload.sessionId || "", job.payload || {}, job.deliveryId || undefined);
+      updateJob(file, { state: "settled", completedAt: job.completedAt || job.runEndedAt || now(), bridge,
+        completionText: bridge.status === "delivered" || bridge.status === "dry_run" ? null : job.completionText, replayedAt: now() }, job.claimId);
+      await appendJSONL(DELIVERIES, { createdAt: now(), kind: "delivery_replay", messageId: payload.messageId, status: job.status || "unknown", reason: job.reason || null, bridge });
       return { status: bridge.status === "delivered" || bridge.status === "dry_run" ? "replayed" : "skipped", reason: "duplicate_delivery_replay", messageId: payload.messageId, bridge, jobPath: file };
     }
     const owners = [job.claimantPid, job.runnerPid].filter((pid) => Number.isInteger(Number(pid)) && Number(pid) > 0);
@@ -596,12 +709,17 @@ async function main() {
     const claimId = process.argv[5];
     const record = readJSON(file);
     if (!record || record.claimId !== claimId) return out({ status: "failed", reason: "claim_lost" });
-    return out(await runJob(record.payload, file, claimId));
+    const result = await runJob(record.payload, file, claimId);
+    await pruneTerminalHistory();
+    return out(result);
   }
   let payload;
   try { payload = JSON.parse(fs.readFileSync(0, "utf8")); } catch { return out({ status: "skipped", reason: "invalid_json" }); }
   if (!payload || !String(payload.text || "").trim()) return out({ status: "skipped", reason: "missing_text" });
   payload.messageId = String(payload.messageId || crypto.randomUUID());
+  await pruneTerminalHistory();
+  const retired = retiredJob(payload.messageId);
+  if (retired) return out(retired);
   const file = jobPath(payload.messageId);
   const claimId = crypto.randomUUID();
   const record = { schemaVersion: 2, messageId: payload.messageId, claimId, state: "claimed", createdAt: now(), claimantPid: process.pid, payload };
@@ -612,6 +730,13 @@ async function main() {
     if (process.env.NATIVE_AGENT_OMP_WAKE_INLINE === "1") return out(await runJob(payload, file, claimId));
     const runnerPid = await detach(file, claimId);
     return out({ status: "sent", mode: "detached", delivery: "omp_thread_wakeup", messageId: payload.messageId, runnerPid, jobPath: file, takeover: true });
+  }
+  // Close the window between the retirement lookup and exclusive job creation.
+  const retiredAfterClaim = retiredJob(payload.messageId);
+  if (retiredAfterClaim) {
+    fs.unlinkSync(file);
+    fsyncDirectorySync(JOBS);
+    return out(retiredAfterClaim);
   }
   if (process.env.NATIVE_AGENT_OMP_WAKE_INLINE === "1") return out(await runJob(payload, file, claimId));
   const runnerPid = await detach(file, claimId);

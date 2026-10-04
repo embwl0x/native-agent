@@ -25,7 +25,7 @@ public enum SessionHistoryPromptRenderer {
     typealias Budget = ContextBudgetPolicy.Resolved
 
     // Shared with structured projection so both lanes admit the same rows.
-    struct Renderable {
+    package struct Renderable: Sendable {
         let role: String
         let content: String
         let historyIdentity: String
@@ -39,14 +39,9 @@ public enum SessionHistoryPromptRenderer {
         /// projection leads with — every cap, exemption and identity rule
         /// treats it exactly as the session's own recollection.
         var isCarriedRecollection: Bool = false
-        /// Tool-row provenance, carried ONLY so the v2 message projection can
-        /// label a replayed tool row `[tool <name> <status>]`. v1 rendering
-        /// never reads these — `content`/`displayContent` are unchanged.
-        var toolName: String? = nil
-        var toolStatus: String? = nil
         /// Run id of the turn that produced this row. Only the v2 volatile
         /// replay reads it — it is how an archived block finds the user message
-        /// it originally followed. v1 rendering never looks at it.
+        /// it originally followed.
         var runId: String? = nil
 
         /// How a recollection announces itself at the head of the replayed
@@ -61,9 +56,8 @@ public enum SessionHistoryPromptRenderer {
         /// The same body as `content`, but with paragraph breaks, indentation
         /// and fenced code preserved. ONLY the v2 structured replay reads it —
         /// `content` stays whitespace-flattened so identity hashes, lexical
-        /// scoring, correction detection and the v1 one-line-per-row text block
-        /// stay byte-identical. Empty means "no structured form" (tool rows,
-        /// summaries); readers fall back to `content`.
+        /// scoring and correction detection stay byte-identical. Empty means
+        /// "no structured form" (tool rows, summaries); readers fall back to `content`.
         var structuredContent: String = ""
 
         /// Display provenance is not query text: origin labels must not affect
@@ -86,90 +80,51 @@ public enum SessionHistoryPromptRenderer {
         public let historyBlock: String?
     }
 
-    public static func render(
-        messages: [ChatMessage],
-        middleCandidates: [ChatMessage] = [],
-        userMessage: String = "",
-        surface: String,
-        historyLimit: Int,
-        windowTokens: Int? = nil
-    ) -> String? {
-        renderDetailed(
-            messages: messages,
-            middleCandidates: middleCandidates,
-            userMessage: userMessage,
-            surface: surface,
-            historyLimit: historyLimit,
-            windowTokens: windowTokens
-        ).historyBlock
-    }
-
     /// `windowTokens` is the model's context window for THIS turn (nil when the
     /// model is unknown or the caller has none). It selects the budget regime;
     /// see `ContextBudgetPolicy`.
-    /// `includeConversationHistory: false` is the v2Prefix arm: the
-    /// conversation rows leave the system block and become real
-    /// `[LLMMessage]` turns (see `SessionHistoryMessageProjection`), and only
-    /// middle sampling stays text in the volatile block — continuity state and
-    /// the reply-reference hint would restate those real turns.
     public static func renderDetailed(
         messages: [ChatMessage],
         middleCandidates: [ChatMessage] = [],
         userMessage: String = "",
         surface: String,
         historyLimit: Int,
-        windowTokens: Int? = nil,
-        includeConversationHistory: Bool = true
+        windowTokens: Int? = nil
+    ) -> RenderResult {
+        renderDetailed(
+            renderables: messages.compactMap(renderable),
+            middleCandidates: middleCandidates.compactMap(renderable),
+            userMessage: userMessage, surface: surface,
+            historyLimit: historyLimit, windowTokens: windowTokens
+        )
+    }
+
+    package static func renderDetailed(
+        renderables: [Renderable],
+        middleCandidates: [Renderable],
+        userMessage: String,
+        surface: String,
+        historyLimit: Int,
+        windowTokens: Int?
     ) -> RenderResult {
         let cappedLimit = max(0, historyLimit)
         guard cappedLimit > 0 else { return RenderResult(historyBlock: nil) }
 
-        let renderables = messages.compactMap(renderable)
         guard !renderables.isEmpty else { return RenderResult(historyBlock: nil) }
 
-        let budget = budget(for: surface, windowTokens: windowTokens)
-        // 2026-09-22: one line, both arms — the turn engine's warning covers
-        // packet records only, and only when the packet has items.
         var sections: [String] = [
             "Earlier messages are history, not live readings; recheck anything current before relying on it."
         ]
-        // 2026-09-22: continuity state and the reply-reference hint restate
-        // rows v2 already sends as real messages — v1 (text history) only.
-        if includeConversationHistory,
-           cappedLimit >= 6,
-           let continuity = continuityState(
-            from: renderables,
-            budget: budget
-        ) {
-            sections.append(continuity)
-        }
-        let candidateRenderables = middleCandidates.compactMap(renderable)
         let middleSnippet = middleSnippetText(
             userMessage: userMessage,
             promptRenderables: renderables,
-            candidates: candidateRenderables,
+            candidates: middleCandidates,
             historyLimit: cappedLimit,
             surface: surface,
             windowTokens: windowTokens
         )
         if let middle = middleSnippet {
             sections.append(middle)
-        }
-        if includeConversationHistory,
-           let history = conversationHistory(
-            from: renderables,
-            limit: cappedLimit,
-            budget: budget
-        ) {
-            sections.append(history)
-        }
-        if includeConversationHistory,
-           let hint = immediateReplyReferenceHint(
-            userMessage: userMessage,
-            renderables: renderables,
-            budget: budget
-        ) {
-            sections.append(hint)
         }
         guard !sections.isEmpty else {
             return RenderResult(historyBlock: nil)
@@ -184,8 +139,15 @@ public enum SessionHistoryPromptRenderer {
         messages: [ChatMessage],
         cap maxCount: Int = recallQueryCharCap
     ) -> String {
+        recallQuery(userMessage: userMessage, renderables: messages.compactMap(renderable), cap: maxCount)
+    }
+
+    package static func recallQuery(
+        userMessage: String,
+        renderables: [Renderable],
+        cap maxCount: Int = recallQueryCharCap
+    ) -> String {
         let currentUser = normalize(userMessage)
-        let renderables = messages.compactMap(renderable)
         let userAssistant = renderables.filter { $0.role == "user" || $0.role == "assistant" }
 
         guard !currentUser.isEmpty || !userAssistant.isEmpty else { return "" }
@@ -282,7 +244,7 @@ public enum SessionHistoryPromptRenderer {
         )
     }
 
-    static func renderable(_ message: ChatMessage) -> Renderable? {
+    package static func renderable(_ message: ChatMessage) -> Renderable? {
         let rawRole = message.role
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -295,7 +257,10 @@ public enum SessionHistoryPromptRenderer {
 
         var content: String
         if isTool {
-            content = toolSummary(content: message.content, metadata: metadata)
+            content = toolReceipt(content: message.content, metadata: metadata)
+            if let id = string(extrasObject?["id"]), !id.isEmpty {
+                content += " [context.expand history:\(id)]"
+            }
         } else if isCompactionSummary {
             // A recollection never replays what people call each other as a
             // trait — that line became a verbal habit (2026-09-24).
@@ -307,8 +272,8 @@ public enum SessionHistoryPromptRenderer {
             content = normalize(message.content)
         }
         // Third-pass (conversation): the flattened body above is what identity,
-        // scoring and the v1 text block have always seen — unchanged. The v2
-        // structured replay additionally carries the SHAPE of what was said, so
+        // scoring have always seen — unchanged. Structured replay additionally
+        // carries the SHAPE of what was said, so
         // "change the second paragraph" / "use the second option" / an indented
         // Python snippet survive replay. Same redaction, same input cap.
         var structured = isTool || isCompactionSummary
@@ -344,12 +309,6 @@ public enum SessionHistoryPromptRenderer {
             isCompactionSummary: isCompactionSummary,
             isCarriedRecollection: isCompactionSummary
                 && !(string(metadata?[CarriedAnchorRecollection.carriedFromKey]) ?? "").isEmpty,
-            toolName: isTool
-                ? (string(metadata?["toolName"]) ?? string(metadata?["tool_name"]) ?? "tool")
-                : nil,
-            toolStatus: isTool
-                ? (ChatTranscriptEvidenceRendering.recordedToolStatus(metadata) ?? "ran")
-                : nil,
             runId: string(extrasObject?["runId"]) ?? string(metadata?["runId"]),
             structuredContent: structured
         )
@@ -360,48 +319,6 @@ public enum SessionHistoryPromptRenderer {
         return lower.hasPrefix("chat error:")
             || lower.hasPrefix("(drafting stalled;")
             || lower.hasPrefix("(internal error while drafting")
-    }
-
-    private static func continuityState(
-        from messages: [Renderable],
-        budget: Budget
-    ) -> String? {
-        let userAssistant = messages.filter { $0.role == "user" || $0.role == "assistant" }
-        guard !userAssistant.isEmpty else { return nil }
-
-        let anchors = Array(userAssistant.prefix(3))
-        let latestUser = userAssistant.reversed().first { $0.role == "user" }
-        let latestAssistant = userAssistant.reversed().first { $0.role == "assistant" }
-        let latestCorrection = userAssistant.reversed().first {
-            $0.role == "user" && looksLikeCorrection($0.content)
-        }
-        let openLoop = latestAssistant.flatMap { looksLikeOpenLoop($0.content) ? $0 : nil }
-
-        var lines: [String] = ["SESSION_CONTINUITY_STATE:"]
-        if !anchors.isEmpty {
-            let rendered = anchors
-                .map { "[\($0.role)] \(cap($0.displayContent, 220))" }
-                .joined(separator: " | ")
-            lines.append("Initial anchors: \(rendered)")
-        }
-        if let latestUser {
-            lines.append("Latest user before this turn: \(cap(latestUser.displayContent, 280))")
-        }
-        if let latestAssistant {
-            lines.append("Latest assistant tail: \(cap(latestAssistant.displayContent, 320))")
-        }
-        if let latestCorrection {
-            lines.append("Recent correction/callout: \(cap(latestCorrection.displayContent, 260))")
-        }
-        if let openLoop {
-            lines.append("Open loop: \(cap(openLoop.displayContent, 280))")
-        }
-        lines.append("To pick up prior work, use workspace. For exact older wording, use search_chat_history scoped to this session first.")
-
-        let rendered = lines.joined(separator: "\n")
-        return rendered.count > budget.continuityCap
-            ? String(rendered.prefix(budget.continuityCap)) + "..."
-            : rendered
     }
 
     private static func relevantEarlierSessionSnippets(
@@ -530,114 +447,21 @@ public enum SessionHistoryPromptRenderer {
         message.historyIdentity
     }
 
-    /// The rendered history line for one admitted row. ONE owner, shared by
-    /// the v1 text block and the v2 message projection so the two can never
-    /// disagree about caps.
+    /// The budgeted history line for one admitted row. The message projection
+    /// uses this length with the same role caps as the replayed text.
     static func renderedHistoryLine(_ msg: Renderable, budget: Budget) -> String {
         "[\(msg.role)] \(cap(msg.displayContent, capForRole(msg, budget: budget)))"
     }
 
-    /// The row TEXT the v2 projection replays — the same capped body the v1
-    /// line carries, without the `[role]` prefix (the message role carries it).
+    /// The capped row text the projection replays; the message role carries
+    /// the role prefix.
     static func projectedHistoryText(_ msg: Renderable, budget: Budget) -> String {
         cap(msg.structuredDisplayContent, capForRole(msg, budget: budget))
     }
 
-    /// The newest-first admission the conversation-history block runs, lifted
-    /// out verbatim so `SessionHistoryMessageProjection` replays EXACTLY the
-    /// rows v1 rendered (compaction-summary reservation included) instead of
-    /// re-deriving a second, drifting rule.
-    ///
-    /// Returns indices INTO `tail`, oldest→newest, plus whether anything was
-    /// left out (either trimmed off the front by `limit` or squeezed out by
-    /// `budget.historyChars`).
-    static func admittedHistoryIndices(
-        tail: [Renderable],
-        totalCount: Int,
-        budget: Budget
-    ) -> (indices: [Int], omitted: Bool) {
-        var admitted: [(index: Int, length: Int)] = []
-        var used = 0
-        var omitted = totalCount > tail.count
-
-        // Sweep R4 A3: the compaction recollection is the ONLY surviving record
-        // of every turn that was elided — and it is by construction one of the
-        // OLDEST rows in the tail. The fill below runs newest-first, so now that
-        // this row can legitimately be several thousand characters, ordinary
-        // recent chatter would crowd out the exact artifact compaction paid an
-        // LLM call to produce. It gets first claim on `historyChars`; the
-        // aggregate bound itself is unchanged.
-        let reservedIndex = tail.indices.last { tail[$0].isCompactionSummary }
-        if let reservedIndex {
-            let length = renderedHistoryLine(tail[reservedIndex], budget: budget).count
-            admitted.append((reservedIndex, length))
-            used = length + 1
-        }
-
-        // Unchanged fill semantics for every other row: newest-first, and the
-        // newest row is admitted even if it alone exceeds the budget.
-        var admittedFromStream = false
-        for idx in tail.indices.reversed() {
-            if idx == reservedIndex { continue }
-            let length = renderedHistoryLine(tail[idx], budget: budget).count
-            let projected = used + length + 1
-            if admittedFromStream && projected > budget.historyChars {
-                omitted = true
-                continue
-            }
-            admitted.append((idx, length))
-            used = projected
-            admittedFromStream = true
-        }
-        return (admitted.map(\.index).sorted(), omitted)
-    }
-
-    private static func conversationHistory(
-        from messages: [Renderable],
-        limit: Int,
-        budget: Budget
-    ) -> String? {
-        let tail = Array(messages.suffix(limit))
-        guard !tail.isEmpty else { return nil }
-
-        let admission = admittedHistoryIndices(
-            tail: tail, totalCount: messages.count, budget: budget
-        )
-        let omitted = admission.omitted
-        let lines = admission.indices.map { renderedHistoryLine(tail[$0], budget: budget) }
-        guard !lines.isEmpty else { return nil }
-
-        var out: [String] = ["Conversation history:"]
-        if omitted {
-            out.append("[NOTICE: Earlier details are elided. Use workspace for prior work; load search_chat_history through tool_catalog for exact older wording.]")
-        }
-        out.append(contentsOf: lines)
-        return out.joined(separator: "\n")
-    }
-
-    private static func immediateReplyReferenceHint(
-        userMessage: String,
-        renderables: [Renderable],
-        budget: Budget
-    ) -> String? {
-        guard looksLikeShortAffirmativeContinuation(userMessage) else { return nil }
-        let userAssistant = renderables.filter { $0.role == "user" || $0.role == "assistant" }
-        guard let latest = userAssistant.last, latest.role == "assistant" else { return nil }
-        let assistantCap = min(max(220, budget.assistantCap), 700)
-        return """
-        Immediate reply reference:
-        The current user message is a short approval or continuation. Unless contradicted, treat it as referring to the immediately previous assistant message:
-        [assistant] \(cap(latest.displayContent, assistantCap))
-        """
-    }
-
     static func capForRole(_ message: Renderable, budget: Budget) -> Int {
-        // Sweep R4 #6: `toolSummary` already projected this row head+tail. A
-        // row cap BELOW that projection's length would head-truncate it and
-        // throw the tail (the part that carries the failure) away again — the
-        // exact bug being fixed. Floor the tool row cap at the projection's
-        // worst case so the two layers cannot fight.
-        if message.isTool { return max(budget.toolCap, toolRowMinimumCap) }
+        // Receipt identifiers and the recovery pointer must survive intact.
+        if message.isTool { return message.content.count }
         // Sweep R4 A3: routed to its OWN cap, not the generic system cap.
         if message.isCompactionSummary { return budget.compactionSummaryCap }
         switch message.role {
@@ -648,9 +472,7 @@ public enum SessionHistoryPromptRenderer {
         }
     }
 
-    // internal (not private) so the skills-recall rework test can pin the
-    // 180-char cap — the guarantee that a pulled skill body never rides
-    // forward into later prompts at full length.
+    /// Compaction still reads bounded result evidence before distilling it.
     static func toolSummary(
         content: String,
         metadata: [String: JSONValue]?,
@@ -689,20 +511,84 @@ public enum SessionHistoryPromptRenderer {
         let rawResult = string(metadata?["resultBody"])
             ?? string(metadata?["resultSummary"]) ?? ""
         let result = resultCap.map { String(normalize(rawResult).prefix($0)) }
-            ?? toolResultProjection(rawResult)
+            ?? toolEvidenceProjection(rawResult)
         if result.isEmpty {
             return toolStatus
         }
         return "\(toolStatus): \(result)"
     }
 
-    // MARK: - Cross-turn tool-result projection
+    static func toolReceipt(
+        content: String,
+        metadata: [String: JSONValue]?
+    ) -> String {
+        let name = string(metadata?["toolName"]) ?? string(metadata?["tool_name"]) ?? "tool"
+        let input = string(metadata?["inputJSON"]).flatMap { try? JSONValue.parse(Data($0.utf8)) }
+        var call = name
+        if name == "app", case .object(let args)? = input {
+            if let action = string(args["action"]), !action.isEmpty { call += " " + action }
+            else if let page = string(args["page"]), !page.isEmpty { call += " page=" + page }
+            else if let find = string(args["find"]), !find.isEmpty { call += " find=" + find }
+            else if let item = string(args["item"]), !item.isEmpty { call += " item=" + item }
+        }
+        let raw = string(metadata?["resultBody"]) ?? string(metadata?["resultSummary"]) ?? content
+        let result = try? JSONValue.parse(Data(raw.utf8))
+        let recordedStatus = ChatTranscriptEvidenceRendering.recordedToolStatus(metadata)
+            ?? string(metadata?["resultStatus"])
+        let status = recordedStatus ?? result.flatMap { receiptField("status", in: $0) }.flatMap { string($0) }
+            ?? (metadata?["ok"] == .bool(true) ? "ok" : metadata?["ok"] == .bool(false) ? "failed" : "ran")
+        let effects = string(metadata?["resultEffects"])
+            ?? result.flatMap { receiptField("effects", in: $0) }.map(receiptValue)
+        let returnedID = string(metadata?["resultReturnedID"]) ?? result.flatMap(returnedIdentifier)
+        return toolResultProjection(call: call, status: status, effects: effects, returnedID: returnedID)
+    }
 
-    /// Floor for the per-row cap applied to tool rows, sized so the head+tail
-    /// projection below (plus a long tool name and the "ok: " lead-in) always
-    /// survives `capForRole` intact.
-    static let toolRowMinimumCap = 360
+    /// A receipt uses returned envelope fields only, never an input id, a
+    /// transcript row id, or the producing turn's run id.
+    package static func returnedIdentifier(_ result: JSONValue) -> String? {
+        for keys in [["approval_id", "approvalId"], ["message_id", "messageId"],
+                     ["run_id", "runId"], ["request_id", "requestId"], ["id"], ["version"]] {
+            for key in keys {
+                guard let value = receiptField(key, in: result) else { continue }
+                switch value {
+                case .string(let text) where !text.isEmpty: return text
+                case .int, .double: return receiptValue(value)
+                default: continue
+                }
+            }
+        }
+        return nil
+    }
 
+    package static func receiptField(_ key: String, in result: JSONValue) -> JSONValue? {
+        guard case .object(let fields) = result else { return nil }
+        if let value = fields[key], value != .null, value != .string("") { return value }
+        // Only result envelopes; ids in lists, inputs or remedy examples do not
+        // identify the operation this call returned.
+        for wrapper in ["result", "receipt", "data"] {
+            if let nested = fields[wrapper], let value = receiptField(key, in: nested) { return value }
+        }
+        return nil
+    }
+
+    package static func receiptValue(_ value: JSONValue) -> String {
+        if case .string(let text) = value { return text }
+        return (try? value.serialize(pretty: false)) ?? ""
+    }
+
+    package static func toolResultProjection(call: String, status: String, effects: String?, returnedID: String?) -> String {
+        var parts = [cap(normalize(call), 120), cap(normalize(status), 100)]
+        if let effects, ["none", "occurred", "unknown", "unknown-after-dispatch"].contains(effects) {
+            parts.append(effects)
+        }
+        if let returnedID, !returnedID.isEmpty {
+            // Redact secrets but never truncate an identifier into a false one.
+            parts.append(ChatSecretRedactor.redactText(returnedID).replacingOccurrences(of: "\n", with: "\\n"))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    // The memory promoter's fact evidence retains its existing head/tail view.
     /// Characters of the ORIGINAL kept from the head of a prior-turn tool result.
     static let toolResultHeadChars = 110
     /// Characters of the ORIGINAL kept from the tail. Tool FAILURES put the
@@ -720,7 +606,7 @@ public enum SessionHistoryPromptRenderer {
     /// preview_head/preview_tail and `SubprocessSupport.headTailPreserve`):
     /// both ends survive and the elision is stated explicitly with a character
     /// count instead of a bare "...". Short results pass through untouched.
-    package static func toolResultProjection(_ raw: String) -> String {
+    package static func toolEvidenceProjection(_ raw: String) -> String {
         let keep = toolResultHeadChars + toolResultTailChars
         if raw.count <= toolResultRedactionWindow {
             let normalized = normalize(raw)
@@ -759,36 +645,6 @@ public enum SessionHistoryPromptRenderer {
             "i said", "you said", "that's not", "thats not", "actually"
         ]
         return needles.contains { lower.contains($0) }
-    }
-
-    private static func looksLikeShortAffirmativeContinuation(_ content: String) -> Bool {
-        let trimmed = normalize(content).lowercased()
-        guard !trimmed.isEmpty, trimmed.count <= 90 else { return false }
-        guard !trimmed.contains("?") else { return false }
-        let simple = trimmed
-            .replacingOccurrences(of: #"[^a-z0-9'\s]"#, with: " ", options: .regularExpression)
-            .split(whereSeparator: { $0.isWhitespace })
-            .joined(separator: " ")
-        guard !simple.isEmpty, simple.split(separator: " ").count <= 8 else { return false }
-
-        let exact: Set<String> = [
-            "yes", "yes please", "yes do it", "yes go ahead",
-            "yeah", "yeah please", "yeah go ahead", "yeah do it", "yeah do that",
-            "yea", "yep", "yup", "sure", "sure do it",
-            "ok", "okay", "ok do it", "okay do it", "ok go ahead", "okay go ahead",
-            "go ahead", "do it", "do that", "please do", "please do that",
-            "sounds good", "that works", "thats fine", "that's fine",
-            "thats good", "that's good", "fine by me", "go for it"
-        ]
-        if exact.contains(simple) { return true }
-
-        let approvalPrefixes = ["yes ", "yeah ", "yep ", "yup ", "ok ", "okay ", "sure "]
-        let actionPhrases = [
-            "go ahead", "do it", "do that", "make it", "fix it",
-            "that works", "thats fine", "that's fine", "go for it"
-        ]
-        return approvalPrefixes.contains { simple.hasPrefix($0) }
-            && actionPhrases.contains { simple.contains($0) }
     }
 
     private static func looksLikeOpenLoop(_ content: String) -> Bool {
@@ -840,9 +696,8 @@ public enum SessionHistoryPromptRenderer {
 
     /// `normalize` with the line structure left intact: same redaction, same
     /// input cap, but newlines, leading indentation and fenced code survive.
-    /// Runs of spaces/tabs INSIDE a line still collapse, trailing whitespace
-    /// goes, and a run of blank lines becomes one — so this can never be
-    /// larger than the raw text, only shaped.
+    /// Fenced code keeps its whitespace verbatim. Outside fences, internal
+    /// whitespace and blank runs collapse; original indentation survives.
     private static func normalizePreservingStructure(
         _ text: String,
         inputCap: Int = normalizationInputCharacterCap
@@ -853,8 +708,28 @@ public enum SessionHistoryPromptRenderer {
             .replacingOccurrences(of: "\r", with: "\n")
         var out: [String] = []
         var blankRun = false
+        var fence: (marker: Character, count: Int)?
         for rawLine in redacted.split(separator: "\n", omittingEmptySubsequences: false) {
-            let indentCount = rawLine.prefix { $0 == " " || $0 == "\t" }.count
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            if let active = fence {
+                out.append(String(rawLine))
+                let markers = trimmed.prefix { $0 == active.marker }
+                if markers.count >= active.count,
+                   trimmed.dropFirst(markers.count).trimmingCharacters(in: .whitespaces).isEmpty {
+                    fence = nil
+                }
+                continue
+            }
+            if let marker = trimmed.first, marker == "`" || marker == "~" {
+                let count = trimmed.prefix { $0 == marker }.count
+                if count >= 3 {
+                    if blankRun { out.append(""); blankRun = false }
+                    fence = (marker, count)
+                    out.append(String(rawLine))
+                    continue
+                }
+            }
+            let indent = rawLine.prefix { $0 == " " || $0 == "\t" }
             let body = rawLine
                 .split(whereSeparator: { $0.isWhitespace })
                 .joined(separator: " ")
@@ -866,7 +741,7 @@ public enum SessionHistoryPromptRenderer {
                 out.append("")
                 blankRun = false
             }
-            out.append(String(repeating: " ", count: min(indentCount, 8)) + body)
+            out.append(String(indent) + body)
         }
         return out.joined(separator: "\n")
     }

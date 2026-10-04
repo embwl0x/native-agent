@@ -17,8 +17,8 @@ import Foundation
 ///   as a bare array.
 /// - Rows carry the RunRecord fields the readers decode:
 ///   id / kind / status / model / prompt / output / error / createdAt /
-///   durationSeconds. Unknown extra keys are tolerated by JSONDecoder, but
-///   this writer sticks to the known set.
+///   durationSeconds. Swarm rows also retain the selected run reasoningEffort;
+///   older readers ignore this optional field.
 /// - The ledger is bounded (`maxRetainedRuns`, newest kept) and every
 ///   read-modify-write runs under the cross-process `withFileLock` flock
 ///   with an atomic rewrite, so concurrent producers (chat tool loop,
@@ -50,6 +50,7 @@ public enum RunLedger {
         kind: String,
         status: String,
         model: String? = nil,
+        reasoningEffort: String? = nil,
         prompt: String? = nil,
         output: String? = nil,
         error: String? = nil,
@@ -64,6 +65,7 @@ public enum RunLedger {
             "createdAt": .string(Self.isoTimestamp(createdAt)),
         ]
         if let model, !model.isEmpty { row["model"] = .string(model) }
+        if let reasoningEffort { row["reasoningEffort"] = .string(reasoningEffort) }
         if let prompt { row["prompt"] = .string(Self.clip(prompt, cap: promptCap)) }
         if let output { row["output"] = .string(Self.clip(output, cap: outputCap)) }
         if let error { row["error"] = .string(Self.clip(error, cap: errorCap)) }
@@ -78,7 +80,7 @@ public enum RunLedger {
         let persistence = SwiftNativePersistenceCore()
         do {
             try await persistence.withFileLock(path) {
-                let raw = Self.readLedgerJSON(at: path)
+                let raw = try Self.readLedgerJSON(at: path)
                 var rows: [JSONValue]
                 switch raw {
                 case .array(let existing):
@@ -123,16 +125,16 @@ public enum RunLedger {
     /// `maxRetainedRuns` retained rows on the next append. A corrupt file is
     /// preserved as a timestamped sibling BEFORE the rewrite (bounded to the
     /// newest `maxCorruptBackups`) and the loss is logged loudly.
-    private static func readLedgerJSON(at path: URL) -> JSONValue {
+    private static func readLedgerJSON(at path: URL) throws -> JSONValue {
         guard FileManager.default.fileExists(atPath: path.path) else { return .array([]) }
         if let data = try? Data(contentsOf: path), let parsed = try? JSONValue.parse(data) {
             return parsed
         }
+        try preserveCorruptLedger(at: path)
         fputs(
             "[RunLedger] \(path.path) exists but does not parse — preserving it as a .corrupt-*.bak sibling and starting a fresh ledger (previous rows survive in the backup)\n",
             stderr
         )
-        preserveCorruptLedger(at: path)
         return .array([])
     }
 
@@ -140,14 +142,13 @@ public enum RunLedger {
     private static let maxCorruptBackups = 3
 
     /// Copy the unreadable ledger to a timestamped sibling and prune older
-    /// backups past `maxCorruptBackups`. Best-effort: a backup failure must
-    /// never block the append it protects.
-    private static func preserveCorruptLedger(at path: URL) {
+    /// backups past `maxCorruptBackups`. Abort the append if preservation fails.
+    private static func preserveCorruptLedger(at path: URL) throws {
         let fm = FileManager.default
         let stamp = isoTimestamp(Date()).replacingOccurrences(of: ":", with: "-")
         let backup = path.deletingLastPathComponent()
             .appendingPathComponent("\(path.lastPathComponent).corrupt-\(stamp).bak")
-        try? fm.copyItem(at: path, to: backup)
+        try fm.copyItem(at: path, to: backup)
         guard let siblings = try? fm.contentsOfDirectory(
             at: path.deletingLastPathComponent(), includingPropertiesForKeys: nil
         ) else { return }

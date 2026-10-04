@@ -124,6 +124,8 @@ targets:
         buildPhase: resources
       - path: script/codex_thread_wakeup.js
         buildPhase: resources
+      - path: script/chatgpt_dot_ipc.js
+        buildPhase: resources
       - path: script/codex_wake_daemon_probe.js
         buildPhase: resources
       - path: script/codex_wake_execution_policy.js
@@ -153,8 +155,6 @@ targets:
       - path: script/wake_recovery.js
         buildPhase: resources
       - path: script/codex_turn_result.js
-        buildPhase: resources
-      - path: script/claude_thread_wakeup.js
         buildPhase: resources
       - path: script/omp_thread_wakeup.js
         buildPhase: resources
@@ -241,7 +241,6 @@ targets:
           - WorkshopExecution
           - NotificationInbox
           - Research
-          - CommandPalette
           - SystemOps
           - Dispatcher
           - MacControl

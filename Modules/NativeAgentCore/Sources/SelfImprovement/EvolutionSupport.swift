@@ -14,10 +14,7 @@ public enum EvolutionEngineError: Error, LocalizedError, Equatable {
     case proposalNotFound(id: String)
     case illegalTransition(id: String, from: String, to: String)
     case invalidRunId(String)
-    case duplicateRun(String)
     case diffShaMismatch(expected: String, actual: String)
-    case commitNotFound(String)
-    case worktreeFailed(detail: String)
     case applyConflict(detail: String)
     case spawnFailed(detail: String)
     case alreadyPendingVerify(existingRunId: String)
@@ -39,10 +36,7 @@ public enum EvolutionEngineError: Error, LocalizedError, Equatable {
         case .proposalNotFound(let id): return "evolution proposal not found: \(id)"
         case .illegalTransition(let id, let f, let t): return "illegal transition for \(id): \(f) -> \(t)"
         case .invalidRunId(let id): return "invalid run id: \(id)"
-        case .duplicateRun(let id): return "candidate run already in flight: \(id)"
         case .diffShaMismatch(let e, let a): return "diff sha mismatch: expected \(e), actual \(a)"
-        case .commitNotFound(let sha): return "expected head commit not found: \(sha)"
-        case .worktreeFailed(let d): return "worktree operation failed: \(d)"
         case .applyConflict(let d): return "diff did not apply cleanly: \(d)"
         case .spawnFailed(let d): return "process spawn failed: \(d)"
         case .alreadyPendingVerify(let id): return "a pending verify already exists for run \(id) — clear it before staging another"
@@ -111,27 +105,6 @@ enum EvolutionSupport {
         source.filter { key, _ in
             envAllowlist.contains(key) || key.hasPrefix("LC_")
         }
-    }
-
-    /// Hermeticity overlay on top of the scrubbed base: candidate build
-    /// children get a per-candidate HOME and TMPDIR so SwiftPM caches, plugin
-    /// state, and tmp droppings land inside the candidate dir instead of the
-    /// real user profile. XDG_* are re-pointed under the temp home for the
-    /// same reason. This contains *mistakes* (a test that writes to $HOME),
-    /// not malice — see the threat model in EvolutionCandidateBuilder.swift.
-    static func hermeticEnvironment(
-        base: [String: String],
-        homeDir: URL,
-        tmpDir: URL
-    ) -> [String: String] {
-        var env = base
-        env["HOME"] = homeDir.path
-        // macOS convention: TMPDIR carries a trailing slash.
-        env["TMPDIR"] = tmpDir.path.hasSuffix("/") ? tmpDir.path : tmpDir.path + "/"
-        env["XDG_DATA_HOME"] = homeDir.appendingPathComponent(".local/share").path
-        env["XDG_CONFIG_HOME"] = homeDir.appendingPathComponent(".config").path
-        env["XDG_CACHE_HOME"] = homeDir.appendingPathComponent(".cache").path
-        return env
     }
 }
 

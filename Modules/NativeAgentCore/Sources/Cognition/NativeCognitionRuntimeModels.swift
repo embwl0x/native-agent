@@ -148,36 +148,6 @@ public struct CognitiveEvaluationSamplerOutcome: Sendable, Equatable {
     }
 }
 
-/// The exact provenance of the installed-physiology recorder decision. A
-/// missing report is not evidence that installed collection was meant to be
-/// active: normal app use and alternate roots are deliberately excluded unless
-/// a diagnostic caller opts in.
-enum InstalledPhysiologySoakEnablement: Sendable, Equatable {
-    /// Routine app launches must not continuously run an evaluation recorder.
-    case disabledByDefault
-    /// An injected root must never write into the user's installed evidence feed.
-    case disabledNonDefaultDataRoot
-    /// Explicit alternate-runtime controls are a test/diagnostic choice, not
-    /// the production root gate.
-    case forcedEnabled
-    case forcedDisabled
-    /// An injected recorder is generated/diagnostic evidence and retains that
-    /// provenance even when the ambient root would otherwise be excluded.
-    case injectedEvidence
-
-    var createsInstalledRecorder: Bool {
-        switch self {
-        case .forcedEnabled:
-            true
-        case .disabledByDefault,
-             .disabledNonDefaultDataRoot,
-             .forcedDisabled,
-             .injectedEvidence:
-            false
-        }
-    }
-}
-
 public struct NativeSubconsciousRuntimeState: Sendable, Equatable {
     public let enabled: Bool
     public let capsuleEnabled: Bool
@@ -212,6 +182,7 @@ enum NativeFrozenMindReadError: Error, Sendable, Equatable {
 public enum CognitiveTransientStateClearOutcome: Sendable, Equatable {
     case cleared
     case persistenceFailed(String)
+    case bodyPersistenceFailed
 }
 
 public enum OrganismDebugBodyScenario: String, CaseIterable, Sendable {
@@ -236,26 +207,6 @@ enum OrganismDebugBodyOverrideError: Error, Sendable, CustomStringConvertible {
             return "unknown organism debug scenario: \(value)"
         }
     }
-}
-
-public enum OrganismReflexReviewApplyStatus: String, Sendable, Equatable {
-    case applied
-    case organismDisabled = "organism_disabled"
-    case candidateNotFound = "candidate_not_found"
-    case reviewInFlight = "review_in_flight"
-    case notAwaitingReview = "not_awaiting_review"
-    case approvalRequiresLowRisk = "approval_requires_low_risk"
-    case persistenceFailed = "persistence_failed"
-}
-
-public struct OrganismReflexReviewApplyOutcome: Sendable, Equatable {
-    public var status: OrganismReflexReviewApplyStatus
-    public var snapshot: OrganismSnapshot
-    public var candidate: OrganismReflexCandidate?
-    public var receipt: OrganismReflexReviewReceipt?
-    public var error: String?
-
-    public var applied: Bool { status == .applied }
 }
 
 /// The mutation receipt behind the Observatory's Settle and Reset controls.
@@ -310,7 +261,6 @@ public struct CognitiveMicrocycleTelemetry: Sendable, Equatable {
     public var lastReason: String?
     public var lastOutcome: String?
     public var lastDurationMilliseconds: Int?
-    var lastTurnClass: InstalledPhysiologyTurnClass?
 
     public static func fresh(now: Date = Date()) -> Self {
         Self(

@@ -23,4 +23,10 @@ struct SkillRecord: Identifiable, Codable, Hashable {
     /// uses this to gate destructive actions — Disable/Delete only make sense
     /// for registry rows; body-only rows have no entry to mutate.
     var source: String?
+    /// A repeatable skill's script and the line generated from its header.
+    var script: Script?
+    var signature: String?
+    var scriptDigest: String?
+
+    struct Script: Codable, Hashable { var source: String }
 }

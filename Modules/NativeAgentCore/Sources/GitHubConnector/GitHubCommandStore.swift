@@ -1,5 +1,4 @@
 import NativeAgentCore
-import CryptoKit
 import Foundation
 import PersistenceCore
 import Desk
@@ -35,20 +34,6 @@ private enum GitHubCommandOpBody: Codable, Sendable, Equatable {
 }
 
 private extension GitHubCommandOpBody {
-    var causalKind: String {
-        switch self {
-        case .detected: return "detected"
-        case .observed: return "observed"
-        case .dispatchPrepared: return "dispatch_prepared"
-        case .dispatchSucceeded: return "dispatch_succeeded"
-        case .dispatchFailed: return "dispatch_failed"
-        case .callbackReceived: return "callback_received"
-        case .verificationReadFailed: return "verification_read_failed"
-        case .notificationClaimed: return "notification_claimed"
-        case .notificationRecorded: return "notification_recorded"
-        }
-    }
-
     var affectedItemId: String {
         switch self {
         case .detected(let repository, let number, _, _):
@@ -59,80 +44,6 @@ private extension GitHubCommandOpBody {
              .callbackReceived(let itemId, _), .verificationReadFailed(let itemId, _),
              .notificationClaimed(let itemId, _), .notificationRecorded(let itemId, _):
             return itemId
-        }
-    }
-
-    var expectedNextEvidence: String? {
-        switch self {
-        case .dispatchPrepared: return "dispatch_result"
-        case .dispatchSucceeded: return "codex_callback"
-        case .callbackReceived: return "github_verification"
-        case .notificationClaimed: return "delivery_receipt"
-        default: return nil
-        }
-    }
-
-    var procedureActionKind: String? {
-        switch self {
-        case .dispatchPrepared: return "dispatch_prepare"
-        case .dispatchSucceeded: return "codex_bridge_dispatch"
-        case .notificationClaimed: return "notification_claim"
-        default: return nil
-        }
-    }
-
-    var procedureEvidenceKind: String? {
-        switch self {
-        case .detected: return "item_detection"
-        case .observed: return "github_live_observation"
-        case .dispatchPrepared: return "dispatch_intent"
-        case .dispatchSucceeded: return "dispatch_receipt"
-        case .dispatchFailed: return "dispatch_failure"
-        case .callbackReceived: return "correlated_callback"
-        case .verificationReadFailed: return "github_read_failure"
-        case .notificationClaimed: return "notification_claim"
-        case .notificationRecorded: return "delivery_receipt"
-        }
-    }
-
-    var procedureCheckpointClass: String? {
-        switch self {
-        case .dispatchPrepared: return "canonical_dispatch_precondition"
-        case .callbackReceived: return "canonical_callback_correlation"
-        case .observed: return "github_reducer_verification"
-        case .notificationClaimed: return "canonical_notification_claim"
-        default: return nil
-        }
-    }
-
-    var procedureRetryClass: String? {
-        switch self {
-        case .dispatchPrepared(let intent) where intent.attempt > 1: return "bounded_dispatch_retry"
-        case .dispatchFailed: return "retryable_dispatch_failure"
-        case .verificationReadFailed: return "bounded_read_retry"
-        default: return nil
-        }
-    }
-
-    var procedureRetryCount: Int? {
-        switch self {
-        case .dispatchPrepared(let intent): return max(0, intent.attempt - 1)
-        default: return nil
-        }
-    }
-
-    var procedureExternalEffectClass: String {
-        switch self {
-        case .dispatchSucceeded, .notificationRecorded: return "external_send"
-        case .dispatchPrepared, .dispatchFailed, .notificationClaimed: return "local_control"
-        case .detected, .observed, .callbackReceived, .verificationReadFailed: return "external_read"
-        }
-    }
-
-    var procedureToolCallCount: Int? {
-        switch self {
-        case .dispatchSucceeded, .notificationRecorded: return 1
-        default: return nil
         }
     }
 }
@@ -183,12 +94,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     /// ages into attention(.callbackOverdue). Durable bridge recovery still
     /// owns the original turn; timeout alone never authorizes a competing one.
     static let codexCallbackOverdueSeconds: TimeInterval = 6 * 60 * 60
-
-    /// Bounded "still needs work → back to codex" loop (User, 2026-07-12): a
-    /// verificationFailed item re-dispatches to codex until this many total
-    /// attempts, then parks as a genuine blocker that claims APNS. The cap
-    /// prevents a codex ping-pong loop on work he cannot actually clear.
-    static let maxDispatchAttemptsPerEvent = 3
 
     /// Per-item work-log bound (2026-07-21 audit): a terminal item used to
     /// accumulate one stale_callback row per late/duplicate callback forever.
@@ -390,130 +295,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         ].joined(separator: "|"))
     }
 
-    /// Replays the canonical feed once and observes each reducer transition.
-    /// The projection contains only enum state and SHA-256 identities: no repo
-    /// name, title, comment/callback text, blocker detail, token, or local path.
-    public func causalTransitionEvidence(limit: Int = 512) async throws -> [CausalTransitionEvidence] {
-        let boundedLimit = max(0, min(limit, 2_048))
-        guard boundedLimit > 0 else { return [] }
-        let feed = try await readFeedUnlocked()
-        let ops = feed.ops
-        var evidence: [CausalTransitionEvidence] = []
-        evidence.reserveCapacity(min(boundedLimit, ops.count))
-        let captureStart = max(0, ops.count - boundedLimit)
-        var operationIndex = 0
-        var sequenceByItem: [String: Int] = [:]
-        var parentOperationByItem: [String: String] = [:]
-        _ = try replay(base: feed.base, ops) { op, before, after in
-            let affectedItemID = op.body.affectedItemId
-            let sequence = sequenceByItem[affectedItemID, default: 0]
-            let opaqueOperationID = CausalTransitionEvidence.opaqueIdentity(op.id)
-            let parentOperationID = parentOperationByItem[affectedItemID]
-            defer {
-                operationIndex += 1
-                sequenceByItem[affectedItemID] = sequence + 1
-                parentOperationByItem[affectedItemID] = opaqueOperationID
-            }
-            guard operationIndex >= captureStart else { return }
-            let outcome: String
-            if before == nil, after != nil {
-                outcome = "item_created"
-            } else if before?.state != after?.state {
-                outcome = "state_changed"
-            } else {
-                outcome = "state_unchanged"
-            }
-            let item = after ?? before
-            let itemKind = item?.kind.rawValue ?? "unknown"
-            let opaqueItemIdentity = CausalTransitionEvidence.opaqueIdentity(affectedItemID)
-            let entersResolved = before?.state != .resolved && after?.state == .resolved
-            // Notification receipts appended after canonical resolution are a
-            // separate delivery lifecycle, not extra steps after this reducer
-            // trajectory's verified terminal.
-            let lifecycleTrajectoryID = before?.state == .resolved && after?.state == .resolved
-                ? nil : opaqueItemIdentity
-            let phase: String? = after.map { item in
-                switch item.state {
-                case .detected: return MotorActionPhase.proposed.rawValue
-                case .needsCodex: return MotorActionPhase.ready.rawValue
-                case .codexWorking: return MotorActionPhase.waitingExternal.rawValue
-                case .verifying: return MotorActionPhase.verifying.rawValue
-                case .needsUser: return MotorActionPhase.awaitingHuman.rawValue
-                case .waitingUpstream: return MotorActionPhase.waitingExternal.rawValue
-                case .attention: return MotorActionPhase.blocked.rawValue
-                case .resolved: return MotorActionPhase.succeeded.rawValue
-                }
-            }
-            let verification: String? = after.map { item in
-                switch item.state {
-                case .verifying: return "pending"
-                case .resolved, .waitingUpstream: return "verified"
-                case .attention(.verificationFailed), .attention(.verificationReadFailed): return "failed"
-                case .needsUser: return "unknown"
-                default: return "not_started"
-                }
-            }
-            let latencyMilliseconds: Int? = {
-                let start: String?
-                switch op.body {
-                case .dispatchSucceeded(_, let receipt): start = receipt.queuedAt
-                case .callbackReceived: start = before?.dispatchReceipt?.queuedAt
-                default: start = nil
-                }
-                guard let start,
-                      let startDate = DeskClock.parseISO(start),
-                      let endDate = DeskClock.parseISO(op.at),
-                      endDate >= startDate else { return nil }
-                return Int(min(Double(Int.max), endDate.timeIntervalSince(startDate) * 1_000))
-            }()
-            evidence.append(CausalTransitionEvidence(
-                domain: "github_command",
-                operationId: opaqueOperationID,
-                occurredAt: op.at,
-                itemIdentity: opaqueItemIdentity,
-                kind: op.body.causalKind,
-                beforeState: before?.state.name.rawValue,
-                afterState: after?.state.name.rawValue,
-                expectedNextEvidence: op.body.expectedNextEvidence,
-                outcome: outcome,
-                trajectoryID: lifecycleTrajectoryID,
-                parentOperationID: parentOperationID,
-                sequenceNumber: sequence,
-                motorPhase: phase,
-                verificationClass: verification,
-                authorityClass: "domain_reducer_only",
-                deadlineClass: op.body.causalKind == "dispatch_succeeded"
-                    ? "callback_overdue_6h" : nil,
-                terminalClass: entersResolved ? "verified_success" : nil,
-                completenessClass: entersResolved ? "complete" : "observed",
-                taskFamily: "github_command.\(itemKind)",
-                inputClass: itemKind,
-                inputInstanceIdentity: opaqueItemIdentity,
-                parameterSchemaClass: "github_command_item_v1",
-                parameterSchemaIdentity: CausalTransitionEvidence.opaqueIdentity(
-                    "github_command_item_v1|\(itemKind)"
-                ),
-                procedureShapeIdentity: CausalTransitionEvidence.opaqueIdentity(
-                    "github_command_reducer_v1|\(itemKind)"
-                ),
-                actionKind: op.body.procedureActionKind,
-                evidenceKind: op.body.procedureEvidenceKind,
-                checkpointClass: op.body.procedureCheckpointClass,
-                retryClass: op.body.procedureRetryClass,
-                retryCount: op.body.procedureRetryCount,
-                cancellationClass: nil,
-                externalEffectClass: op.body.procedureExternalEffectClass,
-                latencyMilliseconds: latencyMilliseconds,
-                providerCallCount: nil,
-                toolCallCount: op.body.procedureToolCallCount,
-                providerCostMicros: nil,
-                toolCostMicros: nil,
-                removableOrchestrationProviderCallCount: nil
-            ))
-        }
-        return evidence
-    }
-
     @discardableResult
     public func detect(
         repository: String,
@@ -652,94 +433,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         )
         changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
         return committed.items
-    }
-
-    /// Reserves one deterministic bridge id for an actionable event. Replaying
-    /// an unfinished reservation returns the same id; retrying dispatch_failed
-    /// increments the attempt but never changes the idempotency key.
-    public func prepareDispatch(itemId: String) async throws -> GitHubCommandDispatchIntent? {
-        try await persistence.withFileLock(opsPath) {
-            let feed = try await readFeedLocked()
-            let state = try replay(base: feed.base, feed.ops)
-            guard let item = state.item(itemId) else { throw GitHubCommandStoreError.unknownItem(itemId) }
-            // Never dispatch on an observation whose latest live re-read
-            // FAILED (review: blip tolerance keeps the prior state dispatch-
-            // eligible, but the evidence behind it is unverified). A clean
-            // observe resets the counter and the next cycle dispatches.
-            guard (item.verificationReadFailures ?? 0) == 0 else { return nil }
-            let retryable: Bool
-            let overdueRedispatch: Bool
-            switch item.state {
-            case .needsCodex: retryable = true; overdueRedispatch = false
-            case .attention(.dispatchFailed): retryable = true; overdueRedispatch = false
-            // "Codex said done but GitHub still shows the same actionable
-            // event" goes BACK to codex a bounded number of times (User's spec:
-            // still needs work → back to codex), then parks as a real blocker
-            // that claims APNS. The cap prevents a codex ping-pong loop.
-            case .attention(.verificationFailed):
-                retryable = (item.dispatchIntent?.attempt ?? 1) < Self.maxDispatchAttemptsPerEvent
-                overdueRedispatch = true
-            default: retryable = false; overdueRedispatch = false
-            }
-            guard let eventKey = item.observation?.actionableEventKey else { return nil }
-            // IDEMPOTENT RESUME (review round 4): an already-prepared intent
-            // whose dispatchId has NOT been consumed by a recorded receipt is
-            // returned AS-IS — crash recovery re-preparing the same dispatch
-            // must not burn the retry cap, change the reserved key, or park
-            // the item before its final attempt actually executed.
-            // STATE ELIGIBILITY (round 5): resume only while the item is still
-            // in a dispatch-pending shape. observe() can settle an item
-            // (resolved / needsUser / waitingUpstream) WITHOUT clearing its
-            // leftover intent, and a closed-PR or human-decision observation
-            // can carry the same eventKey — a settled item must never get a
-            // dispatch out of a stale reservation. isDispatchPending includes
-            // verificationFailed regardless of cap, so an unconsumed FINAL
-            // attempt still resumes after a crash.
-            if let intent = item.dispatchIntent, intent.eventKey == eventKey,
-               intent.dispatchId != item.dispatchReceipt?.dispatchId,
-               item.state.isDispatchPending {
-                return intent
-            }
-            guard retryable else { return nil }
-            if !overdueRedispatch {
-                guard !state.dispatchedEventKeys.contains(eventKey) else { return nil }
-            }
-            let attempt = (item.dispatchIntent?.eventKey == eventKey ? item.dispatchIntent?.attempt ?? 0 : 0) + 1
-            let dispatchId: String
-            if overdueRedispatch {
-                dispatchId = Self.dispatchId(eventKey: eventKey, attempt: attempt)
-            } else {
-                dispatchId = Self.dispatchId(eventKey: eventKey)
-            }
-            let intent = GitHubCommandDispatchIntent(
-                itemId: item.itemId,
-                eventKey: eventKey,
-                dispatchId: dispatchId,
-                headSHA: item.observation?.headSHA,
-                attempt: attempt,
-                preparedAt: DeskClock.nowISO()
-            )
-            return try await appendUnlocked(.dispatchPrepared(intent), itemId: item.itemId, feed: feed)
-                .dispatchIntent
-        }
-    }
-
-    /// Receipt and codex_working are reduced from this single feed row. There
-    /// is no API that can set codex_working independently.
-    @discardableResult
-    public func recordDispatchSuccess(
-        itemId: String,
-        receipt: GitHubCommandDispatchReceipt
-    ) async throws -> GitHubCommandItem {
-        try await append(.dispatchSucceeded(itemId: itemId.lowercased(), receipt: receipt), itemId: itemId)
-    }
-
-    @discardableResult
-    public func recordDispatchFailure(itemId: String, eventKey: String, detail: String) async throws -> GitHubCommandItem {
-        try await append(
-            .dispatchFailed(itemId: itemId.lowercased(), eventKey: eventKey, detail: Self.bounded(detail, limit: 500)),
-            itemId: itemId
-        )
     }
 
     /// Correlates callback message ids to the store-owned dispatch receipt (or
@@ -1048,9 +741,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         return nil
     }
 
-    /// Recent-evidence tail kept in the op-log across a compaction, so
-    /// causalTransitionEvidence never blanks right after one (review round
-    /// 2, F1 finding 4). Small thresholds (tests) scale the tail down.
+    /// Recent operation tail retained across compaction for feed continuity.
     static let compactionKeepTailOps = 512
 
     /// Snapshot + keep-tail once the op-log crosses the threshold (audit
@@ -1104,8 +795,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
 
     private func replay(
         base: GitHubCommandState?,
-        _ ops: [GitHubCommandOp],
-        observeTransition: ((GitHubCommandOp, GitHubCommandItem?, GitHubCommandItem?) -> Void)? = nil
+        _ ops: [GitHubCommandOp]
     ) throws -> GitHubCommandState {
         var byId: [String: GitHubCommandItem] = [:]
         var dispatched = Set<String>()
@@ -1300,7 +990,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 }
                 byId[affectedItemId] = current
             }
-            observeTransition?(op, before, byId[affectedItemId])
         }
         // Terminal retirement + ledger bound (2026-07-21 audit, persistence
         // slice): resolved items and unreferenced dispatched keys otherwise
@@ -1718,21 +1407,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         case .needsUser:
             return blockerIntent(for: item, version: version)
         case .attention(let reason):
-            // Only real, actionable blockers claim a notification. Transient
-            // reasons (verificationReadFailed from a briefly-unreadable GitHub,
-            // failures a retry may still clear) must NOT wake User's devices.
-            // verificationFailed claims ONLY once its bounded back-to-codex
-            // retries are exhausted — at that point it is genuinely stuck.
+            // Parked blockers need User; an unreadable verification alone does not.
             switch reason {
-            case .dispatchFailed, .callbackOverdue:
-                return blockerIntent(for: item, version: version)
-            case .verificationFailed:
-                // Ping only when the FINAL attempt was reserved AND recorded —
-                // a prepared-but-unexecuted cap attempt (crash window) must
-                // resume and run before User hears about it (review round 4).
-                guard let intent = item.dispatchIntent,
-                      intent.attempt >= Self.maxDispatchAttemptsPerEvent,
-                      item.dispatchReceipt?.dispatchId == intent.dispatchId else { return nil }
+            case .dispatchFailed, .callbackOverdue, .verificationFailed:
                 return blockerIntent(for: item, version: version)
             case .codexFailed:
                 // Outcome-unknown parks (empty terminal codex turn, failed
@@ -1757,17 +1434,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             title: "GitHub blocker",
             body: Self.bounded("\(item.repository) #\(item.number): \(blocker.detail) Owner: \(blocker.owner).", limit: 260)
         )
-    }
-
-    private static func dispatchId(eventKey: String) -> String {
-        let digest = SHA256.hash(data: Data(eventKey.utf8))
-        return "ghcmd_" + digest.prefix(16).map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// A distinct idempotency key for a verified-but-still-actionable retry.
-    /// Salting by attempt guarantees a new inbox row instead of a dedup no-op.
-    private static func dispatchId(eventKey: String, attempt: Int) -> String {
-        dispatchId(eventKey: "\(eventKey)#retry\(attempt)")
     }
 
     /// A codex_working item is overdue when its dispatch receipt was queued

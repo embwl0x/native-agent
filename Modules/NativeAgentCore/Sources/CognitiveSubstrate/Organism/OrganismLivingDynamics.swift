@@ -187,7 +187,6 @@ public struct OrganismSleepPressureWeights: Sendable, Equatable {
 
 public enum OrganismSleepLane: String, Codable, Sendable, Equatable, CaseIterable {
     case quietLocalRepair = "quiet_local_repair"
-    case operationalConsolidation = "operational_consolidation"
     case identityDreamProposal = "identity_dream_proposal"
     case generatedFrozenRecalibration = "generated_frozen_recalibration"
 }
@@ -231,47 +230,28 @@ public struct OrganismSleepLaneOpportunity: Sendable, Equatable {
 /// raise pressure. It is persisted solely so restarts cannot replay the same
 /// evidence generation or evade the Dream/provider budget.
 public struct OrganismSleepControlState: Codable, Sendable, Equatable {
-    public var lastOperationalConsolidationAt: Date?
-    public var lastOperationalEvidenceGeneration: String?
-    public var lastOperationalReceipt: OrganismOperationalConsolidationReceipt?
     public var lastProviderDreamAt: Date?
     public var lastGeneratedRecalibrationAt: Date?
     public var lastGeneratedEvidenceGeneration: String?
 
     public init(
-        lastOperationalConsolidationAt: Date? = nil,
-        lastOperationalEvidenceGeneration: String? = nil,
-        lastOperationalReceipt: OrganismOperationalConsolidationReceipt? = nil,
         lastProviderDreamAt: Date? = nil,
         lastGeneratedRecalibrationAt: Date? = nil,
         lastGeneratedEvidenceGeneration: String? = nil
     ) {
-        self.lastOperationalConsolidationAt = lastOperationalConsolidationAt
-        self.lastOperationalEvidenceGeneration = lastOperationalEvidenceGeneration.map { String($0.prefix(80)) }
-        self.lastOperationalReceipt = lastOperationalReceipt
         self.lastProviderDreamAt = lastProviderDreamAt
         self.lastGeneratedRecalibrationAt = lastGeneratedRecalibrationAt
         self.lastGeneratedEvidenceGeneration = lastGeneratedEvidenceGeneration.map { String($0.prefix(80)) }
     }
 
     private enum CodingKeys: String, CodingKey {
-        case lastOperationalConsolidationAt, lastOperationalEvidenceGeneration
-        case lastOperationalReceipt, lastProviderDreamAt
+        case lastProviderDreamAt
         case lastGeneratedRecalibrationAt, lastGeneratedEvidenceGeneration
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.init(
-            lastOperationalConsolidationAt: try container.decodeIfPresent(
-                Date.self, forKey: .lastOperationalConsolidationAt
-            ),
-            lastOperationalEvidenceGeneration: try container.decodeIfPresent(
-                String.self, forKey: .lastOperationalEvidenceGeneration
-            ),
-            lastOperationalReceipt: try container.decodeIfPresent(
-                OrganismOperationalConsolidationReceipt.self, forKey: .lastOperationalReceipt
-            ),
             lastProviderDreamAt: try container.decodeIfPresent(Date.self, forKey: .lastProviderDreamAt),
             lastGeneratedRecalibrationAt: try container.decodeIfPresent(
                 Date.self, forKey: .lastGeneratedRecalibrationAt

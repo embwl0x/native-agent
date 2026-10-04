@@ -2,13 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - Built-in workflow defaults (mirror Runtime.workflow_defaults)
+// MARK: - Saved workflow templates
 
-/// The three built-in workflow templates. Mirrors `Runtime.workflow_defaults`
-/// in the retired daemon (lines ~6799-6846). `createdAt`/`updatedAt` are
-/// stamped with the supplied `now` (matching Python's per-call `now_iso()`).
-enum WorkflowDefaults {
-    static func defaults(now: String) -> [JSONValue] {
+/// Saved planning templates. The workflow registry does not execute them.
+public enum WorkflowDefaults {
+    public static func defaults(now: String) -> [JSONValue] {
         func step(_ id: String, _ title: String, _ kind: String, requiresApproval: Bool, layer: String? = nil) -> JSONValue {
             var obj: [String: JSONValue] = [
                 "id": .string(id),
@@ -23,7 +21,7 @@ enum WorkflowDefaults {
             .object([
                 "id": .string("research-to-brief"),
                 "name": .string("Research to Brief"),
-                "description": .string("Route a research objective through search, source capture, memory note, and summary receipt."),
+                "description": .string("Saved template for research, source capture, a memory note, and a summary. Workflow execution is unavailable."),
                 "status": .string("template"),
                 "trigger": .string("research brief"),
                 "steps": .array([
@@ -38,7 +36,7 @@ enum WorkflowDefaults {
             .object([
                 "id": .string("safe-tool-forge"),
                 "name": .string("Safe Tool Forge"),
-                "description": .string("Turn repeated work into a proposed app-owned JSON tool, validate it, and leave promotion gated by permissions."),
+                "description": .string("Saved template for proposing and validating an app-owned JSON tool with permission-gated promotion. Workflow execution is unavailable."),
                 "status": .string("template"),
                 "trigger": .string("make a tool"),
                 "steps": .array([
@@ -53,8 +51,8 @@ enum WorkflowDefaults {
             .object([
                 "id": .string("memory-capture"),
                 "name": .string("Memory Capture"),
-                "description": .string("Execute a safe app-owned workflow that routes an objective, writes a memory, and records a trace receipt."),
-                "status": .string("active"),
+                "description": .string("Saved template for capturing an objective as a semantic memory with a trace receipt. Workflow execution is unavailable."),
+                "status": .string("template"),
                 "trigger": .string("remember this"),
                 "steps": .array([
                     step("route", "Route objective", "router", requiresApproval: false),
@@ -65,5 +63,31 @@ enum WorkflowDefaults {
                 "updatedAt": .string(now),
             ]),
         ]
+    }
+
+    /// Only migrate original seeds; preserve customized rows and their stamps.
+    static func migrateUnchangedSeed(_ saved: JSONValue, to current: JSONValue) -> JSONValue {
+        guard case .object(var original) = current,
+              case .object(var candidate) = saved else { return saved }
+        switch WorkflowMerge.idKey(current) {
+        case "research-to-brief":
+            original["description"] = .string("Route a research objective through search, source capture, memory note, and summary receipt.")
+        case "safe-tool-forge":
+            original["description"] = .string("Turn repeated work into a proposed app-owned JSON tool, validate it, and leave promotion gated by permissions.")
+        case "memory-capture":
+            original["description"] = .string("Execute a safe app-owned workflow that routes an objective, writes a memory, and records a trace receipt.")
+            original["status"] = .string("active")
+        default:
+            return saved
+        }
+        for key in ["createdAt", "updatedAt"] {
+            original.removeValue(forKey: key)
+            candidate.removeValue(forKey: key)
+        }
+        guard candidate == original, case .object(var migrated) = saved,
+              case .object(let template) = current else { return saved }
+        migrated["description"] = template["description"]
+        migrated["status"] = template["status"]
+        return .object(migrated)
     }
 }

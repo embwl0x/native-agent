@@ -771,7 +771,7 @@ private struct ChatToolCatalogSection: View {
                     }
                 ))
             }
-            Text(CapabilitiesPlainCopy.toolDescription(tool.name))
+            Text(CapabilitiesPlainCopy.toolDescription(tool.name, catalogDescription: tool.description))
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .lineLimit(isExpanded ? nil : 2)
@@ -823,7 +823,7 @@ enum AuthoredToolPresentation {
     }
 
     static func autoRunTitle(_ tool: ToolRecord) -> String {
-        tool.autoRun == true ? "Turn off auto-run" : "Turn on auto-run"
+        "Auto-run unavailable"
     }
 
     static func canQuarantine(_ tool: ToolRecord) -> Bool { tool.status != "quarantined" }
@@ -842,6 +842,8 @@ enum AuthoredToolPresentation {
             return .init(title: "proposed", systemImage: "clock", tone: .warning)
         case "quarantined":
             return .init(title: "quarantined", systemImage: "exclamationmark.triangle", tone: .danger)
+        case "archived":
+            return .init(title: "archived", systemImage: "clock", tone: .warning)
         default:
             return .init(title: "status unavailable", systemImage: "questionmark.circle", tone: .warning)
         }
@@ -866,11 +868,9 @@ enum AuthoredToolPresentation {
         controls.append(ActionControl(
             action: .autoRun,
             title: autoRunTitle(tool),
-            isEnabled: tool.status == "active",
+            isEnabled: false,
             accessibilityIdentifier: nil,
-            help: tool.status == "active"
-                ? "Change whether this active tool may run automatically."
-                : "Activate this tool before changing auto-run.",
+            help: "Auto-run does not control execution. Quarantine the tool to stop it.",
             refusal: nil
         ))
         controls.append(ActionControl(
@@ -948,7 +948,7 @@ private struct AuthoredToolsSection: View {
                     Text("Written by me")
                 }
                 if tool.autoRun == true {
-                    Text("Runs on its own")
+                    Text("Legacy auto-run flag (unused)")
                 }
                 Text(tool.validationStatus ?? "untested")
                 Text("Used \(tool.useCount ?? 0) times")

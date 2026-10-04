@@ -24,7 +24,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -46,14 +45,6 @@ import DeviceSync
 
 @MainActor
 extension AppModel {
-    func latestContextReceipt(for sessionId: String) -> ContextReceipt? {
-        latestContextReceiptBySession[sessionId]
-    }
-
-    func setLatestContextReceipt(_ receipt: ContextReceipt?, for sessionId: String) {
-        latestContextReceiptBySession[sessionId] = receipt
-    }
-
     /// The one intake for the live computer pane, fenced on the same exact
     /// identity the lifecycle reducer uses: a frame from a previous turn's
     /// trailing verb can never land in the turn that replaced it.
@@ -122,7 +113,7 @@ extension AppModel {
         await client.refreshResidentMindAfterOnboardingTransition()
     }
 
-    /// Drop a session's cached messages + receipt. Called when a session is
+    /// Drop a session's cached messages. Called when a session is
     /// deleted from the sidebar. The dict would otherwise grow unbounded as
     /// the user creates and discards sessions across a long-running app.
     func pruneSessionChatState(_ sessionId: String) {
@@ -131,9 +122,7 @@ extension AppModel {
             ? engine.turns.lifecycleBySession[sessionId]?.identity.turnId
             : nil
         engine.transcripts.messagesBySession.removeValue(forKey: sessionId)
-        latestContextReceiptBySession.removeValue(forKey: sessionId)
         detachedChatRefreshStatus.removeValue(forKey: sessionId)
-        detachedChatContextReceiptRefreshStatus.removeValue(forKey: sessionId)
         engine.turns.queuedBySession.removeValue(forKey: sessionId)
         engine.turns.pausedQueueSessions.remove(sessionId)
         engine.turns.queuePauseReasons.removeValue(forKey: sessionId)
@@ -164,9 +153,7 @@ extension AppModel {
     /// call from the existing low-frequency session-list refresh.
     func pruneStaleSessionChatState(knownSessionIds: Set<String>) {
         let cached = Set(engine.transcripts.messagesBySession.keys)
-            .union(latestContextReceiptBySession.keys)
             .union(detachedChatRefreshStatus.keys)
-            .union(detachedChatContextReceiptRefreshStatus.keys)
             .union(engine.turns.queuedBySession.keys)
             .union(engine.turns.pausedQueueSessions)
             .union(engine.turns.lifecycleBySession.keys)
@@ -189,7 +176,7 @@ extension AppModel {
     // to `chatMessages(for:)` for its fixed sessionId and stream into it
     // without disturbing the main window's active session.
 
-    /// Load a detached session's messages + receipt from disk into the
+    /// Load a detached session's messages from disk into the
     /// per-session slot. Called when a panel first opens so it shows history
     /// immediately even if the session was never the active one. Does NOT
     /// touch `activeChatSessionId` — the main window stays where it is.
@@ -197,15 +184,13 @@ extension AppModel {
     func loadDetachedSessionMessages(_ sessionId: String) async {
         await loadDetachedSessionMessages(
             sessionId,
-            loadMessages: { [transcripts = engine.transcripts] in try await transcripts.loadMessages(sessionId: $0, cached: true) },
-            loadReceipt: { [client] in try await client.getLatestContextReceipt(sessionId: $0) })
+            loadMessages: { [transcripts = engine.transcripts] in try await transcripts.loadMessages(sessionId: $0, cached: true) })
     }
 
     @MainActor
     func loadDetachedSessionMessages(
         _ sessionId: String,
-        loadMessages: (String) async throws -> [ChatMessage],
-        loadReceipt: (String) async throws -> ContextReceipt
+        loadMessages: (String) async throws -> [ChatMessage]
     ) async {
         guard !sessionId.isEmpty else { return }
         // Skip if a stream is already populating this slot — overwriting
@@ -242,27 +227,6 @@ extension AppModel {
         detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
             previous: detachedChatRefreshStatus[sessionId],
             failedEndpoints: messageFailures,
-            at: Date()
-        )
-        var receiptFailures: [String] = []
-        let receipt: ContextReceipt?
-        do {
-            receipt = try await loadReceipt(sessionId)
-        } catch {
-            receipt = nil
-            receiptFailures.append("context receipt")
-        }
-        // Recheck AFTER this separate await too. A new turn may now own the
-        // slot, or may already have completed and cleared its streaming flag.
-        // Retained lifecycle evidence covers both without another generation.
-        let lifecycleAfterReceipt = engine.turns.lifecycle(for: sessionId)
-        guard !engine.turns.streamingSessions.contains(sessionId),
-              lifecycleAfterReceipt == nil || lifecycleAfterReceipt == lifecycleAtLoadStart
-        else { return }
-        if let receipt { setLatestContextReceipt(receipt, for: sessionId) }
-        detachedChatContextReceiptRefreshStatus[sessionId] = Self.nextRefreshStatus(
-            previous: detachedChatContextReceiptRefreshStatus[sessionId],
-            failedEndpoints: receiptFailures,
             at: Date()
         )
     }

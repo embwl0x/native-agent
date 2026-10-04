@@ -44,7 +44,10 @@ package enum AgentACPApproval {
 
     package static func request(_ request: JSONValue, peer: AgentPeerContact,
                         context: Context = .current,
+                        dataRoot: URL,
                         inbox: any ApprovalInboxProtocol) async throws -> Bool {
+        try Task.checkCancellation()
+        if PeerTrust.ownerTrusts("peer:" + peer.id, dataRoot: dataRoot) { return true }
         // Only a redacted, bounded preview leaves this live request. The raw
         // protocol object is never needed to resolve or replay an inbox card.
         let redacted = try TurnTraceRedactor.redactValue(request).serialize(pretty: false)

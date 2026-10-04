@@ -9,6 +9,11 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     /// Turning this off restores the prior most-recent-active-view behavior
     /// without changing any persisted view or appraisal influence.
     public var standingViewCapsuleRelevanceEnabled: Bool
+    /// Phase 5 D experiment (`personality.views_experiment`): opinions that
+    /// form on independent recurrence and interests from her hour. Off leaves
+    /// every opinion and interest row stored but inert — nothing forms,
+    /// surfaces, or reaches a prompt.
+    public var viewsExperimentEnabled: Bool
     public var affectEnabled: Bool
     public var thoughtSeedsEnabled: Bool
     public var replayEnabled: Bool
@@ -46,6 +51,7 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         workspaceEnabled: Bool = false,
         capsuleInjectionEnabled: Bool = false,
         standingViewCapsuleRelevanceEnabled: Bool = true,
+        viewsExperimentEnabled: Bool = true,
         affectEnabled: Bool = false,
         thoughtSeedsEnabled: Bool = false,
         replayEnabled: Bool = false,
@@ -74,6 +80,7 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.workspaceEnabled = workspaceEnabled
         self.capsuleInjectionEnabled = capsuleInjectionEnabled
         self.standingViewCapsuleRelevanceEnabled = standingViewCapsuleRelevanceEnabled
+        self.viewsExperimentEnabled = viewsExperimentEnabled
         self.affectEnabled = affectEnabled
         self.thoughtSeedsEnabled = thoughtSeedsEnabled
         self.replayEnabled = replayEnabled

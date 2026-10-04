@@ -9,14 +9,18 @@ import PersistenceCore
 public struct WorkshopStepApprovalRequest: Sendable, Equatable {
     public var executionId: String
     public var stepId: String
+    public var taskTitle: String
+    public var actionDescription: String
     public var title: String
     public var tool: String
     public var reason: String
     public var args: JSONValue
 
-    public init(executionId: String, stepId: String, title: String, tool: String, reason: String, args: JSONValue) {
+    public init(executionId: String, stepId: String, taskTitle: String, actionDescription: String, title: String, tool: String, reason: String, args: JSONValue) {
         self.executionId = executionId
         self.stepId = stepId
+        self.taskTitle = taskTitle
+        self.actionDescription = actionDescription
         self.title = title
         self.tool = tool
         self.reason = reason
@@ -80,6 +84,7 @@ public typealias WorkshopStepMeasuredLLM = @Sendable (_ prompt: String) async th
 /// Throw to fail the step; unknown tools MUST throw (honest failure), never
 /// return a fabricated success.
 public typealias WorkshopStepToolDispatch = @Sendable (_ tool: String, _ args: JSONValue) async throws -> JSONValue
+public typealias WorkshopStepApprovedToolDispatch = @Sendable (_ tool: String, _ args: JSONValue, _ approvalId: String) async throws -> JSONValue
 
 /// Emitted only after a terminal Workshop execution CAS wins. App assembly can observe
 /// completed/failed/cancelled outcomes without WorkshopExecution importing
@@ -92,6 +97,7 @@ public typealias WorkshopTerminalEventSink = @Sendable (_ record: WorkshopExecut
 /// Serialized into mission.json `steps_completed` with the same snake_case
 /// keys as Python's asdict(StepResult).
 public struct WorkshopStepOutcome: Sendable, Equatable {
+    public static let successStatus = "succeeded"
     public var stepId: String
     public var status: String        // "succeeded"|"failed"|"blocked_on_approval"|"rejected"|"cancelled"
     public var output: JSONValue     // .object — daemon default {}

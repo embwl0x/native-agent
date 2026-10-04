@@ -169,11 +169,16 @@ extension SwiftNativeMemoryV2 {
             }
         }
         func disclosedRows(_ rows: [ScoredMemoryRecord]) -> [ScoredMemoryRecord] {
-            rows.filter { scoredRecord in
+            var seen: Set<String> = []
+            return rows.sorted { $0.score > $1.score }.filter { scoredRecord in
                 guard let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record) else {
                     return false
                 }
-                return classification.permits(surface: query.surface, personaID: query.persona)
+                guard classification.permits(surface: query.surface, personaID: query.persona) else {
+                    return false
+                }
+                let key = MemoryStorage.normalizedRecallContent(scoredRecord.record.text)
+                return key.isEmpty || seen.insert(key).inserted
             }
         }
         var retrieved = try await retrieve(storageTopK, loggingKeywordFallback: true)

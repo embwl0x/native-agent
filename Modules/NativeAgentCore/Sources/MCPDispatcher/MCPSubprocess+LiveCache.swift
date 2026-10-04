@@ -28,6 +28,59 @@ private final class MCPRegistryPools: @unchecked Sendable {
     }
 }
 
+private actor MCPHTTPRegistryTransports {
+    static let shared = MCPHTTPRegistryTransports()
+    private struct Row {
+        let identity: String
+        let transport: MCPHTTPTransport
+    }
+    private var configurations: [String: [String: String]] = [:]
+    private var rows: [String: [String: Row]] = [:]
+
+    private func registryKey(_ root: URL) -> String {
+        root.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    func reconcile(servers: [MCPServer], root: URL) async {
+        let key = registryKey(root)
+        var identities: [String: String] = [:]
+        for server in servers where server.transport == "http" && server.id != "searxng-local" {
+            identities[server.id] = try? server.executionIdentity()
+        }
+        configurations[key] = identities
+        var retired: [MCPHTTPTransport] = []
+        for (id, row) in rows[key] ?? [:] where identities[id] != row.identity {
+            rows[key]?[id] = nil
+            retired.append(row.transport)
+        }
+        for transport in retired { await transport.close() }
+    }
+
+    func transport(for server: MCPServer, endpoint: URL, root: URL) throws -> MCPHTTPTransport {
+        let key = registryKey(root)
+        let identity = try server.executionIdentity()
+        guard configurations[key]?[server.id] == identity else {
+            throw MCPDispatcherError.malformedResponse("MCP server changed before HTTP dispatch; refresh the connection")
+        }
+        if let row = rows[key]?[server.id], row.identity == identity { return row.transport }
+        let transport = MCPHTTPTransport(serverId: server.id, endpoint: endpoint)
+        rows[key, default: [:]][server.id] = Row(identity: identity, transport: transport)
+        return transport
+    }
+
+    func stop(serverId: String, root: URL) async {
+        if let row = rows[registryKey(root)]?.removeValue(forKey: serverId) {
+            await row.transport.close()
+        }
+    }
+
+    func stopAll() async {
+        let retired = rows.values.flatMap { $0.values.map(\.transport) }
+        rows.removeAll()
+        for transport in retired { await transport.close() }
+    }
+}
+
 // MARK: - Cached live MCP queries on the SwiftNative dispatcher
 
 /// 60-second TTL cache row. Matches the daemon's behavior of stamping a
@@ -67,21 +120,24 @@ public actor MCPLiveCache {
     private var inflight: [String: Task<[JSONValue], Error>] = [:]
     /// A force refresh reserves its generation before awaiting cancellation;
     /// older callers may return a result but cannot overwrite the current slot.
-    private var keyGenerations: [String: Int] = [:]
+    private var keyGenerations: [String: UUID] = [:]
     public var ttl: TimeInterval = 60
 
     public init() {}
 
+    private func pruneExpiredRows() {
+        let now = Date()
+        rows = rows.filter { now.timeIntervalSince($0.value.storedAt) <= ttl }
+    }
+
     func get(_ key: String) -> [JSONValue]? {
+        pruneExpiredRows()
         guard let row = rows[key] else { return nil }
-        if Date().timeIntervalSince(row.storedAt) > ttl {
-            rows.removeValue(forKey: key)
-            return nil
-        }
         return row.value
     }
 
     func put(_ key: String, value: [JSONValue]) {
+        pruneExpiredRows()
         rows[key] = MCPLiveCacheRow(storedAt: Date(), value: value)
     }
 
@@ -123,8 +179,12 @@ public actor MCPLiveCache {
         fill: @escaping @Sendable () async throws -> [JSONValue]
     ) async throws -> [JSONValue] {
         try Task.checkCancellation()
-        let myGen = (keyGenerations[key] ?? 0) + 1
+        pruneExpiredRows()
+        let myGen = UUID()
         keyGenerations[key] = myGen
+        defer {
+            if keyGenerations[key] == myGen { keyGenerations[key] = nil }
+        }
 
         if let existing = inflight[key] {
             existing.cancel()
@@ -236,7 +296,7 @@ extension SwiftNativeMCPDispatcher {
                 }
             }
         } else {
-            let transport = try genericHTTPTransport(for: server)
+            let transport = try await genericHTTPTransport(for: server)
             fetch = { try await transport.listTools() }
         }
         // F-B3 (2026-08-02): `mcp/cache/tools.json` is the ONLY producer of
@@ -400,7 +460,7 @@ extension SwiftNativeMCPDispatcher {
                 }
             }
         } else {
-            let transport = try genericHTTPTransport(for: server)
+            let transport = try await genericHTTPTransport(for: server)
             fetch = { try await transport.listResources() }
         }
         if !cached {
@@ -620,9 +680,10 @@ extension SwiftNativeMCPDispatcher {
             }
             let categories = Self.stringArgument(arguments, key: "categories")
             let timeRange = Self.stringArgument(arguments, key: "time_range")
-            let response = try await client.search(query: query, categories: categories.isEmpty ? nil : categories,
-                                                   timeRange: timeRange.isEmpty ? nil : timeRange)
-            return Self.okMCPResult(response.toJSON())
+            return await WebSearchRoutes.search(query: query, categories: categories, timeRange: timeRange) {
+                try await client.search(query: query, categories: categories.isEmpty ? nil : categories,
+                                        timeRange: timeRange.isEmpty ? nil : timeRange)
+            }
         case "fetch":
             let url = Self.stringArgument(arguments, key: "url")
             guard !url.isEmpty else {
@@ -645,12 +706,18 @@ extension SwiftNativeMCPDispatcher {
         toolName: String,
         arguments: JSONValue
     ) async throws -> JSONValue {
-        let transport = try genericHTTPTransport(for: server)
+        let transport = try await genericHTTPTransport(for: server)
         let result = try await transport.callTool(name: toolName, arguments: arguments)
         return Self.okMCPResult(result)
     }
 
-    private func genericHTTPTransport(for server: MCPServer) throws -> MCPHTTPTransport {
+    private func genericHTTPTransport(for server: MCPServer) async throws -> MCPHTTPTransport {
+        // Refresh registry ownership before accepting even a cached catalog's spec.
+        let servers = try await _readServersUncached()
+        guard let current = servers.first(where: { $0.id == server.id }),
+              try current.executionIdentity() == server.executionIdentity() else {
+            throw MCPDispatcherError.malformedResponse("MCP server changed before HTTP dispatch; refresh the connection")
+        }
         let raw = server.endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty, let url = URL(string: raw), url.scheme != nil else {
             throw MCPSubprocessError.httpTransport(
@@ -658,7 +725,7 @@ extension SwiftNativeMCPDispatcher {
                 detail: "http transport requires a non-empty endpoint URL (got \"\(server.endpoint)\")"
             )
         }
-        return MCPHTTPTransport(serverId: server.id, endpoint: url)
+        return try await MCPHTTPRegistryTransports.shared.transport(for: server, endpoint: url, root: root)
     }
 
     private static func okMCPResult(_ result: JSONValue) -> JSONValue {
@@ -703,10 +770,16 @@ extension SwiftNativeMCPDispatcher {
 
     public func stopSubprocess(serverId: String) async {
         await MCPRegistryPools.shared.pool(for: root).stop(serverId: serverId)
+        await MCPHTTPRegistryTransports.shared.stop(serverId: serverId, root: root)
     }
 
     public static func stopAllSharedPools() async {
         for pool in MCPRegistryPools.shared.allPools() { await pool.stopAll() }
+        await MCPHTTPRegistryTransports.shared.stopAll()
+    }
+
+    func reconcileHTTPTransports(for servers: [MCPServer]) async {
+        await MCPHTTPRegistryTransports.shared.reconcile(servers: servers, root: root)
     }
 
     /// Refresh only this canonical registry's stdio specs.

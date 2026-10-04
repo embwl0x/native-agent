@@ -13,7 +13,7 @@ import TrustCenter
 /// Mac it is answered by tapping it, and `InlineInteractionChatBinding` turns
 /// that tap into three steps: mark the row running, OPEN THE CONTROL that
 /// already owns the thing, then ask that control's owner whether it is now
-/// done. This tool is the same three steps with the middle one taken through
+/// done. The door's card actions are the same three steps with the middle one taken through
 /// the control's non-UI path — Connectors' own token write, the receipted
 /// permission store, `saveMultimodalPolicy`, the model override binding —
 /// instead of through a sheet.
@@ -83,14 +83,14 @@ extension AppToolExecutor {
             && card.verifiedUserId == caller.verifiedUserId
     }
 
-    /// The authority this route moves, named for the refusal — or nil when the
-    /// route changes nothing about what the agent is allowed to do.
     /// The capability flags a card may turn on, spelled as the saved policy
     /// spells them. A key not on this list is not written at all.
     private static let selfAdminCapabilityPolicyKeys: Set<String> = [
         "image_generation_openai", "screen_capture", "vision_api_calls", "tts_openai",
     ]
 
+    /// The authority this route moves, named for the refusal — or nil when the
+    /// route changes nothing about what the agent is allowed to do.
     private static func authorityMutation(_ route: InteractionControlRoute) -> String? {
         switch route {
         case .connectorToken: return "Writing a connector's token"
@@ -106,70 +106,70 @@ extension AppToolExecutor {
         return raw.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    @MainActor
-    public func runInteractionAct(input: [String: JSONValue], surface: String) async -> JSONValue {
-        // The app's OWN window, worked in process.
-        //
-        // Reaching our own UI over accessibility deadlocks the turn that is
-        // asking (in-process AppKit re-entry on the main thread), so that
-        // refusal stands for everything not named here. What is named here
-        // never goes near AX: each verb calls the same entry point the visible
-        // control calls when a person clicks it.
-        let target = Self.interactionText(input["target"]).lowercased()
-        if !target.isEmpty {
-            guard target == "composer" else {
-                return Self.interactionFailure(
-                    "self_inspection_unsupported",
-                    "This app's own window can only be worked through the in-process composer "
-                    + "verbs — reading or clicking our own UI over accessibility deadlocks the "
-                    + "turn asking for it. target=composer covers: "
-                    + presentation.composerVerbs.joined(separator: ", ")
-                    + ". Everything else on our own window stays refused; use app_page_read, "
-                    + "app_settings_list and app_setting_set for the rest.",
-                    extra: [
-                        "requested_target": .string(target),
-                        "targets": .array([.string("composer")]),
-                        "verbs": .array(presentation.composerVerbs.map { .string($0) }),
-                    ]
-                )
-            }
-            return await runComposerVerb(input: input, surface: surface)
-        }
+    /// What a card action needs once nothing refuses it.
+    private struct CardPlan {
+        let appModel: any QuietToolHost
+        let dataRoot: URL
+        let sessionID: String
+        let current: InlineInteraction
+        /// The posture read for the receipt: Full Mac re-read for a card
+        /// that moves authority.
+        let posture: QuietPosture
+        /// Nil for decline, which routes to no control.
+        let route: InteractionControlRoute?
+        let value: String
+        let choice: String
+    }
 
-        let id = Self.interactionText(input["interaction_id"])
-        guard !id.isEmpty else {
-            return Self.interactionFailure(
-                "missing_interaction_id",
-                "Name the card. app_page_read page=chat lists each one's interaction id."
-            )
-        }
+    /// Every check that can refuse a card action before the card is touched:
+    /// its origin and the caller's, the posture, a card that is User's by
+    /// kind, a control with no non-UI path, and Full Mac for one that moves
+    /// authority. Reads only, so the door's preview asks it too and refuses
+    /// what the real call would; `runCardAction` asks it first.
+    @MainActor
+    func cardRefusal(input: [String: JSONValue], surface: String) async -> JSONValue? {
+        if case .failure(let refusal) = await cardGate(input: input, surface: surface) { return refusal.answer }
+        return nil
+    }
+
+    /// What a gate refused with, before anything was touched.
+    struct GateRefusal: Error { let answer: JSONValue }
+
+    /// A card's id, bare or as its inbox note's (`interaction:<id>`).
+    private static func cardID(_ input: [String: JSONValue]) -> String {
+        let id = interactionText(input["interaction_id"])
+        return id.hasPrefix("interaction:") ? String(id.dropFirst("interaction:".count)) : id
+    }
+
+    @MainActor
+    private func cardGate(input: [String: JSONValue], surface: String) async -> Result<CardPlan, GateRefusal> {
+        func refuse(_ answer: JSONValue) -> Result<CardPlan, GateRefusal> { .failure(GateRefusal(answer: answer)) }
+        let id = Self.cardID(input)
         let rawAction = Self.interactionText(input["action"]).lowercased()
         let action = rawAction.isEmpty ? "primary" : rawAction
-        guard ["primary", "decline", "retry"].contains(action) else {
-            return Self.interactionFailure(
-                "unknown_action", "action is primary, decline or retry.",
-                extra: ["requested": .string(rawAction)]
-            )
-        }
         guard let appModel = quietHost() else {
-            return Self.interactionFailure(
+            return refuse(Self.interactionFailure(
                 "app_window_unavailable",
                 "The app's own controls are not available in this process."
-            )
+            ))
         }
         let dataRoot = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let sessionID = appModel.activeChatSessionId
-        guard !sessionID.isEmpty else {
-            return Self.interactionFailure("no_conversation", "No conversation is open.")
+        // The card by its id in the conversation that raised it: the open one,
+        // or the one its inbox note points at, as the inbox opens it.
+        let openSession = appModel.activeChatSessionId
+        var sessionID = openSession
+        var found = openSession.isEmpty ? nil
+            : await interactions.interaction(id: id, sessionID: openSession, dataRoot: dataRoot)
+        if found == nil, let raisedIn = await interactions.sessionID(ofCard: id, dataRoot: dataRoot) {
+            sessionID = raisedIn
+            found = await interactions.interaction(id: id, sessionID: raisedIn, dataRoot: dataRoot)
         }
-        guard let current = await interactions.interaction(
-            id: id, sessionID: sessionID, dataRoot: dataRoot
-        ) else {
-            return Self.interactionFailure(
+        guard let current = found else {
+            return refuse(Self.interactionFailure(
                 "not_found",
-                "No card with that id is in the open conversation.",
+                "No card has that id in any conversation.",
                 extra: ["interaction_id": .string(id)]
-            )
+            ))
         }
 
         // Whose question this is, and whether THIS caller is the one it was
@@ -188,16 +188,16 @@ extension AppToolExecutor {
         guard let cardOrigin = await interactions.originEnvelope(
             of: id, sessionID: sessionID, dataRoot: dataRoot
         ), !cardOrigin.surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return Self.interactionFailure(
+            return refuse(Self.interactionFailure(
                 "origin_unverifiable",
                 "I can't tell whose card this is — the row that raised it records no origin, so "
                 + "I won't settle it. The person can answer it in the app.",
                 extra: ["interaction_id": .string(id)]
-            )
+            ))
         }
         let caller = TurnEnvelope.current(surface: surface)
         if Self.isRemoteOrigin(cardOrigin) {
-            return Self.interactionFailure(
+            return refuse(Self.interactionFailure(
                 "not_yours_to_answer",
                 "That card was raised from \(cardOrigin.surface) — it's the person "
                 + "on that surface who was asked, so it isn't mine to answer.",
@@ -205,10 +205,10 @@ extension AppToolExecutor {
                     "interaction_id": .string(id),
                     "origin_surface": .string(cardOrigin.surface),
                 ]
-            )
+            ))
         }
         if Self.isRemoteOrigin(caller) {
-            return Self.interactionFailure(
+            return refuse(Self.interactionFailure(
                 "not_yours_to_answer",
                 "This turn came in from \(caller.surface), and the card was raised in the app "
                 + "here — answering it from there would settle a question I wasn't asked.",
@@ -217,10 +217,10 @@ extension AppToolExecutor {
                     "origin_surface": .string(cardOrigin.surface),
                     "caller_surface": .string(caller.surface),
                 ]
-            )
+            ))
         }
         guard Self.sameOriginLane(card: cardOrigin, caller: caller) else {
-            return Self.interactionFailure(
+            return refuse(Self.interactionFailure(
                 "not_yours_to_answer",
                 "That card belongs to a different conversation lane than this turn, so it isn't "
                 + "mine to answer from here.",
@@ -229,72 +229,73 @@ extension AppToolExecutor {
                     "origin_surface": .string(cardOrigin.surface),
                     "caller_surface": .string(caller.surface),
                 ]
-            )
+            ))
         }
-        // The session this turn was VERIFIED to be in, where the transport
-        // named one. The card was found in the window's active session, which
-        // is a different question from the one this caller is speaking in.
-        if let verifiedSession = ChatToolSessionContext.verifiedSessionId?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !verifiedSession.isEmpty, verifiedSession != sessionID {
-            return Self.interactionFailure(
+        // The conversation this turn is in: the one it was VERIFIED to be in,
+        // where the transport named one, else the one open in the window. The
+        // card is answered only from the conversation that raised it.
+        let verified = ChatToolSessionContext.verifiedSessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let callerSession = verified.isEmpty ? openSession : verified
+        if callerSession != sessionID {
+            return refuse(Self.interactionFailure(
                 "not_yours_to_answer",
-                "This turn is verified in another conversation, and the card is in the one open "
-                + "here. I won't answer across the two.",
-                extra: ["interaction_id": .string(id)]
-            )
+                "That card was raised in another conversation (\(sessionID)) than the one this turn is in, "
+                + "so I won't answer it from here. Nothing was changed and the card still waits there.",
+                extra: ["interaction_id": .string(id), "card_session_id": .string(sessionID)]
+            ))
         }
 
         // The same posture gate app_setting_set stands behind, read the same
         // fresh way: answering a card writes to Connectors, Trust or Providers.
         guard let posture = await Self.freshQuietPosture(dataRoot: dataRoot) else {
-            return Self.interactionFailure(
+            return refuse(Self.interactionFailure(
                 "trust_mode_unreadable",
                 "The saved Trust policy does not say which mode this Mac is in, so nothing is "
                 + "changed. The person can set the mode in Trust."
-            )
+            ))
         }
         guard posture.changesAllowed else {
-            return Self.interactionFailure(
+            return refuse(Self.interactionFailure(
                 "trust_mode_read_only",
                 "Answering a card is a write, and \(posture.name) is the posture that changes "
                 + "nothing at all — the person's standing choice, and only they lift it.",
                 extra: ["trust_mode": .string(posture.name)]
-            )
+            ))
         }
 
-        if action == "decline" {
-            do {
-                let declined = try await interactions.decline(
-                    id: id, sessionID: sessionID,
-                    expectedRevision: current.revision, dataRoot: dataRoot
-                )
-                return interactionReceipt(
-                    declined, action: action, status: "ok",
-                    posture: posture, surface: surface, dataRoot: dataRoot,
-                    extra: continuationExtra(id)
-                )
-            } catch {
-                return Self.interactionFailure(
-                    "not_settled", error.localizedDescription,
-                    extra: ["interaction_id": .string(id)]
-                )
-            }
+        // Below Full Mac, granting macOS access is User's, and turning a
+        // capability on raises Trust, which is his. Decided by the card's
+        // kind, before the card is touched: it stays waiting for him; Not now
+        // on it stays hers. Under Full Mac both are hers (User, 10-02).
+        if action != "decline", posture.name != Self.fullMacModeName,
+           current.kind == .permission || current.kind == .capability {
+            return refuse(Self.interactionFailure(
+                "users_call",
+                "\(current.kind == .permission ? "Granting Mac access" : "Turning on a Trust capability") is User's "
+                + "call below Full Mac, and this Mac is in \(posture.name). Nothing was changed and the card still "
+                + "waits for him: leave it for him. Not now still declines it.",
+                extra: ["interaction_id": .string(id)]
+            ))
         }
 
-        let descriptor = interactions.descriptor(for: current, dataRoot: dataRoot)
         let value = Self.interactionText(input["value"])
         let choice = Self.interactionText(input["choice"])
+        // Not now is hers on every card, User's too: it routes to no control.
+        if action == "decline" {
+            return .success(CardPlan(appModel: appModel, dataRoot: dataRoot, sessionID: sessionID, current: current,
+                                     posture: posture, route: nil, value: value, choice: choice))
+        }
+        let descriptor = interactions.descriptor(for: current, dataRoot: dataRoot)
         let route = Self.route(
             control: descriptor.control, interaction: current,
             descriptor: descriptor, value: value, choice: choice
         )
         if case .needsGlass(let reason) = route {
-            return interactionReceipt(
+            return refuse(interactionReceipt(
                 current, action: action, status: "needs_glass",
                 posture: posture, surface: surface, dataRoot: dataRoot,
                 extra: ["reason": .string(reason)]
-            )
+            ))
         }
 
         // A card that moves AUTHORITY — what the agent may reach, which keys it
@@ -310,15 +311,15 @@ extension AppToolExecutor {
         var effective = posture
         if let authority = Self.authorityMutation(route) {
             guard let fresh = await Self.freshQuietPosture(dataRoot: dataRoot) else {
-                return Self.interactionFailure(
+                return refuse(Self.interactionFailure(
                     "trust_mode_unreadable",
                     "The saved Trust policy does not say which mode this Mac is in, so nothing is "
                     + "changed. The person can set the mode in Trust."
-                )
+                ))
             }
             effective = fresh
             guard fresh.name == Self.fullMacModeName else {
-                return interactionReceipt(
+                return refuse(interactionReceipt(
                     current, action: action, status: "needs_glass",
                     posture: fresh, surface: surface, dataRoot: dataRoot,
                     extra: ["reason": .string(
@@ -326,6 +327,45 @@ extension AppToolExecutor {
                         + "Full Mac lets the agent make that call. This Mac is in \(fresh.name), "
                         + "so the person answers this card on the glass."
                     )]
+                ))
+            }
+        }
+        return .success(CardPlan(appModel: appModel, dataRoot: dataRoot, sessionID: sessionID, current: current,
+                                 posture: effective, route: route, value: value, choice: choice))
+    }
+
+    /// One card action (`runFolded`): the door's card.answer, card.not_now and
+    /// card.try_again. `cardGate` has
+    /// every check first; what is left is the answer itself, and the Full
+    /// Mac re-check at the mutation.
+    @MainActor
+    func runCardAction(input: [String: JSONValue], surface: String) async -> JSONValue {
+        let plan: CardPlan
+        switch await cardGate(input: input, surface: surface) {
+        case .failure(let refusal): return refusal.answer
+        case .success(let ready): plan = ready
+        }
+        let (appModel, dataRoot, sessionID, current) = (plan.appModel, plan.dataRoot, plan.sessionID, plan.current)
+        let (value, choice) = (plan.value, plan.choice)
+        let id = Self.cardID(input)
+        let rawAction = Self.interactionText(input["action"]).lowercased()
+        let action = rawAction.isEmpty ? "primary" : rawAction
+        var effective = plan.posture
+        guard let route = plan.route else {
+            do {
+                let declined = try await interactions.decline(
+                    id: id, sessionID: sessionID,
+                    expectedRevision: current.revision, dataRoot: dataRoot
+                )
+                return interactionReceipt(
+                    declined, action: action, status: "ok",
+                    posture: effective, surface: surface, dataRoot: dataRoot,
+                    extra: continuationExtra(id)
+                )
+            } catch {
+                return Self.interactionFailure(
+                    "not_settled", error.localizedDescription,
+                    extra: ["interaction_id": .string(id)]
                 )
             }
         }
@@ -407,16 +447,14 @@ extension AppToolExecutor {
             selection = connector
 
         case .permissionGrant:
+            // Below Full Mac `cardGate` refused the card by its kind.
             await grantInteractionPermissions(current, appModel: appModel, dataRoot: dataRoot)
+            HarnessDecidedRow.post(requester: "Full Mac", tool: "card.answer \(current.kind.rawValue)",
+                                   sessionID: sessionID, dataRoot: dataRoot)
 
         case .capabilityFlag:
-            // The Full Mac check above ran before `begin`'s transcript I/O,
-            // and the old write then sent back the WHOLE cached multimodal
-            // block — so a posture the person lowered in the meantime still
-            // got the flag through, and any other switch they flipped since
-            // the cache was read was overwritten with the stale value. The
-            // patch is the one field, and the Full Mac check is re-run inside
-            // the same locked generation the patch merges into.
+            // The patch is the one field, and the Full Mac check is re-run
+            // inside the same locked generation the patch merges into.
             guard let flag = InlineInteractionRegistry.capabilityFlags[current.target],
                   Self.selfAdminCapabilityPolicyKeys.contains(flag.policyKey)
             else { break }
@@ -424,6 +462,8 @@ extension AppToolExecutor {
                 policyKey: flag.policyKey, appModel: appModel,
                 dataRoot: dataRoot, logTag: "interaction_act"
             )
+            HarnessDecidedRow.post(requester: "Full Mac", tool: "card.answer \(current.kind.rawValue)",
+                                   sessionID: sessionID, dataRoot: dataRoot)
 
         case .providerKey:
             // Checked with the provider before it is saved, as the card does.
@@ -692,82 +732,56 @@ extension AppToolExecutor {
 
     // MARK: - The app's own composer
 
-    /// One composer verb, receipted like every other quiet write.
-    ///
-    /// `read` is a read and stands behind no posture gate. Everything else
-    /// changes what the person sees, so it stands behind the SAME fresh
-    /// posture gate `app_setting_set` stands behind. There is no verb that
-    /// sets Trust posture — the trust card opens and its word reads, and the
-    /// posture itself stays the person's.
+    /// The composer as it is now, read in process: the door's chat item read.
     @MainActor
-    private func runComposerVerb(input: [String: JSONValue], surface: String) async -> JSONValue {
-        let rawVerb = Self.interactionText(input["verb"]).lowercased()
-        let verb = rawVerb.isEmpty ? "read" : rawVerb
-        guard presentation.composerVerbs.contains(verb) else {
-            return Self.interactionFailure(
-                "unknown_verb",
-                "No composer verb is called that.",
-                extra: [
-                    "requested": .string(rawVerb),
-                    "verbs": .array(presentation.composerVerbs.map { .string($0) }),
-                ]
-            )
-        }
+    func composerRead(sessionId: String) async -> JSONValue {
         guard let appModel = quietHost() else {
             return Self.interactionFailure(
                 "app_window_unavailable",
                 "The app's own composer is not available in this process."
             )
         }
+        var body = await appModel.composerState(sessionId: sessionId)
+        if body["status"] == nil { body["status"] = .string("ok") }
+        body["target"] = .string("composer")
+        body["verb"] = .string("read")
+        body["note"] = .string(
+            "Read from the live composer's own state in process — no accessibility round "
+            + "trip, and nothing was brought forward or clicked.")
+        return .object(body)
+    }
 
-        if verb == "read" {
-            var body = await appModel.composerState()
-            body["status"] = .string("ok")
-            body["target"] = .string("composer")
-            body["verb"] = .string("read")
-            body["note"] = .string(
-                "Read from the live composer's own state in process — no accessibility round "
-                + "trip, and nothing was brought forward or clicked.")
-            return .object(body)
+    /// One composer action (`runFolded`): Safe has already refused it unless
+    /// it runs in Safe (check_updates, which changes nothing; installing is
+    /// User's). The posture is read again for the receipt and the attachment
+    /// fence; the screen, sound and User's-draft fences are the app's.
+    @MainActor
+    func runComposerAction(
+        verb: String, input: [String: JSONValue], surface: String, host appModel: any QuietToolHost
+    ) async -> JSONValue {
+        let sessionId = Self.interactionText(input["session_id"])
+        let posture: QuietPosture?
+        let attachments: [URL]
+        switch await composerGate(verb: verb, input: input, host: appModel) {
+        case .failure(let refusal): return refusal.answer
+        case .success(let ready): (posture, attachments) = ready
         }
-
-        guard let posture = await Self.freshQuietPosture(
-            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        ) else {
-            return Self.interactionFailure(
-                "trust_mode_unreadable",
-                "The saved Trust policy does not say which mode this Mac is in, so nothing is "
-                + "changed. The person can set the mode in Trust."
-            )
-        }
-        guard posture.changesAllowed else {
-            return Self.interactionFailure(
-                "trust_mode_read_only",
-                "Working the composer is a write, and \(posture.name) is the posture that changes "
-                + "nothing at all — the person's standing choice, and only they lift it.",
-                extra: ["trust_mode": .string(posture.name)]
-            )
-        }
-
+        let reachesUser = await Self.reachesUser(surface: surface, fullMac: posture?.name == Self.fullMacModeName,
+                                               dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let outcome = await appModel.runComposer(
             verb: verb,
             value: Self.interactionText(input["value"]),
-            choice: Self.interactionText(input["choice"])
+            choice: Self.interactionText(input["choice"]),
+            sessionId: sessionId,
+            attachments: attachments,
+            reachesUser: reachesUser,
+            turnSessionId: Self.interactionText(input["__session_id"])
         )
-        if let refusal = outcome.refusal {
-            return Self.interactionFailure(
-                refusal.reason, refusal.detail,
-                extra: [
-                    "target": .string("composer"),
-                    "verb": .string(verb),
-                    "element": .string(outcome.element),
-                ]
-            )
-        }
+        if let refusal = Self.composerFailure(outcome, verb: verb) { return refusal }
         // The receipt names the element acted on, and carries the composer's
         // state after the write — the same trail app_page_read page=chat now
         // shows, out of the same live objects.
-        var body = await appModel.composerState()
+        var body = await appModel.composerState(sessionId: sessionId)
         body["status"] = .string("ok")
         body["target"] = .string("composer")
         body["verb"] = .string(verb)
@@ -777,7 +791,7 @@ extension AppToolExecutor {
         if verb == "set_page", let page = presentation.currentPage {
             body["showing_page"] = .string(page.id)
         }
-        body["trust_mode"] = .string(posture.name)
+        if let posture { body["trust_mode"] = .string(posture.name) }
         body["surface"] = .string(surface)
         body["decided_by"] = .string("agent")
         body["note"] = .string(
@@ -785,6 +799,119 @@ extension AppToolExecutor {
             + "window shows it now. No accessibility round trip, nothing brought forward, and no "
             + "click was synthesized.")
         return .object(body)
+    }
+
+    /// Every check that refuses a composer action before it runs: the
+    /// posture, a file outside the read_file fence, and the app's own fences
+    /// (User's screen, his ears, his draft). Reads only, so the door's preview
+    /// asks it too and refuses what the real call would; the real call meets
+    /// the same app fences first inside `runComposer`.
+    @MainActor
+    func composerRefusal(verb: String, input: [String: JSONValue], surface: String, host: any QuietToolHost) async -> JSONValue? {
+        let posture: QuietPosture?
+        switch await composerGate(verb: verb, input: input, host: host) {
+        case .failure(let refusal): return refusal.answer
+        case .success(let ready): posture = ready.0
+        }
+        let reachesUser = await Self.reachesUser(surface: surface, fullMac: posture?.name == Self.fullMacModeName,
+                                               dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        return host.composerFence(
+            verb: verb, value: Self.interactionText(input["value"]), sessionId: Self.interactionText(input["session_id"]),
+            reachesUser: reachesUser,
+            turnSessionId: Self.interactionText(input["__session_id"])
+        ).flatMap { Self.composerFailure($0, verb: verb) }
+    }
+
+    /// The posture (nil for check_updates, which stands behind none) and
+    /// the fenced attachments, or what refused them.
+    @MainActor
+    private func composerGate(
+        verb: String, input: [String: JSONValue], host: any QuietToolHost
+    ) async -> Result<(QuietPosture?, [URL]), GateRefusal> {
+        let dataRoot = host.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        var posture: QuietPosture?
+        if verb != "check_updates" {
+            guard let fresh = await Self.freshQuietPosture(dataRoot: dataRoot) else {
+                return .failure(GateRefusal(answer: Self.interactionFailure(
+                    "trust_mode_unreadable",
+                    "The saved Trust policy does not say which mode this Mac is in, so nothing is "
+                    + "changed. The person can set the mode in Trust."
+                )))
+            }
+            guard fresh.changesAllowed else {
+                return .failure(GateRefusal(answer: Self.interactionFailure(
+                    "trust_mode_read_only",
+                    "Working the composer is a write, and \(fresh.name) is the posture that changes "
+                    + "nothing at all — the person's standing choice, and only they lift it.",
+                    extra: ["trust_mode": .string(fresh.name)]
+                )))
+            }
+            posture = fresh
+        }
+        var attachments: [URL] = []
+        for raw in Self.attachmentPaths(input["attachments"]) {
+            switch await Self.fencedAttachment(raw, fullMac: posture?.name == Self.fullMacModeName, dataRoot: dataRoot) {
+            case .success(let file): attachments.append(file)
+            case .failure(let refusal):
+                return .failure(GateRefusal(answer: Self.interactionFailure(
+                    refusal.reason, refusal.detail,
+                    extra: ["target": .string("composer"), "verb": .string(verb), "attachment": .string(raw)]
+                )))
+            }
+        }
+        return .success((posture, attachments))
+    }
+
+    private static func composerFailure(_ outcome: QuietComposerOutcome, verb: String) -> JSONValue? {
+        outcome.refusal.map { refusal in
+            interactionFailure(
+                refusal.reason, refusal.detail,
+                extra: [
+                    "target": .string("composer"),
+                    "verb": .string(verb),
+                    "element": .string(outcome.element),
+                ]
+            )
+        }
+    }
+
+    private struct AttachmentRefusal: Error { let reason: String; let detail: String }
+
+    private static func attachmentPaths(_ value: JSONValue?) -> [String] {
+        switch value {
+        case .string(let one)?: return [one].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        case .array(let many)?: return many.map(interactionText).filter { !$0.isEmpty }
+        default: return []
+        }
+    }
+
+    /// The fence `read_file` keeps, for a file the agent attaches: it must sit
+    /// in a Trust workspace root unless this Mac is in Full Mac. A relative
+    /// path is read against her workspace, as `read_file` reads it.
+    private static func fencedAttachment(
+        _ raw: String, fullMac: Bool, dataRoot: URL
+    ) async -> Result<URL, AttachmentRefusal> {
+        let expanded = HomePath.expand(raw)
+        let file = (expanded.hasPrefix("/")
+            ? URL(fileURLWithPath: expanded)
+            : NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot).appendingPathComponent(expanded))
+            .standardizedFileURL.resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: file.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            return .failure(.init(reason: "attachment_missing",
+                detail: "No file is at \(file.path). Check the path with app files.list, then try again."))
+        }
+        if fullMac { return .success(file) }
+        guard let policy = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked() else {
+            return .failure(.init(reason: "trust_mode_unreadable",
+                detail: "The saved Trust policy could not be read, so no file was attached. The person can check Trust."))
+        }
+        guard SwiftNativeSecurityCenter.isInsideTrustedWorkspace(file, policy: policy, dataRoot: dataRoot) else {
+            return .failure(.init(reason: "attachment_outside_workspace",
+                detail: "\(file.path) is outside your Trust workspace folders, the same fence app files.read keeps. "
+                + "Ask User to attach it himself, or to add its folder to the workspace roots in Trust."))
+        }
+        return .success(file)
     }
 
     // MARK: - Answers
@@ -797,7 +924,8 @@ extension AppToolExecutor {
             "reason": .string(reason),
             "detail": .string(detail),
         ]
-        for (key, value) in extra { body[key] = value }
+        // The code, status and detail stand: extra never overwrites them.
+        body.merge(extra) { own, _ in own }
         return .object(body)
     }
 

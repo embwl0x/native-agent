@@ -346,7 +346,10 @@ extension CognitiveSubstrate {
         // show an undertone that had drifted without ever saying whether an
         // experience did it or time did. Defaulted so every existing caller
         // compiles unchanged; each is named at its own call site.
-        source: String = "experience"
+        source: String = "experience",
+        // Phase 5 B0: only HER updates are undoable — her reflection and her
+        // dream. A view User settled is his, and is never recorded.
+        undoable: Bool = false
     ) async -> Bool {
         guard configuration.enabled, configuration.affectEnabled, tone != 0 else { return true }
         let previousDisposition = disposition
@@ -381,6 +384,11 @@ extension CognitiveSubstrate {
         // produced" can never disagree — the reason the dream sink can retry
         // its residue without nudging her a second time.
         if let dreamNight { dreamDispositionNight = dreamNight }
+        // Phase 5 B0: a newer revision for the maintenance rollback guard, so a
+        // maintenance commit that fails while this write is in flight cannot
+        // restore its older snapshot over this nudge.
+        dirtyRevision &+= 1
+        let written = disposition
         do {
             try await persistArtifactChecked(
                 kind: "disposition",
@@ -394,8 +402,18 @@ extension CognitiveSubstrate {
                 // A3 sweep — else a same-day reflection would drop the claim.
                 payload: dispositionArtifactPayload(at: now)
             )
+            if undoable { await recordUndo(key: "disposition", what: "undertone nudge: \(source)",
+                             previous: .object([
+                                 "valence": .double(previousDisposition.valence),
+                                 "updatedAt": .double(previousDisposition.updatedAt.timeIntervalSince1970),
+                             ]),
+                             stamp: Self.undoStamp(written)) }
             return true
         } catch {
+            // Phase 5 B0: a later writer already built on this value while the
+            // write was suspended; its own write carries it. Roll back only what
+            // is still ours.
+            guard disposition == written else { return false }
             // 2026-09-06: nothing reached disk, so nothing may stay in memory.
             // A retained nudge made a same-process retry believe the night was
             // already integrated while the store held the old undertone.
@@ -510,7 +528,7 @@ extension CognitiveSubstrate {
         let dispositionPersisted = dreamDispositionNight == night
             ? true
             : await integrateDisposition(
-                tone: tone, at: now, dreamNight: night, source: "dream \(night)")
+                tone: tone, at: now, dreamNight: night, source: "dream \(night)", undoable: true)
         // Item 7 (2026-09-02) — RESIDUE. The dream already crosses here exactly
         // once per committed dream, so this is the honest mint site and no new
         // wire is needed. See `mintDreamResidue`.

@@ -687,22 +687,31 @@ public actor MacIntegrationPermissionStore {
     }
 
     /// Called only after strict document/receipt validation. Legacy stores did
-    /// not record additive-vs-replacement intent, so only a changed human axis
-    /// establishes an override. A default false left untouched by a read card
-    /// must not be mistaken for an explicit revocation. On the next normal
-    /// mutation this migration is persisted before receipts can rotate away.
+    /// not record additive-vs-replacement intent. Supported reads default ON,
+    /// so a saved read-OFF is a revocation even without a receipt. Default
+    /// write-OFF still needs a changed human axis to establish an override.
+    /// On the next normal mutation this migration is persisted before receipts
+    /// can rotate away.
     private nonisolated static func operatorOverrides(in dict: [String: JSONValue]) -> [String: [String: Bool]] {
         if case .object(let rows)? = dict["_operatorOverrides"] {
-            return rows.reduce(into: [String: [String: Bool]]()) { result, row in
+            var result = rows.reduce(into: [String: [String: Bool]]()) { result, row in
                 guard case .object(let axes) = row.value else { return }
                 result[row.key] = axes.compactMapValues { value -> Bool? in
                     guard case .bool(let bit) = value else { return nil }
                     return bit
                 }
             }
+            for id in MacIntegrationID.all where MacIntegrationID.supportsRead(id) {
+                guard result[id]?["read"] == nil,
+                      case .object(let entry)? = dict[id], entry["read"] == .bool(false) else { continue }
+                result[id, default: [:]]["read"] = false
+            }
+            return result
         }
         var result: [String: [String: Bool]] = [:]
-        guard case .array(let receipts)? = dict["_mutationReceipts"] else { return result }
+        let receipts: [JSONValue]
+        if case .array(let rows)? = dict["_mutationReceipts"] { receipts = rows }
+        else { receipts = [] }
         for receipt in receipts {
             guard case .object(let row) = receipt,
                   case .object(let provenance)? = row["provenance"],
@@ -717,6 +726,10 @@ public actor MacIntegrationPermissionStore {
                 }
             }
             if !axes.isEmpty { result[id] = axes }
+        }
+        for id in MacIntegrationID.all where MacIntegrationID.supportsRead(id) {
+            guard case .object(let entry)? = dict[id], entry["read"] == .bool(false) else { continue }
+            result[id, default: [:]]["read"] = false
         }
         return result
     }

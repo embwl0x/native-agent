@@ -83,24 +83,32 @@ extension WorkshopExecutorLoop {
 
         var hasExactEvidence = hasTextCriterion
         var unsupportedAction = false
+        var writes: [String: [WorkshopExecutionStep]] = [:]
         for step in record.plan {
             let tool = step.toolOrAction.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if tool == "write_file" {
-                switch verifyFileWrite(step: step, record: record, fileManager: fileManager) {
-                case .satisfied:
-                    hasExactEvidence = true
-                    if !methods.contains("file_bytes") { methods.append("file_bytes") }
-                case .failed(let detail):
-                    return WorkshopVerificationRecord(
-                        status: .failed,
-                        checkedAt: checkedAt,
-                        methods: methods + ["file_bytes"],
-                        detail: detail
-                    )
-                case .unverifiable:
-                    unsupportedAction = true
+                guard let path = fileWriteReceiptPath(step: step, record: record) else {
+                    return WorkshopVerificationRecord(status: .failed, checkedAt: checkedAt,
+                        methods: methods + ["file_bytes"], detail: "write_file completed without an exact success receipt")
                 }
+                writes[path, default: []].append(step)
             } else if !isVerificationNeutral(tool: tool) {
+                unsupportedAction = true
+            }
+        }
+        for path in writes.keys.sorted() {
+            switch verifyFileWrites(steps: writes[path]!, path: path, record: record, fileManager: fileManager) {
+            case .satisfied:
+                hasExactEvidence = true
+                if !methods.contains("file_bytes") { methods.append("file_bytes") }
+            case .failed(let detail):
+                return WorkshopVerificationRecord(
+                    status: .failed,
+                    checkedAt: checkedAt,
+                    methods: methods + ["file_bytes"],
+                    detail: detail
+                )
+            case .unverifiable:
                 unsupportedAction = true
             }
         }
@@ -131,15 +139,11 @@ extension WorkshopExecutorLoop {
 
     /// One bounded terminal read. The verifier never persists file content or
     /// the path; it records only the evidence method and verdict.
-    private static func verifyFileWrite(
+    private static func fileWriteReceiptPath(
         step: WorkshopExecutionStep,
-        record: WorkshopExecutionRecord,
-        fileManager: FileManager
-    ) -> FileVerificationVerdict {
-        let resolvedArgs = resolveStepReferences(in: step.args, execution: record)
-        guard case .object(let args) = resolvedArgs,
-              case .string(let content)? = args["content"],
-              let completed = record.stepsCompleted.last(where: { value in
+        record: WorkshopExecutionRecord
+    ) -> String? {
+        guard let completed = record.stepsCompleted.last(where: { value in
                   guard case .object(let object) = value,
                         case .string(let stepID)? = object["step_id"] else { return false }
                   return stepID == step.id
@@ -149,15 +153,30 @@ extension WorkshopExecutorLoop {
               case .object(let output)? = completedObject["output"],
               case .bool(true)? = output["ok"],
               case .string(let path)? = output["path"]
-        else { return .failed("write_file completed without an exact success receipt") }
+        else { return nil }
+        return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+    }
 
-        let expected = Data(content.utf8)
+    private static func verifyFileWrites(
+        steps: [WorkshopExecutionStep], path: String,
+        record: WorkshopExecutionRecord, fileManager: FileManager
+    ) -> FileVerificationVerdict {
+        var expected = Data()
+        var append = true
+        for step in steps {
+            guard case .object(let args) = resolveStepReferences(in: step.args, execution: record),
+                  case .string(let content)? = args["content"] else {
+                return .failed("write_file has no exact declared content")
+            }
+            if args["append"] == .bool(true) {
+                expected.append(Data(content.utf8))
+            } else {
+                expected = Data(content.utf8)
+                append = false
+            }
+        }
         let verificationByteLimit = 1_048_576
         guard expected.count <= verificationByteLimit else { return .unverifiable }
-        let append: Bool = {
-            if case .bool(let value)? = args["append"] { return value }
-            return false
-        }()
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue,
               let attributes = try? fileManager.attributesOfItem(atPath: path),

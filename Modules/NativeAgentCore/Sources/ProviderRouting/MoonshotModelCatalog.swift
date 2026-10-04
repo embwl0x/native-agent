@@ -161,7 +161,7 @@ public enum MoonshotModelCatalog {
         dataRoot.appendingPathComponent("providers/moonshot-models-cache.json")
     }
 
-    private static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
+    static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
         guard let data = try? Data(contentsOf: cachePath(dataRoot: dataRoot)),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = root["models"] as? [[String: Any]] else { return nil }

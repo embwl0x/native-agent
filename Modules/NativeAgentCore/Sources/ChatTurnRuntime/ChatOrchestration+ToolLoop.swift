@@ -7,6 +7,11 @@ import MemoryV2
 import ProviderRouting
 import MacIntegration
 import Context
+import MacControl
+import AgentWorkspace
+import ToolRegistry
+import Desk
+import TrustCenter
 
 // MARK: - Tool-dispatch loops
 
@@ -15,98 +20,6 @@ import Context
 // Tool errors remain model-visible feedback. The loop itself lives in
 // ChatOrchestration+StreamingToolLoop.swift; its dispatch, completion, and
 // exhaustion segments are below.
-
-/// `tool_load` mutates the session's authorized loadout during a turn. The
-/// structured loops must append those schemas before the next provider call;
-/// otherwise the model can see the returned schema text but cannot emit a
-/// native tool call until a later user turn. Existing schemas stay in place so
-/// provider aliases already present in the conversation remain stable.
-enum SameTurnToolSchemaRefresh {
-    static func afterLoad(
-        current: [LLMToolSchema],
-        sessionId: String?,
-        tools: any ToolDispatchClient,
-        activeToolsStore: ActiveToolsStore
-    ) async throws -> [LLMToolSchema] {
-        let session = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !session.isEmpty else { return current }
-        // A throw here used to keep the old array, so the loaded tool was
-        // described to the model but never callable. It fails the turn instead.
-        let available: [LLMToolSchema]
-        do {
-            available = try await tools.listAvailableToolSchemas()
-        } catch {
-            try Task.checkCancellation()
-            throw TurnEngineError.toolCatalogLoadFailed(underlying: error)
-        }
-
-        let loadout = try await activeToolsStore.load(sessionId: session)
-        let active = loadout.activeTools.union(LLMCallContext.turnActiveTools ?? [])
-        let allowed = SwiftToolDispatcher.normalModelToolNames(activeTools: active)
-        var known = Set(current.map(\.name))
-        var refreshed = current
-        var additions: [String: LLMToolSchema] = [:]
-        for schema in available where !known.contains(schema.name) {
-            guard schema.name.hasPrefix("mcp__") || allowed.contains(schema.name) else { continue }
-            additions[schema.name] = loadout.pinnedSchemas[schema.name]?.schema(named: schema.name) ?? schema
-            known.insert(schema.name)
-        }
-        // Match turn-start order, including a multi-name load's persisted order.
-        // Catalog enumeration must not reorder these slots on the next turn.
-        let order = SwiftToolDispatcher.canonicalToolOrder(
-            available.map(\.name).filter { additions[$0] != nil },
-            loadOrder: loadout.advertisedLoadOrder
-        )
-        refreshed.append(contentsOf: order.advertised.compactMap { additions[$0] })
-        return refreshed
-    }
-
-    /// PLAN LANE (Anthropic mid-conversation tool changes). The `tools` array
-    /// is TURN-INVARIANT there — growing it mid-turn is exactly the prefix
-    /// rewrite the whole lane exists to stop — so a `tool_load` is expressed
-    /// as a `tool_addition` message instead. Everything the model could load
-    /// is already declared in the array, so this only has to work out which
-    /// declared names became OFFERED, in array order.
-    static func newlyOfferedNames(
-        plan: StructuredToolChangePlan,
-        alreadyOffered: Set<String>,
-        sessionId: String?,
-        activeToolsStore: ActiveToolsStore
-    ) async throws -> [String] {
-        let session = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !session.isEmpty else { return [] }
-        let persisted = try await activeToolsStore.load(sessionId: session).activeTools
-        let active = persisted.union(LLMCallContext.turnActiveTools ?? [])
-        let allowed = SwiftToolDispatcher.normalModelToolNames(activeTools: active)
-        let declared = plan.arrayNames
-        return plan.array.map(\.name).filter {
-            allowed.contains($0) && declared.contains($0) && !alreadyOffered.contains($0)
-        }
-    }
-
-    static let placeOpeningTools: Set<String> = [
-        "workspace", "browser.chrome_navigate", "browser.chrome_acquire",
-    ]
-
-    static func wasRequested(
-        calls: [ParsedToolCall],
-        providerTools: ProviderToolNameMap
-    ) -> Bool {
-        calls.contains { call in
-            let name = CanonicalToolNameDispatcher.canonical(providerTools.internalName(forProviderName: call.name))
-            if name == "tool_load" { return true }
-            // Her-screen Phase 3: opening a place or a page loads its tools
-            // inside the call, so the next provider call must offer them.
-            if placeOpeningTools.contains(name) { return true }
-            guard name == "tool_catalog" || name == "list_tools" else { return false }
-            if call.input["load"] == .bool(true) { return true }
-            if case .string(let raw)? = call.input["load"] {
-                return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true"
-            }
-            return false
-        }
-    }
-}
 
 // MARK: - Lazy tool filtering
 
@@ -135,67 +48,9 @@ extension TurnContext {
             naturalExpressionCue: naturalExpressionCue,
             historyMessages: historyMessages,
             turnVolatileBlock: turnVolatileBlock,
-            historyWindowReceipt: historyWindowReceipt
+            historyWindowReceipt: historyWindowReceipt,
+            preparationMs: preparationMs
         )
-    }
-}
-
-extension SwiftNativeTurnEngine {
-    /// Derive the session's active-tools set (persisted ∪ turn-local; fail
-    /// closed to turn-local only on an empty/nil session) and return `ctx` with
-    /// its toolSchemas lazy-filtered to `alwaysOnCore ∪ active` (MCP schemas
-    /// always pass). Single owner of the `persisted.union(turnActiveTools)`
-    /// derivation + the filter + the rebuild that the structured loop and
-    /// `streamTurn` used to hand-inline. Byte-identical to those inlines.
-    /// `nonisolated` because it only reads the `activeToolsStore` `let`,
-    /// task-locals, and pure statics — callable from `streamTurn`'s nonisolated
-    /// task without an actor hop.
-    nonisolated func lazyFilteredTurnContext(
-        _ ctx: TurnContext,
-        sessionId: String?,
-        pinnedActiveTools: Set<String>? = nil,
-        pinnedContract: SessionToolContract? = nil
-    ) async throws -> TurnContext {
-        // pinnedActiveTools (2026-08-13, turn-context-iteration-cache): the
-        // text-compat marker lane rebuilds context per tool iteration, and a
-        // fresh ActiveToolsStore read here after a mid-turn `tool_load` grows
-        // the tool catalog INSIDE the stable cache-breakpointed system
-        // segment — byte-diff-proven to kill the Anthropic prefix cache for
-        // the rest of the turn (369k cache-creation tokens on one live turn).
-        // A caller that pins passes its turn-start set: the advertised
-        // catalog stays byte-stable for the whole turn. Dispatchability is
-        // NOT reduced — the lazy dispatch gate re-reads the store per call,
-        // and tool_load's result already carries the loaded schemas
-        // (schemas_added), so the model can use a just-loaded tool
-        // immediately. Callers that need next-iteration list refresh pass nil
-        // and keep the store read.
-        //
-        // The CONTRACT is pinned for the whole turn on a pinned lane, exactly
-        // like the active set. Re-reading the store per iteration was a
-        // mid-turn shrink: `tool_unload(A)` (or an idle drop landing between
-        // iterations) removed A's row, so the next iteration advertised a
-        // SHORTER catalog inside the cache-breakpointed stable segment and
-        // killed the prefix for the rest of the turn. Every contract change —
-        // unloads included — now takes effect at the NEXT turn start.
-        let trimmedSession = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let contract: SessionToolContract?
-        let active: Set<String>
-        if let pinnedActiveTools {
-            contract = pinnedContract
-            active = pinnedActiveTools.union(LLMCallContext.turnActiveTools ?? [])
-        } else if !trimmedSession.isEmpty {
-            let loadout = try await activeToolsStore.load(sessionId: trimmedSession)
-            contract = loadout.toolContract
-            active = loadout.activeTools.union(LLMCallContext.turnActiveTools ?? [])
-        } else {
-            contract = nil
-            active = LLMCallContext.turnActiveTools ?? []
-        }
-        return SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
-            to: ctx,
-            activeTools: active,
-            contract: contract
-        ) ?? ctx
     }
 }
 
@@ -214,9 +69,9 @@ extension SwiftNativeTurnEngine {
 
     /// Shared pre-loop context resolution. Prefer a caller-provided context
     /// (e.g. one already threaded with session history); otherwise build a fresh
-    /// per-turn context AND lazy-filter ctx.toolSchemas through the session's
-    /// active-tools set so the no-preBuiltContext path can't expose the full
-    /// eager catalog. Then fire the context-snapshot event.
+    /// per-turn context AND lazy-filter ctx.toolSchemas so the
+    /// no-preBuiltContext path can't expose the full eager catalog. Then fire
+    /// the context-snapshot event.
     func resolveToolLoopContext(
         surface: String,
         userMessage: String,
@@ -242,12 +97,14 @@ extension SwiftNativeTurnEngine {
             userMessage: userMessage,
             personaOverride: nil,
             imageBlocks: [],
-            sessionID: sessionId
+            sessionID: sessionId,
+            offeredToolNames: SwiftToolDispatcher.normalModelToolNames(activeTools: LLMCallContext.turnActiveTools ?? [])
         )
-        // Apply lazy-load filter (C3 shared helper):
-        //   - non-empty sessionId: alwaysOnCore + sessionActive + MCP
-        //   - empty/nil sessionId: alwaysOnCore + MCP only (fail closed)
-        let ctx = try await lazyFilteredTurnContext(rawCtx, sessionId: sessionId)
+        // The one lazy filter: always-on core plus this turn's own scope.
+        let ctx = SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
+            to: rawCtx,
+            activeTools: LLMCallContext.turnActiveTools ?? []
+        ) ?? rawCtx
         Self.fireContextSnapshotEvent(
             surface: surface,
             context: ctx,
@@ -278,9 +135,7 @@ extension SwiftNativeTurnEngine {
         // An assistant row is NEVER blank. A completed turn whose reply trims
         // to nothing persisted an empty bubble under the receipts — the
         // "Looked something up · 8 of 12 failed" card with no sentence beside
-        // it. The streaming lane's empty-reply bounce is capped at two and
-        // accepts the third empty text as final, so a blank still reaches
-        // here; this is the one place every completed turn passes through.
+        // it. Keep this guard at the shared completed-turn boundary too.
         let reply = reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? ToolLoopExhaustion.emptyReply(
                 dispatchCount: dispatches.count,
@@ -289,6 +144,8 @@ extension SwiftNativeTurnEngine {
             : reply
         let recalledIds = ctx.resolvedRecalledIds
         await ctx.fluidContextTurn?.recordOutcome(.completed)
+        await queuePromises(in: reply, dispatches: dispatches, surface: surface)
+        Self.noticeRepeatedWork(dispatches: dispatches, surface: surface, root: remPinsDataRoot)
         // NOT run here (Astra audit 2, finding 4, 2026-09-11): this used to hold
         // the TurnEngineResult — and therefore the caller's assistant-row persist
         // and output milestone — for the whole promotion, 8-10 s on live bridge
@@ -321,6 +178,68 @@ extension SwiftNativeTurnEngine {
         )
     }
 
+    /// Wave 2 #7: work her reply promises for a later turn goes to MY QUEUE,
+    /// in her words, tagged inferred with the sentence it came from
+    /// (`ToolCallParser.crossTurnDeferrals`). Only on the doors people and
+    /// peers talk to her through, and not when she queued a step herself this
+    /// turn. "Once you approve" follows the card this turn filed, if it filed
+    /// one. The turn's steer rides along (`PeerDataTaint.carried`). Inferred
+    /// steps untouched for a week expire here (`MyQueue.expireInferred`).
+    func queuePromises(in reply: String, dispatches: [TurnEngineResult.ToolDispatchRecord], surface: String) async {
+        let doors: Set<String> = ["chat", "mac", "telegram", "slack", "ios", "iphone", "mobile", "icloud", "mac_ios",
+                                  "ios_icloud", "agent-bridge", "claude-bridge", "codex-bridge"]
+        guard let root = remPinsDataRoot else { return }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                                          peerID: ChatToolSessionContext.envelope?.verifiedUserId)
+        // A skill run still stopped as the turn ends waits for her own turn,
+        // the turn's steer with it: its last word this turn is the one that counts.
+        var stopped: [String: String] = [:]
+        for dispatch in dispatches where dispatch.name == "app"
+            && [.string("skill.run"), .string("skill.resume")].contains(dispatch.input["action"]) {
+            guard case .object(let receipt) = dispatch.result else { continue }
+            if case .object(let resume)? = receipt["resume"], case .string(let run)? = resume["run_id"],
+               case .string(let skill)? = receipt["skill"] {
+                let held = if case .array(let items)? = resume["held"] {
+                    items.compactMap { if case .string(let id) = $0 { id } else { nil } }
+                } else { [String]() }
+                let question = if case .string(let text)? = resume["question"] { text } else { "" }
+                stopped[run] = MyQueue.skillRunWords(skill: skill, run: run, question: question, held: held)
+            } else if case .object(let args)? = dispatch.input["args"], case .string(let run)? = args["run_id"] {
+                stopped.removeValue(forKey: run)
+            }
+        }
+        for words in stopped.values.sorted() {
+            do {
+                _ = try await MyQueue.add(DeskStep(words: words, when: "own_turn", peers: steer.sources, elevated: steer.elevated,
+                                                   session: ChatToolSessionContext.verifiedSessionId), store: store)
+            } catch {
+                NSLog("[my-queue] a stopped skill run was not queued: \(error)")
+            }
+        }
+        guard doors.contains(surface.lowercased()),
+              !dispatches.contains(where: { $0.name == "app" && $0.input["action"] == .string("queue.add") }) else { return }
+        do { try await MyQueue.expireInferred(store: store) } catch { NSLog("[my-queue] expiry failed: \(error)") }
+        let promises = ToolCallParser.crossTurnDeferrals(reply)
+        guard !promises.isEmpty else { return }
+        let card = dispatches.last { ChatToolOutcome.isWaitingApproval($0.result) }.flatMap { dispatch -> String? in
+            guard case .object(let object) = dispatch.result,
+                  case .string(let id)? = object["approvalId"] ?? object["approval_id"] else { return nil }
+            return id
+        }
+        for promise in promises {
+            let after = promise.when == "after_card" ? card : nil
+            let when = promise.when == "after_card" && after == nil ? "next_turn" : promise.when
+            do {
+                _ = try await MyQueue.add(DeskStep(words: promise.sentence, when: when, card: after, source: promise.sentence,
+                                                   peers: steer.sources, elevated: steer.elevated,
+                                                   session: ChatToolSessionContext.verifiedSessionId), store: store)
+            } catch {
+                NSLog("[my-queue] a promise was not queued: \(error)")
+            }
+        }
+    }
+
     /// Result of a shared post-dispatch round: `.stopLoop` when the no-progress
     /// guard tripped (caller breaks BEFORE the next-iteration prep, exactly as
     /// the inlined code did), `.continueLoop` otherwise.
@@ -349,12 +268,9 @@ extension SwiftNativeTurnEngine {
         progress: ChatOrchestrationProgressHandler?,
         conversation: inout [LLMMessage],
         dispatches: inout [TurnEngineResult.ToolDispatchRecord],
-        activeToolSchemas: inout [LLMToolSchema],
         providerTools: inout ProviderToolNameMap,
         noProgressGuard: inout ToolLoopNoProgressGuard,
         loopRecoveryReply: inout String?,
-        toolChangePlan: StructuredToolChangePlan? = nil,
-        offeredToolNames: inout Set<String>,
         cancelFlagPath: URL? = nil,
         /// Set on the marker protocol: the round replays as the model's own
         /// text and its results come back as one text message (8b carrier).
@@ -411,10 +327,6 @@ extension SwiftNativeTurnEngine {
             fluidContextTurn: ctx.fluidContextTurn,
             tools: tools,
             progress: progress,
-            // OFFERED != AUTHORIZED != DECLARED. The array declares the whole
-            // session catalog; only the offered set may dispatch, and
-            // SwiftToolDispatcher still gates every one of those.
-            offeredToolNames: toolChangePlan == nil ? nil : offeredToolNames,
             cancelFlagPath: cancelFlagPath,
             neutralizingTextResults: markerCodec != nil
         )
@@ -434,7 +346,6 @@ extension SwiftNativeTurnEngine {
                     toolName: iterationRecords[resultIndex].name,
                     ok: !isError,
                     content: content,
-                    wroteResult: resultIndex < providerCalls.count && providerCalls[resultIndex].wroteResult,
                     to: &carrier
                 )
                 resultIndex += 1
@@ -444,6 +355,50 @@ extension SwiftNativeTurnEngine {
         }
         dispatches.append(contentsOf: iterationRecords)
         ChatTurnExecution.current?.keepTools(iterationRecords)
+        // An app chrome.* call is the Chrome tool it ran, with its args as input.
+        if let stopped = iterationRecords.first(where: {
+            let ran = ToolNameAliases.ranTool($0.name, input: $0.input)
+            return Self.driverTakeoverReceipt($0.result) != nil
+                || (!MacAttentionSessionStore.shared.currentDriverAllowed
+                    && (["act", "go"].contains(ran) || ran.contains("chrome"))
+                    && ChatToolOutcome.wasCancelled($0.result))
+        }) {
+            let stoppedName = ToolNameAliases.ranTool(stopped.name, input: stopped.input)
+            let stoppedInput = ToolNameAliases.ranInput(stopped.name, input: stopped.input)
+            let receipt = Self.driverTakeoverReceipt(stopped.result) ?? [:]
+            let place = [stoppedInput["app"], stoppedInput["target"], stoppedInput["url"]]
+                .compactMap { if case .string(let value)? = $0 { value } else { nil } }
+                .joined(separator: " · ")
+            var lines = ["I stopped because you took control of the Mac."]
+            if !place.isEmpty { lines.append("Stopped at: " + place + ".") }
+            if case .object(let result) = stopped.result, case .string(let text)? = result["text"] {
+                lines.append(String(text.prefix(1_600)))
+            }
+            for (key, label) in [("failed_step", "Stopped at step"), ("steps_completed", "Steps completed"), ("steps_total", "Steps requested"), ("repeat_completed", "Attempts completed"), ("posted_events", "Input events sent"), ("characters_sent", "Characters sent"), ("requested_events_emitted", "Gesture events sent"), ("recovery_events_emitted", "Held inputs released"), ("gesture", "Gesture"), ("outcome", "Outcome")] {
+                if let value = receipt[key], value != .null {
+                    if let data = try? value.serializedData(pretty: false), let text = String(data: data, encoding: .utf8) {
+                        lines.append(label + ": " + text)
+                    }
+                }
+            }
+            if stoppedName.contains("chrome") {
+                let lease: String? = if case .string(let value)? = receipt["leaseId"] ?? stoppedInput["lease_id"] { value } else { nil }
+                if let page = ChromePageMirror.page(lease: lease, session: sessionId) {
+                    lines.append("Chrome page: " + page.title + " · " + page.url)
+                    let node = receipt["nodeId"] ?? receipt["targetNodeId"] ?? stoppedInput["node_id"]
+                    if (receipt["snapshotId"] ?? stoppedInput["snapshot_id"]) == .string(page.snapshotID),
+                       case .string(let id)? = node, let target = page.rows.first(where: { $0.node == id }) {
+                        lines.append("Chrome target: " + target.label)
+                    }
+                }
+                lines.append("Chrome action: " + stoppedName.replacingOccurrences(of: "browser.chrome_", with: ""))
+            }
+            let handback = String(lines.joined(separator: "\n").prefix(2_200))
+                + "\nInput already sent may have changed the app; unfinished work remains unverified. Under Full Mac I'll pick it up when you ask; otherwise I'll wait until you return Mac control with Let agent use Mac."
+            loopRecoveryReply = handback
+            await progress?(.notice(kind: "mac_handback", text: handback))
+            return .stopLoop
+        }
         if surface == "bot", iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
             ChatTurnExecution.current?.waitForApproval()
         }
@@ -491,63 +446,24 @@ extension SwiftNativeTurnEngine {
             // survived, never an inference about the agent's arguments.
             loopRecoveryReply = visible
         }
-        // Item 5 (third conversation pass): a message the person sent while
-        // this turn was working is delivered HERE — the next safe boundary,
-        // after the round's results and before the model picks its next action
-        // — as plain text in the same tool_result turn (the same shape the
-        // no-progress feedback above uses, so no role alternation changes).
-        // Empty in the ordinary case: one actor hop and nothing appended.
-        //
-        // NOT when this round already chose a terminal reply: draining takes the
-        // offer out of BOTH queues, and the loop stops below without another
-        // provider call — so the message would be neither read by the model nor
-        // left to run as its own turn. Left pending, the close/cleanup requeues
-        // it, which is the lossless contract `ChatTurnSteering` documents.
-        if loopRecoveryReply == nil, let sessionId, !sessionId.isEmpty {
-            for offer in await ChatTurnSteering.shared.drain(sessionId: sessionId) {
-                toolResultBlocks.append(.text(ChatTurnSteering.deliveryText(offer.text)))
-            }
-        }
         conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
         LocalToolImage.boundConversation(&conversation)
         if loopRecoveryReply != nil { return .stopLoop }
-        if SameTurnToolSchemaRefresh.wasRequested(calls: providerCalls, providerTools: providerTools) {
-            if let toolChangePlan {
-                // Same SEMANTICS as the refresh below — a tool loaded mid-turn
-                // is usable on the very next provider call — expressed without
-                // touching the array. The message goes after the tool_result
-                // user message (a legal position for a mid-conversation system
-                // message) and ends the array, so it renders on the next call.
-                let newlyOffered = try await SameTurnToolSchemaRefresh.newlyOfferedNames(
-                    plan: toolChangePlan,
-                    alreadyOffered: offeredToolNames,
-                    sessionId: sessionId,
-                    activeToolsStore: activeToolsStore
-                )
-                if !newlyOffered.isEmpty {
-                    offeredToolNames.formUnion(newlyOffered)
-                    // Validated by construction: every name came out of the
-                    // array, and the map was built from that same array.
-                    let providerNames = newlyOffered.compactMap {
-                        providerTools.providerName(forInternalName: $0)
-                    }
-                    if let message = ConversationPrefixSeeding.toolChangeMessage(
-                        additions: providerNames, removals: []
-                    ) {
-                        conversation.append(message)
-                    }
-                }
-            } else {
-                activeToolSchemas = try await SameTurnToolSchemaRefresh.afterLoad(
-                    current: activeToolSchemas,
-                    sessionId: sessionId,
-                    tools: tools,
-                    activeToolsStore: activeToolsStore
-                )
-                providerTools = ProviderToolNameMap(activeToolSchemas)
+        return .continueLoop(madeProgress: madeProgress)
+    }
+
+    private static func driverTakeoverReceipt(_ value: JSONValue, depth: Int = 0) -> [String: JSONValue]? {
+        guard depth < 5, case .object(let object) = value else { return nil }
+        if object["status"] == .string("yielded_to_user")
+            || { if case .string(let error)? = object["error"] { error.hasPrefix("human_takeover:") } else { false } }() {
+            return object
+        }
+        for key in ["detail", "output", "result"] {
+            if let child = object[key], let receipt = driverTakeoverReceipt(child, depth: depth + 1) {
+                return receipt.merging(object.filter { $0.key != key }) { current, _ in current }
             }
         }
-        return .continueLoop(madeProgress: madeProgress)
+        return nil
     }
 
     /// Shared exhaustion tail for a loop that ran out of iterations without a
@@ -644,7 +560,7 @@ extension SwiftNativeTurnEngine {
         }
         await ctx.fluidContextTurn?.recordRetry()
         await ctx.fluidContextTurn?.recordOutcome(.abandoned)
-        await observeMemoryPromotion(
+        let promotionTicket = deferMemoryPromotion(
             userMessage: userMessage,
             assistantMessage: final,
             toolDispatches: dispatches,
@@ -661,7 +577,8 @@ extension SwiftNativeTurnEngine {
             elapsedMs: elapsedMs,
             rawLLMResponse: lastRawResponse,
             providerCallCount: providerCallCount,
-            completionState: .incomplete
+            completionState: .incomplete,
+            memoryPromotionTicket: promotionTicket
         )
     }
 

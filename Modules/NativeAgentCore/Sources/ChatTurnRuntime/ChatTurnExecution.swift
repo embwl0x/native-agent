@@ -5,6 +5,7 @@ import NativeAgentShared
 import ProviderRouting
 import PersistenceCore
 import CognitiveSubstrate
+import StandingBots
 
 extension SwiftNativeChatOrchestrationClient {
     /// Explicit picker and one aggregate output allowance, scoped to this turn.
@@ -14,6 +15,7 @@ extension SwiftNativeChatOrchestrationClient {
     /// names. Nil is the ordinary case.
     public func chat(message: String, sessionId: String, choice: ProviderTurnChoice?,
                      tokenLimit: Int, surface: String,
+                     fileAccess: String = "auto", suppressUserAppend: Bool = false,
                      mechanicalRow: CognitiveMechanicalRowKind? = nil,
                      progress: ChatOrchestrationProgressHandler? = nil) async throws -> ChatResponse {
         guard tokenLimit > 0 else { throw ChatOrchestrationError.underlying("The turn token limit must be positive.") }
@@ -25,12 +27,12 @@ extension SwiftNativeChatOrchestrationClient {
         try await LLMCallContext.$toolCapabilityNote.withValue({ execution.keepCapabilityNote($0) }) {
             do {
                 var response = try await chat(message: message, sessionId: sessionId, model: choice?.model ?? "",
-                    reasoningEffort: choice?.reasoningEffort ?? "", fileAccess: "auto", attachments: [], persona: nil,
-                    surface: surface, suppressUserAppend: false, progress: progress)
+                    reasoningEffort: choice?.reasoningEffort ?? "", fileAccess: fileAccess, attachments: [], persona: nil,
+                    surface: surface, suppressUserAppend: suppressUserAppend, progress: progress)
                 response.runtimeStatus = execution.waitingForApproval ? "waiting for approval"
                     : execution.waitingForInteraction ? "waiting on you"
                     : budget.exhausted || response.runtimeStatus == "interrupted" ? "interrupted" : "completed"
-                response.statusDetail = execution.waitingForApproval ? "Approval is available in Approvals."
+                response.statusDetail = execution.waitingForApproval ? "Answer the approval card in this conversation."
                     : execution.waitingForInteraction
                         ? (execution.waitingInteraction?.title).map { "\($0) — answer it in the conversation." }
                             ?? "Waiting on your answer in the conversation."
@@ -39,7 +41,9 @@ extension SwiftNativeChatOrchestrationClient {
                 response.pendingApprovalID = execution.pendingApprovalID
                 return response
             } catch {
-                let partial = ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(budget.partialReply))
+                let partial = BotRunner.conditionReply(
+                    ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(budget.partialReply)),
+                    sessionID: sessionId)
                 let artifacts = ChatGeneratedImageArtifacts.attachments(from: execution.toolRecords, dataRoot: dataRoot)
                 // Preserve already-produced work even when the provider throws.
                 // The ordinary transcript and index remain the sole chat owners.

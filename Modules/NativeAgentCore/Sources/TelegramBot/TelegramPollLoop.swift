@@ -60,11 +60,27 @@ public struct TelegramPollLoop: LoopRunner {
     public static func dropsForMissingMention(
         requireMention: Bool,
         chatId: Int,
-        text: String
+        text: String,
+        entities: JSONValue? = nil,
+        botUsername: String? = nil
     ) -> Bool {
-        requireMention && chatId < 0 && !text.contains("@")
+        guard requireMention && chatId < 0 else { return false }
+        guard let botUsername, case .array(let entities)? = entities else { return true }
+        let source = text as NSString
+        return !entities.contains { entity in
+            guard case .object(let fields) = entity,
+                  _tgJSONString(fields["type"]) == "mention",
+                  let offset = _tgJSONInt(fields["offset"]),
+                  let length = _tgJSONInt(fields["length"]),
+                  offset >= 0, length > 0, offset <= source.length,
+                  length <= source.length - offset else { return false }
+            return source.substring(with: NSRange(location: offset, length: length))
+                .compare("@\(botUsername)", options: .caseInsensitive) == .orderedSame
+        }
     }
     let offsetURL: URL
+    let legacyOffsetURL: URL
+    var botIdentity: String { String(token.prefix { $0 != ":" }) }
     // 2026-09-06: every SEND carries a TelegramDestination so a forum topic's
     // reply lands in that topic. Edits and callback answers are addressed by
     // message id and keep taking a bare chat id — Telegram takes no thread on
@@ -106,6 +122,7 @@ public struct TelegramPollLoop: LoopRunner {
     let chatRetryDelayNanoseconds: UInt64
     let typingRefreshNanoseconds: UInt64
     let turnCoordinator: TelegramTurnCoordinator
+    let revokeDriverControl: @Sendable () async -> Void
     // chat-smoothness phase 5: growing-draft transport + cadence.
     let sendMessageReturningId: @Sendable (_ token: String, _ destination: TelegramDestination, _ text: String) async throws -> Int
     let sendRichMessageDraft: (@Sendable (
@@ -157,6 +174,7 @@ public struct TelegramPollLoop: LoopRunner {
     public init(
         interval: TimeInterval = 2,
         token: String,
+        revokeDriverControl: @escaping @Sendable () async -> Void,
         allowedChatIds: Set<Int64> = [],
         allowedUserIds: Set<Int64> = [],
         requireMention: Bool = false,
@@ -211,6 +229,7 @@ public struct TelegramPollLoop: LoopRunner {
     ) {
         self.interval = interval
         self.token = token
+        self.revokeDriverControl = revokeDriverControl
         self.allowedChatIds = allowedChatIds
         self.allowedUserIds = allowedUserIds
         self.requireMention = requireMention
@@ -218,7 +237,11 @@ public struct TelegramPollLoop: LoopRunner {
         self.session = session
         let resolvedDataRoot = dataRoot ?? Self.inferDataRoot(from: offsetURL)
         self.dataRoot = resolvedDataRoot
-        self.offsetURL = offsetURL
+        self.legacyOffsetURL = offsetURL
+        self.offsetURL = offsetURL.deletingLastPathComponent()
+            .appendingPathComponent("bots", isDirectory: true)
+            .appendingPathComponent(Self.botStorageIdentity(token), isDirectory: true)
+            .appendingPathComponent(offsetURL.lastPathComponent)
         if let legacySendMessage = sendMessage {
             self.sendMessage = { token, destination, text in
                 try await legacySendMessage(token, destination.chatId, text)
@@ -371,7 +394,7 @@ public struct TelegramPollLoop: LoopRunner {
         var saved: String?
         let receipts = (try? await SwiftNativePersistenceCore()
             .readJSONL(telegramDir.appendingPathComponent("receipts.jsonl"))) ?? []
-        let replyKinds: Set<String> = ["reply", "voice_reply", "photo_reply", "error_notice", "empty_reply_notice"]
+        let replyKinds: Set<String> = ["reply", "voice_reply", "photo_reply", "error_notice", "empty_reply_notice", "retry_reply", "empty_retry_notice"]
         let delivered = receipts.contains {
             guard case .object(let row) = $0,
                   case .string(let kind)? = row["kind"] else { return false }
@@ -426,6 +449,12 @@ public struct TelegramPollLoop: LoopRunner {
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
+        do {
+            try await prepareBotIngressStorage()
+        } catch {
+            await recordError(context: "bot_ingress_storage", error: String(describing: error))
+            return .failed(error: "Telegram bot ingress storage unavailable")
+        }
         await repairInterruptedTurnCardsIfNeeded()
         await replayApprovalContinuationsIfNeeded()
         // U5 W-D comms resilience: while a poll-failure backoff window is
@@ -461,6 +490,16 @@ public struct TelegramPollLoop: LoopRunner {
             var reconciled: [TelegramUpdateClaim] = []
             reconciled.reserveCapacity(snapshots.count)
             for claim in snapshots {
+                if claim.phase == .awaitingSpeechPermission {
+                    if voiceTranscriber?.hasSpeechPermission == true {
+                        reconciled.append(try await updateInbox.transition(
+                            updateId: claim.updateId, from: [.awaitingSpeechPermission], to: .pending
+                        ))
+                    } else {
+                        reconciled.append(claim)
+                    }
+                    continue
+                }
                 // A `.processing` claim owned by a turn running in THIS process
                 // is not an orphan: the durable claim stays processing for the
                 // whole turn so a crash leaves recoverable ingress, and this
@@ -590,6 +629,8 @@ public struct TelegramPollLoop: LoopRunner {
             switch claim.phase {
             case .completed, .outcomeUnknown:
                 continue
+            case .awaitingSpeechPermission:
+                continue
             case .processing:
                 // 2026-09-06: a turn running in this process now holds its
                 // claim in `.processing` for the whole turn. Leave that one
@@ -670,6 +711,7 @@ public struct TelegramPollLoop: LoopRunner {
             }
             if let callback = update.callbackQuery,
                await handleApprovalCallback(update: update, callback: callback) {
+                shouldCompleteClaim = false
                 break updateProcessing
             }
             guard let msg = update.message else {
@@ -722,6 +764,27 @@ public struct TelegramPollLoop: LoopRunner {
                 break updateProcessing
             case .allowed:
                 break
+            }
+            // Mention offsets refer to the wire text, never a transcript.
+            // Gate ordinary group traffic before downloading or acknowledging media.
+            let mentionText = msg.text ?? {
+                guard case .object(let extras)? = msg.extras else { return "" }
+                return _tgJSONString(extras["caption"]) ?? ""
+            }()
+            let mentionEntities: JSONValue? = {
+                guard case .object(let extras)? = msg.extras else { return nil }
+                return extras[msg.text == nil ? "caption_entities" : "entities"]
+            }()
+            if (voiceAttachment != nil || !mentionText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")),
+               Self.dropsForMissingMention(
+                requireMention: requireMention,
+                chatId: msg.chatId,
+                text: mentionText,
+                entities: mentionEntities,
+                botUsername: requireMention && msg.chatId < 0 ? await resolveBotUsername() : nil
+               ) {
+                await recordBlocked(reason: "mention_required", update: update, message: msg, text: textFromMessage)
+                break updateProcessing
             }
             if let unsupportedAttachmentKind,
                textFromMessage?.isEmpty != false, voiceAttachment == nil, photoAttachment == nil {
@@ -871,9 +934,9 @@ public struct TelegramPollLoop: LoopRunner {
                         let pending = try await updateInbox.transition(
                             updateId: update.updateId,
                             from: [.processing, .queued],
-                            to: .pending
+                            to: awaitingPermission ? .awaitingSpeechPermission : .pending
                         )
-                        guard pending.phase == .pending else {
+                        guard pending.phase == (awaitingPermission ? .awaitingSpeechPermission : .pending) else {
                             return .failed(error: "Telegram voice update \(update.updateId) could not be released for retry")
                         }
                     } catch {
@@ -926,18 +989,35 @@ public struct TelegramPollLoop: LoopRunner {
                 // The command parser stripped the `@suffix` without reading it,
                 // so `/stop@SomeOtherBot` stopped this agent's own turn. A
                 // command addressed to another bot is dropped here; a bare
-                // `/cmd` and `/cmd@ThisBot` are handled as before, and an
-                // unknown own-identity (getMe failed) stays permissive.
-                if let addressedBot = TelegramCommandRegistry.addressedBotUsername(text: text),
-                   let ownUsername = await resolveBotUsername(),
-                   addressedBot.compare(ownUsername, options: .caseInsensitive) != .orderedSame {
-                    await recordBlocked(
-                        reason: "command_for_other_bot",
-                        update: update,
-                        message: msg,
-                        text: text
-                    )
-                    break updateProcessing
+                // `/cmd` and verified `/cmd@ThisBot` are handled as before.
+                if let addressedBot = TelegramCommandRegistry.addressedBotUsername(text: text) {
+                    guard let ownUsername = await resolveBotUsername() else {
+                        do {
+                            let pending = try await updateInbox.transition(
+                                updateId: update.updateId, from: [.processing, .queued], to: .pending
+                            )
+                            guard pending.phase == .pending else {
+                                await turnCoordinator.endUpdateProcessing(update.updateId)
+                                return .failed(error: "Telegram addressed command could not be retained pending bot identity")
+                            }
+                        } catch {
+                            await turnCoordinator.endUpdateProcessing(update.updateId)
+                            await recordError(context: "command_identity_pending", error: String(describing: error), update: update)
+                            return .failed(error: "Telegram addressed command could not be retained pending bot identity")
+                        }
+                        await turnCoordinator.endUpdateProcessing(update.updateId)
+                        shouldCompleteClaim = false
+                        break updateProcessing
+                    }
+                    if addressedBot.compare(ownUsername, options: .caseInsensitive) != .orderedSame {
+                        await recordBlocked(
+                            reason: "command_for_other_bot",
+                            update: update,
+                            message: msg,
+                            text: text
+                        )
+                        break updateProcessing
+                    }
                 }
                 // 2026-09-06: the command runs in its own task and settles its
                 // own claim there. Handling it inline meant the poll loop waited
@@ -945,7 +1025,7 @@ public struct TelegramPollLoop: LoopRunner {
                 // meant `/restart` armed termination and this claim was marked
                 // completed while the reply was still on the wire. The task owns
                 // both, so nothing after the reply happens before it is out.
-                await runSlashCommandDetached(update: update, message: msg, text: text)
+                await runCommandDetached(update: update, message: msg, text: text)
                 shouldCompleteClaim = false
                 break updateProcessing
             }
@@ -954,19 +1034,15 @@ public struct TelegramPollLoop: LoopRunner {
                 await recordBlocked(reason: "chat_handler_not_configured", update: update, message: msg, text: text)
                 break updateProcessing
             }
-            // requireMention: in group/supergroup chats (negative chat.id),
-            // drop non-mention messages so the bot doesn't reply to every
-            // group line. Private chats (positive chat.id) bypass — every
-            // message is addressed to the bot. Mention proxy: text must
-            // contain "@" (full bot-username verification would need a
-            // getMe() round-trip we don't cache yet).
-            if Self.dropsForMissingMention(
-                requireMention: requireMention,
-                chatId: msg.chatId,
-                text: text
-            ) {
-                FileHandle.standardError.write(Data("TelegramPollLoop: dropping update \(update.updateId) — requireMention=true, no @-mention in group chat \(msg.chatId)\n".utf8))
-                await recordBlocked(reason: "mention_required", update: update, message: msg, text: text)
+            var handoffText = text
+            if text.contains("@"), let username = await resolveBotUsername() {
+                handoffText = text.split(whereSeparator: { $0.isWhitespace })
+                    .filter { String($0).compare("@\(username)", options: .caseInsensitive) != .orderedSame }
+                    .joined(separator: " ")
+            }
+            if UserMessageIntentSignals.isControlHandoff(handoffText) {
+                await runCommandDetached(update: update, message: msg, text: handoffText)
+                shouldCompleteClaim = false
                 break updateProcessing
             }
             if let unsupportedAttachmentKind {
@@ -1113,6 +1189,23 @@ public struct TelegramPollLoop: LoopRunner {
             // update. Freeze that mutable local before it crosses the
             // coordinator's @Sendable task boundary.
             let turnImageAttachments = stagedImageAttachments
+            // Pin before admission: card delivery and queue waits must not let
+            // a later /new or /resume redirect this message.
+            let turnSessionId: String
+            do {
+                turnSessionId = try await TelegramSessionStore(dataRoot: dataRoot)
+                    .activeSessionId(destination: msg.destination)
+            } catch {
+                await recordError(context: "turn_session", error: String(describing: error), update: update, message: msg, text: text)
+                let notice = Self.chatErrorNotice(for: error)
+                do {
+                    try await sendMessage(token, msg.destination, notice)
+                    await recordReceipt(kind: "error_notice", update: update, message: msg, text: text, reply: notice)
+                } catch {
+                    await recordError(context: "send_session_error_notice", error: String(describing: error), update: update, message: msg, text: text)
+                }
+                break updateProcessing
+            }
             let turnOperation: @Sendable (UUID) async -> Void = { turnId in
                     if let queuedMessageId = claim.queueAcknowledgementMessageId {
                         let preview = String(text.replacingOccurrences(of: "\n", with: " ").prefix(120))
@@ -1203,7 +1296,8 @@ public struct TelegramPollLoop: LoopRunner {
                         attachments: turnImageAttachments,
                         progress: capturingProgress,
                         replyTo: msg.replyTo,
-                        fromUserId: msg.fromUserId
+                        fromUserId: msg.fromUserId,
+                        sessionId: turnSessionId
                     )
                     try Task.checkCancellation()
                     if !reply.isEmpty {
@@ -1396,7 +1490,7 @@ public struct TelegramPollLoop: LoopRunner {
                 }
                 shouldCompleteClaim = false
             }
-            await turnCoordinator.recordLastUserMessage(destination: msg.destination, text: text)
+            await turnCoordinator.recordLastUserMessage(destination: msg.destination, text: text, message: msg)
             }
             guard shouldCompleteClaim else { continue }
             // 2026-09-06: the claim settles here, so no turn owns it in this

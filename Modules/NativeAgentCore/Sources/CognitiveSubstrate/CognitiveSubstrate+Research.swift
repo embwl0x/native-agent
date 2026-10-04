@@ -37,7 +37,7 @@ extension CognitiveSubstrate {
         guard configuration.enabled, configuration.observatoryEnabled else { return nil }
         let now = dependencies.now()
         let metrics = await experimentMetrics(kind: kind)
-        let score = experimentScore(kind: kind, metrics: metrics)
+        guard let score = experimentScore(kind: kind, metrics: metrics) else { return nil }
         let notes = experimentNotes(kind: kind)
         let key = experimentReproducibilityKey(kind: kind, seed: seed, metrics: metrics)
         let result = CognitiveExperimentResult(
@@ -57,7 +57,11 @@ extension CognitiveSubstrate {
     }
 
     public func researchExperimentSnapshot() async -> [CognitiveExperimentResult] {
-        experimentResults.values.sorted { lhs, rhs in
+        // Older stores can contain scores from samplers that never measured
+        // their claimed outcome. Preserve the bytes without presenting them.
+        experimentResults.values.filter {
+            experimentScore(kind: $0.kind, metrics: $0.metrics) != nil
+        }.sorted { lhs, rhs in
             if lhs.generatedAt != rhs.generatedAt { return lhs.generatedAt > rhs.generatedAt }
             return lhs.id.uuidString < rhs.id.uuidString
         }
@@ -157,23 +161,8 @@ extension CognitiveSubstrate {
                 "workspace": Double((await workspaceSnapshot()).items.count),
                 "timeline": Double(developmentalTimeline.count),
             ]
-        case .providerSwap:
-            let capsule = await compileCapsule(CognitiveCapsuleRequest(
-                surface: "provider_swap_experiment",
-                userMessage: "provider swap continuity experiment",
-                mode: .inspectOnly,
-                maximumCharacters: 800
-            ))
-            let stateDigest = Double(Int(stableDigest(capsule.combined)) ?? 0) / 1_000_000_000_000
-            return [
-                "stateDigest": stateDigest,
-                "providerVariants": 2,
-                "reflectionSurfaceConfigured": configuration.reflectionSurface.isEmpty ? 0 : 1,
-            ]
-        case .selfModelAccuracy:
-            return [
-                "schemaReviewItems": Double(schemaProposals.count),
-            ]
+        case .providerSwap, .selfModelAccuracy:
+            return [:]
         case .ablation:
             return [
                 "ablationCount": Double(ablations.count),
@@ -183,15 +172,13 @@ extension CognitiveSubstrate {
         }
     }
 
-    private func experimentScore(kind: CognitiveExperimentKind, metrics: [String: Double]) -> Double {
+    private func experimentScore(kind: CognitiveExperimentKind, metrics: [String: Double]) -> Double? {
         switch kind {
         case .continuity:
             return clamp((metrics["nodes"] ?? 0) > 0 ? 1 : 0.5)
-        case .providerSwap:
-            return clamp((metrics["providerVariants"] ?? 0) >= 2 ? 1 : 0)
-        case .selfModelAccuracy:
-            let unresolved = metrics["proposedIdentity"] ?? 0
-            return clamp(1 - min(1, unresolved / 10))
+        case .providerSwap, .selfModelAccuracy:
+            // Neither provider agreement nor self-model accuracy is measured.
+            return nil
         case .ablation:
             return clamp((metrics["ablationCount"] ?? 0) > 0 ? 1 : 0.5)
         }
@@ -201,10 +188,8 @@ extension CognitiveSubstrate {
         switch kind {
         case .continuity:
             return ["snapshot counts provide continuity baseline"]
-        case .providerSwap:
-            return ["compares provider variants without making provider calls"]
-        case .selfModelAccuracy:
-            return ["identity remains proposal-only and rejection-aware"]
+        case .providerSwap, .selfModelAccuracy:
+            return []
         case .ablation:
             return ["ablation map is explicit and exportable"]
         }

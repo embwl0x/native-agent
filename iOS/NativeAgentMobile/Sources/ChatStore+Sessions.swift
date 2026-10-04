@@ -105,6 +105,7 @@ extension ChatStore {
         cancelSessionSwitch()
         sendTask?.cancel()
         sendTask = nil
+        // Detach observation without discarding an unaccepted signed handoff.
         // Clearing the pending maps alone makes their eventual signed replies
         // look unsolicited. Retire every old correlation first so sessionless
         // stragglers are rejected as well as replies carrying the old session id.
@@ -114,7 +115,7 @@ extension ChatStore {
             .union(canceledPendingIds)
             .union(maxDeltaSeqByCorrelation.keys)
         for correlationID in retiringCorrelations {
-            markICloudReplyResolved(correlationID)
+            markICloudReplyResolved(correlationID, discardRetainedSend: false)
         }
         pendingTimeouts.values.forEach { $0.cancel() }
         pendingTimeouts.removeAll()
@@ -168,13 +169,14 @@ extension ChatStore {
         onSessionChange?()
         sendTask?.cancel()
         sendTask = nil
+        // Detachment retires visible callbacks, not the retained transport queue.
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
             .union(pendingSendArgs.keys)
             .union(timedOutPendingIds.keys)
             .union(canceledPendingIds)
             .union(maxDeltaSeqByCorrelation.keys)
         for correlationID in retiringCorrelations {
-            markICloudReplyResolved(correlationID)
+            markICloudReplyResolved(correlationID, discardRetainedSend: false)
         }
         pendingTimeouts.values.forEach { $0.cancel() }
         pendingTimeouts.removeAll()
@@ -238,8 +240,9 @@ extension ChatStore {
                     self.noteMacPublishedMessageIDs(macMessages)
                     // Prefer the exact session cache and preserve complete local
                     // replies when the Mac publishes a truncated snapshot.
-                    self.messages = self.mergedMacMessagesPreservingPending(
-                        macMessages, replyArrived: false)
+                    if !self.resolvePendingReplyFromMac(macMessages) {
+                        self.messages = self.mergedMacMessagesPreservingPending(macMessages)
+                    }
                     self.persistMessages()
                 } else if case .published(_, let generation) = read,
                           macMessages.isEmpty,

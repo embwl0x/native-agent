@@ -293,10 +293,10 @@ public struct MaintenanceBackgroundWork: Sendable {
             totalOverBudget: report.totalOverBudget,
             truncated: report.truncated,
             depthTruncated: report.depthTruncated,
-            // F1: directory offenders survive the existence filter as-is — a
-            // branch is not a Clean Up target (nothing here ever trashes a
-            // directory), it is the "where did the growth go" line.
-            largeDirectories: report.largeDirectories
+            largeDirectories: report.largeDirectories.filter {
+                FileManager.default.fileExists(
+                    atPath: dataRoot.appendingPathComponent($0.relativePath).path)
+            }
         )
         guard report.tripped else { return true }
         let now = ISO8601DateFormatter().string(from: Date())
@@ -323,7 +323,7 @@ public struct MaintenanceBackgroundWork: Sendable {
         let detail = ("Large files and directories under the app data directory "
             + "(nothing was deleted):\n"
             + lines.joined(separator: "\n")
-            + "\n\nClean Up moves these files to the Trash (recoverable).")
+            + "\n\nClean Up moves only disposable residue to the Trash (recoverable). Other app data is kept.")
         let summary = report.totalOverBudget
             ? "data/ is \(DataRootDiskHygiene.humanSize(report.totalBytes)); "
                 + "\(report.largeFiles.count) large file(s), "
@@ -346,7 +346,7 @@ public struct MaintenanceBackgroundWork: Sendable {
             "related_groups": .array([]),
             "actions": .array([
                 .object(["id": .string("act"), "label": .string("Clean Up"),
-                         "description": .string("Move these files to the Trash")]),
+                         "description": .string("Move disposable residue to the Trash")]),
                 .object(["id": .string("archive"), "label": .string("Archive"),
                          "description": .string("Archive this card")]),
                 .object(["id": .string("dismiss"), "label": .string("Dismiss"),
@@ -372,7 +372,7 @@ public struct MaintenanceBackgroundWork: Sendable {
     }
 
     /// User clicked "Clean Up" on the disk-hygiene card. Re-scans `dataRoot`
-    /// (the card may be up to a day stale), moves the CURRENT offenders to the
+    /// (the card may be up to a day stale), moves only declared residue to the
     /// Trash via `DataRootDiskHygiene.cleanup` (reversible; protected stores
     /// and anything outside the data root are refused), then rewrites the card
     /// with the results, marked read. Throws when there were offenders but
@@ -382,21 +382,24 @@ public struct MaintenanceBackgroundWork: Sendable {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> String {
         let report = DataRootDiskHygiene.scan(dataRoot: dataRoot)
+        let residuePaths = report.largeDirectories
+            .filter { DataRootDiskHygiene.isResidue(relativePath: $0.relativePath) }
+            .map(\.relativePath)
         let now = ISO8601DateFormatter().string(from: Date())
         var lines: [String] = []
         var summary: String
         var nothingMovedError: NSError?
-        if report.largeFiles.isEmpty {
-            summary = "Nothing to clean — no oversized files right now"
-            lines.append("A fresh scan found no oversized files"
+        if residuePaths.isEmpty {
+            summary = "Nothing to clean — no disposable residue right now"
+            lines.append("A fresh scan found no disposable residue. Other app data was kept"
                 + (report.totalOverBudget
                     ? ", but data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes)) "
-                        + "(over the 2GB budget) from many smaller files — worth a look by hand."
+                        + "(over the \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget) — worth a look by hand."
                     : "; data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes))."))
         } else {
             let result = DataRootDiskHygiene.cleanup(
                 dataRoot: dataRoot,
-                relativePaths: report.largeFiles.map(\.relativePath))
+                relativePaths: residuePaths)
             for outcome in result.trashed {
                 lines.append("• Moved to Trash: \(outcome.relativePath) — "
                     + DataRootDiskHygiene.humanSize(outcome.sizeBytes))
@@ -410,14 +413,14 @@ public struct MaintenanceBackgroundWork: Sendable {
                 // throwing (gpt-5.5 review: throwing first left the stale
                 // actionable card up with only an error toast to explain).
                 summary = "Cleanup couldn't move anything — "
-                    + "\(result.skipped.count) file(s) skipped"
+                    + "\(result.skipped.count) item(s) skipped"
                 nothingMovedError = NSError(
                     domain: "NativeAgentSwiftOnly", code: -424,
                     userInfo: [NSLocalizedDescriptionKey:
                         "Disk cleanup could not move anything to the Trash: "
                         + lines.joined(separator: "; ")])
             } else {
-                summary = "Cleaned up \(result.trashed.count) file(s), freed "
+                summary = "Moved \(result.trashed.count) residue item(s) to Trash, totaling "
                     + DataRootDiskHygiene.humanSize(result.freedBytes) + " (in the Trash)"
             }
         }
@@ -532,8 +535,8 @@ private struct ConfiguredDoctorAutoRunLoop: LoopRunner {
     }
 }
 
-/// M7: prunes `turn_traces/` to the newest ~14 days, taking each day's orphaned
-/// `.lock` sidecar with it. Never silent — a sweep that removes anything says so.
+/// M7: prunes `turn_traces/` to the newest ~14 days; the sidecar lifecycle
+/// reclaims orphaned locks. A sweep that removes anything says so.
 private struct TurnTraceRetentionRunner: LoopRunner {
     let interval: TimeInterval
     let dataRoot: URL
@@ -548,7 +551,7 @@ private struct TurnTraceRetentionRunner: LoopRunner {
     func tickOutcome() async -> LoopTickOutcome {
         do {
             let now = Date()
-            let traceReport = try TurnTraceRetention.enforce(dataRoot: dataRoot, now: now)
+            let traceReport = try await TurnTraceRetention.enforce(dataRoot: dataRoot, now: now)
             let lockReport = try await FileLockSidecarLifecycle.reapOrphanedSidecars(
                 dataRoot: dataRoot,
                 now: now

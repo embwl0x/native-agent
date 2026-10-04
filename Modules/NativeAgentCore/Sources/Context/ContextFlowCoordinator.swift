@@ -3,7 +3,6 @@ import NativeAgentCore
 
 public enum ContextFlowMode: String, Codable, CaseIterable, Sendable {
     case off
-    case shadow
     case active
 }
 
@@ -93,8 +92,7 @@ public enum ContextFlowCoordinatorError: Error, Equatable, Sendable {
     case duplicateProjectedSource(ContextSourceID)
 }
 
-/// Resident event-driven compiler and RAM publication coordinator. FC0-FC3
-/// callers run this in shadow mode; active prompt selection is a later gate.
+/// Resident event-driven compiler and RAM publication coordinator.
 public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     public let mode: ContextFlowMode
     public let store: ContextSQLiteStore
@@ -115,10 +113,12 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
 
     private struct ReconciliationCandidate: Sendable {
         let batch: ReconciliationBatch
+        let baselineGenerationID: Int64?
         let changedSources: [ContextCompiledSource]
         let removedSourceIDs: Set<ContextSourceID>
         let successfulSources: [ContextSourceID: ContextCompiledSource]
         let compileFailures: [ContextSourceID: String]
+        let projectionResults: [String: ContextCompiledProjectionResult]
     }
 
     private let compiler: any ContextMarkdownCompiling
@@ -187,6 +187,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         /// Part of the key because it changes the DERIVED value: it decides
         /// whether every persona source is precovered or only the kernel's.
         let stableSegmentCarriesRequiredDocuments: Bool
+        let userMemoryCore: [String]?
+        let memoryRecallDisabled: Bool
+        let excludedSourceOwners: Set<String>
 
         init(
             generationID: Int64,
@@ -199,7 +202,10 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             kernelSourceFingerprint: String,
             stableIncludedDocumentIDs: [String],
             allowedPrivacy: [String],
-            stableSegmentCarriesRequiredDocuments: Bool = false
+            stableSegmentCarriesRequiredDocuments: Bool = false,
+            userMemoryCore: [String]? = nil,
+            memoryRecallDisabled: Bool = false,
+            excludedSourceOwners: Set<String> = []
         ) {
             self.generationID = generationID
             self.generationSourceFingerprint = generationSourceFingerprint
@@ -212,13 +218,17 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             self.stableIncludedDocumentIDs = stableIncludedDocumentIDs
             self.allowedPrivacy = allowedPrivacy
             self.stableSegmentCarriesRequiredDocuments = stableSegmentCarriesRequiredDocuments
+            self.userMemoryCore = userMemoryCore
+            self.memoryRecallDisabled = memoryRecallDisabled
+            self.excludedSourceOwners = excludedSourceOwners
         }
 
         init(
             generation: ContextStoredGeneration,
             request: ContextTurnRequest,
             mirror: RequiredDocumentMirror,
-            kernel: StablePromptKernel
+            kernel: StablePromptKernel,
+            excludedSourceOwners: Set<String>
         ) {
             self.init(
                 generationID: generation.generation.id,
@@ -232,7 +242,10 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 stableIncludedDocumentIDs: kernel.includedDocumentIDs.map(\.rawValue),
                 allowedPrivacy: request.allowedPrivacy.map(\.rawValue).sorted(),
                 stableSegmentCarriesRequiredDocuments:
-                    request.stableSegmentCarriesRequiredDocuments
+                    request.stableSegmentCarriesRequiredDocuments,
+                userMemoryCore: request.userMemoryCore,
+                memoryRecallDisabled: !request.memoryRecallEnabled,
+                excludedSourceOwners: excludedSourceOwners
             )
         }
     }
@@ -254,7 +267,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     public init(
-        mode: ContextFlowMode = .shadow,
+        mode: ContextFlowMode = .active,
         store: ContextSQLiteStore,
         arena: ContextArena,
         registry: ContextSourceRegistry,
@@ -301,12 +314,14 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         monitor = nil
         started = false
         activeStoredGeneration = nil
+        prewarmPlans.removeAll()
         invalidateGenerationDerivedCache()
     }
 
     public func reconcileAfterWake() async {
         guard mode != .off else { return }
         _ = try? arena.applyMemoryPressure(.normal)
+        _ = await prewarmPlanner.setResourcePressure(.normal)
         await reconcileAll(reason: "wake")
         await refreshWatchedDirectories()
     }
@@ -389,6 +404,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     public func applyMemoryPressure(_ pressure: ContextArenaPressure) async throws -> ContextArenaTrimReceipt {
         let receipt = try arena.applyMemoryPressure(pressure)
         _ = await prewarmPlanner.setResourcePressure(pressure)
+        if pressure != .normal { prewarmPlans.removeAll() }
         try? await store.recordReceipt(ContextStoreReceipt(
             kind: .pressure,
             generationID: arena.currentSnapshot()?.generationID,
@@ -462,11 +478,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         mirror: RequiredDocumentMirror,
         kernel: StablePromptKernel
     ) -> GenerationDerivedTurnState {
+        let excludedSourceOwners = Set(compiledProjectionProviders.flatMap(\.excludedSourceOwners))
         let key = GenerationDerivedCacheKey(
             generation: generation,
             request: request,
             mirror: mirror,
-            kernel: kernel
+            kernel: kernel,
+            excludedSourceOwners: excludedSourceOwners
         )
         if let cached = generationDerivedCache[key] {
             generationDerivedCacheHitCount += 1
@@ -483,6 +501,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         selectedSources.reserveCapacity(generation.sources.count)
         var slotScopedMemorySourceCount = 0
         for source in generation.sources {
+            if excludedSourceOwners.contains(source.descriptor.owner) { continue }
+            if !request.memoryRecallEnabled, source.descriptor.owner == "nativeagent.memory-v2" { continue }
             if source.descriptor.owner == "nativeagent.memory-v2",
                source.descriptor.canonicalLocator.hasPrefix(memoryPersonaPrefix) {
                 slotScopedMemorySourceCount += 1
@@ -537,12 +557,15 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             generation: generation
         )
         precoveredSourceIDs.formUnion(userPrecoverage.precoveredSourceIDs)
-        // 2026-09-26: the other direction. When USER.md rides the stable
-        // prompt, a memory row whose text IS one of its lines is already there;
-        // 31% of inline memory rows were. Same join as precoverage.
+        // Suppress only facts in the USER block actually carried this turn.
+        // Persona USER atoms remain precovered: omitted facts must come from
+        // their canonical memory sources, never from the generated document.
         if let user = mirror.documents.first(where: { $0.id.rawValue == "USER.md" }),
-           let userSourceID = user.sourceID, precoveredSourceIDs.contains(userSourceID),
-           let facts = Self.generatedUserFacts(in: user.text) {
+           let userSourceID = user.sourceID, precoveredSourceIDs.contains(userSourceID) {
+            let carried = UserMDAutogenMarkers.promptText(user.text, pinnedCore: request.userMemoryCore)
+            let facts = Self.generatedUserFacts(in: carried) ?? Set(carried.split(separator: "\n").compactMap { line in
+                line.hasPrefix("- ") ? MemoryDisplayText.projectionJoinKey(String(line.dropFirst(2))) : nil
+            })
             let factsByCore = Dictionary(grouping: facts, by: \.core)
             let memorySourceIDs = Set(selectedSources.lazy.filter {
                 $0.descriptor.owner == "nativeagent.memory-v2"
@@ -590,6 +613,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 || activeStoredGeneration.generation.sourceFingerprint
                     != stored.generation.sourceFingerprint {
             invalidateGenerationDerivedCache()
+            prewarmPlans.removeAll()
         }
         activeStoredGeneration = stored
     }
@@ -752,6 +776,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                                 $0.draft, message: request.userMessage, recentTurns: request.recentTurns
                             )
                     }.map(\.draft.id)),
+                    // `deletedAtomIDs` is the selector's existing exclusion;
+                    // here it carries her rejections (Phase 5 B0).
+                    deletedAtomIDs: request.suppressedAtomIDs,
                     queryEmbedding: request.queryEmbedding,
                     alternateQueryEmbedding: request.alternateQueryEmbedding,
                     queryEmbeddingModelFingerprint: request.queryEmbeddingModelFingerprint,
@@ -918,6 +945,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 prewarmPlans[scope] = plan
             }
         }
+        await prunePrewarmPlans()
         let receipt = ContextStoreReceipt(
             kind: .prewarm,
             generationID: planning.plan?.items.first?.candidate.generationID,
@@ -935,6 +963,21 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             try? await store.recordReceipt(receipt)
         }
         return planning
+    }
+
+    private func prunePrewarmPlans() async {
+        let plans = prewarmPlans
+        let validIDs = await prewarmPlanner.validPlanIDs(Array(plans.values))
+        for (scope, plan) in plans {
+            let currentGeneration = activeStoredGeneration?.generation
+            let obsolete = plan.items.contains {
+                $0.candidate.generationID != currentGeneration?.id
+                    || $0.candidate.sourceFingerprint != currentGeneration?.sourceFingerprint
+            }
+            if (!validIDs.contains(plan.id) || obsolete), prewarmPlans[scope]?.id == plan.id {
+                prewarmPlans[scope] = nil
+            }
+        }
     }
 
     @discardableResult
@@ -1632,16 +1675,18 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     // MARK: - Event handling
 
     private func observe(_ event: ContextDirectoryEvent) async {
-        await coalescer?.enqueue(event.directory)
         if event.requiresRearm {
-            // Reconciliation runs before the watch set is rebuilt. Parent
-            // watches remain alive and catch replacement of the child path.
-            await monitor?.setDirectories([])
+            // Retire only the invalid descriptor; parents keep observing.
+            await monitor?.invalidateWatch(for: event.directory)
         }
+        await coalescer?.enqueue(event.directory)
     }
 
     private func reconcile(dirtyDirectories: Set<URL>) async {
-        guard await refreshDiscoveredSources() else { return }
+        guard await refreshDiscoveredSources() else {
+            await refreshWatchedDirectories()
+            return
+        }
         guard !Task.isCancelled else { return }
         var affected: [ContextSourceRegistration] = []
         for directory in dirtyDirectories.sorted(by: { $0.path < $1.path }) {
@@ -1701,91 +1746,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
 
         var compileFailures: [ContextSourceID: String] = [:]
         do {
-            let active = try await store.loadActiveGeneration()
-            let previousBySource = Self.previousCompiledSources(active)
-            let authoritativeSources = await registry.authoritativeSourceIDsByOwner()
-            var changedSources: [ContextCompiledSource] = []
-            // Discovery can remove a registration before this loop sees it.
-            // Retire only sources whose owner explicitly supplied a complete
-            // inventory, including empty inventories after restart.
-            var removedSourceIDs = Set(previousBySource.compactMap { sourceID, source in
-                guard let currentIDs = authoritativeSources[source.descriptor.owner],
-                      !currentIDs.contains(sourceID) else { return nil as ContextSourceID? }
-                return sourceID
-            })
-            var successfulSources: [ContextSourceID: ContextCompiledSource] = [:]
-
-            for registration in batch.registrations {
-                let sourceID = registration.descriptor.id
-                if let currentIDs = authoritativeSources[registration.descriptor.owner],
-                   !currentIDs.contains(sourceID) {
-                    // A retry may still carry this now-retired registration.
-                    continue
-                }
-                guard FileManager.default.fileExists(atPath: registration.fileURL.path) else {
-                    if previousBySource[sourceID] != nil {
-                        removedSourceIDs.insert(sourceID)
-                    }
-                    continue
-                }
-                do {
-                    let attributes = try FileManager.default.attributesOfItem(atPath: registration.fileURL.path)
-                    let updatedAt = (attributes[.modificationDate] as? Date) ?? Date()
-                    let data = try Data(contentsOf: registration.fileURL, options: [.mappedIfSafe])
-                    guard data.count <= registration.maximumUTF8Bytes else {
-                        throw ContextMarkdownCompilerError.sourceTooLarge(
-                            actualBytes: data.count,
-                            maximumBytes: registration.maximumUTF8Bytes
-                        )
-                    }
-                    let compiled = try await compiler.compile(
-                        sourceData: data,
-                        descriptor: registration.descriptor,
-                        previous: previousBySource[sourceID],
-                        updatedAt: updatedAt
-                    )
-                    successfulSources[sourceID] = compiled
-                    // 2026-09-22: an embedding-provider change leaves bytes
-                    // (and so sourceHash) unchanged; without this the
-                    // re-embedded atoms were dropped and old vectors stuck.
-                    let embeddingChanged = Set(compiled.atoms.map { $0.embedding?.modelFingerprint })
-                        != Set((previousBySource[sourceID]?.atoms ?? []).map { $0.embedding?.modelFingerprint })
-                    if compiled.sourceHash != previousBySource[sourceID]?.sourceHash
-                        || compiled.descriptor != previousBySource[sourceID]?.descriptor
-                        || embeddingChanged {
-                        changedSources.append(compiled)
-                    }
-                } catch let error as CancellationError {
-                    throw error
-                } catch {
-                    compileFailures[sourceID] = String(reflecting: type(of: error))
-                }
-            }
-
-            if !batch.compiledProjectionIdentifiers.isEmpty {
-                for provider in compiledProjectionProviders where
-                    batch.compiledProjectionIdentifiers.contains(provider.projectionIdentifier) {
-                    let result = try await provider.compiledProjection(previousSources: previousBySource)
-                    for source in result.changedSources {
-                        if changedSources.contains(where: { $0.descriptor.id == source.descriptor.id }) {
-                            throw ContextFlowCoordinatorError.duplicateProjectedSource(source.descriptor.id)
-                        }
-                        changedSources.append(source)
-                    }
-                    removedSourceIDs.formUnion(result.removedSourceIDs)
-                }
-            }
-
-            return await commit(ReconciliationCandidate(
-                batch: batch,
-                changedSources: changedSources,
-                removedSourceIDs: removedSourceIDs,
-                successfulSources: successfulSources,
-                compileFailures: compileFailures
-            ))
+            return await commit(try await makeCandidate(for: batch, compileFailures: &compileFailures))
         } catch is CancellationError {
-            // Cancellation is control flow, not source degradation. Demand
-            // stays pending and the next owner edge will retry it.
+            // Cancellation leaves demand pending for the next owner edge.
             return false
         } catch {
             await commitFailure(error, compileFailures: compileFailures, for: batch)
@@ -1793,16 +1756,120 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
     }
 
+    private func makeCandidate(
+        for batch: ReconciliationBatch,
+        compileFailures: inout [ContextSourceID: String]
+    ) async throws -> ReconciliationCandidate {
+        let active = try await store.loadActiveGeneration()
+        let previousBySource = Self.previousCompiledSources(active)
+        let authoritativeSources = await registry.authoritativeSourceIDsByOwner()
+        var changedSources: [ContextCompiledSource] = []
+        // Discovery can remove a registration before this loop sees it.
+        // Retire only sources whose owner explicitly supplied a complete
+        // inventory, including empty inventories after restart.
+        var removedSourceIDs = Set(previousBySource.compactMap { sourceID, source in
+            guard let currentIDs = authoritativeSources[source.descriptor.owner],
+                  !currentIDs.contains(sourceID) else { return nil as ContextSourceID? }
+            return sourceID
+        })
+        var successfulSources: [ContextSourceID: ContextCompiledSource] = [:]
+        var projectionResults: [String: ContextCompiledProjectionResult] = [:]
+
+        for registration in batch.registrations {
+            let sourceID = registration.descriptor.id
+            if let currentIDs = authoritativeSources[registration.descriptor.owner],
+               !currentIDs.contains(sourceID) {
+                // A retry may still carry this now-retired registration.
+                continue
+            }
+            guard FileManager.default.fileExists(atPath: registration.fileURL.path) else {
+                if previousBySource[sourceID] != nil {
+                    removedSourceIDs.insert(sourceID)
+                }
+                continue
+            }
+            do {
+                let attributes = try FileManager.default.attributesOfItem(atPath: registration.fileURL.path)
+                let updatedAt = (attributes[.modificationDate] as? Date) ?? Date()
+                let data = try Data(contentsOf: registration.fileURL, options: [.mappedIfSafe])
+                guard data.count <= registration.maximumUTF8Bytes else {
+                    throw ContextMarkdownCompilerError.sourceTooLarge(
+                        actualBytes: data.count,
+                        maximumBytes: registration.maximumUTF8Bytes
+                    )
+                }
+                let compiled = try await compiler.compile(
+                    sourceData: data,
+                    descriptor: registration.descriptor,
+                    previous: previousBySource[sourceID],
+                    updatedAt: updatedAt
+                )
+                successfulSources[sourceID] = compiled
+                // 2026-09-22: an embedding-provider change leaves bytes
+                // (and so sourceHash) unchanged; without this the
+                // re-embedded atoms were dropped and old vectors stuck.
+                let embeddingChanged = Set(compiled.atoms.map { $0.embedding?.modelFingerprint })
+                    != Set((previousBySource[sourceID]?.atoms ?? []).map { $0.embedding?.modelFingerprint })
+                if compiled.sourceHash != previousBySource[sourceID]?.sourceHash
+                    || compiled.descriptor != previousBySource[sourceID]?.descriptor
+                    || embeddingChanged {
+                    changedSources.append(compiled)
+                }
+            } catch let error as CancellationError {
+                throw error
+            } catch {
+                compileFailures[sourceID] = String(reflecting: type(of: error))
+            }
+        }
+
+        // SQLite may have advanced before a mirror/arena failure retained the
+        // live generation. Rebuild projection metadata against that durable
+        // baseline before a selective retry can accept it.
+        let projectionIdentifiers = active?.generation.id != activeStoredGeneration?.generation.id
+            ? Set(compiledProjectionProviders.map(\.projectionIdentifier))
+            : batch.compiledProjectionIdentifiers
+        if !projectionIdentifiers.isEmpty {
+            for provider in compiledProjectionProviders where
+                projectionIdentifiers.contains(provider.projectionIdentifier) {
+                let result = try await provider.compiledProjection(previousSources: previousBySource)
+                projectionResults[provider.projectionIdentifier] = result
+                for source in result.changedSources {
+                    if changedSources.contains(where: { $0.descriptor.id == source.descriptor.id }) {
+                        throw ContextFlowCoordinatorError.duplicateProjectedSource(source.descriptor.id)
+                    }
+                    changedSources.append(source)
+                }
+                removedSourceIDs.formUnion(result.removedSourceIDs)
+            }
+        }
+
+        return ReconciliationCandidate(
+            batch: batch,
+            baselineGenerationID: active?.generation.id,
+            changedSources: changedSources,
+            removedSourceIDs: removedSourceIDs,
+            successfulSources: successfulSources,
+            compileFailures: compileFailures,
+            projectionResults: projectionResults
+        )
+    }
+
     private func commit(_ candidate: ReconciliationCandidate) async -> Bool {
         guard await beginPublication(for: candidate.batch.requestID) else { return false }
         defer { finishPublication() }
 
         do {
+            var candidate = candidate
+            // Compilation suspends outside the publication gate. An earlier
+            // publisher may have replaced its baseline while this diff waited.
+            if try await store.activeGeneration()?.id != candidate.baselineGenerationID {
+                var compileFailures: [ContextSourceID: String] = [:]
+                candidate = try await makeCandidate(for: candidate.batch, compileFailures: &compileFailures)
+            }
             let persistedDegradedCount = (try? await store.healthSnapshot().degradedSources) ?? 0
             let hasUnknownPersistedDegradation = persistedDegradedCount > degradedSourceIDs.count
             for (sourceID, error) in candidate.compileFailures.sorted(by: { $0.key < $1.key }) {
-                try? await store.markSourceDegraded(sourceID, error: error)
-                degradedSourceIDs.insert(sourceID)
+                await markSourceDegraded(sourceID, error: error)
             }
 
             var changedBySource = Dictionary(uniqueKeysWithValues: candidate.changedSources.map {
@@ -1855,6 +1922,14 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             case nil, .published, .rehydrated:
                 lastError = nil
                 activateStoredGeneration(stored)
+                let pinnedGenerationIDs = Set(arena.metrics().pinnedGenerations.keys)
+                for provider in compiledProjectionProviders {
+                    provider.didPublish(
+                        candidate.projectionResults[provider.projectionIdentifier],
+                        generation: stored,
+                        retaining: pinnedGenerationIDs
+                    )
+                }
             case .retainedLastGood(let failure, _):
                 throw ContextFlowCoordinatorError.arenaPublicationFailed(String(describing: failure))
             }
@@ -1909,10 +1984,32 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         guard await beginPublication(for: batch.requestID) else { return }
         defer { finishPublication() }
         for (sourceID, compileError) in compileFailures.sorted(by: { $0.key < $1.key }) {
-            try? await store.markSourceDegraded(sourceID, error: compileError)
-            degradedSourceIDs.insert(sourceID)
+            await markSourceDegraded(sourceID, error: compileError)
         }
         recordReconciliationFailure(error)
+    }
+
+    private func markSourceDegraded(_ sourceID: ContextSourceID, error: String) async {
+        try? await store.markSourceDegraded(sourceID, error: error)
+        degradedSourceIDs.insert(sourceID)
+        guard let stored = activeStoredGeneration else { return }
+        invalidateGenerationDerivedCache()
+        activeStoredGeneration = ContextStoredGeneration(
+            generation: stored.generation,
+            sources: stored.sources.map { source in
+                guard source.descriptor.id == sourceID else { return source }
+                return ContextStoredSource(
+                    descriptor: source.descriptor,
+                    sourceHash: source.sourceHash,
+                    health: .degraded,
+                    lastError: error,
+                    validFromGeneration: source.validFromGeneration,
+                    validToGeneration: source.validToGeneration
+                )
+            },
+            atoms: stored.atoms,
+            relationships: stored.relationships
+        )
     }
 
     private func beginPublication(for requestID: UInt64) async -> Bool {

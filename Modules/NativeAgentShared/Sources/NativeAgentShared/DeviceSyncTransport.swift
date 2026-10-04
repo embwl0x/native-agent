@@ -70,7 +70,7 @@ public enum NAChatDirection: String, Sendable, Codable {
 // MARK: - CloudKit record schema (identifiers shared by every transport)
 
 public enum NADeviceSyncRecordType {
-    /// Chat message payloads. `recordName` == BridgeMessage.id (natural dedup).
+    /// Chat message payloads. Record identity defaults to BridgeMessage.id.
     public static let chatMessage = "NAChatMessage"
     /// Explicit user-visible notifications. Kept separate from chat so exactly
     /// one CloudKit subscription projects each record into an APNS alert.
@@ -148,6 +148,8 @@ public struct NAChatMessageFields: Sendable, Equatable, Codable {
 // MARK: - BridgeMessage <-> record codec (CloudKit-independent, unit-testable)
 
 public enum NAChatMessageCodec {
+    public static let recordIDMetadataKey = "cloudKitRecordID"
+
     /// Conservative encoded-record ceiling below CloudKit's 1 MB record limit.
     /// `payloadJSON` already includes base64 attachment expansion and the record
     /// also duplicates a few query fields, so reserve 224 KiB for those fields
@@ -170,8 +172,9 @@ public enum NAChatMessageCodec {
         guard let payloadJSON = String(data: data, encoding: .utf8) else {
             throw DeviceSyncError.underlying(message: "BridgeMessage payload was not UTF-8 encodable")
         }
+        let recordName = message.metadata?[recordIDMetadataKey] ?? message.id
         let projectedScalarBytes =
-            message.id.utf8.count
+            recordName.utf8.count
             + message.text.utf8.count
             + (message.sessionID?.utf8.count ?? 0)
             + message.sender.utf8.count
@@ -188,7 +191,7 @@ public enum NAChatMessageCodec {
             )
         }
         return NAChatMessageFields(
-            recordName: message.id,
+            recordName: recordName,
             direction: direction(forSender: message.sender).rawValue,
             sessionId: message.sessionID,
             text: message.text,
@@ -368,6 +371,7 @@ public protocol DeviceSyncTransport: Sendable {
     /// Defaulted onto the unacknowledged form so a transport that cannot tell
     /// keeps today's behaviour.
     func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async
+    func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async
 
     /// iCloud account availability: "available" | "noAccount" | "restricted" |
     /// "temporarilyUnavailable" | "unknown". Defaulted for transports (KVS)
@@ -406,6 +410,12 @@ public protocol DeviceSyncTransport: Sendable {
 }
 
 public extension DeviceSyncTransport {
+    func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async {
+        await observeStatus(key: key, onApply: { value in
+            await onApply(value, nil)
+        })
+    }
+
     var presentsVisualNotifications: Bool { false }
     func ensurePushSubscriptions() async -> Bool { presentsVisualNotifications }
 

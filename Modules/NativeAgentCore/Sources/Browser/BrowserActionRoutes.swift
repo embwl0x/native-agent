@@ -49,7 +49,7 @@ public struct BrowserActionRoutes: Sendable {
         if let envelope = try await writer.runBrowserAction(body: bodyValue) {
             let decoded = try decode(envelope, "runBrowser(swiftNative)")
             if !dryRun {
-                await observeBrowserMotorAction(runID: decoded.id)
+                await observeBrowserMotorAction(runID: decoded.id, dataRoot: dataRoot)
             }
             return decoded.value
         }
@@ -64,7 +64,8 @@ public struct BrowserActionRoutes: Sendable {
             runID: runID,
             approvalId: nil,
             captureSource: captureSource,
-            captureScreenshot: captureScreenshot
+            captureScreenshot: captureScreenshot,
+            dataRoot: dataRoot
         )
         return try decode(run, "runBrowser(swiftVisibleDirect)").value
     }
@@ -85,14 +86,19 @@ public struct BrowserActionRoutes: Sendable {
         let writer = makeBrowserWriter(
             dataRoot: dataRoot
         )
-        // `try`: a THROW means the cancel already persisted to runs.json. nil
-        // only occurs for a non-object body.
-        if let envelope = try await writer.cancelBrowserRun(body: .object(swiftBody)) {
-            let run = try decode(envelope, "cancelBrowserRun(swiftNative)")
-            if run.status == "canceled" {
-                await effects.cancelNavigation(runID: run.id)
+        do {
+            if let envelope = try await writer.cancelBrowserRun(body: .object(swiftBody)) {
+                if jsonString(envelope, "status") == "canceled",
+                   let runID = jsonString(envelope, "id") {
+                    await effects.cancelNavigation(runID: runID)
+                }
+                return try decode(envelope, "cancelBrowserRun(swiftNative)").value
             }
-            return run.value
+        } catch let error as BrowserCancellationProjectionError {
+            if let runID = jsonString(error.run, "id") {
+                await effects.cancelNavigation(runID: runID)
+            }
+            throw error
         }
         throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
             NSLocalizedDescriptionKey: "Browser cancel body was not handled by the Swift browser writer."
@@ -104,7 +110,8 @@ public struct BrowserActionRoutes: Sendable {
         runID: String,
         approvalId: String?,
         captureSource: Bool,
-        captureScreenshot: Bool
+        captureScreenshot: Bool,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> JSONValue {
         var status = "succeeded"
         var opened = false
@@ -113,7 +120,7 @@ public struct BrowserActionRoutes: Sendable {
             "url": .string(parsed.url.absoluteString),
             "captureSource": .bool(captureSource),
         ]
-        let browser = SwiftNativeBrowserClient.defaultClient()
+        let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         let start = BrowserOperationStart(
             id: runID,
             url: parsed.url.absoluteString,
@@ -131,7 +138,8 @@ public struct BrowserActionRoutes: Sendable {
         _ = try await browser.executeBrowserOperation(.start(start))
 
         let navigation = await effects.beginNavigation(
-            parsed.url, runID: runID, captureSource: captureSource, captureScreenshot: captureScreenshot
+            parsed.url, runID: runID, captureSource: captureSource, captureScreenshot: captureScreenshot,
+            dataRoot: dataRoot
         )
         let captureTask = navigation.task
         defer {
@@ -162,7 +170,8 @@ public struct BrowserActionRoutes: Sendable {
                     id: runID,
                     url: parsed.url,
                     text: text,
-                    links: result.links
+                    links: result.links,
+                    dataRoot: dataRoot
                 )
                 for (key, value) in persisted {
                     sourceReceipt[key] = value
@@ -173,7 +182,8 @@ public struct BrowserActionRoutes: Sendable {
                 screenshotReceipt = .object(try await persistBrowserScreenshotCapture(
                     id: runID,
                     url: parsed.url,
-                    png: png
+                    png: png,
+                    dataRoot: dataRoot
                 ))
             }
             try Task.checkCancellation()
@@ -206,7 +216,7 @@ public struct BrowserActionRoutes: Sendable {
         }
         // The Core reducer makes terminal state absorbing, so an explicit
         // cancel committed during WebKit/capture always defeats late success.
-        await observeBrowserMotorAction(runID: runID)
+        await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
         return committed
     }
 
@@ -334,8 +344,19 @@ public struct BrowserActionRoutes: Sendable {
         _ url: URL,
         runID: String,
         captureSource: Bool,
-        captureScreenshot: Bool
+        captureScreenshot: Bool,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> BrowserVisibleCapture {
+        // The app installs the cancellation hook before this task starts.
+        // Catch a canonical cancel that landed before that registration.
+        try Task.checkCancellation()
+        let model = try await SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
+            .motorActionReadModel(actionId: runID)
+        if model?.phase == .cancelled { throw CancellationError() }
+        guard model?.phase == .running else { throw BrowserOperationStoreError.invalidTransition }
+        try Task.checkCancellation()
+        try effects.acquireBrowser(runID: runID)
+        defer { effects.releaseBrowser(runID: runID) }
         let nav = try await effects.navigate(url, runID: runID)
         try Task.checkCancellation()
         let text = captureSource ? (try await effects.readText()) : nil
@@ -366,6 +387,9 @@ public struct BrowserActionRoutes: Sendable {
         readLinks: Bool,
         screenshot: Bool
     ) async throws -> BrowserVisibleCapture {
+        let runID = UUID().uuidString
+        try effects.acquireBrowser(runID: runID)
+        defer { effects.releaseBrowser(runID: runID) }
         guard let current = effects.currentURL(),
               let url = URL(string: current),
               let scheme = url.scheme?.lowercased(),
@@ -393,9 +417,10 @@ public struct BrowserActionRoutes: Sendable {
         id: String,
         url: URL,
         text: String,
-        links: [BrowserLink]?
+        links: [BrowserLink]?,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> [String: JSONValue] {
-        let browser = SwiftNativeBrowserClient.defaultClient()
+        let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         var artifacts: [BrowserCaptureCache.Kind: Data] = [.text: Data(text.utf8)]
         if let links { artifacts[.links] = try JSONEncoder().encode(links) }
         let paths = try await BrowserCaptureCache.shared.store(
@@ -411,7 +436,7 @@ public struct BrowserActionRoutes: Sendable {
         if let links, let linksPath = paths[.links] {
             receipt["linksPath"] = .string(linksPath.path)
             receipt["linkCount"] = .int(Int64(links.count))
-            receipt["linksPreview"] = try JSONValue.fromEncodable(Array(links.prefix(25)))
+            receipt["linksPreview"] = NativeAppSecretRedactor.redactValue(try JSONValue.fromEncodable(Array(links.prefix(25))))
         }
         return receipt
     }
@@ -419,9 +444,10 @@ public struct BrowserActionRoutes: Sendable {
     public func persistBrowserLinksCapture(
         id: String,
         url: URL,
-        links: [BrowserLink]
+        links: [BrowserLink],
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> [String: JSONValue] {
-        let browser = SwiftNativeBrowserClient.defaultClient()
+        let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         let data = try JSONEncoder().encode(links)
         let paths = try await BrowserCaptureCache.shared.store(
             id: id, artifacts: [.links: data], browserRoot: browser.sourcesDir.deletingLastPathComponent())
@@ -430,7 +456,7 @@ public struct BrowserActionRoutes: Sendable {
             "url": .string(url.absoluteString),
             "linksPath": .string(path.path),
             "linkCount": .int(Int64(links.count)),
-            "linksPreview": try JSONValue.fromEncodable(Array(links.prefix(25))),
+            "linksPreview": NativeAppSecretRedactor.redactValue(try JSONValue.fromEncodable(Array(links.prefix(25)))),
             "captureRetention": BrowserCaptureCache.shared.policy.receipt,
         ]
     }
@@ -438,9 +464,10 @@ public struct BrowserActionRoutes: Sendable {
     public func persistBrowserScreenshotCapture(
         id: String,
         url: URL,
-        png: Data
+        png: Data,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> [String: JSONValue] {
-        let browser = SwiftNativeBrowserClient.defaultClient()
+        let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         let paths = try await BrowserCaptureCache.shared.store(
             id: id, artifacts: [.screenshot: png], browserRoot: browser.screenshotsDir.deletingLastPathComponent())
         guard let path = paths[.screenshot] else { throw CocoaError(.fileWriteUnknown) }

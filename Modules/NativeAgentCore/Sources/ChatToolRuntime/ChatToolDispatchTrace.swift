@@ -2,6 +2,7 @@ import ChatSessionWork
 import ChatTurnContracts
 import ProviderRouting
 import Foundation
+import ToolRegistry
 import MacControl
 import MCPDispatcher
 import NativeAgentCore
@@ -19,7 +20,7 @@ import TrustCenter
 extension ChatToolOutcome {
 
     /// Fill missing failure evidence at the result boundary; successes pass through unchanged.
-    public static func normalizedFailure(_ output: JSONValue) -> JSONValue {
+    public static func normalizedFailure(_ output: JSONValue, tool: String? = nil) -> JSONValue {
         guard !outputLooksSuccessful(output), !isWaitingOnPerson(output),
               !wasCancelled(output), case .object(var object) = output else { return output }
         func text(_ key: String) -> String? {
@@ -57,16 +58,64 @@ extension ChatToolOutcome {
         if object["failure_code"] == nil { object["failure_code"] = .string(code) }
         if object["reason"] == nil { object["reason"] = .string(message) }
         if object["message"] == nil { object["message"] = .string(message) }
+        if object["argument_path"] == nil { object["argument_path"] = .null }
+        if object["accepted"] == nil { object["accepted"] = .null }
+        // A missing receipt is not proof that a write did not happen.
+        let effects = text("effects") ?? (object["effects_unknown"] == .bool(true) ? "unknown"
+            : object["not_run_status"] != nil ? "none" : "unknown")
+        if object["effects"] == nil { object["effects"] = .string(effects) }
+        if object["remedy"] == nil {
+            let named = tool ?? text("tool")
+            // A folded tool is an app action: she calls and finds it there,
+            // when the call came through the door. A lane that calls it by
+            // name (Workshop, studio wander) keeps its name.
+            let door = AppDoorReentry.perform != nil
+            let action = door ? named.flatMap { ToolNameAliases.appAction($0) } : nil
+            let argument = text("argument_path")
+            let correction = effects == "none" && argument != nil && named != nil
+            var nextCall: JSONValue
+            switch named {
+            case "bot_create", "bot_update":
+                nextCall = .object(["tool": .string("bot_list"), "input": .object(["include_models": .bool(true)])])
+            case "scheduler_update_job":
+                nextCall = .object(["tool": .string("scheduler_list_jobs"), "input": .object([:])])
+            default:
+                // Through the door, app {find} shows the action and its args;
+                // a lane calling by name has its own declared tools.
+                let words = (action ?? named ?? "").replacingOccurrences(of: ".", with: " ").replacingOccurrences(of: "_", with: " ")
+                nextCall = door && !words.isEmpty
+                    ? .object(["tool": .string("app"), "input": .object(["find": .string(words)])]) : .null
+            }
+            if door { nextCall = ToolNameAliases.appPointer(nextCall) }
+            object["remedy"] = .object([
+                "kind": .string(correction ? "correct_arguments" : "inspect"),
+                "instruction": .string(correction
+                    ? "Correct \(argument!) to the accepted shape, then call \(action.map { "app " + $0 } ?? named!) again with the intended values. Do not guess missing choices. Use next_call to inspect accepted choices or the current state if needed."
+                    : effects == "none"
+                        ? "Inspect the tool contract and resolve the reported prerequisite before retrying."
+                        : effects == "occurred"
+                            ? "The call took effect. Read the affected state before making another change; do not replay it blindly."
+                            : "Inspect the tool contract, then verify the affected state with its reader before retrying; the failed call may have taken effect."),
+                "next_call": nextCall,
+            ])
+        }
         return .object(object)
     }
 
     public static func failure(error: any Error, tool: String? = nil) -> JSONValue {
+        if let back = error as? SkillRunContext.HandBack { return SkillRunContext.handBack(back.why) }
         var object: [String: JSONValue] = [
             "status": .string("failed"),
             "failure_code": .string("dispatch_error"),
             "reason": .string(errorMessage(error)),
             "error": .string(errorMessage(error)),
         ]
+        if let evidence = error as? ToolFailureError {
+            object["argument_path"] = evidence.argumentPath.map(JSONValue.string) ?? .null
+            object["accepted"] = evidence.accepted.map { .string(ChatSecretRedactor.redactText($0)) } ?? .null
+            object["effects"] = .string(evidence.effects.rawValue)
+            if evidence.argumentPath != nil { object["failure_code"] = .string("invalid_arguments") }
+        }
         if let recovery = (error as? LocalizedError)?.recoverySuggestion,
            !recovery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             object["hint"] = .string(ChatSecretRedactor.redactText(recovery))
@@ -80,9 +129,9 @@ extension ChatToolOutcome {
                     object["error"] = .string(sentence)
                 }
             }
-            return normalizedFailure(gate.notRunStatus.reporting(.object(object), tool: tool))
+            return normalizedFailure(gate.notRunStatus.reporting(.object(object), tool: tool), tool: tool)
         }
-        return normalizedFailure(.object(object))
+        return normalizedFailure(.object(object), tool: tool)
     }
 
     package enum CognitiveResult: String, Sendable, Equatable {
@@ -438,7 +487,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         )
         let result: JSONValue
         do {
-            result = ChatToolOutcome.normalizedFailure(try await inner.dispatch(tool: tool, input: input, surface: surface))
+            result = ChatToolOutcome.normalizedFailure(try await inner.dispatch(tool: tool, input: input, surface: surface), tool: tool)
         } catch {
             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
             Self.fireBusEvent(
@@ -459,8 +508,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         // as "failed" — with an error class — until 2026-09-14, which is what
         // made the chat fold read "1 of 3 failed" for a card nobody had
         // answered yet. The row stays honest: it is waiting.
-        let waiting = !ok && ChatToolOutcome.isWaitingOnPerson(result)
-        let status = ok ? "ok" : (waiting ? "waiting" : "failed")
+        let waiting = ChatToolOutcome.isWaitingOnPerson(result)
+        let status = waiting ? "waiting" : (ok ? "ok" : "failed")
         let failureShaped = !ok && !waiting
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         Self.fireBusEvent(
@@ -510,6 +559,9 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             )),
         ]
         if let durationMs { payload["durationMs"] = .int(Int64(durationMs)) }
+        // An app call as a person is shown it: the action it ran.
+        let shown = ToolNameAliases.shown(tool, input: .object(input)).name
+        if shown != tool { payload["shown"] = .string(shown) }
         // Her-screen Phase 4 — "User's screen touched: y/n" for the proof tasks.
         if tool == "act", case .object(let reply)? = result, case .object(let detail)? = reply["detail"],
            let changed = detail["user_front_changed"] {
@@ -534,10 +586,13 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             // secret-shaped VALUES, so the picture rode into the bus payload
             // (and from there the Inspector) intact. The full image still goes
             // to the live model call; only this preview loses the pixels.
+            // An app call of a folded action is redacted as the tool it ran
+            // (mac.act's result echoes what it typed).
+            let ran = ToolNameAliases.ranTool(tool, input: input)
             payload["result"] = .string(Self.truncatePreview(
                 MacInjectionResultRedaction.redacted(
-                    tool: tool,
-                    result: MacScreenViewResultRedaction.redacted(tool: tool, result: result)
+                    tool: ran,
+                    result: MacScreenViewResultRedaction.redacted(tool: ran, result: result)
                 )
             ))
         }
@@ -651,6 +706,10 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
 
     package func listAvailableTools() async throws -> [String] {
         try await inner.listAvailableTools()
+    }
+
+    package func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(named: names)
     }
 
     package func listAvailableToolSchemas() async throws -> [LLMToolSchema] {

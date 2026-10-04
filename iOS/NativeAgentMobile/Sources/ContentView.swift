@@ -47,9 +47,9 @@ struct ContentView: View {
 
     private var activityBadgeCount: Int {
         ActivityScreenPresentation.counts(
-            storedApprovals: approvalsStore.pendingCount,
+            storedApprovals: approvalsStore.hasLoadedSnapshot ? approvalsStore.pendingCount : nil,
             snapshotApprovals: sync.approvals,
-            storedInbox: inboxStore.activeCount,
+            storedInbox: inboxStore.hasLoadedSnapshot ? inboxStore.activeCount : nil,
             snapshotInbox: sync.inboxItems,
             memoryProposals: sync.memoryProposals,
             trainingProposals: sync.trainingProposals,
@@ -194,15 +194,26 @@ struct ContentView: View {
                 animated: true,
                 notifyNewPending: true
             )
+            Task {
+                await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
+                    activeInboxItems: inboxStore.items,
+                    pendingApprovalIDs: Set(approvalsStore.approvals.filter { $0.status.lowercased() == "pending" }.map(\.id))
+                )
+            }
         }
         .onChange(of: sync.inboxItems) { _, _ in
+            approvalsStore.applySyncedApprovalsFromSnapshot(
+                animated: true,
+                notifyNewPending: true
+            )
             inboxStore.applySyncedInboxFromSnapshot(
                 animated: true,
                 notifyNewArrivals: true
             )
             Task {
                 await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
-                    activeInboxItems: inboxStore.items
+                    activeInboxItems: inboxStore.items,
+                    pendingApprovalIDs: Set(approvalsStore.approvals.filter { $0.status.lowercased() == "pending" }.map(\.id))
                 )
             }
         }
@@ -299,7 +310,10 @@ struct ContentView: View {
             )
         }
         if pruneNotifications {
-            await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(activeInboxItems: inboxStore.items)
+            await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
+                activeInboxItems: inboxStore.items,
+                pendingApprovalIDs: Set(approvalsStore.approvals.filter { $0.status.lowercased() == "pending" }.map(\.id))
+            )
         }
     }
 }
@@ -315,12 +329,13 @@ enum NativeAgentActivityNotificationCleaner {
         let badgeCount: Int
     }
 
-    static func pruneDeliveredNotifications(activeInboxItems: [InboxItemRecord]) async {
+    static func pruneDeliveredNotifications(activeInboxItems: [InboxItemRecord], pendingApprovalIDs: Set<String>) async {
         let activeItemIDs = Set(activeInboxItems.filter { $0.isUnread }.map(\.id))
         let center = UNUserNotificationCenter.current()
         let delivered = await center.deliveredNotifications()
         let result = pruningResult(
             activeItemIDs: activeItemIDs,
+            pendingApprovalIDs: pendingApprovalIDs,
             deliveredNotifications: delivered.map {
                 DeliveredNotification(
                     identifier: $0.request.identifier,
@@ -344,16 +359,19 @@ enum NativeAgentActivityNotificationCleaner {
 
     static func pruningResult(
         activeInboxItems: [InboxItemRecord],
+        pendingApprovalIDs: Set<String>,
         deliveredNotifications: [DeliveredNotification]
     ) -> PruningResult {
         pruningResult(
             activeItemIDs: Set(activeInboxItems.filter { $0.isUnread }.map(\.id)),
+            pendingApprovalIDs: pendingApprovalIDs,
             deliveredNotifications: deliveredNotifications
         )
     }
 
     private static func pruningResult(
         activeItemIDs: Set<String>,
+        pendingApprovalIDs: Set<String>,
         deliveredNotifications: [DeliveredNotification]
     ) -> PruningResult {
         var removeIDs: [String] = []
@@ -361,6 +379,13 @@ enum NativeAgentActivityNotificationCleaner {
         for notification in deliveredNotifications {
             let info = normalizedNativeAgentInfo(notification.userInfo)
             guard isNativeAgentActivityNotification(info) else { continue }
+
+            if let approvalID = infoString("approvalId", in: info), !approvalID.isEmpty {
+                if !pendingApprovalIDs.contains(approvalID) {
+                    removeIDs.append(notification.identifier)
+                }
+                continue
+            }
 
             if let itemID = infoString("itemId", in: info), !itemID.isEmpty {
                 if !activeItemIDs.contains(itemID) {
@@ -378,7 +403,7 @@ enum NativeAgentActivityNotificationCleaner {
 
         return PruningResult(
             notificationIDsToRemove: removeIDs,
-            badgeCount: activeItemIDs.count
+            badgeCount: activeItemIDs.count + pendingApprovalIDs.count
         )
     }
 
@@ -394,7 +419,7 @@ enum NativeAgentActivityNotificationCleaner {
 
     private static func isNativeAgentActivityNotification(_ info: [AnyHashable: Any]) -> Bool {
         if infoString("screen", in: info) == "activity" { return true }
-        return infoString("itemId", in: info) != nil || infoString("source", in: info) != nil
+        return infoString("itemId", in: info) != nil || infoString("approvalId", in: info) != nil
     }
 
     private static func infoString(_ key: String, in info: [AnyHashable: Any]) -> String? {

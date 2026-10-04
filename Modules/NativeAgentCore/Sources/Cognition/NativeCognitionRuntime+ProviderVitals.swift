@@ -315,7 +315,7 @@ extension NativeCognitionRuntime {
         if transition.consecutiveFailures > 0 {
             parts.append("Consecutive-failure run: \(transition.consecutiveFailures).")
         }
-        parts.append("This card only proposes — approving it does not switch providers; use the surface model picker to ride another provider until this one recovers.")
+        parts.append("This notice reports provider health. Use the provider picker to choose another provider until this one recovers.")
         return parts.joined(separator: " ")
     }
 }

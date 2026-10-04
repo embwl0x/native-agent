@@ -1,11 +1,12 @@
 import Foundation
+import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
 public enum TelegramModelSelectionAction: Sendable, Equatable {
     case providers
-    case provider(index: Int)
-    case model(providerIndex: Int, modelIndex: Int)
+    case provider(key: String)
+    case model(providerKey: String, modelKey: String)
 }
 
 public struct TelegramModelSelectionCallback: Sendable, Equatable {
@@ -44,12 +45,16 @@ public struct TelegramModelSelectionCallback: Sendable, Equatable {
         self.fromUserId = fromUserId
     }
 
-    public static func providerData(index: Int) -> String {
-        "na_model:p:\(index)"
+    public static func selectionKey(_ identity: String) -> String {
+        SHA256.hash(data: Data(identity.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 
-    public static func modelData(providerIndex: Int, modelIndex: Int) -> String {
-        "na_model:m:\(providerIndex):\(modelIndex)"
+    public static func providerData(id: String) -> String {
+        "na_model:p:\(selectionKey(id))"
+    }
+
+    public static func modelData(providerId: String, modelId: String) -> String {
+        "na_model:m:\(selectionKey(providerId)):\(selectionKey(modelId))"
     }
 
     public static var providersData: String {
@@ -62,20 +67,20 @@ public struct TelegramModelSelectionCallback: Sendable, Equatable {
         if parts.count == 2, parts[1] == "providers" {
             return .providers
         }
-        if parts.count == 3, parts[1] == "p", let index = Int(parts[2]), index >= 0 {
-            return .provider(index: index)
+        if parts.count == 3, parts[1] == "p", isSelectionKey(parts[2]) {
+            return .provider(key: parts[2])
         }
         if parts.count == 4,
            parts[1] == "m",
-           let providerIndex = Int(parts[2]),
-           let modelIndex = Int(parts[3]),
-           providerIndex >= 0,
-           modelIndex >= 0 {
-            return .model(providerIndex: providerIndex, modelIndex: modelIndex)
+           isSelectionKey(parts[2]), isSelectionKey(parts[3]) {
+            return .model(providerKey: parts[2], modelKey: parts[3])
         }
         return nil
     }
 
+    private static func isSelectionKey(_ value: String) -> Bool {
+        value.count == 24 && value.allSatisfy { "0123456789abcdef".contains($0) }
+    }
 }
 
 enum TelegramModelSelectionUI {
@@ -90,11 +95,11 @@ enum TelegramModelSelectionUI {
     }
 
     static func providerReplyMarkup(menu: TelegramModelMenu) -> JSONValue {
-        let rows = menu.providers.enumerated().map { index, provider -> JSONValue in
+        let rows = menu.providers.map { provider -> JSONValue in
             .array([
                 .object([
                     "text": .string(providerButtonTitle(provider)),
-                    "callback_data": .string(TelegramModelSelectionCallback.providerData(index: index)),
+                    "callback_data": .string(TelegramModelSelectionCallback.providerData(id: provider.id)),
                 ]),
             ])
         }
@@ -120,13 +125,13 @@ enum TelegramModelSelectionUI {
     ) -> JSONValue? {
         guard providerIndex >= 0, providerIndex < menu.providers.count else { return nil }
         let provider = menu.providers[providerIndex]
-        var rows: [JSONValue] = provider.models.prefix(maxModels).enumerated().map { modelIndex, model in
+        var rows: [JSONValue] = provider.models.prefix(maxModels).map { model in
             .array([
                 .object([
                     "text": .string(modelButtonTitle(model)),
                     "callback_data": .string(TelegramModelSelectionCallback.modelData(
-                        providerIndex: providerIndex,
-                        modelIndex: modelIndex
+                        providerId: provider.id,
+                        modelId: model.id
                     )),
                 ]),
             ])
@@ -142,21 +147,21 @@ enum TelegramModelSelectionUI {
 
     static func selectedText(provider: TelegramModelProviderChoice, model: TelegramModelChoice) -> String {
         """
-        Telegram model set
+        Chat model set
         Provider: \(provider.displayName) (\(provider.id))
         Model: \(modelLabel(id: model.id, name: model.name))
 
-        Providers tab will reflect this under Telegram.
+        Providers → Chat now uses this model for Mac, iPhone, Telegram, and Slack.
         """
     }
 
-    static func selectedReplyMarkup(providerIndex: Int) -> JSONValue {
+    static func selectedReplyMarkup(providerId: String) -> JSONValue {
         .object([
             "inline_keyboard": .array([
                 .array([
                     .object([
                         "text": .string("Choose another model"),
-                        "callback_data": .string(TelegramModelSelectionCallback.providerData(index: providerIndex)),
+                        "callback_data": .string(TelegramModelSelectionCallback.providerData(id: providerId)),
                     ]),
                 ]),
                 .array([

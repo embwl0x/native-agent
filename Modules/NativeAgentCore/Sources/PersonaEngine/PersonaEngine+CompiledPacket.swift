@@ -138,45 +138,13 @@ extension PersonaCompiler {
         for id in ids {
             let url = root.appendingPathComponent("\(id).md")
             if fm.fileExists(atPath: url.path),
-               let body = try? String(contentsOf: url, encoding: .utf8) {
-                out[id] = id == "GROWTH" ? stripEpisodicGrowthLines(body) : body
+               let body = try? SwiftNativePersonaEngine.readPersonaDocument(at: url) {
+                out[id] = body
             } else {
                 out[id] = ""
             }
         }
         return out
-    }
-
-    // GROWTH.md feedback hygiene (read-side guard). The doc is injected into
-    // every chat turn, so any episodic dash-line that landed in it leaks raw
-    // transcript into the prompt. The capture-side discipline routes
-    // persona-feedback to the episodic memory layer and never appends to
-    // GROWTH directly — but if a stale line slips in (legacy installs, a
-    // future bug), this guard drops `- <ts> · feedback · ...` and
-    // `- <ts> · dream_candidate · ...` lines before retrieval ever sees them.
-    // Distilled prose bullets and `## DATE · category` headers are preserved.
-    // Mirrors the daemon's `_is_episodic_growth_log_line` parser drop pinned
-    // by the nativeagent-rem-dream-cycle vault skill.
-    private static let episodicGrowthLineRegex: NSRegularExpression = {
-        // swiftlint:disable:next force_try
-        try! NSRegularExpression(
-            pattern: #"^- \S+\s+·\s+(feedback|dream_candidate)\s+·"#,
-            options: []
-        )
-    }()
-
-    fileprivate static func stripEpisodicGrowthLines(_ body: String) -> String {
-        let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var out: [String] = []
-        out.reserveCapacity(lines.count)
-        for line in lines {
-            let range = NSRange(line.startIndex..., in: line)
-            if episodicGrowthLineRegex.firstMatch(in: line, options: [], range: range) != nil {
-                continue
-            }
-            out.append(line)
-        }
-        return out.joined(separator: "\n")
     }
 
     // MARK: - slice_for_surface

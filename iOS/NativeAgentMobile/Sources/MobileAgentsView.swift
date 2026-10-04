@@ -46,6 +46,10 @@ private struct MobileAgentThreadView: View {
     @State private var busy = false
     @State private var error: String?
 
+    private var sendRestriction: String? {
+        (thread?.agent ?? agent).sendRestriction
+    }
+
     var body: some View {
         AlivePage(title: agent.name, line: thread?.agent.status ?? agent.via) {
             if let error { AliveSection("Couldn’t complete the request") { Text(error).aliveRow() } }
@@ -63,10 +67,14 @@ private struct MobileAgentThreadView: View {
                 } else { Text("Loading conversation…").aliveRow() }
             }
             AliveSection("Message") {
-                if let message { Text(message).aliveRow() }
-                TextField("Message \(agent.name)", text: $draft, axis: .vertical).lineLimit(2...8).aliveRow()
-                Button("Send") { Task { await refresh(send: true) } }.aliveRow()
-                    .disabled(busy || !pairing.isPaired || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if let restriction = sendRestriction {
+                    Text(restriction).aliveRow()
+                } else {
+                    if let message { Text(message).aliveRow() }
+                    TextField("Message \(agent.name)", text: $draft, axis: .vertical).lineLimit(2...8).aliveRow()
+                    Button("Send") { Task { await refresh(send: true) } }.aliveRow()
+                        .disabled(busy || !pairing.isPaired || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
             }
             if busy { ProgressView("Waiting for Mac…").aliveRow() }
         }
@@ -78,7 +86,7 @@ private struct MobileAgentThreadView: View {
     }
 
     private func refresh(send: Bool = false) async {
-        guard !busy else { return }
+        guard !busy, !send || sendRestriction == nil else { return }
         busy = true; error = nil; message = nil
         let sentDraft = draft
         defer { busy = false }

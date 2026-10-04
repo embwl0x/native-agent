@@ -1,5 +1,7 @@
 // PATCH-2026-05-07: mac-control-ui-1 iOS Mac Tools — remote Mac Control from iPhone/iPad
 import SwiftUI
+import Combine
+import NativeAgentShared
 
 // MARK: - MacToolsView
 
@@ -192,7 +194,7 @@ struct MacToolsView: View {
         // ── Receipts ───────────────────────────────────────────────
         if !remoteActions.isEmpty {
             AliveSection("Recent on the Mac", footer: "Kept while this app stays open.") {
-                ForEach(Array(remoteActions.prefix(8).enumerated()), id: \.element.id) { index, action in
+                ForEach(Array(remoteActions.enumerated()), id: \.element.id) { index, action in
                     if index > 0 { AliveDivider() }
                     RemoteActionCardView(action: action) {
                         Task { await retry(action) }
@@ -233,7 +235,7 @@ struct MacToolsView: View {
     @ViewBuilder
     private func spotlightResultPresentation(_ outcome: MacToolsSpotlightPresentation.Outcome) -> some View {
         switch outcome {
-        case .emptyResponse, .noResults:
+        case .emptyResponse, .invalidResponse, .noResults:
             Text(outcome.statusText)
                 .font(.subheadline)
                 .foregroundStyle(AlivePalette.secondary)
@@ -276,9 +278,9 @@ struct MacToolsView: View {
         }
     }
 
-    private func updateRemoteAction(_ id: UUID, state: RemoteActionState, detail: String) {
+    private func updateRemoteAction(_ id: UUID, state: RemoteActionState, detail: String, approvalID: String? = nil) {
         withAnimation(AppMotion.snappy) {
-            remoteActionLedger.update(id, state: state, detail: detail)
+            remoteActionLedger.update(id, state: state, detail: detail, approvalID: approvalID)
         }
     }
 
@@ -338,6 +340,8 @@ struct MacToolsView: View {
     private func sendNotification(titleOverride: String? = nil, messageOverride: String? = nil, retrying cardID: UUID? = nil) async {
         isSendingNotif = true
         notifResult = nil
+        let submittedTitle = notifTitle
+        let submittedMessage = notifMessage
         let title = titleOverride ?? (notifTitle.isEmpty ? iCloudSyncEngine.shared.agentDisplayName : notifTitle)
         let message = messageOverride ?? notifMessage
         let actionID = cardID ?? startRemoteAction(.notify(title: title, message: message), title: "Send notification", subtitle: title)
@@ -353,11 +357,15 @@ struct MacToolsView: View {
             _ = try await iCloudSyncEngine.shared.macNotify(title: title, message: message)
             notifResult = .sent
             updateRemoteAction(actionID, state: .ranOnMac, detail: "Ran on Mac through iCloud")
-            notifMessage = ""
-            notifTitle = ""
+            if cardID == nil, titleOverride == nil, messageOverride == nil,
+               notifTitle == submittedTitle, notifMessage == submittedMessage {
+                notifMessage = ""
+                notifTitle = ""
+            }
         } catch {
             notifResult = .failed(error.localizedDescription)
-            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription)
+            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription,
+                               approvalID: (error as? SyncError)?.approvalID)
         }
         isSendingNotif = false
     }
@@ -390,7 +398,7 @@ struct MacToolsView: View {
             }
         }
         actionStatus = completion.status
-        updateRemoteAction(actionID, state: completion.state, detail: completion.detail)
+        updateRemoteAction(actionID, state: completion.state, detail: completion.detail, approvalID: completion.approvalID)
     }
 
     private func setVolume(percentOverride: Int? = nil, retrying cardID: UUID? = nil) async {
@@ -412,7 +420,8 @@ struct MacToolsView: View {
             updateRemoteAction(actionID, state: .ranOnMac, detail: "Mac accepted the request; current volume is not read back.")
         } catch {
             actionStatus = error.localizedDescription
-            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription)
+            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription,
+                               approvalID: (error as? SyncError)?.approvalID)
         }
         isSettingVolume = false
     }
@@ -439,14 +448,15 @@ struct MacToolsView: View {
             actionStatus = outcome.statusText
 
             switch outcome {
-            case .emptyResponse:
+            case .emptyResponse, .invalidResponse:
                 updateRemoteAction(actionID, state: .failed, detail: outcome.statusText)
             case .noResults, .results:
                 updateRemoteAction(actionID, state: .ranOnMac, detail: "\(outcome.resultCount) result(s)")
             }
         } catch {
             actionStatus = error.localizedDescription
-            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription)
+            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription,
+                               approvalID: (error as? SyncError)?.approvalID)
         }
         isSearching = false
     }
@@ -469,7 +479,8 @@ struct MacToolsView: View {
         } catch {
             let failure = MacShortcutRunnerPresentation.failure(for: error, shortcutName: name)
             actionStatus = failure.status
-            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: failure.detail)
+            updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: failure.detail,
+                               approvalID: (error as? SyncError)?.approvalID)
         }
     }
 }
@@ -480,6 +491,7 @@ enum RemoteActionState: String, Equatable {
     case waiting = "waiting"
     case running = "running"
     case waitingApproval = "waiting approval"
+    case approvalResolved = "approval resolved"
     case ranOnMac = "ran on Mac"
     case failed = "failed"
 
@@ -496,6 +508,7 @@ enum RemoteActionState: String, Equatable {
         switch self {
         case .waiting, .running: return .orange
         case .waitingApproval: return .purple
+        case .approvalResolved: return .secondary
         case .ranOnMac: return .green
         case .failed: return .red
         }
@@ -506,6 +519,7 @@ enum RemoteActionState: String, Equatable {
         case .waiting: return "clock"
         case .running: return "arrow.triangle.2.circlepath"
         case .waitingApproval: return "checkmark.shield"
+        case .approvalResolved: return "checkmark.shield"
         case .ranOnMac: return "checkmark.circle.fill"
         case .failed: return "xmark.octagon.fill"
         }
@@ -526,7 +540,7 @@ enum RemoteActionCardRecoveryPresentation {
         switch state {
         case .waitingApproval: .reviewApproval
         case .failed: .retry
-        case .waiting, .running, .ranOnMac: .none
+        case .waiting, .running, .ranOnMac, .approvalResolved: .none
         }
     }
 }
@@ -570,6 +584,7 @@ struct RemoteActionCard: Identifiable, Equatable {
     var detail: String
     var createdAt: Date
     var updatedAt: Date
+    var approvalID: String?
 
     init(kind: RemoteActionKind, title: String, subtitle: String, state: RemoteActionState, detail: String) {
         self.id = UUID()
@@ -592,9 +607,13 @@ final class RemoteActionLedger: ObservableObject {
 
     @Published private(set) var actions: [RemoteActionCard] = []
     private let maximumOrdinaryActions: Int
+    private var approvalsObserver: AnyCancellable?
 
     init(maximumOrdinaryActions: Int = 12) {
         self.maximumOrdinaryActions = max(0, maximumOrdinaryActions)
+        approvalsObserver = iCloudSyncEngine.shared.$approvals.sink { [weak self] approvals in
+            self?.reconcileApprovals(approvals)
+        }
     }
 
     @discardableResult
@@ -611,18 +630,35 @@ final class RemoteActionLedger: ObservableObject {
         return card.id
     }
 
-    func update(_ id: UUID, state: RemoteActionState, detail: String) {
+    func update(_ id: UUID, state: RemoteActionState, detail: String, approvalID: String? = nil) {
         guard let index = actions.firstIndex(where: { $0.id == id }) else { return }
         actions[index].state = state
         actions[index].detail = detail
         actions[index].updatedAt = Date()
+        actions[index].approvalID = approvalID?.isEmpty == false ? approvalID : nil
+        reconcileApprovals(iCloudSyncEngine.shared.approvals)
+    }
+
+    private func reconcileApprovals(_ approvals: [ApprovalRequest]) {
+        for index in actions.indices where actions[index].state == .waitingApproval {
+            guard let id = actions[index].approvalID,
+                  let approval = approvals.first(where: { $0.id == id }),
+                  ["resolved", "denied", "canceled", "orphaned"]
+                    .contains(approval.status.lowercased()) else { continue }
+            actions[index].state = .approvalResolved
+            actions[index].detail = "Approval \(approval.decision ?? approval.status). Check Activity for the action outcome."
+            actions[index].updatedAt = Date()
+        }
         trimOrdinaryActions()
     }
 
     private func trimOrdinaryActions() {
-        let approvalWaits = actions.filter { $0.state == .waitingApproval }
-        let ordinary = actions.filter { $0.state != .waitingApproval }
-        actions = approvalWaits + Array(ordinary.prefix(maximumOrdinaryActions))
+        var ordinaryCount = 0
+        actions = actions.sorted { $0.updatedAt > $1.updatedAt }.filter { action in
+            if action.state == .waitingApproval, action.approvalID != nil { return true }
+            ordinaryCount += 1
+            return ordinaryCount <= maximumOrdinaryActions
+        }
     }
 }
 
@@ -660,7 +696,7 @@ private struct RemoteActionCardView: View {
                 .fixedSize(horizontal: false, vertical: true)
             if action.state == .waitingApproval,
                RemoteActionCardRecoveryPresentation.control(for: action.state) == .reviewApproval {
-                Text("Approval status is local to this session; review it in Activity.")
+                Text("Review this approval in Activity.")
                     .font(.footnote)
                     .foregroundStyle(AlivePalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)

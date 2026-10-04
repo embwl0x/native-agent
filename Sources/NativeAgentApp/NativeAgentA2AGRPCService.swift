@@ -74,7 +74,8 @@ struct NativeAgentA2AGRPCService: Lf_A2a_V1_A2AService.ServiceProtocol {
     }
 
     private func unary<Input: SwiftProtobuf.Message, Output: SwiftProtobuf.Message>(_ request: ServerRequest<Input>, method: String) async throws -> ServerResponse<Output> {
-        guard case .json(let value) = try await handle(request, method: method) else {
+        // gRPC replies never acknowledge a fetch; HTTP transports own onSent.
+        guard case .json(let value, _) = try await handle(request, method: method) else {
             throw RPCError(code: .internalError, message: "Unexpected stream")
         }
         return ServerResponse(message: try decode(value))
@@ -82,7 +83,7 @@ struct NativeAgentA2AGRPCService: Lf_A2a_V1_A2AService.ServiceProtocol {
 
     private func stream<Input: SwiftProtobuf.Message>(_ request: ServerRequest<Input>, method: String) async throws -> StreamingServerResponse<Lf_A2a_V1_StreamResponse> {
         switch try await handle(request, method: method) {
-        case .json(let value):
+        case .json(let value, _):
             let _: Lf_A2a_V1_StreamResponse = try decode(value)
             throw RPCError(code: .internalError, message: "Expected stream")
         case .stream(_, let events, _):

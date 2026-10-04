@@ -4,20 +4,20 @@ import PersistenceCore
 import MacIntegration
 
 extension MacAppleScriptBridge {
-    /// Bounded inbox reads with opaque owner IDs. Transport fields are encoded
+    /// Bounded mailbox reads with opaque owner IDs. Transport fields are encoded
     /// separately so message content can never manufacture another message ID.
     static func mailWorkspaceRead(input: [String: JSONValue], query: String? = nil) async throws -> JSONValue {
-        for key in ["scope", "mailbox"] {
-            if let value = input[key], value != .string("inbox") {
-                return .object(["status": .string("failed"), "integration": .string("mail"),
-                    "reason": .string("unsupported_mailbox"),
-                    "message": .string("Accepted mailbox: inbox.")])
-            }
+        var input = input
+        if input["message_id"] != nil, input["expected_message_id"] == nil { input["expected_message_id"] = .string("") }
+        guard let scope = mailReadScope(input) else {
+            return .object(["status": .string("failed"), "integration": .string("mail"),
+                "reason": .string("unsupported_mailbox"),
+                "message": .string("Accepted scopes: inbox, sent. scope and mailbox must agree when both are supplied.")])
         }
         if input["message_id"] != nil && mailExactLocator(input, allowMissingMessageID: true) == nil {
             return .object(["status": .string("failed"), "integration": .string("mail"),
                 "reason": .string("invalid_message_locator"),
-                "message": .string("Call mail_list_recent without message_id to list the inbox, then copy message_id, expected_message_id, expected_account and position from the same row to read it.")])
+                "message": .string("Call mail_list_recent without message_id, then copy scope, message_id, expected_message_id, expected_account and position from the same row to read it.")])
         }
         do {
             let script = mailWorkspaceScript(input: input, query: query)
@@ -34,32 +34,66 @@ extension MacAppleScriptBridge {
             if raw == "__MESSAGE_CHANGED__" {
                 return .object(["status": .string("failed"), "integration": .string("mail"),
                     "reason": .string("message_changed_or_moved_refresh_inbox"),
-                    "message": .string("The message no longer matches this inbox locator. Call mail_list_recent without message_id and use the identifiers from one fresh row; do not reuse its old position.")])
+                    "message": .string("The message no longer matches this mailbox locator. Call mail_list_recent without message_id in the same scope and use the identifiers from one fresh row; do not reuse its old position.")])
             }
             if input["message_id"] == nil { return mailIndexPage(header: raw, input: input, query: query) }
             let rows = parseMailWorkspaceRecords(raw, detail: true)
             if rows.isEmpty { return failedEnvelope(integration: "mail", reason: "message_not_in_inbox") }
             return .object(["status": .string("completed"), "count": .int(Int64(rows.count)),
-                "messages": .array(rows), "scope": .string("inbox"), "detail": .bool(true)])
+                "messages": .array(rows.map { row in
+                    guard case .object(var object) = row else { return row }
+                    object["scope"] = .string(scope)
+                    return .object(object)
+                }), "scope": .string(scope), "detail": .bool(true)])
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "mail", app: app)
         } catch let error as NSError where error.domain == "NativeAgentAppleScript" && [-1712, -1001, appleScriptOutcomeUnknownCode].contains(error.code) {
             // A read changes nothing, so the "outcome unknown" caution for sends does not apply.
             return .object(["status": .string("failed"), "integration": .string("mail"), "error_code": .int(Int64(error.code)),
-                "error": .string("Mail did not answer within two bounded read attempts (it may be busy syncing). Nothing was changed. Let Mail finish syncing, then call mail_list_recent again; for a message body, use the identifiers and position from a fresh inbox row.")])
+                "error": .string("Mail did not answer within two bounded read attempts (it may be busy syncing). Nothing was changed. Let Mail finish syncing, then call mail_list_recent again; for a message body, use the scope, identifiers and position from a fresh row.")])
         } catch { return failedEnvelope(integration: "mail", error: error) }
     }
 
+    static func mailReadScope(_ input: [String: JSONValue]) -> String? {
+        let value = input["scope"] ?? input["mailbox"] ?? .string("inbox")
+        guard case .string(let scope) = value, ["inbox", "sent"].contains(scope),
+              input["scope"] == nil || input["mailbox"] == nil || input["scope"] == input["mailbox"] else { return nil }
+        return scope
+    }
+
+    static func mailIndexDatabase() -> OpaquePointer? {
+        let library = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mail")
+        let version = ((try? FileManager.default.contentsOfDirectory(atPath: library.path)) ?? [])
+            .compactMap { $0.hasPrefix("V") ? Int($0.dropFirst()) : nil }.max()
+        var database: OpaquePointer?
+        guard let version,
+              sqlite3_open_v2(library.appendingPathComponent("V\(version)/MailData/Envelope Index").path, &database,
+                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
+            if let database { sqlite3_close(database) }
+            return nil
+        }
+        if let database { sqlite3_busy_timeout(database, 500) }
+        return database
+    }
+
     /// One inbox page read from Mail's own index (Envelope Index, read-only,
-    /// under the app's Full Disk Access): rows round-robin from each account's
+    /// under the app's Full Disk Access): rows from each account's
     /// inbox, newest first, positions as Mail numbers them, `limit` rows by
     /// date. `header` is the script's unread count and account inboxes. An
     /// account whose inbox the index lacks is named in `accounts_not_listed`;
     /// the others still list.
     static func mailIndexPage(header: String, input: [String: JSONValue], query: String?) -> JSONValue {
+        guard let scope = mailReadScope(input) else { return failedEnvelope(integration: "mail", reason: "unsupported_mailbox") }
         let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
         let listOffset = clampedInt(input["offset"], defaultValue: 0, min: 0, max: 10000)
-        let rounds = listOffset + (query == nil ? limit : 50)
+        var offsets: [String: JSONValue] = [:]
+        if case .object(let cursor)? = input["offset"] {
+            guard cursor.values.allSatisfy({ if case .int(let value) = $0 { value >= 0 && value < Int.max - 50 } else { false } }) else {
+                return failedEnvelope(integration: "mail", reason: "invalid_mail_offset")
+            }
+            offsets = cursor
+        }
+        let pageSize = query == nil ? limit : 50
         var unread: Int64 = -1
         var accounts: [(name: String, id: String, inbox: String)] = []
         for line in header.split(separator: "\n") {
@@ -70,17 +104,10 @@ extension MacAppleScriptBridge {
                 accounts.append((decoded[0], decoded[1], decoded[2]))
             }
         }
-        let library = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mail")
-        let version = ((try? FileManager.default.contentsOfDirectory(atPath: library.path)) ?? [])
-            .compactMap { $0.hasPrefix("V") ? Int($0.dropFirst()) : nil }.max()
-        var database: OpaquePointer?
-        defer { if let database { sqlite3_close(database) } }
-        guard !accounts.isEmpty, let version,
-              sqlite3_open_v2(library.appendingPathComponent("V\(version)/MailData/Envelope Index").path, &database,
-                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let database else {
+        guard !accounts.isEmpty, let database = mailIndexDatabase() else {
             return failedEnvelope(integration: "mail", reason: "mail_index_unavailable")
         }
-        sqlite3_busy_timeout(database, 500)
+        defer { sqlite3_close(database) }
         /// Runs `sql` with integer/text bindings, one closure call per row; false when it cannot run.
         func each(_ sql: String, _ bindings: [Any], _ row: (OpaquePointer) -> Void) -> Bool {
             var statement: OpaquePointer?
@@ -109,9 +136,12 @@ extension MacAppleScriptBridge {
                 mailboxes.append((Int(sqlite3_column_int64(statement, 0)), host, String(url.path.dropFirst())))
             }
         }) else { return failedEnvelope(integration: "mail", reason: "mail_index_unavailable") }
-        var boxes: [(count: Int, rows: [JSONValue])] = [], notListed: [JSONValue] = []
-        for account in accounts {
+        var boxes: [(account: String, count: Int, offset: Int, consumed: Int, rows: [JSONValue])] = [], notListed: [JSONValue] = []
+        for account in accounts.sorted(by: { $0.id < $1.id }) {
             var count = 0, rows: [JSONValue] = []
+            let offset: Int
+            if case .int(let value)? = offsets[account.id] { offset = Int(value) }
+            else { offset = listOffset }
             let unnamed = account.id.isEmpty || account.inbox.isEmpty
             let mailbox = unnamed ? nil : mailboxes.first {
                 $0.account.caseInsensitiveCompare(account.id) == .orderedSame && $0.path.caseInsensitiveCompare(account.inbox) == .orderedSame
@@ -119,9 +149,9 @@ extension MacAppleScriptBridge {
             guard let mailbox else {
                 notListed.append(.object(unnamed
                     ? ["account": .string(account.name), "reason": .string("account_details_unreadable"),
-                       "message": .string("Mail did not give this inbox's account id or name, so its mail is not in this list.")]
-                    : ["account": .string(account.name), "reason": .string("inbox_not_in_mail_index"),
-                       "message": .string("This account's inbox was not found in Mail's index, so its mail is not in this list.")]))
+                       "message": .string("Mail did not give this mailbox's account id or name, so its mail is not in this list.")]
+                    : ["account": .string(account.name), "reason": .string("mailbox_not_in_mail_index"),
+                       "message": .string("This account's requested mailbox was not found in Mail's index, so its mail is not in this list.")]))
                 continue
             }
             guard each("SELECT count(*) FROM messages m WHERE \(inboxMessages)", [mailbox], { count = Int(sqlite3_column_int64($0, 0)) }),
@@ -130,7 +160,7 @@ extension MacAppleScriptBridge {
                     FROM messages m LEFT JOIN subjects s ON s.ROWID = m.subject LEFT JOIN addresses a ON a.ROWID = m.sender
                     LEFT JOIN message_global_data g ON g.ROWID = m.global_message_id
                     WHERE \(inboxMessages) ORDER BY m.date_received DESC, m.ROWID DESC LIMIT ?2 OFFSET ?3
-                    """, [mailbox, rounds - listOffset, listOffset], { statement in
+                    """, [mailbox, pageSize, offset], { statement in
                         var messageID = text(statement, 1)
                         if messageID.hasPrefix("<"), messageID.hasSuffix(">") { messageID = String(messageID.dropFirst().dropLast()) }
                         let received = sqlite3_column_type(statement, 6) == SQLITE_NULL ? ""
@@ -138,41 +168,52 @@ extension MacAppleScriptBridge {
                         var row: [String: JSONValue] = ["message_id": .int(sqlite3_column_int64(statement, 0)), "expected_message_id": .string(messageID),
                             "subject": .string(text(statement, 2) + text(statement, 3)), "sender": .string(mailSenderText(comment: text(statement, 4), address: text(statement, 5))),
                             "date": .string(received), "unread": .bool(sqlite3_column_int(statement, 7) == 0),
-                            "position": .int(Int64(listOffset + rows.count + 1)), "body_status": .string("not_loaded")]
+                            "position": .int(Int64(offset + rows.count + 1)), "body_status": .string("not_loaded"), "scope": .string(scope)]
                         if !account.name.isEmpty { row["expected_account"] = .string(account.name) }
                         rows.append(.object(row))
                     }) else { return failedEnvelope(integration: "mail", reason: "mail_index_unavailable") }
-            boxes.append((count, rows))
+            boxes.append((account.id, count, offset, 0, rows))
         }
-        // Rounds as Mail's inbox numbers them: position i of every account, then i + 1.
-        var picked: [JSONValue] = [], scannedThrough = listOffset
-        for i in (listOffset + 1)...rounds {
-            let left = boxes.filter { i <= $0.count }
-            for box in left where i - listOffset <= box.rows.count {
-                let row = box.rows[i - listOffset - 1]
-                guard let query, case .object(let o) = row else { picked.append(row); continue }
-                if [o["subject"], o["sender"]].contains(where: { if case .string(let v)? = $0 { v.localizedCaseInsensitiveContains(query) } else { false } }) {
-                    picked.append(row)
-                }
-            }
-            scannedThrough = i
-            if left.isEmpty || (query != nil && picked.count >= limit) { break }
-        }
-        // Newest first across accounts (ISO dates sort as text), then the page size.
+        // Merge account heads; fetched rows outside this page remain unconsumed.
         func received(_ row: JSONValue) -> String { if case .object(let o) = row, case .string(let d)? = o["date"] { d } else { "" } }
-        let rows = Array(picked.sorted { received($0) > received($1) }.prefix(limit))
-        var result: [String: JSONValue] = ["status": .string("completed"), "count": .int(Int64(rows.count)),
-            "messages": .array(rows), "scope": .string("inbox"), "detail": .bool(false),
-            "content_note": .string("Inbox metadata only; open a message to load its body. Pages read the current inbox, which may change between reads."),
-            "inbox_total": .int(Int64(boxes.reduce(0) { $0 + $1.count }))]
-        if query != nil {
-            result["search_coverage"] = .string("Sender and subject in at most 50 inbox messages per page. Message bodies and later pages were not searched; continue with next_offset when offered.")
+        var rows: [JSONValue] = [], inspected = 0
+        while rows.count < limit {
+            var next: Int?
+            for index in boxes.indices where boxes[index].consumed < boxes[index].rows.count {
+                if let current = next {
+                    if received(boxes[index].rows[boxes[index].consumed]) > received(boxes[current].rows[boxes[current].consumed]) { next = index }
+                } else { next = index }
+            }
+            guard let next else { break }
+            let row = boxes[next].rows[boxes[next].consumed]
+            boxes[next].consumed += 1
+            inspected += 1
+            if let query, case .object(let object) = row {
+                if [object["subject"], object["sender"]].contains(where: { if case .string(let value)? = $0 { value.localizedCaseInsensitiveContains(query) } else { false } }) { rows.append(row) }
+            } else { rows.append(row) }
         }
-        if boxes.contains(where: { $0.count > scannedThrough }), scannedThrough <= 10000 { result["next_offset"] = .int(Int64(scannedThrough)) }
-        if unread >= 0 { result["inbox_unread"] = .int(unread) }
+        var result: [String: JSONValue] = ["status": .string("completed"), "count": .int(Int64(rows.count)),
+            "messages": .array(rows), "scope": .string(scope), "detail": .bool(false),
+            "content_note": .string("Mailbox metadata only; open a message to load its body. Pages read the current mailbox, which may change between reads."),
+            "mailbox_total": .int(Int64(boxes.reduce(0) { $0 + $1.count }))]
+        let hasMore = boxes.contains(where: { $0.count > $0.offset + $0.consumed })
+        result["has_more"] = .bool(hasMore)
+        if query != nil {
+            result["inspected_count"] = .int(Int64(inspected))
+            result["matches_omitted"] = .int(0)
+            result["search_coverage"] = .string("Inspected \(inspected) messages in \(scope), sender and subject only, up to 50 per account per page. Bodies were not searched.\(hasMore ? " Later messages remain; continue with next_offset when offered. An empty page does not prove absence." : " No later messages remain in the listed accounts.")")
+        }
+        if hasMore {
+            for box in boxes { offsets[box.account] = .int(Int64(box.offset + box.consumed)) }
+            result["next_offset"] = .object(offsets)
+        }
+        if scope == "inbox" {
+            result["inbox_total"] = result["mailbox_total"]
+            if unread >= 0 { result["inbox_unread"] = .int(unread) }
+        }
         if !notListed.isEmpty {
             // The totals would count different accounts, so a partial page carries none.
-            result["inbox_total"] = nil; result["inbox_unread"] = nil
+            result["mailbox_total"] = nil; result["inbox_total"] = nil; result["inbox_unread"] = nil
             result["accounts_not_listed"] = .array(notListed)
             let names = notListed.compactMap { if case .object(let o) = $0, case .string(let n)? = o["account"] { n.isEmpty ? "an account" : n } else { nil } }
             result["message"] = .string("Not listed: \(names.joined(separator: ", ")); see accounts_not_listed.\(boxes.isEmpty ? "" : " The other accounts are listed.")")
@@ -196,6 +237,17 @@ extension MacAppleScriptBridge {
         MailReadLocator.parse(input, allowMissingMessageID: allowMissingMessageID)
     }
 
+    static func mailLookupCommand(_ command: String, deadline: String? = nil) -> String {
+        guard let deadline else { return command }
+        return """
+        set lookupSecondsRemaining to \(deadline) - (current date)
+        if lookupSecondsRemaining < 1 then error number -1712
+        with timeout of lookupSecondsRemaining seconds
+            \(command)
+        end timeout
+        """
+    }
+
     /// The one message `list` holds is the one that was read: exactly one
     /// match, its RFC id when available, and its account when supplied, so the
     /// same email in a second account's inbox is never the one acted on.
@@ -204,8 +256,8 @@ extension MacAppleScriptBridge {
     /// pushes it down) and earlier, before the full `whose id is` scan, which
     /// times out in a ~140k-message account inbox (2026-09-24). The identity
     /// check after it still decides.
-    static func mailExactLookup(_ locator: MailLocator, into list: String) -> String {
-        let scan = "set \(list) to (messages of targetBox whose id is \(locator.id))"
+    static func mailExactLookup(_ locator: MailLocator, into list: String, deadline: String? = nil) -> String {
+        let scan = mailLookupCommand("set \(list) to (messages of targetBox whose id is \(locator.id))", deadline: deadline)
         guard let position = locator.position else { return scan }
         return """
         set \(list) to {}
@@ -213,19 +265,24 @@ extension MacAppleScriptBridge {
             set probeIndex to \(position) + (shiftBy as integer)
             if probeIndex ≥ 1 then
                 try
-                    set candidateMsg to message probeIndex of targetBox
-                    if (id of candidateMsg) is \(locator.id) then
+                    \(mailLookupCommand("set candidateMsg to message probeIndex of targetBox", deadline: deadline))
+                    \(mailLookupCommand("set candidateID to id of candidateMsg", deadline: deadline))
+                    if candidateID is \(locator.id) then
                         set \(list) to {candidateMsg}
                         exit repeat
                     end if
+                on error errText number errNum
+                    if errNum is -1712 then error errText number errNum
                 end try
             end if
         end repeat
-        if (count of \(list)) is 0 then \(scan)
+        if (count of \(list)) is 0 then
+            \(scan)
+        end if
         """
     }
 
-    static func mailIdentityCheck(_ locator: MailLocator, list: String, fail: String) -> String {
+    static func mailIdentityCheck(_ locator: MailLocator, list: String, fail: String, deadline: String? = nil) -> String {
         var lines = [
             "if (count of \(list)) is not 1 then return \"\(fail)\"",
             "if (id of item 1 of \(list)) is not \(locator.id) then return \"\(fail)\"",
@@ -236,7 +293,7 @@ extension MacAppleScriptBridge {
         if let account = locator.account {
             lines.append("if ((name of account of mailbox of item 1 of \(list)) as text) is not \"\(escapeForAppleScript(account))\" then return \"\(fail)\"")
         }
-        return lines.joined(separator: "\n")
+        return lines.map { mailLookupCommand($0, deadline: deadline) }.joined(separator: "\n")
     }
 
     /// AppleScript that sets `targetBox` (not `scope`: Mail owns that word, -10006) to the inbox of the named account (each
@@ -244,24 +301,32 @@ extension MacAppleScriptBridge {
     /// inbox when none is named or found. An id looked up there is scanned in
     /// one account's inbox, not all of them (2026-09-24: a 141k-message
     /// combined inbox timed out on `whose id is`).
-    static func mailAccountScope(_ account: String?) -> String {
-        guard let account else { return "set targetBox to inbox" }
+    static func mailAccountScope(_ account: String?, scope: String = "inbox", deadline: String? = nil) -> String {
+        let box = scope == "sent" ? "sent mailbox" : "inbox"
+        let target = mailLookupCommand("set targetBox to \(box)", deadline: deadline)
+        guard let account else { return target }
         return """
-        set targetBox to inbox
+        \(target)
         try
-            repeat with mb in (mailboxes of inbox)
-                if ((name of account of mb) as text) is "\(escapeForAppleScript(account))" then
+            \(mailLookupCommand("set accountMailboxes to mailboxes of \(box)", deadline: deadline))
+            repeat with mb in accountMailboxes
+                \(mailLookupCommand("set mailboxAccountName to (name of account of mb) as text", deadline: deadline))
+                if mailboxAccountName is "\(escapeForAppleScript(account))" then
                     set targetBox to mb
                     exit repeat
                 end if
             end repeat
+        on error errText number errNum
+            if errNum is -1712 then error errText number errNum
         end try
         """
     }
 
-    static func mailWorkspaceScript(input: [String: JSONValue], query: String? = nil) -> String {
+    static func mailWorkspaceScript(input: [String: JSONValue], query: String? = nil, batch: Bool = false) -> String {
+        let scope = mailReadScope(input) ?? "inbox"
+        let box = scope == "sent" ? "sent mailbox" : "inbox"
         let locator = mailExactLocator(input, allowMissingMessageID: true)
-        let contentLimit = 16000
+        let contentLimit = batch ? 4000 : 16000
         let offset = locator == nil ? 0 : clampedInt(input["body_offset"], defaultValue: 0, min: 0, max: 2_000_000)
         let match = query == nil ? "true" : "(subjectText contains q) or (senderText contains q)"
         /// One row: `msg` and `accountName` are set by the caller.
@@ -291,7 +356,7 @@ extension MacAppleScriptBridge {
         let body: String
         if let locator {
             body = """
-            \(mailAccountScope(locator.account))
+            \(batch ? locator.account.map { mailBatchAccountScope($0, scope: scope) } ?? "return \"__MESSAGE_CHANGED__\"" : mailAccountScope(locator.account, scope: scope))
             \(mailExactLookup(locator, into: "msgList"))
             \(mailIdentityCheck(locator, list: "msgList", fail: "__MESSAGE_CHANGED__"))
             set msg to item 1 of msgList
@@ -309,12 +374,12 @@ extension MacAppleScriptBridge {
             body = """
             set unreadMessages to -1
             try
-                set unreadMessages to unread count of inbox
+                set unreadMessages to unread count of \(box)
             end try
             set output to output & "__UNREAD__|" & (unreadMessages as text) & linefeed
             set boxes to {}
             try
-                set boxes to (mailboxes of inbox) as list
+                set boxes to (mailboxes of \(box)) as list
             end try
             repeat with mb in boxes
                 set boxName to ""

@@ -13,6 +13,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
+import Skills
 // W7 (2026-08-14) — THE ONLY `import ActivityWatch` in ChatOrchestration, and
 // ActivityWatchArchitectureTests asserts it stays the only one. The module is
 // reachable from an EXPLICIT tool call and from nowhere else: not from context
@@ -409,7 +410,7 @@ extension SwiftToolDispatcher {
         }
     }
 
-    func personaToolPath(kind: String, skillName: String?) -> URL? {
+    func personaToolPath(kind: String, skillName: String?) throws -> URL? {
         let personaRoot = personaRootForTools()
         switch kind {
         case "soul": return personaRoot.appendingPathComponent("SOUL.md")
@@ -419,17 +420,13 @@ extension SwiftToolDispatcher {
         case "agents": return personaRoot.appendingPathComponent("AGENTS.md")
         case "skill":
             guard let skillName, validatePersonaSkillName(skillName) else { return nil }
-            let personaSkill = personaRoot
-                .appendingPathComponent("skills", isDirectory: true)
-                .appendingPathComponent("bodies", isDirectory: true)
-                .appendingPathComponent("\(skillName).md")
-            if FileManager.default.fileExists(atPath: personaSkill.path) {
-                return personaSkill
-            }
-            return dataRoot
-                .appendingPathComponent("skills", isDirectory: true)
-                .appendingPathComponent("bodies", isDirectory: true)
-                .appendingPathComponent("\(skillName).md")
+            let entries = try InstalledSkillInventory.entries(
+                dataRoot: dataRoot, sourceRoot: rootForRead, personaRoot: personaRoot)
+            // Registered identity wins over a stale loose body with the same name.
+            let entry = InstalledSkillInventory.match(skillName, in: entries.filter {
+                $0.row["source"] == .string("runtime_registry")
+            }) ?? InstalledSkillInventory.match(skillName, in: entries)
+            return entry?.bodyURL
         default:
             return nil
         }
@@ -606,21 +603,18 @@ extension SwiftToolDispatcher {
         // cooperative pool, whose thread count is core-bounded — parallel tool
         // fan-out (ToolLoop withTaskGroup) could pin every pool thread and starve
         // the whole app (the exact hazard FileSystemActions.swift:1296 documents
-        // one layer down). Hop to a detached utility thread, same pattern as
-        // MacSyncEngine+Inbox.swift:144.
+        // one layer down). Run on a Dispatch worker outside that pool.
         let imageSink = LocalToolImage.sink
-        let fileReadEvidenceRequired = FileReadEvidence.required
-        let directoryEvidenceNames = FileReadEvidence.directoryNames
-        let detachedResult = await Task.detached(priority: .utility) {
-            LocalToolImage.$sink.withValue(imageSink) {
-                FileReadEvidence.$required.withValue(fileReadEvidenceRequired) {
-                    FileReadEvidence.$directoryNames.withValue(directoryEvidenceNames) {
-                        LocalConnectorActions.fileSystemDefault.run(tool, input: resolvedInput, ctx: ctx)
-                    }
+        let connectorInput = resolvedInput
+        let connectorResult: JSONValue? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let result = LocalToolImage.$sink.withValue(imageSink) {
+                    LocalConnectorActions.fileSystemDefault.run(tool, input: connectorInput, ctx: ctx)
                 }
+                continuation.resume(returning: result)
             }
-        }.value
-        guard let result = detachedResult else {
+        }
+        guard let result = connectorResult else {
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' has no Swift local connector implementation"
             )
@@ -643,9 +637,9 @@ extension SwiftToolDispatcher {
         var hint = "This is a path lookup miss, not a Full Mac or Trust Center denial. Check the exact path and retry."
         if case .string(let rawPath)? = input["path"],
            let personaDoc = Self.personaDocumentHint(for: rawPath) {
-            out["suggested_tool"] = .string("get_persona_doc")
-            out["suggested_input"] = .object(["doc": .string(personaDoc)])
-            hint = "Persona documents are not workspace files on app-only installs. Use get_persona_doc with suggested_input; do not retry read_file with another relative path."
+            out["suggested_tool"] = .string("app")
+            out["suggested_input"] = .object(["action": .string("persona.doc"), "args": .object(["doc": .string(personaDoc)])])
+            hint = "Persona documents are not workspace files on app-only installs. Use app with suggested_input; do not retry read_file with another relative path."
         } else if case .string(let rawPath)? = input["path"],
                   let suggestion = Self.suggestedFullMacPathCorrection(for: rawPath) {
             out["suggested_path"] = .string(suggestion)
@@ -747,6 +741,11 @@ extension SwiftToolDispatcher {
         let input = input.filter {
             !(["direction", "button"].contains($0.key) && ($0.value == .string("")))
         }
+        if let continuation = MacWorkContinuation.current, continuation.isPending,
+           let refusal = continuation.refusal() {
+            return .object(["ok": .bool(false), "text": .string(refusal),
+                "detail": .object(["error": .string("continuation_unavailable")])])
+        }
         let access = await fullMacToolAccess(surface: surface)
         switch tool {
         case "screen", "wait":
@@ -777,7 +776,7 @@ extension SwiftToolDispatcher {
             }
         }
         if tool == "screen", try Self.desktopPixelsRequested(input) {
-            return await Self.desktopPixels()
+            return await Self.desktopPixels(input: input)
         }
         let impl = makeMacControl(
             policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
@@ -940,7 +939,14 @@ extension SwiftToolDispatcher {
                     reason: "go needs `name` — an app, a file or folder path, or a URL"
                 )
             }
-            reply = await verbs.go(name)
+            if let continuation = MacWorkContinuation.current, continuation.isPending,
+               let app = continuation.app,
+               name.caseInsensitiveCompare(app.name) != .orderedSame,
+               name.caseInsensitiveCompare(app.bundleIdentifier ?? "") != .orderedSame {
+                return .object(["ok": .bool(false), "text": .string(continuation.modelContext),
+                    "detail": .object(["error": .string("continuation_target_mismatch")])])
+            }
+            reply = await verbs.go(name, front: input["front"] == .bool(true))
         case "wait":
             reply = await verbs.wait(until: str("until"), seconds: num("seconds"))
         default:

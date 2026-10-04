@@ -87,7 +87,10 @@ struct TaskLedgerCLI {
             note: parsed.options["note"],
             refs: parsed.repeated["ref"] ?? []
         )
-        let written = try await SwiftNativeTaskLedger(dataRoot: dataRoot).append(event)
+        let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
+        let written = kind == .claimed
+            ? try await ledger.claim(event, force: false)
+            : try await ledger.append(event)
         printJSON(.object([
             "status": .string("ok"),
             "event": written.toJSON(),
@@ -146,18 +149,17 @@ struct TaskLedgerCLI {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
         let pretty = parsed.flags.contains("pretty")
         if let taskId = parsed.options["task-id"], !taskId.isEmpty {
-            let events = try await ledger.readEventsUnlocked().filter { $0.taskId == taskId }
-            guard !events.isEmpty else {
+            guard let state = try await ledger.listTasks().first(where: { $0.taskId == taskId }) else {
                 printJSON(.object([
                     "status": .string("not_found"),
                     "task_id": .string(taskId),
                 ]), pretty: pretty)
                 return 0
             }
-            let state = SwiftNativeTaskLedger.compact(events).first?.toJSON() ?? .null
+            let events = try await ledger.readEventsUnlocked().filter { $0.taskId == taskId }
             printJSON(.object([
                 "status": .string("ok"),
-                "task": state,
+                "task": state.toJSON(),
                 "events": .array(events.map { $0.toJSON() }),
             ]), pretty: pretty)
             return 0

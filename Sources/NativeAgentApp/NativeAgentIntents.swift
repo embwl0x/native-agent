@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentCore
 import ChatOrchestration
 import PersonaEngine
+import Transcripts
 
 /// One resident agent, named by this installation's canonical persona.
 struct ResidentAgentEntity: AppEntity {
@@ -50,7 +51,7 @@ struct AskResidentAgentIntent: AppIntent {
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
 
     static let title: LocalizedStringResource = "Ask Your Agent"
-    static let description = IntentDescription("Ask the resident agent by name in the retained Shortcuts conversation.")
+    static let description = IntentDescription("Ask the resident agent by name in the conversation you're in.")
     static let openAppWhenRun = false
 
     @Parameter(title: "Agent")
@@ -84,36 +85,6 @@ private func intentClient() -> NativeClient {
     return NativeClient(baseURL: base)
 }
 
-/// App Intents have no mounted chat tab to supply an active session identity.
-/// Keep one explicit, durable Intent-owned conversation instead of letting the
-/// persistent chat boundary mint an unobservable UUID for every shortcut run.
-/// The ID still enters Core through `resolveSessionId`, so normalization and
-/// path safety remain identical to every other transcript writer.
-enum NativeAgentIntentSession {
-    static let defaultsKey = "nativeagent.intent.chat.sessionID"
-
-    static func resolve(
-        defaults: UserDefaults = .standard,
-        newSessionID: () -> String = { "intent:\(UUID().uuidString)" }
-    ) throws -> String {
-        if let persisted = defaults.string(forKey: defaultsKey) {
-            if let normalized = NativeAgentChatSessionID.normalizedPathComponent(persisted) {
-                let resolved = try SwiftNativeChatOrchestrationClient.resolveSessionId(normalized)
-                if persisted != resolved { defaults.set(resolved, forKey: defaultsKey) }
-                return resolved
-            }
-            // This local presentation preference has no authority over a
-            // transcript. A damaged value cannot select a path, so clear it
-            // before creating a visible, retained replacement identity.
-            defaults.removeObject(forKey: defaultsKey)
-        }
-
-        let resolved = try SwiftNativeChatOrchestrationClient.resolveSessionId(newSessionID())
-        defaults.set(resolved, forKey: defaultsKey)
-        return resolved
-    }
-}
-
 struct NativeAgentStatusIntent: AppIntent {
     @available(macOS 27, *)
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
@@ -137,7 +108,7 @@ struct NativeAgentChatIntent: AppIntent {
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
 
     static let title: LocalizedStringResource = "Ask NativeAgent"
-    static let description = IntentDescription("Sends a message to NativeAgent's retained Shortcuts conversation.")
+    static let description = IntentDescription("Sends a message to NativeAgent in the conversation you're in.")
     static let openAppWhenRun = false
 
     @Parameter(title: "Message")
@@ -165,14 +136,24 @@ struct NativeAgentChatIntent: AppIntent {
         let model = UserDefaults.standard.string(forKey: "chatModel") ?? ""
         let reasoningEffort = UserDefaults.standard.string(forKey: "chatReasoningEffort") ?? "high"
         let fileAccess = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"
-        let sessionID = try NativeAgentIntentSession.resolve()
-        let reply = try await intentClient().chat(
-            message: message,
-            sessionId: sessionID,
-            model: model,
-            reasoningEffort: reasoningEffort,
-            fileAccess: fileAccess
+        // Siri continues the conversation User is in, at whichever door he last
+        // spoke; with none yet, this ask starts one. Either way it is now the
+        // conversation he is in.
+        let sessionID = try SwiftNativeChatOrchestrationClient.resolveSessionId(
+            ConversationAnchor.currentSessionId() ?? UUID().uuidString
         )
+        _ = try? await ConversationAnchor.publish(
+            sessionId: sessionID, source: "siri", conversationKind: .direct
+        )
+        let reply = try await TurnAdmission.shared.run(sessionID: sessionID) {
+            try await intentClient().chat(
+                message: message,
+                sessionId: sessionID,
+                model: model,
+                reasoningEffort: reasoningEffort,
+                fileAccess: fileAccess
+            )
+        }
         return reply.output
     }
 }

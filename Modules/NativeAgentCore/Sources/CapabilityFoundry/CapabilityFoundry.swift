@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Skills
+import ToolRegistry
 
 // MARK: - CapabilityFoundry summary
 //
@@ -252,20 +253,24 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         // a `detail` naming exactly what is and isn't wired. The review queues +
         // the side-effecting backlog tick remain unported (see file header);
         // their envelope fields stay empty and nothing renders them.
-        let skillEntries = InstalledSkillInventory.list(dataRoot: root)
-        let toolEntries = Self.arrayEntries(at: root.appendingPathComponent("tools/registry.json"))
+        let skillEntries = try Self.checkedEntries(store: "skills/registry.json") {
+            try InstalledSkillInventory.entries(dataRoot: root).map { .object($0.row) }
+        }
+        let toolEntries = try ToolRegistryActions.entries(dataRoot: root)
         let workflowEntries = Self.arrayEntries(at: root.appendingPathComponent("workflows/registry.json"))
-        let mcpEntries = Self.arrayEntries(at: root.appendingPathComponent("mcp/servers.json"))
+        let mcpEntries = try Self.checkedEntries(store: "mcp/servers.json") {
+            try Self.mcpEntries(at: root.appendingPathComponent("mcp/servers.json"))
+        }
 
         let skillCount = skillEntries.count
         let workflowCount = workflowEntries.count
         let mcpCount = mcpEntries.count
 
         // "active" across the wired stores: registry convention is
-        // status=="active" (skills/tools/workflows); MCP server records use
+        // status=="active" (skills/tools); MCP server records use
         // "ready" for a configured healthy server.
         let activeStatuses: Set<String> = ["active", "installed", "ready"]
-        let activeCount = (skillEntries + toolEntries + workflowEntries + mcpEntries)
+        let activeCount = (skillEntries + toolEntries + mcpEntries)
             .filter { activeStatuses.contains(Self.status(of: $0) ?? "") }
             .count
 
@@ -304,7 +309,7 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         let lanes: [CapabilityFoundryLane] = [
             CapabilityFoundryLane(id: "skill", title: "Skills", status: "ready", count: skillCount, reviewCount: 0, endpoint: "native:skills/registry.json", policyGate: "skillBuilderPolicy.v2_enabled", hotPath: "manifest_only"),
             CapabilityFoundryLane(id: "tool", title: "Tools", status: "ready", count: toolEntries.count, reviewCount: 0, endpoint: "native:tools/registry.json", policyGate: "signed_manifest_and_validation", hotPath: "summary_only_until_matched"),
-            CapabilityFoundryLane(id: "workflow", title: "Workflows", status: "ready", count: workflowCount, reviewCount: 0, endpoint: "native:workflows/registry.json", policyGate: "step_approval_gates", hotPath: "summary_only_until_routed"),
+            CapabilityFoundryLane(id: "workflow", title: "Retained workflow definitions", status: "retained", count: workflowCount, reviewCount: 0, endpoint: "native:workflows/registry.json", policyGate: "execution_retired", hotPath: "definitions_only"),
             CapabilityFoundryLane(id: "mcp", title: "MCP Servers", status: "ready", count: mcpCount, reviewCount: 0, endpoint: "native:mcp/servers.json", policyGate: "consent_ledger", hotPath: "server_manifest_only"),
             // REMOVED 2026-08-02 (E-1): the panel / plugin / catalog lanes.
             // 2026-06-13 downgraded them from "ready" to "degraded" — honest
@@ -317,13 +322,12 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         ]
         let readouts: [CapabilityFoundryReadout] = [
             CapabilityFoundryReadout(id: "capabilities", title: "Capabilities tab", status: "active", surface: "mac"),
-            CapabilityFoundryReadout(id: "panels", title: "JSON Panel Hub", status: "active", surface: "mac_ios"),
             CapabilityFoundryReadout(id: "activity", title: "Receipts and Activity", status: "active", surface: "mac_ios"),
             CapabilityFoundryReadout(id: "trust", title: "Trust and Approval Center", status: "active", surface: "mac"),
         ]
         return CapabilityFoundryResult(
             status: "partial",
-            detail: "Native counts for skills/tools/workflows/mcp. No panel, plugin, or capability-pack lane exists; the review queue and the auto-implementation ledger are unported, so reviewQueue/recentArtifacts are always empty and summary.review/autoCreated are always 0.",
+            detail: "Native counts for skills/tools/mcp and retained workflow definitions. Workflow execution is retired; definitions are excluded from the active count. No panel, plugin, or capability-pack lane exists; the review queue and the auto-implementation ledger are unported, so reviewQueue/recentArtifacts are always empty and summary.review/autoCreated are always 0.",
             principle: "Tiny core runtime; the agent can build plugin-shaped add-ons on demand through manifests, validation, approval, and lazy routing.",
             hotPathContract: hotPath,
             summary: summary,
@@ -335,7 +339,35 @@ public struct SwiftNativeCapabilityFoundryClient: CapabilityFoundryClient {
         )
     }
 
-    // MARK: On-disk store readers (best-effort, read-only)
+    // MARK: On-disk store readers (read-only)
+
+    private static func checkedEntries(store: String, read: () throws -> [JSONValue]) throws -> [JSONValue] {
+        do {
+            return try read()
+        } catch {
+            throw NSError(domain: "NativeAgentCapabilityFoundry", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Capability inventory unavailable at \(store): \(error.localizedDescription)",
+                NSUnderlyingErrorKey: error,
+            ])
+        }
+    }
+
+    private static func mcpEntries(at url: URL) throws -> [JSONValue] {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch CocoaError.fileReadNoSuchFile {
+            return []
+        }
+        // Match the checked MCP membership reader without merging default servers.
+        struct Record: Decodable { let id: String; let status: String? }
+        let records = try JSONDecoder().decode([Record].self, from: data)
+        guard records.allSatisfy({ !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
+              case .array(let entries) = try JSONValue.parse(data) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return entries
+    }
 
     /// Entries of a JSON-array store, or [] when the file is missing,
     /// unreadable, or not an array. Read-only and best-effort — a Doctor-class

@@ -40,6 +40,8 @@ extension CognitiveThoughtSeed {
             "createdAt": .double(createdAt.timeIntervalSince1970),
             "lastUpdatedAt": .double(lastUpdatedAt.timeIntervalSince1970),
             "sourceNodeIds": .array(sourceNodeIds.map { .string($0.uuidString) }),
+            "sourcePeerIds": sourcePeerIds.map { .array($0.map { .string($0) }) } ?? .null,
+            "materialProvenances": .array(materialProvenances.map { .string($0) }),
         ])
     }
 }
@@ -182,6 +184,7 @@ extension CognitiveReflectionReceipt {
             // receipt re-read after a relaunch could not say what it was about.
             "requestSourceNodeIds": .array(request.sourceNodeIds.map { .string($0.uuidString) }),
             "requestSourceExcerpts": .array(request.sourceExcerpts.map { .string($0) }),
+            "requestSourcePeerIds": request.sourcePeerIds.map { .array($0.map { .string($0) }) } ?? .null,
             "requestMaterialProvenance": .string(request.materialProvenance ?? ""),
             "resultSummary": .string(resultSummary),
             "provider": .string(provider),

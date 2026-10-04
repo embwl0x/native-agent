@@ -66,7 +66,9 @@ enum OrganismProspectiveAffect {
         ledger: OrganismPredictionLedger,
         at now: Date
     ) -> ChemicalState {
-        let pending = ledger.predictions.values.filter { $0.status == .pending }
+        let pending = ledger.predictions.values.filter {
+            $0.status == .pending && carriesFeeling($0.kind)
+        }
         // Violation shadow: a recently violated expectation keeps a fading edge of
         // wariness even between predictions (the body remembers the last miss).
         let shadow = violationShadow(ledger, at: now)
@@ -102,6 +104,13 @@ enum OrganismProspectiveAffect {
         out.urgency = ChemicalState.clamp(out.urgency + maxDelta * bracing * 0.5)
         out.warmth = ChemicalState.clamp(out.warmth + maxDelta * horizonWarmthShare * horizonToward)
         return out
+    }
+
+    static func carriesFeeling(_ kind: OrganismPredictionKind) -> Bool {
+        switch kind {
+        case .toolCompletion, .providerCompletion, .phoneDelivery: return false
+        case .approvalResolution, .workflowAdvance, .semanticExpectation: return true
+        }
     }
 
     /// Per-prediction share of the body's bracing/looking-forward — the ONE
@@ -140,7 +149,7 @@ enum OrganismProspectiveAffect {
     /// resolution-time relief includes the ambient dread, not just the
     /// prediction's own shortfall.
     static func violationShadow(_ ledger: OrganismPredictionLedger, at now: Date) -> Double {
-        guard let lastViolation = ledger.lastViolationAt else { return 0 }
+        guard let lastViolation = ledger.lastFeltViolationAt else { return 0 }
         let age = max(0, now.timeIntervalSince(lastViolation))
         return 0.5 * pow(0.5, age / violationShadowHalfLife)
     }

@@ -72,6 +72,7 @@ struct NewWorkshopTaskSheet: View {
                     .lineLimit(2...5)
             }
             .formStyle(.grouped)
+            .disabled(submitting)
 
             if let errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
@@ -83,6 +84,7 @@ struct NewWorkshopTaskSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
+                    .disabled(submitting)
                 Button("Create Task", systemImage: "plus.circle") {
                     submit()
                 }
@@ -94,6 +96,7 @@ struct NewWorkshopTaskSheet: View {
         }
         .padding(NativeAgentSpacing.xl)
         .frame(minWidth: 420)
+        .interactiveDismissDisabled(submitting)
     }
 
     private func submit() {

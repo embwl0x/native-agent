@@ -191,11 +191,12 @@ enum ChatTranscriptPresentation {
 /// depend on telemetry delivery.
 enum ChatFirstRenderTelemetry {
     enum Eligibility: Equatable, Sendable {
-        case eligible(sessionID: String)
+        case eligible(sessionID: String, turnID: String)
         case notAssistant
         case notLastAssistant
         case emptyContent
         case missingSessionID
+        case missingTurnID
     }
 
     enum Outcome: Equatable, Sendable {
@@ -209,6 +210,7 @@ enum ChatFirstRenderTelemetry {
         content: String,
         isLastAssistant: Bool,
         messageSessionID: String?,
+        messageTurnID: String?,
         activeSessionID: String
     ) -> Eligibility {
         guard role == "assistant" else { return .notAssistant }
@@ -221,7 +223,8 @@ enum ChatFirstRenderTelemetry {
         let sessionID = messageSessionID ?? activeSessionID
         let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanSessionID.isEmpty else { return .missingSessionID }
-        return .eligible(sessionID: cleanSessionID)
+        guard let turnID = messageTurnID, !turnID.isEmpty else { return .missingTurnID }
+        return .eligible(sessionID: cleanSessionID, turnID: turnID)
     }
 
     static func emit(
@@ -229,11 +232,12 @@ enum ChatFirstRenderTelemetry {
         registry: TurnFirstRenderRegistry = .shared,
         bus: TurnTraceBus = .shared
     ) async -> Outcome {
-        guard case .eligible(let sessionID) = eligibility else {
+        guard case .eligible(let sessionID, let turnID) = eligibility else {
             return .ineligible(eligibility)
         }
         guard let event = await registry.claimFirstRenderEvent(
             sessionId: sessionID,
+            turnId: turnID,
             observedBy: "NativeAgentApp.MessageBubble"
         ) else {
             return .noPendingTurn
@@ -465,8 +469,12 @@ enum MessageGrouper {
             // PATCH-2026-05-11: Change C — hide tool-summary system rows (role=system, content starts with "[tool:")
             // These are memory aids for compact_chat_history and should not render as chat bubbles.
             if msg.role == "system" && msg.content.hasPrefix("[tool:") { continue }
-            if msg.role == "tool" {
+            if msg.role == "tool", msg.metadata?.interactionMirror == nil {
                 toolRun.append(msg)
+            } else if msg.metadata?.interactionMirror != nil {
+                // A mirrored card is its own row, always, never folded into a tool run.
+                flushTools()
+                result.append(MessageGroup(id: msg.id, messages: [msg], isToolGroup: true))
             } else {
                 flushTools()
                 result.append(MessageGroup(id: msg.id, messages: [msg], isToolGroup: false))
@@ -624,6 +632,12 @@ struct ChatMessageListView: View {
                     let msg = group.messages[0]
                     if msg.metadata?.isPendingApproval == true {
                         InlineApprovalCard(message: msg)
+                            .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
+                    } else if let mirrored = msg.metadata?.interactionMirror {
+                        // A card raised in another thread, answered here on the original.
+                        InteractionInboxCard(mirrorOf: .init(sessionID: mirrored.sessionID,
+                                                             interactionID: mirrored.interactionID))
+                            .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
                     } else if PersonaWriteReceiptRow.receipt(
                                 for: msg, exemptTitle: appModel.firstConversationReceiptTitle
@@ -1044,6 +1058,10 @@ struct MessageBubble: View {
             && lm.reasoningEffort == rm.reasoningEffort
             && lm.fileAccessMode == rm.fileAccessMode
             && lm.attachments == rm.attachments
+            && lm.workingCommentaryChars == rm.workingCommentaryChars
+            && lm.providerRefusal == rm.providerRefusal
+            && lm.providerRefusalDraft == rm.providerRefusalDraft
+            && lm.envelope == rm.envelope
     }
 
     /// The mind a reply ran on — model / effort / access — said on hover
@@ -1433,7 +1451,6 @@ struct MessageBubble: View {
             voiceOutput.stop()
             return
         }
-        voiceOutput.nativeBaseURL = appModel.nativeBaseURL
         Task {
             await voiceOutput.speak(
                 text: message.content,
@@ -1453,6 +1470,7 @@ struct MessageBubble: View {
             content: message.content,
             isLastAssistant: isLastAssistant,
             messageSessionID: message.sessionId,
+            messageTurnID: message.metadata?.turnTraceId,
             activeSessionID: appModel.activeChatSessionId
         )
         guard case .eligible = eligibility else { return }

@@ -98,7 +98,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
             && !name.contains("/") && !name.contains("\\") && !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
     }
 
-    var wire03: [String: Any] {
+    public var wire03: [String: Any] {
         switch self {
         case .text(let text): return ["kind": "text", "text": text]
         case .file(let name, let mediaType, let bytes, let metadata):
@@ -106,7 +106,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
         case .data(let value, let metadata): return ["kind": "data", "data": Self.object(value), "metadata": Self.object(metadata)]
         }
     }
-    static func object(_ value: JSONValue) -> Any {
+    public static func object(_ value: JSONValue) -> Any {
         (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(value), options: [.fragmentsAllowed])) ?? NSNull()
     }
 
@@ -124,7 +124,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
         }
     }
 
-    static func output(_ attachment: ChatOrchestration.MultimodalAttachment, taskID: String) throws -> Self {
+    public static func output(_ attachment: ChatOrchestration.MultimodalAttachment, taskID: String) throws -> Self {
         let bytes: Data
         if !attachment.base64.isEmpty {
             guard let decoded = Data(base64Encoded: attachment.base64), decoded.count <= maximumFileBytes else { throw invalidPart }

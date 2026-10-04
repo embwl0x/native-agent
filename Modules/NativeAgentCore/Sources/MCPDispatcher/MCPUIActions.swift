@@ -41,6 +41,9 @@ public enum MCPUIActions {
                 NSLocalizedDescriptionKey: "MCP server not found: \(serverId)"
             ])
         }
+        let parsed = try JSONValue.parse(JSONSerialization.data(withJSONObject: input, options: []))
+        let args: [String: JSONValue]
+        if case .object(let object) = parsed { args = object } else { args = [:] }
         let consents = try await dispatcher.listConsents()
         let unpinnedGrant = consents.first {
             $0.serverId == serverId && $0.toolName == toolName && $0.unpinned
@@ -65,7 +68,7 @@ public enum MCPUIActions {
             )
             // Full Mac already supplies authority for this call. Legacy metadata
             // may be repaired only by resolving the real current implementation.
-            if hasUnpinnedGrant && !yoloAdmitted {
+            if hasUnpinnedGrant && !yoloAdmitted && MCPToolBridge.riskRequiresApproval(effectiveRisk) {
                 throw authority.deniedError(
                     "MCP tool '\(serverId)/\(toolName)' has unpinned consent; resolve/pin its implementation and explicitly grant consent again"
                 )
@@ -75,12 +78,16 @@ public enum MCPUIActions {
                     && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "revoked"
             }
             if explicitlyRevoked || (MCPToolBridge.riskRequiresApproval(effectiveRisk) && !yoloAdmitted) {
+                let approvalID = explicitlyRevoked ? nil : try await authority.fileApprovalRequest(
+                    "mcp__\(serverId)__\(toolName)", "mcp_ui", .object(args),
+                    "This MCP tool requires approval."
+                )
                 return MCPCallResult(
                     id: callID,
                     serverId: serverId,
                     toolName: toolName,
-                    status: "needs_approval",
-                    approvalId: nil,
+                    status: explicitlyRevoked ? "blocked" : "needs_approval",
+                    approvalId: approvalID,
                     durationSeconds: Date().timeIntervalSince(started),
                     createdAt: createdAt,
                     evidenceStatus: "not_required"
@@ -98,7 +105,7 @@ public enum MCPUIActions {
                     scope: unpinnedGrant?.scope ?? "server_tool",
                     risk: effectiveRisk,
                     permissions: unpinnedGrant?.permissions ?? [],
-                    argumentSummary: hasUnpinnedGrant
+                    argumentSummary: hasUnpinnedGrant && yoloAdmitted
                         ? "Renewed legacy MCP consent under admitted Full Mac authority using the current resolved implementation."
                         : "Auto-granted low-risk local Swift MCP call."
                 ))
@@ -108,9 +115,6 @@ public enum MCPUIActions {
             }
         }
 
-        let parsed = try JSONValue.parse(JSONSerialization.data(withJSONObject: input, options: []))
-        let args: [String: JSONValue]
-        if case .object(let object) = parsed { args = object } else { args = [:] }
         let envelope = await Self.evaluateMCPUIAdmission(
             serverId: serverId, toolName: toolName, arguments: args, dataRoot: dataRoot
         )

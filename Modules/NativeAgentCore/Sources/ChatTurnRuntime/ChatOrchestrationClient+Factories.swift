@@ -39,8 +39,7 @@ import Context
 
 /// Injection-style factory: when the caller has assembled a SwiftNativeTurnEngine
 /// + llm + tools, build the SwiftNative impl directly. The prebuilt engine owns
-/// its ActiveToolsStore and TurnTraceBus; this factory deliberately reuses
-/// those exact instances rather than pretending `dataRoot` can rewrite an
+/// its TurnTraceBus; this factory deliberately reuses that exact instance rather than pretending `dataRoot` can rewrite an
 /// already-assembled engine. Missing deps → fall through to the no-arg form
 /// which constructs sensible defaults.
 public func makeChatOrchestrationClient(
@@ -88,6 +87,7 @@ public func makeChatOrchestrationClient(
     /// "claude-bridge" budget case shipped but unreachable).
     toolLoopMaxIterations: Int? = nil,
     turnWallClockSeconds: TimeInterval? = nil,
+    continuationCapabilityProfile: String? = nil,
     /// OPTIONAL CREDENTIAL/ROUTING ROOT — token-refresh writes allowed there, nothing else (nil = today's behaviour,
     /// byte for byte). See `makeDefaultChatOrchestrationClient`.
     providersRoot: URL? = nil,
@@ -118,6 +118,7 @@ public func makeChatOrchestrationClient(
         providerRecoverySleep: providerRecoverySleep,
         toolLoopMaxIterations: toolLoopMaxIterations,
         turnWallClockSeconds: turnWallClockSeconds,
+        continuationCapabilityProfile: continuationCapabilityProfile,
         dataRoot: dataRoot,
         providersRoot: providersRoot,
         activeProviderPathOverride: activeProviderPathOverride,
@@ -146,8 +147,7 @@ public func makeChatOrchestrationClient(
     makeDefaultChatOrchestrationClient(
         tools: SwiftToolDispatcher(
             dataRoot: dataRoot,
-            allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot(),
-            enforceLazyToolLoading: true
+            allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot()
         ),
         approvalFiler: nil,
         dataRoot: dataRoot,
@@ -235,7 +235,8 @@ public func makeGatedToolDispatchClient(
         // same chain match nothing. See FirstConversationPersonaExemption.
         firstConversationDataRoot: allowsFirstConversationExemption ? dataRoot : nil,
         // The peer directory supplies display names only, never authority.
-        peerDirectoryDataRoot: dataRoot
+        peerDirectoryDataRoot: dataRoot,
+        fileAccess: fileAccess
     )
     if tracePeerTurn {
         // PeerDataTaintDispatcher sits under the tracer (so a refusal is still
@@ -290,6 +291,7 @@ private func makeDefaultChatOrchestrationClient(
     providerRecoverySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
     toolLoopMaxIterations: Int? = nil,
     turnWallClockSeconds: TimeInterval? = nil,
+    continuationCapabilityProfile: String? = nil,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     /// OPTIONAL CREDENTIAL/ROUTING ROOT. Reads credentials + routing there; the ONLY
     /// writes that may land there are the adapters' own token refreshes.
@@ -302,7 +304,7 @@ private func makeDefaultChatOrchestrationClient(
     /// registry / catalog from there, and the REAL adapters resolve their
     /// credentials there (API keys, OAuth token files, the Codex auth.json).
     /// Everything else — persona, memory, trust, history, traces, REM pins,
-    /// ActiveToolsStore, telemetry — stays on `dataRoot`, so a disposable
+    /// telemetry — stays on `dataRoot`, so a disposable
     /// clone can make a real provider call without the tokens leaving the
     /// live store; the only writes that land there are token refreshes. This is the
     /// personality range bench's Layer 2 seam (docs/build_plans/
@@ -334,7 +336,7 @@ private func makeDefaultChatOrchestrationClient(
     // singleton the factory constructs (persona/router/trust/adapters/engine/
     // client). Default = PersistenceCore.defaultDataRoot() so production
     // callers get the identical wiring they had before; the factory smoke
-    // test passes a temp dir and stops leaking digest/active_tools/activity/
+    // test passes a temp dir and stops leaking digest/activity/
     // traces into the live data root.
     let persona = dataRoot.standardizedFileURL
         == PersistenceCore.defaultDataRoot().standardizedFileURL
@@ -425,9 +427,7 @@ private func makeDefaultChatOrchestrationClient(
                 telemetryDataRootOverride: telemetryRoot
             ),
             openAIOAuthDirect: OpenAIOAuthDirectAdapter(
-                authPathOverride: credentialRoot.map {
-                    OpenAIOAuthDirectAdapter.boundRootReadAuthPath(dataRoot: $0)
-                },
+                dataRootOverride: credentialRoot,
                 telemetryDataRootOverride: telemetryRoot
             ),
             anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
@@ -475,11 +475,6 @@ private func makeDefaultChatOrchestrationClient(
     // promotion hook. They must share the same root decision or one path can
     // still write an alternate-root turn into the live singleton.
     let promoter = makeChatMemoryPromoter(dataRoot: dataRoot)
-    let activeToolsStore: ActiveToolsStore =
-        (tools as? any ActiveToolsStoreProviding)?.activeToolsStore
-        ?? (dataRoot == PersistenceCore.defaultDataRoot()
-            ? .shared
-            : ActiveToolsStore(dataRoot: dataRoot))
     let turnTraceBus = makeChatTurnTraceBus(dataRoot: dataRoot)
     // remPinsDataRoot wired so REM-approved persona drift pins reach the
     // system prompt — without it, REMPinsReader.read is never called and the
@@ -489,13 +484,11 @@ private func makeDefaultChatOrchestrationClient(
         memory: recaller,
         router: router,
         trust: trust,
-        llm: llm,
         tools: tools,
         providerRecoverySleep: providerRecoverySleep,
         clock: clock,
         remPinsDataRoot: dataRoot,
         memoryPromoter: promoter,
-        activeToolsStore: activeToolsStore,
         turnTraceBus: turnTraceBus,
         contextFlow: contextFlow,
         cognitiveContextProvider: cognitiveContextProvider,
@@ -505,13 +498,14 @@ private func makeDefaultChatOrchestrationClient(
         engine: engine,
         tools: tools,
         llm: llm,
+        history: SessionHistoryReader(dataRoot: dataRoot),
         dataRoot: dataRoot,
-        activeToolsStore: activeToolsStore,
         turnTraceBus: turnTraceBus,
         trust: trust,
         approvalFiler: approvalFiler,
         toolLoopMaxIterations: toolLoopMaxIterations,
         turnWallClockSeconds: turnWallClockSeconds,
+        continuationCapabilityProfile: continuationCapabilityProfile,
         // AdaptiveMemoryPromoter.shared is rooted in the production MemoryV2
         // singleton.  An alternate-root client must never feed a synthetic
         // turn back into that live process-wide owner.
@@ -665,19 +659,6 @@ private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting,
             surface: surface
         )
         let staged = observation.proposals
-        // Sweep item 38, the procedural lane: the SAME evidence, read for a
-        // different question. The promoter above asks "did this turn state a
-        // durable fact"; this asks "has she now done this exact thing enough
-        // times that it is craft". It fires on the repetition landing, never
-        // on a schedule, and mints at most one approval card — nothing it does
-        // reaches a prompt. It runs in the same post-reply side channel as the
-        // promoter above (the reply is already sent), and swallows its own
-        // failures for the same reason: a ledger write is never worth a turn.
-        await ProceduralLane.shared.observeTurn(
-            userMessage: userMessage,
-            toolEvidence: toolEvidence,
-            sessionId: sessionId
-        )
         var telemetry = MemoryPromotionTelemetry(
             stagedProposalCount: staged.count,
             semanticStatus: observation.extraction.semanticStatus,
@@ -686,6 +667,10 @@ private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting,
                 + observation.toolEvidenceCandidateCount
         )
         telemetry.momentOutcome = observation.momentOutcome
+        telemetry.savedCorrectionCount = observation.savedCorrectionCount
+        telemetry.pendingCorrectionCount = observation.pendingCorrectionCount
+        telemetry.failedCorrectionCount = observation.failedCorrectionCount
+        telemetry.noveltySkipReason = observation.noveltySkipReason
         return telemetry
     }
 }

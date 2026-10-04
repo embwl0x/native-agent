@@ -24,19 +24,18 @@ public enum NativeAgentPublicSafety {
 
     public static func hasCompletedOnboarding(dataRoot: URL) -> Bool {
         let fm = FileManager.default
-        if fm.fileExists(atPath: dataRoot.appendingPathComponent(".onboarded").path) {
-            return true
-        }
-
-        // A completion transaction writes profile.json before the sentinel.
-        // Its durable manifest therefore proves that profile-only state is an
-        // interrupted setup, not permission to wake resident cognition.
+        // Pending completion or reset must finish before resident cognition
+        // wakes. Reset can still carry the previous completion sentinel.
         for pending in ["pending-completion.json", "pending-reset.json"] {
             if fm.fileExists(atPath: dataRoot
                 .appendingPathComponent("onboarding", isDirectory: true)
                 .appendingPathComponent(pending).path) {
                 return false
             }
+        }
+
+        if fm.fileExists(atPath: dataRoot.appendingPathComponent(".onboarded").path) {
+            return true
         }
 
         // Legacy public installs may predate the sentinel. Accept them only as
@@ -46,19 +45,31 @@ public enum NativeAgentPublicSafety {
         let profileURL = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("profile.json")
+        return hasLegacyCompletionAnchor(
+            personaRoot: PersonaRootResolver.resolveIsolated(dataRoot: dataRoot),
+            profileURL: profileURL
+        )
+    }
+
+    /// Missing profiles may be repaired only when the legacy documents are complete.
+    public static func hasLegacyCompletionAnchor(
+        personaRoot: URL, profileURL: URL, allowMissingProfile: Bool = false
+    ) -> Bool {
+        let fm = FileManager.default
+        guard ["SOUL.md", "VOICE.md", "USER.md", "GROWTH.md"].allSatisfy({ fileName in
+            let url = personaRoot.appendingPathComponent(fileName)
+            guard let attributes = try? fm.attributesOfItem(atPath: url.path),
+                  let size = attributes[.size] as? NSNumber else { return false }
+            return size.intValue > 0
+        }) else { return false }
+        if allowMissingProfile, !fm.fileExists(atPath: profileURL.path) { return true }
         guard let profileData = try? Data(contentsOf: profileURL),
               let profile = try? JSONSerialization.jsonObject(with: profileData) as? [String: Any],
               let name = profile["name"] as? String,
               !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return false
         }
-        let personaRoot = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)
-        return ["SOUL.md", "VOICE.md", "USER.md", "GROWTH.md"].allSatisfy { fileName in
-            let url = personaRoot.appendingPathComponent(fileName)
-            guard let attributes = try? fm.attributesOfItem(atPath: url.path),
-                  let size = attributes[.size] as? NSNumber else { return false }
-            return size.intValue > 0
-        }
+        return true
     }
 
     public static func shouldForceNeutralOrganism(

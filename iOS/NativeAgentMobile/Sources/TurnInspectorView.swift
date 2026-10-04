@@ -139,7 +139,7 @@ private struct TurnSummaryRow: View {
     let summary: TurnSummaryRecord
 
     /// What happened and how long, in plain words: "Replied in 8 seconds,
-    /// using two tools."
+    /// with two tool events."
     private var plainLine: String {
         let took = TurnInspectorPresentation.plainDuration(wallMs: summary.wallMs)
         // Kinds arrive as "reply" or "chat.reply", "tool" or "tool.call".
@@ -147,7 +147,7 @@ private struct TurnSummaryRow: View {
         let tools = summary.kinds.filter { $0.key.hasPrefix("tool") }.values.reduce(0, +)
         var line = took.map { replied ? "Replied in \($0)" : "Took \($0)" } ?? (replied ? "Replied" : "Worked")
         if tools > 0 {
-            line += ", using \(AliveWords.count(tools, "tool", spelled: true))"
+            line += ", with \(AliveWords.count(tools, "tool event", spelled: true))"
         }
         return line + "."
     }

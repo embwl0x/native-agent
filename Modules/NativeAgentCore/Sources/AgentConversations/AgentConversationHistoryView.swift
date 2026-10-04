@@ -44,7 +44,7 @@ enum AgentConversationHistoryView {
             selected = history[start..<end]
             if start > 0 { metadata["earlier_before"] = .string(history[start].id) }
         }
-        if row.agent.hasPrefix("peer:"), selected.contains(where: { !($0.reply ?? "").isEmpty }) {
+        if selected.contains(where: { !($0.reply ?? "").isEmpty }) {
             metadata["untrusted_remote_data"] = .bool(true)
         }
         // Only a problem reading history carries a status: "ok" beside a failed

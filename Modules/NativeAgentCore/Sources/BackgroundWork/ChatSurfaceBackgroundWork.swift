@@ -7,6 +7,7 @@ import MemoryV2
 import DeviceSync
 import NotificationInbox
 import PersistenceCore
+import ToolRegistry
 
 public enum ChatSurfaceBackgroundWork {
     private static func withChatTranscriptCompletionSignal<T>(
@@ -115,7 +116,12 @@ public enum ChatSurfaceBackgroundWork {
                 verifiedUserID: context.fromUserId.map(String.init),
                 replyRoute: replyRoute
             )
+            // Telegram's activity line reads an app call as the action it ran.
+            let shown = ShownToolNames()
+            // One turn at a time in this session across every door. Only the
+            // model turn holds it; Telegram delivery runs after it is released.
             let response = try await withChatTranscriptCompletionSignal(sessionID: sessionId, turnCompleted: turnCompleted) {
+                try await TurnAdmission.shared.run(sessionID: sessionId) {
                 try await request.chat(
                     on: client,
                     progress: { event in
@@ -123,9 +129,10 @@ public enum ChatSurfaceBackgroundWork {
                         case .replyTextSettled(let settled):
                             await progress(.replyTextSettled(settled))
                         case .toolUse(let name, let input):
-                            await progress(.toolUse(name: name, input: input))
+                            let call = shown.use(name, input: input)
+                            await progress(.toolUse(name: call.name, input: call.input))
                         case .toolResult(let name, let output):
-                            await progress(.toolResult(name: name, output: output))
+                            await progress(.toolResult(name: shown.result(name), output: output))
                         case .notice(let kind, let text):
                             // invoke_claude start/heartbeat/timeout — surface on
                             // Telegram so the user sees live progress instead of a silent
@@ -146,6 +153,7 @@ public enum ChatSurfaceBackgroundWork {
                         }
                     }
                 )
+                }
             }
             // The streamed draft showed her working; the settled message is the answer.
             return ChatOrchestration.ChatResponse.answerOnly(

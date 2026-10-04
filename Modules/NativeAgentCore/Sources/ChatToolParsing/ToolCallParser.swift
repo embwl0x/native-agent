@@ -13,32 +13,33 @@ package struct ParsedToolCall: Equatable {
     /// 2026-09-22: <invoke> parameters that were JSON-typed, as written, so a
     /// string-schema param given text "42" can be restored to the string.
     package var invokeRawText: [String: String] = [:]
-    /// The block carried a result-shaped field (output/result/response) the
-    /// tool does not take; it was dropped, and the real result says so.
-    package var wroteResult = false
+    /// Text lane: undeclared fields or raw invoke content without parameters.
+    /// Such a block is a result she wrote, not a call, and never runs.
+    package var undeclaredKeys: [String] = []
 
     package init(
         id: String, name: String, input: [String: JSONValue],
-        invokeRawText: [String: String] = [:], wroteResult: Bool = false
+        invokeRawText: [String: String] = [:]
     ) {
         self.id = id
         self.name = name
         self.input = input
         self.invokeRawText = invokeRawText
-        self.wroteResult = wroteResult
     }
 }
 
 // MARK: - Parsing
 
 package struct ToolCallProtocolViolation: Equatable {
-    enum Kind: Equatable {
+    enum Kind: String, Equatable {
         case markdownToolCallBlock
         case formattedToolUseMarker
         case malformedToolUseMarker
     }
 
     let kind: Kind
+
+    package var traceType: String { kind.rawValue }
 
     package var modelFeedback: String {
         if kind == .malformedToolUseMarker {
@@ -334,6 +335,49 @@ package enum ToolCallParser {
         return !words.contains(where: { completionVerbTokens.contains($0) })
     }
 
+    /// Wave 2 #7: work promised for a LATER turn, which MY QUEUE keeps (the
+    /// in-turn shapes above still bounce first). Conservative
+    /// on purpose: a sentence counts only with BOTH a first-person commitment
+    /// (I'll / I will / I'm going to; not negated, not "I'll be") AND an
+    /// explicit cross-turn marker. A question, an offer or a conditional
+    /// ("if", "would", "could", "might", "want me to", "should I", "unless")
+    /// never counts, nor text in quotes, code fences or block quotes. Each hit
+    /// is the sentence as she wrote it and the condition its marker names:
+    /// after_card, when_user_messages, own_turn or next_turn. Three at most.
+    package static func crossTurnDeferrals(_ raw: String) -> [(sentence: String, when: String)] {
+        var prose = raw.replacingOccurrences(of: #"```[\s\S]*?```"#, with: "\n", options: .regularExpression)
+        prose = prose.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix(">") }.joined(separator: "\n")
+        var found: [(sentence: String, when: String)] = []
+        for piece in prose.split(whereSeparator: { ".!?;\n".contains($0) }) where found.count < 3 {
+            let sentence = piece.trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "-*•_ "))
+            guard (12...280).contains(sentence.count),
+                  prose[piece.endIndex...].first != "?" else { continue }
+            let text = sentence.lowercased()
+                .replacingOccurrences(of: "\u{2019}", with: "'").replacingOccurrences(of: "\u{02BC}", with: "'")
+                .replacingOccurrences(of: #""[^"]*"|“[^”]*”"#, with: " ", options: .regularExpression)
+            func has(_ pattern: String) -> Bool { text.range(of: pattern, options: .regularExpression) != nil }
+            guard has(#"\b(i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to)\s+(?!(not|never|be)\b)[a-z]"#),
+                  !has(#"\b(if|would|could|might|unless|whether|want\s+me|should\s+i)\b"#) else { continue }
+            let when: String
+            if has(#"\b(once|after|when)\s+(you|user|he)\s+(approve|approves|ok|oks|okay|okays|sign\s+off|signs\s+off)\b"#)
+                || has(#"\b(once|after|when)\s+(the\s+|that\s+|this\s+)?(card|approval)\b"#)
+                || has(#"\bonce\s+((it|that|this)('s|\s+is)\s+)?approved\b"#) {
+                when = "after_card"
+            } else if has(#"\b(once|after|when)\s+(you|user|he)\s+(reply|replies|respond|responds|write|writes|message|messages|text|texts|get\s+back|gets\s+back|come\s+back|comes\s+back|wake|wakes)\b"#)
+                || has(#"\b(once|after|when)\s+(you're|you\s+are|user's|user\s+is|he's|he\s+is)\s+back\b"#) {
+                when = "when_user_messages"
+            } else if has(#"\b(on|in|during)\s+my\s+own\s+(turn|time)\b"#) || has(#"\bwhen\s+i\s+(next\s+)?wake\b"#) {
+                when = "own_turn"
+            } else if has(#"\b(next|following)\s+turn\b"#) || has(#"\bin\s+my\s+next\s+(reply|message)\b"#) {
+                when = "next_turn"
+            } else { continue }
+            found.append((sentence, when))
+        }
+        return found
+    }
+
     /// A remaining tool step after a tool result, including
     /// long progress reports ending with "Next are the ... calls."
     package static func looksLikeAnnouncedNextToolStep(_ raw: String) -> Bool {
@@ -408,10 +452,24 @@ package enum ToolCallParser {
         // A syntactically valid marker inside a code fence or inline Markdown
         // is still protocol-invalid. Check this before parseAnthropic, whose
         // intentionally unanchored marker regex otherwise finds the inner tag.
+        // Inspect the whole code region: <function_calls> and example prose
+        // may precede the invoke that the executable parser would find.
+        let codeRegionPatterns = [
+            #"(?ms)^[ \t]*(`{3,})[^\r\n]*\r?\n(.*?)(?:^[ \t]*\1`*[ \t]*\r?$|\z)"#,
+            #"(?ms)^[ \t]*(~{3,})[^\r\n]*\r?\n(.*?)(?:^[ \t]*\1~*[ \t]*\r?$|\z)"#,
+            #"(?s)(`+)(?!`)(.*?)(?<!`)\1(?!`)"#,
+        ]
+        let ns = raw as NSString
+        for pattern in codeRegionPatterns {
+            guard let rx = try? NSRegularExpression(pattern: pattern) else { continue }
+            for match in rx.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
+                if regexMatches(#"(?i)<(?:tool_use|invoke)\b"#, in: ns.substring(with: match.range(at: 2))) {
+                    return ToolCallProtocolViolation(kind: .formattedToolUseMarker)
+                }
+            }
+        }
         let formattedMarkerPatterns = [
-            #"(?is)(?:```|~~~)[^\r\n]*\r?\n\s*<tool_use\b[\s\S]*?</tool_use>\s*(?:```|~~~)"#,
-            #"(?is)`\s*<tool_use\b[\s\S]*?</tool_use>\s*`"#,
-            #"(?is)(?:\*\*|__)\s*<tool_use\b[\s\S]*?</tool_use>\s*(?:\*\*|__)"#,
+            #"(?is)(?:\*\*|__)\s*<(tool_use|invoke)\b[\s\S]*?</\1>\s*(?:\*\*|__)"#,
         ]
         if formattedMarkerPatterns.contains(where: { regexMatches($0, in: raw) }) {
             return ToolCallProtocolViolation(kind: .formattedToolUseMarker)
@@ -440,7 +498,7 @@ package enum ToolCallParser {
                 guard toolNames.contains(ns.substring(with: m.range(at: 1))) else { continue }
                 let body = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !body.isEmpty else { continue }
-                if let d = body.data(using: .utf8), case .object? = try? JSONValue.parse(d) { continue }
+                if markerObject(body) != nil { continue }
                 return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
             }
         }
@@ -545,6 +603,24 @@ package enum ToolCallParser {
     // The legacy form `<tool_use name="X">{json}</tool_use>` is still parsed
     // — id falls back to empty so the tool loop can detect and skip the
     // round-trip ID echo.
+    /// A marker's JSON object body. Models often write code (a script's
+    /// source) with raw newlines or tabs inside a JSON string; those are
+    /// escaped and the body read again, so the call runs as written.
+    static func markerObject(_ body: String) -> [String: JSONValue]? {
+        if case .object(let o)? = try? JSONValue.parse(Data(body.utf8)) { return o }
+        var fixed = "", inString = false, escaped = false
+        for ch in body {
+            if inString, !escaped, ch == "\n" || ch == "\r" || ch == "\t" || ch == "\r\n" {
+                fixed += ch == "\t" ? "\\t" : ch == "\r" ? "\\r" : ch == "\r\n" ? "\\r\\n" : "\\n"
+                continue
+            }
+            if escaped { escaped = false } else if ch == "\\" { escaped = inString } else if ch == "\"" { inString.toggle() }
+            fixed.append(ch)
+        }
+        guard fixed != body, case .object(let o)? = try? JSONValue.parse(Data(fixed.utf8)) else { return nil }
+        return o
+    }
+
     static func parseAnthropic(_ raw: String, parseInvoke: Bool = false) -> [ParsedToolCall] {
         var positionedCalls: [(Int, ParsedToolCall, Bool)] = []
         // The two marker patterns do not overlap; collect both before sorting.
@@ -555,12 +631,7 @@ package enum ToolCallParser {
                 let id = ns.substring(with: m.range(at: 1))
                 let name = ns.substring(with: m.range(at: 2))
                 let body = ns.substring(with: m.range(at: 3))
-                var input: [String: JSONValue] = [:]
-                if let d = body.data(using: .utf8),
-                   let parsed = try? JSONValue.parse(d),
-                   case .object(let o) = parsed {
-                    input = o
-                }
+                let input = markerObject(body) ?? [:]
                 positionedCalls.append((m.range.location, ParsedToolCall(id: id, name: name, input: input), false))
             }
         }
@@ -573,12 +644,7 @@ package enum ToolCallParser {
                 let body = ns.substring(with: m.range(at: 2))
                 // An unclosed legacy marker swallowing a later id-form block.
                 if body.contains("<tool_use") { continue }
-                var input: [String: JSONValue] = [:]
-                if let d = body.data(using: .utf8),
-                   let parsed = try? JSONValue.parse(d),
-                   case .object(let o) = parsed {
-                    input = o
-                }
+                let input = markerObject(body) ?? [:]
                 positionedCalls.append((m.range.location, ParsedToolCall(id: "", name: name, input: input), false))
             }
         }
@@ -605,7 +671,11 @@ package enum ToolCallParser {
                         rawText[key] = value
                     } else { input[key] = .string(value) }
                 }
-                positionedCalls.append((m.range.location, ParsedToolCall(id: "", name: name, input: input, invokeRawText: rawText), true))
+                var call = ParsedToolCall(id: "", name: name, input: input, invokeRawText: rawText)
+                if input.isEmpty, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    call.undeclaredKeys = ["raw <invoke> body without <parameter> elements"]
+                }
+                positionedCalls.append((m.range.location, call, true))
             }
         }
         if !positionedCalls.isEmpty {
@@ -614,6 +684,7 @@ package enum ToolCallParser {
                 let call = positioned.1
                 guard positioned.2 else { return call }
                 let signature = call.name + ((try? JSONValue.object(call.input).serialize(pretty: false)) ?? "")
+                    + call.undeclaredKeys.joined(separator: ",")
                 return seenInvokes.insert(signature).inserted ? call : nil
             }
         }

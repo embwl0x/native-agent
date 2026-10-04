@@ -85,7 +85,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
       : `the session file stayed unchanged across ${ev.stagnantWindows} consecutive wait window(s) after a baseline observation`;
     lines.push(`Codex stopped making progress: no terminal row landed, ${idleClause}, and ${cause}. This turn will not complete on its own.`);
     if (turnResult.noWorkObserved === true) {
-      lines.push("No tool or shell activity was recorded before the stall: the request never executed, so resending it cannot stomp partial work.");
+      lines.push("No tool or shell activity was recorded before the stall. This does not prove that no effects occurred; reconcile the original request with external state before any retry.");
     } else if (turnResult.noWorkObserved === false) {
       lines.push("Tool activity was recorded before the stall, so partial work may exist on disk. Verify external state before resending.");
     } else {
@@ -101,15 +101,13 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
       : "Its rollout file stopped changing during the active turn.";
     lines.push(`NativeAgent's hang watchdog declared this Codex turn failed-hung. ${idleClause}`);
     if (turnResult.noWorkObserved === true) {
-      lines.push("No tool or shell activity was recorded before the hang: the request never executed, so resending it cannot stomp partial work.");
+      lines.push("No tool or shell activity was recorded before the hang. This does not prove that no effects occurred; reconcile the original request with external state before any retry.");
     } else {
       lines.push("Partial work may exist on disk. Verify external state before resending.");
     }
-    if (recovery && recovery.status === "permanent_failed_hung") {
-      lines.push(`NativeAgent's automatic recovery reached its retry cap (${recovery.retryCount}/${recovery.maxRetries}); this message will not be retried again.`);
-    } else {
-      lines.push("NativeAgent did not automatically replay the request.");
-    }
+    lines.push("NativeAgent did not automatically replay the request. Preserve completed effects, verify what remains, and retry only after an explicit decision.");
+    if (recovery) lines.push(`Recovery status: ${recovery.status}.`);
+    if (turnResult.message) lines.push("Retained partial reply:", turnResult.message);
   } else if (turnResult.status === "failed") {
     lines.push("Codex's turn failed before a final reply landed.");
     const failureDetail = turnResult.errorMessage
@@ -117,7 +115,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
       || turnResult.stderrPreview;
     if (failureDetail) lines.push(`Failure detail: ${failureDetail}`);
     if (turnResult.noWorkObserved === true) {
-      lines.push("No tool or shell activity was recorded before the failure: the request never executed, so resending it cannot stomp partial work. If the failure detail is a transient provider error (503 / high demand), waiting and resending the same request is safe.");
+      lines.push("No tool or shell activity was recorded before the failure. This does not prove that no effects occurred; reconcile the original request with external state before any retry.");
     } else if (turnResult.noWorkObserved === false) {
       lines.push("Tool activity was recorded before the failure, so partial work may exist on disk. Verify external state before resending.");
     } else {
@@ -405,297 +403,4 @@ return {
 };
 }
 
-function createClaudeReplyDelivery({
-  AGENT_NAME,
-  BRIDGE_DESCRIPTOR_PATH,
-  BRIDGE_MESSAGE_PATH,
-  DEFAULT_TOPIC,
-  TOKEN_PATH,
-  missingWakeCompletionOrigin,
-  postWakeCompletion,
-  readWakeBridgeToken,
-  readWakeJSON,
-  readWakeJSONLines,
-  topicSlug
-}) {
-const fs = require("fs");
-const http = require("http");
-const https = require("https");
-const path = require("path");
-
-/// The descriptor ClaudeBridge.swift publishes (writeDiscoveryFiles):
-/// {schemaVersion, host, port, url, token, processIdentifier, writtenAt}.
-function readBridgeDescriptor() {
-  const parsed = readWakeJSON(BRIDGE_DESCRIPTOR_PATH);
-  return parsed && typeof parsed === "object" ? parsed : null;
-}
-
-/// Precedence: explicit env override (tests / operator) -> the descriptor the
-/// running bridge published. Null without either: each install listens on its
-/// own port, so there is no fixed one to guess.
-function bridgeURL() {
-  const override = process.env.NATIVE_AGENT_CLAUDE_WAKE_BRIDGE_URL;
-  if (override) return override;
-
-  const descriptor = readBridgeDescriptor();
-  if (descriptor) {
-    if (typeof descriptor.url === "string" && descriptor.url.trim() !== "") {
-      try {
-        return new URL(BRIDGE_MESSAGE_PATH, descriptor.url.trim()).toString();
-      } catch {}
-    }
-    const port = Number(descriptor.port);
-    if (Number.isInteger(port) && port > 0 && port < 65536) {
-      const host = typeof descriptor.host === "string" && descriptor.host.trim() !== ""
-        ? descriptor.host.trim()
-        : "127.0.0.1";
-      return `http://${host}:${port}${BRIDGE_MESSAGE_PATH}`;
-    }
-  }
-  return null;
-}
-
-/// Where the app persists the agent's per-session transcript
-/// (data/chat/messages/<sessionId>.jsonl). The app always sets the env var
-/// (a bundled helper lives inside the .app, nowhere near data/); the
-/// __dirname-relative path covers a checkout run by hand.
-function messageStoreDir() {
-  return process.env.NATIVE_AGENT_CLAUDE_WAKE_MESSAGE_STORE_DIR ||
-    path.join(__dirname, "..", "data", "chat", "messages");
-}
-
-/// The one line of the completion text unique to OUR posted receipt. The bare
-/// messageId is NOT a usable marker: the agent's transcript already carries it in
-/// the original claude_message tool rows.
-function deliveryMarker(messageId) {
-  return `Originating message id: ${messageId}`;
-}
-
-/// Orthogonal delivery observer (the agent, 2026-07-25): a transport must not
-/// grade its own delivery. The bridge enqueues the row into her session store
-/// durably BEFORE her turn runs, so whether the completion reached her is
-/// answered by that store — never by whether the HTTP response came back in
-/// time. Returns "present" | "absent" | "unreadable"; "absent" is only
-/// meaningful because the store file itself was readable.
-function confirmDeliveryViaSessionStore(sessionId, messageId, expectedCompletionText) {
-  const id = String(sessionId || "");
-  if (!id || !messageId || !/^[A-Za-z0-9._:-]+$/.test(id)) return "unreadable";
-  const marker = deliveryMarker(messageId);
-  if (typeof expectedCompletionText !== "string" || !expectedCompletionText.includes("[claude-wake]")
-      || !expectedCompletionText.includes(marker)) return "unreadable";
-  let content;
-  try {
-    content = fs.readFileSync(path.join(messageStoreDir(), `${id}.jsonl`), "utf8");
-  } catch {
-    return "unreadable";
-  }
-  let sawMalformedLine = false;
-  for (const { line, value: row } of readWakeJSONLines(content, () => { sawMalformedLine = true; })) {
-    if (!line.includes(marker)) continue;
-    const text = row && typeof row.content === "string" ? row.content : "";
-    // One admitted message can first receive a topic-busy rejection and later
-    // complete on an explicit same-ID retry. The shared marker is not proof
-    // THIS result landed. Compare the retained result verbatim, accepting the
-    // exact prefix added by ClaudeBridge.handleMessage (and legacy raw rows).
-    if (text === expectedCompletionText || text === `[from: claude, via bridge] ${expectedCompletionText}`) return "present";
-  }
-  // A malformed line means the store was mid-write (or damaged) when we read
-  // it — the missing row could BE the truncated one. "Absent" must mean the
-  // store was fully readable and the message provably is not there; anything
-  // less stays unknown rather than arming a false replay.
-  return sawMalformedLine ? "unreadable" : "absent";
-}
-
-// astra-comb-3 lane3 #1: a reply-free transport event (delivered_live /
-// delivered_inbox) used to arrive as a normal chat turn. The agent then
-// re-decided work that its own in-flight turn had already decided — chat rows
-// 251/256 (the 18-tool ruling that contradicted row 252's floor-20 ruling) and
-// 268/273 (a second bridge drive) are both that shape. Such an event carries no
-// answer to reason about, so it is delivered as an INFORMATIONAL transcript row
-// only: prefix below is load-bearing (postBridgeMessage reads it to pick the
-// bridge's enqueue_only lane, which appends the row and runs no turn).
-const NOTICE_PREFIX = "[claude-wake] [notice]";
-const NOTICE_ONLY_STATUSES = new Set(["delivered_live", "delivered_inbox"]);
-
-function isNoticeOnlyOutcome(result) {
-  return !!result && NOTICE_ONLY_STATUSES.has(result.status);
-}
-
-function isNoticeCompletionText(text) {
-  return typeof text === "string" && text.startsWith(NOTICE_PREFIX);
-}
-
-function formatCompletionForAgent(result, payload) {
-  // A notice runs no turn, but the row stays in the conversation and is reread
-  // in the history window on every later turn. Measured 2026-09-17: thirteen of
-  // these at ~1,200 characters each were 13% of that day's text in the person's
-  // own conversation. It says the one thing worth knowing and stops.
-  if (isNoticeOnlyOutcome(result)) {
-    // Honest about who is answering: nobody yet. The open session's inbox is
-    // read only when someone types there.
-    const where = result.status === "delivered_live"
-      ? "it is waiting in her inbox until her next turn in the open session, and no one is answering it yet"
-      : "it waits in her inbox; no session was started";
-    return [
-      `${NOTICE_PREFIX} Not a reply and nothing to do: your message to Claude (${payload.topic || DEFAULT_TOPIC}) was delivered; ${where}. If she answers later, it arrives on its own.`,
-      deliveryMarker(payload.messageId),
-      `Status: ${result.status}`,
-    ].join("\n");
-  }
-  const lines = [
-    isNoticeOnlyOutcome(result)
-      ? `${NOTICE_PREFIX} Transport record only — not a reply, and nothing to decide. Claude has not answered yet; this row exists so the transcript says where the message went. Take NO action on it: do not call agent_message, do not re-send, do not re-open the inbox, and do not revisit a decision you already sent. Claude's actual reply, if one comes, arrives as its own event.`
-      : "[claude-wake] Automated completion event. Do NOT auto-fire another agent_message to Claude in response unless you have new work for Claude — OR unless Claude ended with a question or decision request, in which case answering on the SAME topic resumes that session with full context. Question-and-answer on one topic is the supported conversation pattern; reflexive acknowledgment messages are the loop to avoid.",
-    "",
-    deliveryMarker(payload.messageId),
-    `Topic: ${payload.topic || DEFAULT_TOPIC}`,
-    `Conversation: claude:${topicSlug(payload.topic)}`,
-    // Suppressed on a notice: the loop this defect describes started with the
-    // agent obeying this line on a row that was only a receipt.
-    ...(isNoticeOnlyOutcome(result)
-      ? ["That conversation id is recorded for later reference only; nothing here asks you to send to it."]
-      : ["Continue this same work with agent_message: agent \"claude\" with conversation_id set to that exact value (it goes on in the conversation you named). Omit conversation_id for new work."]),
-    `Priority: ${payload.priority || "info"}`,
-    `Status: ${result.status}`,
-  ];
-  if (result.durationMs != null) lines.push(`Duration: ${Math.round(result.durationMs / 1000)}s`);
-  lines.push("");
-  if (result.status === "completed") {
-    lines.push("--- Claude's reply ---", result.reply, "--- end reply ---");
-  } else if (result.status === "delivered_inbox") {
-    // Presence could not be established. Say exactly that: no claim about a
-    // live session, and no completion to wait for.
-    lines.push(
-      result.detail || "This Mac could not be scanned for an open Claude session; the message is in the durable inbox and no wake was spawned",
-      "",
-      "The message is in the durable inbox and NO unattended session was started for it. Live presence could NOT be established — this is not evidence that a session is open, nor that one is gone. If an open session reads the inbox it picks the message up; otherwise it waits there. There is no reply to relay, and no completion event is coming for this message."
-    );
-  } else if (result.status === "delivered_live") {
-    // Not a failure and not a completion: the message reached a session that
-    // is already open, and nothing was run unattended.
-    lines.push(
-      result.detail || `Session ${result.sessionId} is open interactively; message left in the inbox for it, no wake spawned`,
-      "",
-      "NO unattended session was started for this message, and the live session was NOT interrupted, resumed, or replaced — it is still running and still owns its working tree. The message waits in the durable inbox until that session's next turn (it reads the inbox only when someone types there), so no one is answering it yet. There is no reply to relay; do not treat this as a completion, a failure, or evidence that the session is gone."
-    );
-  } else if (result.status === "completed_without_reply") {
-    lines.push(
-      "Claude's session exited cleanly (exit 0) but produced NO output. There is no reply to relay — treat this as a failed wake, not as a silent success."
-    );
-  } else if (result.reason === "continuation_unavailable") {
-    lines.push("The explicitly requested conversation could not be resumed. No fresh conversation was started. Inspect the original conversation pointer/transcript before explicitly choosing how to continue; this job must not be automatically rerun as new work.");
-    if (result.stderrTail) lines.push("", "stderr tail:", result.stderrTail);
-    if (result.reply) lines.push("", "partial stdout:", result.reply);
-  } else if (result.reason === "rejected_topic_busy" || result.reason === "topic_lock_unavailable") {
-    // Defect 3 contract: a topic collision is REJECTED loudly, by id — never
-    // silently downgraded to a fresh context-free session.
-    const inFlight = result.inFlightMessageId || "unknown-id";
-    lines.push(
-      result.reason === "topic_lock_unavailable"
-        ? "Claude's wake was REJECTED: the topic lock could not be created at all, and an unserialized wake is never run (it can corrupt the topic's thread)."
-        : `Claude's wake was REJECTED: another wake is already in flight on this topic (in-flight message id: ${inFlight}${result.inFlightDeadlineAt ? `, its deadline: ${result.inFlightDeadlineAt}` : ""}). This message was NOT worked and NO session — threaded or fresh — was started for it.`,
-      "",
-      "It remains in the durable inbox. Re-send it on this topic after the in-flight job settles; it will then resume the topic's thread with full context."
-    );
-  } else {
-    lines.push(`Claude's wake FAILED: ${result.reason}`);
-    if (result.stalled) {
-      lines.push(
-        "The runner was killed by the STALL watchdog, not at its deadline: Claude's canonical session transcript did not advance for the whole stall window. SIGTERM then SIGKILL after 2s — its exit is CONFIRMED. Any partial stdout below is everything it produced."
-      );
-    } else if (result.timedOut) {
-      lines.push(
-        "The runner was killed at its deadline (SIGTERM, then SIGKILL after 2s) and its exit is CONFIRMED — this verdict is about a provably stopped process, not a guess about a running one. Any partial stdout below is everything it produced."
-      );
-    }
-    if (result.stderrTail) lines.push("", "stderr tail:", result.stderrTail);
-    if (result.reply) lines.push("", "partial stdout:", result.reply);
-  }
-  return lines.join("\n");
-}
-
-function missingCompletionOrigin(sessionId) {
-  return missingWakeCompletionOrigin(sessionId, AGENT_NAME);
-}
-
-function postBridgeMessage(text, sessionId) {
-  const missingOrigin = missingCompletionOrigin(sessionId);
-  if (missingOrigin) return Promise.resolve(missingOrigin);
-  sessionId = sessionId.trim();
-  if (process.env.NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN === "1") {
-    return Promise.resolve({
-      status: "dry_run",
-      delivery: "nativeagent_bridge_message",
-      sessionId: sessionId || null,
-      text,
-    });
-  }
-
-  const target = bridgeURL();
-  if (!target) {
-    return Promise.resolve({ status: "failed", reason: "bridge_descriptor_unavailable", descriptorPath: BRIDGE_DESCRIPTOR_PATH });
-  }
-  const { token, failure } = readWakeBridgeToken(TOKEN_PATH, (error) => String((error && error.message) || error));
-  if (failure) return Promise.resolve(failure);
-
-  let url;
-  try {
-    url = new URL(target);
-  } catch (error) {
-    return Promise.resolve({
-      status: "failed",
-      reason: "bridge_url_invalid",
-      error: String((error && error.message) || error),
-    });
-  }
-
-  // The notice lane is chosen from the text itself, so the replay path in
-  // wake_recovery.js (which only has the persisted completionText) classifies
-  // a stranded row exactly as the original attempt did.
-  const noticeOnly = isNoticeCompletionText(text);
-  const body = JSON.stringify({
-    text,
-    sender: "claude",
-    // Request acknowledgment after durable append. Legacy bridges ignore the
-    // field and acknowledge after turn completion; both shapes prove delivery.
-    // "enqueue_only" additionally suppresses the turn: the row lands in the
-    // transcript for the agent to read, and starts no tool-capable decision.
-    // A legacy bridge that does not know the value falls through to its normal
-    // turn lane, which is the pre-fix behaviour rather than a lost delivery.
-    ackMode: noticeOnly ? "enqueue_only" : "enqueue",
-    ...(sessionId ? { sessionId } : {}),
-  });
-  const transport = url.protocol === "https:" ? https : http;
-  // With ack-on-enqueue the response is disk-bound and arrives in seconds;
-  // the generous ceiling only matters against a legacy bridge that still
-  // couples the response to turn completion. Either way a timeout is
-  // classified "unknown" — never "failed" — so it can never arm a replay.
-  // The caller settles "unknown" against the session store, the orthogonal
-  // observer.
-  const timeoutMs = Number(process.env.NATIVE_AGENT_CLAUDE_WAKE_BRIDGE_TIMEOUT_MS || 600_000);
-
-  return postWakeCompletion(transport, {
-    host: url.hostname,
-    port: url.port || (url.protocol === "https:" ? 443 : 80),
-    path: `${url.pathname}${url.search}`,
-    timeout: timeoutMs,
-  }, token, body, sessionId, true).then((result) => (
-    noticeOnly && result && typeof result === "object"
-      ? { ...result, noticeDelivery: true }
-      : result
-  ));
-}
-
-return {
-  bridgeURL,
-  deliveryMarker,
-  confirmDeliveryViaSessionStore,
-  formatCompletionForAgent,
-  isNoticeOnlyOutcome,
-  isNoticeCompletionText,
-  missingCompletionOrigin,
-  postBridgeMessage
-};
-}
-
-module.exports = { createCodexReplyDelivery, createClaudeReplyDelivery };
+module.exports = { createCodexReplyDelivery };

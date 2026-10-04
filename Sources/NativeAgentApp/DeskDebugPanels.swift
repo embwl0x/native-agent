@@ -1,9 +1,5 @@
-// B2.6 (g): DeskView's debug disclosures — the compact projection the agent
-// reads in-context, and the raw all-items table with aliases/handles/numbers —
-// moved OUT of the Workshop (DeskView) and INTO Diagnostics ▸ Cognition, so the
-// Workshop surface keeps zero debug chrome. The rendering is a move (not a
-// rewrite) of DeskView.agentViewDisclosure / .allItemsDisclosure; this view
-// loads its own desk state independently.
+// Diagnostics owns the compact agent projection and raw all-items table.
+// It loads canonical Desk state independently of the primary Desk page.
 
 import SwiftUI
 import PersistenceCore

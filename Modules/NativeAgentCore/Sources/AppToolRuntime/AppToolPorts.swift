@@ -19,9 +19,44 @@ public struct BrowserToolPlatformPort: Sendable {
 @MainActor public protocol QuietToolHost: QuietSettingsHost {
     var activeChatSessionId: String { get }
     func pageRead(_ page: QuietToolPage) async -> (content: [JSONValue], rows: [JSONValue], truncated: Bool)
-    func composerState() async -> [String: JSONValue]
-    func runComposer(verb: String, value: String, choice: String) async -> QuietComposerOutcome
+    /// Empty `sessionId` means the conversation on screen.
+    func composerState(sessionId: String) async -> [String: JSONValue]
+    /// `attachments` are files Core already resolved and fenced; `reachesUser`
+    /// as for `runChatSession`; `turnSessionId` is the asking turn's own
+    /// conversation (`__session_id`).
+    func runComposer(
+        verb: String, value: String, choice: String, sessionId: String, attachments: [URL], reachesUser: Bool,
+        turnSessionId: String
+    ) async -> QuietComposerOutcome
+    /// One `chat_session` verb, already admitted by Core's posture gate.
+    /// `reachesUser`: the asking turn may move User's screen, speak, and touch
+    /// a conversation he is in (`AppToolExecutor.reachesUser`).
+    func runChatSession(verb: String, input: [String: JSONValue], reachesUser: Bool) async -> JSONValue
+    /// The checks `runComposer` and `runChatSession` make first (User's
+    /// screen, his ears, his draft, a conversation he is in, her own),
+    /// asked alone for the door's preview: reads only, nil when none refuses.
+    func composerFence(verb: String, value: String, sessionId: String, reachesUser: Bool, turnSessionId: String)
+        -> QuietComposerOutcome?
+    func chatSessionFence(verb: String, input: [String: JSONValue], reachesUser: Bool) -> JSONValue?
     func saveProviderKey(_ key: String, provider: String) async -> QuietProviderKeyOutcome
+    /// One upkeep button, through the call the button makes.
+    func runUpkeep(verb: String, input: [String: JSONValue]) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
+    /// The `inbox` tool's verbs over the Inbox page's own reads and actions.
+    func inbox(verb: String, input: [String: JSONValue]) async -> JSONValue
+    /// The checks `inbox` makes before it writes, asked alone for the door's
+    /// preview: reads only, nil when none refuses.
+    func inboxFence(verb: String, input: [String: JSONValue]) async -> JSONValue?
+    /// One `mind_run` verb, through the call its Dreams, Self-Improvement or
+    /// Observatory control makes.
+    func runMind(verb: String, input: [String: JSONValue]) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
+    /// One `skill_manage` verb, through the Skills and Tools pages' own calls.
+    /// `steer` names the peers steering this turn (`PeerDataTaint.carried`).
+    func manageSkill(verb: String, input: [String: JSONValue], steer: [String]) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
+    /// The `connections` tool's verbs, through the Connectors, Telegram and
+    /// MCP pages' own buttons. Core has already refused the raising ones.
+    func connections(verb: String, input: [String: JSONValue]) async -> JSONValue
+    /// One `provider` verb, through the call the Providers page's button makes.
+    func provider(verb: String, input: [String: JSONValue]) async -> JSONValue
 }
 
 public struct QuietComposerOutcome: Sendable {
@@ -52,7 +87,6 @@ public struct QuietToolPage: Sendable {
 @MainActor public protocol QuietToolPresentationPort: Sendable {
     var pages: [QuietToolPage] { get }
     var currentPage: QuietToolPage? { get }
-    var composerVerbs: [String] { get }
     func page(named: String) -> QuietToolPage?
     func contextReceiptRead(input: [String: JSONValue]) async -> JSONValue
     func agentViewRead(input: [String: JSONValue]) async -> JSONValue
@@ -63,6 +97,8 @@ public struct QuietToolPage: Sendable {
 /// or continuation state is kept by the tool runtime.
 @MainActor public protocol ToolInteractionResolving: Sendable {
     func interaction(id: String, sessionID: String, dataRoot: URL) async -> InlineInteraction?
+    /// The conversation that raised a card, by its inbox note (`interaction:<id>`).
+    func sessionID(ofCard id: String, dataRoot: URL) async -> String?
     func originEnvelope(of id: String, sessionID: String, dataRoot: URL) async -> TurnEnvelope?
     func descriptor(for interaction: InlineInteraction, dataRoot: URL) -> InlineInteractionDescriptor
     func begin(id: String, sessionID: String, expectedRevision: Int?, dataRoot: URL) async throws -> InlineInteraction

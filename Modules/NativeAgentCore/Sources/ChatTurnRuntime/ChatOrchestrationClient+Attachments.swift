@@ -90,7 +90,13 @@ extension SwiftNativeChatOrchestrationClient {
         message: String,
         attachments: [MultimodalAttachment],
         dataRoot: URL
-    ) -> TurnAttachmentInput {
+    ) throws -> TurnAttachmentInput {
+        if attachments.contains(where: {
+            $0.mime.lowercased() == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                || ($0.name.map { ($0 as NSString).pathExtension.lowercased() } == "docx")
+        }) {
+            throw ChatOrchestrationError.underlying("DOCX attachments are not supported yet. Attach a PDF or text file instead.")
+        }
         guard !attachments.isEmpty else {
             return TurnAttachmentInput(imageBlocks: [], userMessage: message)
         }

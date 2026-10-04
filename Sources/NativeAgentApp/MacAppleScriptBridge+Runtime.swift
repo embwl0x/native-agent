@@ -24,8 +24,21 @@ extension MacAppleScriptBridge {
         private var didResume = false
         private var started = false
         private var abandoned = false
+        private var continuation: CheckedContinuation<String, any Error>?
+        private var pendingResult: Result<String, any Error>?
 
-        /// Claim the right to run. False means the caller's deadline passed
+        func install(_ continuation: CheckedContinuation<String, any Error>) {
+            lock.lock()
+            defer { lock.unlock() }
+            if let pendingResult {
+                self.pendingResult = nil
+                continuation.resume(with: pendingResult)
+            } else {
+                self.continuation = continuation
+            }
+        }
+
+        /// Claim the right to run. False means the caller stopped or timed out
         /// before this script reached the head of the queue, so it must not
         /// execute at all — nothing external has happened yet, and the caller
         /// has already been told so.
@@ -47,96 +60,125 @@ extension MacAppleScriptBridge {
             return false
         }
 
-        func resume(
-            _ continuation: CheckedContinuation<String, any Error>,
-            result: Result<String, any Error>
-        ) {
+        func resume(result: Result<String, any Error>) {
+            lock.lock()
+            defer { lock.unlock() }
+            resolve(result)
+        }
+
+        func cancel() {
             lock.lock()
             defer { lock.unlock() }
             guard !didResume else { return }
+            if !started { abandoned = true }
+            let error: any Error = started ? NSError(
+                domain: "NativeAgentAppleScript",
+                code: appleScriptOutcomeUnknownCode,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "AppleScript was cancelled after it started; its outcome is unknown. "
+                    + "Observe before retrying — a retry may repeat it."]
+            ) : CancellationError()
+            resolve(.failure(error))
+        }
+
+        /// Caller holds the lock; cancellation before install is remembered.
+        private func resolve(_ result: Result<String, any Error>) {
+            guard !didResume else { return }
             didResume = true
-            continuation.resume(with: result)
+            if let continuation {
+                self.continuation = nil
+                continuation.resume(with: result)
+            } else {
+                pendingResult = result
+            }
         }
     }
 
     @TaskLocal static var scriptExecutorForTests: (@Sendable (String) throws -> String)?
 
     static func runAppleScript(_ source: String) async throws -> String {
+        try Task.checkCancellation()
         if let execute = scriptExecutorForTests { return try execute(source) }
-        return try await withCheckedThrowingContinuation { continuation in
-            let gate = AppleScriptContinuationGate()
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(
-                deadline: .now() + appleScriptTimeoutSeconds
-            ) {
-                let wasRunning = gate.markTimedOut()
-                gate.resume(continuation, result: .failure(NSError(
-                    domain: "NativeAgentAppleScript",
-                    code: wasRunning ? appleScriptOutcomeUnknownCode : -1001,
-                    userInfo: [NSLocalizedDescriptionKey: wasRunning
-                        ? "AppleScript was still executing after \(Int(appleScriptTimeoutSeconds))s; "
-                            + "its outcome is unknown. Observe before retrying — a retry may repeat it."
-                        : "AppleScript timed out after \(Int(appleScriptTimeoutSeconds))s before it "
-                            + "started; it was abandoned and never ran."]
-                )))
-            }
-            appleScriptQueue.async {
-                // 2026-09-06: the deadline may have passed while this block sat
-                // behind an earlier script. Refuse to run rather than perform an
-                // action the caller was already told did not happen.
-                guard gate.claimStart() else { return }
-                var error: NSDictionary?
-                guard let script = NSAppleScript(source: source) else {
-                    gate.resume(continuation, result: .failure(NSError(
+        if let back = skillAutomationHandBack(source) { throw back }
+        let gate = AppleScriptContinuationGate()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                gate.install(continuation)
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                    deadline: .now() + appleScriptTimeoutSeconds
+                ) {
+                    let wasRunning = gate.markTimedOut()
+                    gate.resume(result: .failure(NSError(
                         domain: "NativeAgentAppleScript",
-                        code: -500,
-                        userInfo: [NSLocalizedDescriptionKey: "Failed to parse AppleScript"]
+                        code: wasRunning ? appleScriptOutcomeUnknownCode : -1001,
+                        userInfo: [NSLocalizedDescriptionKey: wasRunning
+                            ? "AppleScript was still executing after \(Int(appleScriptTimeoutSeconds))s; "
+                                + "its outcome is unknown. Observe before retrying — a retry may repeat it."
+                            : "AppleScript timed out after \(Int(appleScriptTimeoutSeconds))s before it "
+                                + "started; it was abandoned and never ran."]
                     )))
-                    return
                 }
-                let descriptor = script.executeAndReturnError(&error)
-                if let error = error {
-                    let message = error[NSAppleScript.errorMessage] as? String ?? "Unknown AppleScript error"
-                    let number = error[NSAppleScript.errorNumber] as? Int ?? -1
-                    // gpt-5.5 review NEEDS_FIX: broader TCC / Automation denial
-                    // coverage. -1743 = not authorized to send Apple events,
-                    // -10004 = privilege violation, -10010 = app not running /
-                    // can't be opened, -1719 = invalid index (assistive access).
-                    // Also catch message-based denials — some TCC paths return
-                    // the user-facing strings without setting a known code.
-                    let tccCodes: Set<Int> = [-1743, -10004, -10010, -1719, -27676]
-                    let lowered = message.lowercased()
-                    let messageSignals = [
-                        "not authori", "not allowed", "denied", "access",
-                        "automation", "assistive",
-                    ]
-                    let messageMatch = messageSignals.contains { lowered.contains($0) }
-                    if tccCodes.contains(number) || messageMatch {
-                        gate.resume(continuation, result: .failure(AppleScriptError.permissionDenied(
-                            app: appNameFromError(message)
+                appleScriptQueue.async {
+                    // The caller may have stopped or timed out while this block sat
+                    // behind an earlier script. Refuse to run rather than perform an
+                    // action the caller was already told did not happen.
+                    guard gate.claimStart() else { return }
+                    var error: NSDictionary?
+                    guard let script = NSAppleScript(source: source) else {
+                        gate.resume(result: .failure(NSError(
+                            domain: "NativeAgentAppleScript",
+                            code: -500,
+                            userInfo: [NSLocalizedDescriptionKey: "Failed to parse AppleScript"]
+                        )))
+                        return
+                    }
+                    let descriptor = script.executeAndReturnError(&error)
+                    if let error = error {
+                        let message = error[NSAppleScript.errorMessage] as? String ?? "Unknown AppleScript error"
+                        let number = error[NSAppleScript.errorNumber] as? Int ?? -1
+                        // gpt-5.5 review NEEDS_FIX: broader TCC / Automation denial
+                        // coverage. -1743 = not authorized to send Apple events,
+                        // -10004 = privilege violation, -10010 = app not running /
+                        // can't be opened, -1719 = invalid index (assistive access).
+                        // Also catch message-based denials — some TCC paths return
+                        // the user-facing strings without setting a known code.
+                        let tccCodes: Set<Int> = [-1743, -10004, -10010, -1719, -27676]
+                        let lowered = message.lowercased()
+                        let messageSignals = [
+                            "not authori", "not allowed", "denied", "access",
+                            "automation", "assistive",
+                        ]
+                        let messageMatch = messageSignals.contains { lowered.contains($0) }
+                        if tccCodes.contains(number) || messageMatch {
+                            gate.resume(result: .failure(AppleScriptError.permissionDenied(
+                                app: appNameFromError(message)
+                            )))
+                        } else {
+                            gate.resume(result: .failure(NSError(
+                                domain: "NativeAgentAppleScript",
+                                code: number,
+                                userInfo: [NSLocalizedDescriptionKey: message]
+                            )))
+                        }
+                        return
+                    }
+                    // gpt-5.5 review NEEDS_FIX: distinguish "script ran and returned
+                    // an explicit empty string" (legitimate empty list) from "script
+                    // returned nil descriptor" (possible silent TCC denial). The
+                    // former → return "" so downstream parsers emit 0 records; the
+                    // latter → throw permission-denied so the chat tool fails
+                    // closed instead of falsely reporting an empty inbox.
+                    if descriptor.stringValue == nil {
+                        gate.resume(result: .failure(AppleScriptError.permissionDenied(
+                            app: "an app"
                         )))
                     } else {
-                        gate.resume(continuation, result: .failure(NSError(
-                            domain: "NativeAgentAppleScript",
-                            code: number,
-                            userInfo: [NSLocalizedDescriptionKey: message]
-                        )))
+                        gate.resume(result: .success(descriptor.stringValue ?? ""))
                     }
-                    return
-                }
-                // gpt-5.5 review NEEDS_FIX: distinguish "script ran and returned
-                // an explicit empty string" (legitimate empty list) from "script
-                // returned nil descriptor" (possible silent TCC denial). The
-                // former → return "" so downstream parsers emit 0 records; the
-                // latter → throw permission-denied so the chat tool fails
-                // closed instead of falsely reporting an empty inbox.
-                if descriptor.stringValue == nil {
-                    gate.resume(continuation, result: .failure(AppleScriptError.permissionDenied(
-                        app: "an app"
-                    )))
-                } else {
-                    gate.resume(continuation, result: .success(descriptor.stringValue ?? ""))
                 }
             }
+        } onCancel: {
+            gate.cancel()
         }
     }
 
@@ -169,7 +211,26 @@ extension MacAppleScriptBridge {
         ])
     }
 
+    /// Inside a skill a script never asks for Automation (`SkillRunContext`):
+    /// each app it tells must already be granted, checked without asking;
+    /// anything else hands its step back and nothing runs.
+    static func skillAutomationHandBack(_ source: String) -> SkillRunContext.HandBack? {
+        guard SkillRunContext.handsBack else { return nil }
+        let ids = ["Mail": "com.apple.mail", "Messages": "com.apple.MobileSMS", "Notes": "com.apple.Notes", "Music": "com.apple.Music"]
+        let pattern = try? NSRegularExpression(pattern: #"application\s+"([^"]+)""#)
+        let names = pattern?.matches(in: source, range: NSRange(source.startIndex..., in: source))
+            .compactMap { Range($0.range(at: 1), in: source).map { String(source[$0]) } } ?? []
+        for name in Set(names) {
+            guard let id = ids[name], var target = NSAppleEventDescriptor(bundleIdentifier: id).aeDesc?.pointee,
+                  withUnsafePointer(to: &target, {
+                      AEDeterminePermissionToAutomateTarget($0, AEEventClass(typeWildCard), AEEventID(typeWildCard), false)
+                  }) == noErr else { return SkillRunContext.HandBack("Automation of \(name)") }
+        }
+        return nil
+    }
+
     static func failedEnvelope(integration: String, error: Error) -> JSONValue {
+        if let back = error as? SkillRunContext.HandBack { return SkillRunContext.handBack(back.why) }
         let ns = error as NSError
         // 2026-09-06: a script that timed out while ALREADY RUNNING may still
         // complete — the send may have gone out. Calling that "failed" invites
@@ -216,6 +277,10 @@ extension MacAppleScriptBridge {
         "no_matching_message": "No inbox message matches; list the inbox with mail_list_recent and pass its message_id. An archived message is no longer in the inbox, so delete or mark it before archiving.",
         "mail_refused_send": "Mail refused to send it (no account can send, or it is offline); nothing went out.",
         "no_archive_mailbox": "Mail has no Archive mailbox, so nothing moved; leave it or use mail_delete.",
+        "mail_delete_no_match": "No indexed message matches in Mail, including archived mail; nothing moved to Trash.",
+        "mail_delete_target_changed": "The indexed message moved or changed before deletion; nothing moved to Trash. Locate it again before trying again.",
+        "no_trash_mailbox": "Mail has no Trash mailbox for this message's account; nothing was deleted.",
+        "message_already_in_trash": "That message is already in Trash; it was left there and was not permanently deleted.",
         "mail_index_unavailable": "Mail's message index could not be read (NativeAgent may need macOS Full Disk Access); nothing was listed or changed.",
         "thread_not_found": "That conversation is not in Messages now; list threads again with messages_recent_threads.",
         "invalid_history_cursor": "before_message_id works only with the same thread_id, using older_before_message_id from the last read.",
@@ -224,6 +289,7 @@ extension MacAppleScriptBridge {
         "invalid_expected_participants": "expected_participants must be the handles from the latest thread read, each once.",
         "participants_changed_read_thread_again": "The people in that thread changed; open it again and reply with the new participants. Nothing was sent.",
         "no_matching_note": "No note has that title; find it with notes_search and use the title it shows.",
+        "invalid_note_body_offset": "Use body_offset with the same note id and next_body_offset from its last read; the offset must be within the current text.",
         "missing_body_append_or_new_title": "Say what to change: body (replace), append, or new_title.",
         "body_and_append_mutually_exclusive": "Use body to replace or append to add, not both.",
     ]
@@ -325,33 +391,6 @@ extension MacAppleScriptBridge {
 
     // MARK: - Output record parsers
 
-    /// Parse `subject|||sender|||date|||snippet###...` into mail records.
-    static func parseMailRecords(_ raw: String) -> [JSONValue] {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        var out: [JSONValue] = []
-        for entry in trimmed.components(separatedBy: "###") {
-            let e = entry.trimmingCharacters(in: .whitespacesAndNewlines)
-            if e.isEmpty { continue }
-            let parts = e.components(separatedBy: "|||")
-            let subject = parts.indices.contains(0) ? parts[0] : ""
-            let sender = parts.indices.contains(1) ? parts[1] : ""
-            let date = parts.indices.contains(2) ? parts[2] : ""
-            let snippet = parts.indices.contains(3) ? parts[3] : ""
-            // gpt-5.5 review NEEDS_FIX: AppleScript's `(date as string)` is
-            // locale-dependent; normalize to ISO-8601 so callers can rely on
-            // a single format (matches Phase 1 EventKit output).
-            let isoDate = Self.normalizeAppleScriptDate(date)
-            out.append(.object([
-                "subject": .string(subject),
-                "sender": .string(sender),
-                "date": .string(isoDate),
-                "snippet": .string(snippet),
-            ]))
-        }
-        return out
-    }
-
     /// Convert AppleScript's localized date string ("Saturday, June 7, 2026
     /// at 10:42:00 AM") to ISO-8601 ("2026-06-07T10:42:00Z"). On parse failure
     /// returns the raw input — better than dropping the field.
@@ -377,27 +416,6 @@ extension MacAppleScriptBridge {
         }
         // Fall back to raw; downstream just gets the locale string.
         return trimmed
-    }
-
-    /// Parse `handle|||lastMessage|||lastMessageDate###...` into thread records.
-    static func parseThreadRecords(_ raw: String) -> [JSONValue] {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        var out: [JSONValue] = []
-        for entry in trimmed.components(separatedBy: "###") {
-            let e = entry.trimmingCharacters(in: .whitespacesAndNewlines)
-            if e.isEmpty { continue }
-            let parts = e.components(separatedBy: "|||")
-            let handle = parts.indices.contains(0) ? parts[0] : ""
-            let lastMessage = parts.indices.contains(1) ? parts[1] : ""
-            let lastDate = parts.indices.contains(2) ? parts[2] : ""
-            out.append(.object([
-                "handle": .string(handle),
-                "lastMessage": .string(lastMessage),
-                "lastMessageDate": .string(Self.normalizeAppleScriptDate(lastDate)),
-            ]))
-        }
-        return out
     }
 
     /// Parse `name|||artist|||album|||duration###...` into music track records.
@@ -491,27 +509,22 @@ extension MacAppleScriptBridge {
         return (total, playlists)
     }
 
-    /// Parse `name|||body_preview|||modified_at###...` into note records.
-    static func parseNoteRecords(_ raw: String) -> [JSONValue] {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        var out: [JSONValue] = []
-        for entry in trimmed.components(separatedBy: "###") {
-            let e = entry.trimmingCharacters(in: .whitespacesAndNewlines)
-            if e.isEmpty { continue }
-            let parts = e.components(separatedBy: "|||")
-            let name = parts.indices.contains(0) ? parts[0] : ""
-            let bodyPreview = parts.indices.contains(1) ? parts[1] : ""
-            let modified = Self.normalizeAppleScriptDate(parts.indices.contains(2) ? parts[2] : "")
-            var row: [String: JSONValue] = [
-                "name": .string(name),
-                "body_preview": .string(bodyPreview),
-                "modified_at": .string(modified),
-            ]
-            if parts.count > 3, !parts[3].isEmpty { row["folder"] = .string(parts[3]) }
-            if parts.count > 4, !parts[4].isEmpty { row["id"] = .string(parts[4]) }
-            out.append(.object(row))
+    static func parseNoteRecords(_ raw: String) throws -> (total: Int64, notes: [JSONValue]) {
+        let payload = try JSONDecoder().decode(JSONValue.self, from: Data(raw.utf8))
+        guard case .object(let root) = payload, case .int(let total)? = root["total"], total >= 0,
+              case .array(let records)? = root["notes"], records.count <= total else {
+            throw NSError(domain: "NativeAgentNotes", code: -1, userInfo: [NSLocalizedDescriptionKey: "Notes returned invalid JSON records."])
         }
-        return out
+        let notes = try records.map { record -> JSONValue in
+            guard case .object(var row) = record, case .string(let id)? = row["id"], !id.isEmpty,
+                  case .string(let modified)? = row["modified_at"],
+                  case .string? = row["body"] ?? row["body_preview"],
+                  case .bool? = row["truncated"] else {
+                throw NSError(domain: "NativeAgentNotes", code: -1, userInfo: [NSLocalizedDescriptionKey: "Notes returned an incomplete JSON record."])
+            }
+            row["modified_at"] = .string(Self.normalizeAppleScriptDate(modified))
+            return .object(row)
+        }
+        return (total, notes)
     }
 }

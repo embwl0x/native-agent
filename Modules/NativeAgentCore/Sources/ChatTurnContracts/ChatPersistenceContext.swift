@@ -25,6 +25,8 @@ public enum ChatPersistenceContext {
     /// would silently change what the bridge is allowed to do. Stamped onto
     /// the USER row's metadata only; assistant rows are always hers.
     @TaskLocal public static var originProvenance: ChatMessageOrigin?
+    /// A room import keeps its source timestamp instead of the enqueue time.
+    @TaskLocal public static var importedMessageCreatedAt: String?
 }
 
 /// Where an inbound chat message actually came from, recorded out-of-band so a
@@ -54,6 +56,9 @@ public struct ChatMessageOrigin: Sendable, Equatable, Codable {
     public let authored: ChatMessageAuthorship?
     /// The Claude inbox message this row answers, when the sender named one.
     public var replyTo: String? = nil
+    /// Peer steering carried into a successor, independent of its reply route.
+    public var peerSources: [String]? = nil
+    public var elevatedPeerSources: [String]? = nil
 
     public init(
         surface: String,
@@ -87,16 +92,20 @@ public struct CodexCompletionTranscriptBinding: Sendable, Equatable {
     public let requestDigest: String
     public let model: String
     public let reasoningEffort: String?
+    /// Nonterminal delegation notices retain recovery identity without settling work.
+    public let isTerminalCompletion: Bool
 
     public init(
         deliveryId: String,
         requestDigest: String,
         model: String,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        isTerminalCompletion: Bool = true
     ) {
         self.deliveryId = deliveryId
         self.requestDigest = requestDigest
         self.model = model
         self.reasoningEffort = reasoningEffort
+        self.isTerminalCompletion = isTerminalCompletion
     }
 }

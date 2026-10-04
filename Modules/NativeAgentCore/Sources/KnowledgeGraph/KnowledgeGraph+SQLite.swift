@@ -306,7 +306,10 @@ extension KnowledgeGraphStore {
                     WHERE r.from_id = ? OR r.to_id = ?
                     ORDER BY r.from_id, r.to_id, r.type
                     LIMIT ?
-                    """, arguments: [id, id, sqliteIncidentEdgeLimit])
+                    """, arguments: [id, id, sqliteIncidentEdgeLimit + 1])
+                guard edgeRows.count <= sqliteIncidentEdgeLimit else {
+                    throw KnowledgeGraphReadError.relationshipLimitExceeded(sqliteIncidentEdgeLimit)
+                }
                 let edges = edgeRows.compactMap(edgeValue)
                 let neighborRows = try Row.fetchAll(db, sql: """
                     SELECT id, name, type, summary, aliases_json, mention_count,
@@ -537,6 +540,13 @@ extension KnowledgeGraphStore {
               case .object(let metadata) = value else { return }
         for (key, value) in metadata where object[key] == nil {
             object[key] = value
+        }
+        // Presentation reads are bounded; audits read the complete SQLite
+        // citations directly rather than this display projection.
+        if object["from"] != nil, case .array(let citations)? = object["studio_entry_ids"] {
+            object["studio_entry_ids"] = .array(Array(citations.prefix(24)))
+            object["studio_entry_count"] = .int(Int64(citations.count))
+            object["studio_entry_ids_truncated"] = .bool(citations.count > 24)
         }
     }
 

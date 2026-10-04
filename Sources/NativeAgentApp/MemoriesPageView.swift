@@ -204,9 +204,9 @@ enum MemoriesPageContent {
         if failed { return "I couldn't refresh all my memories just now." }
         let keep: String
         switch kept {
-        case 0: keep = "I haven't kept anything yet."
-        case 1: keep = "I keep 1 memory."
-        default: keep = "I keep \(kept) memories."
+        case 0: keep = "No memories loaded."
+        case 1: keep = "1 memory loaded."
+        default: keep = "\(kept) memories loaded."
         }
         guard toLookAt > 0 else { return keep }
         return "\(keep) \(toLookAt) \(toLookAt == 1 ? "memory" : "memories") to look at."
@@ -255,7 +255,7 @@ enum MemoriesPageContent {
     /// for a fact the fact. The quote that made a moment is evidence, shown
     /// beneath, never in place of the memory (User, 2026-09-10).
     static func proposalLine(_ proposal: ProposalRecord) -> String {
-        TodayWords.line(proposal.content, limit: 200)
+        proposal.content
     }
     static func proposalMeta(quote: String?, staged: String) -> String {
         guard let quote, !quote.isEmpty else { return staged }
@@ -824,6 +824,7 @@ struct MemoriesProposalRow: View {
                     .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(NativeAgentShell.text)
                     .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
                 Text(meta)
                     .font(.system(size: 13))
                     .foregroundStyle(NativeAgentShell.secondary)

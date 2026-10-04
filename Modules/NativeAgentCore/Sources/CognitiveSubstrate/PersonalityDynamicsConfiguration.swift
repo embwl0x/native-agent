@@ -64,9 +64,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     public var soundEchoDutyCycle: Int
     /// How many recent assistant turns the verbal-rut detector reads.
     public var soundRutRecentTurnLimit: Int
-    /// Unread since 2026-09-24 (the named-rut detector reads every sentence
-    /// for a vocative); kept so existing configurations still decode.
-    public var soundRutEdgeSentenceCount: Int
     /// Half-width of the register band: candidates are ranked by how well they
     /// MATCH the room, not by how warm they are in absolute terms.
     public var soundEchoRegisterTolerance: Double
@@ -202,16 +199,16 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
 
     // MARK: - Felt session bridge (W4/P7)
 
-    /// A conversational gap of at least this long makes the NEXT turn the first
-    /// turn after a gap, which is the only turn the bridge line may speak on.
+    /// A gap in USER's turns (any door) of at least this long makes his next
+    /// turn the first one back, the only turn the bridge line may speak on.
+    /// Six hours (Phase 5 B2, replayed on 09-26…10-03): a night or a workday
+    /// away, about one a day (8 gaps in the week, 7 with something in them);
+    /// four hours would also recap afternoon breaks (13 a week), and not every
+    /// return earns a recap.
     public var sessionBridgeGapHours: Double
 
-    // MARK: - Trait-derived fields consumed by later waves
+    // MARK: - Trait-derived fields
 
-    /// Center of the reply-length band the delivery envelope will target (P6).
-    /// Carried here so the `brevity` trait has a home the moment the envelope
-    /// lands; nothing reads it yet.
-    public var deliveryBrevityCenter: Double
     /// How strongly a `play` felt mode is weighted in mode-driven selection
     /// (P11 echo targeting today, the delivery envelope later). Derived from the
     /// `humor` trait.
@@ -228,7 +225,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         soundEchoRecencyHalfLife: TimeInterval = 2.5 * 24 * 60 * 60,
         soundEchoDutyCycle: Int = 4,
         soundRutRecentTurnLimit: Int = 20,
-        soundRutEdgeSentenceCount: Int = 2,
         soundEchoRegisterTolerance: Double = 0.35,
         wornEchoThreshold: Int = 3,
         soundRutMinimumTurnGap: Int = 2,
@@ -256,7 +252,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         fingerprintFamilyRepeatLimit: Int = 4,
         fingerprintSuppressionWindow: TimeInterval = 20 * 60,
         sessionBridgeGapHours: Double = 6,
-        deliveryBrevityCenter: Double = 0.5,
         playModeWeight: Double = 0.5,
         soundEchoNegativeRunLimit: Int = 2,
         soundEchoLandingWeight: Double = 0.15,
@@ -274,7 +269,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         self.soundEchoRecencyHalfLife = soundEchoRecencyHalfLife
         self.soundEchoDutyCycle = soundEchoDutyCycle
         self.soundRutRecentTurnLimit = soundRutRecentTurnLimit
-        self.soundRutEdgeSentenceCount = soundRutEdgeSentenceCount
         self.soundEchoRegisterTolerance = soundEchoRegisterTolerance
         self.wornEchoThreshold = wornEchoThreshold
         self.soundRutMinimumTurnGap = max(0, soundRutMinimumTurnGap)
@@ -302,7 +296,6 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         self.fingerprintFamilyRepeatLimit = fingerprintFamilyRepeatLimit
         self.fingerprintSuppressionWindow = fingerprintSuppressionWindow
         self.sessionBridgeGapHours = sessionBridgeGapHours
-        self.deliveryBrevityCenter = deliveryBrevityCenter
         self.playModeWeight = playModeWeight
         self.soundEchoNegativeRunLimit = max(0, soundEchoNegativeRunLimit)
         self.soundEchoLandingWeight = max(0, min(0.5, soundEchoLandingWeight))
@@ -368,12 +361,10 @@ extension PersonalityDynamicsConfiguration {
     ///
     /// - `warmth`   → `feltWarmthEarnedSpan` (how much warmth a persona can EARN,
     ///                never where it rests — rest stays the calibrated literal).
-    /// - `brevity`  → `deliveryBrevityCenter` (consumed by P6's delivery envelope).
     /// - `humor`    → `playModeWeight` (consumed by P11's mode-driven selection).
     ///
-    /// Every other field stays at its default: this wave deliberately derives only
-    /// the three the campaign named. Adding a dial→constant edge is a decision per
-    /// edge, not a bulk mapping.
+    /// Every other field stays at its base value. Adding a dial→constant edge is
+    /// a decision per edge, not a bulk mapping.
     public static func derived(
         from dials: PersonalityTraitDials,
         base: PersonalityDynamicsConfiguration = .default
@@ -381,7 +372,6 @@ extension PersonalityDynamicsConfiguration {
         var out = base
         out.feltWarmthEarnedSpan = boundedAroundDefault(
             base.feltWarmthEarnedSpan, dial: dials.warmth, relativeSpan: 0.5)
-        out.deliveryBrevityCenter = dials.brevity
         out.playModeWeight = dials.humor
         return out
     }

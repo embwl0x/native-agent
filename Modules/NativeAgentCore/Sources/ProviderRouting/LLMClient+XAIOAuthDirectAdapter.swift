@@ -223,6 +223,9 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                             try Task.checkCancellation()
                             let frame = try decoder.consume(payload: sse.data)
                             if frame.isDone { break }
+                            if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
+                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                            }
                             // User, 2026-09-06: reasoning frames and tool-argument
                             // fragments are model output that yields no text, and
                             // this loop signalled liveness only on content and a
@@ -234,9 +237,6 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                             for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
                             if let content = frame.content {
                                 sawContent = true
-                                if ttftMs == nil {
-                                    ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                                }
                                 continuation.yield(.textDelta(content))
                             }
                             if let finish = frame.finishReason,

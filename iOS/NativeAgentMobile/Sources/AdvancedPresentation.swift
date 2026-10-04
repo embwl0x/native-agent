@@ -57,12 +57,6 @@ struct MobileReadingSurface<Content: View>: View {
     }
 }
 
-struct MobileReadingSurfaceModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        MobileReadingSurface { content }
-    }
-}
-
 struct MobileReadingStat: View {
     let label: String
     let value: String
@@ -79,39 +73,6 @@ struct MobileReadingStat: View {
             }
         }
         .padding(.vertical, 8)
-    }
-}
-
-struct MobileReadingEmptyState: View {
-    let title: String
-    let systemImage: String
-    let kind: AppEmptyStateKind
-    var description: String? = nil
-    var tint: Color = .secondary
-    var action: (title: String, systemImage: String, handler: () -> Void)? = nil
-
-    var body: some View {
-        VStack(spacing: NativeAgentMobileTheme.Spacing.lg) {
-            Image(systemName: systemImage)
-                .font(.system(size: 56, weight: .regular))
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-            Text(title).mobileTypography(.title, weight: .semibold)
-            if let description {
-                Text(description).mobileTypography(.body).foregroundStyle(.secondary)
-            }
-            if let action {
-                Button(action: action.handler) {
-                    Label(action.title, systemImage: action.systemImage)
-                        .frame(minHeight: NativeAgentMobileTheme.Layout.controlHeight)
-                }
-                .hazeTinted()
-            }
-        }
-        .multilineTextAlignment(.center)
-        .fixedSize(horizontal: false, vertical: true)
-        .frame(maxWidth: .infinity)
-        .padding(NativeAgentMobileTheme.Spacing.xl)
     }
 }
 

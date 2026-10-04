@@ -3,40 +3,12 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - Subsystem #18: Dispatcher infrastructure
+// MARK: - Native dispatcher infrastructure
 //
-// Swift-native tool dispatcher.
-//
-// This module ports the *infrastructure* surrounding the unified tool
-// dispatcher: the request-shaping, runId/started_at minting, the response
-// decoder, the cross-process flock'd JSONL ledger writer, and the factory.
-// It does NOT port the 84 connector
-// actions, the policy resolver, the approval flow, or the actual tool
-// execution. Each connector action must be registered in LocalConnectorActions
-// to run. Missing actions fail closed with a Swift receipt; there is no daemon
-// HTTP fallback.
-//
-// Ledger shape: the daemon writes to `<dataRoot>/traces/events.jsonl` via
-// `record_trace(kind, title, payload)`. Each
-// dispatch yields ONE event:
-//   {
-//     "id":        <uuid>,
-//     "kind":      "dispatch",
-//     "title":     "tool:<toolName>",
-//     "status":    "ok"|"failed"|"blocked"|"dry_run"|"pending_approval",
-//     "payload":   <trace_event dict>,        # see the retired daemon:_make_trace_event
-//     "createdAt": <iso8601>
-//   }
-// The Swift writer below produces the SAME shape (same key order, same fields,
-// `sort_keys=true` JSONL) under the SAME `<dataRoot>/traces/events.jsonl`
-// path. Concurrency: Python's `append_jsonl`
-// is UNLOCKED — line-atomicity for cross-process appends comes from POSIX
-// O_APPEND for sub-PIPE_BUF writes (which a dispatch trace always is). The
-// Swift side ADDS a `<path>.lock` flock as a precaution against larger
-// payloads and future readers that mutate (matches the ToolRegistry pattern).
-//
-// The ledger is written directly by Swift for both successful native actions
-// and refused/unsupported dispatches.
+// Shapes requests and receipts, applies autonomy decisions and writes the
+// flock-protected dispatch ledger at <dataRoot>/traces/events.jsonl.
+// NativeActionDispatch supplies the shipped read-only connector handlers.
+// Missing handlers fail closed with a Swift receipt; no daemon HTTP fallback.
 
 // MARK: - Wire types
 
@@ -87,99 +59,10 @@ public struct DispatchContext: Sendable {
         )
     }
 
-    /// WAVE 42 W01 (§6.260) — ACTION-NAME-SCOPED file-sandbox context selector
-    /// for the in-process `_swiftDispatch` seam (NativeAgentApp/NativeClient.swift).
-    ///
-    /// REOPEN of WAVE 41 W02 (§6.240-rd2 #1). The §6.220-rd2 #2 fix correctly
-    /// built a sandbox-ENGAGING `DispatchContext` (non-empty `repoRoot` +
-    /// read-only `file_access` + `_na_data_root`) for the `read_file` /
-    /// `file_excerpt` native flips so an absolute path can't escape the sandbox.
-    /// A prior implementation computed that need from broad read-tool
-    /// availability and then applied the resulting `ctx` to whatever tool the call
-    /// dispatched. So when EITHER file flag was ON, a `persona_read` /
-    /// `workspace_list` / `time_now` / `persona_list_skills` / `system_info`
-    /// dispatch in the SAME process got the sandbox-engaging context instead of
-    /// its legacy `defaultForSurface("chat")`. Those non-file actions resolve
-    /// their OWN roots (persona/workspace) independently and derive persona root
-    /// from `_na_data_root` ONLY in test mode — so a prod `_na_data_root` flips
-    /// their persona root from `defaultPersonaRoot()` (`<repo>/persona`) to the
-    /// `<dataRoot>/memory` legacy fallback: a behavior change. The fix scopes the
-    /// sandbox context to the action name (`read_file` / `file_excerpt`) and its
-    /// explicit availability — every other tool keeps `defaultForSurface`.
-    ///
-    /// Pure (no I/O): the caller passes the resolved `dataRoot` URL (the only
-    /// production source is `PersistenceCore.defaultDataRoot()`, which ALWAYS
-    /// returns a valid non-empty URL — never nil/empty) and the two flag bools,
-    /// so this is unit-testable from DispatcherTests. The sandbox-engaging branch
-    /// mirrors the daemon `_d_ctx` for the read-tool dispatch path
-    /// (`run_dispatcher_read_tool_action`, the retired daemon): `repo_root`/`cwd`
-    /// = the data root's parent (`<repo>/data` → `<repo>`), a READ-ONLY
-    /// `file_access` ({"mode":"read_only","sandbox":"read_only"} — NOT "full", so
-    /// the sandbox stays ENGAGED), and `_na_data_root` (empty-string guarded —
-    /// `fromDispatch` treats "" as falsy) so `isSensitiveDataPath` blocks
-    /// OAuth tokens / pairing secrets even though they live under the repo root.
-    ///
-    /// `dataRoot` is a `URL` (NOT a String) so the parent is computed with the
-    /// SAME URL-native `deletingLastPathComponent()` the prior inline code used —
-    /// reconstructing a URL from `.path` via `URL(fileURLWithPath:)` would silently
-    /// EXPAND a literal leading `~` (the `NATIVE_AGENT_DATA_ROOT` env-var tilde
-    /// case `PersistenceCore.defaultDataRoot` deliberately preserves), a parity
-    /// break. Because the only caller passes a guaranteed-non-empty URL, the
-    /// sandbox branch always yields a NON-empty `repoRoot` → `allowedRoots` is
-    /// non-empty → the `FileSystemActions` guard ENGAGES (no empty-roots bypass).
-    public static func fileSandboxContextForTool(
-        _ tool: String,
-        readFileEnabled: Bool,
-        fileExcerptEnabled: Bool,
-        dataRoot: URL,
-        surface: String = "chat",
-        sessionId: String = ""
-    ) -> DispatchContext {
-        // ACTION-NAME-scoped: ONLY the file-system read tools engage the sandbox
-        // context, and only when that action is available. Every other action —
-        // and an unavailable file tool — keeps the default context and will
-        // fail closed unless another Swift registry handles it.
-        let toolNeedsSandbox =
-            (tool == "read_file" && readFileEnabled) ||
-            (tool == "file_excerpt" && fileExcerptEnabled)
-        guard toolNeedsSandbox else {
-            return .defaultForSurface(surface, sessionId: sessionId)
-        }
-        // Repo root = parent of the data root, mirroring the daemon's
-        // `self.repo_root` (the data dir lives at `<repo>/data`). URL-native parent
-        // (NOT `URL(fileURLWithPath: dataRoot.path)`) so a literal `~` survives.
-        // This is the sole always-allowed sandbox root.
-        let repoRoot = dataRoot.deletingLastPathComponent().path
-        var extra: [String: JSONValue] = [
-            "file_access": .object([
-                "mode": .string("read_only"),
-                "sandbox": .string("read_only"),
-            ]),
-        ]
-        // Empty-string guarded — `fromDispatch` treats "" as falsy (Python
-        // `_resolve_na_data_root`). `defaultDataRoot()` never yields "" in prod;
-        // the guard is defensive for a hand-constructed degenerate URL.
-        let dataRootPath = dataRoot.path
-        if !dataRootPath.isEmpty {
-            extra["_na_data_root"] = .string(dataRootPath)
-        }
-        return DispatchContext(
-            repoRoot: repoRoot,
-            cwd: repoRoot,
-            surface: surface,
-            sessionId: sessionId,
-            persona: "",
-            activeProvider: "",
-            extra: extra
-        )
-    }
 }
 
-/// Best-effort decoded output payload. The Python `Receipt.output` is any
-/// JSON value (or null); we capture it as JSONValue so the entire response
-/// stays inspectable + Sendable. NOT Codable — built manually from the
-/// response dict in `decodeDispatchResult` below to dodge JSONValue's lack
-/// of a Codable conformance.
+/// Native output payload, kept as JSONValue so the entire response stays
+/// inspectable and Sendable.
 public struct DispatchOutput: Sendable, Equatable {
     public var value: JSONValue
     public init(value: JSONValue) { self.value = value }
@@ -293,42 +176,6 @@ public protocol DispatcherClient: Sendable {
         ctx: DispatchContext,
         dryRun: Bool
     ) async throws -> DispatchResult
-}
-
-// MARK: - HTTP transport DI
-
-/// Tiny request-execute protocol so tests can inject a stub instead of
-/// hitting URLSession. The protocol is intentionally Data-in/Data-out so
-/// the impls don't share JSON-shaping responsibility.
-public protocol DispatcherHTTPClient: Sendable {
-    func postJSON(
-        url: URL,
-        body: Data,
-        timeout: TimeInterval
-    ) async throws -> (status: Int, body: Data)
-}
-
-/// Production transport using URLSession.shared. Equivalent to
-/// `_dispatchRaw` in Sources/NativeAgentApp/NativeClient.swift:4631.
-public final class URLSessionDispatcherHTTPClient: DispatcherHTTPClient {
-    private let session: URLSession
-    public init(session: URLSession = .shared) { self.session = session }
-
-    public func postJSON(url: URL, body: Data, timeout: TimeInterval) async throws -> (status: Int, body: Data) {
-        var req = URLRequest(url: url, timeoutInterval: timeout)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = body
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: req)
-        } catch {
-            throw DispatcherError.unavailable
-        }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        return (status, data)
-    }
 }
 
 // MARK: - Request shaping (shared by both impls)
@@ -547,21 +394,16 @@ public actor SwiftNativeDispatcher: DispatcherClient {
     private let ledger: DispatchLedger
     private let clock: @Sendable () -> Date
     private let runIdFactory: @Sendable () -> String
-    /// Wave 29 W3: optional native connector-action registry. When present and
-    /// it knows the requested tool, dispatch runs the action NATIVELY in Swift
-    /// (no HTTP round-trip). Nil means only explicitly registered handlers run;
-    /// other tools fail closed.
+    /// Runs registered connector actions in-process. Nil or missing handlers
+    /// fail closed; production callers supply NativeActionDispatch's registry.
     private let localActions: LocalConnectorActions?
     private let timeout: TimeInterval
     /// Resolves the autonomy level ("auto"/"ask"/"never") for a given tool.
-    /// When nil the native-action paths fall back to "auto" — preserving the
-    /// scaffold behavior. In production wiring this is supplied by the app
-    /// layer and reads the live trust policy via TrustCenter.autonomyForTool.
+    /// Without a resolver, read-only handlers are automatic and side-effecting
+    /// registrations are refused by makeDispatcher.
     private let autonomyResolver: (@Sendable (String) async -> String)?
 
     public init(
-        baseURL: URL? = nil,
-        http: any DispatcherHTTPClient = URLSessionDispatcherHTTPClient(),
         timeout: TimeInterval = 60,
         ledger: DispatchLedger? = nil,
         clock: @escaping @Sendable () -> Date = { Date() },
@@ -569,8 +411,6 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         localActions: LocalConnectorActions? = nil,
         autonomyResolver: (@Sendable (String) async -> String)? = nil
     ) {
-        _ = baseURL
-        _ = http
         self.timeout = timeout
         self.ledger = ledger ?? DispatchLedger(ledgerPath: DispatchLedger.defaultLedgerPath())
         self.clock = clock
@@ -817,6 +657,7 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         let t0 = DispatchClockMonotonic.now()
         let raw: JSONValue
         if ["read_file", "file_excerpt", "list_dir"].contains(tool), !actions.isSideEffecting(tool) {
+            let imageSink = LocalToolImage.sink
             // Folder permission prompts and unavailable volumes can block even
             // metadata reads. Keep them off the caller's executor; BoundedWait
             // can abandon a read without waiting for that syscall to return.
@@ -824,9 +665,11 @@ public actor SwiftNativeDispatcher: DispatcherClient {
                 raw = try await BoundedWait.run(seconds: timeout, reason: "file read") {
                     await withCheckedContinuation { continuation in
                         DispatchQueue.global(qos: .userInitiated).async {
-                            continuation.resume(returning: actions.run(tool, input: input, ctx: connectorCtx) ?? .object([
-                                "ok": .bool(false), "error": .string("native handler returned nil"),
-                            ]))
+                            LocalToolImage.$sink.withValue(imageSink) {
+                                continuation.resume(returning: actions.run(tool, input: input, ctx: connectorCtx) ?? .object([
+                                    "ok": .bool(false), "error": .string("native handler returned nil"),
+                                ]))
+                            }
                         }
                     }
                 }
@@ -862,17 +705,8 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         let status: String
         let dispatchError: DispatchError?
         let executed = true
-        // §6.30 prereq #9 (verify-write semantics) — wave 36 W11. The daemon
-        // sets verify_passed=True for Tool.TRIVIAL_VERIFY read-only tools on a
-        // SUCCESSFUL run, and leaves it None for a
-        // failed handler return (every failure branch passes verify_passed=None,
-        // the retired daemon/1445). Mirror that: verifyPassed=true ONLY
-        // when the action is registered TRIVIAL_VERIFY AND it returned ok; nil
-        // otherwise (failed run, or a non-TRIVIAL_VERIFY tool — daemon's
-        // _DEFAULT_VERIFY read-only tools emit None too). Side-effecting tools
-        // never reach this success-path natively on the flip seam (no
-        // side-effecting tool is in a flipped registry), so their real
-        // verify-on-effect stays server-side.
+        // Successful read-only handlers marked trivialVerify need no separate
+        // effect verification. Failed results leave verification unset.
         let verifyPassed: Bool?
         if resultOK {
             status = "ok"
@@ -1054,8 +888,7 @@ private func truncateForTrace(_ value: JSONValue, maxChars: Int = 200) -> String
 
 // MARK: - Factory
 
-/// Swift-native dispatcher factory. `baseURL` and `http` are retained only for
-/// source compatibility with older callers; they are ignored.
+/// Swift-native dispatcher factory.
 ///
 /// 2026-07-21 audit (pending_approval dead-end): the dispatch-time A4b guard
 /// resolves a SIDE-EFFECTING action with no autonomy resolver to "ask" and
@@ -1072,8 +905,6 @@ private func truncateForTrace(_ value: JSONValue, maxChars: Int = 200) -> String
 /// full registry. Direct `SwiftNativeDispatcher` construction is deliberately
 /// unguarded so the dispatch-time A4b guard (and its pin test) stays intact.
 public func makeDispatcher(
-    http: any DispatcherHTTPClient = URLSessionDispatcherHTTPClient(),
-    baseURL: URL? = nil,
     ledger: DispatchLedger? = nil,
     // Nil keeps this dispatcher fail-closed for every tool. Production callers
     // pass the concrete Swift registry they want to expose.
@@ -1104,123 +935,8 @@ public func makeDispatcher(
         }
     }
     return SwiftNativeDispatcher(
-        baseURL: baseURL,
-        http: http,
         ledger: ledger,
         localActions: actions,
         autonomyResolver: autonomyResolver
-    )
-}
-
-// MARK: - Manual JSONValue-based decoder for DispatchResult
-//
-// DispatchOutput is not Codable (intentionally — JSONValue lives in
-// PersistenceCore and we don't want to pull a Codable conformance into it
-// just for this use). So we parse the response bytes via `JSONValue.parse`
-// and pattern-match each field. Snake_case keys match
-// `_receipt_to_response_dict`.
-
-public func decodeDispatchResult(from data: Data) throws -> DispatchResult {
-    let root: JSONValue
-    do {
-        root = try JSONValue.parse(data)
-    } catch {
-        throw DispatcherError.decodeFailure("not valid JSON: \(error.localizedDescription)")
-    }
-    guard case .object(let obj) = root else {
-        throw DispatcherError.decodeFailure("expected top-level JSON object")
-    }
-
-    func string(_ key: String, default def: String = "") -> String {
-        if case .string(let s) = obj[key] ?? .null { return s }
-        return def
-    }
-    func requiredString(_ key: String) throws -> String {
-        if case .string(let s) = obj[key] ?? .null { return s }
-        throw DispatcherError.decodeFailure("missing or non-string field '\(key)'")
-    }
-    func bool(_ key: String, default def: Bool) -> Bool {
-        if case .bool(let b) = obj[key] ?? .null { return b }
-        return def
-    }
-    func optBool(_ key: String) -> Bool? {
-        switch obj[key] ?? .null {
-        case .bool(let b): return b
-        case .null: return nil
-        default: return nil
-        }
-    }
-    func int(_ key: String, default def: Int = 0) -> Int {
-        switch obj[key] ?? .null {
-        case .int(let i): return Int(i)
-        case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? def
-        default: return def
-        }
-    }
-
-    let ok = bool("ok", default: false)
-    let tool = try requiredString("tool")
-    let status = try requiredString("status")
-    let executed = bool("executed", default: false)
-    let verifyPassed = optBool("verify_passed")
-    let durationUs = int("duration_us", default: 0)
-    let durationMs = int("duration_ms", default: 0)
-    let argsHash = string("args_hash", default: "")
-    let effectiveAutonomy = string("effective_autonomy", default: "")
-    let autonomySource = string("autonomy_source", default: "")
-    let providerMatch = bool("provider_match", default: true)
-    let traceEventId = string("trace_event_id", default: "")
-    let runId = string("run_id", default: "")
-    let startedAt = string("started_at", default: "")
-
-    let output: DispatchOutput?
-    switch obj["output"] ?? .null {
-    case .null:
-        output = nil
-    case let v:
-        output = DispatchOutput(value: v)
-    }
-
-    let error: DispatchError?
-    switch obj["error"] ?? .null {
-    case .object(let eobj):
-        var code = ""
-        if case .string(let s) = eobj["code"] ?? .null { code = s }
-        var message = ""
-        if case .string(let s) = eobj["message"] ?? .null { message = s }
-        var etool: String? = nil
-        if case .string(let s) = eobj["tool"] ?? .null { etool = s }
-        var eHash: String? = nil
-        if case .string(let s) = eobj["args_hash"] ?? .null { eHash = s }
-        var recoverable = false
-        if case .bool(let b) = eobj["recoverable"] ?? .null { recoverable = b }
-        error = DispatchError(
-            code: code,
-            message: message,
-            tool: etool,
-            argsHash: eHash,
-            recoverable: recoverable
-        )
-    default:
-        error = nil
-    }
-
-    return DispatchResult(
-        ok: ok,
-        tool: tool,
-        status: status,
-        output: output,
-        error: error,
-        executed: executed,
-        verifyPassed: verifyPassed,
-        durationUs: durationUs,
-        durationMs: durationMs,
-        argsHash: argsHash,
-        effectiveAutonomy: effectiveAutonomy,
-        autonomySource: autonomySource,
-        providerMatch: providerMatch,
-        traceEventId: traceEventId,
-        runId: runId,
-        startedAt: startedAt
     )
 }

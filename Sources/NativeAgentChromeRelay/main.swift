@@ -288,10 +288,7 @@ private func refuseUnlessLaunchedByChrome() throws -> ChromeHostIdentity.ParentE
         ?? CommandLine.arguments.first ?? ""
     guard ChromeHostIdentity.isBundledRelay(executablePath: selfPath) else { return nil }
     let parent = getppid()
-    guard let parentPath = ChromeHostIdentity.executablePath(ofProcess: parent),
-          let identifier = ChromeHostIdentity.browserSigningIdentifier(
-              forExecutablePath: parentPath
-          ) else {
+    guard let identifier = ChromeHostIdentity.browserSigningIdentifier(forProcess: parent) else {
         diagnostic("refusing: the parent process is not a signed Chromium-family browser.")
         throw RelayError.notLaunchedByChrome
     }

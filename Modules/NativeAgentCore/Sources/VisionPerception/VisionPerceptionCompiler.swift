@@ -2,9 +2,8 @@ import Foundation
 import CoreGraphics
 import NativeAgentCore
 import PersistenceCore
-import MacControl
 
-// MARK: - FUSION: CGImage → the shared percept
+// MARK: - FUSION: CGImage → vision rows
 //
 // The whole pipeline, in one place and in one pass over the frame:
 //
@@ -16,7 +15,7 @@ import MacControl
 //        │
 //   fusion → roles · states · handles · ABSTAIN · five confidences
 //        │
-//   MacLookPercept  +  the vision sidecar
+//   VisionPercept → the shared screen/target adapter
 //
 // PURE: a CGImage in, a percept out. No capture, no injection here; the
 // production caller is SwiftToolDispatcher+FourVerbPerception.swift (the
@@ -118,8 +117,6 @@ public struct VisionPerceptionCompiler: Sendable {
     public func compile(
         image: CGImage,
         using recognizer: some VisionTextRecognizing,
-        appName: String? = nil,
-        windowTitle: String? = nil,
         excludedRegions: [VisionRect] = []
     ) throws -> VisionPercept {
         try Task.checkCancellation()
@@ -337,65 +334,8 @@ public struct VisionPerceptionCompiler: Sendable {
         )
         let readouts = Array(readoutsAll.prefix(config.maxReadouts))
 
-        // 10. The SHARED shape.
-        let affordances = rows.map { row -> MacLookAffordance in
-            MacLookAffordance(
-                handle: row.handle,
-                role: row.roleGuess,
-                subrole: nil,
-                label: row.displayLabel ?? "",
-                labelSource: "vision",
-                value: nil,
-                secret: row.label?.secret ?? false,
-                // The honest, per-attribute answer is in `state.disabled`;
-                // this bare bool exists because the shared struct has one, and
-                // it is set CONSERVATIVELY — believed-disabled reads disabled.
-                enabled: !(row.state.disabled?.value ?? false),
-                frame: row.rect.axFrame,
-                // Pixels publish no AX path. The ordinal position in the
-                // percept is the fallback address, and it is deliberately not
-                // dressed up as a tree path.
-                path: [index(of: row, in: rows)],
-                labelJSON: row.label?.json,
-                valueJSON: nil,
-                handleAmbiguity: row.handleAmbiguity
-            )
-        }
-        let percept = MacLookPercept(
-            app: appName.map { MacAXAppInfo(name: $0, bundleIdentifier: nil, processIdentifier: 0) },
-            windowTitle: windowTitle,
-            focus: nil,
-            modal: nil,
-            landmarks: [],
-            affordances: affordances,
-            unlabeledByRole: unlabeledByRole(rows),
-            affordancesOmitted: max(0, considered - rows.count),
-            interactiveCount: rows.count,
-            labeledCount: rows.filter { $0.displayLabel?.isEmpty == false }.count,
-            truncated: considered > rows.count,
-            truncationReasons: considered > rows.count ? ["vision_affordance_cap"] : [],
-            skippedAtLeast: max(0, considered - rows.count),
-            windowTitleJSON: windowTitle.map {
-                MacScreenViewTextRedaction.redactedLegendString($0, valueChars: 120)
-            },
-            readouts: readouts.map {
-                MacLookReadout(
-                    handle: $0.handle,
-                    role: "AXStaticText",
-                    text: $0.text.display ?? "",
-                    source: "vision",
-                    path: [],
-                    textJSON: $0.text.json
-                )
-            },
-            // A capped readout list must not look complete (gpt-5.5 review).
-            readoutsOmitted: max(0, readoutsAll.count - readouts.count),
-            ambiguousHandles: rows.filter { $0.handleAmbiguity != nil }.count
-        )
-
         try Task.checkCancellation()
         return VisionPercept(
-            percept: percept,
             rows: rows,
             readouts: readouts,
             abstain: VisionAbstainReport(
@@ -446,7 +386,7 @@ public struct VisionPerceptionCompiler: Sendable {
                 kept.append(candidate)
             }
         }
-        return kept.sorted(by: VisionColorRegionLayer.readingOrder)
+        return VisionColorRegionLayer.readingOrder(kept)
     }
 
     /// THE ABSTAIN RULE.
@@ -510,18 +450,6 @@ public struct VisionPerceptionCompiler: Sendable {
         if handleAmbiguous { value = min(value, 0.5) }
         if ambiguous { value = min(value, 0.25) }
         return value
-    }
-
-    func unlabeledByRole(_ rows: [VisionAffordanceRow]) -> [String: Int] {
-        var counts: [String: Int] = [:]
-        for row in rows where row.displayLabel?.isEmpty != false {
-            counts[row.roleGuess, default: 0] += 1
-        }
-        return counts
-    }
-
-    func index(of row: VisionAffordanceRow, in rows: [VisionAffordanceRow]) -> Int {
-        rows.firstIndex { $0.handle == row.handle } ?? 0
     }
 
     /// Prominent standalone values: text nobody claimed as a control's caption,

@@ -57,6 +57,8 @@ public enum MemoryConsolidationSwapOutcome: Sendable, Equatable {
     case staleRefused(runId: String)
     case cleanedUpDenied(runId: String)
     case pendingApproval(runId: String)
+    /// Canonical changes committed; derived projections still need reconciliation.
+    case projectionFailed(runId: String, reason: String)
     case failed(runId: String, reason: String)
 }
 

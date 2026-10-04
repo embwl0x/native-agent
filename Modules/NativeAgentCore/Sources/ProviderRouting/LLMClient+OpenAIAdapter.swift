@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-/// OpenAI Chat Completions adapter. URLSession is injectable for tests.
+/// OpenAI API-key adapter: GPT-6 uses Responses; older models use Chat Completions.
 public final class OpenAIAdapter: LLMAdapter {
     public static let supportsTools = true
     public let providerId: String = "openai"
@@ -65,6 +65,9 @@ public final class OpenAIAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
+        if OpenAIExecutionControls.usesResponses(model: model) {
+            return try await completeResponses(messages: [.user(prompt)], system: system, model: model, tools: tools)
+        }
         guard let key = apiKeyOverride
                 ?? LLMCredentialResolver.resolveAPIKey(
                     providerConfigFile: "openai.json",
@@ -117,6 +120,9 @@ public final class OpenAIAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
+        if OpenAIExecutionControls.usesResponses(model: model) {
+            return try await completeResponses(messages: messages, system: system, model: model, tools: tools)
+        }
         let hasImage = messages.contains { m in
             m.content.contains { if case .image = $0 { return true }; return false }
         }
@@ -234,6 +240,9 @@ public final class OpenAIAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+        if OpenAIExecutionControls.usesResponses(model: model) {
+            return streamResponses(messages: messages, system: system, model: model, tools: tools)
+        }
         let session = self.session
         let endpoint = self.endpoint
         let apiKeyOverride = self.apiKeyOverride
@@ -263,6 +272,9 @@ public final class OpenAIAdapter: LLMAdapter {
                     ]
                     try Self.applyTools(to: &body, tools: tools)
                     OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
+                    if let limit = LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit {
+                        body["max_completion_tokens"] = limit
+                    }
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
                     let requestStartNs = DispatchTime.now().uptimeNanoseconds
@@ -302,15 +314,15 @@ public final class OpenAIAdapter: LLMAdapter {
                         try Task.checkCancellation()
                         let frame = try decoder.consume(payload: sse.data)
                         if frame.isDone { break }
+                        if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
+                            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                        }
                         // Liveness: reasoning frames and tool-argument deltas are
                         // real model output but not reply text — keep the idle
                         // clock in ProviderStreamGuard advancing during a long
                         // thinking phase or a big argument accumulation.
                         if frame.reasoning != nil { continuation.yield(.keepAlive) }
                         if let content = frame.content {
-                            if ttftMs == nil {
-                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                            }
                             sawContent = true
                             continuation.yield(.textDelta(content))
                         }
@@ -341,6 +353,98 @@ public final class OpenAIAdapter: LLMAdapter {
                     continuation.finish(throwing: err)
                 } catch is CancellationError {
                     continuation.finish(throwing: CancellationError())
+                } catch {
+                    continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "stream: \(error)")))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    // MARK: - Public Responses API
+
+    private func completeResponses(
+        messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
+    ) async throws -> String {
+        var text = ""
+        var markers: [String] = []
+        for try await event in streamResponses(messages: messages, system: system, model: model, tools: tools) {
+            switch event {
+            case .textDelta(let delta): text += delta
+            case .toolCall(let call):
+                let arguments = String(decoding: call.inputJSON, as: UTF8.self)
+                markers.append("<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(arguments)</tool_use>")
+            case .keepAlive, .replyTextSettled: break
+            }
+        }
+        return ([text.trimmingCharacters(in: .whitespacesAndNewlines)] + markers)
+            .filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+
+    private func responsesRequest(
+        messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
+    ) throws -> URLRequest {
+        guard let key = apiKeyOverride
+                ?? LLMCredentialResolver.resolveAPIKey(
+                    providerConfigFile: "openai.json", dataRoot: credentialRoot),
+              !key.isEmpty else {
+            throw LLMError.notConfigured(provider: "openai")
+        }
+        // Keep custom endpoint origins and base paths, replacing only the API resource.
+        let responsesEndpoint = endpoint.lastPathComponent == "completions"
+            && endpoint.deletingLastPathComponent().lastPathComponent == "chat"
+            ? endpoint.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("responses")
+            : endpoint
+        var req = URLRequest(url: responsesEndpoint)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        applyStreamingLLMHeaders(to: &req)
+        req.timeoutInterval = Self.requestTimeoutSeconds
+        // Public schemas must encode successfully; do not substitute empty parameters.
+        for tool in tools ?? [] {
+            _ = try JSONSerialization.jsonObject(with: tool.parametersJSON)
+        }
+        var body = OpenAIOAuthDirectAdapter.buildResponsesBodyFromMessages(
+            model: model, messages: messages, system: system, tools: tools, transport: .publicAPI
+        )
+        // The API-key lane has never supplied a default system instruction.
+        if system?.isEmpty != false { body.removeValue(forKey: "instructions") }
+        body["prompt_cache_options"] = ["ttl": "30m"]
+        if let limit = LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit {
+            body["max_output_tokens"] = limit
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        return req
+    }
+
+    private func streamResponses(
+        messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
+    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    let req = try responsesRequest(messages: messages, system: system, model: model, tools: tools)
+                    let requestStartNs = DispatchTime.now().uptimeNanoseconds
+                    let (bytes, response) = try await session.bytes(for: req)
+                    defer { bytes.task.cancel() }
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    if !(200..<300).contains(status) {
+                        let data = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
+                        try throwIfChatCompletionsError(status: status, data: data, response: response)
+                        throw LLMError.invalidResponse(status: status)
+                    }
+                    try await OpenAIOAuthDirectAdapter.consumeResponsesStream(
+                        bytes: bytes, request: req, model: model,
+                        providerId: providerId, telemetry: telemetry, requestStartNs: requestStartNs,
+                        providerLabel: "openai", errorPrefix: "openai",
+                        transport: .publicAPI,
+                        networkError: { _ in .underlying(message: "connection refused: \(req.url?.host ?? "openai")") },
+                        continuation: continuation
+                    )
+                    continuation.finish()
+                } catch let err as LLMError {
+                    continuation.finish(throwing: err)
                 } catch {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "stream: \(error)")))
                 }

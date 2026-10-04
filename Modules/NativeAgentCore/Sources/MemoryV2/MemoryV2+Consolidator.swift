@@ -243,6 +243,10 @@ public actor MemoryConsolidator {
 
         for proposal in pending {
             processed += 1
+            if MemoryManagerLane.requiresHumanApproval(source: proposal.source, metadata: proposal.metadata) {
+                pendingForReview += 1
+                continue
+            }
             do {
                 // 1) Tombstone check — skip if previously rejected.
                 if try await storage.isTombstoned(content: proposal.content) {
@@ -452,6 +456,7 @@ public actor MemoryConsolidator {
         // scope's current row. Same key duplicate hygiene uses.
         var byScopeAndKind: [String: [StoredMemory]] = [:]
         for m in actives {
+            if case .object(let meta)? = m.metadata, meta["owner_restored"] != nil { continue }
             guard let kind = MemoryRecallScoring.kind(of: m.metadata),
                   memorySupersessionSingleValuedKinds.contains(kind) else { continue }
             let key = Self.disclosureScopeKey(personaId: m.personaId, metadata: m.metadata)
@@ -476,7 +481,10 @@ public actor MemoryConsolidator {
                 // `comparableEpochs`. No comparable vectors, no supersession.
                 guard Self.comparableEpochs(newest.embeddingEpoch, older.embeddingEpoch) else { continue }
                 guard Self.cosine(newest.embedding, older.embedding) >= memorySupersessionCosineFloor else { continue }
-                _ = try await storage.archiveSuperseded(id: older.id, by: newest.id)
+                _ = try await storage.archiveSuperseded(
+                    id: older.id, by: newest.id,
+                    expectedContentHash: MemoryStorage.contentFingerprint(older.content),
+                    expectedReplacementContentHash: MemoryStorage.contentFingerprint(newest.content))
             }
         }
     }
@@ -522,7 +530,14 @@ public actor MemoryConsolidator {
     }
 
     private func archiveDuplicateActiveMemories() async throws -> Int {
+        // Agent, 2026-10-01: a row she restored from a merge is her decision
+        // that it stands apart. Re-merging it would undo her restore, so it is
+        // neither archived nor counted as a keeper here.
         let actives = try await storage.listMemories(persona: nil, status: "active", limit: nil)
+            .filter {
+                guard case .object(let meta)? = $0.metadata else { return true }
+                return meta["owner_restored"] == nil
+            }
         var archivedIDs = Set<String>()
         var archived = 0
 
@@ -663,6 +678,9 @@ public actor MemoryConsolidator {
     }
 
     private static func semanticKeeper(_ left: StoredMemory, _ right: StoredMemory) -> StoredMemory {
+        let leftPinned = isPinned(left)
+        let rightPinned = isPinned(right)
+        if leftPinned != rightPinned { return leftPinned ? left : right }
         let leftCorrection = MemoryRecallScoring.kind(of: left.metadata) == "correction"
         let rightCorrection = MemoryRecallScoring.kind(of: right.metadata) == "correction"
         if leftCorrection != rightCorrection { return leftCorrection ? left : right }
@@ -674,6 +692,9 @@ public actor MemoryConsolidator {
 
     private static func preferredKeeper(in memories: [StoredMemory]) -> StoredMemory {
         memories.sorted { left, right in
+            let leftPinned = isPinned(left)
+            let rightPinned = isPinned(right)
+            if leftPinned != rightPinned { return leftPinned }
             if left.confidence != right.confidence { return left.confidence > right.confidence }
             if left.useCount != right.useCount { return left.useCount > right.useCount }
             let leftDate = parseISO8601(left.updatedAt) ?? .distantPast
@@ -682,6 +703,11 @@ public actor MemoryConsolidator {
             if left.content.count != right.content.count { return left.content.count > right.content.count }
             return left.id < right.id
         }.first!
+    }
+
+    private static func isPinned(_ memory: StoredMemory) -> Bool {
+        guard case .object(let metadata)? = memory.metadata else { return false }
+        return metadata["pinned"] == .bool(true)
     }
 
     // Internal (not private): MemoryV2.store's write-time exact-duplicate
@@ -697,7 +723,7 @@ public actor MemoryConsolidator {
             .lowercased()
     }
 
-    private static func lexicalJaccard(_ left: String, _ right: String) -> Double {
+    static func lexicalJaccard(_ left: String, _ right: String) -> Double {
         func tokens(_ text: String) -> Set<String> {
             Set(text.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init))
         }
@@ -715,6 +741,7 @@ public actor MemoryConsolidator {
         let actives = try await storage.listMemories(persona: nil, status: "active", limit: nil)
         var archived = 0
         for m in actives {
+            guard !Self.isPinned(m) else { continue }
             guard let updated = Self.parseISO8601(m.updatedAt) else { continue }
             guard updated < cutoff else { continue }
             let recall: Int64 = try {
@@ -735,10 +762,8 @@ public actor MemoryConsolidator {
             // when NEITHER shows any. A memory recalled often but never merged
             // into must not read as "unused."
             guard recall == 0, m.useCount == 0 else { continue }
-            // Conditional write: re-checks use_count == 0 INSIDE the UPDATE so a
-            // recall bump landing after our snapshot vetoes the eviction
-            // (TOCTOU fix, gpt-5.5 review finding 1).
-            if try await storage.archiveIfStillUnused(id: m.id) {
+            // Recheck age, access and corroboration under the write lock.
+            if try await storage.archiveIfStillUnused(id: m.id, updatedBefore: cutoff) {
                 archived += 1
             }
         }

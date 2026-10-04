@@ -18,11 +18,10 @@ import PersistenceCore
 // size is one ping per item per deliberate User action — there is no timer that
 // can quietly re-arm the whole desk overnight.
 //
-// MUTED MEANS QUIET, NOT BLIND. While muted the evaluator OBSERVES but never
-// CONSUMES: it records a baseline for items it has never seen (so a card
-// created during the quiet week is tracked) and leaves every existing baseline
-// frozen. That freeze is what makes `digestOnUnmute` truthful — the drift is
-// still measurable against the pre-mute snapshot when User comes back.
+// MUTED MEANS QUIET, NOT BLIND. While muted the evaluator never CONSUMES:
+// it leaves existing baselines frozen and unseen items without a
+// baseline. That makes `digestOnUnmute` truthful — drift is still measurable
+// against the pre-mute snapshot and new work is still recognizable as new.
 //
 // Everything here is pure: `now` is injected, no wall clock is read, and the
 // updated config is RETURNED for the caller to persist under the flock. Same
@@ -115,20 +114,22 @@ public enum DeskNagEvaluator {
 
         for item in state.items {
             guard !item.status.isTerminal else { continue }
+            // Her queue is hers to work, not his to be kept on track about.
+            guard item.project != MyQueue.project else { continue }
             guard config.scopeEnabled(for: item) else { continue }
 
-            let snapshot = observation(item, plan: plan)
+            // Freeze all baselines while muted, including the absence of one
+            // for new work. The unmute digest reports it before consuming it.
+            if muted { continue }
+
+            let snapshot = observation(item, state: state, plan: plan, now: now)
 
             guard let previous = config.observed[item.handle] else {
                 // First sighting. A baseline is not a delta — an item can never
-                // nag on the tick it is first seen, muted or not.
+                // nag on the tick it is first seen.
                 next.observed[item.handle] = snapshot
                 continue
             }
-
-            // Muted: observe, never consume. The frozen baseline is the drift
-            // digest's evidence.
-            if muted { continue }
 
             // Parked items are not stale and not next actions (design decision
             // 2). Advance the baseline so that when the park elapses, the
@@ -217,7 +218,7 @@ public enum DeskNagEvaluator {
         var lines: [String] = []
         for item in state.items {
             guard !item.status.isTerminal, config.scopeEnabled(for: item) else { continue }
-            let snapshot = observation(item, plan: plan)
+            let snapshot = observation(item, state: state, plan: plan, now: now)
             guard let previous = config.observed[item.handle] else {
                 lines.append("\(item.alias) \(item.title) — new since the mute")
                 continue
@@ -252,7 +253,7 @@ public enum DeskNagEvaluator {
         var next = config
         for item in state.items where !item.status.isTerminal {
             guard config.scopeEnabled(for: item) else { continue }
-            next.observed[item.handle] = observation(item, plan: plan)
+            next.observed[item.handle] = observation(item, state: state, plan: plan, now: now)
         }
         // Same presence-keyed prune as `evaluate` — an unmute must not be a
         // back door that clears the once-per-window ledger for a closed item.
@@ -264,12 +265,12 @@ public enum DeskNagEvaluator {
 
     // MARK: - Internals
 
-    static func observation(_ item: DeskItem, plan: DeskSequencing.Plan) -> DeskNagObservation {
+    static func observation(_ item: DeskItem, state: DeskState, plan: DeskSequencing.Plan, now: Date) -> DeskNagObservation {
         let itemPlan = plan.byHandle[item.handle]
         return DeskNagObservation(
             updatedAt: item.updatedAt,
             effectiveBlockerCount: itemPlan?.effectiveBlockers.count ?? 0,
-            deferElapsed: !(itemPlan?.isDeferred ?? false)
+            deferElapsed: !DeskNotifyEvaluator.parking(item, in: state, now: now).parked
         )
     }
 
@@ -320,8 +321,8 @@ public enum DeskNagEvaluator {
 
     /// The next wall-clock moment this lane could produce work on its own:
     /// the mute expiring (drift digest fires then), or — unmuted — the
-    /// earliest future defer date on an in-scope item (a park ending is a
-    /// DELTA trigger; without a deadline it waits for the next ops-event wake
+    /// earliest moment an in-scope item's own and ancestor deferrals all lift
+    /// (a park ending is a DELTA trigger; without a deadline it waits for the next ops-event wake
     /// or the 24h backstop, making "parked until Friday" fire sometime
     /// Saturday). Returns only strictly-future dates, same contract as
     /// DeskNotifyEvaluator.nextMeaningfulDeadline — an exact-deadline owner
@@ -342,12 +343,8 @@ public enum DeskNagEvaluator {
             return muteEnd
         }
         return state.items.compactMap { item -> Date? in
-            guard !item.status.isTerminal, config.scopeEnabled(for: item),
-                  let raw = item.deferUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  let until = DeskSequencing.parseDeferStamp(raw),
-                  until > now
-            else { return nil }
-            return until
+            guard !item.status.isTerminal, config.scopeEnabled(for: item) else { return nil }
+            return DeskNotifyEvaluator.parking(item, in: state, now: now).until
         }.min()
     }
 }

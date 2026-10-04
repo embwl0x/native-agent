@@ -28,13 +28,24 @@ public enum ChatToolOutcome {
     package static let successStatuses: Set<String> = [
         "completed", "ok", "passed",
         "succeeded", "loaded", "unloaded", "deleted",
-        "saved", "updated", "sent", "configured", "already_configured",
+        "saved", "updated", "sent", "delivered", "configured", "already_configured",
         "connected", "disconnected", "replied",
         "reviewed", "withdrawn", "archived", "recorded", "no_change",
     ]
 
     package static let failureStatuses: Set<String> = [
         "denied", "error", "failed", "failure", "rejected", "refused",
+    ]
+
+    /// Statuses that are not final: nothing is known to have finished.
+    package static let pendingStatuses: Set<String> = [
+        "accepted", "attention", "awaiting_approval", "dry_run",
+        // `needs_input` is an inline interaction waiting on a person.
+        // Nothing ran, nothing failed — it belongs with the other
+        // non-terminal envelopes, never with success or failure.
+        "needs_input",
+        "pending", "pending_approval", "partial", "queued", "scheduled", "ready",
+        "running", "started", "waiting", "waiting_approval", "skipped", "submitted", "unknown", "warning",
     ]
 
     /// Exact machine-envelope classification for evidence and resident
@@ -86,16 +97,6 @@ public enum ChatToolOutcome {
             case .running, .effectUnconfirmed: return .unknown
             }
         }
-
-        let pendingStatuses: Set<String> = [
-            "accepted", "attention", "awaiting_approval", "dry_run",
-            // `needs_input` is an inline interaction waiting on a person.
-            // Nothing ran, nothing failed — it belongs with the other
-            // non-terminal envelopes, never with success or failure.
-            "needs_input",
-            "pending", "pending_approval", "partial", "queued", "scheduled", "ready",
-            "running", "started", "waiting", "waiting_approval", "skipped", "submitted", "unknown", "warning",
-        ]
 
         if let status, pendingStatuses.contains(status) { return .unknown }
         if let status, ["cancelled", "canceled"].contains(status) { return .cancelled }

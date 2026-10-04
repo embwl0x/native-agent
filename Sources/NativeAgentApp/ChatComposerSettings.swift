@@ -1,7 +1,9 @@
 import ChatOrchestration
 import AppToolRuntime
 import SwiftUI
+import PersistenceCore
 import NativeAgentShared
+import MacControl
 
 /// The composer's three settings, each rendered as the word that names it.
 ///
@@ -96,6 +98,11 @@ enum ComposerShellMetrics {
     /// width it laid out with, so a page read and the shell agree.
     static func fitsBoth(room: CGFloat, bothColumns: CGFloat = bothColumns) -> Bool {
         room > 0 && bothColumns <= max(0, room - roomMargin * 2)
+    }
+
+    static func fitsVendorColumns(room: CGFloat, bothColumns: CGFloat) -> Bool {
+        fitsBoth(room: room, bothColumns: bothColumns)
+            && room >= bothColumns - 1 + vendorColumn + columnGap * 2
     }
 }
 
@@ -347,9 +354,14 @@ final class ComposerShellState {
     /// opens by company (and three columns fit), nothing until one is open,
     /// the provider's own list otherwise.
     func shownModels(_ group: ChatComposerModelGroup) -> ChatComposerModelGroup? {
-        let threeColumns = bothColumnsWidth + ComposerShellMetrics.vendorColumn + 1
-        guard let vendors = group.vendorGroups, roomWidth >= threeColumns else { return group }
+        guard let vendors = shownVendors(group) else { return group }
         return vendors.first { $0.id == flyoutVendor }
+    }
+
+    func shownVendors(_ group: ChatComposerModelGroup) -> [ChatComposerModelGroup]? {
+        guard ComposerShellMetrics.fitsVendorColumns(room: roomWidth, bothColumns: bothColumnsWidth)
+        else { return nil }
+        return group.vendorGroups
     }
 
     func dismiss() {
@@ -389,17 +401,20 @@ final class ComposerShellState {
             guard let group = reader.providerGroups.first(where: { $0.id == provider }) else {
                 return providerRows(reader)
             }
-            let models = group.models.map {
+            let models = (shownModels(group)?.models ?? []).map {
                 ComposerShellRow(
                     id: $0.id,
                     label: $0.displayName,
                     isSelected: $0.id == reader.appModel.chatModel && provider == reader.appModel.chatProvider
                 )
             }
+            let vendors = (shownVendors(group) ?? []).map {
+                ComposerShellRow(id: "vendor:" + $0.id, label: $0.provider, isSelected: $0.id == flyoutVendor)
+            }
             // Wide: both columns are drawn, so both are listed. Narrow: the
             // models took the column's place, and the way back is a control.
             return showsBothColumns
-                ? providerRows(reader) + models
+                ? providerRows(reader) + vendors + models
                 : [ComposerShellRow(id: Self.backRowID, label: "Back to providers", isSelected: false)] + models
         case .think:
             return reader.efforts.map {
@@ -457,16 +472,20 @@ final class ComposerShellState {
             flyoutIndex = nil
             return true
         case .models(let provider):
+            guard rows.contains(where: { $0.id == id }) else { return false }
             if id == Self.backRowID {
                 activePane = .model
                 flyoutIndex = nil
                 return true
             }
-            // The models of the open provider first — they are the pane's own
-            // rows — then the provider column beside them, which is on screen
-            // too and switches which models are shown.
-            if let group = reader.providerGroups.first(where: { $0.id == provider }),
-               let model = group.models.first(where: { $0.id == id }) {
+            guard let group = reader.providerGroups.first(where: { $0.id == provider }) else { return false }
+            if let vendor = shownVendors(group)?.first(where: { "vendor:" + $0.id == id }) {
+                flyoutVendor = vendor.id
+                flyoutIndex = nil
+                return true
+            }
+            // Only the models in the visible column can be taken.
+            if let model = shownModels(group)?.models.first(where: { $0.id == id }) {
                 reader.select(model: model, provider: provider)
                 dismiss()
                 return true
@@ -519,6 +538,47 @@ protocol ChatComposerRoutingReading {
     var appModel: AppModel { get }
     var botContract: BotChatContract? { get }
     var cardState: ComposerShellState? { get }
+}
+
+private struct ComposerBotContractRefresh: ViewModifier {
+    @Environment(AppModel.self) private var appModel
+    @Environment(\.chatPageIsVisible) private var isVisible
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
+    @Binding var contract: BotChatContract?
+
+    private struct Identity: Equatable {
+        let sessionID: String
+        let root: URL
+        let live: Bool
+    }
+
+    func body(content: Content) -> some View {
+        let identity = Identity(
+            sessionID: appModel.activeChatSessionId,
+            root: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            live: isVisible && !quietOffscreenRead
+        )
+        content.task(id: identity) {
+            contract = nil
+            guard identity.sessionID.hasPrefix("bot-"),
+                  let id = UUID(uuidString: String(identity.sessionID.dropFirst(4))) else { return }
+            guard identity.live else {
+                let checked = await BotChatContract.checked(identity.sessionID, dataRoot: identity.root)
+                guard !Task.isCancelled else { return }
+                contract = checked
+                return
+            }
+            let path = identity.root.appendingPathComponent("bots/definitions/\(id.uuidString).json")
+            let events = FileChangeEvents(paths: [path], emitInitial: true)
+            await withTaskCancellationHandler {
+                for await _ in events.stream {
+                    let checked = await BotChatContract.checked(identity.sessionID, dataRoot: identity.root)
+                    guard !Task.isCancelled else { break }
+                    contract = checked
+                }
+            } onCancel: { events.cancel() }
+        }
+    }
 }
 
 /// The same reading, without a view: what the shell state itself uses to
@@ -600,8 +660,10 @@ extension ChatComposerRoutingReading {
     /// What the number keys pick: the first nine rows of the OPEN flyout.
     /// With the card a provider menu, digits address models, never providers.
     var numberedModels: [(provider: String, model: ModelCatalogItem)] {
-        guard let providerID = cardState?.flyoutProvider,
-              let group = providerGroups.first(where: { $0.id == providerID })
+        guard let state = cardState,
+              let providerID = state.flyoutProvider,
+              let full = providerGroups.first(where: { $0.id == providerID }),
+              let group = state.shownModels(full)
         else { return [] }
         return group.models.prefix(9).map { (providerID, $0) }
     }
@@ -708,6 +770,7 @@ extension ChatComposerRoutingReading {
             : (model.defaultReasoningEffort ?? supported.first ?? "high")
         let fast = model.supportsFast == true && appModel.chatFastMode
 
+        appModel.chatBrainSaveGeneration &+= 1
         appModel.isSavingChatBrain = true
         return Task { @MainActor in
             defer { appModel.isSavingChatBrain = false }
@@ -740,7 +803,7 @@ extension ChatComposerRoutingReading {
         let effort = efforts[index].id
         guard effort != appModel.chatReasoningEffort else { return }
         appModel.chatReasoningEffort = effort
-        Task { @MainActor in await appModel.saveChatBrainDefaults() }
+        appModel.enqueueChatBrainDefaultsSave()
     }
 
 }
@@ -776,6 +839,13 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
 
     var body: some View {
         HStack(spacing: 0) {
+            Button("Let agent use Mac") {
+                guard let generation = MacAttentionSessionStore.shared.userHandoffGeneration() else { return }
+                Task { await MacAttentionSessionStore.shared.giveAgentControl(userGeneration: generation) }
+            }
+            .buttonStyle(.plain)
+            .font(ShellType.label)
+            .help("Mouse or keyboard use stops the agent's Mac action. Under Full Mac its next act takes control back; otherwise control stays yours until you hand it back here.")
             Spacer(minLength: 0)
 
             // 2026-09-23: one cluster at the right — ring and percent, model,
@@ -812,6 +882,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             // the ring out in the middle of the bar.
             .frame(maxWidth: 220, alignment: .trailing)
             .fixedSize(horizontal: true, vertical: false)
+            .anchorPreference(key: ChatComposerWordAnchorKey.self, value: .bounds) { [.model: $0] }
 
             separator
 
@@ -841,8 +912,12 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .fixedSize()
+                .buttonFocusable()
+                .focused($focusedWord, equals: .effort)
+                .onKeyPress(keys: [.tab, .backTab]) { press in tab(.effort, press) }
                 .help("How much thinking \(appModel.agentDisplayName) spends on a turn.")
                 .accessibilityIdentifier("chat.composer.effort")
+                .anchorPreference(key: ChatComposerWordAnchorKey.self, value: .bounds) { [.effort: $0] }
             }
 
             separator
@@ -871,8 +946,12 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
+            .buttonFocusable()
+            .focused($focusedWord, equals: .trust)
+            .onKeyPress(keys: [.tab, .backTab]) { press in tab(.trust, press) }
             .help("Your saved permissions, used throughout the app.")
             .accessibilityIdentifier("chat.composer.trust")
+            .anchorPreference(key: ChatComposerWordAnchorKey.self, value: .bounds) { [.trust: $0] }
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
         .font(ShellType.label)
@@ -892,12 +971,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             }
         }
         .task { await appModel.loadProvidersForChat() }
-        .task(id: appModel.activeChatSessionId) {
-            botContract = nil
-            let contract = await BotChatContract.checked(appModel.activeChatSessionId)
-            guard !Task.isCancelled else { return }
-            botContract = contract
-        }
+        .modifier(ComposerBotContractRefresh(contract: $botContract))
         .onChange(of: focusWordToken) { _, _ in focusedWord = .model }
     }
 
@@ -1055,7 +1129,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                         set: { newValue in
                             guard !appModel.isSavingChatBrain || appModel.chatBrainSaveTask != nil else { return }
                             appModel.chatFastMode = newValue
-                            Task { @MainActor in await appModel.saveChatBrainDefaults() }
+                            appModel.enqueueChatBrainDefaultsSave()
                         }
                     ))
                 }
@@ -1069,6 +1143,9 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
+            .buttonFocusable()
+            .focused($focusedWord, equals: .model)
+            .onKeyPress(keys: [.tab, .backTab]) { press in tab(.model, press) }
             .help("\(appModel.chatProvider) · \(appModel.chatModel). Choose the model for Chat.")
             .accessibilityIdentifier("chat.composer.model")
         }
@@ -1334,12 +1411,7 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
             // PORTED-DORMANT-PARTIAL), which nothing has written since, so it
             // only ever said "incomplete"; this one reads the turn traces the
             // engine writes on every turn, and shows only what they record.
-            .task(id: appModel.activeChatSessionId) {
-                botContract = nil
-                let contract = await BotChatContract.checked(appModel.activeChatSessionId)
-                guard !Task.isCancelled else { return }
-                botContract = contract
-            }
+            .modifier(ComposerBotContractRefresh(contract: $botContract))
             // The routing the panes read, and what a driver answers from.
             // Registering the live shell for the verbs is ChatView's job —
             // `liveOnAppear`, so the offscreen copy a quiet page read mounts
@@ -1428,7 +1500,8 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
         let fitsBoth = ComposerShellMetrics.fitsBoth(room: room, bothColumns: bothColumnsWidth)
 
         let vendorMode: Bool = {
-            guard fitsBoth, room >= threeColumnsWidth, case .models(let provider) = pane else { return false }
+            guard ComposerShellMetrics.fitsVendorColumns(room: room, bothColumns: bothColumnsWidth),
+                  case .models(let provider) = pane else { return false }
             return providerGroups.first { $0.id == provider }?.vendorGroups != nil
         }()
         let natural: CGFloat = switch pane {
@@ -1730,7 +1803,9 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
 
 
     private func vendorModeGroups(_ group: ChatComposerModelGroup, placement: ShellLayout) -> [ChatComposerModelGroup]? {
-        guard placement.fitsBoth, state.roomWidth >= threeColumnsWidth else { return nil }
+        guard placement.fitsBoth,
+              ComposerShellMetrics.fitsVendorColumns(room: state.roomWidth, bothColumns: bothColumnsWidth)
+        else { return nil }
         return group.vendorGroups
     }
 
@@ -1830,7 +1905,7 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
                     set: { newValue in
                         guard !appModel.isSavingChatBrain || appModel.chatBrainSaveTask != nil else { return }
                         appModel.chatFastMode = newValue
-                        Task { @MainActor in await appModel.saveChatBrainDefaults() }
+                        appModel.enqueueChatBrainDefaultsSave()
                     }
                 )) {
                     Text("Fast")

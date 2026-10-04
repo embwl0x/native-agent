@@ -119,32 +119,38 @@ struct SelfImprovementView: View {
     private func runNow() async {
         running = true
         runNote = ""
+        runNote = await Self.runManually(appModel: appModel).note
+        running = false
+        await loadDigest()
+    }
+
+    /// The Run now pass, shared with the agent's `mind_run self_improvement`.
+    /// Nil outcome: the run never started.
+    @MainActor
+    static func runManually(appModel: AppModel) async -> (outcome: LoopTickOutcome?, note: String) {
         // Manual run bypasses the weekly idempotency marker so it actually runs.
         let dataRoot = NativeAgentPaths.dataRoot
         let requestToken: String
         do {
             requestToken = try await WeeklySelfImprovementLoop.requestManualRun(dataRoot: dataRoot)
         } catch {
-            running = false
-            runNote = "Could not start — the weekly run request is unavailable."
-            return
+            return (nil, "Could not start — the weekly run request is unavailable.")
         }
         let outcome = await BackgroundLoopsManager.shared.runTickOnce(
             loopId: "self_improvement_sweep"
         )
-        running = false
-        runNote = Self.manualRunNote(for: outcome)
+        var note = manualRunNote(for: outcome)
         do {
             try await WeeklySelfImprovementLoop.clearManualRunRequest(
                 dataRoot: dataRoot,
                 token: requestToken
             )
         } catch {
-            runNote += " Request cleanup could not be verified: \(NativeClient.safeDoctorDetail(error.localizedDescription))."
+            note += " Request cleanup could not be verified: \(NativeClient.safeDoctorDetail(error.localizedDescription))."
         }
-        await loadDigest()
         // The pass may have staged new candidates; re-read the queues.
         _ = await appModel.refreshForSidebarItem(.activity)
+        return (outcome, note)
     }
 
     static func manualRunNote(for outcome: LoopTickOutcome) -> String {

@@ -219,9 +219,8 @@ struct TelegramView: View {
             allowlist: allowlistPresentation,
             savedEnabled: appModel.engine.telegram.status?.enabled,
             savedRequireMention: appModel.engine.telegram.status?.requireMention,
-            savedAcceptedCount: appModel.engine.telegram.status.map {
-                Set($0.allowedChatIds + $0.allowedUserIds).count
-            }
+            savedChatIDs: appModel.engine.telegram.status?.allowedChatIds,
+            savedUserIDs: appModel.engine.telegram.status?.allowedUserIds
         )
     }
 

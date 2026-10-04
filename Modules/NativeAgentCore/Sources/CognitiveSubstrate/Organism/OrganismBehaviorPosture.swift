@@ -37,17 +37,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
     public var notificationRequiresReceipt: Bool
     public var directives: [String]
     public var reviewSignals: [String]
-    public var approvedReflexBiases: [String]
-    public var reviewRequiredReflexCount: Int?
-    public var approvedLowRiskReflexTotalCount: Int?
-
-    public var approvedReflexBiasSampleCount: Int {
-        approvedReflexBiases.count
-    }
-
-    public var approvedReflexBiasesAreSampled: Bool {
-        normalizedApprovedLowRiskReflexTotalCount > approvedReflexBiasSampleCount
-    }
 
     public init(
         generatedAt: Date,
@@ -58,10 +47,7 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         loopBudget: OrganismLoopBudget = .normal,
         notificationRequiresReceipt: Bool = false,
         directives: [String] = [],
-        reviewSignals: [String] = [],
-        approvedReflexBiases: [String] = [],
-        reviewRequiredReflexCount: Int? = nil,
-        approvedLowRiskReflexTotalCount: Int? = nil
+        reviewSignals: [String] = []
     ) {
         self.generatedAt = generatedAt
         self.enabled = enabled
@@ -72,9 +58,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         self.notificationRequiresReceipt = notificationRequiresReceipt
         self.directives = Self.cleanLines(directives, limit: 180, maximumCount: 6)
         self.reviewSignals = Self.cleanLines(reviewSignals, limit: 120, maximumCount: 6)
-        self.approvedReflexBiases = Self.cleanLines(approvedReflexBiases, limit: 180, maximumCount: 8)
-        self.reviewRequiredReflexCount = reviewRequiredReflexCount.map { max(0, $0) }
-        self.approvedLowRiskReflexTotalCount = approvedLowRiskReflexTotalCount.map { max(0, $0) }
     }
 
     public static func from(snapshot: OrganismSnapshot) -> OrganismBehaviorPosture? {
@@ -85,8 +68,7 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
             posture: postureName(
                 chemicalState: snapshot.chemicalState,
                 bodySchema: snapshot.bodySchema,
-                predictionSummary: snapshot.predictionSummary,
-                approvedLowRiskReflexCount: snapshot.reflexSummary.approvedLowRiskCount
+                predictionSummary: snapshot.predictionSummary
             ),
             claimDiscipline: claimDiscipline(
                 bodySchema: snapshot.bodySchema,
@@ -105,15 +87,11 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
             directives: directives(
                 chemicalState: snapshot.chemicalState,
                 bodySchema: snapshot.bodySchema,
-                predictionSummary: snapshot.predictionSummary,
-                reflexSummary: snapshot.reflexSummary
+                predictionSummary: snapshot.predictionSummary
             ),
             reviewSignals: reviewSignals(
                 dreamRepairSummary: snapshot.dreamRepairSummary
-            ),
-            approvedReflexBiases: approvedReflexBiases(from: snapshot.reflexCandidates),
-            reviewRequiredReflexCount: snapshot.reflexSummary.reviewRequiredCount,
-            approvedLowRiskReflexTotalCount: snapshot.reflexSummary.approvedLowRiskCount
+            )
         )
     }
 
@@ -123,36 +101,17 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         surface: String,
         fileAccess: String
     ) -> String {
-        // 2026-09-22: run/session/surface ids dropped — trace plumbing no
-        // directive reads; [CognitiveSubstrate] keeps them for the trace parser.
-        var lines: [String] = [
-            "[OrganismBehavior]",
-            "file_access: \(cleanToken(fileAccess))",
-            "posture: \(posture)",
-            "tool_claims: \(claimDiscipline.rawValue)",
-            "tool_strategy: \(toolStrategy.rawValue)",
-            "loop_budget: \(loopBudget.rawValue)",
-            "notification_requires_receipt: \(notificationRequiresReceipt ? "true" : "false")",
-            "",
-            "Private behavior posture — follow it silently; never quote these labels."
-        ]
-        for directive in directives {
-            lines.append("directive: \(directive)")
-        }
-        for signal in reviewSignals {
-            lines.append("review_signal: \(signal)")
-        }
-        if normalizedApprovedLowRiskReflexTotalCount > 0 {
-            let coverage = approvedReflexBiasesAreSampled ? "sample" : "complete"
-            lines.append(
-                "approved_low_risk_reflex_biases: \(coverage) \(approvedReflexBiasSampleCount) of \(normalizedApprovedLowRiskReflexTotalCount)"
-            )
-        }
-        for bias in approvedReflexBiases {
-            lines.append("approved_low_risk_reflex: \(bias)")
-        }
-        return lines.joined(separator: "\n")
+        // Phase 5A (2026-10-03): ops, not a feeling, and only when it says
+        // something. The labels (posture, tool_claims, …) restated what the
+        // directives already say, and the one always-on directive is GROWTH's
+        // own "no receipt, no claim" — so a default posture renders nothing.
+        var items = directives.filter { $0 != Self.defaultDirective }
+        items += reviewSignals.map { "Review: \($0)." }
+        guard !items.isEmpty else { return "" }
+        return "Ops (follow silently): " + items.joined(separator: " ")
     }
+
+    static let defaultDirective = "Tie completion claims to observed results, not intention."
 
     public func toolResultJSON(tool: String, surface: String) -> JSONValue {
         let object: [String: JSONValue] = [
@@ -165,27 +124,14 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
             "surface": .string(cleanToken(surface)),
             "directive_count": .int(Int64(directives.count)),
             "review_signal_count": .int(Int64(reviewSignals.count)),
-            "review_required_reflex_count": .int(Int64(normalizedReviewRequiredReflexCount)),
-            "approved_low_risk_reflex_total_count": .int(Int64(normalizedApprovedLowRiskReflexTotalCount)),
-            "approved_reflex_bias_sample_count": .int(Int64(approvedReflexBiasSampleCount)),
-            "approved_reflex_biases_are_sampled": .bool(approvedReflexBiasesAreSampled),
         ]
         return .object(object)
-    }
-
-    private var normalizedReviewRequiredReflexCount: Int {
-        max(0, reviewRequiredReflexCount ?? 0)
-    }
-
-    private var normalizedApprovedLowRiskReflexTotalCount: Int {
-        max(approvedReflexBiasSampleCount, approvedLowRiskReflexTotalCount ?? approvedReflexBiasSampleCount)
     }
 
     private static func postureName(
         chemicalState: ChemicalState,
         bodySchema: BodySchema,
-        predictionSummary: OrganismPredictionSummary,
-        approvedLowRiskReflexCount: Int
+        predictionSummary: OrganismPredictionSummary
     ) -> String {
         if bodySchema.resourcePressure == .critical || chemicalState.fatigue >= 0.35 {
             return "conserving"
@@ -195,9 +141,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         }
         if bodySchema.providerPathRequiresCaution || bodySchema.toolPathRequiresCaution || predictionSummary.strategyCaution >= 0.18 || chemicalState.vigilance >= 0.24 {
             return "careful"
-        }
-        if approvedLowRiskReflexCount > 0 {
-            return "trained"
         }
         if bodySchema.notificationRequiresReceipt {
             return "delivery-aware"
@@ -282,12 +225,9 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
     private static func directives(
         chemicalState: ChemicalState,
         bodySchema: BodySchema,
-        predictionSummary: OrganismPredictionSummary,
-        reflexSummary: OrganismReflexSummary
+        predictionSummary: OrganismPredictionSummary
     ) -> [String] {
-        var out: [String] = [
-            "Tie completion claims to observed results, not intention."
-        ]
+        var out: [String] = [defaultDirective]
         if bodySchema.resourcePressure == .critical || chemicalState.fatigue >= 0.35 {
             out.append("Prefer one lightweight next move and skip optional background work.")
         } else if bodySchema.resourcePressure != .nominal {
@@ -305,9 +245,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         if bodySchema.memoryRequiresCurrentContext {
             out.append("Lean on the current conversation before relying on memory recall.")
         }
-        if reflexSummary.approvedLowRiskCount > 0 {
-            out.append("Let approved low-risk reflexes bias order and phrasing only when the current context matches.")
-        }
         return out
     }
 
@@ -319,18 +256,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
             out.append("dream repair has standing-view proposals waiting for review")
         }
         return out
-    }
-
-    private static func approvedReflexBiases(from candidates: [OrganismReflexCandidate]) -> [String] {
-        candidates
-            .filter { $0.autoActivationAllowed && $0.trustClass == .lowRisk && $0.retiredAt == nil }
-            .sorted {
-                if $0.confidence != $1.confidence { return $0.confidence > $1.confidence }
-                if $0.lastUpdatedAt != $1.lastUpdatedAt { return $0.lastUpdatedAt > $1.lastUpdatedAt }
-                return $0.id < $1.id
-            }
-            .prefix(8)
-            .map { "Soft preference: \($0.pattern)" }
     }
 
     private static func cleanLines(_ values: [String], limit: Int, maximumCount: Int) -> [String] {

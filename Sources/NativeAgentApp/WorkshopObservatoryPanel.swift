@@ -1,22 +1,18 @@
 import Foundation
+import OSLog
 import PersistenceCore
 import Desk
 import SwiftUI
 import WorkshopExecution
 
-// MARK: - Workshop Observatory (L11 — veto visibility)
+// MARK: - Workshop Observatory
 //
-// User's window onto Agent's Workshop: her OPEN self-pursuits, the recent work
-// sessions, and any owner cadence items now beating on the pump. The design's L11
-// requirement is the reason this panel exists: the digest/panel MUST source from
-// STORE QUERIES (SwiftNativeDeskStore.liveState()), NOT the capped 25-item
-// DeskProjection — a pursuit can never fall out of User's veto view. So the whole
-// data-shaping layer below is a pure fold over a full DeskState + the workshop
-// receipts feed, unit-testable without SwiftUI or disk.
+// Displays pursuit and session counts, owner cadence items, and recent workshop
+// receipts from EngineWorkshopObservatory snapshots. Pursuit controls live in
+// DeskPageView; EngineWorkshopObservatory owns the data shaping.
 //
-// The view-models mirror the ContextFlowFallbackReader idiom: `unavailable` is a
-// FIRST-CLASS state distinct from a healthy zero — a read that could not complete
-// never renders as "0 sessions" or "no pursuits".
+// Unavailable state stays distinct from a healthy zero: a read that could not
+// complete never renders as "0 sessions" or "no pursuits".
 
 /// The receipt feed is intentionally read as open vocabulary: legacy rows can
 /// outlive the current `WorkshopSessionStatus` enum. Unknown states therefore
@@ -28,13 +24,26 @@ enum WorkshopReceiptStatusPresentation {
         case failure
     }
 
+    static func status(for row: WorkshopReceiptRow) -> String {
+        guard row.isDirectedTask,
+              ["completed", "done", "succeeded"].contains(
+                row.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            return row.status
+        }
+        switch row.verificationStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "satisfied": return row.status
+        case "failed": return "verification failed"
+        default: return "unverified"
+        }
+    }
+
     static func tint(for rawStatus: String) -> Tint {
         switch rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "completed":
             return .success
         case "blocked", "cancelled", "canceled":
             return .warning
-        case "refused", "failed", "error", "errored":
+        case "refused", "failed", "error", "errored", "verification failed":
             return .failure
         default:
             // A new producer status is not proof of success. Keep it visibly
@@ -56,6 +65,7 @@ actor WorkshopObservatoryVetoHandler {
     }
 
     static let rationale = "Vetoed by the user from the Desk observatory."
+    private static let logger = Logger(subsystem: "com.nativeagent.app", category: "workshop-veto")
 
     private let store: SwiftNativeDeskStore
     private var inFlightHandles: Set<String> = []
@@ -76,7 +86,23 @@ actor WorkshopObservatoryVetoHandler {
                 ? .alreadyVetoed
                 : .completed
         } catch {
-            return .failed(String(describing: error))
+            Self.logger.error("Veto failed: \(String(describing: error), privacy: .public)")
+            switch error {
+            case DeskError.unknownHandle:
+                return .failed("This item could not be found on the Desk.")
+            case DeskError.notAPursuit:
+                return .failed("This item is not a pursuit.")
+            case DeskError.vetoRefusedTerminal:
+                return .failed("This pursuit is already closed.")
+            case DeskError.terminalStatusRefusedNonTerminalChild:
+                return .failed("This pursuit has unfinished child items. Close them before vetoing it.")
+            case DeskError.pursuitFieldMissing:
+                return .failed("The veto reason is missing.")
+            case DeskError.compactionBaseCorrupt, DeskError.compactionBaseUnreadable:
+                return .failed("Saved Desk data could not be read. The pursuit was not changed.")
+            default:
+                return .failed("The veto could not be saved. Try again.")
+            }
         }
     }
 }
@@ -85,10 +111,6 @@ actor WorkshopObservatoryVetoHandler {
 /// owns durability and cross-process idempotency; this owner prevents a second
 /// click from launching a stale refresh while the first operation is pending.
 enum WorkshopObservatoryVetoPresentation {
-    static func buttonIsDisabled(handle: String, pendingHandles: Set<String>) -> Bool {
-        pendingHandles.contains(handle)
-    }
-
     static func shouldRefresh(after outcome: WorkshopObservatoryVetoHandler.Outcome) -> Bool {
         switch outcome {
         case .completed, .alreadyVetoed:
@@ -180,7 +202,7 @@ struct WorkshopObservatoryPanel: View {
     // MARK: pursuits
     //
     // The per-pursuit list, its score/budget readout and its Veto button used
-    // to live here — a second copy of `DeskView.pursuitsSection` behind the
+    // to live here — a second pursuit list behind the
     // developer gate (Diagnostics ▸ Cognition ▸ Desk). Item 36 moved the owner
     // control onto the Desk row User already reads and deleted the duplicate;
     // what remains here is the COUNT in the header, which is what an
@@ -231,11 +253,12 @@ struct WorkshopObservatoryPanel: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(rows) { row in
+                    let status = WorkshopReceiptStatusPresentation.status(for: row)
                     VStack(alignment: .leading, spacing: 2) {
                         HStack {
-                            Text(row.status)
+                            Text(status)
                                 .font(.caption2.weight(.semibold))
-                                .foregroundStyle(statusTint(row.status))
+                                .foregroundStyle(statusTint(status))
                             Spacer()
                             Text(receiptTimeText(row.ts))
                                 .font(.caption2)

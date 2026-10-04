@@ -101,8 +101,12 @@ struct SettingsViewFull: View {
 
             connectionGroup
             PhonePlacesSettings()
-            if let error = turnActivity.errorMessage {
-                AliveSection("Live Activity") { AliveNote(error) }
+            AliveSection("Live Activities") {
+                Toggle("Show task names on the Lock Screen", isOn: Binding(
+                    get: { turnActivity.isEnabled }, set: { turnActivity.setEnabled($0) }))
+                    .aliveRow()
+                AliveNote("Includes work started on the Mac, Telegram, helpers and agent bridges. Task names may be visible while this iPhone is locked. Without an APNs key on the Mac, activities start when this app is open or next wakes; updates can be delayed while it is asleep.")
+                if let error = turnActivity.errorMessage { AliveNote(error) }
             }
 
             AliveSection("Recent pushes") {
@@ -160,6 +164,7 @@ struct SettingsViewFull: View {
                 iCloudBridge.shared.pairingStore = pairingStore
                 if pairingStore.usesICloudTransport {
                     bridgeClient.configureICloud()
+                    bridgeClient.recordMacConfirmation()
                 } else {
                     bridgeClient.disconnect()
                 }
@@ -186,11 +191,17 @@ struct SettingsViewFull: View {
             AliveDivider()
             AliveValueRow(label: "Last synced", value: StatusConnectionPresentation.cardValue(for: snapshotState),
                          emphasized: StatusConnectionPresentation.needsAttention(snapshotState))
+            if let repairResult { AliveNote(repairResult) }
             if pairingStore.isICloudSigned,
                let detail = StatusConnectionPresentation.detail(for: snapshotState) {
                 AliveNote(detail)
             }
             AliveDivider()
+            if bridgeClient.bridgeStatus != .online {
+                repairConnectionRow
+                AliveTapRow(title: "Pair with Mac") { showRePairSheet = true }
+                AliveDivider()
+            }
             if !pairingStore.isICloudSigned {
                 AliveNote("This iPhone has no pairing key for the Mac. Setup checks iCloud and connects both devices using the same Apple Account.")
                 AliveTapRow(title: "Set up Mac connection") { showRePairSheet = true }
@@ -200,7 +211,6 @@ struct SettingsViewFull: View {
                          : "The iCloud connection is unavailable. Check the Apple Account and iCloud Drive settings on this iPhone.")
                 AliveTapRow(title: "Connection setup help") { showRePairSheet = true }
             } else {
-                if let repairResult { AliveNote(repairResult) }
                 AliveTapRow(title: isForceRefreshing ? "Checking for Mac updates…" : "Check for Mac updates") {
                     // KVS synchronization runs under PairingStore's timeout, so
                     // this never blocks the MainActor. Reload the settings
@@ -224,6 +234,7 @@ struct SettingsViewFull: View {
             }
             AliveDivider()
             DisclosureGroup {
+                repairConnectionRow
                 HStack {
                     Text("Pairing version").foregroundStyle(AlivePalette.text)
                     Spacer()
@@ -237,6 +248,21 @@ struct SettingsViewFull: View {
             .tint(AlivePalette.secondary)
             .aliveRow()
         }
+    }
+
+    private var repairConnectionRow: some View {
+        AliveTapRow(title: pairingStore.isRepairingConnection ? "Repairing connection…" : "Repair connection") {
+            Task {
+                repairResult = nil
+                do {
+                    try await bridgeClient.repairConnection()
+                    showRePairSheet = true
+                } catch {
+                    repairResult = "Connection repair couldn’t finish: \(error.localizedDescription)"
+                }
+            }
+        }
+        .disabled(pairingStore.isRepairingConnection || isForceRefreshing)
     }
 
     @ViewBuilder
@@ -318,11 +344,9 @@ final class SettingsStore: ObservableObject {
             let sync = iCloudSyncEngine.shared
             availableFields = outcome.availableFields
             trustPolicy = sync.trustPolicy
-            // A partial read has no per-file source timestamp. Do not borrow
-            // an unrelated global sync receipt to make Personality newer.
             personality = sync.personality
             if outcome.availableFields.contains(.personality) {
-                personalitySnapshotSyncedAt = outcome.state == .refreshed ? sync.lastSyncAt : nil
+                personalitySnapshotSyncedAt = sync.transportDeliveryAt(screenGroup: "personality")
             }
             connectors = sync.connectors
             health = sync.health
@@ -539,76 +563,6 @@ struct TraitRow: View {
 }
 
 // MARK: - Trust policy
-
-/// The synced policy format is versioned: an absent Boolean means the Mac did
-/// not publish that setting, not that it explicitly disabled it.
-enum TrustPolicyDetailPresentation {
-    enum BooleanSection: String, Equatable {
-        case permission
-        case workshop
-        case training
-    }
-
-    struct BooleanSetting: Identifiable, Equatable {
-        let section: BooleanSection
-        let title: String
-        let value: String
-
-        var id: String { "\(section.rawValue).\(title)" }
-    }
-
-    static func booleanValue(_ value: Bool?, enabled: String, disabled: String) -> String {
-        guard let value else { return "Not reported by the Mac" }
-        return value ? enabled : disabled
-    }
-
-    /// Keep every optional Boolean on the same tri-state path before the view
-    /// groups it into sections. An omitted field remains visibly unknown;
-    /// it cannot be rendered as an intentional disabled setting.
-    static func booleanSettings(for policy: TrustPolicy) -> [BooleanSetting] {
-        var settings = [
-            BooleanSetting(
-                section: .permission,
-                title: "Developer Mode",
-                value: booleanValue(policy.developerMode, enabled: "On", disabled: "Off")
-            ),
-            BooleanSetting(
-                section: .permission,
-                title: "Require Backups",
-                value: booleanValue(policy.effectiveRequireBackups, enabled: "Yes", disabled: "No")
-            ),
-        ]
-        if let workshop = policy.workshopPolicy {
-            settings += [
-                BooleanSetting(
-                    section: .workshop,
-                    title: "Desk Enabled",
-                    value: booleanValue(workshop.enabled, enabled: "Yes", disabled: "No")
-                ),
-                BooleanSetting(
-                    section: .workshop,
-                    title: "Show Timeline",
-                    value: booleanValue(workshop.showTimeline, enabled: "Yes", disabled: "No")
-                ),
-            ]
-        }
-        if let training = policy.trainingPolicy {
-            settings += [
-                BooleanSetting(
-                    section: .training,
-                    title: "Autonomous Training",
-                    value: booleanValue(training.autonomousTraining, enabled: "On", disabled: "Off")
-                ),
-                BooleanSetting(
-                    section: .training,
-                    title: "Dream Scheduler",
-                    value: booleanValue(training.dreamScheduler, enabled: "On", disabled: "Off")
-                ),
-            ]
-        }
-        return settings
-    }
-}
 
 /// A policy snapshot can predate a field. Keep absent text values visibly
 /// unknown instead of making a missing default look like an intentional one.

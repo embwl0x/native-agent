@@ -172,3 +172,52 @@ struct StatusView: View {
         }
     }
 }
+
+private struct ActivityRow: View {
+    var event: ActivityEvent
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .foregroundStyle(color)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.title)
+                    .font(NativeAgentFont.section)
+                    .lineLimit(1)
+                if let detail = event.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(NativeAgentFont.label)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Text(StatusActivityPresentation.timestamp(for: event))
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer()
+        }
+        .textSelection(.enabled)
+    }
+
+    private var icon: String {
+        switch event.kind {
+        case "mission": "target"
+        case "trust": "lock.shield"
+        case "backup": "externaldrive.badge.timemachine"
+        case "eval": "checklist"
+        case "connector": "point.3.connected.trianglepath.dotted"
+        case "chat": "bubble.left.and.bubble.right"
+        default: "circle"
+        }
+    }
+
+    private var color: Color {
+        switch event.status {
+        case "ok": .green
+        case "warn": .orange
+        case "fail": .red
+        default: .secondary
+        }
+    }
+}

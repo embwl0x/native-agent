@@ -5,9 +5,8 @@ import TrustCenter
 
 // MARK: - Production read routes
 //
-// Swift-owned readers for production migration plan and export registry state.
-// The helpers are read-only: migration plan is a static Swift plan, and exports
-// read <dataRoot>/production/exports/registry.json losslessly. Health-card and
+// Swift-owned reader for production export registry state.
+// Exports read <dataRoot>/production/exports/registry.json losslessly. Health-card and
 // whats-running live in their dedicated Swift runtime/status surfaces; do not
 // resurrect an external runtime to answer production status.
 
@@ -63,72 +62,8 @@ public struct ProductionExportReceipt: Sendable, Equatable {
     public func toJSON() -> JSONValue { raw }
 }
 
-/// Static migration-plan payload. Mirrors `production_migration_plan`
-/// byte-for-byte except `createdAt`, which is
-/// freshly stamped per-call exactly like the Python `now_iso()`.
-public struct ProductionMigrationPlanResult: Sendable, Equatable {
-    public let createdAt: String
-
-    public init(createdAt: String) {
-        self.createdAt = createdAt
-    }
-
-    public func toJSON() -> JSONValue {
-        .object([
-            "id": .string("nativeagent-production-migration-v1"),
-            "status": .string("ready"),
-            "steps": .array([
-                .object([
-                    "id": .string("backup"),
-                    "title": .string("Create app-owned backup"),
-                    "status": .string("available"),
-                ]),
-                .object([
-                    "id": .string("export"),
-                    "title": .string("Export non-secret app data"),
-                    "status": .string("available"),
-                ]),
-                .object([
-                    "id": .string("install"),
-                    "title": .string("Install signed/notarized app bundle"),
-                    "status": .string("planned"),
-                ]),
-                .object([
-                    "id": .string("daemon_lifecycle"),
-                    "title": .string("Restart app-owned runtime with installed app"),
-                    "status": .string("available"),
-                ]),
-                .object([
-                    "id": .string("verify"),
-                    "title": .string("Run Doctor, eval, and smoke checks"),
-                    "status": .string("available"),
-                ]),
-            ]),
-            "createdAt": .string(createdAt),
-        ])
-    }
-}
-
-public protocol ProductionMigrationPlanClient: Sendable {
-    func migrationPlan() async throws -> ProductionMigrationPlanResult
-}
-
 public protocol ProductionExportsClient: Sendable {
     func listExports() async throws -> [ProductionExportReceipt]
-}
-
-// MARK: - SwiftNative — ProductionMigrationPlan
-
-public struct SwiftNativeProductionMigrationPlanClient: ProductionMigrationPlanClient {
-    private let now: @Sendable () -> Date
-
-    public init(now: @escaping @Sendable () -> Date = { Date() }) {
-        self.now = now
-    }
-
-    public func migrationPlan() async throws -> ProductionMigrationPlanResult {
-        ProductionMigrationPlanResult(createdAt: SwiftNativeRouterPlanClient.isoTimestamp(now()))
-    }
 }
 
 // MARK: - SwiftNative — ProductionExports

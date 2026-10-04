@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import PersistenceCore
 
 // MARK: - Per-job timeouts
 //
@@ -57,11 +58,14 @@ extension SchedulerDueJobRunner {
         case .value(let result):
             return result
         case .failure(let message):
-            // Preserve the exact thrown-error mapping the direct call site used.
+            var output: [String: JSONValue] = ["error": .string(message)]
+            if job.kind == "dream", Self.dreamErrorsAreRetryable([message]) {
+                output["retryAfterSeconds"] = .int(15 * 60)
+            }
             return JobResult(
                 status: "error",
                 detail: message,
-                output: .object(["error": .string(message)])
+                output: .object(output)
             )
         case .timedOut:
             let detail = "job kind '\(job.kind)' exceeded \(Int(seconds))s timeout; "

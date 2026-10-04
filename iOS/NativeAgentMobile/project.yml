@@ -20,7 +20,7 @@ settings:
   TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
   SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
   MARKETING_VERSION: "0.5.1"
-  CURRENT_PROJECT_VERSION: "17"
+  CURRENT_PROJECT_VERSION: "18"
   # Set DEVELOPMENT_TEAM locally in Xcode or on the xcodebuild command line
   # for device builds. Do not commit a personal Apple Developer Team ID.
   CODE_SIGN_STYLE: "Automatic"
@@ -133,7 +133,7 @@ targets:
         NativeAgentDeviceSync: "cloudkit"
         NativeAgentAppGroupID: "$(NATIVEAGENT_IOS_APP_GROUP_ID)"
         UILaunchScreen: {}
-        UIBackgroundModes: [remote-notification, location]
+        UIBackgroundModes: [remote-notification]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         NSAppTransportSecurity:
@@ -144,6 +144,8 @@ targets:
     sources:
       - path: LiveActivity
       - path: LiveActivityShared
+    dependencies:
+      - package: NativeAgentShared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_BUNDLE_ID).liveactivity

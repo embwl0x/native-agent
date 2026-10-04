@@ -49,7 +49,7 @@ public struct ConnectorOAuthConfig: Sendable {
         clientSecretEnv:"NATIVE_AGENT_CALENDAR_CLIENT_SECRET",
         authURL:        "https://accounts.google.com/o/oauth2/v2/auth",
         tokenURL:       "https://oauth2.googleapis.com/token",
-        scopes:         "openid https://www.googleapis.com/auth/calendar.readonly",
+        scopes:         "openid https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events",
         redirectURI:    "http://127.0.0.1:53684/oauth/callback",
         extraAuthParams: [("access_type", "offline"), ("prompt", "consent")],
         extraTokenParams: [:]

@@ -151,6 +151,7 @@ actor SlackInFlightHandlers {
     private var tasks: [UUID: Task<Void, Never>] = [:]
     private var finished: Set<UUID> = []
     private var completionWaiters: [UUID: AsyncStream<Void>.Continuation] = [:]
+    private var draining = false
 
     var count: Int { tasks.count }
     var completionWaiterCount: Int { completionWaiters.count }
@@ -160,6 +161,7 @@ actor SlackInFlightHandlers {
         // resurrect a finished entry (that would leak a handle forever).
         if finished.remove(id) != nil { return }
         tasks[id] = task
+        if draining { task.cancel() }
     }
 
     func finish(_ id: UUID) {
@@ -209,27 +211,38 @@ actor SlackInFlightHandlers {
     /// cancelled, and shutdown cannot hang on a wedged provider call.
     /// Returns how many tasks were abandoned (0 = clean drain).
     ///
-    /// Deliberately POLLS the registry instead of `await task.value`: awaiting
-    /// the value of a non-throwing task does not respond to cancellation, so
-    /// any structure that awaits it (including a task group, which must drain
-    /// its children before returning) inherits the wedge — the first cut of
-    /// this fix deadlocked exactly that way. `finish(id)` empties the registry
-    /// as each handler completes; a handler that never finishes is what the
-    /// deadline is for.
+    /// Waits for registry completion in a separately owned task so a cancelled
+    /// caller still gives handlers a bounded grace. Late registrations are
+    /// cancelled too; no wait joins a potentially wedged handler's task value.
     @discardableResult
     func cancelAndWaitAll(timeout: TimeInterval = 10) async -> Int {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !tasks.isEmpty, Date() < deadline {
-            // Re-cancel each round: a handler registered after entry (receive
-            // loop racing shutdown) must still get the cancellation signal.
-            for (_, task) in tasks { task.cancel() }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
+        draining = true
+        for task in tasks.values { task.cancel() }
+        _ = await Task.detached { await self.waitForCompletion(timeout: timeout) }.value
+        draining = false
         let abandoned = tasks.count
         tasks.removeAll()
         finished.removeAll()
         notifyCompletionIfEmpty()
         return abandoned
+    }
+}
+
+/// Settings restarts wait for the inbound handler's reply delivery to settle.
+actor SlackHandlingCompletion {
+    private var operations: [@Sendable () async -> Void] = []
+
+    func append(_ operation: @escaping @Sendable () async -> Void) {
+        operations.append(operation)
+    }
+
+    func finish() {
+        let pending = operations
+        operations.removeAll()
+        guard !pending.isEmpty else { return }
+        Task.detached {
+            for operation in pending { await operation() }
+        }
     }
 }
 

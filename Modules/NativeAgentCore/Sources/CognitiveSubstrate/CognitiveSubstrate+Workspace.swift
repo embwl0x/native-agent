@@ -108,6 +108,10 @@ extension CognitiveSubstrate {
         let frozenSoundLandingScores = soundLandingScoreSnapshot()
         let frozenPresentationState = capsulePresentationStateSnapshot()
         let frozenPendingCompletionOpen = pendingCompletion != nil
+        let frozenSuppressions = associationSuppressions
+        let peerIds = Set(field.peekNodes().compactMap { Self.peerIdentity(metadata: $0.metadata) }
+            + fixedThoughtSeeds.flatMap { $0.sourcePeerIds ?? [] })
+        let frozenTrustedPeers = Set(peerIds.filter { dependencies.peerTrusted($0) })
         // W4/P2: captured, never recomputed downstream (see CognitiveFeltProxyReads).
         // Curiosity is workspace-relative, so it is captured per branch below where
         // the frozen workspace is known; the other two are workspace-independent.
@@ -139,7 +143,9 @@ extension CognitiveSubstrate {
                 standingViewCapsuleCandidates: frozenStandingViewCandidates,
                 soundLandingScores: frozenSoundLandingScores,
                 capsulePresentationState: frozenPresentationState,
-                pendingCompletionOpen: frozenPendingCompletionOpen
+                pendingCompletionOpen: frozenPendingCompletionOpen,
+                associationSuppressions: frozenSuppressions,
+                trustedPeerIds: frozenTrustedPeers
             )
         }
         var copiedField = field
@@ -170,7 +176,9 @@ extension CognitiveSubstrate {
                 standingViewCapsuleCandidates: frozenStandingViewCandidates,
                 soundLandingScores: frozenSoundLandingScores,
                 capsulePresentationState: frozenPresentationState,
-                pendingCompletionOpen: frozenPendingCompletionOpen
+                pendingCompletionOpen: frozenPendingCompletionOpen,
+                associationSuppressions: frozenSuppressions,
+                trustedPeerIds: frozenTrustedPeers
             )
         }
         let sessionId = Self.cleanedSessionId(currentSessionId)
@@ -219,7 +227,9 @@ extension CognitiveSubstrate {
             standingViewCapsuleCandidates: frozenStandingViewCandidates,
             soundLandingScores: frozenSoundLandingScores,
             capsulePresentationState: frozenPresentationState,
-            pendingCompletionOpen: frozenPendingCompletionOpen
+            pendingCompletionOpen: frozenPendingCompletionOpen,
+            associationSuppressions: frozenSuppressions,
+            trustedPeerIds: frozenTrustedPeers
         )
     }
 
@@ -501,25 +511,7 @@ extension CognitiveSubstrate {
             stagedTimelineEvents.append(contentsOf: consolidation.timelineEvents)
         }
 
-        let staleViews = retireStaleProposedStandingViewsInMemory(at: now)
-        for view in staleViews {
-            let event = recordTimelineEventInMemory(
-                kind: .proposalResolution,
-                title: "Standing view retired (stale)",
-                summary: "retired (stale): \(view.body)",
-                artifactId: view.id,
-                lineageId: view.lineageId,
-                externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.expiredUnresolved)]
-            )
-            stagedTimelineEvents.append(event)
-            artifacts.append(CognitiveArtifactWrite(
-                kind: "developmental_timeline",
-                id: event.id,
-                status: "recorded",
-                score: 0.5,
-                payload: event.toJSON()
-            ))
-        }
+        // Phase 5 D: age alone no longer retires a proposed view.
 
         let nodes = field.snapshot(at: now, configuration: configuration)
         publishAttentionProjection(at: now)
@@ -528,7 +520,7 @@ extension CognitiveSubstrate {
             payload: .object([
                 "reason": .string(bounded(reason, maxCharacters: 120)),
                 "nodeCount": .int(Int64(nodes.count)),
-                "retiredStandingViewCount": .int(Int64(staleViews.count)),
+                "retiredStandingViewCount": .int(0),
             ])
         ))
 
@@ -548,7 +540,7 @@ extension CognitiveSubstrate {
                     }
                     : nil,
                 artifacts: artifacts,
-                deletedArtifactIDs: staleViews.map(\.id),
+                deletedArtifactIDs: [],
                 receipts: receipts,
                 at: now
             )
@@ -615,19 +607,6 @@ extension CognitiveSubstrate {
                 } else {
                     futureDeadlines.append(expiry)
                 }
-            }
-        }
-
-        for view in standingViews.values where view.status == .proposed {
-            // Retirement uses `age > maxAge`; the millisecond keeps the exact
-            // deadline from firing at equality and re-arming itself immediately.
-            let expiry = view.createdAt.addingTimeInterval(
-                Self.standingViewProposalMaxAge + 0.001
-            )
-            if expiry <= now {
-                dueReasons.append("standing_view_expiry")
-            } else {
-                futureDeadlines.append(expiry)
             }
         }
 

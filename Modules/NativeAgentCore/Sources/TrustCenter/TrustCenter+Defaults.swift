@@ -34,7 +34,7 @@ extension SwiftNativeTrustCenter {
         ])
         policy["filePolicy"] = .object([
             "allowedWorkspaceIds": .array([]),
-            "workspaceRoots": .array(TrustCenterDefaultWorkspaceRoots.defaultRootPaths().map { .string($0) }),
+            "workspaceRoots": .array(TrustCenterDefaultWorkspaceRoots.defaultRootPaths(dataRoot: dataRoot).map { .string($0) }),
             "requireBackupBeforeWrite": .bool(true),
             "allowDestructiveActions": .bool(false),
             "outsideWorkspaceDefault": .string("deny"),
@@ -218,6 +218,12 @@ extension SwiftNativeTrustCenter {
         "slack_list_channels": .string("auto"),
         "slack_search_messages": .string("auto"),
         "slack_post_message": .string("send_approval"),
+        "google_calendar_send_invitations": .string("send_approval"),
+        "google_calendar_calendars": .string("auto"),
+        "google_calendar_free_busy": .string("auto"),
+        "google_calendar_read": .string("auto"),
+        "mac_calendar_calendars": .string("auto"),
+        "mac_calendar_free_busy": .string("auto"),
         "browser.status": .string("auto"),
         "browser.open_url": .string("auto"),
         "browser.navigate": .string("auto"),
@@ -238,17 +244,6 @@ extension SwiftNativeTrustCenter {
         "browser.chrome_wait": .string("auto"),
         "browser.chrome_scroll": .string("auto"),
         "browser.chrome_release": .string("auto"),
-        "doctor_status": .string("auto"),
-        "telegram_status": .string("auto"),
-        // Quiet self-administration (0.4.14): the agent reading and setting
-        // NativeAgent's OWN pages. No card in any mode — the Trust posture IS
-        // the gate (only Safe refuses changes outright at the call site, and
-        // the reads never prompt), exactly like the Mac verbs.
-        "app_page_read": .string("auto"),
-        "app_page_screenshot": .string("auto"),
-        "app_settings_list": .string("auto"),
-        "app_setting_set": .string("auto"),
-        "interaction_act": .string("auto"),
         "gh.create_issue": .string("draft_auto"),
         "github.status": .string("auto"),
         "github_status": .string("auto"),
@@ -386,9 +381,6 @@ extension SwiftNativeTrustCenter {
         "mac.sleep_display": .string("auto"),
         "mac.lock_screen": .string("auto"),
         "mac.shell": .string("auto"),
-        "tool_catalog": .string("auto"),
-        "list_tools": .string("auto"),
-        "tool_load": .string("auto"),
         "tool_result_page": .string("auto"),
         // Read-only resident/runtime inspection. These expose bounded status
         // already available in the app and have no side effects; allowing them
@@ -397,10 +389,6 @@ extension SwiftNativeTrustCenter {
         "agent_introspect": .string("auto"),
         "daemon_introspect": .string("auto"),
         "time_now": .string("auto"),
-        // Bounded app-owned procedural posture review. The runtime permits
-        // approve only for low-risk candidates; hold/reject never dispatch an
-        // action. Keep it usable on bridge tool surfaces with no approval filer.
-        "reflex_review": .string("auto"),
         "list_skills": .string("auto"),
         "save_skill": .string("auto"),
         "recall_memory": .string("auto"),
@@ -437,7 +425,6 @@ extension SwiftNativeTrustCenter {
         // They are always-on chat tools and default to auto so she can stay in
         // workspace mode and delegate focused work without an approval detour.
         // Reachable on the claude/codex bridge as of 2026-06-13 (open-the-bridges).
-        "invoke_claude": .string("auto"),
         "invoke_codex": .string("auto"),
         // App lifecycle tools default to `confirm` — every call queues a
         // the user-in-the-loop approval. TEMPLATE defaults only; the user's live
@@ -539,6 +526,12 @@ extension SwiftNativeTrustCenter {
         "slack_list_channels": .string("auto"),
         "slack_search_messages": .string("auto"),
         "slack_post_message": .string("send_approval"),
+        "google_calendar_send_invitations": .string("send_approval"),
+        "google_calendar_calendars": .string("auto"),
+        "google_calendar_free_busy": .string("auto"),
+        "google_calendar_read": .string("auto"),
+        "mac_calendar_calendars": .string("auto"),
+        "mac_calendar_free_busy": .string("auto"),
         "browser.navigate": .string("auto"),
         "browser.status": .string("auto"),
         "browser.open_url": .string("auto"),
@@ -559,20 +552,6 @@ extension SwiftNativeTrustCenter {
         "browser.chrome_wait": .string("auto"),
         "browser.chrome_scroll": .string("auto"),
         "browser.chrome_release": .string("auto"),
-        "doctor_status": .string("auto"),
-        "telegram_status": .string("auto"),
-        // Quiet self-administration (0.4.14): the agent reading and setting
-        // NativeAgent's OWN pages. No card in any mode — the Trust posture IS
-        // the gate (only Safe refuses changes outright at the call site, and
-        // the reads never prompt), exactly like the Mac verbs.
-        "app_page_read": .string("auto"),
-        "app_page_screenshot": .string("auto"),
-        "app_settings_list": .string("auto"),
-        "app_setting_set": .string("auto"),
-        "interaction_act": .string("auto"),
-        "tool_catalog": .string("auto"),
-        "list_tools": .string("auto"),
-        "tool_load": .string("auto"),
         "tool_result_page": .string("auto"),
         "list_skills": .string("auto"),
         "save_skill": .string("auto"),

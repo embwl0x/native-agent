@@ -3,6 +3,20 @@ import NativeAgentCore
 import PersistenceCore
 
 extension TelegramPollLoop {
+    func handleControlHandoff(update: TelegramUpdate, message: TelegramMessage, text: String,
+                              admissionReady: @escaping @Sendable () -> Void) async {
+        let (turnId, card) = await turnCoordinator.prepareControlHandoff(destination: message.destination)
+        await revokeDriverControl()
+        admissionReady()
+        let outcome = await requestLiveTurnStop(
+            destination: message.destination, turnId: turnId ?? UUID(), pauseQueuedTurns: true
+        )
+        let activity = await card?.snapshot().state.activities.last(where: { !$0.phase.isTerminal })?.detail
+        let reply = UserMessageIntentSignals.controlHandoffReply(lastActivity: activity)
+            + (outcome == .outcomeUnknown ? " Turn cancellation is not yet confirmed." : "")
+        await sendCommandReply(reply, kind: "control_handoff", update: update, message: message, text: text)
+    }
+
     /// 2026-09-22: the "Queued" acknowledgement is scaffolding. Once its turn
     /// starts, delete it; edit it to `runningText` only when this loop has no
     /// deleteMessage (or the delete fails).
@@ -166,8 +180,12 @@ extension TelegramPollLoop {
             }
             return true
 
-        case .provider(let providerIndex):
-            guard let text = TelegramModelSelectionUI.modelText(menu: menu, providerIndex: providerIndex),
+        case .provider(let key):
+            let matches = menu.providers.indices.filter {
+                TelegramModelSelectionCallback.selectionKey(menu.providers[$0].id) == key
+            }
+            guard matches.count == 1, let providerIndex = matches.first,
+                  let text = TelegramModelSelectionUI.modelText(menu: menu, providerIndex: providerIndex),
                   let markup = TelegramModelSelectionUI.modelReplyMarkup(menu: menu, providerIndex: providerIndex) else {
                 try? await answerCallbackQuery(token, parsed.callbackId, "That provider is no longer available.")
                 return true
@@ -187,17 +205,21 @@ extension TelegramPollLoop {
             }
             return true
 
-        case .model(let providerIndex, let modelIndex):
-            guard providerIndex >= 0, providerIndex < menu.providers.count else {
+        case .model(let providerKey, let modelKey):
+            let providers = menu.providers.filter {
+                TelegramModelSelectionCallback.selectionKey($0.id) == providerKey
+            }
+            guard providers.count == 1, let provider = providers.first else {
                 try? await answerCallbackQuery(token, parsed.callbackId, "That provider is no longer available.")
                 return true
             }
-            let provider = menu.providers[providerIndex]
-            guard modelIndex >= 0, modelIndex < provider.models.count else {
+            let models = provider.models.filter {
+                TelegramModelSelectionCallback.selectionKey($0.id) == modelKey
+            }
+            guard models.count == 1, let model = models.first else {
                 try? await answerCallbackQuery(token, parsed.callbackId, "That model is no longer available.")
                 return true
             }
-            let model = provider.models[modelIndex]
             do {
                 try await bot.saveTelegramModelSelection(
                     surface: "telegram",
@@ -209,9 +231,9 @@ extension TelegramPollLoop {
                     parsed.chatId,
                     parsed.messageId,
                     TelegramModelSelectionUI.selectedText(provider: provider, model: model),
-                    TelegramModelSelectionUI.selectedReplyMarkup(providerIndex: providerIndex)
+                    TelegramModelSelectionUI.selectedReplyMarkup(providerId: provider.id)
                 )
-                try? await answerCallbackQuery(token, parsed.callbackId, "Telegram model set to \(model.id).")
+                try? await answerCallbackQuery(token, parsed.callbackId, "Chat model set to \(model.id).")
             } catch {
                 let reply = "Failed to set Telegram model: \(Self._tgRedactToken(String(describing: error)))"
                 try? await answerCallbackQuery(token, parsed.callbackId, reply)
@@ -298,7 +320,8 @@ extension TelegramPollLoop {
         text: String
     ) async {
         do {
-            let sessions = try await TelegramSessionStore(dataRoot: dataRoot).recentSessions(limit: 8)
+            let sessions = try await TelegramSessionStore(dataRoot: dataRoot)
+                .recentSessions(destination: message.destination, fromUserId: message.fromUserId, limit: 8)
             let reply: String
             if sessions.isEmpty {
                 reply = "No chat sessions found."
@@ -332,7 +355,7 @@ extension TelegramPollLoop {
         let requested = args.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         do {
             let status = try await TelegramSessionStore(dataRoot: dataRoot)
-                .bindSession(destination: message.destination, requestedSessionId: requested)
+                .bindSession(destination: message.destination, requestedSessionId: requested, fromUserId: message.fromUserId)
             admissionReady()
             let reply = """
             Resumed Telegram session: \(status.sessionId)
@@ -375,10 +398,20 @@ extension TelegramPollLoop {
         // pinned text the sender's queued retry answered "nothing to retry"
         // and the claim settled — the request was gone.
         let retryText: String
-        if let pinned = await updateInbox.resolvedRetryText(updateId: update.updateId) {
+        let retryMessage: TelegramMessage?
+        let retryClaim: TelegramUpdateClaim
+        do {
+            retryClaim = try updateInbox.claim(updateId: update.updateId)
+        } catch {
+            await recordError(context: "retry_claim_read", error: String(describing: error), update: update)
+            return false
+        }
+        if let pinned = retryClaim.resolvedRetryText {
             retryText = pinned
+            retryMessage = retryClaim.resolvedRetryMessage
         } else if let last = await turnCoordinator.lastUserMessage(destination: message.destination) {
             retryText = last.text
+            retryMessage = last.message
         } else {
             await sendCommandReply(
                 "There's nothing of yours to retry yet.",
@@ -390,6 +423,17 @@ extension TelegramPollLoop {
             return false
         }
         let retryOperation: @Sendable (UUID) async -> Void = { turnId in
+            do {
+                if let messageId = try updateInbox.claim(updateId: update.updateId).queueAcknowledgementMessageId {
+                    await clearQueueAcknowledgement(
+                        chatId: message.chatId, messageId: messageId,
+                        runningText: "Running retry · \(String(retryText.prefix(120)))"
+                    )
+                }
+            } catch {
+                await recordError(context: "retry_claim_read", error: String(describing: error), update: update)
+                return
+            }
             // 2026-09-06: the same silent-loss window the chat lane had —
             // `.completed` was written after the transition, before the retry
             // turn ran, so a crash left a claim recovery never reopens. It
@@ -432,7 +476,8 @@ extension TelegramPollLoop {
                 update: update,
                 message: message,
                 commandText: text,
-                retryText: retryText
+                retryText: retryText,
+                retryMessage: retryMessage
             )
             do {
                 _ = try await updateInbox.transition(
@@ -479,7 +524,8 @@ extension TelegramPollLoop {
                 updateId: update.updateId,
                 from: [.processing],
                 to: .queued,
-                resolvedRetryText: retryText
+                resolvedRetryText: retryText,
+                resolvedRetryMessage: retryMessage
             )
             guard queued.phase == .queued, queued.resolvedRetryText == retryText else {
                 await sendCommandReply(
@@ -505,32 +551,40 @@ extension TelegramPollLoop {
         let preview = String(retryText.replacingOccurrences(of: "\n", with: " ").prefix(120))
         var acknowledgementMessageId: Int?
         do {
-            let sentMessageId = try await sendMessageWithReplyMarkupReturningId(
-                token,
-                message.destination,
-                "Queued retry · \(preview)",
-                TelegramQueuedTurnControlCallback.replyMarkup(updateId: update.updateId)
-            )
-            acknowledgementMessageId = sentMessageId
-            _ = try await updateInbox.recordQueueAcknowledgement(
-                updateId: update.updateId,
-                messageId: sentMessageId
-            )
-            await recordReceipt(
-                kind: "retry_queued",
-                update: update,
-                message: message,
-                text: text,
-                reply: "Queued retry"
-            )
+            acknowledgementMessageId = try updateInbox.claim(updateId: update.updateId).queueAcknowledgementMessageId
         } catch {
-            await recordError(
-                context: "send_retry_queued_notice",
-                error: String(describing: error),
-                update: update,
-                message: message,
-                text: text
-            )
+            await recordError(context: "retry_claim_read", error: String(describing: error), update: update)
+            return false
+        }
+        if acknowledgementMessageId == nil {
+            do {
+                let sentMessageId = try await sendMessageWithReplyMarkupReturningId(
+                    token,
+                    message.destination,
+                    "Queued retry · \(preview)",
+                    TelegramQueuedTurnControlCallback.replyMarkup(updateId: update.updateId)
+                )
+                acknowledgementMessageId = sentMessageId
+                _ = try await updateInbox.recordQueueAcknowledgement(
+                    updateId: update.updateId,
+                    messageId: sentMessageId
+                )
+                await recordReceipt(
+                    kind: "retry_queued",
+                    update: update,
+                    message: message,
+                    text: text,
+                    reply: "Queued retry"
+                )
+            } catch {
+                await recordError(
+                    context: "send_retry_queued_notice",
+                    error: String(describing: error),
+                    update: update,
+                    message: message,
+                    text: text
+                )
+            }
         }
 
         let queued = await turnCoordinator.enqueueTrackedTurn(
@@ -539,14 +593,7 @@ extension TelegramPollLoop {
             text: retryText,
             acknowledgementMessageId: acknowledgementMessageId,
             operation: retryOperation,
-            onStart: { messageId in
-                guard let messageId else { return }
-                await clearQueueAcknowledgement(
-                    chatId: message.chatId,
-                    messageId: messageId,
-                    runningText: "Running retry · \(preview)"
-                )
-            }
+            onStart: { _ in }
         )
         guard queued != nil else {
             _ = try? await updateInbox.transition(
@@ -564,7 +611,8 @@ extension TelegramPollLoop {
         update: TelegramUpdate,
         message: TelegramMessage,
         commandText: String,
-        retryText: String
+        retryText: String,
+        retryMessage: TelegramMessage?
     ) async {
         let card = makeTurnProgressCard(
             destination: message.destination,
@@ -591,6 +639,24 @@ extension TelegramPollLoop {
             text: commandText
         )
         do {
+            var attachments: [TelegramMediaAttachment] = []
+            if let retryMessage, let photo = Self.photoAttachment(from: retryMessage) {
+                guard let photoDownloader else {
+                    throw TelegramBotError.underlying("Image ingestion is not configured; the original image could not be retried.")
+                }
+                let downloaded = try await photoDownloader.download(token: token, attachment: photo, maxBytes: photoMaxBytes)
+                guard let bytes = downloaded.bytes, !bytes.isEmpty else {
+                    throw TelegramMediaDownloadError.malformedResponse
+                }
+                guard bytes.count <= photoMaxBytes else {
+                    throw TelegramMediaDownloadError.oversized(reportedBytes: bytes.count, capBytes: photoMaxBytes)
+                }
+                attachments = [TelegramMediaAttachment(
+                    kind: downloaded.kind, fileId: downloaded.fileId,
+                    mimeType: Self.imageMime(forFilename: downloaded.captureFilename, fallbackMime: downloaded.mimeType),
+                    sizeBytes: bytes.count, bytes: bytes, captureFilename: downloaded.captureFilename
+                )]
+            }
             let progress = makeProgressSink(delivery: delivery, card: card)
             let generatedImages = TelegramGeneratedImageCollector()
             let capturingProgress: TelegramChatProgressSink = { event in
@@ -600,10 +666,10 @@ extension TelegramPollLoop {
             let reply = try await runChatHandlerWithRetry(
                 destination: message.destination,
                 text: retryText,
-                attachments: [],
+                attachments: attachments,
                 progress: capturingProgress,
-                replyTo: nil,
-                fromUserId: message.fromUserId,
+                replyTo: retryMessage?.replyTo,
+                fromUserId: retryMessage?.fromUserId ?? message.fromUserId,
                 suppressUserAppend: true
             )
             try Task.checkCancellation()
@@ -737,7 +803,7 @@ extension TelegramPollLoop {
     /// termination and the durable claim was completed while the message was
     /// still on the wire — a reply lost with no claim left to replay it. The
     /// whole command now runs off the poll loop instead
-    /// (`runSlashCommandDetached`), so the poller stays free AND everything
+    /// (`runCommandDetached`), so the poller stays free AND everything
     /// a command does after its reply happens after the reply is actually out.
     private func sendCommandReply(
         _ reply: String,
@@ -757,7 +823,7 @@ extension TelegramPollLoop {
         }
     }
 
-    /// Run one slash command in its own task, and settle its durable claim only
+    /// Run one control command in its own task, and settle its durable claim only
     /// once the command (reply included) has finished.
     ///
     /// 2026-09-06: the poll loop no longer waits for a command — a chat in a
@@ -765,7 +831,7 @@ extension TelegramPollLoop {
     /// completed on the command's behalf travels with the command, the same way
     /// a tracked turn carries its own. A crash mid-command therefore leaves the
     /// claim replayable instead of marked done with nothing sent.
-    func runSlashCommandDetached(
+    func runCommandDetached(
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String
@@ -774,9 +840,16 @@ extension TelegramPollLoop {
         // Ingress waits only for a session binding mutation, never its reply.
         // The poller processes updates in order, so the next turn cannot
         // resolve the old binding while /new or /resume is still committing.
-        await turnCoordinator.runCommandUntilAdmitted { admissionReady in
+        let isStop = TelegramCommandRegistry.parse(text: text)?.definition.handler == .stop
+            || UserMessageIntentSignals.isControlHandoff(text)
+        await turnCoordinator.runCommandUntilAdmitted(destination: isStop ? nil : message.destination) { admissionReady in
             let transferred: Bool
-            if let parsed = TelegramCommandRegistry.parse(text: text),
+            if UserMessageIntentSignals.isControlHandoff(text) {
+                await loop.handleControlHandoff(
+                    update: update, message: message, text: text, admissionReady: admissionReady
+                )
+                transferred = false
+            } else if let parsed = TelegramCommandRegistry.parse(text: text),
                parsed.definition.handler == .resume {
                 await loop.handleResumeCommand(
                     args: parsed.args, update: update, message: message, text: text,
@@ -785,7 +858,7 @@ extension TelegramPollLoop {
                 transferred = false
             } else if let parsed = TelegramCommandRegistry.parse(text: text),
                       parsed.definition.handler == .new ||
-                        (parsed.definition.name == "session" && parsed.args.first?.lowercased() == "new") {
+                        (parsed.definition.name == "session" && ["new", "reset", "clear"].contains(parsed.args.first?.lowercased() ?? "")) {
                 await loop.handleExistingBotCommand(
                     parsed: parsed, update: update, message: message, text: text,
                     admissionReady: admissionReady

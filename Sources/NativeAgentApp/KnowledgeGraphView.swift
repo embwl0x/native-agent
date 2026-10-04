@@ -534,8 +534,6 @@ struct KnowledgeGraphView: View {
             guard await loadKnowledgeGraphPolicy() else { return }
             guard !Task.isCancelled else { return }
             await loadGraph()
-            guard !Task.isCancelled else { return }
-            nativeStack = await KGNativeStackStatus.load(graphCounts: (totalEntities, totalEdges ?? 0))
         }
         // Selection sync: when the active filter set drops the currently
         // selected id from `displayEntities`, clear it so the detail pane

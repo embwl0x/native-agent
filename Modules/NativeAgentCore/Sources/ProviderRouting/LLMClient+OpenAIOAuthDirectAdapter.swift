@@ -94,6 +94,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     private let endpoint: URL
     private let refreshEndpoint: URL
     private let authPathOverride: URL?
+    private let dataRootOverride: URL?
     private let openAIPublicClientID: String
     /// U1 step 1 — per-call llm.call telemetry writer (override is test-only).
     private let telemetry: LLMCallTraceRecorder
@@ -103,10 +104,6 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// — a per-instance lock would let two instances race a refresh and
     /// burn the single-use refresh_token. Key by resolved auth-file path so
     /// distinct codex_home roots (rare; only in tests) stay independent.
-    private var refreshSerial: AsyncSerialQueue {
-        Self.sharedRefreshActor(for: resolveAuthPath())
-    }
-
     private static let refreshQueueRegistry = OAuthRefreshQueueRegistry()
 
     static func sharedRefreshActor(for path: URL) -> AsyncSerialQueue {
@@ -127,6 +124,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         endpoint: URL = URL(string: "https://chatgpt.com/backend-api/codex/responses")!,
         refreshEndpoint: URL = URL(string: "https://auth.openai.com/oauth/token")!,
         authPathOverride: URL? = nil,
+        dataRootOverride: URL? = nil,
         openAIPublicClientID: String = "app_EMoamEEZ73f0CkXaXp7hrann",
         telemetryDataRootOverride: URL? = nil
     ) {
@@ -134,6 +132,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         self.endpoint = endpoint
         self.refreshEndpoint = refreshEndpoint
         self.authPathOverride = authPathOverride
+        self.dataRootOverride = dataRootOverride
         self.openAIPublicClientID = openAIPublicClientID
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
@@ -257,7 +256,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        let coercedModel = try Self.coerceToGPTModel(model)
+        let coercedModel = try coerceToGPTModel(model)
         let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
         var forceTokenRefresh = false
         // User, 2026-09-06: the token the last attempt actually sent, handed to
@@ -280,8 +279,9 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
             var req = try responsesRequest(accessToken: access)
 
-            let bodyDict = buildResponsesBodyFromMessages(
-                model: coercedModel, messages: messages, system: system, tools: tools
+            let bodyDict = Self.buildResponsesBodyFromMessages(
+                model: coercedModel, messages: messages, system: system, tools: tools,
+                supportedEfforts: accountSupportedEfforts(model: coercedModel)
             )
             do {
                 req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
@@ -303,10 +303,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     forceTokenRefresh = true
                     continue
                 }
-                throw LLMError.authRejected(
-                    provider: "openai_oauth_direct",
-                    detail: OpenAIOAuthDirectExhaustedMarker
-                )
+                throw exhaustedCredentialError()
             }
             try throwIfChatCompletionsError(status: status, data: data, response: response)
             let parsed = Self.parseResponsesSSEDetailed(from: data)
@@ -334,16 +331,18 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     usage: parsed.usage,
                     ttftMs: nil,
                     durationMs: durationMs,
-                    substitutedFrom: substitutedFrom
+                    status: parsed.incompleteReason == nil ? "ok" : "incomplete",
+                    substitutedFrom: substitutedFrom,
+                    stopReason: parsed.incompleteReason
                 )
-                // User, 2026-09-06: a `response.incomplete` reply is
-                // legitimate but CUT. Carry the provider's own reason out with
-                // the text so the caller (and the transcript) can see it.
                 if let reason = parsed.incompleteReason {
-                    let note = Self.incompleteNote(reason)
-                    return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? note
-                        : s + "\n\n" + note
+                    if reason == "max_output_tokens" {
+                        throw LLMError.outputLengthLimit(partial: s)
+                    }
+                    throw LLMError.providerError(message: Self.incompleteNote(reason))
+                }
+                guard !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw LLMError.streamTruncated(message: "openai oauth response produced no content (terminal event, empty)")
                 }
                 return s
             case .providerError(let message):
@@ -372,7 +371,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 let coercedModel: String
                 let substitutedFrom: String?
                 do {
-                    coercedModel = try Self.coerceToGPTModel(model)
+                    coercedModel = try coerceToGPTModel(model)
                     substitutedFrom = Self.substitutionTrace(
                         requested: model,
                         coerced: coercedModel
@@ -388,7 +387,6 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
                 for attempt in 0...1 {
-                    var emittedProviderOutput = false
                     do {
                         try Task.checkCancellation()
                         let access: String
@@ -404,8 +402,9 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
                         var req = try responsesRequest(accessToken: access)
 
-                        let bodyDict = buildResponsesBodyFromMessages(
-                            model: coercedModel, messages: messages, system: system, tools: tools
+                        let bodyDict = Self.buildResponsesBodyFromMessages(
+                            model: coercedModel, messages: messages, system: system, tools: tools,
+                            supportedEfforts: accountSupportedEfforts(model: coercedModel)
                         )
                         do {
                             req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
@@ -428,10 +427,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                                 forceTokenRefresh = true
                                 continue
                             }
-                            throw LLMError.authRejected(
-                    provider: "openai_oauth_direct",
-                    detail: OpenAIOAuthDirectExhaustedMarker
-                )
+                            throw exhaustedCredentialError()
                         }
                         if !(200..<300).contains(status) {
                             let body = try await Self.boundedBodyString(from: bytes)
@@ -439,284 +435,13 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                                 status: status, data: Data(body.utf8), response: response)
                         }
 
-                        struct PendingCall {
-                            var callId: String
-                            var name: String
-                            var args: String
-                        }
-                        var pendingByItemId: [String: PendingCall] = [:]
-                        var pendingOrder: [String] = []
-                        var replyTextSettled = false
-                        var sawFunctionCall = false
-                        func resumeReply() {
-                            if replyTextSettled {
-                                replyTextSettled = false
-                                continuation.yield(.replyTextSettled(false))
-                            }
-                        }
-                        // U1 step 1 — streaming telemetry: TTFT stamped at
-                        // the FIRST meaningful output frame — text delta,
-                        // function_call output_item.added, or first argument
-                        // delta, whichever arrives first. Stamping only at
-                        // output_item.done (after the whole argument stream)
-                        // read materially too high for tool-call-first
-                        // responses (gpt-5.5 review blocker, 2026-06-10).
-                        // Usage rides on the terminal response.completed.
-                        var capturedUsage: LLMUsage?
-                        var ttftMs: Int?
-                        // User, 2026-09-06: set by a terminal
-                        // `response.incomplete` frame — see the buffered
-                        // sibling. Same omission, same misclassification.
-                        var incompleteReason: String?
-                        // 2026-09-25: the loop guard every other streaming
-                        // adapter has. Without it a looping reply ran to the
-                        // model's own cap (no max_output_tokens is sent).
-                        var runaway = RunawayOutputDetector()
-                        var runawayTripped = false
-
-                        func stampTTFT() {
-                            emittedProviderOutput = true
-                            if ttftMs == nil {
-                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                            }
-                        }
-
-                        func yieldToolCall(id: String, name: String, args: String) {
-                            sawFunctionCall = true
-                            resumeReply()
-                            let body = args.isEmpty ? "{}" : args
-                            stampTTFT()
-                            continuation.yield(.toolCall(LLMStreamToolCall(
-                                id: id,
-                                name: name,
-                                inputJSON: Data(body.utf8)
-                            )))
-                        }
-
-                        var lastRawDelta: ContinuousClock.Instant?
-                        func processPayload(_ payloadStr: String) throws -> Bool {
-                            if payloadStr == "[DONE]" { return true }
-                            guard let pdata = payloadStr.data(using: .utf8),
-                                  let event = try? JSONSerialization.jsonObject(with: pdata) as? [String: Any] else {
-                                // User, 2026-09-06: an unparseable frame used to
-                                // vanish, so a corrupted transport mid-answer
-                                // silently dropped a chunk of the reply (or of
-                                // a function call's arguments) and the turn
-                                // still finished "successfully". Once output
-                                // has started, a frame we cannot read is a
-                                // stream failure the ladder should re-ask on.
-                                guard emittedProviderOutput else { return false }
-                                throw LLMError.transient(
-                                    message: "openai oauth: malformed stream frame after content")
-                            }
-                            let etype = event["type"] as? String ?? ""
-                            if etype == "response.output_text.delta" {
-                                if let delta = event["delta"] as? String, !delta.isEmpty {
-                                    lastRawDelta = ContinuousClock.now
-                                    resumeReply()
-                                    stampTTFT()
-                                    continuation.yield(.textDelta(delta))
-                                    if runaway.feed(delta) {
-                                        runawayTripped = true
-                                        return true
-                                    }
-                                }
-                            } else if etype == "response.output_item.added" {
-                                if let item = event["item"] as? [String: Any],
-                                   (item["type"] as? String) == "function_call",
-                                   let id = item["id"] as? String {
-                                    sawFunctionCall = true
-                                    resumeReply()
-                                    // First model-output frame for a
-                                    // tool-call-first response — stamp TTFT
-                                    // here, not at output_item.done.
-                                    stampTTFT()
-                                    let callId = (item["call_id"] as? String) ?? id
-                                    let name = (item["name"] as? String) ?? ""
-                                    let args = (item["arguments"] as? String) ?? ""
-                                    pendingByItemId[id] = PendingCall(callId: callId, name: name, args: args)
-                                    pendingOrder.append(id)
-                                }
-                            } else if etype == "response.function_call_arguments.delta" {
-                                sawFunctionCall = true
-                                resumeReply()
-                                if let id = event["item_id"] as? String,
-                                   let delta = event["delta"] as? String {
-                                    // Argument deltas are model output even
-                                    // when the item wasn't registered by a
-                                    // recognized `added` frame — stamp
-                                    // unconditionally.
-                                    stampTTFT()
-                                    if pendingByItemId[id] != nil {
-                                        pendingByItemId[id]!.args.append(delta)
-                                    }
-                                }
-                                // Liveness: tool-arg deltas are model output but are
-                                // accumulated (not yielded as content), so emit
-                                // `.keepAlive` to keep ProviderStreamGuard's idle
-                                // clock alive through a long tool-argument stream —
-                                // parity with the Anthropic input_json_delta path
-                                // (pre-existing gap, gpt-5.5 review 2026-06-15).
-                                continuation.yield(.keepAlive)
-                            } else if etype == "response.output_item.done" {
-                                if let item = event["item"] as? [String: Any],
-                                   (item["type"] as? String) == "message",
-                                   lastRawDelta != nil, !sawFunctionCall, !replyTextSettled {
-                                    replyTextSettled = true
-                                    continuation.yield(.replyTextSettled(true))
-                                }
-                                if let item = event["item"] as? [String: Any],
-                                   (item["type"] as? String) == "function_call",
-                                   let id = item["id"] as? String {
-                                    var pending = pendingByItemId[id] ?? PendingCall(callId: id, name: "", args: "")
-                                    if let callId = item["call_id"] as? String { pending.callId = callId }
-                                    if pending.name.isEmpty, let name = item["name"] as? String { pending.name = name }
-                                    if pending.args.isEmpty, let args = item["arguments"] as? String { pending.args = args }
-                                    yieldToolCall(id: pending.callId, name: pending.name, args: pending.args)
-                                    pendingByItemId.removeValue(forKey: id)
-                                }
-                            } else if etype == "response.completed" || etype == "response.done" {
-                                // U1 step 1: usage rides on the terminal frame.
-                                let respObj = event["response"] as? [String: Any]
-                                if let usageObj = respObj?["usage"] as? [String: Any] {
-                                    capturedUsage = LLMUsage.fromOpenAIResponses(usageObj)
-                                }
-                                return true
-                            } else if etype == "response.incomplete" {
-                                // Terminal: the model stopped at a limit, the
-                                // transport did not drop. Without this the
-                                // stream ended `shouldStop == false` and threw
-                                // `.streamTruncated`, sending an output-limit
-                                // completion into the reconnect ladder.
-                                let respObj = event["response"] as? [String: Any]
-                                if let usageObj = respObj?["usage"] as? [String: Any] {
-                                    capturedUsage = LLMUsage.fromOpenAIResponses(usageObj)
-                                }
-                                incompleteReason = Self.incompleteReasonText(from: event)
-                                return true
-                            } else if etype == "response.failed" {
-                                let detail = Self.backendErrorDescription(
-                                    from: event,
-                                    fallback: "response failed"
-                                )
-                                throw Self.classifiedBackendError(
-                                    "chatgpt-backend response failed: \(detail)"
-                                )
-                            } else if etype == "error" {
-                                let detail = Self.backendErrorDescription(
-                                    from: event,
-                                    fallback: "unknown backend error"
-                                )
-                                throw Self.classifiedBackendError(
-                                    "chatgpt-backend error: \(detail)"
-                                )
-                            } else if etype.hasPrefix("response.reasoning") {
-                                // Liveness: extended-reasoning frames
-                                // (response.reasoning_text.delta /
-                                // reasoning_summary_text.delta / …) carry no
-                                // user-visible content but ARE real model activity.
-                                // Emit `.keepAlive` so a long reasoning phase
-                                // doesn't trip the guard's idle timeout — parity
-                                // with the Anthropic thinking_delta path. Reasoning
-                                // is NOT surfaced as reply text (no content yield).
-                                continuation.yield(.keepAlive)
-                            }
-                            return false
-                        }
-
-                        // R15: SSEEventStream owns framing (LF-only terminator
-                        // with CR strip — audit #14 — multi-line `data:` joins,
-                        // EOF flush of an unterminated trailing event);
-                        // processPayload owns the Responses-API semantics.
-                        //
-                        // Mid-stream transport errors (resource timeout,
-                        // connection lost, ...) thrown by the byte stream must
-                        // route through the SAME transientNetworkError mapping
-                        // the initial session.bytes(for:) connect uses —
-                        // without this wrapper they fell through to the
-                        // generic catch below and surfaced as raw URLErrors,
-                        // so mid-stream URLError.timedOut never classified
-                        // transient (Anthropic OAuth parity, gpt-5.5 review
-                        // 2026-07-02). Intentional LLMErrors from
-                        // processPayload (providerError, ...) and
-                        // cancellation re-throw untouched.
-                        var shouldStop = false
-                        do {
-                            for try await sse in SSEEventStream(bytes) {
-                                try Task.checkCancellation()
-                                shouldStop = try processPayload(sse.data)
-                                if shouldStop { break }
-                            }
-                        } catch let err as LLMError {
-                            throw err
-                        } catch is CancellationError {
-                            throw CancellationError()
-                        } catch {
-                            throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
-                        }
-                        if runawayTripped {
-                            await self.telemetry.record(
-                                requestBody: req.httpBody,
-                                provider: self.providerId,
-                                model: coercedModel,
-                                streaming: true,
-                                usage: capturedUsage,
-                                ttftMs: ttftMs,
-                                durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                                status: "incomplete",
-                                substitutedFrom: substitutedFrom,
-                                stopReason: "client_runaway"
-                            )
-                            throw runaway.stopError
-                        }
-                        guard shouldStop else {
-                            // Byte stream ended WITHOUT a terminal event
-                            // ([DONE]/response.completed): a proxy/LB closing
-                            // the response mid-reply otherwise rendered the
-                            // partial as complete and persisted it. Every
-                            // other adapter throws streamTruncated here —
-                            // match the contract (audit 2026-06-09).
-                            continuation.finish(throwing: LLMError.streamTruncated(
-                                message: "openai oauth stream ended without terminal event"
-                            ))
-                            return
-                        }
-                        // User, 2026-09-06: never on a `response.incomplete` —
-                        // an un-`done` call there was cut mid-arguments, so
-                        // yielding it would dispatch invented arguments.
-                        if incompleteReason == nil {
-                            for id in pendingOrder {
-                                if let pending = pendingByItemId[id] {
-                                    yieldToolCall(
-                                        id: pending.callId.isEmpty ? id : pending.callId,
-                                        name: pending.name,
-                                        args: pending.args
-                                    )
-                                }
-                            }
-                        }
-                        // The reply is legitimate but CUT: say so in the one
-                        // channel this lane has (there is no finish-reason
-                        // event on the stream contract).
-                        if let reason = incompleteReason {
-                            // Own line: the consumers concatenate deltas, and a
-                            // note-only reply has its leading whitespace trimmed
-                            // by the surface like any other reply.
-                            continuation.yield(.textDelta(
-                                "\n\n" + Self.incompleteNote(reason)
-                            ))
-                        }
-                        // U1 step 1: one llm.call row per successful stream.
-                        let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                        await self.telemetry.record(
-                            requestBody: req.httpBody,
-                            provider: self.providerId,
-                            model: coercedModel,
-                            streaming: true,
-                            usage: capturedUsage,
-                            ttftMs: ttftMs,
-                            durationMs: durationMs,
-                            substitutedFrom: substitutedFrom
+                        try await Self.consumeResponsesStream(
+                            bytes: bytes, request: req, model: coercedModel,
+                            providerId: self.providerId, telemetry: self.telemetry,
+                            requestStartNs: requestStartNs, substitutedFrom: substitutedFrom,
+                            providerLabel: "openai oauth", errorPrefix: "chatgpt-backend",
+                            networkError: { self.transientNetworkError($0, endpoint: endpoint, operation: "streamMessages") },
+                            continuation: continuation
                         )
                         continuation.finish()
                         return
@@ -772,11 +497,13 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         role == .assistant ? "output_text" : "input_text"
     }
 
-    func buildResponsesBodyFromMessages(
+    static func buildResponsesBodyFromMessages(
         model: String,
         messages: [LLMMessage],
         system: String?,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?,
+        transport: OpenAIExecutionControls.Transport = .chatGPTOAuth,
+        supportedEfforts: [String]? = nil
     ) -> [String: Any] {
         var inputItems: [[String: Any]] = []
         for m in messages {
@@ -856,7 +583,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         OpenAIExecutionControls.applyResponsesControls(
             to: &body,
             model: model,
-            transport: .chatGPTOAuth
+            transport: transport,
+            supportedEfforts: supportedEfforts
         )
         // U1 step 4: stable per-session prompt-cache routing. Absent when no
         // session id is bound (byte-identical body to pre-U1).
@@ -871,6 +599,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     "name": t.name,
                     "description": t.description,
                 ]
+                if transport == .publicAPI { entry["strict"] = false }
                 if let params = try? JSONSerialization.jsonObject(with: t.parametersJSON) {
                     entry["parameters"] = params
                 } else {
@@ -901,7 +630,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         // Coerce non-`gpt-` model ids to the GPT-default. The chatgpt.com
         // backend routes by model id and rejects unknown ids — `openai/...`
         // namespace prefixes need stripping (gpt-5.5 review NON-BLOCKING).
-        let coercedModel = try Self.coerceToGPTModel(model)
+        let coercedModel = try coerceToGPTModel(model)
         let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
         var forceTokenRefresh = false
         // User, 2026-09-06: the token the last attempt actually sent, handed to
@@ -967,10 +696,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 // .underlying with the same marker. Surface NOT as
                 // notConfigured, which would mask the real "tokens revoked,
                 // re-sign-in required" signal.
-                throw LLMError.authRejected(
-                    provider: "openai_oauth_direct",
-                    detail: OpenAIOAuthDirectExhaustedMarker
-                )
+                throw exhaustedCredentialError()
             }
             try throwIfChatCompletionsError(status: status, data: data, response: response)
             // Parse the SSE bytes. Surface mid-stream `response.failed` /
@@ -1000,16 +726,18 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     usage: parsed.usage,
                     ttftMs: nil,
                     durationMs: durationMs,
-                    substitutedFrom: substitutedFrom
+                    status: parsed.incompleteReason == nil ? "ok" : "incomplete",
+                    substitutedFrom: substitutedFrom,
+                    stopReason: parsed.incompleteReason
                 )
-                // User, 2026-09-06: a `response.incomplete` reply is
-                // legitimate but CUT. Carry the provider's own reason out with
-                // the text so the caller (and the transcript) can see it.
                 if let reason = parsed.incompleteReason {
-                    let note = Self.incompleteNote(reason)
-                    return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? note
-                        : s + "\n\n" + note
+                    if reason == "max_output_tokens" {
+                        throw LLMError.outputLengthLimit(partial: s)
+                    }
+                    throw LLMError.providerError(message: Self.incompleteNote(reason))
+                }
+                guard !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw LLMError.streamTruncated(message: "openai oauth response produced no content (terminal event, empty)")
                 }
                 return s
             case .providerError(let message):
@@ -1128,7 +856,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// `deepseek-chat`, `o3`) used to come back as the primary GPT model, so
     /// User's pick was replaced and billed without a word. It now throws
     /// `modelUnavailable` naming the offending id.
-    static func coerceToGPTModel(_ requested: String?) throws -> String {
+    private func coerceToGPTModel(_ requested: String?) throws -> String {
         // 2026-09-13: no model is chosen here, not even for an absent request.
         // Every turn arrives with the picker's answer bound to it; reaching this
         // adapter with no model at all is a routing fault, and answering it with
@@ -1169,7 +897,14 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         // the routing read seam.
         if FirstPartyModelCatalog.descriptor(
             for: normalized, providerID: "openai_oauth_direct"
-        ) != nil {
+        ) != nil || CodexAccountModelCatalog.signedCacheLists(
+            normalized,
+            providerID: "openai_oauth_direct",
+            cacheURL: CodexAccountModelCatalog.matchingCacheCandidate(
+                oauthAuthURL: resolveAuthPath(),
+                fallbackCacheURL: CodexAccountModelCatalog.cacheCandidate()
+            )
+        ) {
             return normalized
         }
         throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: r)
@@ -1221,7 +956,15 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         OpenAIExecutionControls.applyResponsesControls(
             to: &body,
             model: model,
-            transport: .chatGPTOAuth
+            transport: .chatGPTOAuth,
+            supportedEfforts: CodexAccountModelCatalog.load(
+                providerID: "openai_oauth_direct",
+                cacheURL: CodexAccountModelCatalog.matchingCacheCandidate(
+                    oauthAuthURL: resolveAuthPath(),
+                    fallbackCacheURL: CodexAccountModelCatalog.cacheCandidate()
+                ),
+                useDefaultCacheWhenNil: false
+            ).first { $0.id == model }?.supportedReasoningEfforts
         )
         // U1 step 4: stable per-session prompt-cache routing. Absent when no
         // session id is bound (byte-identical body to pre-U1).
@@ -1263,8 +1006,21 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
 
     /// Explicit injection wins; otherwise use the shared credential discovery
     /// and CLI-adoption consent rules in OpenAIOAuthCredentials.
+    /// Effort levels the signed-in account's discovered catalog lists for `model`.
+    func accountSupportedEfforts(model: String) -> [String]? {
+        CodexAccountModelCatalog.load(
+            providerID: "openai_oauth_direct",
+            cacheURL: CodexAccountModelCatalog.matchingCacheCandidate(
+                oauthAuthURL: resolveAuthPath(),
+                fallbackCacheURL: CodexAccountModelCatalog.cacheCandidate()
+            ),
+            useDefaultCacheWhenNil: false
+        ).first { $0.id == model }?.supportedReasoningEfforts
+    }
+
     func resolveAuthPath() -> URL {
         if let override = authPathOverride { return override }
+        if let root = dataRootOverride { return Self.boundRootReadAuthPath(dataRoot: root) }
         return Self.preferredAuthPath()
     }
 
@@ -1272,6 +1028,40 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     // MARK: - Token refresh
 
     private static let tokenExpiryBufferSec: Int = 120
+
+    private func exhaustedCredentialError() -> LLMError {
+        if Self.isUserCodexPath(resolveAuthPath()) {
+            return .failure(.codexCLISessionExpired)
+        }
+        return .authRejected(provider: "openai_oauth_direct", detail: OpenAIOAuthDirectExhaustedMarker)
+    }
+
+    private static func accessTokenIsFresh(_ access: String, blob: [String: Any], buffer: Int) -> Bool {
+        let tokens = blob["tokens"] as? [String: Any] ?? [:]
+        let expiry = [tokenExpiresAt(access), persistedExpiresAt(blob: blob, tokens: tokens)]
+            .compactMap { $0 }.min()
+        return expiry.map { $0 - Int(Date().timeIntervalSince1970) > buffer } ?? false
+    }
+
+    /// The CLI owns token rotation. Re-read its file once on expiry or 401;
+    /// never acquire a credential lock or spend its single-use refresh grant.
+    private func rereadCLIAccessToken(
+        at path: URL, staleToken: String?, requestAccount: OAuthRequestAccount
+    ) throws -> String {
+        // A bound helper must recheck consent before reading the shared file.
+        guard resolveAuthPath().standardizedFileURL == path.standardizedFileURL,
+              let blob = Self.loadAuthBlob(at: path) else {
+            throw LLMError.notConfigured(provider: "openai_oauth_direct")
+        }
+        try requestAccount.check(blob, provider: "openai_oauth_direct", allowUnboundIdentity: true)
+        guard let access = (blob["tokens"] as? [String: Any])?["access_token"] as? String,
+              !access.isEmpty,
+              Self.accessTokenIsFresh(access, blob: blob, buffer: 0),
+              access != staleToken else {
+            throw LLMError.failure(.codexCLISessionExpired)
+        }
+        return access
+    }
 
     /// Return a non-expired access token. Force-refresh when `forceRefresh`
     /// is true (used on retry after HTTP 401). Mirrors
@@ -1288,13 +1078,24 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
         // Fast path OUTSIDE the lock — check disk; return if still fresh.
-        guard let blob0 = loadAuthBlob() else {
+        let path = resolveAuthPath()
+        let isCLI = Self.isUserCodexPath(path)
+        guard let blob0 = Self.loadAuthBlob(at: path) else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
-        try requestAccount.check(blob0, provider: "openai_oauth_direct", rejectedToken: staleToken)
+        try requestAccount.check(blob0, provider: "openai_oauth_direct", rejectedToken: staleToken,
+                                 allowUnboundIdentity: isCLI)
         let tokens0 = (blob0["tokens"] as? [String: Any]) ?? [:]
         guard let access0 = tokens0["access_token"] as? String, !access0.isEmpty else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
+        }
+        if isCLI {
+            if !forceRefresh, Self.accessTokenIsFresh(access0, blob: blob0, buffer: 0) {
+                return access0
+            }
+            return try rereadCLIAccessToken(
+                at: path, staleToken: forceRefresh ? (staleToken ?? access0) : nil,
+                requestAccount: requestAccount)
         }
         if !forceRefresh {
             // Honor BOTH the JWT `exp` AND the persisted top-level
@@ -1302,18 +1103,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             // out-of-band rotation (clock skew, manual sign-in) doesn't
             // serve a token past its real expiry. Mirrors how the daemon
             // tracks expiry independently of the JWT claim.
-            let now = Int(Date().timeIntervalSince1970)
-            let jwtExp = Self.tokenExpiresAt(access0)
-            let persistedExp = Self.persistedExpiresAt(blob: blob0, tokens: tokens0)
-            let effExp: Int? = {
-                switch (jwtExp, persistedExp) {
-                case (.some(let a), .some(let b)): return min(a, b)
-                case (.some(let a), .none):        return a
-                case (.none, .some(let b)):        return b
-                case (.none, .none):               return nil
-                }
-            }()
-            if let exp = effExp, exp - now > Self.tokenExpiryBufferSec {
+            if Self.accessTokenIsFresh(access0, blob: blob0, buffer: Self.tokenExpiryBufferSec) {
                 return access0
             }
             // missing-exp on both sides falls through to refresh (matches
@@ -1321,10 +1111,11 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         }
         // Slow path — serialize via the refresh queue so concurrent callers
         // share ONE refresh instead of double-rotating refresh_token.
-        return try await refreshSerial.run {
+        return try await Self.sharedRefreshActor(for: path).run {
             // Re-load INSIDE the critical section: another waiter may have
             // already refreshed while we were queued.
-            guard let blob = self.loadAuthBlob() else {
+            guard self.resolveAuthPath().standardizedFileURL == path.standardizedFileURL,
+                  let blob = Self.loadAuthBlob(at: path) else {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
             }
             try requestAccount.check(blob, provider: "openai_oauth_direct")
@@ -1342,22 +1133,11 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 return access
             }
             if !forceRefresh {
-                let now = Int(Date().timeIntervalSince1970)
-                let jwtExp = Self.tokenExpiresAt(access)
-                let persistedExp = Self.persistedExpiresAt(blob: blob, tokens: tokens)
-                let effExp: Int? = {
-                    switch (jwtExp, persistedExp) {
-                    case (.some(let a), .some(let b)): return min(a, b)
-                    case (.some(let a), .none):        return a
-                    case (.none, .some(let b)):        return b
-                    case (.none, .none):               return nil
-                    }
-                }()
-                if let exp = effExp, exp - now > Self.tokenExpiryBufferSec {
+                if Self.accessTokenIsFresh(access, blob: blob, buffer: Self.tokenExpiryBufferSec) {
                     return access  // someone else already refreshed
                 }
             }
-            return try await self.refreshTokens(requestAccount: requestAccount)
+            return try await self.refreshTokens(at: path, requestAccount: requestAccount)
         }
     }
 
@@ -1365,13 +1145,15 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// lock-protected refresh block at L511-L531 + `_refresh_with_refresh_
     /// token` at L533-L558.
     @discardableResult
-    func refreshTokens(requestAccount: OAuthRequestAccount = OAuthRequestAccount()) async throws -> String {
+    func refreshTokens(at path: URL, requestAccount: OAuthRequestAccount = OAuthRequestAccount()) async throws -> String {
         // User, 2026-09-06: resolve the path ONCE, before the network call. It
         // used to be resolved again at write time, and candidate resolution
         // probes the filesystem — a sign-out that deleted the app-owned file
         // mid-refresh moved the answer to the shared ~/.codex/auth.json, so
         // the write landed on the Codex CLI's own session file.
-        let path = resolveAuthPath()
+        guard !Self.isUserCodexPath(path) else {
+            throw LLMError.failure(.codexCLISessionExpired)
+        }
         // User, 2026-09-06: ONE read of ONE path. `loadAuthBlob()` re-resolved
         // the candidate list, so the refresh could read its refresh_token from
         // a different file than the one whose bytes it was about to compare

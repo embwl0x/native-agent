@@ -1,7 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Skills
 import ToolRegistry
+import WorkflowOrchestration
 
 // MARK: - Wave 13: dynamic source ports for capability_records() aggregator
 //
@@ -9,8 +11,7 @@ import ToolRegistry
 // capability_records() aggregator at the retired daemon
 // (read 2026-05-31):
 //
-//   1. list_skills
-//   2. persona_skill_manifest_records
+//   1. InstalledSkillInventory (canonical registry and body inventory)
 //   3. list_tools
 //   4. manifest_registered_skills
 //   5. list_workflows
@@ -140,162 +141,6 @@ public func promptSafeCapabilityText(_ raw: String?, limit: Int = 500) -> String
     return text
 }
 
-// MARK: - Source #1: list_skills
-//
-// Port of the retired daemon:
-//   def list_skills(self) -> list[dict[str, Any]]:
-//       skills = read_json(self.skills_path, [])
-//       return sorted(skills, key=lambda item: str(item.get("updatedAt") or item.get("createdAt") or ""), reverse=True)
-//
-// Path: <dataRoot>/skills/registry.json
-public func listSkills(
-    dataRoot: URL,
-    persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async throws -> [[String: JSONValue]] {
-    let path = dataRoot
-        .appendingPathComponent("skills", isDirectory: true)
-        .appendingPathComponent("registry.json")
-    let raw = try await persistence.readJSON(path, ifMissing: .array([]))
-    guard case .array(let items) = raw else { return [] }
-    let dicts: [[String: JSONValue]] = items.compactMap {
-        if case .object(let o) = $0 { return o }
-        return nil
-    }
-    return dicts.sorted { lhs, rhs in
-        let lk = jsonString(lhs, "updatedAt").isEmpty
-            ? jsonString(lhs, "createdAt") : jsonString(lhs, "updatedAt")
-        let rk = jsonString(rhs, "updatedAt").isEmpty
-            ? jsonString(rhs, "createdAt") : jsonString(rhs, "updatedAt")
-        return lk > rk
-    }
-}
-
-// MARK: - Source #2: persona_skill_manifest_records
-//
-// Port of the retired daemon. Walks
-// `<personaRoot>/skills/bodies/*.md` alphabetically (case-insensitive),
-// reads each, extracts a title and description from the first 12 lines,
-// stamps mtime as updatedAt. On any exception, returns [].
-//
-// `personaRoot` resolves via PersistenceCore.defaultPersonaRoot. The Python
-// catches Exception and returns [] — we mirror that.
-public func personaSkillManifestRecords(
-    personaRoot: URL = PersistenceCore.defaultPersonaRoot()
-) -> [[String: JSONValue]] {
-    let bodyDir = personaRoot
-        .appendingPathComponent("skills", isDirectory: true)
-        .appendingPathComponent("bodies", isDirectory: true)
-    let fm = FileManager.default
-    var isDir: ObjCBool = false
-    guard fm.fileExists(atPath: bodyDir.path, isDirectory: &isDir), isDir.boolValue else {
-        return []
-    }
-    var paths: [URL] = []
-    do {
-        let entries = try fm.contentsOfDirectory(
-            at: bodyDir, includingPropertiesForKeys: [.contentModificationDateKey]
-        )
-        for entry in entries where entry.pathExtension == "md" {
-            paths.append(entry)
-        }
-    } catch {
-        return []
-    }
-    // sorted(..., key=lambda p: p.name.lower())
-    paths.sort { $0.lastPathComponent.lowercased() < $1.lastPathComponent.lowercased() }
-
-    var records: [[String: JSONValue]] = []
-    for path in paths {
-        let stem = path.deletingPathExtension().lastPathComponent
-        // Python: title = path.stem.replace("_"," ").replace("-"," ").title()
-        // str.title() lowercases all but first char of each word.
-        var defaultTitle = stem
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-        defaultTitle = pythonTitleCase(defaultTitle)
-
-        // read_text(encoding=utf-8, errors=replace)
-        var raw = ""
-        if let data = try? Data(contentsOf: path) {
-            raw = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
-        }
-        let lines = raw.split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-
-        var title = defaultTitle
-        var description = ""
-        for line in lines.prefix(12) {
-            if line.hasPrefix("#") {
-                // Python: title = line.lstrip("#").strip() or title
-                let stripped = line.drop(while: { $0 == "#" })
-                    .trimmingCharacters(in: .whitespaces)
-                if !stripped.isEmpty { title = stripped }
-            } else if description.isEmpty {
-                // Python: description = line[:500]; break
-                let cap = 500
-                if line.count > cap {
-                    let scalars = Array(line.unicodeScalars)
-                    if scalars.count > cap {
-                        description = String(String.UnicodeScalarView(scalars.prefix(cap)))
-                    } else {
-                        description = line
-                    }
-                } else {
-                    description = line
-                }
-                break
-            }
-        }
-        if description.isEmpty {
-            description = "Persona-owned skill body available on demand."
-        }
-
-        let attrs = (try? fm.attributesOfItem(atPath: path.path)) ?? [:]
-        let mtime = (attrs[.modificationDate] as? Date) ?? Date(timeIntervalSince1970: 0)
-        let updatedAt = SwiftNativeManifestSigner.isoTimestamp(mtime)
-
-        var record: [String: JSONValue] = [:]
-        record["id"] = .string("persona:\(stem)")
-        record["name"] = .string(promptSafeCapabilityText(title, limit: 160))
-        record["description"] = .string(promptSafeCapabilityText(description, limit: 500))
-        record["triggers"] = .array([
-            .string(stem.replacingOccurrences(of: "_", with: " ")),
-            .string(title),
-        ])
-        record["status"] = .string("active")
-        record["kind"] = .string("persona_skill")
-        record["bodyPath"] = .string(path.path)
-        record["sourceRoot"] = .string(bodyDir.path)
-        record["updatedAt"] = .string(updatedAt)
-        record["autoload"] = .bool(false)
-        records.append(record)
-    }
-    return records
-}
-
-/// Mirrors Python's `str.title()`: lowercases each character except the
-/// first character of each "word" (runs of alphanumerics — Python's title
-/// algorithm uses Unicode "cased" detection; we approximate with letters
-/// since the input is `path.stem` which is filesystem-safe ASCII).
-private func pythonTitleCase(_ s: String) -> String {
-    var out = ""
-    var atStartOfWord = true
-    for ch in s {
-        if ch.isLetter || ch.isNumber {
-            if atStartOfWord {
-                out.append(Character(ch.uppercased()))
-                atStartOfWord = false
-            } else {
-                out.append(Character(ch.lowercased()))
-            }
-        } else {
-            out.append(ch)
-            atStartOfWord = true
-        }
-    }
-    return out
-}
 
 // MARK: - Source #3: list_tools
 //
@@ -460,16 +305,9 @@ public func manifestRegisteredSkillsOrdered(
 
 // MARK: - Source #5: list_workflows
 //
-// Port of the retired daemon. Reads <dataRoot>/workflows/registry.json,
-// merges with workflow_defaults() (3 entries), DOES NOT write back here
-// (read-only — the daemon's own route does the write). Sort by updatedAt
-// then createdAt DESC.
-//
-// CARVE: SwiftNative side does NOT write back the merged set to disk like
-// Python does. The aggregator only consumes the read; the next mutating
-// daemon call (POST /v1/workflows or update_workflow) will re-merge and
-// write. This avoids the symmetric-flock burden for what is effectively
-// a stamping-only cache refresh.
+// Reads <dataRoot>/workflows/registry.json with WorkflowOrchestration's
+// defaults, unchanged-seed migration and merge. The workflow client owns
+// write-back; capability aggregation only reads the sorted projection.
 public func listWorkflows(
     dataRoot: URL,
     nowISO: String,
@@ -479,116 +317,17 @@ public func listWorkflows(
         .appendingPathComponent("workflows", isDirectory: true)
         .appendingPathComponent("registry.json")
     let raw = try await persistence.readJSON(path, ifMissing: .array([]))
-    let savedDicts: [[String: JSONValue]]
+    let saved: [JSONValue]
     if case .array(let items) = raw {
-        savedDicts = items.compactMap {
-            if case .object(let o) = $0 { return o }
-            return nil
-        }
+        saved = items
     } else {
-        savedDicts = []
+        saved = []
     }
-
-    var byID: [String: [String: JSONValue]] = [:]
-    for item in savedDicts {
-        byID[jsonString(item, "id")] = item
+    let defaults = WorkflowDefaults.defaults(now: nowISO)
+    return WorkflowMerge.mergeRegistry(defaults: defaults, saved: saved).sorted.compactMap {
+        if case .object(let record) = $0 { return record }
+        return nil
     }
-
-    var merged: [[String: JSONValue]] = []
-    var mergedIDs: Set<String> = []
-    for defaultItem in workflowDefaults(nowISO: nowISO) {
-        var record = defaultItem
-        if let override = byID[jsonString(defaultItem, "id")] {
-            for (k, v) in override { record[k] = v }
-        }
-        let id = jsonString(record, "id")
-        if !id.isEmpty { mergedIDs.insert(id) }
-        merged.append(record)
-    }
-    // Then append any saved entries whose id is not yet in merged.
-    for item in savedDicts {
-        let id = jsonString(item, "id")
-        if !mergedIDs.contains(id) {
-            merged.append(item)
-            if !id.isEmpty { mergedIDs.insert(id) }
-        }
-    }
-    return merged.sorted { lhs, rhs in
-        let lk = jsonString(lhs, "updatedAt").isEmpty
-            ? jsonString(lhs, "createdAt") : jsonString(lhs, "updatedAt")
-        let rk = jsonString(rhs, "updatedAt").isEmpty
-            ? jsonString(rhs, "createdAt") : jsonString(rhs, "updatedAt")
-        return lk > rk
-    }
-}
-
-/// Port of the retired daemon workflow_defaults(). Three static
-/// workflow templates. `nowISO` injects createdAt/updatedAt so tests can pin.
-public func workflowDefaults(nowISO: String) -> [[String: JSONValue]] {
-    let now: JSONValue = .string(nowISO)
-
-    func step(_ id: String, _ title: String, _ kind: String,
-              requiresApproval: Bool = false,
-              layer: String? = nil) -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "title": .string(title),
-            "kind": .string(kind),
-            "requiresApproval": .bool(requiresApproval),
-        ]
-        if let layer = layer {
-            obj["layer"] = .string(layer)
-        }
-        return .object(obj)
-    }
-
-    let researchToBrief: [String: JSONValue] = [
-        "id": .string("research-to-brief"),
-        "name": .string("Research to Brief"),
-        "description": .string("Route a research objective through search, source capture, memory note, and summary receipt."),
-        "status": .string("template"),
-        "trigger": .string("research brief"),
-        "steps": .array([
-            step("route", "Plan intent route", "router"),
-            step("search", "Search private web connector", "research"),
-            step("capture", "Capture source receipts", "receipt"),
-            step("brief", "Draft concise brief", "llm"),
-        ]),
-        "createdAt": now,
-        "updatedAt": now,
-    ]
-    let safeToolForge: [String: JSONValue] = [
-        "id": .string("safe-tool-forge"),
-        "name": .string("Safe Tool Forge"),
-        "description": .string("Turn repeated work into a proposed app-owned JSON tool, validate it, and leave promotion gated by permissions."),
-        "status": .string("template"),
-        "trigger": .string("make a tool"),
-        "steps": .array([
-            step("scope", "Define reusable boundary", "analysis"),
-            step("proposal", "Create tool proposal", "tool_proposal"),
-            step("validate", "Run safety scan and tests", "validation"),
-            step("promote", "Promote only safe app-data tool", "approval",
-                 requiresApproval: true),
-        ]),
-        "createdAt": now,
-        "updatedAt": now,
-    ]
-    let memoryCapture: [String: JSONValue] = [
-        "id": .string("memory-capture"),
-        "name": .string("Memory Capture"),
-        "description": .string("Execute a safe app-owned workflow that routes an objective, writes a memory, and records a trace receipt."),
-        "status": .string("active"),
-        "trigger": .string("remember this"),
-        "steps": .array([
-            step("route", "Route objective", "router"),
-            step("memory", "Write semantic memory", "memory",
-                 layer: "semantic"),
-            step("trace", "Record trace receipt", "trace"),
-        ]),
-        "createdAt": now,
-        "updatedAt": now,
-    ]
-    return [researchToBrief, safeToolForge, memoryCapture]
 }
 
 // MARK: - Source #6: list_mcp_servers
@@ -704,15 +443,17 @@ public func defaultCatalogItems(nowISO: String) -> [[String: JSONValue]] {
     ]
 }
 
+private func capabilityTrustMetadata(_ source: [String: JSONValue]) -> [String: JSONValue] {
+    source.filter { ["sourcePackId", "provenance", "signature"].contains($0.key) }
+}
+
 // MARK: - Aggregator: full capability_records() port
 //
-// Byte-for-byte port of the retired daemon capability_records().
-// Returns a list of records (as JSON-style dicts) matching the Python
-// aggregator's merge order + sort key + dedup semantics EXACTLY.
+// Projects installed capabilities without independently rediscovering skills.
 //
 // Merge order preserved from the retired runtime:
 //   1. feature_surface_records (19)
-//   2. list_skills()[:150] + persona_skill_manifest_records()[:80]   (kind: skill)
+//   2. InstalledSkillInventory                                    (kind: skill)
 //   3. list_tools()[:150]                                            (kind: tool)
 //   4. manifest_registered_skills().get("skills", {})[:150]          (kind: tool|skill)
 //   5. list_workflows()[:100]                                        (kind: workflow)
@@ -726,7 +467,8 @@ public func capabilityRecordsFull(
     personaRoot: URL? = nil,
     nowISO: String,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
-    mcpServers: @Sendable () async -> [[String: JSONValue]]
+    connectorActionStatuses: @Sendable () async throws -> [String: String],
+    mcpServers: @Sendable () async throws -> [[String: JSONValue]]
 ) async throws -> [[String: JSONValue]] {
 
     var records: [[String: JSONValue]] = []
@@ -755,14 +497,11 @@ public func capabilityRecordsFull(
         records.append(rec)
     }
 
-    // 2. list_skills + persona_skill_manifest_records → kind: skill
-    let skills = try await listSkills(dataRoot: dataRoot, persistence: persistence)
-    let personaSkills = personaSkillManifestRecords(
-        personaRoot: personaRoot ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-    )
-    let skillSlice = Array(skills.prefix(150)) + Array(personaSkills.prefix(80))
-    for skill in skillSlice {
-        var rec: [String: JSONValue] = [:]
+    // 2. Canonical installed skills → kind: skill
+    let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot, personaRoot: personaRoot)
+    for entry in skills.prefix(230) {
+        let skill = entry.row
+        var rec = capabilityTrustMetadata(skill)
         let sid = jsonString(skill, "id")
         rec["id"] = .string("skill:\(sid)")
         rec["sourceId"] = .string(sid)
@@ -788,7 +527,7 @@ public func capabilityRecordsFull(
     // 3. list_tools → kind: tool
     let tools = try await listTools(dataRoot: dataRoot, persistence: persistence)
     for tool in tools.prefix(150) {
-        var rec: [String: JSONValue] = [:]
+        var rec = capabilityTrustMetadata(tool)
         let tid = jsonString(tool, "id")
         rec["id"] = .string("tool:\(tid)")
         rec["sourceId"] = .string(tid)
@@ -829,7 +568,7 @@ public func capabilityRecordsFull(
         let kindRaw = jsonString(entryObj, "type").isEmpty
             ? (jsonString(entryObj, "kind").isEmpty ? "skill" : jsonString(entryObj, "kind"))
             : jsonString(entryObj, "type")
-        var rec: [String: JSONValue] = [:]
+        var rec = capabilityTrustMetadata(entryObj)
         rec["id"] = .string("manifest:\(manifestName)")
         rec["sourceId"] = .string(manifestName)
         let nameRaw = jsonString(entryObj, "name")
@@ -866,7 +605,7 @@ public func capabilityRecordsFull(
         dataRoot: dataRoot, nowISO: nowISO, persistence: persistence
     )
     for workflow in workflows.prefix(100) {
-        var rec: [String: JSONValue] = [:]
+        var rec = capabilityTrustMetadata(workflow)
         let wid = jsonString(workflow, "id")
         rec["id"] = .string("workflow:\(wid)")
         rec["sourceId"] = .string(wid)
@@ -899,6 +638,7 @@ public func capabilityRecordsFull(
     }
 
     // 6. connector_actions_registry (static port) → kind: tool
+    let actionStatuses = try await connectorActionStatuses()
     for action in connectorActionDescriptors().prefix(200) {
         var rec: [String: JSONValue] = [:]
         rec["id"] = .string("connector_action:\(action.id)")
@@ -906,11 +646,10 @@ public func capabilityRecordsFull(
         let nameSource = action.name ?? action.id
         rec["name"] = .string(promptSafeCapabilityText(nameSource, limit: 160))
         rec["kind"] = .string("tool")
-        // Python: "active" if action.get("enabled", True) else "needs_setup".
-        // ConnectorActionDescriptor has no `enabled` field today, so the
-        // default-True branch always wins → "active". If a descriptor ever
-        // gains `enabled: Bool`, gate this with that field.
-        rec["status"] = .string("active")
+        guard let status = actionStatuses[action.id] else {
+            throw CapabilityTrustError.unavailable
+        }
+        rec["status"] = .string(status)
         let descSource = action.description ?? "Connector action \(action.id)."
         rec["description"] = .string(promptSafeCapabilityText(descSource, limit: 500))
         rec["triggers"] = .array([
@@ -931,9 +670,9 @@ public func capabilityRecordsFull(
     }
 
     // 7. list_mcp_servers → kind: mcp
-    let servers = await mcpServers()
+    let servers = try await mcpServers()
     for server in servers.prefix(50) {
-        var rec: [String: JSONValue] = [:]
+        var rec = capabilityTrustMetadata(server)
         let sid = jsonString(server, "id")
         rec["id"] = .string("mcp:\(sid)")
         rec["sourceId"] = .string(sid)
@@ -970,7 +709,7 @@ public func capabilityRecordsFull(
         dataRoot: dataRoot, nowISO: nowISO, persistence: persistence
     )
     for item in catalog {
-        var rec: [String: JSONValue] = [:]
+        var rec = capabilityTrustMetadata(item)
         let iid = jsonString(item, "id")
         rec["id"] = .string("catalog:\(iid)")
         rec["sourceId"] = .string(iid)

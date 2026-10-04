@@ -14,7 +14,7 @@ extension SwiftNativeMacControl {
         case refused(MacControlResult)
     }
 
-    private func menuTarget(_ body: [String: JSONValue]) -> MenuTarget {
+    private func menuTarget(_ body: [String: JSONValue], continuation: MacWorkContinuation? = nil) -> MenuTarget {
         let started = now()
         func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
             var output: [String: JSONValue] = [
@@ -42,7 +42,7 @@ extension SwiftNativeMacControl {
         }
         guard let requested = body.stringValue("app")?
             .trimmingCharacters(in: .whitespacesAndNewlines), !requested.isEmpty else {
-            guard let front = accessibilitySource.frontmostApp() else {
+            guard let front = continuation == nil ? accessibilitySource.frontmostApp() : continuation?.app else {
                 return .refused(refuse(
                     "no_frontmost_app",
                     "Nothing is frontmost right now, so there is no menu bar to read."
@@ -76,8 +76,8 @@ extension SwiftNativeMacControl {
         case .refused(let refusal): return refusal
         case .app(let hit): app = hit
         }
-        // Her-screen 09-24 — `find` walks menu by menu and stops at the first
-        // item of that name, so a long menu can't hide a later one.
+        // `find` keeps every match within the bounded walk so repeated names
+        // remain ambiguous across menus.
         // A path ("Format › Make Plain Text") finds that item under that menu.
         // A bare name ("Find/Replace") is never split.
         let wantedLevels = body.stringValue("find").map {
@@ -102,11 +102,11 @@ extension SwiftNativeMacControl {
             return chord.keyCode == wantedChord.keyCode && chord.modifiers == wantedChord.modifiers
         }
         // A path walks its named menus whole, so an exact level can beat a
-        // prefix one ("Edit" over "Editor"); a bare name or chord stops at the first.
+        // prefix one ("Edit" over "Editor"); only a chord stops at the first.
         let reading = MacMenuBar.read(
             source: accessibilitySource, pid: app.processIdentifier,
             top: wantedLevels.count > 1 ? wantedLevels.first : nil,
-            until: wanted != nil ? (wantedLevels.count > 1 ? nil : isWanted) : (wantedChord != nil ? hasChord : nil)
+            until: wanted == nil && wantedChord != nil ? hasChord : nil
         )
         // A background app's menus report stale enabled states (File › Save
         // "disabled" on an edited document), so they are not claimed.
@@ -126,13 +126,17 @@ extension SwiftNativeMacControl {
             func exact(_ item: MacMenuBar.Item) -> [Bool] {
                 zip(item.titlePath.map(MacMenuBar.normalized), wantedLevels).map { $0 == $1 }
             }
-            let hits = wanted == nil
+            var hits = wanted == nil
                 ? reading.items.suffix(1).filter(hasChord)
                 : reading.items.filter(isWanted).enumerated().sorted {
                     exact($0.element) != exact($1.element)
                         ? exact($0.element).lexicographicallyPrecedes(exact($1.element)) { $0 && !$1 }
                         : $0.offset < $1.offset
                 }.map(\.element)
+            if wantedLevels.count > 1, let first = hits.first {
+                let best = exact(first)
+                hits = hits.filter { exact($0) == best }
+            }
             output["found"] = .array(hits.prefix(3).map { item in
                 var row: [String: JSONValue] = [
                     "path": MacScreenViewTextRedaction.redactedLegendString(
@@ -208,10 +212,14 @@ extension SwiftNativeMacControl {
                 "menu_press needs `path` — the menu path to press, like \"File › Export › PDF\"."
             )
         }
+        let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
         let app: MacAXAppInfo
-        switch menuTarget(body) {
+        switch menuTarget(body, continuation: continuation) {
         case .refused(let refusal): return refusal
         case .app(let hit): app = hit
+        }
+        if let continuation, continuation.app?.processIdentifier != app.processIdentifier {
+            return refuse("continuation_target_mismatch", continuation.modelContext)
         }
         // Her-screen 09-24 — a path walks only its own top-level menu.
         let reading = MacMenuBar.read(
@@ -269,10 +277,35 @@ extension SwiftNativeMacControl {
                 "\(app.name)'s menu bar is not reachable any more."
             )
         }
+        func validatedTarget() -> MacAXActTarget? {
+            var titles: [String] = []
+            var leaf: MacAXActTarget?
+            for depth in 1...item.path.count {
+                guard case .resolved(let hit) = accessibilityActSource.resolve(
+                    menuPath: Array(item.path.prefix(depth)), inAppPid: app.processIdentifier
+                ) else { return nil }
+                if hit.role == "AXMenuBarItem" || hit.role == "AXMenuItem" {
+                    guard let title = MacMenuBar.cleanTitle(hit.title ?? hit.value) else { return nil }
+                    titles.append(title)
+                } else if hit.role != "AXMenu" {
+                    return nil
+                }
+                leaf = hit
+            }
+            return titles == item.titlePath ? leaf : nil
+        }
+        func driftRefusal() -> MacControlResult {
+            refuse("menu_path_drifted", "The menu changed, so the selected command was not pressed. Read the menu again.")
+        }
+        guard let validated = validatedTarget() else { return driftRefusal() }
+        target = validated
         // A front-only press (act with front:true): re-checked at the last
         // moment, so a person who switched apps during the walk wins.
         if requireFront, accessibilitySource.frontmostApp()?.processIdentifier != app.processIdentifier {
             return refuse("front_changed", "\(app.name) is no longer in front, so nothing was pressed.")
+        }
+        if let refusal = continuation?.refusal() {
+            return refuse("continuation_unavailable", refusal)
         }
         // Right after a raise an item can still read greyed out from its last
         // (background) validation. Opening its menu makes the app revalidate,
@@ -280,11 +313,13 @@ extension SwiftNativeMacControl {
         // the menu is closed and nothing is pressed.
         if requireFront, !target.enabled, let top = item.path.first,
            case .resolved(let bar) = accessibilityActSource.resolve(menuPath: [top], inAppPid: app.processIdentifier) {
+            guard MacMenuBar.cleanTitle(bar.title ?? bar.value) == item.titlePath.first else {
+                return driftRefusal()
+            }
             _ = accessibilityActSource.perform(bar, action: "AXPress")
             usleep(150_000)
-            if case .resolved(let fresh) = accessibilityActSource.resolve(menuPath: item.path, inAppPid: app.processIdentifier) {
-                target = fresh
-            }
+            guard let fresh = validatedTarget() else { return driftRefusal() }
+            target = fresh
             if !target.enabled {
                 if case .resolved(let menu) = accessibilityActSource.resolve(
                     menuPath: Array(item.path.prefix(2)), inAppPid: app.processIdentifier
@@ -298,12 +333,21 @@ extension SwiftNativeMacControl {
                 )
             }
         }
+        guard let fresh = validatedTarget() else { return driftRefusal() }
+        target = fresh
+        if requireFront, !target.enabled {
+            return refuse(
+                "menu_item_disabled",
+                MacMenuBar.words(for: .disabled(item), requested: requested) ?? "The menu item is greyed out.",
+                ["requested_path": .string(requested)]
+            )
+        }
         // Again right before the press: the revalidation above takes ~150 ms.
         if requireFront, accessibilitySource.frontmostApp()?.processIdentifier != app.processIdentifier {
             return refuse("front_changed", "\(app.name) is no longer in front, so nothing was pressed.")
         }
-        guard craftDocumentMatches(pid: app.processIdentifier) else {
-            return refuse("craft_document_changed", "The craft document changed; Save was not pressed.")
+        if let refusal = continuation?.refusal() {
+            return refuse("continuation_unavailable", refusal)
         }
         let outcome = accessibilityActSource.perform(target, action: "AXPress")
         guard outcome == .performed else {

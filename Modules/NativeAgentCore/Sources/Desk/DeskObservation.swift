@@ -60,6 +60,8 @@ public struct DeskObservedRef: Sendable, Equatable {
     /// Opaque change token for cadence learning: differing fingerprint between
     /// passes == the thing changed. Not interpreted here.
     public var fingerprint: String
+    /// When the source confirmed a transition from closed to open.
+    public var reopenedObservedAt: String?
 
     public init(
         refKey: String,
@@ -68,7 +70,8 @@ public struct DeskObservedRef: Sendable, Equatable {
         evidence: String,
         source: String,
         observedAt: String,
-        fingerprint: String
+        fingerprint: String,
+        reopenedObservedAt: String? = nil
     ) {
         self.refKey = refKey
         self.status = status
@@ -77,6 +80,7 @@ public struct DeskObservedRef: Sendable, Equatable {
         self.source = source
         self.observedAt = observedAt
         self.fingerprint = fingerprint
+        self.reopenedObservedAt = reopenedObservedAt
     }
 
     /// Canonical key for a desk ref, or nil when the ref names nothing
@@ -651,16 +655,18 @@ public enum DeskObservationEvaluator {
     }
 
     /// Reality reopened something the desk considers finished. Requires the
-    /// observation to be NEWER than the close, otherwise a stale snapshot of a
-    /// pre-close state would reopen every item it touched.
+    /// source to have observed a closed-to-open transition after the Desk close.
+    /// A newer poll alone proves no transition.
     private static func reopenDrift(item: DeskItem, observed: [DeskObservedRef]) -> DeskDrift? {
         guard item.status.isTerminal else { return nil }
         let reopened = observed.filter { !$0.terminal }
         guard !reopened.isEmpty else { return nil }
         guard let closedAtRaw = item.closedAt, let closedAt = DeskClock.parseISO(closedAtRaw) else { return nil }
         let fresh = reopened.filter { observation in
-            guard let stamp = DeskClock.parseISO(observation.observedAt) else { return false }
-            return stamp > closedAt
+            guard let raw = observation.reopenedObservedAt,
+                  let reopenedAt = DeskClock.parseISO(raw),
+                  let stamp = DeskClock.parseISO(observation.observedAt) else { return false }
+            return reopenedAt > closedAt && stamp >= reopenedAt
         }
         guard !fresh.isEmpty else { return nil }
         let keys = fresh.map(\.refKey).sorted()
@@ -692,8 +698,8 @@ public enum DeskObservationEvaluator {
         default:
             break
         }
-        let candidateKey = "\(candidate.status)\u{1F}\(candidate.fingerprint)\u{1F}\(candidate.source)"
-        let incumbentKey = "\(incumbent.status)\u{1F}\(incumbent.fingerprint)\u{1F}\(incumbent.source)"
+        let candidateKey = "\(candidate.status)\u{1F}\(candidate.fingerprint)\u{1F}\(candidate.source)\u{1F}\(candidate.reopenedObservedAt ?? "")"
+        let incumbentKey = "\(incumbent.status)\u{1F}\(incumbent.fingerprint)\u{1F}\(incumbent.source)\u{1F}\(incumbent.reopenedObservedAt ?? "")"
         return candidateKey < incumbentKey
     }
 

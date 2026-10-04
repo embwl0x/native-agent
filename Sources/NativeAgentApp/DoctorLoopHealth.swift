@@ -2,6 +2,7 @@ import Foundation
 import BackgroundLoops
 import DoctorChecks
 import PersistenceCore
+import Privacy
 
 // Doctor visibility for background loops. Motivated by 2026-07-12→16:
 // github_tracking failed every tick for 4 days (633 timeout receipts in
@@ -104,9 +105,35 @@ struct LoopHealthVerdict: Equatable, Identifiable, Sendable {
     let level: LoopHealthLevel
     let detail: String
     var id: String { loopId }
+
+    init(loopId: String, level: LoopHealthLevel, detail: String) {
+        self.loopId = loopId
+        self.level = level
+        self.detail = NativeAppSecretRedactor.redactText(detail)
+    }
 }
 
 enum DoctorLoopHealth {
+    struct FailureIncident: Sendable {
+        let firstAt: Date?
+        let lastAt: Date
+        let cumulativeOccurrences: Int
+
+        func confirmedOccurrences(since cutoff: Date, through now: Date) -> Int {
+            if let firstAt, firstAt >= cutoff, firstAt <= lastAt, lastAt <= now {
+                return cumulativeOccurrences
+            }
+            // A coalesced incident has no timestamps for its middle failures.
+            // Across a window boundary only its endpoints are evidence.
+            var count = lastAt >= cutoff && lastAt <= now ? 1 : 0
+            if cumulativeOccurrences > 1, let firstAt, firstAt < lastAt,
+               firstAt >= cutoff, firstAt <= now {
+                count += 1
+            }
+            return count
+        }
+    }
+
     /// A skip whose reason starts with this is a lane that cannot run on this
     /// Mac (iCloud Drive off): it is shown as a WARN row with the reason rather
     /// than folded into "nothing was due".
@@ -163,13 +190,11 @@ enum DoctorLoopHealth {
         max(estimatedInterval(for: observation) / 2, 60)
     }
 
-    /// Pure health rule. `recentFailureDates` maps loopId → receipt timestamps
-    /// (any order), with coalesced incidents contributing one timestamp per
-    /// occurrence. Only receipts inside the loop's grace window count toward
-    /// persistence.
+    /// Pure health rule. Incidents stay compact; only occurrences confirmed
+    /// inside the loop's grace window count toward persistence.
     static func evaluate(
         observations: [LoopHealthObservation],
-        recentFailureDates: [String: [Date]],
+        recentFailureDates: [String: [FailureIncident]],
         now: Date
     ) -> [LoopHealthVerdict] {
         observations.map { observation in
@@ -301,7 +326,7 @@ enum DoctorLoopHealth {
 
     private static func baseVerdict(
         for observation: LoopHealthObservation,
-        recentFailureDates: [String: [Date]],
+        recentFailureDates: [String: [FailureIncident]],
         now: Date
     ) -> LoopHealthVerdict {
         guard let lastError = observation.lastError else {
@@ -315,14 +340,17 @@ enum DoctorLoopHealth {
         let window = graceWindow(for: observation)
         let cutoff = now.addingTimeInterval(-window)
         let recentFailures = (recentFailureDates[observation.loopId] ?? [])
-            .filter { $0 >= cutoff && $0 <= now }
-            .count
+            .reduce(0) { count, incident in
+                let (sum, overflow) = count.addingReportingOverflow(
+                    incident.confirmedOccurrences(since: cutoff, through: now))
+                return overflow ? Int.max : sum
+            }
         let age = observation.lastRun.map { describeAge(now.timeIntervalSince($0)) } ?? "unknown"
         if recentFailures >= persistentFailureThreshold {
             return LoopHealthVerdict(
                 loopId: observation.loopId,
                 level: .fail,
-                detail: "Failing persistently (\(recentFailures) failures in \(describeAge(window))): \(lastError). Last tick \(age) ago."
+                detail: "Failing persistently (at least \(recentFailures) failures in \(describeAge(window))): \(lastError). Last tick \(age) ago."
             )
         }
         return LoopHealthVerdict(
@@ -414,7 +442,7 @@ enum DoctorLoopHealth {
         return "\(Int(s / 86400))d"
     }
 
-    /// Parses failure-receipt timestamps per loop from the scheduler's durable
+    /// Parses compact failure incidents per loop from the scheduler's durable
     /// receipts file (logs/background_loop_failures.jsonl). Bounded: reads at
     /// most the trailing `maxBytes` of the file and the newest `maxReceipts`
     /// rows, so a months-old file cannot balloon a Doctor load.
@@ -422,7 +450,7 @@ enum DoctorLoopHealth {
         receiptsFile: URL,
         maxBytes: Int = 512 * 1024,
         maxReceipts: Int = 500
-    ) -> [String: [Date]] {
+    ) -> [String: [FailureIncident]] {
         guard let handle = try? FileHandle(forReadingFrom: receiptsFile) else { return [:] }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
@@ -433,7 +461,7 @@ enum DoctorLoopHealth {
         let parser = ISO8601DateFormatter()
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        var result: [String: [Date]] = [:]
+        var result: [String: [FailureIncident]] = [:]
         // Drop the first line when we started mid-file: it is almost certainly
         // a partial JSON row.
         let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
@@ -446,10 +474,13 @@ enum DoctorLoopHealth {
             guard let date = parser.date(from: timestamp) ?? fractional.date(from: timestamp) else {
                 continue
             }
-            let occurrences = max(1, row["occurrences"] as? Int ?? 1)
-            for _ in 0..<occurrences {
-                result[loopId, default: []].append(date)
-            }
+            let firstTimestamp = (row["firstAt"] as? String) ?? (row["createdAt"] as? String) ?? ""
+            let firstAt = parser.date(from: firstTimestamp) ?? fractional.date(from: firstTimestamp)
+            result[loopId, default: []].append(FailureIncident(
+                firstAt: firstAt,
+                lastAt: date,
+                cumulativeOccurrences: max(1, row["occurrences"] as? Int ?? 1)
+            ))
         }
         return result
     }
@@ -479,7 +510,7 @@ enum DoctorLoopHealth {
     /// called it failing.
     static func doctorCheck(
         observations: [LoopHealthObservation],
-        recentFailureDates: [String: [Date]],
+        recentFailureDates: [String: [FailureIncident]],
         now: Date
     ) -> CheckResult {
         // Absence of loops is no signal, never health: the app registers its

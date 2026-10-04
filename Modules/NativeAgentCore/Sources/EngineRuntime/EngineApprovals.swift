@@ -38,24 +38,6 @@ public final class ApprovalsFacade {
     }
 }
 
-extension ApprovalRecord {
-    /// The conversation that asked, for a chat tool approval: the filer
-    /// (`NativeAgentChatApprovalFiler`) records it as `payload.origin.sessionId`.
-    /// Only chat approvals carry a chat origin — every other kind is nil rather
-    /// than borrowing a lookalike field.
-    public var chatOriginSessionId: String? {
-        guard case .object(let fields) = payload,
-              case .string(let kind)? = fields["kind"],
-              // ACP questions belong to a live protocol request, not a tool
-              // replay. They share chat presentation only, never execution.
-              kind == "chat_tool_approval" || kind == "agent_acp_live_approval",
-              case .object(let origin)? = fields["origin"],
-              case .string(let sessionId)? = origin["sessionId"] else { return nil }
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
 extension ApprovalRequest {
     /// The phone's approvals.json row, in the shape the Mac has always sent.
     public init(record: ApprovalRecord) {
@@ -72,7 +54,9 @@ extension ApprovalRequest {
             payloadPreview: record.payloadPreview,
             localOnly: record.localOnly,
             remoteResolvable: record.remoteResolvable,
-            chatOriginSessionId: record.chatOriginSessionId,
+            // Where the phone draws its inline card: the conversation the
+            // approval's chat card went to, else the one that asked.
+            chatOriginSessionId: record.chatCardSessionId ?? record.chatOriginSessionId,
             lastRequestedAt: record.lastRequestedAt
         )
     }

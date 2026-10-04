@@ -63,9 +63,16 @@ enum AppRelauncher {
 // Restart App is a worded item in the menu bar's NativeAgent menu
 // (NativeAgentApp.swift), reachable even when this window is closed.
 struct MainWindowContent: View {
+    @Environment(\.openWindow) private var openWindow
+
     var body: some View {
         ContentView()
             .background { ShellWindowChrome() }
+            .onAppear {
+                NativeAgentAppCoordinator.shared.configureMainWindowOpening { [openWindow] in
+                    openWindow(id: NativeAgentAppCoordinator.mainSceneID)
+                }
+            }
     }
 }
 
@@ -81,7 +88,7 @@ struct MenuBarOpenButton: View {
             // The main scene is a single-instance Window (not WindowGroup),
             // so openWindow(id:) reuses the existing one if visible or
             // recreates it if closed — never stacks copies.
-            openWindow(id: "main")
+            openWindow(id: NativeAgentAppCoordinator.mainSceneID)
         }
     }
 }

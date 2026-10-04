@@ -92,8 +92,23 @@ enum TelegramRichMessageRenderer {
         let parsed = parseBlocks(Array(safe.split(separator: "\n", omittingEmptySubsequences: false)))
         var remainingUnits = maximumBlockUnits
         let blocks = bounded(parsed, remainingUnits: &remainingUnits)
-        guard !blocks.isEmpty else { return nil }
+        guard !blocks.isEmpty, blocks == parsed, blocks.allSatisfy(fitsLimits) else { return nil }
         return TelegramInputRichMessage(blocks: blocks)
+    }
+
+    private static func fitsLimits(_ block: TelegramInputRichBlock) -> Bool {
+        switch block {
+        case .paragraph(let text): return text.utf8.count <= 8_000
+        case .heading(let text, _): return text.utf8.count <= 1_024
+        case .preformatted(let text, let language):
+            return text.utf8.count <= 12_000 && (language?.count ?? 0) <= 32
+        case .table(let rows):
+            return rows.count <= maximumTableRows && rows.allSatisfy {
+                $0.count <= maximumTableColumns && $0.allSatisfy { $0.text.utf8.count <= 1_024 }
+            }
+        case .details(let summary, let children):
+            return summary.utf8.count <= 512 && children.count <= 48 && children.allSatisfy(fitsLimits)
+        }
     }
 
     /// Telegram counts nested blocks and table rows toward its 500-block
@@ -196,7 +211,7 @@ enum TelegramRichMessageRenderer {
         let lines = source.map(String.init)
         var blocks: [TelegramInputRichBlock] = []
         var index = 0
-        while index < lines.count, blocks.count < maximumBlocks {
+        while index < lines.count {
             let line = lines[index]
             if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 index += 1
@@ -214,8 +229,8 @@ enum TelegramRichMessageRenderer {
                 }
                 if index < lines.count { index += 1 }
                 blocks.append(.preformatted(
-                    text: truncateUTF8(body.joined(separator: "\n"), limit: 12_000),
-                    language: language.isEmpty ? nil : String(language.prefix(32))
+                    text: body.joined(separator: "\n"),
+                    language: language.isEmpty ? nil : language
                 ))
                 continue
             }
@@ -237,13 +252,8 @@ enum TelegramRichMessageRenderer {
                     index += 1
                 }
                 if index < lines.count { index += 1 }
-                let childBlocks = Array(parseBlocks(nested).prefix(48))
-                if !childBlocks.isEmpty {
-                    blocks.append(.details(
-                        summary: truncateUTF8(summary, limit: 512),
-                        blocks: childBlocks
-                    ))
-                }
+                let childBlocks = parseBlocks(nested)
+                blocks.append(.details(summary: summary, blocks: childBlocks))
                 continue
             }
 
@@ -254,8 +264,7 @@ enum TelegramRichMessageRenderer {
                 index += 2
                 var rows = [header.map { TelegramInputRichTableCell(text: $0, isHeader: true) }]
                 while index < lines.count,
-                      isTableRow(lines[index]),
-                      rows.count < maximumTableRows {
+                      isTableRow(lines[index]) {
                     rows.append(tableCells(lines[index]).map {
                         TelegramInputRichTableCell(text: $0, isHeader: false)
                     })
@@ -276,7 +285,7 @@ enum TelegramRichMessageRenderer {
                 paragraph.append(lines[index])
                 index += 1
             }
-            let text = truncateUTF8(paragraph.joined(separator: "\n"), limit: 8_000)
+            let text = paragraph.joined(separator: "\n")
             if !text.isEmpty { blocks.append(.paragraph(text)) }
         }
         return blocks
@@ -289,7 +298,7 @@ enum TelegramRichMessageRenderer {
         guard remainder.first == " " else { return nil }
         let text = String(remainder).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        return (hashes.count, truncateUTF8(text, limit: 1_024))
+        return (hashes.count, text)
     }
 
     private static func detailsSummary(from line: String) -> String? {
@@ -322,25 +331,6 @@ enum TelegramRichMessageRenderer {
         if value.hasPrefix("|") { value.removeFirst() }
         if value.hasSuffix("|") { value.removeLast() }
         return value.split(separator: "|", omittingEmptySubsequences: false)
-            .prefix(maximumTableColumns)
-            .map {
-                truncateUTF8(
-                    String($0).trimmingCharacters(in: .whitespacesAndNewlines),
-                    limit: 1_024
-                )
-            }
-    }
-
-    private static func truncateUTF8(_ value: String, limit: Int) -> String {
-        guard value.utf8.count > limit else { return value }
-        var output = ""
-        var count = 0
-        for character in value {
-            let bytes = String(character).utf8.count
-            if count + bytes + 3 > limit { break }
-            output.append(character)
-            count += bytes
-        }
-        return output + "..."
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 }

@@ -50,12 +50,24 @@ extension MacFourVerbs {
         /// bringing it forward. Absent is the ordinary frontmost act.
         app: String? = nil,
         /// With `app`: bring it forward for this act, then put the person's
-        /// front app back. Only after a background act answered `needs_front`.
+        /// front app back. Requires an explicit foreground request from the task.
         front: Bool = false,
         /// Her-screen Phase 5 — a short ordered batch, run in ONE call. When
         /// given, `verb`/`target` are ignored.
         steps: [MacActStep] = []
     ) async -> MacFourVerbsReply {
+        if MacDriverContext.binding == nil {
+            let binding = await MacAttentionSessionStore.shared.bindDriver()
+            return await withTaskCancellationHandler {
+                defer { binding.releaseHeldInputs() }
+                return await MacDriverContext.$binding.withValue(binding) {
+                    await act(verb: rawVerb, target: target, text: text, mode: mode,
+                              to: destination, toApp: destinationApp, seconds: seconds,
+                              repeat: requestedRepeat, interval: interval, holding: holding,
+                              button: button, scrollAmount: scrollAmount, app: app, front: front, steps: steps)
+                }
+            } onCancel: { binding.cancel() }
+        }
         // Her-screen 09-24 — acts run one at a time: two parallel calls on one
         // app interleaved their presses (7×7×6). Then the app maps this act
         // taught or corrected are written once, and the next act may start.
@@ -66,20 +78,33 @@ extension MacFourVerbs {
                 await MacActSerial.shared.release()
             }
         }
-        let anchor = app.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
+        if let refusal = continuation?.refusal() {
+            return .init(ok: false, text: refusal, detail: ["error": .string("continuation_unavailable")])
+        }
+        if let continuation, let app, let captured = continuation.app,
+           app.caseInsensitiveCompare(captured.name) != .orderedSame,
+           app.caseInsensitiveCompare(captured.bundleIdentifier ?? "") != .orderedSame {
+            return .init(ok: false, text: continuation.modelContext,
+                detail: ["error": .string("continuation_target_mismatch")])
+        }
+        let anchor = (continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .flatMap { $0.isEmpty ? nil : $0 }
         let run: ([MacActStep], String?, FrontExpectation?) async -> MacFourVerbsReply = { steps, anchorApp, expect in
-            guard steps.isEmpty else { return await self.actSteps(steps, app: anchorApp, expect: expect) }
-            return await self.actCore(
-                verb: rawVerb, target: target, text: text, mode: mode, to: destination, toApp: destinationApp,
-                seconds: seconds, repeat: requestedRepeat, interval: interval, holding: holding,
-                button: button, scrollAmount: scrollAmount, app: anchorApp, expect: expect
-            )
+            await Self.$foregroundRequested.withValue(front) {
+                guard steps.isEmpty else { return await self.actSteps(steps, app: anchorApp, expect: expect) }
+                return await self.actCore(
+                    verb: rawVerb, target: target, text: text, mode: mode, to: destination, toApp: destinationApp,
+                    seconds: seconds, repeat: requestedRepeat, interval: interval, holding: holding,
+                    button: button, scrollAmount: scrollAmount, app: anchorApp, expect: expect
+                )
+            }
         }
         guard let anchor else { return Self.withUncertainActionOutcome(await run(steps, nil, nil)) }
         // A miss never touches the screen: the (first) thing to act on is
         // resolved in the background read before anything is raised.
-        let missBefore: ([MacActStep], Sighting) async -> MacFourVerbsReply? = { steps, seen in
+        let missBefore: ([MacActStep], Sighting?) async -> MacFourVerbsReply? = { steps, seen in
             // Every verb is checked before anything is raised.
             for (index, step) in (steps.isEmpty ? [MacActStep(verb: rawVerb, target: target)] : steps).enumerated() {
                 guard let bad = Self.unknownVerb(step.verb, target: step.target) else { continue }
@@ -89,32 +114,44 @@ extension MacFourVerbs {
                     detail: bad.detail.merging(["failed_step": .int(Int64(index + 1)), "steps_completed": .int(0)]) { _, new in new }
                 )
             }
+            guard let seen else { return nil }
             guard let first = steps.first else { return await self.missBeforeRaise(verb: rawVerb, target: target, in: seen) }
             // An optional first step ("OK?") that isn't here is skipped once
             // raised, like any optional step — it never stops the batch here.
             if first.target.hasSuffix("?"), first.target.count > 1 { return nil }
             guard let miss = await self.missBeforeRaise(verb: first.verb, target: first.target, in: seen) else { return nil }
+            let reason = Self.string(miss.detail["error"]) ?? "no_match"
             return MacFourVerbsReply(
                 ok: false,
-                text: "Stopped at step 1 of \(steps.count) (no_match); the rest were not run.\n" + miss.text,
+                text: "Stopped at step 1 of \(steps.count) (\(reason)); the rest were not run.\n" + miss.text,
                 detail: miss.detail.merging([
                     "failed_step": .int(1), "steps_completed": .int(0), "steps_total": .int(Int64(steps.count)),
                 ]) { _, new in new }
             )
         }
+        let first = steps.first ?? MacActStep(verb: rawVerb, target: target)
+        let menuOrKey = Self.isMenuPath(first.target) || Self.parseVerb(first.verb).0 == "key" || Self.pressMeansKey(first.target)
         let forward: ([MacActStep]) async -> MacFourVerbsReply = { steps in
             await self.actBroughtForward(
-                app: anchor, seek: steps.first?.target ?? target, missBefore: { await missBefore(steps, $0) }
+                app: anchor, seek: steps.first?.target ?? target, menuOrKey: menuOrKey,
+                missBefore: { await missBefore(steps, $0) }
             ) { await run(steps, nil, $0) }
         }
         var reply = front ? await forward(steps) : await run(steps, anchor, nil)
         if front, steps.isEmpty, reply.ok {
             reply = MacFourVerbsReply(ok: true, text: Self.oneCallNudge + "\n" + reply.text, detail: reply.detail)
         }
-        if !front {
-            reply = await frontWhenNeeded(reply, app: anchor, steps: steps, rawVerb: rawVerb, target: target, forward: forward) {
-                await run(steps, nil, $0)
-            }
+        if !front, menuOrKey, Self.string(reply.detail["error"]) == "no_window_in_app" {
+            let reason = "\(anchor) has no window, so its menu bar or keys need it in front"
+            reply = MacFourVerbsReply(
+                ok: false,
+                text: "I need the screen because " + reason + ". Nothing came to the front. "
+                    + "Only use front:true when the task explicitly asks to bring \(anchor) forward.\n" + reply.text,
+                detail: reply.detail.merging([
+                    "error": .string("needs_front"), "status": .string("needs_front"),
+                    "needs_front_reason": .string(reason), "user_front_changed": .bool(false),
+                ]) { _, new in new }
+            )
         }
         // Electron/Chromium: the enhanced-AX flag was only for this act.
         let release = try? await host.dispatch(action: "look", body: [
@@ -134,80 +171,36 @@ extension MacFourVerbs {
     /// in front when the act looks, or it refuses.
     typealias FrontExpectation = (pid: Int32, frame: MacAXFrame?)
 
-    /// Her-screen 09-25 — User: "it's practically her computer"; a retry is our
-    /// defect. A background act that answered needs_front takes the front in
-    /// the SAME call (steps already done in the back are not run again), unless
-    /// the person is at the keyboard or mouse right now. An app with no window
-    /// is brought forward itself, so its menu bar and keys work (File > New
-    /// makes the window). An accessibility action that already went out
-    /// unconfirmed is not followed by a real click: that could do it twice.
-    private func frontWhenNeeded(
-        _ reply: MacFourVerbsReply,
+    /// Explicit front:true can activate a windowless app for its menus or keys.
+    private func actWindowlessBroughtForward(
+        _ windowless: MacFourVerbsReply,
         app: String,
-        steps: [MacActStep],
-        rawVerb: String,
-        target: String,
-        forward: ([MacActStep]) async -> MacFourVerbsReply,
-        runInFront: (FrontExpectation?) async -> MacFourVerbsReply
+        run: (FrontExpectation?) async -> MacFourVerbsReply
     ) async -> MacFourVerbsReply {
-        let error = Self.string(reply.detail["error"])
-        let first = steps.first ?? MacActStep(verb: rawVerb, target: target)
-        let menuOrKey = Self.isMenuPath(first.target) || Self.parseVerb(first.verb).0 == "key" || Self.pressMeansKey(first.target)
-        guard (error == "no_window_in_app" && menuOrKey)
-            || (error == "needs_front" && Self.bool(reply.detail["ax_delivered"]) != true) else { return reply }
-        if let ago = MacPersonInput.activeSecondsAgo() {
-            return MacFourVerbsReply(
-                ok: false,
-                text: "The person is using the Mac right now (input \(Int(ago.rounded()))s ago), so I didn't take the front from them. "
-                    + reply.text,
-                detail: reply.detail.merging(["person_active": .bool(true)]) { _, new in new }
-            )
-        }
-        let done = Self.int(reply.detail["steps_completed"]).map(Int.init) ?? 0
-        var windowless = reply
-        if error == "needs_front" {
-            let typedInBack = done > 0 && Self.parseVerb(steps[done - 1].verb).0 == "type" ? steps[done - 1].text : nil
-            let rest = await Self.$typedJustBefore.withValue(typedInBack) { await forward(Array(steps.dropFirst(done))) }
-            // A key for an app with no window: raising found nothing to raise.
-            guard done == 0, menuOrKey, Self.string(rest.detail["error"]) == "no_window_in_app" else {
-                guard done > 0 else { return rest }
-                // The receipt counts the whole batch, not the resumed part.
-                var detail = rest.detail
-                detail["steps_completed"] = .int((Self.int(rest.detail["steps_completed"]) ?? 0) + Int64(done))
-                detail["steps_total"] = .int(Int64(steps.count))
-                if let failed = Self.int(rest.detail["failed_step"]) { detail["failed_step"] = .int(failed + Int64(done)) }
-                detail["steps_completed_in_back"] = .int(Int64(done))
-                let doneLines = reply.text.split(separator: "\n").dropFirst().prefix(done).joined(separator: "\n")
-                return MacFourVerbsReply(
-                    ok: rest.ok,
-                    text: "Steps 1–\(done) ran in the back:\n\(doneLines)\nFrom step \(done + 1) on it needed \(app) in front (numbered again from 1):\n"
-                        + rest.text,
-                    detail: detail
-                )
-            }
-            windowless = rest
-        }
-        // No window at all: bring the app itself forward — its menu bar and
-        // keys still work, and they are how a window comes back — then put the
-        // app that was in front back. No known front app: nothing is taken.
         let previous = Self.object(windowless.detail["frontmost_app"])
         guard let previousPid = Self.int(previous["pid"]).flatMap(Int32.init(exactly:)) else { return windowless }
         let previousName = Self.string(previous["name"]) ?? "the previous app"
         func restore() async -> Bool {
             var body: [String: JSONValue] = ["pid": .int(Int64(previousPid))]
             if let window = previous["window"], window != .null { body["window"] = window }
-            let result = try? await host.dispatch(action: "focus_app", body: body)
+            let result = await MacWorkContinuation.$current.withValue(nil) {
+                try? await host.dispatch(action: "focus_app", body: body)
+            }
             return result?.ok == true && Self.bool(Self.object(result?.output)["frontmost_pid_matches"]) == true
         }
         let focused = try? await host.dispatch(action: "focus_app", body: ["app": .string(app)])
+        if let focused, let error = focused.error, error.hasPrefix("human_takeover:") {
+            return MacFourVerbsReply(ok: false, text: error,
+                detail: Self.operationDetail(focused).merging(["error": .string(error)]) { _, new in new })
+        }
         guard focused?.ok == true,
               let pid = Self.int(Self.object(focused?.output)["process_identifier"]).flatMap(Int32.init(exactly:))
         else {
             _ = await restore()
             return windowless
         }
-        let acted = await runInFront((pid, nil))
-        // He picked a new front app mid-act; putting his old one back would undo him.
+        let acted = await run((pid, nil))
+        // A new front app chosen mid-act must not be replaced by the old one.
         guard Self.string(acted.detail["error"]) != "user_changed_apps" else { return acted }
         let wasFront = pid == previousPid
         let restored = wasFront ? true : await restore()
@@ -229,12 +222,16 @@ extension MacFourVerbs {
     private func actBroughtForward(
         app: String,
         seek: String,
-        missBefore: (Sighting) async -> MacFourVerbsReply?,
+        menuOrKey: Bool,
+        missBefore: (Sighting?) async -> MacFourVerbsReply?,
         run: (FrontExpectation?) async -> MacFourVerbsReply
     ) async -> MacFourVerbsReply {
         let anchored: Sighting
         switch await sight(part: nil, app: app, seek: seek) {
-        case .blind(let reply): return reply
+        case .blind(let reply):
+            guard menuOrKey, Self.string(reply.detail["error"]) == "no_window_in_app" else { return reply }
+            if let miss = await missBefore(nil) { return miss }
+            return await actWindowlessBroughtForward(reply, app: app, run: run)
         case .seen(let hit): anchored = hit
         }
         let appName = anchored.appName ?? app
@@ -273,7 +270,9 @@ extension MacFourVerbs {
         func restore() async -> (restored: Bool, gone: Bool) {
             var body: [String: JSONValue] = ["pid": .int(Int64(previous.pid))]
             if let window = previous.window { body["window"] = window }
-            let result = try? await host.dispatch(action: "focus_app", body: body)
+            let result = await MacWorkContinuation.$current.withValue(nil) {
+                try? await host.dispatch(action: "focus_app", body: body)
+            }
             let output = Self.object(result?.output)
             return (
                 result?.ok == true && Self.bool(output["frontmost_pid_matches"]) == true,
@@ -297,6 +296,10 @@ extension MacFourVerbs {
             "frame_id": .string(anchored.frameId),
         ])
         let raisedOutput = Self.object(raised?.output)
+        if let raised, let error = raised.error, error.hasPrefix("human_takeover:") {
+            return MacFourVerbsReply(ok: false, text: error,
+                detail: Self.operationDetail(raised).merging(["error": .string(error)]) { _, new in new })
+        }
         guard raised?.ok == true else {
             let windowChanged = Self.string(raisedOutput["status"]) == "front_window_changed"
             let (words, extra) = restoreWords(await restore())
@@ -407,7 +410,7 @@ extension MacFourVerbs {
             return MacFourVerbsReply(
                 ok: false,
                 text: "I couldn't start a continuous act safely. \(message)",
-                detail: ["error": .string("continuous_attention_unavailable")]
+                detail: ["error": .string(message.hasPrefix("human_takeover:") ? message : "continuous_attention_unavailable")]
             )
         }
         let burstStartedAt = clock.monotonicSeconds()
@@ -563,7 +566,9 @@ extension MacFourVerbs {
             let status = try await host.dispatch(action: "attention", body: ["mode": .string("status")])
             if Self.bool(Self.object(status.output)["active"]) == true {
                 guard let current = lease(from: status, owned: false) else {
-                    return .failure("The existing attention session needs a fresh observation first.")
+                    return .failure(Self.bool(Self.object(Self.object(status.output)["attention"])["yield_required"]) == true
+                        ? MacAttentionSessionStore.driverRefusal
+                        : "The existing attention session needs a fresh observation first.")
                 }
                 return .success(current)
             }
@@ -572,7 +577,9 @@ extension MacFourVerbs {
                 "duration_seconds": .int(Int64(Self.maximumActBurstSeconds)),
             ])
             guard let created = lease(from: started, owned: true) else {
-                return .failure("The Mac's bounded human-takeover observer did not become ready.")
+                return .failure(Self.bool(Self.object(Self.object(started.output)["attention"])["yield_required"]) == true
+                    ? MacAttentionSessionStore.driverRefusal
+                    : "The Mac's bounded human-takeover observer did not become ready.")
             }
             return .success(created)
         } catch {
@@ -636,10 +643,8 @@ extension MacFourVerbs {
                 : "I haven't touched \(name) and nothing came to the front. "
             return MacFourVerbsReply(
                 ok: false,
-                text: "needs_front: \(reason). " + touched
-                    + "Repeat with front: true and I'll bring \(name) forward briefly, then put the front app back: "
-                    + "act app:\"\(name)\" verb:\"\(verbName)\" target:\"\(target)\" front:true"
-                    + (verbName == "key" || reason.contains("menu") ? ". " + Self.oneCallNudge : "")
+                text: "I need the screen because \(reason). " + touched
+                    + "Only use front:true when the task explicitly asks to bring \(name) forward."
                     + (screen.map { "\n" + $0 } ?? ""),
                 detail: [
                     "error": .string("needs_front"),
@@ -939,7 +944,7 @@ extension MacFourVerbs {
             }
             if named.count < 3 {
                 line += " This window exposes almost nothing to accessibility, so a name can't reach it:"
-                    + " call screen for this app (it attaches the window's image when accessibility is thin)"
+                    + " look at this app again (it attaches the window's image when accessibility is thin)"
                     + " and act on the visual target it lists."
             }
             return MacFourVerbsReply(
@@ -1248,9 +1253,8 @@ extension MacFourVerbs {
                 if let label = Self.string(acted["label"]), !label.isEmpty { return "\(actedKind) \"\(label)\"" }
                 return "\(actedKind) \(Self.name(candidate))"
             }()
-            // Typing says what went where: `Typed "hello.txt" into "Save As"`.
             let typedInto = verb == .type
-                ? " \"\(String((text ?? "").prefix(60)))\" into \"\(target.trimmingCharacters(in: .whitespacesAndNewlines))\""
+                ? " into " + matchedName
                 : nil
             var line = (effect.status == "acted"
                 ? (typedInto == nil ? Self.pastTense(verb, direction: direction) : "Typed")
@@ -1305,6 +1309,9 @@ extension MacFourVerbs {
                     return Self.path(output["path"]).starts(with: ancestor) ? nil
                         : (Self.string(actedOn["role"]).map { MacScreenRender.kindName(role: $0) } ?? "another element")
                 }
+                if bareFieldHit, let path = candidate.sourceAXPath,
+                   Self.path(output["path"]) == path,
+                   Self.string(Self.object(Self.object(output["effect"])["acted_element"])["handle"]) == candidate.handle { return nil }
                 guard let actedLabel = Self.string(acted["label"]), !answersLabel(actedLabel) else { return nil }
                 return actedLabel
             }()
@@ -1383,6 +1390,9 @@ extension MacFourVerbs {
         return ["return", "enter"].contains(normalize(keySpec(step.target) ?? step.target))
     }
 
+    /// Only the caller's explicit front:true permits a cross-app drag to raise.
+    @TaskLocal static var foregroundRequested = false
+
     /// In a batch, what the step before a key step typed: a change that is
     /// only that text is not the key's effect.
     @TaskLocal static var typedJustBefore: String?
@@ -1420,7 +1430,7 @@ extension MacFourVerbs {
         let reply = await Self.$requiredFrontPid.withValue(pid) {
             await performHand(
                 body: ["gesture": .string("type"), "text": .string(text)],
-                description: "Typed \"\(String(text.prefix(60)))\" into \(place) with the keyboard.",
+                description: "Typed into \(place) with the keyboard.",
                 attention: attention,
                 before: before
             )
@@ -1785,8 +1795,9 @@ extension MacFourVerbs {
                     detail: ["error": .string("front_unknown")]
                 )
             }
-            guard let row = await menuFind(target, app: before.appName),
-                  let path = Self.string(row["path"]) else { return nil }
+            let lookup = await menuLookup(target, app: before.appName, frontPid: pid)
+            if let refusal = Self.menuLookupRefusal(target, lookup: lookup, screen: screen) { return refusal }
+            guard let row = lookup.row, let path = Self.string(row["path"]) else { return nil }
             var press: [String: JSONValue] = ["path": .string(path), "require_front": .bool(true)]
             // Keep the observed process across Finder navigation and menu
             // revalidation; never resolve its display name to a new process.
@@ -1838,7 +1849,9 @@ extension MacFourVerbs {
             if let after { text += "\n" + after.render }
             return MacFourVerbsReply(ok: true, text: text, detail: detail)
         }
-        guard let row = await menuFind(target, app: app), let path = Self.string(row["path"]) else { return nil }
+        let lookup = await menuLookup(target, app: app)
+        if let refusal = Self.menuLookupRefusal(target, lookup: lookup, screen: screen) { return refusal }
+        guard let row = lookup.row, let path = Self.string(row["path"]) else { return nil }
         let menuName = MacMenuBar.components(path).first ?? path
         let glyphs = Self.string(row["shortcut"])
         let chord = Self.string(row["chord"])
@@ -1858,16 +1871,13 @@ extension MacFourVerbs {
             detail["status"] = .string("needs_front")
             detail["needs_front_reason"] = .string("it's a menu command")
             detail["background"] = .bool(true)
-            // The exact ready-to-use call, so the next turn is one step.
-            let call = chord.map { "act app:\"\(app)\" verb:\"key\" target:\"\($0)\" front:true" }
-                ?? "act app:\"\(app)\" verb:\"click\" target:\"\(path)\" front:true"
-            text = "\"\(target)\" is in \(app)'s \(menuName) menu\(shortcut) — that needs \(app) in front. Use: \(call)"
-                + ". Nothing was touched. " + Self.oneCallNudge + greyed
+            text = "\"\(target)\" is in \(app)'s \(menuName) menu\(shortcut) — I need the screen because it's a menu command. "
+                + "Nothing was touched. Only use front:true when the task explicitly asks to bring \(app) forward." + greyed
         } else {
             detail["error"] = .string("in_menu")
             detail["status"] = .string("in_menu")
             text = "\"\(target)\" isn't in the window; it's the menu command \(path)\(shortcut). Use: "
-                + (chord.map { "act verb:\"key\" target:\"\($0)\"" } ?? "menu_press \"\(path)\"")
+                + (chord.map { "verb:\"key\" target:\"\($0)\"" } ?? "app mac.menu_press {path: \"\(path)\"} (menu_press where that is your tool)")
                 + ". Nothing was touched." + greyed
         }
         return MacFourVerbsReply(ok: false, text: text + "\n" + screen, detail: detail)
@@ -1878,7 +1888,9 @@ extension MacFourVerbs {
     /// path there, then look for the window it brings up. `frontPid`: the app
     /// the act brought forward, which must still be in front for both.
     func menuPressNoWindow(_ target: String, frontPid: Int32?) async -> MacFourVerbsReply {
-        let path = await menuFind(target, app: nil, frontPid: frontPid).flatMap { Self.string($0["path"]) } ?? target
+        let lookup = await menuLookup(target, app: nil, frontPid: frontPid)
+        if let refusal = Self.menuLookupRefusal(target, lookup: lookup) { return refusal }
+        let path = lookup.row.flatMap { Self.string($0["path"]) } ?? target
         var body: [String: JSONValue] = ["path": .string(path), "require_front": .bool(true)]
         if let frontPid { body["require_front_pid"] = .int(Int64(frontPid)) }
         let pressed = try? await host.dispatch(action: "menu_press", body: body)
@@ -1930,14 +1942,27 @@ extension MacFourVerbs {
         }
         let items = open.targets.filter { $0.kind == "menu item" }
         guard case .hit(let item) = Self.resolve(option, among: items), Self.answers(option, item), item.enabled else {
-            _ = try? await host.dispatch(action: "hand", body: ["gesture": .string("key"), "keys": .string("escape")])
+            let dismissed = try? await host.dispatch(action: "hand", body: ["gesture": .string("key"), "keys": .string("escape")])
             let offered = items.compactMap { $0.enabled ? $0.label : nil }.filter { !$0.isEmpty }
-            return fail(
-                "\(Self.name(popup)) has no \"\(option)\" to choose"
-                    + (offered.isEmpty ? "." : "; it offers: " + offered.joined(separator: ", ") + ".")
-                    + " I closed it; nothing changed.",
-                "option_not_offered", screen: before.render
-            )
+            let words = "\(Self.name(popup)) has no \"\(option)\" to choose"
+                + (offered.isEmpty ? "." : "; it offers: " + offered.joined(separator: ", ") + ".")
+            switch await sight(part: nil) {
+            case .blind(let reply):
+                return fail(words + " I couldn't confirm that the popup closed. " + reply.text,
+                            "popup_dismissal_unverified", screen: "")
+            case .seen(let after):
+                let closed = dismissed?.ok == true && after.pid == open.pid
+                    && !after.targets.contains { $0.kind == "menu item" }
+                    && after.targets.contains {
+                        $0.handle == popup.handle
+                            || (popup.sourceAXPath != nil && $0.sourceAXPath == popup.sourceAXPath)
+                    }
+                return fail(
+                    words + (closed ? " The popup is closed; I didn't select an option."
+                                    : " I couldn't confirm that the popup closed; I didn't select an option."),
+                    closed ? "option_not_offered" : "popup_dismissal_unverified", screen: after.render
+                )
+            }
         }
         let picked = await performSupplementalSemantic(
             .click, direction: .down, candidate: item, target: option, text: nil, holding: nil,
@@ -1968,17 +1993,34 @@ extension MacFourVerbs {
         return MacFourVerbsReply(ok: true, text: "Selected \"\(wanted)\" in \(Self.name(popup)); it now reads that.\n" + after.render, detail: detail)
     }
 
-    /// The menu item `target` names: a path ("Format › Make Plain Text") or a
-    /// bare name. Menu titles are literal, so the name is tried as said first
-    /// ("Make Plain Text" keeps its "Text"), then without a trailing role word.
-    func menuFind(_ target: String, app: String?, frontPid: Int32? = nil) async -> [String: JSONValue]? {
-        await menuLookup(target, app: app, frontPid: frontPid).row
+    struct MenuLookup {
+        let row: [String: JSONValue]?
+        let readable: Bool
+        var candidates: [String] = []
+        var ambiguous: Bool = false
+        var incomplete: Bool = false
     }
 
+    static func menuLookupRefusal(_ target: String, lookup: MenuLookup, screen: String? = nil) -> MacFourVerbsReply? {
+        guard lookup.ambiguous || lookup.incomplete else { return nil }
+        let words = lookup.ambiguous
+            ? "More than one menu command matches \"\(target)\""
+                + (lookup.candidates.isEmpty ? "." : ": " + lookup.candidates.joined(separator: "; ") + ".")
+            : "I couldn't read all the menus, so I can't tell whether \"\(target)\" names one command."
+        return MacFourVerbsReply(
+            ok: false,
+            text: words + " Use an explicit menu path. No command was pressed." + (screen.map { "\n" + $0 } ?? ""),
+            detail: ["error": .string(lookup.incomplete ? "menu_lookup_incomplete" : "menu_path_ambiguous"),
+                     "target": .string(target), "candidates": .array(lookup.candidates.map(JSONValue.string))]
+        )
+    }
+
+    /// Menu titles are literal: try the name as said, then without a trailing
+    /// role word. A repeated name or incomplete bare-name walk is not a hit.
     /// `readable`: the walk reached real items (a level under a menu) in the
     /// menus it looked in. An app launched in the back may publish a missing
     /// or bare menu bar until it is first activated — absent there is unknown.
-    func menuLookup(_ target: String, app: String?, frontPid: Int32? = nil) async -> (row: [String: JSONValue]?, readable: Bool) {
+    func menuLookup(_ target: String, app: String?, frontPid: Int32? = nil) async -> MenuLookup {
         let said = target.trimmingCharacters(in: .whitespacesAndNewlines)
         let stripped = Self.stripRoleWords(said)
         let names = MacMenuBar.isPath(said) || stripped == Self.normalize(said) ? [said] : [said, stripped]
@@ -1992,9 +2034,18 @@ extension MacFourVerbs {
             if Self.array(output["paths"]).contains(where: { (Self.string(Self.object($0)["path"]) ?? "").contains("›") }) {
                 readable = true
             }
-            if found.ok, let first = Self.array(output["found"]).first { return (Self.object(first), true) }
+            guard found.ok else { continue }
+            let hits = Self.array(output["found"]).map(Self.object)
+            if hits.count > 1 {
+                return MenuLookup(row: nil, readable: true,
+                                  candidates: hits.compactMap { Self.string($0["path"]) }, ambiguous: true)
+            }
+            if !Self.isMenuPath(name), Self.bool(output["truncated"]) == true {
+                return MenuLookup(row: nil, readable: readable, incomplete: true)
+            }
+            if let first = hits.first { return MenuLookup(row: first, readable: true) }
         }
-        return (nil, readable)
+        return MenuLookup(row: nil, readable: readable)
     }
 
     /// An act verb this hand has, or the short answer listing them.
@@ -2044,6 +2095,7 @@ extension MacFourVerbs {
         if clickish {
             // Found, or menus not readable in the back yet: the real press decides.
             let menu = await menuLookup(target, app: seen.appName)
+            if let refusal = Self.menuLookupRefusal(target, lookup: menu, screen: seen.render) { return refusal }
             if menu.row != nil || !menu.readable { return nil }
         }
         let name = seen.appName ?? "that app"

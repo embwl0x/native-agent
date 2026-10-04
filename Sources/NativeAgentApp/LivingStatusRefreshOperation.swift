@@ -5,7 +5,6 @@ import CognitiveSubstrate
 import NativeAgentShared
 import PersistenceCore
 import Desk
-import DeviceSync
 
 /// The mounted Living Status refresh owns a complete snapshot: mixing one
 /// fresh endpoint with guessed zeroes from another would fabricate a calm
@@ -33,25 +32,17 @@ struct LivingStatusRefreshOperation {
         }
     }
 
-    static func run(
-        appModel: AppModel,
-        dataRoot: URL,
-        approvalsOverride: (() async throws -> [ApprovalRecord])? = nil
-    ) async -> Outcome {
+    static func run(appModel: AppModel) async -> Outcome {
         guard let organism = await appModel.engine.cognitionView.organismSnapshot() else {
             return Outcome(snapshot: nil, failedEndpoints: ["Cognition"])
         }
         var failedEndpoints: [String] = []
-        let deskItems: [DeskItem]
-        do {
-            deskItems = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
-        } catch {
-            deskItems = []
-            failedEndpoints.append("Desk")
-        }
-        let activeDeskCount = deskItems.filter { !$0.status.isTerminal }.count
-        let blockedDeskCount = deskItems.filter { $0.status == .blocked }.count
-        let ownerDecisionDeskCount = LivingAttentionPolicy.ownerDecisionDeskCount(in: deskItems)
+        // The Desk's own overview: its Needs you is the one "needs User".
+        let board = await appModel.engine.desk.loadBoard(includeOverview: true)
+        let overview = board.overview!
+        if !overview.unavailable.isEmpty { failedEndpoints.append("Desk") }
+        let activeDeskCount = board.items.filter { !$0.status.isTerminal }.count
+        let blockedDeskCount = board.items.filter { $0.status == .blocked }.count
 
         let dreamDiary = await appModel.fetchDreamDiary(limit: 1)
         if dreamDiary == nil { failedEndpoints.append("Dream diary") }
@@ -59,11 +50,7 @@ struct LivingStatusRefreshOperation {
 
         let approvalRows: [ApprovalRecord]
         do {
-            if let approvalsOverride {
-                approvalRows = try await approvalsOverride()
-            } else {
-                approvalRows = try await appModel.engine.approvals.list()
-            }
+            approvalRows = try await appModel.engine.approvals.list()
         } catch {
             approvalRows = []
             failedEndpoints.append("Approvals")
@@ -72,16 +59,13 @@ struct LivingStatusRefreshOperation {
         guard failedEndpoints.isEmpty else {
             return Outcome(snapshot: nil, failedEndpoints: failedEndpoints)
         }
-        let pendingApprovals = approvalRows.filter { $0.status.lowercased() == "pending" }.count
-        let requiredApprovals = LivingAttentionPolicy.requiredApprovalCount(in: approvalRows)
         return Outcome(
             snapshot: LivingStatusSnapshot.make(
                 organism: organism,
                 activeDeskCount: activeDeskCount,
                 blockedDeskCount: blockedDeskCount,
-                ownerDecisionDeskCount: ownerDecisionDeskCount,
-                pendingApprovals: pendingApprovals,
-                requiredApprovals: requiredApprovals,
+                ownerWaiting: overview.needsYouCount,
+                pendingApprovals: approvalRows.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }.count,
                 latestDream: latestDream,
                 agentDisplayName: appModel.agentDisplayName
             ),

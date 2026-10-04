@@ -7,6 +7,7 @@ import PersistenceCore
 import TurnTrace
 import ProviderRouting
 import TrustCenter
+import ToolRegistry
 
 /// The one place an inline card settles and the one place a suspended request
 /// resumes.
@@ -120,6 +121,7 @@ public enum InlineInteractionResolver {
         case alreadyClaimed
         case notVerified(String)
         case noControl(String)
+        case usersCard
 
         public var errorDescription: String? {
             switch self {
@@ -131,6 +133,9 @@ public enum InlineInteractionResolver {
                 return "That was already \(state)."
             case .alreadyClaimed:
                 return "Already continuing — a second tap does nothing."
+            case .usersCard:
+                return "That card is in User's conversation waiting for him, so answering it is his. "
+                    + "Nothing was changed; Not now still withdraws your ask."
             case .notVerified(let detail):
                 return detail
             case .noControl(let detail):
@@ -260,12 +265,18 @@ public enum InlineInteractionResolver {
     ) async -> InlineInteraction? {
         var stamped = interaction
         let resumeRunId = "interaction-\(stamped.id)"
+        let steer = PeerDataTaint.carried(
+            peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: ChatToolSessionContext.envelope?.surface ?? "chat"),
+            peerID: ChatToolSessionContext.envelope?.verifiedUserId
+        )
         var continuation = InlineInteraction.Continuation(
             toolName: nil,
             mode: .continueTurn,
             state: resumable ? .waiting : .invalidated,
             resumeRunId: resumeRunId,
-            resumeText: resumeText
+            resumeText: resumeText,
+            peerSources: steer.sources,
+            elevatedPeerSources: steer.elevated
         )
         // Same reason as the tool-raised card: a signed turn's card resumes as
         // a signed turn only through a receipt re-verified against the live
@@ -351,8 +362,10 @@ public enum InlineInteractionResolver {
         id: String,
         sessionID: String,
         expectedRevision: Int? = nil,
+        byAgent: Bool = false,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction {
+        try await refuseAgentOnUsersCard(id, byAgent: byAgent, dataRoot: dataRoot)
         let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
         try checkRevision(current, expectedRevision)
         // `failed` is retryable BY DESIGN: the card keeps its control and its
@@ -411,8 +424,10 @@ public enum InlineInteractionResolver {
         attribution: String? = nil,
         setupError: String? = nil,
         note: String? = nil,
+        byAgent: Bool = false,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction {
+        try await refuseAgentOnUsersCard(id, byAgent: byAgent, dataRoot: dataRoot)
         let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
         try checkRevision(current, expectedRevision)
         guard current.state.isOpen else {
@@ -464,11 +479,16 @@ public enum InlineInteractionResolver {
     /// "No." Settles as declined and resumes the request with the consequence
     /// the card promised, so Agent acts on the refusal rather than waiting
     /// forever or silently retrying the same wall.
+    ///
+    /// `resume: false` is Agent withdrawing her own card (the inbox tool): she
+    /// already knows the outcome, so the continuation is retired with the
+    /// card instead of re-running the request that raised it.
     @discardableResult
     public static func decline(
         id: String,
         sessionID: String,
         expectedRevision: Int? = nil,
+        resume: Bool = true,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction {
         let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
@@ -476,12 +496,23 @@ public enum InlineInteractionResolver {
         guard current.state.isOpen else {
             throw ResolveError.alreadySettled(current.state.name)
         }
-        let declined = current.declined()
+        var declined = current.declined()
+        if !resume { declined.continuation?.state = .invalidated }
         try await persist(
             declined, sessionID: sessionID, ifRevision: current.revision, dataRoot: dataRoot
         )
-        await resumeOnce(declined, sessionID: sessionID, dataRoot: dataRoot)
+        if resume { await resumeOnce(declined, sessionID: sessionID, dataRoot: dataRoot) }
         return declined
+    }
+
+    /// The one gate on the agent answering: a card mirrored into User's
+    /// conversation (`ApprovalChatCards`) is his under every posture, whether
+    /// she reaches it by card.answer or by its inbox note. User's own taps (Mac,
+    /// phone, Telegram owner) are not the agent and pass. Not now is `decline`,
+    /// which stays hers.
+    private static func refuseAgentOnUsersCard(_ id: String, byAgent: Bool, dataRoot: URL) async throws {
+        guard byAgent, await ApprovalChatCards.isMirroredToUser(id, dataRoot: dataRoot) else { return }
+        throw ResolveError.usersCard
     }
 
     /// Undo a `begin` that must not carry through: the card goes back to
@@ -838,6 +869,27 @@ public enum InlineInteractionResolver {
         sessionID: String,
         dataRoot: URL
     ) async {
+        guard interaction.continuation?.state == .waiting,
+              interaction.continuation?.resumedByTurnId == nil,
+              !resumesInFlight.contains(interaction.id) else { return }
+        let sources = interaction.continuation?.peerSources ?? [PeerDataTaint.unrecorded]
+        let elevated = interaction.continuation?.elevatedPeerSources ?? []
+        let taint = PeerDataTaint.current
+            ?? PeerDataTaint(restoring: sources, elevated: elevated)
+        // A turn already carrying this card must keep its provenance too.
+        // Historical steering cannot be cleared by a later trust change.
+        for source in sources { taint.mark(peer: source, attested: false) }
+        for source in elevated { taint.markElevated(peer: source, attested: false) }
+        await PeerDataTaint.$current.withValue(taint) {
+            await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot)
+        }
+    }
+
+    private static func resumeUnderPeerProvenance(
+        _ interaction: InlineInteraction,
+        sessionID: String,
+        dataRoot: URL
+    ) async {
         guard var continuation = interaction.continuation else { return }
         // One continuation, one resume — whichever half of the fork took it.
         // `.waiting` is the durable claim; `resumedByTurnId` is the hand-back's
@@ -995,8 +1047,8 @@ public enum InlineInteractionResolver {
                 // replayed `read_file` returns the file — credentials
                 // included. Redacted before either, never after.
                 let safeResult = result.map {
-                    SwiftNativeChatOrchestrationClient
-                        .redactedPersistedToolResult(tool: toolName, json: $0)
+                    SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(
+                        tool: ToolNameAliases.shown(toolName, inputJSON: arguments).name, json: $0)
                 }
                 replayed = true
                 replayedResult = safeResult
@@ -1223,7 +1275,8 @@ public enum InlineInteractionResolver {
     ///
     /// A relaunch has no resumes in flight, so any claim still on disk when
     /// this session first reads the conversation belongs to a process that is
-    /// gone. Put it back to `waiting` and it becomes retryable again.
+    /// gone. Put it back to `waiting` and it becomes retryable again. Settled
+    /// or declined rows still waiting lost the process before its claim.
     public static func reclaimStrandedContinuations(
         sessionID: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -1256,7 +1309,11 @@ public enum InlineInteractionResolver {
                     reason: "The app closed before this finished."
                 )
                 do {
-                    try await persist(orphaned, sessionID: sessionID, dataRoot: dataRoot)
+                    try await persist(
+                        orphaned, sessionID: sessionID, ifRevision: interaction.revision,
+                        dataRoot: dataRoot,
+                        expecting: { $0.continuation?.state == interaction.continuation?.state }
+                    )
                 } catch {
                     reconciled = false
                 }
@@ -1288,9 +1345,22 @@ public enum InlineInteractionResolver {
                     } ?? "I can't tell whether that resumed. Try again."
                 )
                 do {
-                    try await persist(stranded, sessionID: sessionID, dataRoot: dataRoot)
+                    try await persist(
+                        stranded, sessionID: sessionID, ifRevision: interaction.revision,
+                        dataRoot: dataRoot,
+                        expecting: { $0.continuation?.state == interaction.continuation?.state }
+                    )
                 } catch {
                     reconciled = false
+                }
+                continue
+            }
+            if interaction.continuation?.state == .waiting {
+                switch interaction.state {
+                case .settled, .declined:
+                    await resumeOnce(interaction, sessionID: sessionID, dataRoot: dataRoot)
+                default:
+                    break
                 }
                 continue
             }
@@ -1301,7 +1371,11 @@ public enum InlineInteractionResolver {
             released.continuation?.state = .waiting
             released.revision += 1
             do {
-                try await persist(released, sessionID: sessionID, dataRoot: dataRoot)
+                try await persist(
+                    released, sessionID: sessionID, ifRevision: interaction.revision,
+                    dataRoot: dataRoot,
+                    expecting: { $0.continuation?.state == interaction.continuation?.state }
+                )
             } catch {
                 // The claim is still on disk, so this card is still stranded.
                 // Leave the session retryable and do NOT resume from a release
@@ -1509,7 +1583,13 @@ public enum InlineInteractionResolver {
         let persistence = SwiftNativePersistenceCore()
         let file = path(sessionID, dataRoot)
         try await persistence.withFileLock(file) {
-            var rows = (try? await persistence.readJSONL(file)) ?? []
+            let read = try await persistence.readJSONLReporting(file)
+            guard read.report.isClean else {
+                throw PersistenceCoreError.ioFailure(
+                    "This conversation has damaged rows. Nothing was changed."
+                )
+            }
+            var rows = read.rows
             guard let index = rows.firstIndex(where: {
                 Self.interaction(in: $0)?.id == interaction.id
             }) else { throw ResolveError.notFound }

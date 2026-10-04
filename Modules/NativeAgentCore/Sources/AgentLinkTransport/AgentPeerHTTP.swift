@@ -31,12 +31,15 @@ public enum AgentPeerHTTP {
     public static func send(_ request: AgentA2AWire.Request, bearerToken: String? = nil,
                             timeout: TimeInterval = 45, liveUpdate: LiveUpdateHandler?) async throws -> Response {
         if request.grpcMethod != nil {
-            return try await AgentA2AGRPC.send(request, bearerToken: bearerToken, timeout: timeout)
+            return try await AgentA2AGRPC.send(request, bearerToken: bearerToken, timeout: timeout,
+                liveUpdate: liveUpdate)
         }
         let configuration = fixtureConfiguration?() ?? .ephemeral
         return try await exchange(url: request.url, method: request.httpMethod, headers: request.headers,
                                   body: request.body, bearerToken: bearerToken, timeout: timeout,
-                                  configuration: configuration, liveUpdate: liveUpdate)
+                                  configuration: configuration, liveUpdate: liveUpdate,
+                                  streamInterface: request.streamInterface, requestID: request.requestID,
+                                  expectedTaskID: request.expectedTaskID)
     }
 
     public static func get(_ url: URL, bearerToken: String? = nil, headers: [String: String] = [:],
@@ -64,7 +67,8 @@ public enum AgentPeerHTTP {
     static func exchange(url: URL, method: String, headers: [String: String], body: JSONValue?,
                          bearerToken: String?, timeout: TimeInterval,
                          configuration: URLSessionConfiguration = .ephemeral,
-                         liveUpdate: LiveUpdateHandler?) async throws -> Response {
+                         liveUpdate: LiveUpdateHandler?, streamInterface: AgentA2AWire.Interface? = nil,
+                         requestID: String? = nil, expectedTaskID: String? = nil) async throws -> Response {
         try validateURL(url)
         guard ["GET", "POST", "DELETE"].contains(method), timeout.isFinite, timeout > 0, timeout <= 600 else { throw TransportError.invalidRequest }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
@@ -89,7 +93,11 @@ public enum AgentPeerHTTP {
         configuration.urlCredentialStorage = nil
         configuration.urlCache = nil
         configuration.waitsForConnectivity = false
-        let exchange = Exchange(streaming: headers["Accept"] == "text/event-stream", liveUpdate: liveUpdate)
+        let exchange = Exchange(streaming: headers["Accept"] == "text/event-stream",
+            liveUpdate: liveUpdate, accumulator: streamInterface.map {
+                AgentA2AStream.Accumulator(interface: $0, requestID: requestID,
+                    expectedTaskID: expectedTaskID, bearerToken: bearerToken)
+            })
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 exchange.start(request: request, configuration: configuration, continuation: continuation)
@@ -108,6 +116,28 @@ public enum AgentPeerHTTP {
         !token.isEmpty && token.utf8.count <= 16_384 && token.unicodeScalars.allSatisfy { $0.value >= 0x21 && $0.value <= 0x7e }
     }
 
+    /// Redact the assembled snapshot and hold its trailing credential prefix.
+    /// Prefix matching is linear, including for the maximum allowed token size.
+    package static func redactLiveText(_ text: String, token: String?) -> String {
+        guard let token, !token.isEmpty else { return text }
+        let redacted = text.replacingOccurrences(of: token, with: "[redacted]")
+        let needle = Array(token.utf8)
+        guard needle.count > 1 else { return redacted }
+        var prefixes = Array(repeating: 0, count: needle.count)
+        var matched = 0
+        for index in 1..<needle.count {
+            while matched > 0, needle[index] != needle[matched] { matched = prefixes[matched - 1] }
+            if needle[index] == needle[matched] { matched += 1 }
+            prefixes[index] = matched
+        }
+        matched = 0
+        for byte in redacted.utf8.suffix(needle.count - 1) {
+            while matched > 0, byte != needle[matched] { matched = prefixes[matched - 1] }
+            if byte == needle[matched] { matched += 1 }
+        }
+        return String(decoding: redacted.utf8.dropLast(matched), as: UTF8.self)
+    }
+
     private final class Exchange: NSObject, URLSessionDataDelegate, @unchecked Sendable {
         private let lock = NSLock()
         private var continuation: CheckedContinuation<Response, Error>?
@@ -119,15 +149,17 @@ public enum AgentPeerHTTP {
         private var status: Int?
         private let streaming: Bool
         private var eventStream = false
-        /// Complete SSE frames go to the live stream as they arrive; the result
+        /// The live stream retains the latest display snapshot; the result
         /// below is still built from the whole capture, exactly as before.
         private let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
         private var liveOffset = 0
+        private var accumulator: AgentA2AStream.Accumulator?
 
-        init(streaming: Bool, liveUpdate: LiveUpdateHandler?) {
+        init(streaming: Bool, liveUpdate: LiveUpdateHandler?, accumulator: AgentA2AStream.Accumulator?) {
             self.streaming = streaming
-            guard streaming, let liveUpdate else { liveFeed = nil; return }
-            let (updates, feed) = AsyncStream.makeStream(of: AgentA2AStream.LiveUpdate.self)
+            self.accumulator = accumulator
+            guard streaming, accumulator != nil, let liveUpdate else { liveFeed = nil; return }
+            let (updates, feed) = AsyncStream.makeStream(of: AgentA2AStream.LiveUpdate.self, bufferingPolicy: .bufferingNewest(1))
             liveFeed = feed
             Task {
                 for await update in updates { await liveUpdate(update) }
@@ -135,7 +167,7 @@ public enum AgentPeerHTTP {
         }
 
         private func forwardLive() {
-            guard let liveFeed, eventStream else { return }
+            guard let liveFeed, eventStream, let status, (200..<300).contains(status) else { return }
             // Frames end in a blank line (\n\n or \r\n\r\n); both end in LF.
             var end = data.endIndex - 1
             while end > data.startIndex + liveOffset {
@@ -145,7 +177,15 @@ public enum AgentPeerHTTP {
             guard end > data.startIndex + liveOffset else { return }
             let complete = data[(data.startIndex + liveOffset)...end]
             liveOffset = end + 1 - data.startIndex
-            for update in AgentA2AStream.liveUpdates((try? AgentA2AStream.events(in: Data(complete))) ?? []) { liveFeed.yield(update) }
+            do {
+                for event in try AgentA2AStream.events(in: Data(complete)) {
+                    if let update = try accumulator?.receive(event) { liveFeed.yield(update) }
+                }
+            } catch {
+                accumulator = nil
+                liveFeed.finish()
+                finish(.failure(error))
+            }
         }
 
         func start(request: URLRequest, configuration: URLSessionConfiguration, continuation: CheckedContinuation<Response, Error>) {

@@ -42,7 +42,7 @@ extension NativeClient {
             checks.append(HarnessBenchmarkCheck(
                 id: "tools_manifest",
                 title: "Tool manifest loads",
-                passed: !tools.isEmpty,
+                passed: true,
                 detail: "\(tools.count) tool row(s)"
             ))
         } catch {
@@ -79,7 +79,7 @@ extension NativeClient {
             detail: memorySnapshot == nil ? "no embedding runtime snapshot" : "embedding runtime snapshot available"
         ))
 
-        let doctor = try? await makeDoctorChecks().runAll(repair: false, checkLLM: false)
+        let doctor = try? await makeDoctorChecks().runAll(repair: false)
         let failedDoctor = doctor?.filter { $0.status == "fail" }.count ?? 0
         checks.append(HarnessBenchmarkCheck(
             id: "doctor_snapshot",

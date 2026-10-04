@@ -4,6 +4,7 @@ import PersistenceCore
 
 enum TelegramUpdateClaimPhase: String, Sendable, Equatable, Codable {
     case pending
+    case awaitingSpeechPermission = "awaiting_speech_permission"
     case processing
     case queued
     case completed
@@ -21,6 +22,7 @@ struct TelegramUpdateClaim: Sendable, Equatable {
     /// queued retry replayed from this inbox answered "nothing to retry" and
     /// settled its claim. Nil for every other update.
     let resolvedRetryText: String?
+    let resolvedRetryMessage: TelegramMessage?
     let claimedAt: String
     let updatedAt: String
 }
@@ -110,6 +112,7 @@ struct TelegramUpdateInbox: Sendable {
                 phase: .pending,
                 queueAcknowledgementMessageId: nil,
                 resolvedRetryText: nil,
+                resolvedRetryMessage: nil,
                 claimedAt: now,
                 updatedAt: now
             )
@@ -129,7 +132,8 @@ struct TelegramUpdateInbox: Sendable {
         updateId: Int,
         from allowed: Set<TelegramUpdateClaimPhase>,
         to phase: TelegramUpdateClaimPhase,
-        resolvedRetryText: String? = nil
+        resolvedRetryText: String? = nil,
+        resolvedRetryMessage: TelegramMessage? = nil
     ) async throws -> TelegramUpdateClaim {
         let path = claimPath(updateId: updateId)
         return try await withClaimMutationLock(path) {
@@ -143,6 +147,7 @@ struct TelegramUpdateInbox: Sendable {
                     ? current.queueAcknowledgementMessageId
                     : nil,
                 resolvedRetryText: resolvedRetryText ?? current.resolvedRetryText,
+                resolvedRetryMessage: resolvedRetryMessage ?? current.resolvedRetryMessage,
                 claimedAt: current.claimedAt,
                 updatedAt: _tgNowString()
             )
@@ -167,6 +172,7 @@ struct TelegramUpdateInbox: Sendable {
                 phase: current.phase,
                 queueAcknowledgementMessageId: messageId,
                 resolvedRetryText: current.resolvedRetryText,
+                resolvedRetryMessage: current.resolvedRetryMessage,
                 claimedAt: current.claimedAt,
                 updatedAt: _tgNowString()
             )
@@ -176,20 +182,12 @@ struct TelegramUpdateInbox: Sendable {
         }
     }
 
-    /// The pinned retry text for this update, or nil when the claim is gone,
-    /// unreadable, or was never a queued retry.
-    func resolvedRetryText(updateId: Int) async -> String? {
-        guard let claim = try? decodeClaim(
-            at: claimPath(updateId: updateId),
-            kind: .mutation
-        ) else { return nil }
-        let trimmed = claim.resolvedRetryText?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (trimmed?.isEmpty ?? true) ? nil : trimmed
+    func claim(updateId: Int) throws -> TelegramUpdateClaim {
+        try decodeClaim(at: claimPath(updateId: updateId), kind: .mutation)
     }
 
     /// Recovery reads the maintained index, then opens only pending,
-    /// processing, or queued claim files. Terminal retention never makes an idle Telegram
+    /// processing, queued, or permission-blocked claim files. Terminal retention never makes an idle Telegram
     /// tick reread hundreds of historical update payloads.
     func recoverableClaims() async throws -> [TelegramUpdateClaim] {
         try await persistence.withFileLock(indexPath) {
@@ -202,7 +200,8 @@ struct TelegramUpdateInbox: Sendable {
         var recovered: [TelegramUpdateClaim] = []
         var repairedIndex = false
         for entry in index.entries.values.sorted(by: { $0.updateId < $1.updateId })
-        where entry.phase == .pending || entry.phase == .processing || entry.phase == .queued {
+        where entry.phase == .pending || entry.phase == .processing || entry.phase == .queued
+            || entry.phase == .awaitingSpeechPermission {
             let claim = try decodeClaim(at: claimPath(updateId: entry.updateId), kind: .recovery)
             recovered.append(claim)
             if claim.phase != entry.phase {
@@ -286,6 +285,16 @@ struct TelegramUpdateInbox: Sendable {
         guard update.updateId == updateId else {
             throw TelegramUpdateInboxError.mismatchedUpdateId(expected: updateId, actual: update.updateId)
         }
+        let retryMessage: TelegramMessage?
+        if let value = object["resolvedRetryMessage"], value != .null {
+            do {
+                retryMessage = try JSONDecoder().decode(TelegramMessage.self, from: value.serializedData(pretty: false))
+            } catch {
+                throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
+            }
+        } else {
+            retryMessage = nil
+        }
         return TelegramUpdateClaim(
             updateId: updateId,
             update: update,
@@ -294,6 +303,7 @@ struct TelegramUpdateInbox: Sendable {
                 object["queueAcknowledgementMessageId"]
             ),
             resolvedRetryText: Self.optionalString(object["resolvedRetryText"]),
+            resolvedRetryMessage: retryMessage,
             claimedAt: claimedAt,
             updatedAt: updatedAt
         )
@@ -302,6 +312,9 @@ struct TelegramUpdateInbox: Sendable {
     private func write(_ claim: TelegramUpdateClaim, to path: URL) async throws {
         let updateData = try JSONEncoder().encode(claim.update)
         let updateValue = try JSONValue.parse(updateData)
+        let retryMessageValue: JSONValue = try claim.resolvedRetryMessage.map {
+            try JSONValue.parse(JSONEncoder().encode($0))
+        } ?? .null
         let value: JSONValue = .object([
             "schemaVersion": .int(1),
             "updateId": .int(Int64(claim.updateId)),
@@ -311,6 +324,7 @@ struct TelegramUpdateInbox: Sendable {
             "queueAcknowledgementMessageId": claim.queueAcknowledgementMessageId
                 .map { .int(Int64($0)) } ?? .null,
             "resolvedRetryText": claim.resolvedRetryText.map { .string($0) } ?? .null,
+            "resolvedRetryMessage": retryMessageValue,
             "update": updateValue,
         ])
         try await persistence.writeDataAtomicDurable(

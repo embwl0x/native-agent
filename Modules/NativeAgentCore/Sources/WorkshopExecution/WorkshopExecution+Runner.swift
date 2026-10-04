@@ -243,11 +243,11 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// guard at the TOP of submit().
     private func assertSlotAvailable() async throws {
         let cap = effectiveWorkshopExecutionSlotsCap()
-        let active = await listActive()
+        let active = Self.activeRecords(try await scanAllQueueWorkshopExecutionsChecked().map(\.record))
         if let corrupt = active.first(where: { $0.status == "corrupt" }) {
             throw WorkshopExecutionError.persistenceFailure(String(describing: corrupt.result))
         }
-        let activeCount = active.count + liveReservationCount()
+        let activeCount = active.count + (try liveReservationCount())
         if activeCount >= cap {
             // Same message MissionsBusyError ships by default.
             throw WorkshopExecutionError.workshopExecutionsBusy("missions_busy: too many active or pending Workshop executions")
@@ -260,11 +260,11 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// Age-out: a reservation older than 10 minutes is a crashed submit
     /// (planning happens BEFORE reservation; only file IO remains) — ignore
     /// it rather than leak the slot forever.
-    private nonisolated func liveReservationCount() -> Int {
+    private nonisolated func liveReservationCount() throws -> Int {
         let fm = FileManager.default
-        guard let subdirs = try? fm.contentsOfDirectory(
+        let subdirs = try fm.contentsOfDirectory(
             at: executionRecordsRoot, includingPropertiesForKeys: [.contentModificationDateKey]
-        ) else { return 0 }
+        )
         var count = 0
         for dir in subdirs {
             let marker = dir.appendingPathComponent(".reserved")
@@ -275,7 +275,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
                   !ExecutionRecordFile.exists(in: dir, fileManager: fm) else {
                 continue
             }
-            let mtime = (try? marker.resourceValues(forKeys: [.contentModificationDateKey])
+            let mtime = (try marker.resourceValues(forKeys: [.contentModificationDateKey])
                 .contentModificationDate) ?? Date.distantPast
             if Date().timeIntervalSince(mtime) < 600 { count += 1 }
         }
@@ -372,6 +372,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         let connectorActions = await planner.availableConnectorActions()
         try Task.checkCancellation()
         var availableTools: [(id: String, description: String, autonomy: String)] = []
+        var schemas: [String: JSONValue] = [:]
         for action in connectorActions {
             guard case .object(let obj) = action,
                   case .string(let aid) = obj["id"] ?? .null,
@@ -381,6 +382,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
                 return aid
             }()
             let autonomy = DefaultToolAutonomy.resolve(toolId: aid)
+            if case .object? = obj["parameters"] { schemas[aid] = obj["parameters"] }
             availableTools.append((id: aid, description: desc, autonomy: autonomy))
         }
         if !availableTools.contains(where: { $0.id == "chat.synthesize" }) {
@@ -395,7 +397,8 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // executions picked the wrong tool and failed; 2026-06-15, the user: executions
         // do everything). Cap high (200) only as a prompt-size backstop.
         let toolsSummary = availableTools.prefix(200).map { t in
-            "  - \(t.id): \(t.description) [autonomy=\(t.autonomy)]"
+            let schema = schemas[t.id].flatMap { try? $0.serialize(pretty: false) }
+            return "  - \(t.id): \(t.description) [autonomy=\(t.autonomy)]" + (schema.map { " [schema=\($0)]" } ?? "")
         }.joined(separator: "\n")
 
         // Current date/time for the plan. The planner had NO clock, so a
@@ -436,7 +439,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             - Each step's tool_or_action must be one of the available tool IDs above, OR chat.synthesize.
             - autonomy_hint must be one of: auto, needs_approval
             - Maximum 8 steps. Prefer fewer, focused steps.
-            - args should be a flat JSON object with string values.
+            - args must be a JSON object preserving each tool schema's declared types, including booleans, numbers, arrays, and objects. Never quote booleans or numbers.
             - args must be FINAL literal values, never placeholders. Do NOT write things like "<today's date>", "<result>", or "<the summary>". For the date, use the Current date/time above directly in the arg.
             - If a step's arg must contain the OUTPUT of an EARLIER step (e.g. write a file whose body is what a prior step produced), put the token {{step:<that earlier step's id>}} in the arg — it is replaced at run time with that step's actual output. This works in tool args only; chat.synthesize steps automatically see all prior step outputs, so to turn raw data into prose first add a chat.synthesize step, then reference ITS id with {{step:<id>}} in the write step.
 
@@ -464,11 +467,14 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
         // Parse + validate.
         do {
-            let steps = try Self.parsePlanJSON(raw, validTools: Set(availableTools.map(\.id)))
+            let steps = try Self.parsePlanJSON(raw, validTools: Set(availableTools.map(\.id)), schemas: schemas)
             if steps.isEmpty {
                 return (WorkshopExecutionPlan(steps: stub, fromStub: true), "codex returned 0 valid steps")
             }
             return (WorkshopExecutionPlan(steps: steps, fromStub: false), nil)
+        } catch let error as WorkshopExecutionError {
+            if case .invalidRequest = error { throw error }
+            return (WorkshopExecutionPlan(steps: stub, fromStub: true), String(describing: error))
         } catch {
             return (WorkshopExecutionPlan(steps: stub, fromStub: true), String(describing: error))
         }
@@ -521,10 +527,21 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // which the runner checks AFTER its objective validation (L728) and
         // BEFORE planning + file IO. Refuse a new submit when the queue is
         // already at (max_active + max_pending) active executions.
+        let id = uuid()
+        guard Self.isSafeExecutionID(id) else {
+            throw WorkshopExecutionError.invalidRequest("executionId must be a single path component")
+        }
+        try FileManager.default.createDirectory(at: executionRecordsRoot, withIntermediateDirectories: true)
+        let admissionLock = executionRecordsRoot.appendingPathComponent(".admission")
+        let prior = try await persistence.withFileLock(admissionLock) { [self] in
+            try await getWorkshopExecution(id)
+        }
+        if let prior {
+            return WorkshopExecutionEnqueueResult(status: prior.status, executionId: id, record: prior)
+        }
         try await assertSlotAvailable()
 
         // Build the Workshop execution record.
-        let id = uuid()
         let titleTrunc = String(spec.title.prefix(160))
         let objectiveTrunc = String(spec.objective.prefix(2000))
         let nowStr = Self.isoTimestamp(now())
@@ -567,8 +584,17 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // outright, so the cap was silently unenforced. `withFileLock` is a
         // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4),
         // so the downcast was gratuitous; admission now always runs, locked.
-        let admissionLock = executionRecordsRoot.appendingPathComponent(".admission")
-        try await persistence.withFileLock(admissionLock) { [self] in
+        let existing = try await persistence.withFileLock(admissionLock) { [self] () async throws -> WorkshopExecutionRecord? in
+            let raw = try await persistence.readJSON(executionRecordPath(id), ifMissing: .null)
+            if case .object(let object) = raw {
+                guard object["id"] == .string(id) else {
+                    throw WorkshopExecutionError.persistenceFailure("execution identity mismatch")
+                }
+                return Self.recordFromJSON(object)
+            }
+            guard !FileManager.default.fileExists(atPath: workshopExecutionDir(id).path) else {
+                throw WorkshopExecutionError.invalidRequest("execution admission is already in progress")
+            }
             try await assertSlotAvailable()
             // COUNTED reservation (delta review: an empty dir is invisible
             // to the slot count, so racers serializing through this lock
@@ -577,8 +603,17 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             // failure, age-out guards a crash between the two.
             try FileManager.default.createDirectory(
                 at: workshopExecutionDir(id), withIntermediateDirectories: true)
-            try Data("reserved \(nowStr)".utf8)
-                .write(to: workshopExecutionDir(id).appendingPathComponent(".reserved"))
+            do {
+                try Data("reserved \(nowStr)".utf8)
+                    .write(to: workshopExecutionDir(id).appendingPathComponent(".reserved"))
+            } catch {
+                try? FileManager.default.removeItem(at: workshopExecutionDir(id))
+                throw error
+            }
+            return nil
+        }
+        if let existing {
+            return WorkshopExecutionEnqueueResult(status: existing.status, executionId: id, record: existing)
         }
 
         // Ensure execution dir + receipts/ exist (daemon does this in
@@ -597,7 +632,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             try? FileManager.default.removeItem(at: dir)
             throw error
         }
-        let record = WorkshopExecutionRecord(
+        var record = WorkshopExecutionRecord(
             id: id,
             deskHandle: spec.deskHandle,
             projectSpaceId: spec.projectSpaceId,
@@ -619,6 +654,9 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             planningRemovableOrchestrationProviderCallCount: exactPlanningProviderCallCount
         )
         do {
+        if let compiled = planner as? WorkshopCompiledLocalFileCopyPlanner {
+            record.compiledOperationBinding = try JSONValue.parse(JSONEncoder().encode(compiled.binding))
+        }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: receipts, withIntermediateDirectories: true)
 
@@ -1122,17 +1160,35 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// subdir with a parseable mission.json whose `id` matches the directory.
     /// Failed reads and invalid records remain visible as corrupt and block queue admission.
     private func scanAllQueueWorkshopExecutions() async -> [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] {
-        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return [] }
+        do {
+            return try await scanAllQueueWorkshopExecutionsChecked()
+        } catch {
+            let raw: [String: JSONValue] = [
+                "id": .string("queue-unavailable"),
+                "title": .string("Workshop queue unavailable"),
+                "status": .string("unavailable"),
+                "result": .object(["error": .string(error.localizedDescription)]),
+            ]
+            return [(Self.recordFromJSON(raw), raw)]
+        }
+    }
+
+    /// Only an absent execution root is empty; failed reads cannot prove inactivity.
+    private func scanAllQueueWorkshopExecutionsChecked() async throws -> [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] {
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let fm = FileManager.default
         let queueRoot = executionRecordsRoot
-        guard let entries = try? fm.contentsOfDirectory(
-            at: queueRoot, includingPropertiesForKeys: [.isDirectoryKey], options: []
-        ) else {
-            return []  // execution root absent -> no Workshop executions
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(
+                at: queueRoot, includingPropertiesForKeys: [.isDirectoryKey], options: []
+            )
+        } catch CocoaError.fileReadNoSuchFile {
+            return []
         }
         var out: [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] = []
         for sub in entries {
-            let isDir = (try? sub.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            let isDir = try sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false
             guard isDir else { continue }
             let mp = ExecutionRecordFile.resolve(in: sub, fileManager: fm)
             let raw = await Self.readQueueRecord(mp, id: sub.lastPathComponent, persistence: persistence)
@@ -1187,7 +1243,9 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// sorted by updated_at DESC, capped at 20 — the `active=false` query
     /// branch of GET /v1/missions.
     public func listHistory() async -> [WorkshopExecutionRecord] {
-        Self.recentRecords(await scanAllQueueWorkshopExecutions().map(\.record))
+        let records = await scanAllQueueWorkshopExecutions().map(\.record)
+        if records.contains(where: { $0.status == "unavailable" }) { return records }
+        return Self.recentRecords(records)
     }
 
     /// One observed set for the status tool's active/recent sections. Each
@@ -1200,7 +1258,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     }
 
     private nonisolated static func activeRecords(_ records: [WorkshopExecutionRecord]) -> [WorkshopExecutionRecord] {
-        let live: Set<String> = ["queued", "running", "blocked_on_approval", "corrupt"]
+        let live: Set<String> = ["queued", "running", "blocked_on_approval", "blocked_on_reconciliation", "corrupt", "unavailable"]
         return records.filter { live.contains($0.status) }
     }
 
@@ -1218,7 +1276,12 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// passing these through verbatim is byte-faithful.
     public func listLegacyWorkshopExecutions() async throws -> [JSONValue] {
         let raw = try await persistence.readJSON(legacyWorkshopExecutionsPath, ifMissing: .array([]))
-        guard case .array(let items) = raw else { return [] }
+        guard case .array(let items) = raw else {
+            throw WorkshopExecutionError.persistenceFailure("Legacy execution store must be an array")
+        }
+        guard items.allSatisfy({ if case .object = $0 { return true }; return false }) else {
+            throw WorkshopExecutionError.persistenceFailure("Legacy execution rows must be objects")
+        }
         let dicts = items.compactMap { item -> [String: JSONValue]? in
             if case .object(let o) = item { return o }
             return nil
@@ -1242,7 +1305,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // verbatim. Matches the retired daemon `new_missions +
         // old_missions`. gpt-5.5 finding #1: emit via readJSONForWorkshopExecution so the
         // raw `plan` survives instead of being normalized by WorkshopExecutionRecord.
-        let queue = await scanAllQueueWorkshopExecutions()
+        let queue = try await scanAllQueueWorkshopExecutionsChecked()
             .sorted { $0.record.createdAt > $1.record.createdAt }
             .map { Self.readJSONForWorkshopExecution($0.raw) }
         let legacy = try await listLegacyWorkshopExecutions()
@@ -1300,6 +1363,15 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         ]
         if let deskHandle = obj["desk_handle"], case .string = deskHandle {
             normalized["desk_handle"] = deskHandle
+        }
+        if let projectSpaceId = obj["project_space_id"], case .string = projectSpaceId {
+            normalized["project_space_id"] = projectSpaceId
+        }
+        if let movement = obj["last_movement_at"], case .string = movement {
+            normalized["last_movement_at"] = movement
+        }
+        if let binding = obj["compiled_operation_binding"] {
+            normalized["compiled_operation_binding"] = binding
         }
         if let verification = obj["verification"], case .object = verification {
             normalized["verification"] = verification
@@ -1366,7 +1438,16 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             planningProviderCallCount: optionalInt("planning_provider_call_count"),
             planningRemovableOrchestrationProviderCallCount:
                 optionalInt("planning_removable_orchestration_provider_call_count"),
-            verification: WorkshopVerificationRecord.fromJSON(obj["verification"])
+            verification: WorkshopVerificationRecord.fromJSON(obj["verification"]),
+            lastMovementAt: {
+                if case .string(let value)? = obj["last_movement_at"] { return value }
+                return nil
+            }(),
+            compiledOperationBinding: obj["compiled_operation_binding"],
+            terminalReason: {
+                if case .string(let value)? = obj["terminal_reason"] { return value }
+                return nil
+            }()
         )
     }
 
@@ -1381,7 +1462,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             let tool: String = { if case .string(let s) = o["tool_or_action"] ?? .null { return s }; return "chat.synthesize" }()
             let auto: String = { if case .string(let s) = o["autonomy"] ?? .null { return s }; return "auto" }()
             let args: JSONValue = { if case .object = o["args"] ?? .null { return o["args"]! }; return .object([:]) }()
-            out.append(WorkshopExecutionStep(id: id, description: desc, toolOrAction: tool, args: args, autonomy: auto))
+            out.append(WorkshopExecutionStep(id: id, description: desc, toolOrAction: tool, args: args, autonomy: auto, argumentSchema: o["argument_schema"]))
         }
         return out
     }
@@ -1430,7 +1511,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// Unknown step tools fall back to chat.synthesize per L1679-L1681.
     /// Autonomy hints not in {auto, needs_approval} clamp to "auto" per
     /// L1683-L1684. Max 8 steps per L1675.
-    static func parsePlanJSON(_ raw: String, validTools: Set<String>) throws -> [WorkshopExecutionStep] {
+    static func parsePlanJSON(_ raw: String, validTools: Set<String>, schemas: [String: JSONValue] = [:]) throws -> [WorkshopExecutionStep] {
         let data = Data(raw.utf8)
         guard let parsed = try? JSONValue.parse(data),
               case .object(let obj) = parsed,
@@ -1480,10 +1561,21 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
                 description: desc,
                 toolOrAction: tool,
                 args: args,
-                autonomy: hint
+                autonomy: hint,
+                argumentSchema: schemas[tool]
             ))
         }
+        try validateStepIDs(out)
         return out
+    }
+
+    static func validateStepIDs(_ steps: [WorkshopExecutionStep]) throws {
+        var seen: Set<String> = []
+        for step in steps {
+            guard seen.insert(step.id).inserted else {
+                throw WorkshopExecutionError.invalidRequest("Duplicate Workshop step ID: \(step.id)")
+            }
+        }
     }
 
     /// Same shape as MCPDispatcher.isoTimestamp and TriggerScheduler.isoTimestamp.

@@ -290,6 +290,9 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         /// continuation — the result was handed back to it — so no second turn
         /// was ever started, and this records which one took it.
         public var resumedByTurnId: String?
+        /// Peer provenance of the suspended turn. Nil on older cards.
+        public var peerSources: [String]?
+        public var elevatedPeerSources: [String]?
 
         public init(
             originRunId: String? = nil,
@@ -303,8 +306,12 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             replayedAt: Date? = nil,
             replayedResult: String? = nil,
             signatureReceipt: String? = nil,
-            resumedByTurnId: String? = nil
+            resumedByTurnId: String? = nil,
+            peerSources: [String]? = nil,
+            elevatedPeerSources: [String]? = nil
         ) {
+            self.peerSources = peerSources
+            self.elevatedPeerSources = elevatedPeerSources
             self.resumedByTurnId = resumedByTurnId
             self.replayedAt = replayedAt
             self.replayedResult = replayedResult

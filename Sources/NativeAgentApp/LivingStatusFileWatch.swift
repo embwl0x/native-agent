@@ -28,6 +28,8 @@ enum LivingStatusFileWatch {
             desk.opsPath,
             desk.statePath,
             dataRoot.appendingPathComponent("workflows/approvals/requests.json"),
+            // The Desk overview also counts actionable inbox rows as needs you.
+            dataRoot.appendingPathComponent("notifications/inbox.jsonl"),
             // Dream reads choose the newest dated entry, so the directory—not
             // a guessed filename—is the canonical invalidation boundary.
             dataRoot.appendingPathComponent("dream_diary", isDirectory: true),

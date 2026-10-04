@@ -139,12 +139,14 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "shelf_read": keys = ["bot_id", "include_read", "newest_first"]; required = []
             case "task_ledger_list": keys = ["task_id"]; required = []
             case "delegation_status": keys = ["task_id"]; required = []
-            case "mail_search": keys = ["query"]; required = keys
-            case "mail_list_recent": keys = ["expected_message_id", "expected_account"]; required = []
+            case "mail_search": keys = ["query", "scope", "mailbox"]; required = ["query"]
+            case "mail_list_recent": keys = ["expected_message_id", "expected_account", "scope", "mailbox"]; required = []
             case "messages_recent_threads": keys = ["thread_id"]; required = []
             case "screen": keys = ["app", "part"]; required = []
             case "bot_list": keys = ["id"]; required = []
-            case "mac_calendar_list_upcoming": keys = ["day", "calendar_name"]; required = []
+            case "mac_calendar_list_upcoming": keys = ["day", "calendar_name", "calendar_id"]; required = []
+            case "mac_reminders_read": keys = ["id"]; required = keys
+            case "mac_reminders_query": keys = ["query", "list_name", "due_start", "due_end", "undated_only", "include_completed"]; required = []
             case "list_skills", "agent_contacts",
                  "mac_reminders_list_due_today",
                  "inner_state", "agent_introspect": keys = []; required = []
@@ -153,8 +155,13 @@ struct AgentWorkspaceDesktopStore: Sendable {
             var arguments: [String: JSONValue] = [:]
             for key in keys {
                 guard let value = input[key], value != .null else { continue }
-                if tool == "shelf_read", ["include_read", "newest_first"].contains(key) {
+                if (tool == "shelf_read" && ["include_read", "newest_first"].contains(key))
+                    || (tool == "mac_reminders_query" && ["undated_only", "include_completed"].contains(key)) {
                     guard case .bool = value else { return nil }
+                    arguments[key] = value
+                    continue
+                }
+                if tool == "mac_reminders_query", ["due_start", "due_end"].contains(key), case .int = value {
                     arguments[key] = value
                     continue
                 }
@@ -192,10 +199,16 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "mail_search": numericKeys = ["offset"]
             case "messages_recent_threads": numericKeys = ["before_message_id", "limit"]
             case "mac_calendar_list_upcoming": numericKeys = ["hours_ahead", "limit"]
+            case "mac_reminders_query": numericKeys = ["offset", "limit"]
             default: numericKeys = []
             }
             for key in numericKeys {
                 guard let value = input[key] else { continue }
+                if key == "offset", ["mail_list_recent", "mail_search"].contains(tool), case .object(let cursor) = value {
+                    guard cursor.values.allSatisfy({ if case .int(let number) = $0 { number >= 0 && number < Int.max - 50 } else { false } }) else { return nil }
+                    arguments[key] = value
+                    continue
+                }
                 guard case .int(let number) = value, number >= 0,
                       number <= (key == "before_message_id" ? Int64.max : 16_777_216) else { return nil }
                 if key != "offset" && !key.hasSuffix("_offset"), number == 0 { return nil }

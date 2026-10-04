@@ -478,6 +478,7 @@ public enum StudioCanonTending {
                     duplicates += 1
                     continue
                 }
+                guard staged.count < StudioCanonLaw.maximumProposalsPerPass else { break }
                 guard let record = try? await StudioCanonProposal.stage(draft, inbox: inbox) else {
                     continue
                 }
@@ -583,27 +584,21 @@ extension SwiftToolDispatcher {
             "anti_canon": .array(members.filter { $0.standing == .antiCanon }.map(render)),
             "decided_rows": .int(Int64(rows.count)),
         ]
-        // Item 10: the canon moved since you last said what you care about. An
-        // offer, not a task — it carries no deadline and nothing counts it.
-        if case .staged = await store.sensibilityStaging() {
-            result["sensibility_staged"] = .bool(true)
-            result["sensibility_note"] = .string(
-                "The canon has moved since you last wrote what you have come to care about "
-                + "in work. If you want to restate it, pass `sensibility` (2-3 lines, your "
-                + "words) the next time you resolve a proposal. Nobody drafts or approves it."
-            )
-        }
-        if let current = await store.currentSensibility() {
-            result["sensibility"] = .array(current.map { .string($0) })
-        }
         let includeProposals: Bool = {
             if case .some(.bool(let value)) = input["include_proposals"] { return value }
             return true
         }()
         if includeProposals {
-            let pending = (try? await studioCanonInbox().list(filter: ApprovalFilter(
-                status: "pending", action: StudioCanonProposal.approvalAction
-            ))) ?? []
+            let pending: [ApprovalRecord]
+            do {
+                pending = try await studioCanonInbox().list(filter: ApprovalFilter(
+                    status: "pending", action: StudioCanonProposal.approvalAction
+                ))
+            } catch {
+                result["status"] = .string("failed")
+                result["reason"] = .string("Pending canon proposals could not be read: \(error.localizedDescription)")
+                return .object(result)
+            }
             result["pending_proposals"] = .array(pending.compactMap { record in
                 guard let draft = StudioCanonProposal.draft(of: record) else { return nil }
                 var obj: [String: JSONValue] = [
@@ -722,7 +717,13 @@ extension SwiftToolDispatcher {
             )
             switch outcome {
             case .applied(let title, let action, let written):
-                var result: [String: JSONValue] = [
+                if !written {
+                    guard let persisted = try await studioCanonStore().readCanon().first(where: { $0.proposalID == proposalID }) else {
+                        throw StudioCanonError.unknownProposal(proposalID)
+                    }
+                    standing = persisted.standing
+                }
+                return .object([
                     "status": .string("ok"),
                     "action": .string(action.rawValue),
                     "standing": .string(standing.rawValue),
@@ -730,11 +731,7 @@ extension SwiftToolDispatcher {
                     "row_written": .bool(written),
                     "canon_path": .string(studioCanonStore().canonPath.path),
                     "decided_on_surface": .string(provenance.surface),
-                ]
-                for (key, value) in await applySensibility(input: input, provenance: provenance) {
-                    result[key] = value
-                }
-                return .object(result)
+                ])
             case .declined(let title):
                 return .object([
                     "status": .string("ok"),
@@ -751,55 +748,6 @@ extension SwiftToolDispatcher {
                 "status": .string("refused"),
                 "reason": .string(error.errorDescription ?? "\(error)"),
             ])
-        }
-    }
-
-    /// SENSIBILITY (personality-depth item 10), written in the same seat-verified
-    /// call that moved the canon — which is the only moment it may be written at
-    /// all, and the only moment SHE is unambiguously the author.
-    ///
-    /// Deliberately NOT a second card. A card would need a drafter, and anything
-    /// that drafted three lines of what she cares about would be the author of
-    /// them; her rule for the canon ("my taste, not User's to sign off") is even
-    /// stronger here, because there is nothing external to point at. So the seat
-    /// gate this method inherits IS the approval, and the lines arrive already
-    /// hers or not at all.
-    ///
-    /// Absent input writes nothing and says nothing: leaving it out is the
-    /// ordinary case, and a canon change that leaves her with nothing new to say
-    /// about herself is a normal canon change.
-    ///
-    /// Never throws into the resolve path. The canon row already landed; a
-    /// refused or failed distillation must be REPORTED beside it, not made to
-    /// look like a failed promotion.
-    private func applySensibility(
-        input: [String: JSONValue],
-        provenance: StudioCanonTurnProvenance
-    ) async -> [String: JSONValue] {
-        guard let raw = optionalString(input, "sensibility")?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return [:] }
-        do {
-            let written = try await studioCanonStore().appendSensibility(
-                lines: raw.components(separatedBy: .newlines),
-                decidedBy: StudioCanonSeat.agent,
-                provenance: provenance
-            )
-            return [
-                "sensibility_written": .bool(true),
-                "sensibility": .array(written.map { .string($0) }),
-                "sensibility_path": .string(studioCanonStore().sensibilityPath.path),
-                "sensibility_note": .string(
-                    "Yours, in your words, and nobody signed off on it. It rides your own "
-                    + "prompt from the next turn on."
-                ),
-            ]
-        } catch {
-            return [
-                "sensibility_written": .bool(false),
-                "sensibility_reason": .string(
-                    (error as? StudioSensibility.Error)?.errorDescription ?? "\(error)"
-                ),
-            ]
         }
     }
 }

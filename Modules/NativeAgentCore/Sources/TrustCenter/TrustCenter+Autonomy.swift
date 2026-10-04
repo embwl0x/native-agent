@@ -148,7 +148,7 @@ extension SwiftNativeTrustCenter {
     /// Restrictiveness ranking over `unifiedPolicyAutonomyLevels`. An
     /// unrecognized level ranks as approval-tier, matching `AutonomyGate.map`'s
     /// safe default for one.
-    nonisolated static func moreRestrictiveAutonomy(_ a: String, _ b: String) -> String {
+    public nonisolated static func moreRestrictiveAutonomy(_ a: String, _ b: String) -> String {
         func rank(_ level: String) -> Int {
             switch level {
             case "auto": return 0

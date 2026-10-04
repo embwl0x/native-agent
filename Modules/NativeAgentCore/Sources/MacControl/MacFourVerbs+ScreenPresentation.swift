@@ -395,6 +395,11 @@ extension MacFourVerbs {
 
     static func operationDetail(_ result: MacControlResult) -> [String: JSONValue] {
         var detail: [String: JSONValue] = [:]
+        if result.error?.hasPrefix("human_takeover:") == true, case .object(let receipt) = result.output {
+            for key in ["status", "posted_events", "characters_sent", "text_character_count", "requested_events_emitted", "recovery_events_emitted", "gesture", "element", "app", "window", "frame_id", "handle", "method", "ax_delivered", "effect"] {
+                detail[key] = receipt[key]
+            }
+        }
         if let operationId = result.operationId { detail["operationId"] = .string(operationId) }
         if let state = result.operationState { detail["operationState"] = .string(state.rawValue) }
         if let verification = result.verification { detail["verification"] = .string(verification.rawValue) }

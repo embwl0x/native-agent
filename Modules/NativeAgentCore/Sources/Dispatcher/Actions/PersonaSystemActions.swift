@@ -1,70 +1,24 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Skills
 
-// MARK: - Wave 34 W06: Native Swift persona/system connector actions (DORMANT — no production wiring)
+// MARK: - Native persona/system connector actions
 //
-// Retry of the wave-33 W08 batch that died mid-task (API socket) before commit.
-// Starts fresh from base. Ports 4 SMALL, SELF-CONTAINED, READ-ONLY persona /
-// system connector action handlers from the retired runtime into Swift, so the
-// SwiftNativeDispatcher can execute them natively. The four:
-//
-//   persona_read        ← the retired daemon:_exec_persona_read        (3549)
-//   persona_list_skills ← the retired daemon:_exec_persona_list_skills (3757)
-//   workspace_list      ← the retired daemon:_exec_workspace_list      (3872)
-//   time_now            ← the retired daemon:_exec_time_now            (205)
-//
-// Each handler takes the same `(input, context)` → result-dict shape as the
-// historical executor and returns a `JSONValue` whose keys/values are byte-shape
-// equivalent to the old return dict (same keys, defaults, error_code
-// strings). NOTHING here is wired into a production caller yet: the production
-// `makeDispatcher` factory passes `localActions: nil`; this registry is only
-// consulted when a SwiftNativeDispatcher is explicitly constructed with
-// `localActions: .fileSystemDefault`. Flipping callers through SwiftNative is a
-// separate, leash-gated wave.
-//
-// AUDIT NOTE (HONESTY GATE): the brief asked for "+5". A full audit of the
-// remaining unported `_exec_*` builtin handlers found that the 5th would-be
-// candidate — `scratchpad_read` — is NOT a clean
-// self-contained connector-action port: it reads the stateful, in-process
-// `Scratchpad` TTL store which has no shared on-disk
-// surface for byte-parity. Every other unported builtin handler
-// (tool_catalog / daemon_status / context_lookup / recall_* /
-// tradingview_watchlist / daemon_introspect / recent_trace_summary / tool_*)
-// requires a LIVE runtime or dispatcher object injected into `context`. These 4
-// are the COMPLETE set of read-only, runtime-independent persona/system
-// handlers. Porting the 5th would mean porting a subsystem, not an action —
-// out of scope for the per-action migration seam. See §6.97.
-//
-// Sandbox parity: persona_read reuses the EXACT FileSystemActions sandbox
-// (allowedRoots + isSensitiveDataPath) so the security posture is identical to
-// read_file. persona_list_skills / workspace_list are list-only and resolve
-// their roots from the action context (persona_root / workspace_root) with the
-// daemon's same priority order, then sandbox-validate (workspace_list rejects a
-// subdir that escapes the workspace root, mirroring the Python C4 fix).
+// Registered read-only handlers for persona documents, skill inventory,
+// workspace listings and the clock. Persona reads resolve the sensitive-path
+// fence before opening a verified regular-file descriptor.
 
 // MARK: - Constants
 
 /// the retired daemon `_SKILL_DESC_MAX_LEN = 280`
-let personaSkillDescMaxLen = 280
 
 /// the retired daemon `_PERSONA_READ_KINDS`.
 let personaReadKinds: Set<String> = ["soul", "user", "skill", "voice", "growth", "agents"]
 
-/// the retired daemon `_SKILL_NAME_RE = re.compile(r'^[A-Za-z0-9_-]+$')`.
-private let personaSkillNameRegex = try! NSRegularExpression(pattern: "^[A-Za-z0-9_-]+$")
-
 enum PersonaSystemActions {
 
     // MARK: helpers
-
-    /// Mirror `_validate_skill_name`: allow only
-    /// ASCII letters/digits/underscore/hyphen — rejects path-traversal chars.
-    static func validateSkillName(_ name: String) -> Bool {
-        let ns = name as NSString
-        return personaSkillNameRegex.firstMatch(
-            in: name, range: NSRange(location: 0, length: ns.length)) != nil
-    }
 
     /// An explicit context personaRoot, otherwise
     /// PersistenceCore.defaultPersonaRoot for the context's data root.
@@ -84,11 +38,11 @@ enum PersonaSystemActions {
         return PersistenceCore.defaultDataRoot()
     }
 
-    /// Mirror `_persona_path`. Returns nil for an
-    /// invalid skill name / missing skill_name (caller emits bad_input).
+    /// Resolve skill bodies through the checked inventory; fixed docs stay
+    /// under the persona root. Invalid or missing skill names return nil.
     static func personaPath(
         kind: String, skillName: String?, dataRoot: URL, personaRoot: URL
-    ) -> URL? {
+    ) throws -> URL? {
         switch kind {
         case "soul":   return personaRoot.appendingPathComponent("SOUL.md")
         case "user":   return personaRoot.appendingPathComponent("USER.md")
@@ -97,19 +51,13 @@ enum PersonaSystemActions {
         case "agents": return personaRoot.appendingPathComponent("AGENTS.md")
         case "skill":
             guard let sn = skillName, !sn.isEmpty else { return nil }
-            guard validateSkillName(sn) else { return nil }
-            // Persona dir wins if the body exists there; else data-root legacy.
-            let personaSkill = personaRoot
-                .appendingPathComponent("skills")
-                .appendingPathComponent("bodies")
-                .appendingPathComponent("\(sn).md")
-            if FileManager.default.fileExists(atPath: personaSkill.path) {
-                return personaSkill
-            }
-            return dataRoot
-                .appendingPathComponent("skills")
-                .appendingPathComponent("bodies")
-                .appendingPathComponent("\(sn).md")
+            let entries = try InstalledSkillInventory.entries(
+                dataRoot: dataRoot, personaRoot: personaRoot)
+            // Registered identity wins over a stale loose body with the same name.
+            let entry = InstalledSkillInventory.match(sn, in: entries.filter {
+                $0.row["source"] == .string("runtime_registry")
+            }) ?? InstalledSkillInventory.match(sn, in: entries)
+            return entry?.bodyURL
         default:
             return nil
         }
@@ -147,37 +95,42 @@ enum PersonaSystemActions {
             return FileSystemActions.errResult(
                 "skill_name is required when kind=skill", code: "bad_input")
         }
-        // C3 fix: validate skill_name BEFORE path construction.
-        if let sn = skillName, !validateSkillName(sn) {
-            return FileSystemActions.errResult(
-                "skill_name '\(sn)' contains invalid characters (only A-Za-z0-9_- allowed)",
-                code: "bad_input")
-        }
-
         let dataRoot = dataRootURL(ctx)
         let personaRoot = personaRootURL(ctx)
-        guard let target = personaPath(
-            kind: kind, skillName: skillName, dataRoot: dataRoot, personaRoot: personaRoot
-        ) else {
+        let target: URL
+        do {
+            guard let resolved = try personaPath(
+                kind: kind, skillName: skillName, dataRoot: dataRoot, personaRoot: personaRoot
+            ) else {
+                return FileSystemActions.errResult(
+                    "Could not resolve persona path", code: "bad_input")
+            }
+            target = resolved
+        } catch {
             return FileSystemActions.errResult(
-                "Could not resolve persona path", code: "bad_input")
+                String(describing: error), code: "persona_not_found")
         }
 
-        // Python: only `if not target.exists()` → the dedicated "Persona file
-        // not found: <path>" message. Anything else (a directory, a permission
-        // error, a non-UTF-8 file) reaches `read_text()`, raises, and is caught
-        // into `{ok:false, error:str(exc), error_code:"persona_not_found"}`.
-        // (gpt-5.5 review: do NOT pre-reject a directory as "not found" — let
-        // the read attempt produce the caught-exception shape Python emits.)
-        if !FileManager.default.fileExists(atPath: target.path) {
+        let resolved = FileSystemActions.resolvePath(target.path, repoRoot: ctx.repoRoot)
+        if FileSystemActions.isSensitiveDataPath(resolved, ctx) {
+            return FileSystemActions.errResult(
+                "Persona file resolves to a protected credential or policy path.", code: "path_not_allowed")
+        }
+        if !FileManager.default.fileExists(atPath: resolved.path) {
             return FileSystemActions.errResult(
                 "Persona file not found: \(target.path)", code: "persona_not_found")
         }
         let content: String
         do {
-            // Throwing read so a directory / permission / decode failure lands in
-            // the same caught-exception branch Python's `read_text` does.
-            content = try String(contentsOf: target, encoding: .utf8)
+            let handle = try FileSystemActions.openRegularReadHandle(resolved)
+            defer { try? handle.close() }
+            let bytes = try handle.readToEnd() ?? Data()
+            guard let decoded = String(data: bytes, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding)
+            }
+            content = decoded
+        } catch let error as FileSystemActions.FileReadFailure {
+            return FileSystemActions.errResult(error.message, code: error.code)
         } catch {
             return FileSystemActions.errResult(
                 String(describing: error), code: "persona_not_found")
@@ -214,66 +167,27 @@ enum PersonaSystemActions {
 
         let dataRoot = dataRootURL(ctx)
         let personaRoot = personaRootURL(ctx)
-        let personaBodies = personaRoot
-            .appendingPathComponent("skills").appendingPathComponent("bodies")
-        let dataBodies = dataRoot
-            .appendingPathComponent("skills").appendingPathComponent("bodies")
-
-        // Per-name record; persona/ wins on collision (newer authoritative layout).
-        // Preserve insertion-independent state via a dict + the source-priority
-        // walk order ("persona" first), mirroring the Python `if name in records: continue`.
         var records: [String: SkillRecord] = [:]
-        for (source, dir) in [("persona", personaBodies), ("data", dataBodies)] {
-            let mdFiles = listMarkdownFiles(in: dir)
-            for p in mdFiles {
-                let name = p.deletingPathExtension().lastPathComponent
-                if records[name] != nil { continue }  // persona/ already claimed it
-                let body = (try? String(contentsOf: p, encoding: .utf8)) ?? ""
-                guard SkillBodyHygiene.violations(in: body).isEmpty else { continue }
-                records[name] = SkillRecord(
-                    name: name,
-                    source: source,
-                    path: p.path,
-                    description: extractSkillDescription(p),
-                    triggers: nil, kind: nil, useCount: nil
-                )
-            }
+        let entries: [InstalledSkillInventory.Entry]
+        do {
+            entries = try InstalledSkillInventory.entries(dataRoot: dataRoot, personaRoot: personaRoot)
+        } catch {
+            return FileSystemActions.errResult(
+                "Could not load skill inventory: \(error.localizedDescription)", code: "skill_inventory_unavailable")
         }
-
-        // Merge runtime metadata from data/skills/registry.json.
-        let runtimeReg = loadRuntimeSkillRegistry(dataRoot: dataRoot)
-        for (name, entry) in runtimeReg {
-            if records[name] == nil {
-                guard registrySkillBodyIsClean(entry, dataRoot: dataRoot) else { continue }
-                // Registry references a skill whose body is missing — surface a stub.
-                var desc = ""
-                if case .string(let s)? = entry["description"] { desc = s }
-                var bodyPath = ""
-                if case .string(let s)? = entry["bodyPath"] { bodyPath = s }
-                records[name] = SkillRecord(
-                    name: name, source: "registry", path: bodyPath,
-                    description: desc, triggers: nil, kind: nil, useCount: nil)
+        for entry in entries {
+            let row = entry.row
+            let text = { (key: String) -> String in
+                if case .string(let value)? = row[key] { return value }; return ""
             }
-            var rec = records[name]!
-            // Prefer a registry description ONLY if extraction failed.
-            if rec.description.isEmpty, case .string(let s)? = entry["description"], !s.isEmpty {
-                rec.description = s
-            }
-            // Retired truthiness: `if entry.get("triggers"):` only fires for a
-            // NON-EMPTY list; `if entry.get("kind"):` only for a NON-EMPTY string.
-            // An empty list / empty string must NOT add the key (gpt-5.5 review).
-            if case .array(let arr)? = entry["triggers"], !arr.isEmpty {
-                rec.triggers = arr
-            }
-            if case .string(let s)? = entry["kind"], !s.isEmpty {
-                rec.kind = s
-            }
-            // Python: `if entry.get("useCount") is not None:` — present and not
-            // null (0 is kept; only None is skipped).
-            if let uc = entry["useCount"], !isNullValue(uc) {
-                rec.useCount = uc
-            }
-            records[name] = rec
+            let source = text("source") == "persona_body" ? "persona"
+                : text("source") == "runtime_body" ? "data" : "registry"
+            let triggers: [JSONValue]?
+            if case .array(let values)? = row["triggers"], !values.isEmpty { triggers = values } else { triggers = nil }
+            records[entry.name] = SkillRecord(name: entry.name, source: source,
+                path: entry.bodyURL?.path ?? text("bodyPath"), description: text("description"),
+                triggers: triggers, kind: text("kind").isEmpty ? nil : text("kind"),
+                useCount: row["useCount"] == .null ? nil : row["useCount"])
         }
 
         let sortedNames = records.keys.sorted()
@@ -328,34 +242,6 @@ enum PersonaSystemActions {
         ])
     }
 
-    static func registrySkillBodyIsClean(_ entry: [String: JSONValue], dataRoot: URL) -> Bool {
-        var candidates: [URL] = []
-        if case .string(let rawPath)? = entry["bodyPath"] {
-            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                let expanded = (trimmed as NSString).expandingTildeInPath
-                if expanded.hasPrefix("/") {
-                    candidates.append(URL(fileURLWithPath: expanded))
-                } else {
-                    candidates.append(dataRoot.appendingPathComponent(expanded))
-                }
-            }
-        }
-        if case .string(let name)? = entry["name"], !name.isEmpty {
-            candidates.append(dataRoot
-                .appendingPathComponent("skills")
-                .appendingPathComponent("bodies")
-                .appendingPathComponent("\(name).md"))
-        }
-
-        var seen: Set<String> = []
-        for url in candidates where seen.insert(url.path).inserted {
-            guard let body = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            return SkillBodyHygiene.violations(in: body).isEmpty
-        }
-        return true
-    }
-
     /// A per-skill manifest record. Mirrors the Python `records[name]` dict.
     struct SkillRecord {
         var name: String
@@ -380,53 +266,6 @@ enum PersonaSystemActions {
             if let uc = useCount { obj["use_count"] = uc }
             return .object(obj)
         }
-    }
-
-    /// Mirror `_extract_skill_description`.
-    static func extractSkillDescription(_ bodyPath: URL) -> String {
-        guard let fh = FileManager.default.contents(atPath: bodyPath.path) else { return "" }
-        // Read at most ~4KB prefix (Python reads fh.read(4096)).
-        let head = decodeUTF8Replacing4096(fh)
-        var descLines: [String] = []
-        for raw in splitLinesLocal(head) {
-            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty {
-                if !descLines.isEmpty { break }  // paragraph break ends description
-                continue
-            }
-            if line.hasPrefix("#") { continue }  // skip heading lines
-            if line.hasPrefix("-") || line.hasPrefix("*")
-                || line.hasPrefix("1.") || line.hasPrefix("2.") {
-                if !descLines.isEmpty { break }  // list starts → done
-                continue
-            }
-            descLines.append(line)
-        }
-        var desc = descLines.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        if desc.count > personaSkillDescMaxLen {
-            // Python: desc[: MAX-1].rstrip() + "…"
-            let cut = String(desc.prefix(personaSkillDescMaxLen - 1))
-            desc = cut.replacingOccurrences(
-                of: "\\s+$", with: "", options: .regularExpression) + "…"
-        }
-        return desc
-    }
-
-    /// Mirror `_load_runtime_skill_registry`. Returns a
-    /// name→entry map; empty on any error or non-list JSON.
-    static func loadRuntimeSkillRegistry(dataRoot: URL) -> [String: [String: JSONValue]] {
-        let regPath = dataRoot
-            .appendingPathComponent("skills").appendingPathComponent("registry.json")
-        guard let data = FileManager.default.contents(atPath: regPath.path) else { return [:] }
-        guard let parsed = try? JSONSerialization.jsonObject(with: data),
-              let arr = parsed as? [Any] else { return [:] }
-        var out: [String: [String: JSONValue]] = [:]
-        for item in arr {
-            guard let dict = item as? [String: Any],
-                  let name = dict["name"] as? String, !name.isEmpty else { continue }
-            out[name] = foundationToJSONObject(dict)
-        }
-        return out
     }
 
     // MARK: - workspace_list
@@ -637,70 +476,6 @@ private func intOrZero(_ v: JSONValue?) -> Int {
     }
 }
 
-private func isNullValue(_ v: JSONValue) -> Bool {
-    if case .null = v { return true }; return false
-}
-
-/// List `*.md` regular files in a directory (mirror `bodies_dir.glob("*.md")`
-/// + `p.is_file()`). Empty when the dir is absent / unreadable.
-private func listMarkdownFiles(in dir: URL) -> [URL] {
-    let fm = FileManager.default
-    var isDir: ObjCBool = false
-    guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { return [] }
-    guard let children = try? fm.contentsOfDirectory(
-        at: dir, includingPropertiesForKeys: [.isRegularFileKey], options: []) else { return [] }
-    return children.filter { url in
-        guard url.pathExtension == "md" else { return false }
-        var f: ObjCBool = false
-        let exists = fm.fileExists(atPath: url.path, isDirectory: &f)
-        return exists && !f.boolValue
-    }
-}
-
-/// Decode at most a 4096-byte UTF-8 prefix with replacement (Python
-/// `fh.read(4096)` on a text handle reads up to 4096 CHARS, but the description
-/// always lives in the first few lines so a 4096-byte prefix is an
-/// over-approximation that never truncates a real description short).
-private func decodeUTF8Replacing4096(_ data: Data) -> String {
-    let slice = data.count > 4096 ? data.prefix(4096) : data[...]
-    if let s = String(data: Data(slice), encoding: .utf8) { return s }
-    var scalars = String.UnicodeScalarView()
-    var decoder = UTF8()
-    var iter = Data(slice).makeIterator()
-    loop: while true {
-        switch decoder.decode(&iter) {
-        case .scalarValue(let sc): scalars.append(sc)
-        case .emptyInput: break loop
-        case .error: scalars.append(Unicode.Scalar(0xFFFD)!)
-        }
-    }
-    return String(scalars)
-}
-
-/// Mirror Python `str.splitlines()` (universal newlines, no trailing empty
-/// element for a final newline).
-private func splitLinesLocal(_ text: String) -> [String] {
-    if text.isEmpty { return [] }
-    var lines: [String] = []
-    var current = ""
-    let chars = Array(text)
-    var i = 0
-    while i < chars.count {
-        let c = chars[i]
-        if c == "\r" {
-            lines.append(current); current = ""
-            if i + 1 < chars.count && chars[i + 1] == "\n" { i += 1 }
-        } else if c == "\n" {
-            lines.append(current); current = ""
-        } else {
-            current.append(c)
-        }
-        i += 1
-    }
-    if !current.isEmpty { lines.append(current) }
-    return lines
-}
-
 /// True when `path` equals or is nested under `root` (both pre-resolved).
 private func isWithinRoot(_ path: URL, root: URL) -> Bool {
     let p = path.path
@@ -761,38 +536,4 @@ private func weekdayName(_ weekday: Int) -> String {
     let names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     let idx = weekday - 1
     return (idx >= 0 && idx < names.count) ? names[idx] : "Sunday"
-}
-
-/// Convert a Foundation-parsed JSON dict (from JSONSerialization) into a
-/// `[String: JSONValue]`. Used for registry.json entries.
-private func foundationToJSONObject(_ dict: [String: Any]) -> [String: JSONValue] {
-    var out: [String: JSONValue] = [:]
-    for (k, v) in dict { out[k] = foundationToJSONValue(v) }
-    return out
-}
-
-private func foundationToJSONValue(_ v: Any) -> JSONValue {
-    switch v {
-    case let s as String:
-        return .string(s)
-    case let n as NSNumber:
-        // Distinguish bool from numeric: a CFBoolean has the boolean type id.
-        if CFGetTypeID(n as CFTypeRef) == CFBooleanGetTypeID() {
-            return .bool(n.boolValue)
-        }
-        // Integral vs floating.
-        let dbl = n.doubleValue
-        if dbl == dbl.rounded() && Swift.abs(dbl) < 9.0e18 {
-            return .int(n.int64Value)
-        }
-        return .double(dbl)
-    case let arr as [Any]:
-        return .array(arr.map { foundationToJSONValue($0) })
-    case let obj as [String: Any]:
-        return .object(foundationToJSONObject(obj))
-    case is NSNull:
-        return .null
-    default:
-        return .null
-    }
 }

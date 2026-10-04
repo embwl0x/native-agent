@@ -173,6 +173,9 @@ extension MCPServer {
                     inputs[input.path] = .string(try Self.contentDigest(at: input))
                 }
                 identity["interpreterInputs"] = .object(inputs)
+                if Self.launchesPythonModule(arguments, launcher: launcher) {
+                    unpinned = true
+                }
             }
         }
         // 2026-09-06: invalidate older grants that called label-only evidence
@@ -234,6 +237,34 @@ extension MCPServer {
             }
         }
         return operands.filter { !$0.isEmpty }
+    }
+
+    private static func launchesPythonModule(_ arguments: [String], launcher: String) -> Bool {
+        guard launcher == "python" || launcher == "python2" || launcher == "python3"
+            || launcher.hasPrefix("python3.") else { return false }
+        var skipOptionValue = false
+        for argument in arguments.dropFirst() {
+            if skipOptionValue {
+                skipOptionValue = false
+                continue
+            }
+            if argument == "--" || !argument.hasPrefix("-") || argument == "-" { return false }
+            if argument == "--check-hash-based-pycs" {
+                skipOptionValue = true
+                continue
+            }
+            guard !argument.hasPrefix("--") else { continue }
+            let options = Array(argument.dropFirst())
+            for (index, option) in options.enumerated() {
+                if option == "m" { return true }
+                if option == "c" { return false }
+                if option == "W" || option == "X" {
+                    skipOptionValue = index == options.count - 1
+                    break
+                }
+            }
+        }
+        return false
     }
 
     private static func contentDigest(at path: URL) throws -> String {
@@ -815,6 +846,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
         }
 
         let records = merged.compactMap(MCPServer.init(json:))
+        await reconcileHTTPTransports(for: records)
         // Match list_mcp_servers: sorted by name (fallback id).
         return records.sorted { lhs, rhs in
             let lkey = lhs.name.isEmpty ? lhs.id : lhs.name
@@ -964,6 +996,9 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             }) else {
                 throw MCPDispatcherError.malformedResponse("MCP consent key collides with another server/tool pair")
             }
+            guard records.contains(where: { $0.id == key }) || records.count < 300 else {
+                throw MCPDispatcherError.malformedResponse("MCP consent ledger is full (300 records); new grants cannot be saved")
+            }
             let kept = records
                 .filter { $0.id != key }
                 .map { $0.toJSON() }
@@ -988,8 +1023,6 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             record.validatedServerIdentity = serverIdentity
             var out: [JSONValue] = [record.toJSON()]
             out.append(contentsOf: kept)
-            // Match Python's records[:300] cap.
-            if out.count > 300 { out = Array(out.prefix(300)) }
             try await persistence.writeJSON(.array(out), to: ledgerPath)
             return record
         }

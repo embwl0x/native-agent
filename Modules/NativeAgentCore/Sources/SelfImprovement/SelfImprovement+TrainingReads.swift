@@ -26,21 +26,6 @@ extension SwiftNativeSelfImprovement {
         SavedTrustPolicyAuthority.read(dataRoot: trainingPromotionDataRoot())
     }
 
-    /// Python-compatible truthiness for saved policy leaves: absent, null,
-    /// false, zero and empty strings/containers are false; other values are true.
-    static func pythonBool(_ v: JSONValue?) -> Bool {
-        guard let v else { return false }
-        switch v {
-        case .null:            return false
-        case .bool(let b):     return b
-        case .int(let i):      return i != 0
-        case .double(let d):   return d != 0
-        case .string(let s):   return !s.isEmpty
-        case .array(let a):    return !a.isEmpty
-        case .object(let o):   return !o.isEmpty
-        }
-    }
-
     /// One saved trust leaf, strictly. Absent policy / absent block / absent
     /// leaf keep the shipped default; damaged authority and any non-Bool leaf
     /// throw, so a caller can never mistake corrupt policy for a configured

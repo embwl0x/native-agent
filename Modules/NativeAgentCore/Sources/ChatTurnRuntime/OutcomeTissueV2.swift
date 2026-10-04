@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ChatSessionWork
+import ToolRegistry
 
 extension ResponseOutcomeObservationV2 {
     public static func make(
@@ -27,7 +28,9 @@ extension ResponseOutcomeObservationV2 {
         let packet = context?.fluidContextTurn?.packet
         let toolReferences = Array((result?.toolDispatches ?? []).prefix(64).enumerated()).compactMap {
             index, dispatch -> ResponseOutcomeToolReference? in
-            guard let tool = closedToken(dispatch.name, maximum: 128) else { return nil }
+            // A folded app action is recorded as the tool it ran.
+            guard let tool = closedToken(ToolNameAliases.ranTool(dispatch.name, input: dispatch.input), maximum: 128)
+            else { return nil }
             let sourceID = dispatch.id ?? "sequence:\(index)"
             let opaqueID = CausalTransitionEvidence.opaqueIdentity("\(turnID)|tool|\(sourceID)")
             return ResponseOutcomeToolReference(
@@ -63,8 +66,9 @@ extension ResponseOutcomeObservationV2 {
                         ? .observed : .unverified)),
             "motor": motorReferences.isEmpty
                 ? (boundedDispatches.contains(where: {
-                    ToolCausalBoundary.hasCanonicalMotorOwner(tool: $0.name)
-                        || ToolCausalBoundary.isExternalProtocolTool($0.name)
+                    let ran = ToolNameAliases.ranTool($0.name, input: $0.input)
+                    return ToolCausalBoundary.hasCanonicalMotorOwner(tool: ran)
+                        || ToolCausalBoundary.isExternalProtocolTool(ran)
                 }) ? .unknown : .notApplicable)
                 : aggregateMotorEvidence(motorReferences.map(\.verification)),
             "reaction": .unknown,
@@ -111,7 +115,7 @@ extension ResponseOutcomeObservationV2 {
     ) -> ResponseOutcomeMotorReference? {
         guard case .object(let object) = dispatch.result,
               let binding = ToolCausalBoundary.motorReference(
-                  tool: dispatch.name,
+                  tool: ToolNameAliases.ranTool(dispatch.name, input: dispatch.input),
                   output: dispatch.result
               ) else { return nil }
         let verification: OutcomeEvidenceState = {

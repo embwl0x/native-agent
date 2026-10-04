@@ -15,6 +15,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+import TurnTrace
 
 extension SwiftToolDispatcher {
     /// Conventional source checkout retained only as one validated candidate.
@@ -102,6 +103,7 @@ extension SwiftToolDispatcher {
         )
         var envelope: [String: JSONValue] = [
             "status": .string("failed"),
+            "effects": .string("none"),
             "tool": .string(tool),
             "reason": .string("source_checkout_required"),
             "workspace_root": .string(builderWorkspaceRoot(dataRoot: dataRoot).path),
@@ -118,6 +120,7 @@ extension SwiftToolDispatcher {
     static func builderFullMacRequiredEnvelope(tool: String) -> JSONValue {
         .object([
             "status": .string("failed"),
+            "effects": .string("none"),
             "reason": .string("trust_center_full_mac_required"),
             "tool": .string(tool),
             "detail": .string(
@@ -150,25 +153,6 @@ extension SwiftToolDispatcher {
             return code
         }
         return nil
-    }
-
-    static func builderNormalizeShellCommand(_ raw: String) -> (cmd: String, rewrites: [String]) {
-        var cmd = raw
-        var rewrites: [String] = []
-        if cmd.contains("cat -A") {
-            cmd = cmd.replacingOccurrences(of: "cat -A", with: "cat -vet")
-            rewrites.append("cat -A -> cat -vet")
-        }
-        let timeoutPattern = #"(^|[;&|]\s*)timeout\s+\d+(?:\.\d+)?[smhd]?\s+"#
-        if let regex = try? NSRegularExpression(pattern: timeoutPattern) {
-            let before = cmd
-            let full = NSRange(cmd.startIndex..<cmd.endIndex, in: cmd)
-            cmd = regex.stringByReplacingMatches(in: cmd, range: full, withTemplate: "$1")
-            if cmd != before {
-                rewrites.append("removed GNU timeout wrapper; use timeout_seconds")
-            }
-        }
-        return (cmd, rewrites)
     }
 
     /// Fresh macOS installs keep developer-tool shims such as `/usr/bin/git`,
@@ -272,6 +256,7 @@ extension SwiftToolDispatcher {
     static func builderXcodebuildRefusalEnvelope(tool: String, cmd: String) -> JSONValue {
         .object([
             "status": .string("failed"),
+            "effects": .string("none"),
             "tool": .string(tool),
             "reason": .string("xcodebuild_requires_full_mac_posture"),
             "sandboxed": .bool(true),
@@ -340,8 +325,8 @@ extension SwiftToolDispatcher {
     }
 
     struct BuilderContextPatchHunk {
-        var oldBlock: String
-        var newBlock: String
+        var oldLines: [String]
+        var newLines: [String]
     }
 
     struct BuilderContextPatchFile {
@@ -402,32 +387,43 @@ extension SwiftToolDispatcher {
 
                 var oldLines: [String] = []
                 var newLines: [String] = []
+                var previousPrefix: Character?
                 while index < lines.count,
                       !lines[index].hasPrefix("@@"),
                       !lines[index].hasPrefix("--- ") {
                     let hunkLine = lines[index]
                     if hunkLine.hasPrefix("\\ No newline") {
+                        if previousPrefix == "-" || previousPrefix == " " {
+                            if let last = oldLines.indices.last { oldLines[last].removeLast() }
+                        }
+                        if previousPrefix == "+" || previousPrefix == " " {
+                            if let last = newLines.indices.last { newLines[last].removeLast() }
+                        }
+                        previousPrefix = nil
                         index += 1
                         continue
                     }
+                    if hunkLine.isEmpty, index == lines.count - 1 { break }
                     guard let prefix = hunkLine.first else {
-                        oldLines.append("")
-                        newLines.append("")
+                        oldLines.append("\n")
+                        newLines.append("\n")
+                        previousPrefix = " "
                         index += 1
                         continue
                     }
                     if prefix == " " {
-                        let body = String(hunkLine.dropFirst())
+                        let body = String(hunkLine.dropFirst()) + "\n"
                         oldLines.append(body)
                         newLines.append(body)
                     } else if prefix == "-" {
-                        oldLines.append(String(hunkLine.dropFirst()))
+                        oldLines.append(String(hunkLine.dropFirst()) + "\n")
                     } else if prefix == "+" {
-                        newLines.append(String(hunkLine.dropFirst()))
+                        newLines.append(String(hunkLine.dropFirst()) + "\n")
                     } else {
-                        oldLines.append(hunkLine)
-                        newLines.append(hunkLine)
+                        oldLines.append(hunkLine + "\n")
+                        newLines.append(hunkLine + "\n")
                     }
+                    previousPrefix = [" ", "-", "+"].contains(prefix) ? prefix : " "
                     index += 1
                 }
 
@@ -435,8 +431,8 @@ extension SwiftToolDispatcher {
                     return (true, [], "context_patch_add_only_hunk_not_supported")
                 }
                 hunks.append(BuilderContextPatchHunk(
-                    oldBlock: oldLines.joined(separator: "\n"),
-                    newBlock: newLines.joined(separator: "\n")
+                    oldLines: oldLines,
+                    newLines: newLines
                 ))
             }
 
@@ -453,18 +449,6 @@ extension SwiftToolDispatcher {
             return (true, [], "no_file_patches")
         }
         return (true, files, nil)
-    }
-
-    static func builderRanges(of needle: String, in haystack: String) -> [Range<String.Index>] {
-        guard !needle.isEmpty else { return [] }
-        var ranges: [Range<String.Index>] = []
-        var searchStart = haystack.startIndex
-        while searchStart < haystack.endIndex,
-              let range = haystack.range(of: needle, range: searchStart..<haystack.endIndex) {
-            ranges.append(range)
-            searchStart = range.upperBound
-        }
-        return ranges
     }
 
     /// The subtrees the builder sandbox profile denies `file-write*` on — the
@@ -486,15 +470,24 @@ extension SwiftToolDispatcher {
     static func builderContextPatchFileURL(
         path: String,
         cwd: String,
-        dataRoot: URL
+        dataRoot: URL,
+        sandboxMode: BuilderShellSandboxMode
     ) -> URL? {
         guard !path.hasPrefix("/"), !path.contains("\0") else { return nil }
         let base = URL(fileURLWithPath: cwd).standardizedFileURL
         let candidate = base.appendingPathComponent(path).standardizedFileURL
         let resolved = candidate.resolvingSymlinksInPath()
-        guard builderAllowedRoots(dataRoot: dataRoot).contains(where: { root in
+        let inAllowedRoot = builderAllowedRoots(dataRoot: dataRoot).contains(where: { root in
             resolved.path == root.path || resolved.path.hasPrefix(root.path + "/")
-        }) else { return nil }
+        })
+        guard inAllowedRoot || sandboxMode == .off else { return nil }
+        if sandboxMode == .off {
+            guard builderNormalizeCwd(cwd, dataRoot: dataRoot, allowOutsideWorkspace: true) != nil,
+                  MacControlSensitivePathFence.reason(forPath: resolved.path) == nil,
+                  MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolved.path) == nil else {
+                return nil
+            }
+        }
         // 2026-09-06: a range-less @@ hunk takes the IN-PROCESS branch and
         // writes with Foundation, never entering the sandboxed subprocess —
         // so the SBPL profile's trust-directory denial did not apply and
@@ -504,6 +497,17 @@ extension SwiftToolDispatcher {
             resolved.path == denied.path || resolved.path.hasPrefix(denied.path + "/")
         }) {
             return nil
+        }
+        if sandboxMode == .developerFullMac {
+            let workspace = builderWorkspaceRoot(dataRoot: dataRoot).standardizedFileURL.resolvingSymlinksInPath().path
+            let dataPath = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
+            let inWorkspace = resolved.path == workspace || resolved.path.hasPrefix(workspace + "/")
+            let protected = MacControlSensitivePathFence.protectedSystemMutationPrefixes
+                + [dataPath, NSHomeDirectory() + "/.ssh", NSHomeDirectory() + "/Library/Keychains"]
+            if !inWorkspace, protected.contains(where: { raw in
+                let denied = URL(fileURLWithPath: raw).standardizedFileURL.resolvingSymlinksInPath().path
+                return resolved.path == denied || resolved.path.hasPrefix(denied + "/")
+            }) { return nil }
         }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir),
@@ -519,7 +523,8 @@ extension SwiftToolDispatcher {
         cwd: String,
         runId: String,
         startedAt: Date,
-        dataRoot: URL
+        dataRoot: URL,
+        sandboxMode: BuilderShellSandboxMode
     ) -> JSONValue {
         // One staged body per resolved path. Repeated sections (including
         // symlink/path aliases) apply in order to the previous section's result,
@@ -527,7 +532,7 @@ extension SwiftToolDispatcher {
         var stagedFiles: [(url: URL, path: String, original: String, content: String)] = []
         var stagedIndex: [String: Int] = [:]
 
-        func failure(_ reason: String, detail: String? = nil, path: String? = nil) -> JSONValue {
+        func failure(_ reason: String, detail: String? = nil, path: String? = nil, effects: String = "none") -> JSONValue {
             var auditEntry: [String: Any] = [
                 "toolName": "apply_patch",
                 "runId": runId,
@@ -537,13 +542,14 @@ extension SwiftToolDispatcher {
                 "reason": reason,
                 "cwd": cwd,
                 "patch_format": "range_less_unified_context",
-                "sourcePayload": patch.count > 4_096 ? String(patch.prefix(4_096)) : patch,
+                "sourcePayload": patch,
             ]
             if let detail { auditEntry["detail"] = detail }
             if let path { auditEntry["path"] = path }
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
             var env: [String: JSONValue] = [
                 "status": .string("failed"),
+                "effects": .string(effects),
                 "tool": .string("apply_patch"),
                 "reason": .string(reason),
                 "runId": .string(runId),
@@ -561,7 +567,8 @@ extension SwiftToolDispatcher {
             guard let url = builderContextPatchFileURL(
                 path: filePatch.path,
                 cwd: cwd,
-                dataRoot: dataRoot
+                dataRoot: dataRoot,
+                sandboxMode: sandboxMode
             ) else {
                 return failure("context_patch_path_invalid_or_missing", path: filePatch.path)
             }
@@ -581,7 +588,14 @@ extension SwiftToolDispatcher {
             }
             var updated = stagedFiles[index].content
             for hunk in filePatch.hunks {
-                let ranges = builderRanges(of: hunk.oldBlock, in: updated)
+                var lines = updated.components(separatedBy: "\n")
+                for index in lines.indices.dropLast() { lines[index] += "\n" }
+                if lines.last?.isEmpty == true { lines.removeLast() }
+                let ranges: [Range<Int>] = lines.count < hunk.oldLines.count ? []
+                    : (0...(lines.count - hunk.oldLines.count)).compactMap { start in
+                        let range = start..<(start + hunk.oldLines.count)
+                        return lines[range].elementsEqual(hunk.oldLines) ? range : nil
+                    }
                 guard ranges.count == 1, let range = ranges.first else {
                     return failure(
                         ranges.isEmpty ? "context_patch_old_block_not_found" : "context_patch_old_block_ambiguous",
@@ -589,7 +603,12 @@ extension SwiftToolDispatcher {
                         path: filePatch.path
                     )
                 }
-                updated.replaceSubrange(range, with: hunk.newBlock)
+                guard hunk.newLines.dropLast().allSatisfy({ $0.hasSuffix("\n") }),
+                      hunk.newLines.last?.hasSuffix("\n") != false || range.upperBound == lines.count else {
+                    return failure("context_patch_newline_marker_not_at_end", path: filePatch.path)
+                }
+                lines.replaceSubrange(range, with: hunk.newLines)
+                updated = lines.joined()
             }
             stagedFiles[index].content = updated
         }
@@ -602,7 +621,7 @@ extension SwiftToolDispatcher {
             do {
                 try write.content.write(to: write.url, atomically: true, encoding: .utf8)
             } catch {
-                return failure("context_patch_write_failed", detail: String(describing: error), path: write.url.path)
+                return failure("context_patch_write_failed", detail: String(describing: error), path: write.url.path, effects: "unknown")
             }
         }
 
@@ -619,7 +638,7 @@ extension SwiftToolDispatcher {
             "cwd": cwd,
             "patch_format": "range_less_unified_context",
             "changed_files": changedFiles,
-            "sourcePayload": patch.count > 4_096 ? String(patch.prefix(4_096)) : patch,
+            "sourcePayload": patch,
             "sandboxed": false,
             "sandbox_mode": "swift_context_patch",
             "outer_sandbox_policy": "not_applicable",
@@ -675,9 +694,26 @@ extension SwiftToolDispatcher {
             try FileManager.default.createDirectory(
                 at: auditDir, withIntermediateDirectories: true
             )
-            let data = try JSONSerialization.data(
-                withJSONObject: entry, options: [.prettyPrinted]
-            )
+            var receipt = TurnTraceRedactor.redactValue(JSONValue(fromFoundation: entry)).mapStrings(builderAuditText)
+            if case .object(var fields) = receipt {
+                if case .array(let args)? = fields["args"] {
+                    var secretValue = false
+                    fields["args"] = .array(args.map { arg in
+                        guard case .string(let text) = arg else { return arg }
+                        if secretValue {
+                            secretValue = false
+                            return .string("[REDACTED_NAMED_SECRET]")
+                        }
+                        secretValue = text.hasPrefix("-") && builderAuditSecretName(text.trimmingCharacters(in: CharacterSet(charactersIn: "-")))
+                        return arg
+                    })
+                }
+                for (key, cap) in [("stdout", 16_384), ("stderr", 16_384), ("sourcePayload", 4_096)] {
+                    if case .string(let text)? = fields[key] { fields[key] = .string(String(text.prefix(cap))) }
+                }
+                receipt = .object(fields)
+            }
+            let data = Data(try receipt.serialize(pretty: true).utf8)
             try data.write(to: auditURL)
             let pruneResult = pruneBuilderAuditsIfNeeded(in: auditDir, keeping: builderAuditRetentionLimit)
             if pruneResult.removedCount > 0 {
@@ -690,6 +726,31 @@ extension SwiftToolDispatcher {
         } catch {
             return (auditURL, String(describing: error))
         }
+    }
+
+    private static func builderAuditSecretName(_ name: String) -> Bool {
+        TurnSecretRedactor.isCredentialName(name) || ["auth", "credential", "cookie"].contains(name.lowercased())
+    }
+
+    private static func builderAuditText(_ text: String) -> String {
+        // Include named shell flags and short assignments; token-shape scrubbing
+        // alone cannot recognize an arbitrary password passed as an argument.
+        var result = text.replacingOccurrences(
+            of: #"\b(?:authorization|proxy-authorization|auth|cookie|set-cookie)\s*:\s*[^\r\n"']+"#,
+            with: "[REDACTED_NAMED_SECRET]", options: [.regularExpression, .caseInsensitive])
+        result = result.replacingOccurrences(
+            of: #"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"#,
+            with: "[REDACTED_PRIVATE_KEY]", options: .regularExpression)
+        let pattern = #"(?<![\w-])((?:--?)?(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization|auth|credential|cookie))(?![\w-])["']?(\s*=\s*|\s*:\s*|[ \t]+)("(?:\\.|[^"\\])*"|'[^']*'|[^\s;,]+)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { preconditionFailure("Invalid builder audit redaction pattern") }
+        let source = result as NSString
+        for match in expression.matches(in: result, range: NSRange(location: 0, length: source.length)).reversed() {
+            let name = source.substring(with: match.range(at: 1)).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            if builderAuditSecretName(name) {
+                result = (result as NSString).replacingCharacters(in: match.range(at: 3), with: "[REDACTED_NAMED_SECRET]")
+            }
+        }
+        return result
     }
 
     static let builderAuditRetentionLimit = 500
@@ -1101,7 +1162,6 @@ extension SwiftToolDispatcher {
         cwd: String,
         timeoutSeconds: Int,
         sourcePayloadForAudit: String? = nil,
-        compatRewrites: [String] = [],
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         // Two narrow seams used by the agent-host command adapter alone. Left
         // nil/false, every existing caller behaves exactly as it did.
@@ -1118,8 +1178,8 @@ extension SwiftToolDispatcher {
         closeStandardInput: Bool = false,
         reapDescendantsOnExit: Bool = false,
         // agent_cancel: a cancelled task interrupts the run (SIGINT, then
-        // SIGTERM) and it reports "cancelled". Agent-host command runs only.
-        interruptOnCancel: Bool = false,
+        // SIGTERM) and it reports "cancelled" for every synchronous run.
+        interruptOnCancel: Bool = true,
         // Each stdout line as it is written, for a caller that shows progress
         // live. The envelope is unchanged. Agent-host command runs only.
         onStdoutLine: (@Sendable (String) -> Void)? = nil
@@ -1164,6 +1224,7 @@ extension SwiftToolDispatcher {
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
             var env: [String: JSONValue] = [
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string(toolName),
                 "reason": .string("cwd_invalid_or_outside_workspace"),
                 "cwd_requested": .string(cwd),
@@ -1213,7 +1274,7 @@ extension SwiftToolDispatcher {
         //     `swift run --disable-sandbox` builds AND runs under the workspace
         //     profile, while an out-of-workspace write is still denied).
         var env = environmentOverride ?? ProcessInfo.processInfo.environment
-        var effectiveCompatRewrites = compatRewrites
+        var effectiveCompatRewrites: [String] = []
         let developerDirectory = Self.builderSelectedDeveloperDirectory(environment: env)
         let developerPromptPolicy = Self.builderEnvironmentSuppressingDeveloperToolsPrompt(
             environment: env,
@@ -1266,7 +1327,7 @@ extension SwiftToolDispatcher {
         let interruptRun: @Sendable () -> Void = {
             let pid = process.processIdentifier
             guard interruptOnCancel, pid > 0 else { return }
-            Self.interruptThenTerminate(ProcessTreeReaper.snapshot(rootPID: pid), stillRunning: { process.isRunning })
+            Self.interruptThenTerminate(ProcessTreeReaper.snapshot(rootPID: pid, retaining: launchedTree.value), stillRunning: { process.isRunning })
         }
         return await withTaskCancellationHandler {
         await withCheckedContinuation { (cont: CheckedContinuation<JSONValue, Never>) in
@@ -1275,7 +1336,7 @@ extension SwiftToolDispatcher {
             process.terminationHandler = { proc in
                 // Settle anything the command backgrounded BEFORE returning, so
                 // nothing of it outlives this turn or the directory it ran in.
-                if let tree = launchedTree.value { Self.reapLaunchedTree(tree) }
+                if reapDescendantsOnExit || cancelled.isSet, let tree = launchedTree.value { Self.reapLaunchedTree(tree) }
                 // The direct child exiting does NOT guarantee EOF — a
                 // backgrounded grandchild can inherit the write end and keep it
                 // open. Stop the live drains, then grab any already-buffered
@@ -1299,17 +1360,6 @@ extension SwiftToolDispatcher {
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let status = cancelled.isSet ? "cancelled" : timedOut.isSet ? "timed_out" : (exitCode == 0 ? "completed" : "failed")
 
-                // Audit truncation: 16KB out/err, 4KB payload.
-                let auditStdout = stdoutText.count > 16_384
-                    ? String(stdoutText.prefix(16_384))
-                    : stdoutText
-                let auditStderr = stderrText.count > 16_384
-                    ? String(stderrText.prefix(16_384))
-                    : stderrText
-                let auditPayload: String? = sourcePayloadForAudit.map {
-                    $0.count > 4_096 ? String($0.prefix(4_096)) : $0
-                }
-
                 var auditEntry: [String: Any] = [
                     "toolName": toolName,
                     "runId": runId,
@@ -1326,14 +1376,14 @@ extension SwiftToolDispatcher {
                     "args": args,
                     "stdout_len": stdoutText.count,
                     "stderr_len": stderrText.count,
-                    "stdout": auditStdout,
-                    "stderr": auditStderr,
+                    "stdout": stdoutText,
+                    "stderr": stderrText,
                     "pipe_truncated": pipeTruncated,
                     "sandboxed": sandboxed,
                     "sandbox_mode": sandboxMode.rawValue,
                     "outer_sandbox_policy": "policy",
                 ]
-                if let auditPayload { auditEntry["sourcePayload"] = auditPayload }
+                if let sourcePayloadForAudit { auditEntry["sourcePayload"] = sourcePayloadForAudit }
                 if timedOut.isSet { auditEntry["reason"] = "watchdog_timeout" }
                 if let maskedExitCode {
                     auditEntry["masked_exit_detected"] = true
@@ -1396,7 +1446,7 @@ extension SwiftToolDispatcher {
 
             do {
                 try process.run()
-                if reapDescendantsOnExit {
+                if reapDescendantsOnExit || interruptOnCancel {
                     // Taken here, while the child is alive and leads its own
                     // group: after it exits its descendants are reparented and
                     // cannot be found from it any more.
@@ -1432,6 +1482,7 @@ extension SwiftToolDispatcher {
                 guard resumed.tryResume() else { return }
                 var env: [String: JSONValue] = [
                     "status": .string("failed"),
+                    "effects": .string("none"),
                     "tool": .string(toolName),
                     "reason": .string("spawn_failed"),
                     "detail": .string(String(describing: error)),
@@ -1549,6 +1600,7 @@ extension SwiftToolDispatcher {
         default:
             return (nil, .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string(tool),
                 "reason": .string("invalid_configuration"),
                 "configuration": .string(raw),
@@ -1569,28 +1621,27 @@ extension SwiftToolDispatcher {
         guard case .string(let cmd)? = input["cmd"], !cmd.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("shell"),
                 "reason": .string("missing_cmd"),
             ])
         }
         let cwd = builderResolveCwd(input, dataRoot: dataRoot)
         let timeout = builderResolveTimeout(input, defaultSeconds: 120, maxSeconds: 600)
-        let normalized = builderNormalizeShellCommand(cmd)
         // No command escapes the profile. xcodebuild physically cannot run
         // inside it, so it is refused with a reason instead of being lifted or
         // left to fail as exit 74 — see builderXcodebuildRefusalEnvelope.
-        if builderCommandInvokesXcodebuild(normalized.cmd),
+        if builderCommandInvokesXcodebuild(cmd),
            await builderShellSandboxMode(dataRoot: dataRoot) != .off {
             return builderXcodebuildRefusalEnvelope(tool: "shell", cmd: cmd)
         }
         return await runShellLikeProcess(
             toolName: "shell",
             executable: "/bin/sh",
-            args: ["-c", normalized.cmd],
+            args: ["-c", cmd],
             cwd: cwd,
             timeoutSeconds: timeout,
             sourcePayloadForAudit: cmd,
-            compatRewrites: normalized.rewrites,
             dataRoot: dataRoot
         )
     }
@@ -1599,26 +1650,25 @@ extension SwiftToolDispatcher {
         guard case .string(let cmd)? = input["cmd"], !cmd.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("bash"),
                 "reason": .string("missing_cmd"),
             ])
         }
         let cwd = builderResolveCwd(input, dataRoot: dataRoot)
         let timeout = builderResolveTimeout(input, defaultSeconds: 120, maxSeconds: 600)
-        let normalized = builderNormalizeShellCommand(cmd)
         // See impl_shell: xcodebuild is refused, everything else rides the shim.
-        if builderCommandInvokesXcodebuild(normalized.cmd),
+        if builderCommandInvokesXcodebuild(cmd),
            await builderShellSandboxMode(dataRoot: dataRoot) != .off {
             return builderXcodebuildRefusalEnvelope(tool: "bash", cmd: cmd)
         }
         return await runShellLikeProcess(
             toolName: "bash",
             executable: "/bin/bash",
-            args: ["-c", normalized.cmd],
+            args: ["-c", cmd],
             cwd: cwd,
             timeoutSeconds: timeout,
             sourcePayloadForAudit: cmd,
-            compatRewrites: normalized.rewrites,
             dataRoot: dataRoot
         )
     }
@@ -1633,6 +1683,7 @@ extension SwiftToolDispatcher {
                 else {
                     return .object([
                         "status": .string("failed"),
+                        "effects": .string("none"),
                         "tool": .string("git"),
                         "reason": .string("args_must_be_string_array_or_shell_string"),
                         "fix": .string("Pass args as [\"status\", \"--short\"] or as a shell-style string like \"status --short\"."),
@@ -1645,6 +1696,7 @@ extension SwiftToolDispatcher {
             guard let args = parsed.args else {
                 return .object([
                     "status": .string("failed"),
+                    "effects": .string("none"),
                     "tool": .string("git"),
                     "reason": .string("args_string_parse_failed"),
                     "detail": .string(parsed.error ?? "invalid_args_string"),
@@ -1655,6 +1707,7 @@ extension SwiftToolDispatcher {
         default:
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("git"),
                 "reason": .string("missing_args"),
                 "fix": .string("Pass args as [\"status\", \"--short\"] or as a shell-style string like \"status --short\"."),
@@ -1663,6 +1716,7 @@ extension SwiftToolDispatcher {
         if parsedArgs.isEmpty {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("git"),
                 "reason": .string("empty_args"),
                 "fix": .string("Pass at least one git subcommand, e.g. \"status --short\"."),
@@ -1685,6 +1739,7 @@ extension SwiftToolDispatcher {
         guard case .string(let patch)? = input["patch"], !patch.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("apply_patch"),
                 "reason": .string("missing_patch"),
             ])
@@ -1692,6 +1747,7 @@ extension SwiftToolDispatcher {
         if patch.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("*** Begin Patch") {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("apply_patch"),
                 "reason": .string("codex_apply_patch_format_not_supported"),
                 "detail": .string("NativeAgent chat apply_patch accepts unified diffs. Codex *** Begin Patch format is not interpreted by the app runtime."),
@@ -1702,6 +1758,7 @@ extension SwiftToolDispatcher {
         if contextPatch.applicable, let error = contextPatch.error {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("apply_patch"),
                 "reason": .string(error),
                 "patch_format": .string("range_less_unified_context"),
@@ -1711,6 +1768,7 @@ extension SwiftToolDispatcher {
         if !contextPatch.applicable, !builderUnifiedPatchIsValid(patch) {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("apply_patch"),
                 "reason": .string("invalid_unified_patch"),
                 "detail": .string("Provide a unified diff with paired ---/+++ file headers and complete @@ -old,count +new,count @@ hunks whose line counts match the body."),
@@ -1834,7 +1892,7 @@ extension SwiftToolDispatcher {
             let runId = UUID().uuidString
             let now = ISO8601DateFormatter().string(from: Date())
             let sourcePayload: String
-            if case .string(let patch)? = input["patch"] { sourcePayload = String(patch.prefix(4_096)) }
+            if case .string(let patch)? = input["patch"] { sourcePayload = patch }
             else { sourcePayload = "" }
             var entry: [String: Any] = [
                 "toolName": "apply_patch", "runId": runId,
@@ -1869,7 +1927,8 @@ extension SwiftToolDispatcher {
                 cwd: cwd,
                 runId: runId,
                 startedAt: startedAt,
-                dataRoot: dataRoot
+                dataRoot: dataRoot,
+                sandboxMode: await builderShellSandboxMode(dataRoot: dataRoot)
             )
         }
 
@@ -1892,6 +1951,7 @@ extension SwiftToolDispatcher {
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: preSpawnAudit, dataRoot: dataRoot)
             var env: [String: JSONValue] = [
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("apply_patch"),
                 "reason": .string("apply_patch_tmp_write_failed"),
                 "detail": .string(String(describing: error)),
@@ -1940,6 +2000,7 @@ extension SwiftToolDispatcher {
         if product != nil && target != nil {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("swift_build"),
                 "reason": .string("product_and_target_are_mutually_exclusive"),
             ])
@@ -2041,6 +2102,7 @@ extension SwiftToolDispatcher {
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
             var env: [String: JSONValue] = [
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("install_app"),
                 "reason": .string("script_missing"),
                 "script_path": .string(script.path),
@@ -2070,6 +2132,7 @@ extension SwiftToolDispatcher {
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
             var env: [String: JSONValue] = [
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("install_app"),
                 "reason": .string("log_dir_create_failed"),
                 "detail": .string(String(describing: error)),
@@ -2114,6 +2177,7 @@ extension SwiftToolDispatcher {
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
             var env: [String: JSONValue] = [
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "tool": .string("install_app"),
                 "reason": .string("spawn_failed"),
                 "detail": .string(String(describing: error)),

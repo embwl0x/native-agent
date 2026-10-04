@@ -103,12 +103,14 @@ public actor TurnFirstRenderRegistry {
 
     public func claimFirstRenderEvent(
         sessionId: String,
+        turnId: String,
         observedBy: String
     ) -> TurnTraceEvent? {
         let session = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !session.isEmpty, let pending = pendingBySession.removeValue(forKey: session) else {
+        guard !session.isEmpty, let pending = pendingBySession[session], pending.turnId == turnId else {
             return nil
         }
+        pendingBySession.removeValue(forKey: session)
         insertionOrder.removeAll { $0 == session }
         let elapsedMs = Int64(
             (DispatchTime.now().uptimeNanoseconds &- pending.registeredAtUptimeNs) / 1_000_000
@@ -284,6 +286,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "toolSchemaMaterialBytes", "toolSchemaFingerprintSHA256",
                 "promptFingerprintSHA256", "systemTotalBytes",
                 "stableBytes", "dynamicBytes", "userMessageBytes",
+                "userBlockBytes", "preparationMs",
                 "promptTextBytes", "imagePayloadBytes", "segmented",
                 // The composer's context receipt reads these five as well.
                 // Every real turn carries previews, so every real snapshot row
@@ -626,8 +629,6 @@ public actor TurnTraceBus {
     private struct Sink {
         let continuation: AsyncStream<TurnTraceEvent>.Continuation
         let dropContinuation: AsyncStream<Int>.Continuation
-        let capacity: Int
-        var inFlight: Int
         var drops: Int
     }
 
@@ -674,8 +675,6 @@ public actor TurnTraceBus {
         sinks[id] = Sink(
             continuation: continuation,
             dropContinuation: dropContinuation,
-            capacity: cap,
-            inFlight: 0,
             drops: 0
         )
         continuation.onTermination = { [weak self] _ in
@@ -937,15 +936,23 @@ public actor TurnTraceBus {
     /// non-blocking (AsyncStream.yield never suspends).
     public func deliver(_ event: TurnTraceEvent) async {
         if let deliveryGate { await deliveryGate() }
+        deliverToSubscribers(event)
+        // The per-bus writer owns disk ordering and backpressure. Enqueue is a
+        // short lock operation; no disk await occurs on this actor or on the
+        // process-wide ingress worker.
+        persistPump.submit(event)
+    }
+
+    /// Live delivery without persistence. Reconciliation uses this after its
+    /// guarded append so the event is not written twice.
+    func deliverToSubscribers(_ event: TurnTraceEvent) {
         for (id, var sink) in sinks {
             // `.bufferingNewest(cap)` means yield NEVER blocks; on overflow it
-            // drops the OLDEST buffered value and reports `.dropped`. We also
-            // track an explicit inFlight watermark so `drops` reflects the
-            // backpressure even when the policy silently rotates the ring.
+            // drops the OLDEST buffered value and reports `.dropped`.
             let r = sink.continuation.yield(event)
             switch r {
             case .enqueued:
-                sink.inFlight = min(sink.inFlight + 1, sink.capacity)
+                break
             case .dropped:
                 sink.drops += 1
                 sink.dropContinuation.yield(sink.drops)
@@ -956,19 +963,6 @@ public actor TurnTraceBus {
             }
             sinks[id] = sink
         }
-        // The per-bus writer owns disk ordering and backpressure. Enqueue is a
-        // short lock operation; no disk await occurs on this actor or on the
-        // process-wide ingress worker.
-        persistPump.submit(event)
-    }
-
-    /// Test seam: drain — called by a subscriber after consuming N events to
-    /// release the inFlight watermark. Production consumers don't need this;
-    /// the watermark is advisory (the ring policy is the real bound).
-    func releaseInFlight(_ id: UUID, _ n: Int = 1) {
-        guard var sink = sinks[id] else { return }
-        sink.inFlight = max(0, sink.inFlight - n)
-        sinks[id] = sink
     }
 }
 
@@ -1277,7 +1271,8 @@ public struct TurnTracePersistLane: Sendable {
     /// the lock that every `turn.terminal` row is written under.
     ///
     /// `shouldAppend` receives the target file's current text (empty when the
-    /// file does not exist yet). Returns whether the row was written.
+    /// file does not exist yet). Returns false only when the predicate confirms
+    /// no append is needed; read, guard and persistence failures throw.
     ///
     /// `alsoLocking` extends the critical section over further files the
     /// predicate reads (the reconciler's sibling day files). Every lock in the
@@ -1287,8 +1282,8 @@ public struct TurnTracePersistLane: Sendable {
     public func appendGuarded(
         _ event: TurnTraceEvent,
         alsoLocking siblings: [URL] = [],
-        shouldAppend: @escaping @Sendable (String) -> Bool
-    ) async -> Bool {
+        shouldAppend: @escaping @Sendable (String) throws -> Bool
+    ) async throws -> Bool {
         let target = path(for: event.ts)
         let dir = target.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -1298,35 +1293,28 @@ public struct TurnTracePersistLane: Sendable {
             .union([target.path])
             .sorted()
             .map { URL(fileURLWithPath: $0) }
-        do {
-            return try await withFileLocks(lockOrder) {
-                let existing = (try? String(contentsOf: target, encoding: .utf8)) ?? ""
-                guard shouldAppend(existing) else { return false }
-                try await appendJSONLCapped(
-                    event.jsonRow,
-                    to: target,
-                    using: persistence,
-                    maxLines: Self.maxLines,
-                    logLabel: "TurnTracePersistLane",
-                    // The lock is already held by this call — nesting the same
-                    // non-recursive flock on the same path would deadlock.
-                    takeLock: false,
-                    trimWhenBytesExceed: JSONLLineCaps.turnTraceTrimTriggerBytes,
-                    maxBytes: Self.maxBytes,
-                    trimToBytes: Self.trimToBytes,
-                    capCheckStride: 4096,
-                    durable: true
-                )
-                await onPersist?(event)
-                Self.postTerminalIfNeeded(event)
-                return true
-            }
-
-        } catch {
-            FileHandle.standardError.write(
-                Data("TurnTracePersistLane: guarded append failed (turn \(event.turnId)): \(error)\n".utf8)
+        return try await withFileLocks(lockOrder) {
+            let existing = FileManager.default.fileExists(atPath: target.path)
+                ? try String(contentsOf: target, encoding: .utf8) : ""
+            guard try shouldAppend(existing) else { return false }
+            try await appendJSONLCapped(
+                event.jsonRow,
+                to: target,
+                using: persistence,
+                maxLines: Self.maxLines,
+                logLabel: "TurnTracePersistLane",
+                // The lock is already held by this call — nesting the same
+                // non-recursive flock on the same path would deadlock.
+                takeLock: false,
+                trimWhenBytesExceed: JSONLLineCaps.turnTraceTrimTriggerBytes,
+                maxBytes: Self.maxBytes,
+                trimToBytes: Self.trimToBytes,
+                capCheckStride: 4096,
+                durable: true
             )
-            return false
+            await onPersist?(event)
+            Self.postTerminalIfNeeded(event)
+            return true
         }
     }
 

@@ -2,16 +2,12 @@ import Foundation
 import Combine
 import NativeAgentShared
 import PersistenceCore
+import TrustCenter
 
 /// Main-actor serialization keeps removal and decision verification ordered.
 @MainActor
 public final class PairedPhoneStore: ObservableObject {
-    public struct Phone: Codable, Identifiable {
-        public enum Status: String, Codable { case pending, paired, removed }
-        public let id: String
-        public let publicKey: Data
-        public var status: Status
-    }
+    public typealias Phone = PairedPhoneAuthority.Phone
 
     @Published public private(set) var phones: [Phone] = []
     @Published public private(set) var message: String?
@@ -26,31 +22,11 @@ public final class PairedPhoneStore: ObservableObject {
 
     /// Doctor reads the owner store without constructing or reloading UI state.
     nonisolated public static func pairedCountChecked(at url: URL) throws -> Int {
-        try read(at: url).filter { $0.status == .paired }.count
+        try PairedPhoneAuthority.pairedCountChecked(at: url)
     }
 
     nonisolated private static func read(at url: URL) throws -> [Phone] {
-        let fm = FileManager.default
-        let attributes: [FileAttributeKey: Any]
-        do { attributes = try fm.attributesOfItem(atPath: url.path) }
-        catch let error as NSError {
-            if error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return [] }
-            throw error
-        }
-        guard attributes[.type] as? FileAttributeType == .typeRegular else { throw StoreError.unavailable }
-        guard let size = attributes[.size] as? NSNumber, size.int64Value <= 128 * 1024 else {
-            throw StoreError.unavailable
-        }
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: 128 * 1024 + 1) ?? Data()
-        guard data.count <= 128 * 1024 else { throw StoreError.unavailable }
-        let rows = try JSONDecoder().decode([Phone].self, from: data)
-        guard Set(rows.map(\.id)).count == rows.count,
-              rows.allSatisfy({ $0.publicKey.count == 32 && $0.id == DeviceApprovalSignature.deviceID(publicKey: $0.publicKey) }) else {
-            throw StoreError.unavailable
-        }
-        return rows
+        try PairedPhoneAuthority.read(at: url)
     }
 
     /// Phones paired right now, read from disk (a setup card's done-check).

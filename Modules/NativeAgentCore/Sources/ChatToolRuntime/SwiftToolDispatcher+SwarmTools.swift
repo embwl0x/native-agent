@@ -24,7 +24,6 @@ public struct SwarmProviderAssembly: Sendable {
     let codexEnvironment: [String: String]
     let anthropicDataRoot: URL
     let openAIDataRoot: URL
-    let openAIOAuthPath: URL
     let anthropicOAuthPath: URL
     let xaiOAuthPath: URL
     let moonshotDataRoot: URL
@@ -37,7 +36,6 @@ public struct SwarmProviderAssembly: Sendable {
         ]) { _, bound in bound }
         self.anthropicDataRoot = dataRoot
         self.openAIDataRoot = dataRoot
-        self.openAIOAuthPath = OpenAIOAuthDirectAdapter.boundRootReadAuthPath(dataRoot: dataRoot)
         self.anthropicOAuthPath = dataRoot.appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("anthropic_oauth_direct.json")
         self.xaiOAuthPath = XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot)
@@ -68,6 +66,18 @@ extension SwiftToolDispatcher {
             policy.defaultModel = preference.model
             policy.defaultReasoningEffort = preference.reasoningEffort
         }
+        if let providerID = routingSnapshot.activeProviders["swarms"] {
+            if CodexAccountModelCatalog.isAccountBackedProvider(providerID) {
+                policy.supportedReasoningEfforts = CodexAccountModelCatalog.load(
+                    providerID: providerID,
+                    cacheURL: CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(dataRoot: dataRoot),
+                    useDefaultCacheWhenNil: false
+                ).first { $0.id.caseInsensitiveCompare(policy.defaultModel) == .orderedSame }?.supportedReasoningEfforts ?? []
+            } else {
+                policy.supportedReasoningEfforts = FirstPartyModelCatalog.models(forProviderID: providerID)
+                    .first { $0.id.caseInsensitiveCompare(policy.defaultModel) == .orderedSame }?.supportedReasoningEfforts ?? []
+            }
+        }
         let executor = swarmExecutor ?? makeDefaultAgentSwarmExecutor(
             router: router,
             routing: SwarmAdmittedRouting(
@@ -78,8 +88,8 @@ extension SwiftToolDispatcher {
             ),
             providerLifecycleObserver: providerLifecycleObserver
         )
-        // Child effort is filled by the parsed worker or the captured swarm
-        // tuple (synthesis), never an ambient parent call's reasoning depth.
+        // Child effort is filled by the parsed worker/run, never an ambient
+        // parent call's reasoning depth.
         return try await LLMCallContext.$reasoningEffort.withValue(nil) {
             try await executor.runTool(input: body, policy: policy)
         }
@@ -113,7 +123,7 @@ extension SwiftToolDispatcher {
             anthropic: AnthropicAdapter(dataRootOverride: providerAssembly.anthropicDataRoot, telemetryDataRootOverride: providerAssembly.dataRoot),
             openAI: OpenAIAdapter(dataRootOverride: providerAssembly.openAIDataRoot, telemetryDataRootOverride: providerAssembly.dataRoot),
             openAIOAuthDirect: OpenAIOAuthDirectAdapter(
-                authPathOverride: providerAssembly.openAIOAuthPath,
+                dataRootOverride: providerAssembly.dataRoot,
                 telemetryDataRootOverride: providerAssembly.dataRoot
             ),
             anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
@@ -174,10 +184,11 @@ extension SwiftToolDispatcher {
 /// parent turn that owns the swarm receipt.
 struct AgentSwarmInheritedToolScope: ToolDispatchClient {
     let inner: any ToolDispatchClient
+    @TaskLocal static var isWorker = false
 
     private static let blocked: Set<String> = [
         "agent_swarm",
-        "invoke_codex", "invoke_claude",
+        "invoke_codex",
         "codex_message", "claude_message", "omp_message",
         "install_app", "restart_app", "self_install",
     ]
@@ -201,146 +212,9 @@ struct AgentSwarmInheritedToolScope: ToolDispatchClient {
                 reason: "\(tool) is reserved for the parent turn and is unavailable inside a swarm worker"
             )
         }
-        let discovery = ToolNameAliases.canonical(tool) {
-            ["tool_catalog", "tool_load", "tool_unload"].contains($0)
+        return try await Self.$isWorker.withValue(true) {
+            try await core { try await inner.dispatch(tool: tool, input: input, surface: surface) }
         }
-        switch discovery {
-        case "tool_catalog":
-            let result = try await core { try await inner.dispatch(tool: discovery, input: input, surface: surface) }
-            return try await scopedCatalog(result)
-        case "tool_load":
-            return try await scopedLoad(input)
-        case "tool_unload":
-            return .object([
-                "status": .string("no_change"), "changed": .bool(false), "dropped": .array([]),
-                "worker_active_count": .int(Int64(try await requestToolNames().count)),
-                "parent_loadout_changed": .bool(false),
-                "note": .string(Self.fixedCatalogNote),
-            ])
-        default: break
-        }
-        return try await core { try await inner.dispatch(tool: tool, input: input, surface: surface) }
-    }
-
-    private static let fixedCatalogNote = "Worker tools are fixed for this request's lifetime. Loading only reports existing worker readiness; unloading makes no change. The parent's session loadout is untouched."
-
-    private static func discoveryDescription(_ name: String) -> String? {
-        switch name {
-        case "tool_catalog": return "Discover this worker's available tools and fixed request readiness. Parent-owned delegation and app lifecycle tools are excluded."
-        case "tool_load": return "Check requested names or a category against this worker's already-exposed tools. Does not load new schemas or change the parent's session loadout."
-        case "tool_unload": return "Reports no change: worker tools remain fixed for this request's lifetime. Does not unload tools or change the parent's session loadout."
-        default: return nil
-        }
-    }
-
-    private func requestToolNames() async throws -> Set<String> {
-        if let active = LLMCallContext.turnActiveTools {
-            return active.filter { !Self.isParentOwned($0) }
-        }
-        return Set(try await listAvailableToolSchemas().map(\.name))
-    }
-
-    /// Discovery is a view of this worker, not the inner parent's loadout.
-    /// Filter only defined tool-name slots, never arbitrary tool content.
-    private func scopedCatalog(_ result: JSONValue) async throws -> JSONValue {
-        guard case .object(var object) = result else { return result }
-        func names(_ value: JSONValue) -> JSONValue {
-            guard case .array(let rows) = value else { return value }
-            return .array(rows.filter {
-                guard case .string(let name) = $0 else { return true }
-                return !Self.isParentOwned(name)
-            })
-        }
-        for key in ["available_tools", "currently_loaded", "turn_active_tools", "discovery_only_tools",
-                    "builder_available_tools", "builder_policy_locked_tools", "active_tools"] {
-            if let value = object[key] { object[key] = names(value) }
-        }
-        if case .object(let groups)? = object["tool_groups"] {
-            object["tool_groups"] = .object(groups.mapValues(names).filter {
-                if case .array(let rows) = $0.value { return !rows.isEmpty }
-                return true
-            })
-        }
-        if case .array(let rows)? = object["tools"] {
-            object["tools"] = .array(rows.filter {
-                guard case .object(let row) = $0, case .string(let name)? = row["name"] else { return true }
-                return !Self.isParentOwned(name)
-            })
-        }
-        let ready = try await requestToolNames()
-        if case .array(let available)? = object["available_tools"] {
-            let visible = Set(available.compactMap { value -> String? in
-                if case .string(let name) = value { return name }; return nil
-            })
-            object["currently_loaded"] = .array(visible.intersection(ready).sorted().map(JSONValue.string))
-            object["turn_active_tools"] = object["currently_loaded"]
-            object["discovery_only_tools"] = .array(visible.subtracting(ready).sorted().map(JSONValue.string))
-        }
-        if case .array(let rows)? = object["tools"] {
-            object["tools"] = .array(rows.map { value in
-                guard case .object(var row) = value, case .string(let name)? = row["name"] else { return value }
-                row["load_state"] = .string(ready.contains(name) ? "loaded" : "discovery_only")
-                if let description = Self.discoveryDescription(name) { row["description"] = .string(description) }
-                return .object(row)
-            })
-        }
-        if case .object(let bridges)? = object["builder_bridge_readiness"] {
-            object["builder_bridge_readiness"] = .object(bridges.mapValues { value in
-                guard case .object(var bridge) = value else { return value }
-                bridge["status"] = .string("parent_only")
-                bridge["execution_ready"] = .bool(false)
-                bridge["worker_available"] = .bool(false)
-                return .object(bridge)
-            })
-        }
-        object["dynamic_loading"] = .string("fixed_worker_request")
-        object["builder_mode_detail"] = .string("Ordinary worker tools retain the parent's policy. Recursive delegation and app lifecycle replacement remain parent-owned.")
-        object["worker_scope_note"] = .string(Self.fixedCatalogNote)
-        return .object(object)
-    }
-
-    /// Ephemeral workers already expose their complete scoped schemas. Never
-    /// call the session-mutating loader with the inherited parent session ID.
-    private func scopedLoad(_ input: [String: JSONValue]) async throws -> JSONValue {
-        func string(_ value: JSONValue?) -> String? {
-            guard case .string(let raw)? = value else { return nil }
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
-        var requested = Set<String>()
-        let category = string(input["category"])?.lowercased()
-        if let category {
-            guard let group = ToolPreloadHeuristics.loadGroup(forCategory: category) else {
-                return .object(["status": .string("failed"), "reason": .string("unknown_category"),
-                                "category": .string(category),
-                                "known_categories": .array(ToolPreloadHeuristics.knownLoadCategories.map(JSONValue.string))])
-            }
-            requested.formUnion(group.tools)
-        }
-        if case .array(let values)? = input["names"] { requested.formUnion(values.compactMap { string($0) }) }
-        if let name = string(input["name"]) { requested.insert(name) }
-        let all = Set(try await core { try await inner.listAvailableTools() })
-        var aliases: [String: JSONValue] = [:]
-        requested = Set(requested.map { name in
-            let canonical = ToolNameAliases.canonical(name) { all.contains($0) }
-            if canonical != name { aliases[name] = .string(canonical) }
-            return canonical
-        })
-        let ready = try await requestToolNames()
-        let loaded = requested.intersection(all).intersection(ready).filter { !Self.isParentOwned($0) }
-        let unavailable = requested.subtracting(loaded)
-        return .object([
-            "status": .string(unavailable.isEmpty ? "loaded" : "partial"),
-            "category": category.map(JSONValue.string) ?? .null,
-            "loaded": .array(loaded.sorted().map(JSONValue.string)), "loaded_now": .array([]),
-            "already_active": .array(loaded.sorted().map(JSONValue.string)),
-            "turn_active": .array(loaded.sorted().map(JSONValue.string)), "schemas_added": .array([]),
-            "unavailable": .array(unavailable.sorted().map(JSONValue.string)),
-            "parent_only": .array(requested.filter(Self.isParentOwned).sorted().map(JSONValue.string)),
-            "not_in_catalog": .array(requested.subtracting(all).sorted().map(JSONValue.string)),
-            "aliased": .object(aliases), "parent_loadout_changed": .bool(false),
-            "next_turn_note": .string(Self.fixedCatalogNote),
-        ])
     }
 
     func listAvailableTools() async throws -> [String] {
@@ -348,10 +222,7 @@ struct AgentSwarmInheritedToolScope: ToolDispatchClient {
     }
 
     func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await core { try await inner.listAvailableToolSchemas() }.filter { !Self.isParentOwned($0.name) }.map { schema in
-            guard let description = Self.discoveryDescription(schema.name) else { return schema }
-            return LLMToolSchema(name: schema.name, description: description, parametersJSON: schema.parametersJSON)
-        }
+        try await core { try await inner.listAvailableToolSchemas() }.filter { !Self.isParentOwned($0.name) }
     }
 }
 

@@ -36,7 +36,9 @@ package enum AgentWorkspaceScreenPreview {
     }
 
     public static func render(_ room: String, dataRoot: URL, scope: String) async -> String {
-        await HerScreen.$previewing.withValue(true) { await look(room, dataRoot: dataRoot, scope: scope) }
+        await AgentWorkspaceReadiness.withSnapshot(dataRoot: dataRoot) {
+            await HerScreen.$previewing.withValue(true) { await look(room, dataRoot: dataRoot, scope: scope) }
+        }
     }
 
     private static func look(_ room: String, dataRoot: URL, scope: String) async -> String {
@@ -50,7 +52,8 @@ package enum AgentWorkspaceScreenPreview {
 
         // The workspace's order: her names, an alias, then a family.
         func resolve(_ name: String) async -> HerScreen.Target? {
-            await HerScreen.resolve(name, dataRoot: dataRoot, scope: scope, browserPages: pages, openPlaces: await navigation.places(key: key))
+            await HerScreen.resolve(name, dataRoot: dataRoot, scope: scope, browserPages: pages,
+                                    openPlaces: await navigation.places(key: key), currentPlace: await navigation.current(key: key))
         }
         let alias = HerScreen.familyAliases[room]
         var target = await resolve(room)

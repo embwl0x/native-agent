@@ -302,6 +302,20 @@ public final class AnthropicAdapter: LLMAdapter {
         // Thinking models (K3, Claude extended thinking) lead with a thinking
         // block — join all text blocks instead of requiring content[0].text.
         let text = Self.joinedTextBlocks(content)
+        if obj["stop_reason"] as? String == "max_tokens" {
+            await telemetry.record(
+                requestBody: req.httpBody,
+                provider: providerId,
+                model: model,
+                streaming: false,
+                usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
+                ttftMs: nil,
+                durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
+                status: "incomplete",
+                stopReason: "max_tokens"
+            )
+            throw LLMError.outputLengthLimit(partial: text)
+        }
         guard !text.isEmpty else {
             throw emptyTextResponseError(obj, content: content)
         }
@@ -450,7 +464,7 @@ public final class AnthropicAdapter: LLMAdapter {
         // clear_at in the body REQUIRES its beta header. Same rule as the
         // OAuth lane: present iff a message carries the flag, absent
         // otherwise, so every pre-existing request stays byte-identical.
-        if let beta = AnthropicOAuthDirectAdapter.midConversationBetas(for: messages) {
+        if let beta = AnthropicOAuthDirectAdapter.clearAtBeta(for: messages) {
             req.setValue(beta, forHTTPHeaderField: "anthropic-beta")
         }
 

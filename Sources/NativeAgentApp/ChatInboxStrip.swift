@@ -50,22 +50,30 @@ struct InboxStripContainer: View {
     @State private var approvals: [ApprovalRecord] = []
     @State private var approvalError: String?
 
+    /// A card already posted into the open conversation shows there, once.
+    private var stripApprovals: [ApprovalRecord] {
+        approvals.filter { !$0.chatCardDelivered || $0.chatCardSessionId != appModel.activeChatSessionId }
+    }
+    private var stripCards: [InboxItemRecord] {
+        items.filter { $0.source == InteractionCardDelivery.source && $0.chat_session_id != appModel.activeChatSessionId }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
         if let approvalError {
             Text(approvalError).foregroundStyle(.orange)
         }
-        if !approvals.isEmpty || items.contains(where: { $0.source == InteractionCardDelivery.source }) {
+        if !stripApprovals.isEmpty || !stripCards.isEmpty {
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(approvals) { approval in
+                    ForEach(stripApprovals) { approval in
                         if ApprovalPayloadPreviewPresentation.canResolve(approval) {
                             InlineApprovalCard(message: approvalMessage(approval))
                         } else {
                             Text(ApprovalPayloadPreviewPresentation.unavailableText)
                         }
                     }
-                    ForEach(items.filter { $0.source == InteractionCardDelivery.source }) { item in
+                    ForEach(stripCards) { item in
                         InteractionInboxCard(item: item)
                     }
                 }

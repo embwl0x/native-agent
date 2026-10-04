@@ -3,7 +3,7 @@ import PersistenceCore
 
 // MARK: - Merge helpers (shared, pure)
 
-enum WorkflowMerge {
+public enum WorkflowMerge {
     /// Reads the `id` field of a workflow object as a string (mirrors
     /// `str(item.get("id"))`, so a missing/non-string id becomes "" / "None"-ish).
     /// Python's `str(None)` == "None"; we mirror that for missing ids so two
@@ -41,14 +41,16 @@ enum WorkflowMerge {
     /// Full mirror of Runtime.list_workflows merge logic. Returns
     /// (mergedUnsorted, sortedDescending). The caller persists `mergedUnsorted`
     /// and returns `sortedDescending`.
-    static func mergeRegistry(defaults: [JSONValue], saved: [JSONValue]) -> (mergedUnsorted: [JSONValue], sorted: [JSONValue]) {
+    public static func mergeRegistry(defaults: [JSONValue], saved: [JSONValue]) -> (mergedUnsorted: [JSONValue], sorted: [JSONValue]) {
         // by_id = {str(item.get("id")): item for item in saved}  — last write wins
         var byId: [String: JSONValue] = [:]
         for item in saved { byId[idKey(item)] = item }
 
         var merged: [JSONValue] = []
         for def in defaults {
-            let override = byId[idKey(def)] ?? .object([:])
+            let override = byId[idKey(def)].map {
+                WorkflowDefaults.migrateUnchangedSeed($0, to: def)
+            } ?? .object([:])
             merged.append(merge(base: def, override: override))
         }
         let savedIds = Set(merged.map { idKey($0) })
@@ -68,4 +70,3 @@ enum WorkflowMerge {
         return (merged, sorted)
     }
 }
-

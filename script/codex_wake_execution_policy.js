@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
-function createCodexWakeExecutionPolicy({ stringSetting, enumStringSetting, GITHUB_COMMAND_EXECUTION_PROFILE }) {
+function createCodexWakeExecutionPolicy({ stringSetting, GITHUB_COMMAND_EXECUTION_PROFILE }) {
 function brainControlsForEntries(entries, config) {
   const firstPayload = Array.isArray(entries) && entries[0] && entries[0].payload
     ? entries[0].payload
@@ -78,39 +78,42 @@ function repositoryWritableRoots(workingDirectory) {
   return [...roots];
 }
 
+/// The sandbox and approval policy are NativeAgent's finished launch decision
+/// (SecurityCenter, for each request's real origin), stamped on every queued
+/// entry from the helper's argv — never read from a payload, the queue or
+/// settings. A batch runs elevated only when every entry was stamped so;
+/// anything else, including an unstamped entry, runs restricted.
+const RESTRICTED_LAUNCH = Object.freeze({ sandbox: "workspace-write", approvalPolicy: "never" });
+
+function launchForEntries(entries) {
+  const stamps = (Array.isArray(entries) ? entries : []).map((entry) => entry && entry.launch);
+  const first = stamps[0];
+  const same = first && stamps.every((stamp) => stamp
+    && stamp.sandbox === first.sandbox && stamp.approvalPolicy === first.approvalPolicy);
+  return same ? first : RESTRICTED_LAUNCH;
+}
+
 function executionPolicyForEntries(entries, config) {
   const workingDirectories = [...new Set(entries
     .map((entry) => entry && entry.payload && entry.payload.workingDirectory)
     .filter((value) => typeof value === "string" && path.isAbsolute(value)))];
   const configuredCwd = stringSetting(config, "cwd", "NATIVE_AGENT_CODEX_WAKEUP_CWD", process.cwd());
-  const configuredSandbox = enumStringSetting(
-    config,
-    "sandbox",
-    "NATIVE_AGENT_CODEX_WAKEUP_SANDBOX",
-    "danger-full-access",
-    new Set(["read-only", "workspace-write", "danger-full-access"])
-  );
+  const launch = launchForEntries(entries);
   const trustedGitHubCwd = trustedGitHubCommandWorkingDirectory(entries);
-  if (trustedGitHubCwd) {
-    const writableRoots = repositoryWritableRoots(trustedGitHubCwd);
-    return {
-      cwd: trustedGitHubCwd,
-      sandbox: "danger-full-access",
-      sandboxPolicy: {
-        type: "dangerFullAccess",
-      },
-      executionProfile: GITHUB_COMMAND_EXECUTION_PROFILE,
-      networkAccess: true,
-      writableRoots,
-    };
-  }
+  // Sent explicitly on every turn: Codex keeps a turn's override as the
+  // thread's default, so an omitted one would carry an earlier grant forward.
+  const writableRoots = trustedGitHubCwd ? repositoryWritableRoots(trustedGitHubCwd) : [];
+  const sandboxPolicy = launch.sandbox === "danger-full-access"
+    ? { type: "dangerFullAccess" }
+    : { type: "workspaceWrite", writableRoots, networkAccess: Boolean(trustedGitHubCwd) };
   return {
-    cwd: workingDirectories.length === 1 ? workingDirectories[0] : configuredCwd,
-    sandbox: configuredSandbox,
-    sandboxPolicy: null,
-    executionProfile: null,
-    networkAccess: false,
-    writableRoots: [],
+    cwd: trustedGitHubCwd || (workingDirectories.length === 1 ? workingDirectories[0] : configuredCwd),
+    sandbox: launch.sandbox,
+    approvalPolicy: launch.approvalPolicy,
+    sandboxPolicy,
+    executionProfile: trustedGitHubCwd ? GITHUB_COMMAND_EXECUTION_PROFILE : null,
+    networkAccess: Boolean(trustedGitHubCwd),
+    writableRoots,
   };
 }
 

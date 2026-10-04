@@ -161,7 +161,8 @@ extension SwiftToolDispatcher {
         let hasSession = !(marketJSONString(obj["sessionid"]) ?? "").isEmpty
         let hasSessionSign = !(marketJSONString(obj["sessionid_sign"]) ?? "").isEmpty
         let hasAuthToken = !(marketJSONString(obj["auth_token"]) ?? "").isEmpty
-        let expires = marketJSONString(obj["jwt_expires_at"])
+        // Session-cookie reads do not depend on the saved JWT expiry.
+        let expires = hasSession ? nil : marketJSONString(obj["jwt_expires_at"])
         return .object([
             "configured": .bool(true),
             "status": .string((hasSession || hasAuthToken) ? "configured" : "missing_session"),
@@ -171,7 +172,7 @@ extension SwiftToolDispatcher {
             "has_session_signature": .bool(hasSessionSign),
             "has_auth_token": .bool(hasAuthToken),
             "jwt_expires_at": expires.map(JSONValue.string) ?? .null,
-            "jwt_status": .string(jwtStatus(expires)),
+            "jwt_status": .string(hasSession ? "not_required_for_session" : jwtStatus(expires)),
             "watchlist_endpoint_configured": .bool(!(marketJSONString(obj["watchlist_endpoint"]) ?? "").isEmpty),
             "scanner_endpoint_configured": .bool(!(marketJSONString(obj["scanner_endpoint"]) ?? "").isEmpty),
         ])

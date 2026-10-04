@@ -267,21 +267,10 @@ extension CognitiveSubstrate {
 //     consume site leaves behind (single-use, session-scoped, same max age).
 // Calling it before ingest yields nothing rather than something wrong.
 //
-// NOT WIRED HERE — the remaining hop. The organism is fed by
-// `SomaticSignalBus.observe(event)`, and the bus reads the event's own metadata.
-// The single place that hands the SAME event to both owners is
-// `NativeCognitionRuntime.observe(_:)` (Sources/NativeAgentApp), which sits
-// outside this change's fence. The wire is four lines there, AFTER the substrate
-// ingest and BEFORE the bus:
-//
-//     var enriched = inherited.event
-//     for (key, value) in await substrate.semanticExpectationMetadata(
-//         for: inherited.event
-//     ) { enriched.metadata[key] = value }
-//     let somaticAccepted = await somaticSignalBus.observe(enriched) != nil
-//
-// Until that line exists the lane is inert (no metadata ⇒ no mint ⇒ no
-// resolution), which is exactly how an unwired seam should fail.
+// `NativeCognitionRuntime.observe(_:)` in the core's Sources/Cognition calls
+// `semanticExpectationMetadata(for:)` after substrate ingest, enriches that
+// same event, then passes it to `SomaticSignalBus.observe(_:)`. The bus reads
+// the enriched metadata to mint and resolve semantic predictions.
 
 extension CognitiveSubstrate {
 
@@ -543,7 +532,7 @@ extension CognitiveSubstrate {
         let source = Self.relationalSource(for: event)
         let weight = source.appraisalWeight
         guard weight > 0 else { return AffectAppraisal() }
-        var appraisal = conversationalAppraisal(in: event.summary)
+        var appraisal = afterTurnAppraisals[event.subject.id] ?? AffectAppraisal()
         guard weight != 1.0 else { return appraisal }
         appraisal.valence *= weight
         appraisal.warmth *= weight

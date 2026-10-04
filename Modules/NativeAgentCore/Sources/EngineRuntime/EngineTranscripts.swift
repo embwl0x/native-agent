@@ -6,6 +6,7 @@ import ChatOrchestration
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import ProviderRouting
 
 public enum ChatMessageClearError: Error, LocalizedError, Sendable {
     case transcriptClearedMetadataNotSaved(String)
@@ -197,6 +198,30 @@ public final class TranscriptsFacade {
         return try rows.map(NativeAgentShared.ChatSession.init(row:))
     }
 
+    /// The archive tier (`chat/archive/sessions.jsonl`), where Archive and
+    /// retention move a conversation out of the index: the newest row per id,
+    /// less any a door has since brought back into the index. Missing file → `[]`.
+    public nonisolated func listArchived() async throws -> [NativeAgentShared.ChatSession] {
+        let url = sessionsPath
+        let archivePath = chatRoot
+            .appendingPathComponent("archive", isDirectory: true)
+            .appendingPathComponent("sessions.jsonl")
+        return try await SwiftNativePersistenceCore().withFileLock(url) {
+            let hot = Set(try ChatSessionIndexFile.loadObjectRowsForMutation(at: url).compactMap { row -> String? in
+                guard case .string(let id)? = row["id"], row["archived"] != .bool(true) else { return nil }
+                return id
+            })
+            guard FileManager.default.fileExists(atPath: archivePath.path) else { return [] }
+            var newest: [String: NativeAgentShared.ChatSession] = [:]
+            for line in try Data(contentsOf: archivePath).split(separator: 10) {
+                guard case .object(let row) = try JSONValue.parse(Data(line)) else { continue }
+                let session = try NativeAgentShared.ChatSession(row: row)
+                if !hot.contains(session.id) { newest[session.id] = session }
+            }
+            return Array(newest.values)
+        }
+    }
+
     public nonisolated func loadMessages(sessionId: String, cached: Bool = false) async throws -> [ChatMessage] {
         try await loadTranscript(sessionId: sessionId, cached: cached).messages
     }
@@ -346,7 +371,7 @@ public final class TranscriptsFacade {
     /// A user-initiated archive leaves the hot index immediately. Retention
     /// later bounds the archive tier, but it must not be responsible for the
     /// visible archive action: an archived chat may never linger in
-    /// `sessions.json` or be appended twice to the archive tail.
+    /// `sessions.json` or append duplicate retry records to the archive tail.
     public nonisolated func archive(
         id: String,
         afterArchiveTailWrite: (@Sendable () throws -> Void)? = nil
@@ -376,7 +401,7 @@ public final class TranscriptsFacade {
             } else {
                 existingTail = Data()
             }
-            var archivedIDs = Set<String>()
+            var latestArchived: [String: JSONValue]?
             for line in existingTail.split(separator: 10) {
                 guard let value = try? JSONValue.parse(Data(line)),
                       case .object(let row) = value,
@@ -385,10 +410,12 @@ public final class TranscriptsFacade {
                         NSLocalizedDescriptionKey: "chat archive tail is unreadable; refusing to overwrite it"
                     ])
                 }
-                archivedIDs.insert(archivedID)
+                if archivedID == id { latestArchived = row }
             }
-            let alreadyArchived = archivedIDs.contains(id)
-            if !alreadyArchived {
+            // Ignore only this operation's timestamp when recognizing a retry.
+            // A resumed session's changed metadata needs a new archive record.
+            latestArchived?["archivedAt"] = archived["archivedAt"]
+            if latestArchived != archived {
                 var nextTail = existingTail
                 if !nextTail.isEmpty, nextTail.last != 10 { nextTail.append(10) }
                 nextTail.append(archivedData)
@@ -399,8 +426,8 @@ public final class TranscriptsFacade {
             }
 
             // The tail is the durable claim. If the index commit faults after
-            // it lands, a retry sees this same id in the tail and only removes
-            // the live row; it never appends another archival record.
+            // it lands, a retry sees the same metadata in the tail and only
+            // removes the live row; it never appends another archival record.
             try afterArchiveTailWrite?()
             rows.remove(at: index)
 
@@ -440,6 +467,10 @@ public final class TranscriptsFacade {
             .appendingPathComponent("messages.jsonl")
         let persistence = SwiftNativePersistenceCore()
         let sessionsPath = self.sessionsPath
+        let usagePath = chatRoot
+            .appendingPathComponent("session_state", isDirectory: true)
+            .appendingPathComponent(safeSessionId, isDirectory: true)
+            .appendingPathComponent("provider_usage.json")
         // Refuse known index corruption before deleting any transcript bytes.
         // Keep locks separate: other writers have their own transcript/index
         // ordering, so clear must not add a nested cross-file lock dependency.
@@ -457,15 +488,44 @@ public final class TranscriptsFacade {
             }
             return rows
         }
-        try await persistence.withFileLock(messagesPath) {
+        let usageBeforeClear: Data? = try await persistence.withFileLock(messagesPath) {
+            let usage: Data?
+            do {
+                usage = try Data(contentsOf: usagePath)
+            } catch CocoaError.fileReadNoSuchFile {
+                usage = nil
+            }
             let parent = messagesPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
             try Data().write(to: messagesPath, options: .atomic)
             if FileManager.default.fileExists(atPath: staleNestedPath.path) {
                 try? FileManager.default.removeItem(at: staleNestedPath)
             }
+            return usage
         }
         do {
+            if let usageBeforeClear {
+                let invalidated = try await persistence.withFileLock(usagePath) {
+                    let current: Data
+                    do {
+                        current = try Data(contentsOf: usagePath)
+                    } catch CocoaError.fileReadNoSuchFile {
+                        return false
+                    }
+                    // A concurrent provider call owns its replacement receipt.
+                    guard current == usageBeforeClear else { return false }
+                    try FileManager.default.removeItem(at: usagePath)
+                    return true
+                }
+                if invalidated {
+                    await MainActor.run {
+                        NotificationCenter.default.post(
+                            name: .nativeAgentSessionProviderUsageDidChange,
+                            object: safeSessionId
+                        )
+                    }
+                }
+            }
             try await afterTranscriptClear?()
             try await persistence.withFileLock(sessionsPath) {
                 var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)

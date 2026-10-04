@@ -12,6 +12,7 @@ public actor BotRunnerScheduler {
         var failureID: UUID? = nil
         var minimumInterval: TimeInterval? = BotRunLimits.minimumInterval
         var scheduledFrom: Date? = nil
+        var lastRunAt: Date? = nil
         /// The last occurrence this scheduler found already past its window.
         var missed: BotMissedRun? = nil
     }
@@ -36,14 +37,15 @@ public actor BotRunnerScheduler {
     public init(
         dataRoot: URL,
         session: @escaping BotRunnerSession,
-        isAutonomyEnabled: @escaping @Sendable () async -> Bool = { true }
+        isAutonomyEnabled: @escaping @Sendable () async -> Bool = { true },
+        conditionMet: @escaping @Sendable (BotDefinition, ShelfEntry) async -> Void = { _, _ in }
     ) {
         self.isAutonomyEnabled = isAutonomyEnabled
         disk = StandingBotsDisk(dataRoot: dataRoot)
         shelf = ShelfStore(dataRoot: dataRoot)
         events = BotEventStore(dataRoot: dataRoot)
         definitions = BotDefinitionStore(dataRoot: dataRoot)
-        runner = BotRunner(dataRoot: dataRoot, session: session)
+        runner = BotRunner(dataRoot: dataRoot, session: session, conditionMet: conditionMet)
         queue = BotRunQueue(dataRoot: dataRoot)
     }
 
@@ -80,12 +82,12 @@ public actor BotRunnerScheduler {
         return max(seconds, BotRunLimits.minimumInterval)
     }
 
-    private func next(_ bot: BotDefinition, after date: Date) throws -> Date {
-        try StandingBotsDisk.nextOccurrence(bot, after: date)
+    private func next(_ bot: BotDefinition, after date: Date, lastRunAt: Date? = nil) throws -> Date {
+        try StandingBotsDisk.nextOccurrence(bot, after: date, lastRunAt: lastRunAt)
     }
 
-    /// `reschedule` false is a person's Run once: it clears a block but leaves
-    /// the schedule where it was, so "daily at 09:00" still means 09:00.
+    /// A person's Run once keeps the schedule unless it would run again inside
+    /// the minimum spacing, so "daily at 09:00" still means 09:00.
     private func completed(_ id: UUID, at date: Date, reschedule: Bool = true) throws {
         let bot = try definitions.get(id)
         try disk.locked {
@@ -95,12 +97,18 @@ public actor BotRunnerScheduler {
             let missed = jobs[id.uuidString]?.missed
             let cleared = missed?.reason == .blocked ? nil : missed
             if !reschedule {
-                guard var job = jobs[id.uuidString], job.missed != cleared else { return }
+                guard var job = jobs[id.uuidString] else { return }
                 job.missed = cleared
+                job.lastRunAt = date
+                if job.next < date.addingTimeInterval(BotRunLimits.minimumInterval) {
+                    job.next = try next(bot, after: date, lastRunAt: date)
+                    job.scheduledFrom = date
+                }
                 jobs[id.uuidString] = job
                 return try disk.write(jobs, at: path)
             }
-            jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date), scheduledFrom: date,
+            jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date, lastRunAt: date),
+                                      scheduledFrom: date, lastRunAt: date,
                                       missed: cleared)
             try disk.write(jobs, at: path)
         }
@@ -118,13 +126,16 @@ public actor BotRunnerScheduler {
                 // An edit reschedules the bot; it does not erase the record of
                 // an occurrence that never ran.
                 let missed = jobs[key]?.missed
-                do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: anchor), scheduledFrom: anchor,
+                let lastRunAt = jobs[key]?.lastRunAt
+                do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: anchor, lastRunAt: lastRunAt),
+                                     scheduledFrom: anchor, lastRunAt: lastRunAt,
                                      missed: missed) }
                 catch { jobs[key] = Job(revision: bot.updatedAt, next: .distantFuture,
-                                        reason: String(describing: error), failureID: UUID(), missed: missed) }
+                                        reason: String(describing: error), failureID: UUID(), lastRunAt: lastRunAt, missed: missed) }
             }
         }
-        guard jobs.values.allSatisfy({ $0.next.timeIntervalSince1970.isFinite && $0.revision.timeIntervalSince1970.isFinite }) else {
+        guard jobs.values.allSatisfy({ $0.next.timeIntervalSince1970.isFinite && $0.revision.timeIntervalSince1970.isFinite
+            && ($0.lastRunAt?.timeIntervalSince1970.isFinite ?? true) }) else {
             throw StandingBotsError.corruptStore("bot scheduler dates")
         }
     }
@@ -178,7 +189,7 @@ public actor BotRunnerScheduler {
                     job.missed = BotMissedRun(dueAt: job.next, reason: Self.reason(
                         bot, due: job.next, autonomyEnabled: autonomyEnabled,
                         startedAt: startedAt, lastTick: lastTick, now: now))
-                    job.next = try next(bot, after: now)
+                    job.next = try next(bot, after: now, lastRunAt: job.lastRunAt)
                     job.scheduledFrom = now
                     jobs[key] = job
                     changed = true
@@ -345,8 +356,9 @@ public actor BotRunnerScheduler {
                     // Reserve before any network/model work, across processes.
                     // Crash recovery skips this occurrence; never replays spend.
                     jobs[key] = Job(revision: fresh.updatedAt,
-                                    next: try next(fresh, after: now.addingTimeInterval(BotRunLimits.maximumSeconds)),
+                                    next: try next(fresh, after: now.addingTimeInterval(BotRunLimits.maximumSeconds), lastRunAt: now),
                                     scheduledFrom: now.addingTimeInterval(BotRunLimits.maximumSeconds),
+                                    lastRunAt: jobs[key]?.lastRunAt,
                                     missed: jobs[key]?.missed)
                     try disk.write(jobs, at: path)
                     return due

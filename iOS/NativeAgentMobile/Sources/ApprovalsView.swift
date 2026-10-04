@@ -64,12 +64,17 @@ enum ApprovalText {
         case "memory", "rem": return "Memory"
         case "autonomy": return "Autonomy"
         case "mission", "execution", "workshop": return "Task step"
-        default: return id.isEmpty ? "Before I go ahead" : AliveWords.humanized(id)
+        default: return id.isEmpty ? "Before I go ahead" : ToolActivityPresentation.title(id)
         }
     }
 
     static func title(_ approval: PendingApproval) -> String {
-        approval.title.isEmpty ? kind(approval.action) : approval.title
+        approval.title.isEmpty ? ToolActivityPresentation.title(approval.action)
+            : ToolActivityPresentation.approvalText(approval.title, tool: approval.action)
+    }
+
+    static func reason(_ approval: PendingApproval) -> String? {
+        approval.reason.map { readable(ToolActivityPresentation.approvalText($0, tool: approval.action)) }
     }
 
     /// "[run_memory_hygiene] Run memory hygiene…" → "Run memory hygiene…";
@@ -145,6 +150,7 @@ enum ApprovalPendingNotificationPresentation {
 @MainActor
 final class ApprovalsStore: ObservableObject {
     @Published var approvals: [PendingApproval] = []
+    @Published private(set) var hasLoadedSnapshot = false
     @Published var isLoading = false
     @Published var bannerError: String? = nil
     @Published var bannerWarning: String? = nil
@@ -190,6 +196,7 @@ final class ApprovalsStore: ObservableObject {
             hasPendingLocalDecision: !locallyFinalizedApprovals.isEmpty
         )
         bannerError = nil
+        if iCloudSyncEngine.shared.approvalsSnapshotLoaded { hasLoadedSnapshot = true }
     }
 
     // MARK: - Decide
@@ -435,7 +442,7 @@ struct ApprovalsView: View {
                 Text("Nothing is waiting on you.")
                     .font(.system(.title3, design: .serif))
                     .foregroundStyle(AlivePalette.text)
-                Text("When I want to use a tool, change a memory, act on your Mac or write somewhere, I'll ask here first.")
+                Text("When a call is yours — Trust, publishing in your name — I'll ask here.")
                     .font(.subheadline)
                     .foregroundStyle(AlivePalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -539,7 +546,7 @@ struct ApprovalCard: View {
                 }
             }
 
-            if let reason = approval.reason.map(ApprovalText.readable), !reason.isEmpty {
+            if let reason = ApprovalText.reason(approval), !reason.isEmpty {
                 Text(reason)
                     .font(.body)
                     .foregroundStyle(AlivePalette.text.opacity(0.88))

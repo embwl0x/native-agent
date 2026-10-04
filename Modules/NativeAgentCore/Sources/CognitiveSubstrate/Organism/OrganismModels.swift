@@ -360,9 +360,6 @@ public struct OrganismSnapshot: Sendable, Equatable {
     public var fieldSummary: OrganismFieldSummary
     public var predictionSummary: OrganismPredictionSummary
     public var dreamRepairSummary: OrganismDreamRepairSummary
-    public var reflexSummary: OrganismReflexSummary
-    public var reflexCandidates: [OrganismReflexCandidate]
-    public var reflexReviewReceipts: [OrganismReflexReviewReceipt]
     public var residualRepairOpportunity: OrganismResidualRepairOpportunity
     public var capabilityBeliefs: [OrganismCapabilityBelief]
     public var projectedBodyLine: String?
@@ -377,9 +374,6 @@ public struct OrganismSnapshot: Sendable, Equatable {
         fieldSummary: OrganismFieldSummary = .empty,
         predictionSummary: OrganismPredictionSummary = .empty,
         dreamRepairSummary: OrganismDreamRepairSummary = .empty,
-        reflexSummary: OrganismReflexSummary = .empty,
-        reflexCandidates: [OrganismReflexCandidate] = [],
-        reflexReviewReceipts: [OrganismReflexReviewReceipt] = [],
         residualRepairOpportunity: OrganismResidualRepairOpportunity? = nil,
         capabilityBeliefs: [OrganismCapabilityBelief] = [],
         projectedBodyLine: String? = nil,
@@ -393,14 +387,6 @@ public struct OrganismSnapshot: Sendable, Equatable {
         self.fieldSummary = fieldSummary
         self.predictionSummary = predictionSummary
         self.dreamRepairSummary = dreamRepairSummary
-        self.reflexSummary = reflexSummary
-        // The compiler itself is bounded to 64 candidates. Keep that complete
-        // bounded set in the runtime snapshot: truncating to 12 before behavior
-        // posture was derived hid approved reflexes whenever review-required
-        // candidates sorted ahead of them, and also made omitted candidates
-        // impossible to review through the runtime-owned path.
-        self.reflexCandidates = Array(reflexCandidates.prefix(64))
-        self.reflexReviewReceipts = Array(reflexReviewReceipts.prefix(24))
         self.residualRepairOpportunity = residualRepairOpportunity ?? .empty(at: generatedAt)
         self.capabilityBeliefs = Array(capabilityBeliefs.prefix(OrganismPredictionKind.allCases.count))
         self.projectedBodyLine = projectedBodyLine
@@ -440,7 +426,6 @@ public struct OrganismConfiguration: Sendable, Equatable {
     public var fieldLimits: OrganismFieldLimits
     public var predictionLimits: OrganismPredictionLimits
     public var dreamRepairLimits: OrganismDreamRepairLimits
-    public var reflexLimits: OrganismReflexLimits
     /// Item 4 (2026-09-02). Nil = no clock, and the diurnal curve is then a
     /// no-op end to end. Pushed by the app layer from the user's already-declared
     /// quiet hours; never read from a config file of its own.
@@ -452,7 +437,6 @@ public struct OrganismConfiguration: Sendable, Equatable {
         fieldLimits: OrganismFieldLimits = .defaults,
         predictionLimits: OrganismPredictionLimits = .defaults,
         dreamRepairLimits: OrganismDreamRepairLimits = .defaults,
-        reflexLimits: OrganismReflexLimits = .defaults,
         diurnalClock: OrganismDiurnalClock? = nil
     ) {
         self.enabled = enabled
@@ -460,7 +444,6 @@ public struct OrganismConfiguration: Sendable, Equatable {
         self.fieldLimits = fieldLimits
         self.predictionLimits = predictionLimits
         self.dreamRepairLimits = dreamRepairLimits
-        self.reflexLimits = reflexLimits
         self.diurnalClock = diurnalClock
     }
 

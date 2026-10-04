@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-import TelegramBot
 
 /// Checked status projection supplied by the higher-level status owner.
 public struct ConnectorRegistryProjectionPort: Sendable {
@@ -68,19 +67,6 @@ public enum ConnectorRegistryActions {
             entry["enabled"] = .bool(enabled)
             entry["updatedAt"] = .string(SwiftNativeManifestSigner.isoTimestamp(Date()))
         }
-        if normalizedID == "telegram",
-           let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root) {
-            let updated = TelegramBot.TelegramConfig(
-                botToken: cfg.botToken,
-                allowedChatIds: cfg.allowedChatIds,
-                allowedUserIds: cfg.allowedUserIds,
-                requireMention: cfg.requireMention,
-                enabled: enabled,
-                model: cfg.model,
-                reasoningEffort: cfg.reasoningEffort
-            )
-            try TelegramBot.TelegramConfig.saveToDisk(updated, dataRoot: root)
-        }
         let overlay = projection.overlay(resultEntry, root)
         return .object(overlay)
     }
@@ -116,10 +102,20 @@ public enum ConnectorRegistryActions {
         )
         return try await core.withFileLock(wsPath) {
             let fm = FileManager.default
-            try? fm.createDirectory(at: wsPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.createDirectory(at: wsPath.deletingLastPathComponent(), withIntermediateDirectories: true)
             var rows: [[String: Any]] = []
-            if let data = try? Data(contentsOf: wsPath),
-               let arr = try? JSONSerialization.jsonObject(with: data, options: []) as? [[String: Any]] {
+            let exists: Bool
+            do {
+                _ = try fm.attributesOfItem(atPath: wsPath.path)
+                exists = true
+            } catch CocoaError.fileReadNoSuchFile {
+                exists = false
+            }
+            if exists {
+                let data = try Data(contentsOf: wsPath)
+                guard let arr = try JSONSerialization.jsonObject(with: data, options: []) as? [[String: Any]] else {
+                    throw workspaceValidationError("Saved workspaces must be an array of objects.")
+                }
                 rows = arr
             }
             for existing in rows {

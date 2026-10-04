@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 
 /// Surface-neutral lifecycle phases for presenting one accepted agent turn.
 /// Raw values remain stable for existing persisted presentation adapters.
@@ -139,7 +140,7 @@ public enum TurnPresentationReducer {
             return transition(
                 state,
                 phase: .tool,
-                action: action ?? "Using tool: \(name)",
+                action: action ?? ToolActivityPresentation.progress(name),
                 at: instant,
                 additionalRedactor: additionalRedactor
             )

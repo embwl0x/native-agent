@@ -384,11 +384,17 @@ public actor DeskCadenceStore {
     /// derived from that same snapshot.
     @discardableResult
     public func updating<T: Sendable>(
+        at now: Date = Date(),
         _ transform: @Sendable (DeskCadenceStats) -> (DeskCadenceStats, T)
     ) async throws -> (stats: DeskCadenceStats, value: T) {
         try await persistence.withFileLock(statsPath) {
             let current = DeskCadenceStats.fromJSON(try await persistence.readJSON(statsPath, ifMissing: .null))
-            let (next, value) = transform(current)
+            var (next, value) = transform(current)
+            // Unobserved refs (including removed tracking) expire after a month.
+            let cutoff = now.addingTimeInterval(-30 * 86_400)
+            next.refs = next.refs.filter { _, stat in
+                DeskClock.parseISO(stat.lastObservedAt).map { $0 >= cutoff } ?? false
+            }
             try await persistence.writeJSON(next.toJSON(), to: statsPath)
             return (next, value)
         }
@@ -402,7 +408,7 @@ public actor DeskCadenceStore {
         fingerprint: String,
         at now: Date = Date()
     ) async throws -> DeskRefObservationStat {
-        try await updating { stats in
+        try await updating(at: now) { stats in
             var next = stats
             let base = next.refs[refKey] ?? DeskRefObservationStat.seed(refKey: refKey, at: now)
             let updated = DeskCadenceLearner.record(base, fingerprint: fingerprint, at: now)
@@ -422,8 +428,7 @@ public actor DeskCadenceStore {
         _ fingerprintsByRef: [String: String],
         at now: Date = Date()
     ) async throws -> [String: DeskRefObservationStat] {
-        guard !fingerprintsByRef.isEmpty else { return [:] }
-        return try await updating { stats in
+        return try await updating(at: now) { stats in
             var next = stats
             var committed: [String: DeskRefObservationStat] = [:]
             committed.reserveCapacity(fingerprintsByRef.count)

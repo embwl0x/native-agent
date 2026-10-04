@@ -18,7 +18,66 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 
+/// One finished launch of an agent NativeAgent drives: SecurityCenter's
+/// decision for this turn's real origin and, under Full Mac, the exact program
+/// approved for that agent, its receipt re-verified just now.
+struct DrivenAgentLaunch: Sendable {
+    var permission: DrivenAgentLaunchPermission
+    /// Full Mac only: the approved file to run, never a PATH lookup.
+    var executable: String? = nil
+    /// Why a Full Mac request runs restricted, when it does.
+    var note: String? = nil
+
+    /// The answer for a launch that must not happen at all.
+    var deniedResult: JSONValue? {
+        guard case .denied(let reason) = permission else { return nil }
+        return .object(["status": .string("failed"), "reason": .string("launch_blocked"),
+                        "detail": .string("Nothing was launched: \(reason).")])
+    }
+
+    var receipt: JSONValue {
+        var value: [String: JSONValue] = ["permission": .string(permission == .fullMac ? "full_mac" : "restricted")]
+        if let note { value["note"] = .string(note) }
+        return .object(value)
+    }
+}
+
 extension SwiftToolDispatcher {
+
+    /// `contact` carries the approved program's receipt: the contact itself
+    /// for agent_message, otherwise the connected contact for that agent.
+    static func drivenAgentLaunch(tool: String, surface: String, contact: AgentPeerContact?,
+                                  name: String, dataRoot: URL) async -> DrivenAgentLaunch {
+        let origin = SecurityOriginContext.currentTurn(
+            verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)
+        let permission = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+            .drivenAgentLaunchPermission(tool: tool, origin: origin)
+        guard permission == .fullMac else { return DrivenAgentLaunch(permission: permission) }
+        // Full Mac follows updates: the version installed now is approved
+        // here, so an update never needs a reconnect.
+        var contact = contact
+        if let current = contact, current.transport == .mcpHost,
+           let line = AgentPeerStore.hostRowID(current.endpoint).flatMap({ AgentHostDirectory.row(named: $0)?.commandLine }),
+           let installed = AgentHostCommandLines.resolveExecutable(line.executable), installed != current.verifiedExecutablePath {
+            let store = AgentPeerStore(dataRoot: dataRoot)
+            if (try? store.approveExecutable(peerID: current.id, path: installed)) == true {
+                contact = (try? store.list())?.first { $0.id == current.id } ?? current
+            }
+        }
+        guard let path = contact?.verifiedExecutablePath else {
+            return DrivenAgentLaunch(permission: .restricted, note: "Full Mac is on, but \(name) ran restricted: "
+                + "no program is approved for it, or the approved one has changed. "
+                + "Connect \(name) again to approve the one installed now.")
+        }
+        return DrivenAgentLaunch(permission: .fullMac, executable: path)
+    }
+
+    /// The connected contact for a known command-line agent ("codex", "claude-code").
+    static func drivenAgentContact(host: String, dataRoot: URL) -> AgentPeerContact? {
+        (try? AgentPeerStore(dataRoot: dataRoot).list())?.first {
+            $0.transport == .mcpHost && AgentPeerStore.hostRowID($0.endpoint) == host
+        }
+    }
 
     /// Stamp every delegated wake with the runtime contract that produced it.
     /// Older job records deliberately remain unstamped: readers can then keep
@@ -400,6 +459,8 @@ extension SwiftToolDispatcher {
 
     /// Keep deduplication and the capped append under the same inbox lock.
     /// Claude includes reviewer pairing in operation identity; OMP does not.
+    /// `durable`: the row is flushed and closed before this returns, and a
+    /// failed flush or close throws (Claude: the row is the whole delivery).
     static func appendBuilderInboxMessage(
         _ messageId: String,
         entry: [String: JSONValue],
@@ -409,14 +470,15 @@ extension SwiftToolDispatcher {
         maxLines: Int,
         logLabel: String,
         persistence: SwiftNativePersistenceCore,
-        quarantine: BuilderInboxQuarantineNote
+        quarantine: BuilderInboxQuarantineNote,
+        durable: Bool = false
     ) async throws -> (status: String, retryWake: Bool, queuedAt: String) {
         try await persistence.withFileLock(inboxURL) {
             let existing = try await checkedBuilderInboxMessage(
                 messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantine
             )
             if case .object(let object)? = existing {
-                let operationFields = ["text", "topic", "conversationId", "workingDirectory", "deskHandle"]
+                let operationFields = ["text", "topic", "conversationId", "workingDirectory", "deskHandle", "origin"]
                 guard operationFields.allSatisfy({ object[$0] == entry[$0] }),
                       (object["requireExistingConversation"] == .bool(true)) == (entry["requireExistingConversation"] == .bool(true)),
                       !comparePairReviewer || object["pairReviewer"] == entry["pairReviewer"] else {
@@ -429,6 +491,13 @@ extension SwiftToolDispatcher {
                         return ("conflict", false, queuedAt)
                     }
                 }
+                // A durable retry proves the row is on disk before it says so:
+                // an earlier attempt may have written it but failed to flush.
+                if durable {
+                    let handle = try FileHandle(forWritingTo: inboxURL)
+                    defer { try? handle.close() }
+                    try handle.synchronize()
+                }
                 return ("duplicate", builderInboxAllowsExplicitWakeRetry(object),
                         stringField("createdAt", in: .object(object)) ?? queuedAt)
             }
@@ -437,7 +506,8 @@ extension SwiftToolDispatcher {
                 maxLines: maxLines, logLabel: logLabel, takeLock: false,
                 // 2026-09-22: without a trigger the line cap re-read the whole
                 // inbox on every append.
-                trimWhenBytesExceed: 4 << 20
+                trimWhenBytesExceed: 4 << 20,
+                durable: durable
             )
             return ("appended", false, queuedAt)
         }
@@ -461,15 +531,10 @@ extension SwiftToolDispatcher {
         quarantine: BuilderInboxQuarantineNote
     ) async throws -> JSONValue? {
         let scan = try await persistence.readJSONLReporting(inboxURL)
-        guard scan.report.isClean,
-              scan.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else {
-            // Self-heal instead of wedging the bridge. This used to throw, so a
-            // SINGLE torn line failed EVERY later send to that agent until a
-            // human repaired the file by hand — the bridge went dark and stayed
-            // dark. Move the damaged bytes aside (never delete), then return nil
-            // so the caller appends into a fresh inbox. A quarantine failure
-            // still throws: appending onto bytes we could not preserve would be
-            // the silent-drop this path exists to prevent.
+        if !scan.report.isClean
+            || !scan.rows.allSatisfy({ if case .object = $0 { return true }; return false }) {
+            // Preserve the original bytes before rebuilding the active queue
+            // from its valid rows. Those rows still own delivery and deduplication.
             let aside = try await quarantineBuilderInbox(
                 inboxURL,
                 report: scan.report,
@@ -477,7 +542,6 @@ extension SwiftToolDispatcher {
                 persistence: persistence
             )
             quarantine.record(aside.path)
-            return nil
         }
         let matching = scan.rows.filter { row in
             guard case .object(let object) = row else { return false }
@@ -493,10 +557,8 @@ extension SwiftToolDispatcher {
         return matching.first
     }
 
-    /// A quarantined inbox may have held an admission of THIS very message that
-    /// no longer parses, so the send that recovers the bridge has to say so out
-    /// loud. The old behaviour failed every send forever; the new one must not
-    /// trade that for a silent second admission.
+    /// Damage may conceal an earlier admission; report the preserved bytes
+    /// while valid rows keep their deduplication identities.
     static func stampBuilderInboxQuarantine(
         _ note: BuilderInboxQuarantineNote,
         on response: inout [String: JSONValue]
@@ -504,17 +566,12 @@ extension SwiftToolDispatcher {
         guard let aside = note.path else { return }
         response["inboxQuarantined"] = .object([
             "quarantinedPath": .string(aside),
-            "note": .string("The previous inbox was malformed. Its bytes were moved aside, NOT deleted, and a fresh inbox was started so this send could land. An earlier admission of this same message may sit inside the preserved file — reconcile against it before assuming this was the first."),
+            "note": .string("The inbox contained malformed rows. Its original bytes were preserved separately; valid rows remain queued and retain their message identities. An earlier admission may be in a damaged row; reconcile against the preserved file before assuming this was the first."),
         ])
     }
 
-    /// Rename aside, NEVER delete — the same contract the claude session
-    /// pointer takeover uses for `.stale-<ts>` (script/claude_thread_wakeup.js
-    /// `renameSessionPointerAside`): a file that turns out to be recoverable is
-    /// still on disk, and a human can read `<name>.quarantined-<ts>` to see
-    /// exactly which messages were set aside. An error receipt lands in a
-    /// sibling `bridge-inbox-quarantine.jsonl` so the loss is recorded rather
-    /// than silent. Throws if the bytes could NOT be preserved.
+    /// Preserve the original bytes, then atomically retain valid object rows
+    /// in the active inbox. Failure leaves the original queue available.
     private static func quarantineBuilderInbox(
         _ inboxURL: URL,
         report: JSONLReadReport,
@@ -529,7 +586,16 @@ extension SwiftToolDispatcher {
             aside = inboxURL.appendingPathExtension("quarantined-\(stamp)-\(collision)")
             collision += 1
         }
-        try fileManager.moveItem(at: inboxURL, to: aside)
+        try fileManager.copyItem(at: inboxURL, to: aside)
+        let original = try Data(contentsOf: aside)
+        var retained = Data()
+        for line in original.split(separator: 0x0A, omittingEmptySubsequences: false) {
+            guard String(data: Data(line), encoding: .utf8) != nil,
+                  let parsed = try? JSONValue.parse(Data(line)), case .object = parsed else { continue }
+            retained.append(contentsOf: line)
+            retained.append(0x0A)
+        }
+        try retained.write(to: inboxURL, options: .atomic)
         let receipt: [String: JSONValue] = [
             "event": .string("builder_inbox_quarantined"),
             "quarantinedAt": .string(ISO8601DateFormatter().string(from: Date())),
@@ -757,8 +823,13 @@ extension SwiftToolDispatcher {
     /// the waiting path, bounds captured output, and owns cancellation plus
     /// process-tree timeout escalation. Builder-specific wrappers only supply
     /// environment and deadline policy.
+    /// `launch`: the finished decision for an agent NativeAgent drives. A
+    /// Full Mac launch runs only its approved file; the helper receives the
+    /// finished values (`launchArguments`, `launchEnvironment`) and nothing else.
     func runAgentWakeupHelper(helper: URL, inputData: Data, cwd: URL,
-                              cli: String, variable: String, timeout: TimeInterval) async -> JSONValue {
+                              cli: String, variable: String, timeout: TimeInterval,
+                              launch: DrivenAgentLaunch? = nil, launchArguments: [String] = [],
+                              launchEnvironment: [String: String] = [:]) async -> JSONValue {
         var environment = AgentBridgeRuntime.processEnvironment()
         environment.merge(InstallPaths.current.bridgeEnvironment(configRoot: builderWorktreeConfigRoot)) { _, path in path }
         guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
@@ -768,17 +839,19 @@ extension SwiftToolDispatcher {
             if cli != "omp" { failure["fix"] = .string("Install Node.js, then restart NativeAgent.") }
             return .object(failure)
         }
+        environment.merge(launchEnvironment) { _, finished in finished }
+        if let executable = launch?.executable { environment[variable] = executable }
         if environment[variable] == nil {
             environment[variable] = AgentBridgeRuntime.executableURL(named: cli, environment: environment)?.path
         }
-        // A bundled helper sits inside the app, not beside data/, so its
-        // `__dirname/../data` guess misses; name the real session store.
-        if environment["NATIVE_AGENT_CLAUDE_WAKE_MESSAGE_STORE_DIR"] == nil {
-            environment["NATIVE_AGENT_CLAUDE_WAKE_MESSAGE_STORE_DIR"] = dataRoot
-                .appendingPathComponent("chat/messages", isDirectory: true).path
+        var receipt = await Self.runBuilderWakeupHelper(node: node, helper: helper, inputData: inputData,
+                                                       cwd: cwd, environment: environment, timeoutSeconds: timeout,
+                                                       arguments: launchArguments)
+        if let launch, case .object(var fields) = receipt {
+            fields["launch"] = launch.receipt
+            receipt = .object(fields)
         }
-        return await Self.runBuilderWakeupHelper(node: node, helper: helper, inputData: inputData,
-                                                cwd: cwd, environment: environment, timeoutSeconds: timeout)
+        return receipt
     }
 
     static func runBuilderWakeupHelper(
@@ -787,7 +860,8 @@ extension SwiftToolDispatcher {
         inputData: Data,
         cwd: URL,
         environment: [String: String],
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        arguments: [String] = []
     ) async -> JSONValue {
         // The helpers address the agent and the user by their configured
         // names (2026-09-05: the scripts used to carry the maintainer's).
@@ -801,7 +875,7 @@ extension SwiftToolDispatcher {
         do {
             result = try await SystemProcessAdapter().run(
                 executable: node.path,
-                arguments: [helper.path],
+                arguments: [helper.path] + arguments,
                 currentDirectory: cwd,
                 environment: environment,
                 standardInput: inputData,
@@ -970,7 +1044,6 @@ extension SwiftToolDispatcher {
 enum WakeupReplayGuard {
 
     enum Store {
-        case claude
         case omp
         case codex
     }
@@ -985,6 +1058,7 @@ enum WakeupReplayGuard {
         let storeLabel: String
         /// The prior run's answer, when its record still holds it.
         var reply: String? = nil
+        var deliveryConfirmed: Bool = true
     }
 
     /// How long an identical completed request keeps suppressing a re-fire.
@@ -1014,11 +1088,6 @@ enum WakeupReplayGuard {
                 .appendingPathComponent(bridge, isDirectory: true)
         }
         switch store {
-        case .claude:
-            let base = configRoot?.appendingPathComponent("claude-bridge", isDirectory: true)
-                ?? environment["NATIVE_AGENT_CLAUDE_BRIDGE_DIR"].map { URL(fileURLWithPath: $0) }
-                ?? home("claude-bridge")
-            return base.appendingPathComponent("wake-jobs", isDirectory: true)
         case .omp:
             let base = configRoot?.appendingPathComponent("omp-bridge", isDirectory: true)
                 ?? environment["NATIVE_AGENT_OMP_BRIDGE_DIR"].map { URL(fileURLWithPath: $0) }
@@ -1046,6 +1115,7 @@ enum WakeupReplayGuard {
         jobsDirectory: URL,
         topic: String?,
         text: String,
+        conversationId: String? = nil,
         now: Date,
         window: TimeInterval = defaultWindow
     ) -> Match? {
@@ -1062,7 +1132,7 @@ enum WakeupReplayGuard {
             records.append(record)
             guard let candidate = match(
                 store: store, record: record, url: url,
-                wantedSlug: wanted, text: text, now: now, window: window
+                wantedSlug: wanted, text: text, conversationId: conversationId, now: now, window: window
             ) else { continue }
             // Newest match wins, so the receipt names the most recent run.
             let stamp = parseISO(candidate.completedAt) ?? .distantPast
@@ -1088,7 +1158,7 @@ enum WakeupReplayGuard {
     private static func turns(store: Store, record: [String: JSONValue]) -> [(text: String, slug: String)] {
         let payloads: [[String: JSONValue]]
         switch store {
-        case .claude, .omp:
+        case .omp:
             guard case .object(let payload)? = record["payload"] else { return [] }
             payloads = [payload]
         case .codex:
@@ -1109,17 +1179,15 @@ enum WakeupReplayGuard {
         url: URL,
         wantedSlug: String,
         text: String,
+        conversationId: String?,
         now: Date,
         window: TimeInterval
     ) -> Match? {
         switch store {
-        case .claude, .omp:
-            // Both wake-job writers persist the whole request under `payload`.
+        case .omp:
+            // The wake-job writer persists the whole request under `payload`.
             guard case .object(let payload)? = record["payload"],
                   string(payload, "text") == text else { return nil }
-            // `topicSlug` is written by the claude runner; the OMP record only
-            // carries the raw topic in its payload, so slug that instead. Both
-            // go through the dispatcher's slug function, so both agree.
             let slug = string(record, "topicSlug")
                 ?? SwiftToolDispatcher.builderTopicSlugForReplayGuard(string(payload, "topic") ?? "")
             guard slug == wantedSlug else { return nil }
@@ -1134,8 +1202,8 @@ enum WakeupReplayGuard {
                 topicSlug: slug,
                 completedAt: completedAt,
                 statusWord: statusWord,
-                storeLabel: store == .claude ? "claude" : "omp",
-                reply: string(record, store == .claude ? "agentReplyText" : "reply")
+                storeLabel: "omp",
+                reply: string(record, "reply")
             )
 
         case .codex:
@@ -1145,7 +1213,8 @@ enum WakeupReplayGuard {
             // it. Records preserved under `undelivered/` are never scanned (the
             // caller does not descend into it), which is the point: an
             // undeliverable job must stay re-askable.
-            guard case .array(let entries)? = record["entries"] else { return nil }
+            guard let conversationId, string(record, "threadId") == conversationId,
+                  case .array(let entries)? = record["entries"] else { return nil }
             var matched = false
             for entry in entries {
                 guard case .object(let e) = entry,
@@ -1169,7 +1238,8 @@ enum WakeupReplayGuard {
                 completedAt: completedAt,
                 statusWord: statusWord,
                 storeLabel: "codex",
-                reply: string(turnResult, "message")
+                reply: string(turnResult, "message"),
+                deliveryConfirmed: false
             )
         }
     }
@@ -1230,8 +1300,10 @@ enum WakeupReplayGuard {
             "jobId": .string(match.jobId),
             "topicSlug": .string(match.topicSlug),
             "store": .string(match.storeLabel),
+            "delivery": .string(match.deliveryConfirmed ? "delivered" : "pending"),
             "detail": .string("This exact request already ran to completion on this topic and "
-                + "its answer was delivered. The durable inbox row was still written; only the "
+                + (match.deliveryConfirmed ? "its answer was delivered. " : "its answer is awaiting delivery. ")
+                + "The durable inbox row was still written; only the "
                 + "duplicate wake was skipped."),
             "fix": .string("Change the message text to send new work on this topic, or set "
                 + "\(disableEnvironmentKey)=1 to force an identical re-run."),

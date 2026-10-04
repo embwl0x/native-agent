@@ -41,6 +41,8 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
     // ("execution no longer blocked — not executed") instead of reporting a
     // generic failure + claim-clear.
     case staleApproval(String)
+    /// No slot was available; keep the resolved approval for a later drain.
+    case approvalDeferred
 
     public var errorDescription: String? {
         switch self {
@@ -53,6 +55,7 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
         case .workshopExecutionsBusy(let m): return m
         case .executorUnavailable(let m): return m
         case .staleApproval(let m): return m
+        case .approvalDeferred: return "Approved Workshop step deferred until execution capacity is available"
         }
     }
 
@@ -76,7 +79,7 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
 public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
     public var title: String
     public var objective: String
-    public var triggerSource: String     // "manual" or "trigger:<name>"
+    public var triggerSource: String     // "manual" (the person), "agent" (workshop_submit) or "trigger:<name>"
     public var trustRequired: String     // "none"|"draft_auto"|"send_approval"|"destructive_strong"
     /// Stable Desk identity for the Workshop-owned path. Nil is retained for
     /// daemon-era callers while consumers migrate shadow-first.
@@ -110,30 +113,35 @@ public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
     public var toolOrAction: String
     public var args: JSONValue           // .object(...) keeps Python's flat dict shape
     public var autonomy: String          // "auto" | "needs_approval"
+    public var argumentSchema: JSONValue? = nil
 
     public init(
         id: String,
         description: String,
         toolOrAction: String,
         args: JSONValue = .object([:]),
-        autonomy: String = "auto"
+        autonomy: String = "auto",
+        argumentSchema: JSONValue? = nil
     ) {
         self.id = id
         self.description = description
         self.toolOrAction = toolOrAction
         self.args = args
         self.autonomy = autonomy
+        self.argumentSchema = argumentSchema
     }
 
     /// Emit the asdict(step) shape (snake_case keys, raw JSON values).
     public func toJSON() -> JSONValue {
-        return .object([
+        var object: [String: JSONValue] = [
             "id": .string(id),
             "description": .string(description),
             "tool_or_action": .string(toolOrAction),
             "args": args,
             "autonomy": .string(autonomy),
-        ])
+        ]
+        if let argumentSchema { object["argument_schema"] = argumentSchema }
+        return .object(object)
     }
 }
 
@@ -236,7 +244,7 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
     public var title: String
     public var objective: String
     public var createdAt: String         // "created_at" in JSON
-    public var status: String            // "queued"|"running"|"blocked_on_approval"|"completed"|"failed"|"cancelled"
+    public var status: String            // "queued"|"running"|"blocked_on_approval"|"blocked_on_reconciliation"|"completed"|"failed"|"cancelled"
     public var plan: [WorkshopExecutionStep]
     public var stepsCompleted: [JSONValue]   // "steps_completed" — opaque from Swift's POV
     public var receiptsDir: String       // "receipts_dir" — absolute path to receipts/
@@ -256,6 +264,10 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
     /// Optional post-cutover extension. Absence means an older/unverified
     /// record; it never defaults to satisfied.
     public var verification: WorkshopVerificationRecord? = nil
+    /// Executor-owned movement; metadata edits only change updatedAt.
+    public var lastMovementAt: String? = nil
+    public var compiledOperationBinding: JSONValue? = nil
+    public var terminalReason: String? = nil
 
     public func toJSON() -> JSONValue {
         var object: [String: JSONValue] = [
@@ -284,6 +296,11 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
         if let verification {
             object["verification"] = verification.toJSON()
         }
+        if let lastMovementAt {
+            object["last_movement_at"] = .string(lastMovementAt)
+        }
+        if let compiledOperationBinding { object["compiled_operation_binding"] = compiledOperationBinding }
+        if let terminalReason { object["terminal_reason"] = .string(terminalReason) }
         if let planningProviderCallCount {
             object["planning_provider_call_count"] = .int(Int64(planningProviderCallCount))
         }
@@ -333,6 +350,53 @@ public struct WorkshopExecutionStartResult: Codable, Sendable, Equatable {
 }
 
 // MARK: - Planner LLM hook
+
+public enum WorkshopArgumentValidation {
+    public static func validate(_ value: JSONValue, schema: JSONValue) throws {
+        guard case .object(let rules) = schema else {
+            throw WorkshopExecutionError.invalidRequest("tool argument schema is unavailable")
+        }
+        if let declaredType = rules["type"] {
+            let types: [JSONValue]
+            if case .array(let alternatives) = declaredType { types = alternatives }
+            else { types = [declaredType] }
+            let compatible = types.contains { type in
+                switch (type, value) {
+                case (.string("string"), .string), (.string("boolean"), .bool),
+                     (.string("integer"), .int), (.string("number"), .int),
+                     (.string("number"), .double), (.string("object"), .object),
+                     (.string("array"), .array), (.string("null"), .null): return true
+                default: return false
+                }
+            }
+            guard compatible else {
+                throw WorkshopExecutionError.invalidRequest("tool argument has an incompatible schema type")
+            }
+        }
+        if case .array(let options)? = rules["enum"], !options.contains(value) {
+            throw WorkshopExecutionError.invalidRequest("tool argument is outside its declared values")
+        }
+        if case .object(let object) = value {
+            if case .array(let required)? = rules["required"] {
+                for case .string(let key) in required where object[key] == nil {
+                    throw WorkshopExecutionError.invalidRequest("missing tool argument: \(key)")
+                }
+            }
+            if case .object(let properties)? = rules["properties"] {
+                for (key, child) in object {
+                    if let childSchema = properties[key] {
+                        try validate(child, schema: childSchema)
+                    } else if rules["additionalProperties"] == .bool(false) {
+                        throw WorkshopExecutionError.invalidRequest("unknown tool argument: \(key)")
+                    }
+                }
+            }
+        }
+        if case .array(let items) = value, let itemSchema = rules["items"] {
+            for item in items { try validate(item, schema: itemSchema) }
+        }
+    }
+}
 
 /// Pluggable LLM call for the planner. The default HTTP-backed impl asks
 /// the daemon to run codex; tests pass a deterministic stub. The protocol

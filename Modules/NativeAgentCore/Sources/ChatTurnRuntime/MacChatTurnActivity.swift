@@ -1,7 +1,9 @@
 import Privacy
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
+import ToolRegistry
 
 /// Exact routing identity for live Mac turn activity. The session id selects
 /// the AppModel slot; the turn id prevents late events from a prior stream
@@ -43,16 +45,18 @@ public struct MacChatTurnActivity: Sendable, Equatable {
 /// boundary. Raw JSON input/output is pattern-discarded in this switch before
 /// an activity value can be constructed.
 public enum MacChatTurnActivityBoundary {
+    /// `shown` is the turn's own: an `app` call reads as the action it ran.
     public static func activity(
         from event: TurnStreamEvent,
         identity: MacChatTurnIdentity,
+        shown: ShownToolNames,
         at instant: Date
     ) -> MacChatTurnActivity? {
         switch event {
-        case .toolUse(let name, _):
-            return toolUse(name: name, identity: identity, at: instant)
+        case .toolUse(let name, let input):
+            return toolUse(name: shown.use(name, input: input).name, identity: identity, at: instant)
         case .toolResult(let name, _):
-            return toolResult(name: name, identity: identity, at: instant)
+            return toolResult(name: shown.result(name), identity: identity, at: instant)
         case .notice(let kind, let text):
             return notice(kind: kind, text: text, identity: identity, at: instant)
         case .delta, .final, .error, .replyTextSettled:
@@ -85,13 +89,13 @@ public enum MacChatTurnActivityBoundary {
         identity: MacChatTurnIdentity,
         at instant: Date
     ) -> MacChatTurnActivity {
-        let safeName = sanitized(name) ?? "Tool"
+        let safeName = sanitized(ToolActivityPresentation.title(name)) ?? "Tool"
         return MacChatTurnActivity(
             identity: identity,
             source: .toolUse,
             phase: delegateName(forTool: name) == nil ? .tool : .delegation,
             toolDisplayName: safeName,
-            actionSummary: sanitized("Using tool: \(safeName)"),
+            actionSummary: sanitized(ToolActivityPresentation.progress(name)),
             userVisibleNoticeText: nil,
             delegateDisplayName: delegateName(forTool: name),
             occurredAt: instant
@@ -103,13 +107,13 @@ public enum MacChatTurnActivityBoundary {
         identity: MacChatTurnIdentity,
         at instant: Date
     ) -> MacChatTurnActivity {
-        let safeName = sanitized(name) ?? "Tool"
+        let safeName = sanitized(ToolActivityPresentation.title(name)) ?? "Tool"
         return MacChatTurnActivity(
             identity: identity,
             source: .toolResult,
             phase: .working,
             toolDisplayName: safeName,
-            actionSummary: sanitized("Finished tool: \(safeName)"),
+            actionSummary: sanitized(ToolActivityPresentation.finished(name)),
             userVisibleNoticeText: nil,
             delegateDisplayName: nil,
             occurredAt: instant

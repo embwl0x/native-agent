@@ -4,12 +4,6 @@ import PersistenceCore
 import PersonaEngine
 
 extension SlackSocketModeLoop {
-    private static let turnAdmission = TurnAdmission()
-
-    public static func runAdmittedTurn<T>(sessionID: String, operation: () async throws -> T) async throws -> T {
-        try await turnAdmission.run(sessionID: sessionID, operation: operation)
-    }
-
     /// The Slack surface, built only when Socket Mode is configured and
     /// enabled. The host supplies the engine's Slack-profiled chat client
     /// (built only past the config check) and a transcript-completion signal
@@ -59,7 +53,7 @@ extension SlackSocketModeLoop {
                 // reconnect and compaction notices died here. Only notices are
                 // forwarded — tool events would be channel noise; the sink
                 // posts one line per kind.
-                response = try await Self.runAdmittedTurn(sessionID: sessionId) {
+                response = try await TurnAdmission.shared.run(sessionID: sessionId) {
                     try await request.chat(on: client, progress: { event in
                         if case .notice(let kind, let text) = event {
                             await progress(kind, text)

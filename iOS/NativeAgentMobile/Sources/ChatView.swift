@@ -51,6 +51,8 @@ struct ChatView: View {
     @State private var inputText = ""
     @State private var showsChatSetup = false
     @State private var showsConfiguration = false
+    @State private var inboxDetailItem: InboxItemRecord?
+    @State private var inboxGroup: InboxRelatedGroup?
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @FocusState private var composerIsFocused: Bool
     @State private var scrollScheduler = ChatScrollScheduler()
@@ -242,9 +244,37 @@ struct ChatView: View {
         )
     }
 
+    /// Cards raised in another thread and mirrored into this conversation for
+    /// User; their buttons answer the original through the signed inbox action.
+    private var inlineChatCards: [InboxItemRecord] {
+        guard let session = store.selectedSessionID, !session.isEmpty else { return [] }
+        return sync.inboxItems.filter {
+            $0.source == "interaction" && $0.chat_session_id == session
+                && !["archived", "dismissed"].contains($0.status)
+        }
+    }
+
     private var inlineApprovalAnchorID: UUID? {
-        guard !inlineChatApprovals.isEmpty else { return nil }
+        guard !inlineChatApprovals.isEmpty || !inlineChatCards.isEmpty else { return nil }
         return MobileChatApprovalProjection.anchorMessageID(in: visibleMessages)
+    }
+
+    @ViewBuilder
+    private var inlinePendingCards: some View {
+        ForEach(inlineChatApprovals) { approval in
+            InlineChatApprovalCard(approval: approval)
+        }
+        ForEach(inlineChatCards) { item in
+            InboxCardRow(item: item, onAction: { action in
+                Task {
+                    do {
+                        _ = try await sync.inboxAction(itemId: item.id, actionId: action)
+                    } catch {
+                        store.errorBanner = error.localizedDescription
+                    }
+                }
+            }, onView: { inboxDetailItem = item })
+        }
     }
 
     private var queuedTurns: [QueuedChatSend] {
@@ -305,7 +335,7 @@ struct ChatView: View {
             .onChange(of: sync.pinnedChatSessions) { _, _ in
                 reconcilePublishedChatSessions()
             }
-            // Main follows Mac selection changes, including while already open.
+            // Main follows the conversation User is in, including while already open.
             .onChange(of: sync.chatAnchor) { _, _ in
                 adoptConversationAnchorIfNeeded()
             }
@@ -385,7 +415,7 @@ struct ChatView: View {
 
                 ScrollViewReader { proxy in
                     ScrollView {
-                        if visibleMessages.isEmpty {
+                        if visibleMessages.isEmpty && inlineChatApprovals.isEmpty && inlineChatCards.isEmpty {
                             chatEmptyState
                                 .containerRelativeFrame(.vertical)
                         } else {
@@ -428,11 +458,12 @@ struct ChatView: View {
 	                                    // here instead of only in the Activity
 	                                    // tab. Activity stays canonical.
 	                                    if msg.id == inlineApprovalAnchorID {
-	                                        ForEach(inlineChatApprovals) { approval in
-	                                            InlineChatApprovalCard(approval: approval)
-	                                        }
+                                            inlinePendingCards
 	                                    }
 	                                }
+                                if inlineApprovalAnchorID == nil {
+                                    inlinePendingCards
+                                }
                                 // Reaching the bottom by hand is following again:
                                 // the Latest button goes away on its own.
                                 Color.clear.frame(height: 1)
@@ -569,6 +600,17 @@ struct ChatView: View {
             // Sweep R4 C11.3: iCloudSyncEngine.syncError was published and read
             // by nothing. Render-only — no retry, no new sync work.
             .macSyncErrorBanner()
+            .sheet(item: $inboxDetailItem, onDismiss: { inboxGroup = nil }) { item in
+                if let inboxGroup {
+                    InboxView(initialGroup: inboxGroup)
+                } else {
+                    InboxDetailSheet(item: item, allItems: sync.inboxItems, onOpenGroup: { group in
+                        inboxGroup = group
+                    }) {
+                        inboxDetailItem = nil
+                    }
+                }
+            }
             .sheet(isPresented: $showsChatSetup) {
                 PairingView(onSkip: { showsChatSetup = false }, onPaired: { showsChatSetup = false })
             }
@@ -757,12 +799,12 @@ struct ChatView: View {
                     inputText += " " + newValue
                 }
             }
-            .onChange(of: selectedPhotoItems) { _, items in
+            .onChange(of: selectedPhotoItems) { previousItems, items in
                 if items.isEmpty && suppressNextEmptyPhotoSelection {
                     suppressNextEmptyPhotoSelection = false
                     return
                 }
-                loadPhotoAttachments(items)
+                loadPhotoAttachments(items, previousItems: previousItems)
             }
         }
     }
@@ -985,6 +1027,9 @@ struct ChatView: View {
                             }
                             .accessibilityLabel("Attached photo")
                         Button {
+                            photoLoadTask?.cancel()
+                            photoLoadGeneration += 1
+                            isLoadingPhotos = false
                             let removal = PendingPhotoPresentation.removing(photo.id, from: pendingPhotos)
                             pendingPhotos = removal.photos
                             if removal.clearsPicker {
@@ -1084,9 +1129,12 @@ struct ChatView: View {
     /// the closure captures the value, not `self`.
     private var photosPickerButton: some View {
         let loading = isLoadingPhotos
+        let retainedOutsidePicker = pendingPhotos.filter { photo in
+            !selectedPhotoItems.contains { $0 == photo.pickerItem }
+        }.count
         return PhotosPicker(
             selection: $selectedPhotoItems,
-            maxSelectionCount: maxPendingPhotos,
+            maxSelectionCount: max(1, maxPendingPhotos - retainedOutsidePicker),
             matching: .images
         ) {
             Image(systemName: loading ? "hourglass" : "plus")
@@ -1095,7 +1143,7 @@ struct ChatView: View {
                 .frame(width: 44, height: 44)
                 .contentShape(Circle())
         }
-        .disabled(store.isLoading || store.isSwitchingSession || loading)
+        .disabled(store.isLoading || store.isSwitchingSession || loading || pendingPhotos.count == maxPendingPhotos)
         .accessibilityLabel("Add photos")
     }
 
@@ -1459,61 +1507,8 @@ struct ChatView: View {
         }
     }
 
-    /// Catalog projections may be incomplete. Passive refresh can seed an
-    /// empty selection, but cannot establish that a saved model is invalid.
-    private func reconcileSelectedModel(forProviderId id: String) {
-        guard selectedModel.isEmpty else { return }
-        guard let provider = sync.providers.first(where: { $0.provider_id == id }) else { return }
-        let reconciledModel = ChatRuntimeControlPresentation.modelForProvider(
-            currentModel: selectedModel,
-            provider: provider,
-            preferredModels: Self.preferredModelIDs
-        )
-        guard reconciledModel != selectedModel else { return }
-        selectedModel = reconciledModel
-        reconcileExecutionControlsForSelectedModel()
-    }
-
     private func seedProviderIfNeeded() {
-        let ready = selectableProviders
-        guard !ready.isEmpty else {
-            selectedProviderId = ""
-            return
-        }
-        // Keep a saved model on a still-selectable provider even when a partial
-        // catalog omits it. Explicit provider changes choose from that catalog.
-        if !selectedProviderId.isEmpty, ready.contains(where: { $0.provider_id == selectedProviderId }) {
-            reconcileSelectedModel(forProviderId: selectedProviderId)
-            return
-        }
-        // Seed prefers the active ios/chat surface provider (preserves the
-        // operator's per-surface choice — matches pre-picker send behavior),
-        // else the provider that owns the current model, else first ready provider.
-        let activeChatProvider = sync.trustPolicy?.providerPolicy?.activePerSurface?["ios"]
-            ?? sync.trustPolicy?.providerPolicy?.activePerSurface?["chat"]
-        let seededProviderID = ChatRuntimeControlPresentation.seededProviderID(
-            selectedProviderID: selectedProviderId,
-            activeProviderID: activeChatProvider,
-            model: selectedModel,
-            readyProviders: ready
-        )
-        guard let seededProviderID,
-              let selection = ChatRuntimeControlPresentation.selectionForProvider(
-                providerID: seededProviderID,
-                current: .init(providerID: selectedProviderId, model: selectedModel, reasoningEffort: selectedReasoningEffort, fastMode: selectedFastMode),
-                providers: ready,
-                preferredModels: Self.preferredModelIDs
-              ) else {
-            selectedProviderId = ""
-            return
-        }
-        selectedProviderId = selection.providerID
-        selectedModel = selection.model
-        selectedReasoningEffort = selection.reasoningEffort
-        selectedFastMode = selection.fastMode
-        // Keep the (provider, model) pair consistent so a send never carries a
-        // model the chosen provider doesn't offer.
-        reconcileExecutionControlsForSelectedModel()
+        adoptSurfaceModelPreferenceFromSync()
     }
 
     /// The phone holds no model of its own. Anything in local storage that the
@@ -1540,6 +1535,7 @@ struct ChatView: View {
             selectableProviderIDs: Set(selectableProviders.map(\.provider_id))
         )
         surfaceSelectionAwaitingSync = resolution.awaitingAcknowledgement
+        hasHydratedModelFromMac = true
         guard resolution.selection != .init(
             providerID: selectedProviderId,
             model: selectedModel,
@@ -1550,8 +1546,6 @@ struct ChatView: View {
         selectedModel = resolution.selection.model
         selectedReasoningEffort = resolution.selection.reasoningEffort
         selectedFastMode = resolution.selection.fastMode
-        hasHydratedModelFromMac = true
-        reconcileSelectedModel(forProviderId: selectedProviderId)
         reconcileExecutionControlsForSelectedModel()
     }
 
@@ -1571,6 +1565,7 @@ struct ChatView: View {
         selectedFastMode = selection.fastMode
         // Keep stale projections fenced until this exact canonical tuple is
         // observed. The matching snapshot may already have arrived mid-await.
+        hasHydratedModelFromMac = true
         surfaceSelectionAwaitingSync = true
         adoptSurfaceModelPreferenceFromSync()
     }
@@ -1673,17 +1668,26 @@ struct ChatView: View {
     }
 
     private func adoptMainSessionFromSnapshots(afterClearingDraft: Bool = false) {
+        let isInitialBinding = store.selectedSessionID == nil
+            && !MobileChatSelectionIntent.userChoseThisLaunch
         guard !store.isSwitchingSession,
-              !hasComposerDraft,
-              !composerIsFocused || afterClearingDraft,
+              !hasComposerDraft || isInitialBinding,
+              !composerIsFocused || afterClearingDraft || isInitialBinding,
+              !isInitialBinding || (!store.isLoading && store.pendingSendArgs.isEmpty),
               // Switching cancels the send task. Keep accepted drafts here
               // until their exact-session handoff has crossed the transport.
-              !store.queuedSends.contains(where: { $0.sessionID == store.selectedSessionID }),
+              !store.queuedSends.contains(where: {
+                  $0.sessionID == store.selectedSessionID
+                      && (!isInitialBinding || $0.preparedMessage != nil || $0.placeholderID != nil)
+              }),
               let anchorID = sync.chatAnchor?.cleanSessionId,
               sync.sessions.contains(where: { $0.id == anchorID && $0.archived != true }) else { return }
         store.replaceMainSessionID(anchorID)
         guard !MobileChatSelectionIntent.userChoseThisLaunch,
               store.selectedSessionID != anchorID else { return }
+        if isInitialBinding {
+            store.migrateQueuedSends(from: nil, to: anchorID)
+        }
         store.switchSession(to: anchorID, using: bridgeClient,
                             fallbackMessages: snapshotMessages(for: anchorID))
     }
@@ -1945,22 +1949,30 @@ struct ChatView: View {
         selectedPhotoItems = []
     }
 
-    private func loadPhotoAttachments(_ items: [PhotosPickerItem]) {
+    private func loadPhotoAttachments(_ items: [PhotosPickerItem], previousItems: [PhotosPickerItem]) {
         photoLoadTask?.cancel()
         photoLoadGeneration += 1
         let generation = photoLoadGeneration
+        pendingPhotos.removeAll { photo in
+            previousItems.contains { $0 == photo.pickerItem }
+                && !items.contains { $0 == photo.pickerItem }
+        }
         guard !items.isEmpty else {
-            pendingPhotos = []
             isLoadingPhotos = false
             return
         }
         isLoadingPhotos = true
         let existingPhotoBytes = pendingPhotos.reduce(0) { $0 + $1.attachment.byteSize }
+        let newItems = items.filter { item in !pendingPhotos.contains { $0.pickerItem == item } }
+        guard !newItems.isEmpty else {
+            isLoadingPhotos = false
+            return
+        }
+        let selectedItems = Array(newItems.prefix(max(0, maxPendingPhotos - pendingPhotos.count)))
         photoLoadTask = Task {
             var loaded: [PendingPhotoAttachment] = []
-            var skippedCount = 0
+            var skippedCount = newItems.count - selectedItems.count
             var remainingBudget = max(0, Self.cloudKitPhotoPayloadBudgetBytes - existingPhotoBytes)
-            let selectedItems = Array(items.prefix(maxPendingPhotos))
             for (index, item) in selectedItems.enumerated() {
                 if Task.isCancelled { return }
                 do {
@@ -1992,7 +2004,7 @@ struct ChatView: View {
                         name: "iphone-photo-\(index + 1).jpg",
                         byteSize: jpeg.count
                     )
-                    loaded.append(PendingPhotoAttachment(id: id, attachment: attachment, thumbnail: thumbnail))
+                    loaded.append(PendingPhotoAttachment(id: id, attachment: attachment, thumbnail: thumbnail, pickerItem: item))
                 } catch {
                     await MainActor.run {
                         store.errorBanner = "Photo could not be loaded: \(error.localizedDescription)"
@@ -2001,7 +2013,7 @@ struct ChatView: View {
             }
             await MainActor.run {
                 guard generation == photoLoadGeneration, !Task.isCancelled else { return }
-                pendingPhotos = Self.mergedPendingPhotos(existing: pendingPhotos, loaded: loaded, limit: maxPendingPhotos)
+                pendingPhotos.append(contentsOf: loaded)
                 isLoadingPhotos = false
                 if let message = PhotosPickerLoadPresentation.message(
                     loadedCount: loaded.count,
@@ -2015,21 +2027,6 @@ struct ChatView: View {
                 }
             }
         }
-    }
-
-    private static func mergedPendingPhotos(
-        existing: [PendingPhotoAttachment],
-        loaded: [PendingPhotoAttachment],
-        limit: Int
-    ) -> [PendingPhotoAttachment] {
-        var seen: Set<String> = []
-        var merged: [PendingPhotoAttachment] = []
-        for item in existing + loaded {
-            let key = "\(item.attachment.name ?? item.id):\(item.attachment.byteSize):\(item.attachment.base64.prefix(64))"
-            guard seen.insert(key).inserted else { continue }
-            merged.append(item)
-        }
-        return Array(merged.suffix(limit))
     }
 
     static func perPhotoBudget(remainingBytes: Int, remainingCount: Int) -> Int {

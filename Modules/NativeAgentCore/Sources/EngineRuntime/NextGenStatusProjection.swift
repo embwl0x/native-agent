@@ -35,7 +35,8 @@ public struct NextGenStatusProjection {
         if let minPhase = phaseNumbers.min(), let maxPhase = phaseNumbers.max() {
             phaseRange = NextGenPhaseRange(start: minPhase, end: maxPhase)
         }
-        return NextGenSummary(
+        let actions = sortedPhases.flatMap { $0.actions ?? [] }
+        var summary = NextGenSummary(
             status: status,
             readiness: status,
             roadmap: "Swift-native local next-gen snapshot",
@@ -43,7 +44,7 @@ public struct NextGenStatusProjection {
             currentPhaseName: current?.displayName,
             readyPhaseCount: readyPhases.count,
             totalPhaseCount: sortedPhases.count,
-            actionCount: sortedPhases.reduce(0) { $0 + ($1.actions?.count ?? 0) },
+            actionCount: actions.count,
             receiptCount: receipts.count,
             phaseRange: phaseRange,
             latestReceipts: receipts.prefix(10).map { receipt in
@@ -54,6 +55,8 @@ public struct NextGenStatusProjection {
             createdAt: ISO8601DateFormatter().string(from: Date()),
             updatedAt: ISO8601DateFormatter().string(from: Date())
         )
+        summary.actions = actions
+        return summary
     }
 
     public func getNextGenPhases() async throws -> [NextGenPhase] {

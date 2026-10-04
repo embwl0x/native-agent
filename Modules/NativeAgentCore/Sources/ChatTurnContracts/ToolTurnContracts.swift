@@ -11,10 +11,15 @@ public protocol ToolDispatchClient: Sendable {
     /// returns `[]` so dispatchers that only know names compile unchanged
     /// (the LLM then sees no tools — pre-tools behavior).
     func listAvailableToolSchemas() async throws -> [LLMToolSchema]
+    /// Select the offered contract without collecting unused internal schemas.
+    func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema]
 }
 
 extension ToolDispatchClient {
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] { [] }
+    public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+        try await listAvailableToolSchemas().filter { names.contains($0.name) }
+    }
 }
 
 /// Narrow protocol so tests can substitute the trust source without

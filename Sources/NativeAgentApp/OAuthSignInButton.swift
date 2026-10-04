@@ -3,8 +3,7 @@ import ProviderRouting
 // `NativeOAuthFlow` — provider-native OAuth for Anthropic/Grok via the
 // registered `nativeagent://oauth/...` callback, and (since 2026-07-05) the
 // codex-free native loopback flow on :1455 for ChatGPT (see
-// NativeOAuthFlow+Loopback; the codex device flow survives only as the
-// alternative path). PKCE-exchanges the returned code via URLSession and
+// NativeOAuthFlow+Loopback). PKCE-exchanges the returned code via URLSession and
 // persists tokens to the same on-disk shape the read-side OAuth-direct
 // adapters already consume. No daemon, no HTTP plumbing through /v1/providers/*.
 
@@ -180,11 +179,7 @@ struct OAuthSignInButton: View {
     private func runFlow() async {
         // Keep the task owned until cancellation has torn down the old flow.
         defer { flowTask = nil }
-        // ChatGPT now uses the DIRECT in-process browser OAuth (NativeOAuthFlow,
-        // like Anthropic/Grok) — no codex CLI (2026-07-04, User). The old
-        // codex device-login path (runCodexDeviceLoginFlow, still below) is
-        // retained but no longer the default; the direct flow opens
-        // auth.openai.com in a browser and returns the token.
+        // ChatGPT uses the direct in-process browser OAuth, like Anthropic/Grok.
         status = .running
         lastError = nil
         authStatusText = nil
@@ -221,72 +216,6 @@ struct OAuthSignInButton: View {
             status = .idle
             lastError = result.error ?? "OAuth failed (no details)"
         }
-    }
-
-    @MainActor
-    private func runCodexDeviceLoginFlow() async {
-        status = .running
-        lastError = nil
-        authStatusText = "Opening Codex browser login..."
-        print("[oauth-signin] starting Codex device flow for \(provider.id)")
-
-        do {
-            let login = try await appModel.client.openCodexLoginInBrowser()
-            appModel.codexDeviceLogin = login
-            authStatusText = codexDeviceLoginStatusText(login)
-        } catch {
-            status = .idle
-            lastError = "Codex login failed: \(error.localizedDescription)"
-            return
-        }
-
-        let deadline = Date().addingTimeInterval(15 * 60)
-        while Date() < deadline {
-            if Task.isCancelled {
-                status = .idle
-                return
-            }
-
-            do {
-                let login = try await appModel.client.getCodexDeviceLoginStatus()
-                appModel.codexDeviceLogin = login
-                authStatusText = codexDeviceLoginStatusText(login)
-                if login.running != true {
-                    let auth = try? await appModel.engine.providers.codexAuthStatus()
-                    appModel.engine.providers.codexAuth = auth
-                    await appModel.loadProvidersForChat()
-                    if auth?.appOwnedLoggedIn == true {
-                        status = .complete
-                        authStatusText = "Signed in through Codex"
-                        // No CLI-adoption consent write here: the device flow
-                        // writes tokens into the APP-OWNED data/codex_home,
-                        // not the shared ~/.codex session.
-                        onSuccess?()
-                    } else {
-                        status = .idle
-                        lastError = login.detail ?? "Codex login did not finish."
-                    }
-                    return
-                }
-            } catch {
-                lastError = "Codex login status failed: \(error.localizedDescription)"
-            }
-
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-        }
-
-        status = .idle
-        lastError = "Codex login timed out. Start ChatGPT sign-in again to get a fresh code."
-    }
-
-    private func codexDeviceLoginStatusText(_ login: CodexDeviceLogin) -> String {
-        if let code = login.code, !code.isEmpty {
-            if let minutes = login.expiresInMinutes {
-                return "Enter code \(code) in the browser (\(minutes)m)"
-            }
-            return "Enter code \(code) in the browser"
-        }
-        return login.detail ?? "Waiting for Codex login code..."
     }
 
     @MainActor

@@ -27,8 +27,8 @@ enum InboxPushNotifier {
             try await AttentionRouter.shared.route(
                 eventId: "inbox:\(itemId)",
                 importance: importance ?? AttentionImportance.fromInboxSeverity(severity),
-                title: NativeAppSecretRedactor.redactText(String(title.prefix(160))),
-                body: NativeAppSecretRedactor.redactText(String(summary.prefix(500))),
+                title: String(NativeAppSecretRedactor.redactText(title).prefix(160)),
+                body: String(NativeAppSecretRedactor.redactText(summary).prefix(500)),
                 reason: "\(severity)|\(summary.prefix(500))",
                 userInfo: [
                     "screen": "inbox",

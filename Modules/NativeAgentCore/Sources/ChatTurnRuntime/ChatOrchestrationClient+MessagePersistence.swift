@@ -18,6 +18,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
+import ToolRegistry
 
 /// Process-wide, stat-validated line count for chat transcript JSONL files.
 ///
@@ -52,10 +53,10 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
     }
 
     static let shared = ChatTranscriptLineCountCache()
+    private static let capacity = 128
 
     private let lock = NSLock()
     private var entries: [String: Entry] = [:]
-    private var fullRecounts: [String: Int] = [:]
 
     /// Current line count for `path`, recomputing only when the file on disk is
     /// not the one this cache last measured.
@@ -72,11 +73,11 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
         }
         let counted = recount(path)
         lock.lock()
-        fullRecounts[key, default: 0] += 1
         // Only cache when the file did not move under the read. If it did, the
         // pairing of (count, stamp) would be a lie — drop it and let the next
         // caller recount.
         if let before, let after = Self.stamp(of: path), before == after {
+            makeRoom(for: key)
             entries[key] = Entry(stamp: after, count: counted)
         } else {
             entries[key] = nil
@@ -92,6 +93,7 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
         let key = path.path
         lock.lock()
         if let stamp = Self.stamp(of: path) {
+            makeRoom(for: key)
             entries[key] = Entry(stamp: stamp, count: count)
         } else {
             entries[key] = nil
@@ -106,19 +108,11 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Test/diagnostic probe: how many full byte scans this cache has paid for
-    /// `path`. A cache that is working keeps this at 1 for a hot session.
-    func fullRecountCount(at path: URL) -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return fullRecounts[path.path] ?? 0
-    }
-
-    func resetForTesting() {
-        lock.lock()
-        entries.removeAll()
-        fullRecounts.removeAll()
-        lock.unlock()
+    /// Called with the cache lock held. Eviction only costs a later recount.
+    private func makeRoom(for key: String) {
+        if entries[key] == nil, entries.count >= Self.capacity, let evicted = entries.keys.first {
+            entries.removeValue(forKey: evicted)
+        }
     }
 
     private static func stamp(of path: URL) -> Stamp? {
@@ -281,6 +275,7 @@ extension SwiftNativeChatOrchestrationClient {
         sessionId: String,
         runId: String,
         text: String,
+        attachments: [MultimodalAttachment] = [],
         cancelled: Bool,
         failure: Error? = nil,
         source: String = "app",
@@ -288,7 +283,7 @@ extension SwiftNativeChatOrchestrationClient {
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
         onNotice: @escaping @Sendable (String, String) async -> Void
     ) async {
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty || !attachments.isEmpty else { return }
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return }
         let messageSource = Self.messageSource(for: source)
         let path = dataRoot
@@ -311,7 +306,23 @@ extension SwiftNativeChatOrchestrationClient {
         var partialMetadata: [String: JSONValue] = [
             "cancelled": .bool(cancelled),
             "partial": .bool(true),
+            "envelope": TurnEnvelope.current(surface: messageSource).persistedMetadata(),
         ]
+        if !attachments.isEmpty {
+            partialMetadata["attachments"] = .array(attachments.map { attachment in
+                var item: [String: JSONValue] = [
+                    "id": .string(attachment.id),
+                    "type": .string(attachment.type),
+                    "mime": .string(attachment.mime),
+                    "name": .string(attachment.name ?? ""),
+                    "byteSize": .int(Int64(attachment.byteSize)),
+                ]
+                if let path = attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+                    item["path"] = .string(path)
+                }
+                return .object(item)
+            })
+        }
         let refused = !cancelled && failure.flatMap { ProviderFailure.report($0)?.cause } == .refused
         let visibleText: String
         if refused {
@@ -362,6 +373,26 @@ extension SwiftNativeChatOrchestrationClient {
             )
             return
         }
+        do {
+            try await syncSessionIndex(
+                sessionId: sessionId,
+                role: "assistant",
+                content: visibleText,
+                timestamp: createdAt,
+                messagesPath: path,
+                source: messageSource,
+                mechanicalRow: nil
+            )
+        } catch {
+            await Self.reportTranscriptWriteFailure(
+                label: "persistPartialIfNeeded session index",
+                path: dataRoot.appendingPathComponent("chat/sessions.json"),
+                error: error,
+                userText: "Saved this turn's partial reply, but couldn't update the conversation list.",
+                onNotice: onNotice
+            )
+        }
+        NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: sessionId)
     }
 
     /// Persist a role="tool" message capturing one tool dispatch (name,
@@ -390,16 +421,15 @@ extension SwiftNativeChatOrchestrationClient {
         // Approval detection already requires the original envelope. Share that
         // one parse with the exact outcome tag before rendering a bounded body.
         let originalResult = try? JSONValue.parse(Data(resultSummary.utf8))
-        let safeInputJSON = Self.boundedRedactedToolReceipt(
-            Self.injectionRedactedArgJSON(tool: toolName, json: inputJSON),
-            maximumCharacters: Self.persistedToolInputMaximumCharacters,
-            label: "tool input"
-        )
+        let safeInputJSON = Self.redactedPersistedToolInput(tool: toolName, json: inputJSON)
+        // An app call of a folded action returns that tool's result, kept and
+        // observed as that tool's (a read's bounded receipt among them).
+        let ranTool = ToolNameAliases.shown(toolName, inputJSON: inputJSON).name
         // W3.5-FIX 3 — and for `mac_view` the RESULT is a base64 screenshot of
         // the whole window. The persisted transcript is read back by every
         // surface and syncs; the pixels come out here and leave the digest.
         let safeResultSummary = Self.redactedPersistedToolResult(
-            tool: toolName, json: resultSummary
+            tool: ranTool, json: resultSummary
         )
         let canonicalRiskInput: [String: JSONValue] = {
             guard let parsed = try? JSONValue.parse(Data(inputJSON.utf8)),
@@ -475,6 +505,18 @@ extension SwiftNativeChatOrchestrationClient {
             // and they take the fast append precisely to stay off the hot path.
             "envelope": TurnEnvelope.current(surface: messageSource).persistedMetadata(),
         ]
+        // Keep the small receipt fields before the persisted body is clipped.
+        // These are returned values, never the transcript's own id or runId.
+        if let originalResult {
+            if let id = SessionHistoryPromptRenderer.returnedIdentifier(originalResult) {
+                metadata["resultReturnedID"] = .string(ChatSecretRedactor.redactText(id))
+            }
+            if let effects = SessionHistoryPromptRenderer.receiptField("effects", in: originalResult) {
+                metadata["resultEffects"] = .string(ChatSecretRedactor.redactText(
+                    String(SessionHistoryPromptRenderer.receiptValue(effects).prefix(512))
+                ))
+            }
+        }
         if let raisedInteraction {
             // The runtime owns identity and the continuation record, never the
             // model: this is where the raised need learns which tool call it
@@ -500,20 +542,28 @@ extension SwiftNativeChatOrchestrationClient {
                 // stored and the resume falls back to asking the model.
                 let exactArguments = safeInputJSON == inputJSON ? inputJSON : nil
                 let resumeRunId = "interaction-\(stamped.id)"
+                let steer = PeerDataTaint.carried(
+                    peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: messageSource),
+                    peerID: ChatToolSessionContext.envelope?.verifiedUserId
+                )
                 var continuation = InlineInteraction.Continuation(
                     originRunId: runId,
                     toolCallId: nil,
                     toolName: toolName,
-                    toolArgumentsJSON: toolName == InlineInteractionWire.toolName
+                    // app card.request is request_interaction: the card is
+                    // the turn's own question, so the turn continues.
+                    toolArgumentsJSON: ranTool == InlineInteractionWire.toolName
                         ? nil
                         : exactArguments,
-                    mode: toolName == InlineInteractionWire.toolName
+                    mode: ranTool == InlineInteractionWire.toolName
                         ? .continueTurn
                         : .retryBlockedTool,
                     state: .waiting,
                     // Stable: a duplicate resolve from a second surface lands
                     // on this same claim instead of starting a second turn.
-                    resumeRunId: resumeRunId
+                    resumeRunId: resumeRunId,
+                    peerSources: steer.sources,
+                    elevatedPeerSources: steer.elevated
                 )
                 // A signed turn's card has to be able to replay AS a signed
                 // turn. The envelope cannot carry that (a persisted trust
@@ -610,11 +660,12 @@ extension SwiftNativeChatOrchestrationClient {
         await observeCognitiveTool(
             sessionId: sessionId,
             runId: runId,
-            toolName: toolName,
+            toolName: ranTool,
             resultSummary: safeResultSummary,
             ok: ok,
             cognitiveResult: cognitiveResult,
             canonicalToolRisk: canonicalToolRisk,
+            effects: { if case .string(let value)? = metadata["resultEffects"] { value } else { nil } }(),
             source: messageSource,
             createdAt: createdAt,
             messageId: messageId
@@ -669,7 +720,11 @@ extension SwiftNativeChatOrchestrationClient {
         // only thing `try?` hid here was a read that actually failed — and a
         // failed read looks exactly like "no older copy of this ask", which
         // appended a second live card for the same question.
-        var rows = try await persistence.readJSONL(path)
+        let (read, report) = try await persistence.readJSONLReporting(path)
+        guard report.isClean else {
+            throw ChatOrchestrationError.underlying("The conversation contains unreadable rows. Its cards were not changed.")
+        }
+        var rows = read
         var changed = false
         var sawRunning = false
         for index in rows.indices {
@@ -762,6 +817,100 @@ extension SwiftNativeChatOrchestrationClient {
     /// that can throw AFTER the row is durably on disk. A thrown error from
     /// this method therefore means "not proven enqueued", never "proven not
     /// enqueued" — transports must settle ambiguity against the store itself.
+    /// `byPerson`: the person typed it in the contact's thread; she did not send it.
+    public func appendAgentConversationSend(sessionID: String, text: String, clientUserMessageID: String? = nil,
+                                            byPerson: Bool = false) async throws {
+        try await appendMessage(sessionId: sessionID, role: "assistant", content: text,
+                                runId: nil, attachments: [], source: "agent-bridge", agentConversationSendID: clientUserMessageID,
+                                agentConversationSendByPerson: byPerson)
+    }
+
+    /// Her answer from a turn that ran in a contact's own conversation, as a
+    /// row of the chat that asked for it (User 10-01). Once per `deliveryID`:
+    /// a retried delivery finds its row and adds none.
+    public func appendAnswerForAskingChat(sessionID: String, text: String, attachments: [MultimodalAttachment],
+                                          surface: String, deliveryID: String) async throws {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
+            throw ChatOrchestrationError.underlying("invalid chat session id")
+        }
+        let path = dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl")
+        if FileManager.default.fileExists(atPath: path.path) {
+            let rows = try await persistence.readJSONL(path)
+            if rows.contains(where: { row in
+                guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return false }
+                return metadata["answerFor"] == .string(deliveryID)
+            }) { return }
+        }
+        try await appendMessage(sessionId: safeSessionId, role: "assistant", content: text, runId: UUID().uuidString,
+                                attachments: attachments, source: surface, answerFor: deliveryID)
+    }
+
+    /// One-time history import (10-01): what a contact's conversation kept
+    /// outside its own session (record exchanges, a built-in lane's live-file
+    /// replies), set among the session's rows by time without reordering any.
+    /// A row is keyed by its send id (`dotClientUserMessageID`) or the reply
+    /// it is (`origin.replyTo`); one whose key is already there is skipped, so
+    /// importing again adds nothing. A send saved before sends carried an id
+    /// (no run, from the bridge) is given its own row id as one. Returns how
+    /// many rows changed.
+    public func importAgentConversationHistory(sessionID: String, rows imported: [JSONValue]) async throws -> Int {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
+            throw ChatOrchestrationError.underlying("invalid chat session id")
+        }
+        let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
+        _ = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+        let path = dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl")
+        @Sendable func key(_ row: JSONValue) -> String? {
+            guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return nil }
+            if case .string(let id)? = metadata["dotClientUserMessageID"] { return "send:" + id }
+            if case .object(let origin)? = metadata["origin"], case .string(let id)? = origin["replyTo"] { return "reply:" + id }
+            return nil
+        }
+        @Sendable func date(_ row: JSONValue) -> Date? {
+            guard case .object(let object) = row, case .string(let raw)? = object["createdAt"] else { return nil }
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return iso.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+        }
+        let changed: (count: Int, last: JSONValue?) = try await persistence.withFileLock(path) {
+            var rows: [JSONValue] = []
+            if FileManager.default.fileExists(atPath: path.path) {
+                let (read, report) = try await persistence.readJSONLReporting(path)
+                // A row it could not read would be lost in the rewrite.
+                guard report.isClean else { throw ChatOrchestrationError.underlying("transcript has unreadable rows") }
+                rows = read
+            }
+            var count = 0
+            for index in rows.indices {
+                guard case .object(var row) = rows[index], row["role"] == .string("assistant"), row["runId"] == nil,
+                      row["source"] == .string("agent-bridge"), case .string(let id)? = row["id"] else { continue }
+                var metadata: [String: JSONValue] = if case .object(let value)? = row["metadata"] { value } else { [:] }
+                guard metadata["dotClientUserMessageID"] == nil else { continue }
+                metadata["dotClientUserMessageID"] = .string(id)
+                row["metadata"] = .object(metadata)
+                rows[index] = .object(row)
+                count += 1
+            }
+            var present = Set(rows.compactMap(key))
+            for row in imported.sorted(by: { (date($0) ?? .distantPast) < (date($1) ?? .distantPast) }) {
+                guard let rowKey = key(row), present.insert(rowKey).inserted, let at = date(row) else { continue }
+                let index = rows.firstIndex { (date($0) ?? .distantPast) > at } ?? rows.count
+                rows.insert(row, at: index)
+                count += 1
+            }
+            guard count > 0 else { return (0, nil) }
+            try Self.writeJSONLAtomically(rows, to: path)
+            ChatTranscriptLineCountCache.shared.record(count: rows.count, at: path)
+            return (count, rows.last)
+        }
+        guard changed.count > 0, case .object(let last)? = changed.last, case .string(let content)? = last["content"],
+              case .string(let at)? = last["createdAt"] else { return changed.count }
+        try await syncSessionIndex(sessionId: safeSessionId, role: "assistant", content: content, timestamp: at,
+                                   messagesPath: path, source: "agent-bridge", mechanicalRow: nil)
+        NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: safeSessionId)
+        return changed.count
+    }
+
     public func enqueueUserMessage(
         message: String,
         sessionId: String?,
@@ -792,6 +941,70 @@ extension SwiftNativeChatOrchestrationClient {
         return EnqueuedUserMessage(sessionId: resolvedSession, runId: runId)
     }
 
+    /// A handoff is recorded without constructing a provider turn.
+    public func recordControlHandoff(message: String, reply: String, sessionId: String, surface: String) async throws {
+        let runId = UUID().uuidString
+        try await appendMessage(sessionId: sessionId, role: "user", content: message,
+                                runId: runId, attachments: [], source: surface)
+        try await appendMessage(sessionId: sessionId, role: "assistant", content: reply,
+                                runId: runId, attachments: [], source: surface)
+    }
+
+    /// A manual command receipt uses the same durable transcript and index writer.
+    public func appendSystemReceipt(sessionId: String, messageId: String, content: String) async throws {
+        try await appendMessage(sessionId: sessionId, role: "system", content: content,
+                                runId: nil, attachments: [], messageId: messageId)
+    }
+
+    /// Keep the enqueue identity available when bookkeeping throws after the
+    /// user row commits. Only that exact row proves a steering offer saved.
+    func enqueueSteeringMessage(
+        message: String, sessionId: String, surface: String, runId: String
+    ) async throws -> AfterTurnOrigin? {
+        guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ChatOrchestrationError.emptyMessage
+        }
+        let resolvedSession = try Self.resolveSessionId(sessionId)
+        do {
+            return try await appendMessage(
+                sessionId: resolvedSession, role: "user", content: message,
+                runId: runId, attachments: [], source: surface
+            )
+        } catch {
+            let committed = try await Self.steeringMessageCommitted(
+                message: message, sessionId: resolvedSession, runId: runId,
+                dataRoot: dataRoot, persistence: persistence
+            )
+            guard committed else { throw error }
+            NSLog("Steering message committed; transcript bookkeeping failed: \(error)")
+            return try afterTurnOrigin(sessionId: resolvedSession, runId: runId)
+        }
+    }
+
+    /// A failed read leaves the enqueue unresolved; only a clean locked scan
+    /// can prove absence and permit queue replay to append a new user row.
+    static func steeringMessageCommitted(
+        message: String, sessionId: String, runId: String,
+        dataRoot: URL, persistence: any PersistenceCoreProtocol
+    ) async throws -> Bool {
+        let resolvedSession = try resolveSessionId(sessionId)
+        let path = dataRoot.appendingPathComponent("chat/messages/\(resolvedSession).jsonl")
+        return try await persistence.withFileLock(path) {
+            let (rows, report) = try await persistence.readJSONLReporting(path)
+            let committed = rows.contains { row in
+                guard case .object(let object) = row else { return false }
+                return object["role"] == .string("user")
+                    && object["sessionId"] == .string(resolvedSession)
+                    && object["runId"] == .string(runId)
+                    && object["content"] == .string(message)
+            }
+            guard committed || report.isClean else {
+                throw ChatOrchestrationError.underlying("Steering enqueue reconciliation is unavailable")
+            }
+            return committed
+        }
+    }
+
     /// Append one chat message in the daemon's per-line JSON shape so a
     /// future reader (Python or SwiftNative SessionHistoryReader) round-trips
     /// the record. Mirrors `append_chat_message` in the retired daemon.
@@ -800,6 +1013,7 @@ extension SwiftNativeChatOrchestrationClient {
     /// turn's cognitive event as `memoryRecordIds` metadata — the convention
     /// `attentionSignals(at:)` reads to feed felt-memory activation back into
     /// Fluid Context selection. Without this stamp that channel is inert.
+    @discardableResult
     func appendMessage(
         sessionId: String,
         role: String,
@@ -822,8 +1036,14 @@ extension SwiftNativeChatOrchestrationClient {
         // names ITSELF (`CognitiveMechanicalRowKind`). The felt organ keeps such
         // a row out of lived state; it must never be inferred from the text of
         // the row itself. Nil is the ordinary case — a turn somebody meant.
-        mechanicalRow: CognitiveMechanicalRowKind? = nil
-    ) async throws {
+        mechanicalRow: CognitiveMechanicalRowKind? = nil,
+        requestedResultIntent: JSONValue? = nil,
+        agentConversationSendID: String? = nil,
+        agentConversationSendByPerson: Bool = false,
+        answerFor: String? = nil,
+        proactiveSpeechIdempotencyKey: String? = nil,
+        messageId: String = UUID().uuidString
+    ) async throws -> AfterTurnOrigin? {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw ChatOrchestrationError.underlying("invalid chat session id")
         }
@@ -840,8 +1060,9 @@ extension SwiftNativeChatOrchestrationClient {
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeSessionId).jsonl")
         let persistedAt = clock()
-        let createdAt = Self.iso8601(persistedAt)
-        let messageId = UUID().uuidString
+        let createdAt = role == "user"
+            ? ChatPersistenceContext.importedMessageCreatedAt ?? Self.iso8601(persistedAt)
+            : Self.iso8601(persistedAt)
         // Precompute and encode the complete payload-free observation before
         // entering the transcript lock. The lock performs no awaits and no
         // future-state lookup; it only appends/replaces immutable bytes.
@@ -870,6 +1091,16 @@ extension SwiftNativeChatOrchestrationClient {
         ]
         if let runId { record["runId"] = .string(runId) }
         var metadata: [String: JSONValue] = [:]
+        if let proactiveSpeechIdempotencyKey {
+            metadata["proactiveSpeechIdempotencyKey"] = .string(proactiveSpeechIdempotencyKey)
+        }
+        if canonicalAssistantCompletion, role == "assistant", let completion = outcomeResult?.completionState {
+            metadata["completionState"] = .string(completion == .completed ? "completed" : "incomplete")
+        }
+        if let agentConversationSendID { metadata["dotClientUserMessageID"] = .string(agentConversationSendID) }
+        if agentConversationSendByPerson { metadata["byPerson"] = .bool(true) }
+        if let answerFor { metadata["answerFor"] = .string(answerFor) }
+        if let requestedResultIntent { metadata["resultDelivery"] = requestedResultIntent }
         if !attachments.isEmpty {
             // Stash attachment metadata (not bytes) so a future consolidation
             // pass can correlate. Including base64 inline would explode the
@@ -922,6 +1153,13 @@ extension SwiftNativeChatOrchestrationClient {
                 originObject["agent"] = .string(agent)
             }
             if let replyTo = origin.replyTo { originObject["replyTo"] = .string(replyTo) }
+            if let authored = origin.authored { originObject["authored"] = .string(authored.rawValue) }
+            let steer = PeerDataTaint.carried(
+                peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: messageSource),
+                peerID: ChatToolSessionContext.envelope?.verifiedUserId
+            )
+            originObject["peerSources"] = .array(steer.sources.map(JSONValue.string))
+            originObject["elevatedPeerSources"] = .array(steer.elevated.map(JSONValue.string))
             metadata["origin"] = .object(originObject)
         }
         // `metadata.envelope` — the turn's surface identity and return route,
@@ -1011,6 +1249,13 @@ extension SwiftNativeChatOrchestrationClient {
             metadata["turnTraceId"] = .string(outcomeObservation.turnID)
             metadata["outcomeObservation"] = outcomeObservation.jsonValue
         }
+        if role == "assistant", let result = outcomeResult {
+            metadata["completionState"] = .string(result.completionState == .incomplete ? "incomplete" : "completed")
+            let writtenFiles = ChatWrittenFileArtifacts.files(from: result.toolDispatches)
+            if !writtenFiles.isEmpty {
+                metadata["outputFiles"] = .array(writtenFiles.map(\.reference))
+            }
+        }
         // Where this assistant row's working commentary ends and its answer
         // begins. Content is untouched; the transcript uses this to fold the
         // commentary into a detail once the turn has settled.
@@ -1051,7 +1296,10 @@ extension SwiftNativeChatOrchestrationClient {
                let replacementID = ChatPersistenceContext.replacementAssistantMessageID?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !replacementID.isEmpty {
-                let rows = try await persistence.readJSONL(path)
+                let (rows, report) = try await persistence.readJSONLReporting(path)
+                guard report.isClean else {
+                    throw ChatOrchestrationError.underlying("The conversation contains unreadable rows. Its reply was not replaced.")
+                }
                 let matching = rows.indices.filter { index in
                     Self.messageID(in: rows[index]) == replacementID
                 }
@@ -1082,6 +1330,7 @@ extension SwiftNativeChatOrchestrationClient {
                     else { return false }
                     return kind == ChatTranscriptToolMessageKind.toolUse
                         || kind == ChatTranscriptToolMessageKind.approvalPending
+                        || kind == InlineInteractionWire.transcriptKind
                 }
                 guard onlyOwnRetryReceipts else {
                     throw ChatOrchestrationError.underlying(
@@ -1164,8 +1413,12 @@ extension SwiftNativeChatOrchestrationClient {
             content: content,
             timestamp: createdAt,
             messagesPath: path,
-            source: messageSource
+            source: messageSource,
+            mechanicalRow: mechanicalRow
         )
+        // One signal for every row any door writes: an open chat and the phone
+        // see Telegram, phone and agent turns as they land, not on the next turn.
+        NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: sessionId)
         await observeCognitiveMessage(
             sessionId: sessionId,
             role: role,
@@ -1178,6 +1431,37 @@ extension SwiftNativeChatOrchestrationClient {
             recalledMemoryIds: recalledMemoryIds,
             mechanicalRow: mechanicalRow
         )
+        return role == "user" ? AfterTurnOrigin(sessionId: sessionId, runId: runId,
+            messageId: messageId, occurredAt: persistedAt, userMessage: content) : nil
+    }
+
+    /// A suppressed append adopts the original row by run identity, never prose.
+    /// A session with no transcript yet (the first-run greeting's hidden
+    /// kickoff) has no original row, so there is no origin to adopt.
+    func afterTurnOrigin(sessionId: String, runId: String) throws -> AfterTurnOrigin? {
+        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        let data = try Data(contentsOf: path)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ChatOrchestrationError.underlying("incoming transcript is not UTF-8")
+        }
+        let matches = try text.split(separator: "\n").compactMap { line -> AfterTurnOrigin? in
+            let parsed = try JSONValue.parse(Data(line.utf8))
+            guard case .object(let row) = parsed,
+                  row["role"] == .string("user"), row["runId"] == .string(runId),
+                  case .string(let id)? = row["id"], !id.isEmpty,
+                  case .string(let content)? = row["content"] else { return nil }
+            let at: Date?
+            if case .string(let timestamp)? = row["createdAt"] {
+                at = Self.dateFromISO8601(timestamp)
+            } else { at = nil }
+            return AfterTurnOrigin(sessionId: sessionId, runId: runId,
+                messageId: id, occurredAt: at, userMessage: content)
+        }
+        guard matches.count <= 1 else {
+            throw ChatOrchestrationError.underlying("incoming turn identity is ambiguous")
+        }
+        return matches.first
     }
 
     private static func messageID(in row: JSONValue) -> String? {
@@ -1227,6 +1511,7 @@ extension SwiftNativeChatOrchestrationClient {
         errorMessage: String,
         failure: Error? = nil,
         persona: String?,
+        surface: String,
         outcomeContext: TurnContext? = nil,
         outcomeTurnID: String? = nil,
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil
@@ -1239,9 +1524,12 @@ extension SwiftNativeChatOrchestrationClient {
         if report?.cause == .refused {
             let route = outcomeContext?.providerId ?? "unknown route"
             let model = outcomeContext?.modelId ?? "unknown model"
+            let recovery = Self.messageSource(for: surface) == "app"
+                ? "Use Retry draft below, choose another configured model in the chat model picker, then send it."
+                : "Choose another configured model for this conversation, then resend your request."
             content = "The \(route) route rejected this request on \(model). "
                 + (canDraft
-                    ? "Use Retry draft below, choose another configured model in the chat model picker, then send it."
+                    ? recovery
                     : "outcome unknown — inspect before retry. Some steps may have run.")
         } else {
             content = report?.personDescription ?? "The reply could not be completed."
@@ -1263,6 +1551,7 @@ extension SwiftNativeChatOrchestrationClient {
             runId: runId,
             attachments: [],
             persona: persona,
+            source: surface,
             outcomeContext: outcomeContext,
             outcomeTurnID: outcomeTurnID,
             responseOutcomeStatus: "failed",
@@ -1321,22 +1610,15 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         runId: String?
     ) async throws -> ChatSessionCompactionOutcome {
-        // A pre-seeding provider call is never a prefix-shaped request: this
-        // runs BEFORE the turn's context is built and its messages are seeded,
-        // so there is no replayed prefix for a v2 wire layout to describe.
-        // Binding here covers every caller of this entry point — the
-        // text-compat lane and both structured-chat sites.
-        try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
-            try await compactSession(
-                sessionId: sessionId,
-                model: model,
-                surface: surface,
-                runId: runId,
-                providerID: LLMCallContext.providerId,
-                trigger: "auto_threshold",
-                force: false
-            )
-        }
+        try await compactSession(
+            sessionId: sessionId,
+            model: model,
+            surface: surface,
+            runId: runId,
+            providerID: LLMCallContext.providerId,
+            trigger: "auto_threshold",
+            force: false
+        )
     }
 
     /// Explicit user-requested compaction through the same canonical owner as
@@ -1407,46 +1689,21 @@ extension SwiftNativeChatOrchestrationClient {
             let clock = self.clock
             let messagesReplaced = outcome.messagesReplaced
             Task.detached(priority: .background) {
-                let distiller = ChatCompactionDistiller(
+                let distiller = ChatSessionAgingConsolidation.makeAgingDistiller(
                     dataRoot: dataRoot,
-                    summaryModelResolver: { surface in
-                        try? await SwiftNativeProviderRouting(
-                            dataRoot: dataRoot,
-                            surfacesPathOverride: dataRoot
-                                .appendingPathComponent("providers", isDirectory: true)
-                                .appendingPathComponent("surfaces.json"),
-                            activeProviderPathOverride: dataRoot
-                                .appendingPathComponent("providers", isDirectory: true)
-                                .appendingPathComponent("active.json")
-                        ).modelForSurface(surface).model
-                    },
-                    llmComplete: { model, prompt in
-                        try await llm.complete(
-                            prompt: prompt,
-                            system: ChatCompactionDistiller.distillSystem,
-                            model: model,
-                            surface: ChatCompactionDistiller.distillSurface
-                        )
-                    },
+                    llm: llm,
                     now: clock
                 )
-                // `Task.detached` inherits no task-locals, so the caller's
-                // binding cannot reach here — and the distiller's own LLM call
-                // is a plain prompt with no replayed prefix. Say v1 outright
-                // rather than depending on unbound-means-legacy, which holds
-                // only while the adapters read `override` and not `.effective`.
-                await ConversationPrefixShape.$override.withValue(.v1Legacy) {
-                    await distiller.distill(
-                        sessionId: sessionId,
-                        summaryRowId: rowId,
-                        backupPath: backupPath,
-                        messagesReplaced: messagesReplaced,
-                        turnModel: model,
-                        providerID: providerID,
-                        surface: surface,
-                        runId: runId
-                    )
-                }
+                await distiller.distill(
+                    sessionId: sessionId,
+                    summaryRowId: rowId,
+                    backupPath: backupPath,
+                    messagesReplaced: messagesReplaced,
+                    turnModel: model,
+                    providerID: providerID,
+                    surface: surface,
+                    runId: runId
+                )
             }
         }
         return outcome
@@ -1602,9 +1859,8 @@ extension SwiftNativeChatOrchestrationClient {
             metadata["memoryRecordIds"] = .array(bounded.map { .string($0) })
         }
         if normalizedRole == "assistant", kind == .assistantTurnCompleted {
-            // The event summary is deliberately capped below, but delivery-
-            // envelope telemetry needs the length of the actual redacted
-            // reply. Carry only that bounded count; never duplicate content.
+            // Sound needs the full redacted reply length to distinguish a
+            // complete summary from a clipped head. Carry only the count.
             metadata[CognitiveSubstrate.replyCharacterCountMetadataKey] =
                 .int(Int64(redactedSummary.count))
             // The summary keeps the head; a long reply's sign-off is where a
@@ -1765,6 +2021,7 @@ extension SwiftNativeChatOrchestrationClient {
         ok: Bool,
         cognitiveResult: ChatToolOutcome.CognitiveResult?,
         canonicalToolRisk: CanonicalToolRisk,
+        effects: String? = nil,
         source: String,
         createdAt: String,
         messageId: String
@@ -1781,6 +2038,8 @@ extension SwiftNativeChatOrchestrationClient {
             "trustRisk": .string(canonicalToolRisk.rawValue),
         ]
         if let runId { metadata["runId"] = .string(runId) }
+        // Phase 5 E3: the receipt's own word on whether it took effect.
+        if let effects { metadata["effects"] = .string(effects) }
         let succeeded = exactCognitiveResult == .succeeded
         let status = succeeded ? "ok" : "failed"
         let summary = resultSummary.isEmpty
@@ -1813,8 +2072,10 @@ extension SwiftNativeChatOrchestrationClient {
             guard !safeName.isEmpty else { return }
             // Canonical motor owners emit their own exact action identity and
             // lifecycle. A generic start here cannot be correlated with that
-            // terminal state and would leave false pending physiology.
-            guard !ChatToolOutcome.hasCanonicalMotorOwner(safeName) else { return }
+            // terminal state and would leave false pending physiology. An app
+            // call is judged as the tool it runs.
+            let ranInput: [String: JSONValue] = if case .object(let fields) = input { fields } else { [:] }
+            guard !ChatToolOutcome.hasCanonicalMotorOwner(ToolNameAliases.ranTool(safeName, input: ranInput)) else { return }
             // W2/W3-FIX-R2 2 — cognitive events are persisted physiology, so
             // the same by-tool redaction applies before the preview is cut.
             // (Injection tools take the canonical-motor-owner early return
@@ -1854,10 +2115,13 @@ extension SwiftNativeChatOrchestrationClient {
             )
             guard cognitiveResult != .unknown else { return }
             let ok = cognitiveResult == .succeeded
+            // A result carries no input, so an app result is redacted as the
+            // one action whose result can echo typed text (mac.act is act).
+            let redactAs = safeName == "app" ? "act" : safeName
             let outputPreview = Self.compactCognitiveJSON(
                 MacInjectionResultRedaction.redacted(
-                    tool: safeName,
-                    result: MacScreenViewResultRedaction.redacted(tool: safeName, result: output)
+                    tool: redactAs,
+                    result: MacScreenViewResultRedaction.redacted(tool: redactAs, result: output)
                 ),
                 maxCharacters: 300
             )
@@ -1915,7 +2179,9 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     nonisolated private static func dateFromISO8601(_ raw: String) -> Date? {
-        ISO8601DateFormatter().date(from: raw)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
     }
 
     nonisolated static func injectionRedactedArgJSON(tool: String, json: String) -> String {
@@ -1953,6 +2219,16 @@ extension SwiftNativeChatOrchestrationClient {
             safeResult,
             maximumCharacters: persistedToolResultMaximumCharacters,
             label: "tool result"
+        )
+    }
+
+    /// The same for a tool's ARGUMENTS: typed secrets by tool, then the
+    /// secret redactor and the input cap. Also what a Desk checkpoint keeps.
+    public nonisolated static func redactedPersistedToolInput(tool: String, json: String) -> String {
+        boundedRedactedToolReceipt(
+            injectionRedactedArgJSON(tool: tool, json: json),
+            maximumCharacters: persistedToolInputMaximumCharacters,
+            label: "tool input"
         )
     }
 
@@ -2029,7 +2305,8 @@ extension SwiftNativeChatOrchestrationClient {
         content: String,
         timestamp: String,
         messagesPath: URL,
-        source: String
+        source: String,
+        mechanicalRow: CognitiveMechanicalRowKind?
     ) async throws {
         let dataRoot = self.dataRoot
         let sessionsPath = dataRoot
@@ -2046,6 +2323,31 @@ extension SwiftNativeChatOrchestrationClient {
             ? (contactName ?? Self.peerBridgeTitle(content: content, source: source) ?? Self.titleText(content))
             : nil
         let sourceKey = Self.sessionSourceKey(for: sessionId, source: source)
+        // Continuity is person-bound, never inferred from a title, allowlist,
+        // or storage key. A paired phone and this Mac belong to the operator;
+        // remote senders remain in their transport's identity namespace.
+        let continuityParticipant: String? = {
+            guard normalizedRole == "user", ChatPersistenceContext.originProvenance == nil,
+                  mechanicalRow == nil,
+                  envelope?.agent == nil else { return nil }
+            switch source {
+            case "app": return "local_operator"
+            case "ios" where envelope?.commandSignatureVerified == true
+                || ChatToolSessionContext.commandSignatureVerified == true:
+                return "local_operator"
+            case "telegram", "slack":
+                guard let user = envelope?.verifiedUserId ?? ChatToolSessionContext.verifiedUserId,
+                      !user.isEmpty else { return nil }
+                return source + ":" + user
+            default: return nil
+            }
+        }()
+        let continuityScope: String? = {
+            guard source == "telegram" || source == "slack",
+                  let chat = envelope?.verifiedChatId ?? ChatToolSessionContext.verifiedChatId else { return nil }
+            let thread = envelope?.deliveryRoute?.threadId ?? ChatToolSessionContext.replyRoute?.threadId
+            return chat + "\u{1F}" + (thread ?? "")
+        }()
         // Same value, same moment, same definition as the old
         // `countJSONLLines(at: messagesPath)` that stood here — this count is
         // NOT advisory bookkeeping. `SessionDigestProvider.swift:243` renders
@@ -2126,6 +2428,10 @@ extension SwiftNativeChatOrchestrationClient {
                 if row["sourceKey"] == nil, let sourceKey {
                     row["sourceKey"] = .string(sourceKey)
                 }
+                if normalizedRole == "user" {
+                    ChatSessionIndexFile.recordContinuityParticipant(
+                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
+                }
                 // Additive classification so readers stop having to infer a
                 // conversation's nature from a field that describes traffic.
                 // Backfill-only: a kind assigned once is not re-decided by a
@@ -2156,6 +2462,10 @@ extension SwiftNativeChatOrchestrationClient {
                     ChatSessionIndexFile.transcriptGenerationKey: .int(1),
                 ]
                 if let sourceKey { row["sourceKey"] = .string(sourceKey) }
+                if normalizedRole == "user" {
+                    ChatSessionIndexFile.recordContinuityParticipant(
+                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
+                }
                 if !preview.isEmpty { row["lastMessagePreview"] = .string(preview) }
                 updated = row
             }

@@ -195,11 +195,14 @@ extension CognitiveSubstrate {
         /// When the owner last touched it. The weight is age since THIS, not
         /// since it opened: an item worked on yesterday is not a nag.
         public let lastTouchedAt: Date
+        /// Nil for Desk rows; moment rows retain their resolved disclosure scope.
+        public let permittedSurfaces: Set<String>?
 
-        public init(id: String, label: String, lastTouchedAt: Date) {
+        public init(id: String, label: String, lastTouchedAt: Date, permittedSurfaces: Set<String>? = nil) {
             self.id = String(id.prefix(120))
             self.label = String(label.prefix(CognitiveSubstrate.externalRuminationLabelCharacters))
             self.lastTouchedAt = lastTouchedAt
+            self.permittedSurfaces = permittedSurfaces
         }
     }
 
@@ -269,7 +272,7 @@ extension CognitiveSubstrate {
                 return lhs.id.uuidString < rhs.id.uuidString
             }
             .prefix(Self.ruminationScanBound)
-        guard !eligible.isEmpty else { return [] }
+        guard !eligible.isEmpty else { return Self.merged(seedCandidates: [], external: external) }
         let concerns = appraisalConcerns()
         let livedEvidence = livedEvidenceNodeIDs()
         var out: [CognitiveRuminationRead] = []
@@ -379,9 +382,12 @@ extension CognitiveSubstrate {
         externalRuminationsRefreshedAt = now
     }
 
-    /// Replace the external set. Anything that was itching and is no longer in
-    /// the set has CLOSED — its weight goes, and one relief is staged through
-    /// the same door a seed release uses.
+    public func externalRuminationIDs() -> Set<String> {
+        Set(externalRuminations.keys)
+    }
+
+    /// Replace the bounded window. Only owner-confirmed closures stage relief;
+    /// exclusion from the window is not evidence that an item closed.
     ///
     /// HONEST BOUND: the set is in-memory, so after a restart the first push
     /// finds no prior set and an item that closed while the app was down mints
@@ -389,6 +395,7 @@ extension CognitiveSubstrate {
     /// seed lane's durable marker buys.
     public func setExternalRuminations(
         _ items: [CognitiveExternalRumination],
+        confirmedClosedIDs: Set<String> = [],
         at now: Date
     ) {
         guard configuration.enabled else { return }
@@ -403,24 +410,29 @@ extension CognitiveSubstrate {
             next[item.id] = CognitiveExternalRumination(
                 id: item.id,
                 label: label,
-                lastTouchedAt: item.lastTouchedAt
+                lastTouchedAt: item.lastTouchedAt,
+                permittedSurfaces: item.permittedSurfaces
             )
         }
         // Heal what left the set — but only what had actually started to itch.
         // A thing closed the same hour it opened never nagged, so it owes no
         // relief (design law 4: no weight, no exhale).
-        let closed = externalRuminations.keys.filter { next[$0] == nil }
+        let closed = externalRuminations.keys.filter { next[$0] == nil && confirmedClosedIDs.contains($0) }
         let itching = Set(externalRuminationCandidates(at: now).compactMap(\.externalId))
         for id in closed.sorted() where itching.contains(id) {
             guard let item = externalRuminations[id] else { continue }
             let weight = Self.ruminationWeight(
                 ageSeconds: now.timeIntervalSince(item.lastTouchedAt)
             )
-            stageRuminationRelief(externalRuminationReliefEvent(
+            deferredExternalRuminationRelief[id] = externalRuminationReliefEvent(
                 for: item, weight: weight, at: now
-            ))
+            )
         }
-        externalRuminations = next
+        stageDeferredExternalRuminationRelief()
+        // Deferred closures retain tracking slots until their relief is staged.
+        let available = max(0, Self.externalRuminationCap - deferredExternalRuminationRelief.count)
+        let retainedIDs = Set(items.map(\.id).filter { next[$0] != nil }.prefix(available))
+        externalRuminations = next.filter { retainedIDs.contains($0.key) }
     }
 
     /// Relief for a commitment she finished. Labelled `workflowAdvance` — D-2's
@@ -443,7 +455,7 @@ extension CognitiveSubstrate {
             ),
             sourceClass: .selfReported,
             occurredAt: now,
-            summary: "Relief — \(item.label) is closed.",
+            summary: item.permittedSurfaces == nil ? "Relief — \(item.label) is closed." : "Relief — a moment is closed.",
             importance: min(1, 0.4 + weight),
             metadata: [
                 CognitiveEvent.feltValenceMetadataKey: .double(min(0.6, 0.15 + weight)),
@@ -497,6 +509,8 @@ extension CognitiveSubstrate {
         )
         var released: [UUID] = []
         for candidate in ruminationCandidates(at: now) {
+            guard candidate.externalId == nil,
+                  pendingRuminationReleases.count < Self.pendingRuminationReleaseCap else { continue }
             guard Self.answers(
                 candidate.text,
                 withSpokenTokens: spoken,
@@ -570,14 +584,18 @@ extension CognitiveSubstrate {
         stageRuminationRelief(ruminationReliefEvent(for: candidate, at: now))
     }
 
-    /// One staging door, one bound. Capped drop-oldest so an organism-off
-    /// install that never drains can never grow this.
-    private func stageRuminationRelief(_ event: CognitiveEvent) {
+    /// One staging door, one bound. Undelivered releases keep their slots.
+    @discardableResult
+    private func stageRuminationRelief(_ event: CognitiveEvent) -> Bool {
+        guard pendingRuminationReleases.count < Self.pendingRuminationReleaseCap else { return false }
         pendingRuminationReleases.append(event)
-        if pendingRuminationReleases.count > Self.pendingRuminationReleaseCap {
-            pendingRuminationReleases.removeFirst(
-                pendingRuminationReleases.count - Self.pendingRuminationReleaseCap
-            )
+        return true
+    }
+
+    private func stageDeferredExternalRuminationRelief() {
+        for id in deferredExternalRuminationRelief.keys.sorted() {
+            guard let event = deferredExternalRuminationRelief[id], stageRuminationRelief(event) else { break }
+            deferredExternalRuminationRelief.removeValue(forKey: id)
         }
     }
 
@@ -640,22 +658,33 @@ extension CognitiveSubstrate {
     /// The relief event id is itself keyed on the seed, so even a replay inside
     /// the field's seen-event horizon is inert (design law 9).
     public func drainRuminationReleaseEvents() async -> [CognitiveEvent] {
-        guard !pendingRuminationReleases.isEmpty else { return [] }
-        await persistPendingRuminationReleases()
+        stageDeferredExternalRuminationRelief()
+        guard !pendingRuminationReleases.isEmpty, !isDrainingRuminationReleases else { return [] }
+        isDrainingRuminationReleases = true
+        defer { isDrainingRuminationReleases = false }
         let drained = pendingRuminationReleases
-        pendingRuminationReleases.removeAll()
+        do {
+            try await persistPendingRuminationReleases()
+        } catch {
+            NSLog("[cognition] rumination release not saved: %@", "\(error)")
+            return []
+        }
+        pendingRuminationReleases.removeAll { pending in
+            drained.contains { $0.id == pending.id && $0.occurredAt == pending.occurredAt }
+        }
+        stageDeferredExternalRuminationRelief()
         return drained
     }
 
     /// One durable marker per released seed, plus the seed removal the marker
     /// describes. Through the existing artifact door — no new store, no new
     /// table, and the same stable-id shape disposition and affect already use.
-    private func persistPendingRuminationReleases() async {
+    private func persistPendingRuminationReleases() async throws {
         guard configuration.enabled, configuration.persistenceEnabled else { return }
         let now = dependencies.now()
         for (seedId, releasedAt) in ruminationReleasedAt.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
             guard now.timeIntervalSince(releasedAt) < Self.ruminationReleaseMemory else { continue }
-            await persistArtifact(
+            try await persistArtifactChecked(
                 kind: "rumination_release",
                 id: stableArtifactID("rumination_release|\(seedId.uuidString)"),
                 status: "released",
@@ -668,7 +697,7 @@ extension CognitiveSubstrate {
         }
         // The removal itself, so a restart does not restore a seed this lane has
         // already closed.
-        try? await persistThoughtSeedFamily()
+        try await persistThoughtSeedFamily()
     }
 
     /// Rehydrate the ledger, and drop any seed a marker says was already

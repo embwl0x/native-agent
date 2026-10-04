@@ -73,11 +73,24 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
     public let predictedToolGroups: Set<String>
     public let memoryActivation: [String: Double]
     public let workingMemoryRecordIDs: Set<String>
+    /// Phase 5 B0: memory record id → the signatures she rejected it for
+    /// (empty signature: never). ≤ 48 rows, already capped by the owner.
+    public let suppressedMemory: [String: [[String]]]
 
     public var isEmpty: Bool {
         terms.isEmpty && unresolvedQuestion == nil && activeTask == nil
             && goal == nil && predictedToolGroups.isEmpty
             && memoryActivation.isEmpty && workingMemoryRecordIDs.isEmpty
+            && suppressedMemory.isEmpty
+    }
+
+    /// The record ids she rejected for this kind of message.
+    public func suppressedMemoryRecordIDs(for message: String) -> Set<String> {
+        guard !suppressedMemory.isEmpty else { return [] }
+        let terms = CognitiveSubstrate.appraisalConcernTerms(in: message)
+        return Set(suppressedMemory.compactMap { id, signatures in
+            signatures.contains { CognitiveSubstrate.suppressionCovers($0, messageTerms: terms) } ? id : nil
+        })
     }
 
     public init(
@@ -88,7 +101,8 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
         residentWorkIntent: Bool = false,
         predictedToolGroups: Set<String> = [],
         memoryActivation: [String: Double] = [:],
-        workingMemoryRecordIDs: Set<String> = []
+        workingMemoryRecordIDs: Set<String> = [],
+        suppressedMemory: [String: [[String]]] = [:]
     ) {
         func bounded(_ text: String, to limit: Int) -> String {
             text.count <= limit ? text : String(text.prefix(limit))
@@ -120,6 +134,7 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
         self.predictedToolGroups = Set(predictedToolGroups.sorted().prefix(8).map { bounded($0, to: 64) })
         self.memoryActivation = cappedByWeight(memoryActivation, cap: 32, keyLimit: 128)
         self.workingMemoryRecordIDs = Set(workingMemoryRecordIDs.sorted().prefix(16).map { bounded($0, to: 128) })
+        self.suppressedMemory = suppressedMemory
     }
 }
 
@@ -181,6 +196,13 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     /// Accepted chat provenance, when supplied by the shared turn owner.
     /// Bare diagnostic callers retain legacy inference for compatibility.
     public var turnKind: CognitiveTurnKind?
+    /// Phase 5 B2: User started this turn himself, from one of his doors (Mac,
+    /// phone, Telegram). Her wakes, peer threads and bridge lanes are not him,
+    /// so they never open or close the "since we last talked" gap.
+    public var fromUser: Bool
+    /// Phase 5 B2/E2: User's verified turn before this one (`UserTurnStamp`),
+    /// where the gap this turn closes opened. Nil when unknown or not his turn.
+    public var previousUserTurnAt: Date?
 
     public var resolvedTurnKind: CognitiveTurnKind {
         turnKind ?? CognitiveTurnKind.inferred(fromSignals: [
@@ -197,7 +219,9 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         organismProjection: OrganismProjection? = nil,
         toward: OrganismTowardRead? = nil,
         allowNonLiveProjection: Bool = false,
-        turnKind: CognitiveTurnKind? = nil
+        turnKind: CognitiveTurnKind? = nil,
+        fromUser: Bool = false,
+        previousUserTurnAt: Date? = nil
     ) {
         self.surface = surface
         self.userMessage = userMessage
@@ -209,6 +233,8 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         self.toward = toward
         self.allowNonLiveProjection = allowNonLiveProjection
         self.turnKind = turnKind
+        self.fromUser = fromUser
+        self.previousUserTurnAt = previousUserTurnAt
     }
 }
 
@@ -266,13 +292,21 @@ public struct CognitiveCapsulePresentationCommit: Sendable, Equatable {
 public struct CognitivePreparedCapsule: Sendable, Equatable {
     public let capsule: CognitiveCapsule
     public let presentationCommit: CognitiveCapsulePresentationCommit?
+    /// Phase 5 B0: why this cue (or none) — for the turn trace, never the prompt.
+    public let why: JSONValue?
 
     public init(
         capsule: CognitiveCapsule,
-        presentationCommit: CognitiveCapsulePresentationCommit? = nil
+        presentationCommit: CognitiveCapsulePresentationCommit? = nil,
+        why: JSONValue? = nil
     ) {
         self.capsule = capsule
         self.presentationCommit = presentationCommit
+        self.why = why
+    }
+    /// The capsule to inject, or nil when this turn's felt answer was "none".
+    public var nonEmptyCapsule: CognitiveCapsule? {
+        capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : capsule
     }
 }
 
@@ -284,17 +318,22 @@ public struct CognitiveTurnProjection: Sendable, Equatable {
     public let capsule: CognitiveCapsule?
     public let posture: OrganismBehaviorPosture?
     public let capsulePresentationCommit: CognitiveCapsulePresentationCommit?
+    /// Phase 5 B0: the cue's `mind.why` record, fired into the turn trace once
+    /// the turn is delivered.
+    public let why: JSONValue?
 
     public init(
         fixedAt: Date,
         capsule: CognitiveCapsule?,
         posture: OrganismBehaviorPosture?,
-        capsulePresentationCommit: CognitiveCapsulePresentationCommit? = nil
+        capsulePresentationCommit: CognitiveCapsulePresentationCommit? = nil,
+        why: JSONValue? = nil
     ) {
         self.fixedAt = fixedAt
         self.capsule = capsule
         self.posture = posture
         self.capsulePresentationCommit = capsulePresentationCommit
+        self.why = why
     }
 
     public var isEmpty: Bool { capsule == nil && posture == nil }
@@ -339,6 +378,10 @@ public struct CognitiveThoughtSeed: Sendable, Equatable, Identifiable {
     public var createdAt: Date
     public var lastUpdatedAt: Date
     public var sourceNodeIds: [UUID]
+    /// Nil means the source peers could not be established (including legacy seeds).
+    public var sourcePeerIds: [String]?
+    /// External material identities are not field-node evidence.
+    public var materialProvenances: [String]
 
     public init(
         id: UUID,
@@ -347,7 +390,9 @@ public struct CognitiveThoughtSeed: Sendable, Equatable, Identifiable {
         priority: Double,
         createdAt: Date,
         lastUpdatedAt: Date,
-        sourceNodeIds: [UUID] = []
+        sourceNodeIds: [UUID] = [],
+        sourcePeerIds: [String]? = nil,
+        materialProvenances: [String] = []
     ) {
         self.id = id
         self.kind = kind
@@ -356,6 +401,8 @@ public struct CognitiveThoughtSeed: Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.lastUpdatedAt = lastUpdatedAt
         self.sourceNodeIds = sourceNodeIds
+        self.sourcePeerIds = sourcePeerIds
+        self.materialProvenances = materialProvenances
     }
 }
 
@@ -503,11 +550,58 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
     public var createdAt: Date
     public var updatedAt: Date
     public var lineageId: String
+    /// Phase 5 D (2026-10-03): the independent occurrences behind this view,
+    /// as `day|source` keys — a distinct day AND a distinct source
+    /// conversation or experience. Re-reading the same reflection material
+    /// adds nothing (Agent: "repeated ingestion is not conviction"). Bounded.
+    public var occurrences: [String]
+    /// Phase 5 D1 — an OPINION's reasons, in her words: why she thinks it,
+    /// and what would change her mind ("taste" for an aesthetic preference,
+    /// which age never makes stale). Empty on a plain view.
+    public var because: String
+    public var wouldChangeMind: String
+    /// What she used to think and the evidence that changed it, newest last.
+    public var revisions: [CognitiveViewRevision]
+
+    public static let maximumOccurrences = 8
+    public static let maximumRevisions = 3
+    /// A factual opinion this long unrevisited is due for RECONSIDERATION
+    /// (shown to her reflection). Never a change and never a retirement.
+    public static let reconsiderAfter: TimeInterval = 30 * 24 * 60 * 60
+    /// An interest fades slowly unless she returns to it.
+    public static let interestHalfLife: TimeInterval = 14 * 24 * 60 * 60
+    public static let interestFloor = 0.25
+
+    /// Independent occurrences; a legacy row counts its formation plus revisits.
+    public var independentOccurrenceCount: Int {
+        occurrences.isEmpty ? 1 + revisitCount : occurrences.filter { !$0.hasPrefix("x:") }.count
+    }
+    public var hasReasons: Bool { !because.isEmpty && !wouldChangeMind.isEmpty }
+    public var isTaste: Bool { wouldChangeMind.lowercased().hasPrefix("taste") }
+    /// When she last stood behind this stance: formed, reaffirmed or revised.
+    public var stanceSince: Date {
+        max(createdAt, lastRevisitedAt ?? createdAt, revisions.last?.at ?? createdAt)
+    }
+    public func dueForReconsideration(at now: Date) -> Bool {
+        status == .opinion && !isTaste && now.timeIntervalSince(stanceSince) >= Self.reconsiderAfter
+    }
+    public func interestWeight(at now: Date) -> Double {
+        pow(0.5, max(0, now.timeIntervalSince(updatedAt)) / Self.interestHalfLife)
+    }
+    /// Hers alone: held by her hand, an opinion, or an interest.
+    public var isHers: Bool { status == .held || status == .opinion || status == .interest }
 
     /// At most this many excerpts carried on one view — two per formation, and
     /// a revisit may attach genuinely new ones. Bounded so a thought she keeps
     /// returning to cannot grow an unbounded transcript behind it.
     public static let maximumEvidenceExcerpts = 6
+    public static let maximumEvidenceNodeIds = 32
+
+    public static func boundedEvidenceNodeIds(_ ids: [UUID]) -> [UUID] {
+        var seen = Set<UUID>()
+        return Array(ids.reversed().filter { seen.insert($0).inserted }
+            .prefix(maximumEvidenceNodeIds).reversed())
+    }
 
     public enum Status: String, Sendable, Equatable, CaseIterable {
         case proposed, active, retired
@@ -521,6 +615,11 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
         /// and each place that should also honour a held view had to be changed
         /// on purpose.
         case held
+        /// Phase 5 D1: a view that recurred independently with its reasons —
+        /// hers, no signature. It never leans the felt lane, a pursuit or a tap.
+        case opinion
+        /// Phase 5 D2: what she explored in her hour, with her open question.
+        case interest
     }
 
     /// True for the two statuses that lean her at all. Never symmetric between
@@ -541,14 +640,18 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
         revisesViewId: UUID? = nil,
         createdAt: Date,
         updatedAt: Date,
-        lineageId: String = ""
+        lineageId: String = "",
+        occurrences: [String] = [],
+        because: String = "",
+        wouldChangeMind: String = "",
+        revisions: [CognitiveViewRevision] = []
     ) {
         self.id = id
         self.title = title
         self.body = body
         self.status = status
         self.moodValenceAtFormation = (moodValenceAtFormation).clampedSigned()
-        self.evidenceNodeIds = evidenceNodeIds
+        self.evidenceNodeIds = Self.boundedEvidenceNodeIds(evidenceNodeIds)
         self.evidenceExcerpts = Array(evidenceExcerpts.prefix(Self.maximumEvidenceExcerpts))
         self.revisitCount = max(0, revisitCount)
         self.lastRevisitedAt = lastRevisitedAt
@@ -556,6 +659,26 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.lineageId = lineageId
+        self.occurrences = Array(occurrences.suffix(Self.maximumOccurrences))
+        self.because = because
+        self.wouldChangeMind = wouldChangeMind
+        self.revisions = Array(revisions.suffix(Self.maximumRevisions))
+    }
+}
+
+/// Phase 5 D1: one revision of an opinion — the stance she held and the
+/// evidence that moved her off it.
+public struct CognitiveViewRevision: Sendable, Equatable {
+    public var priorStance: String
+    public var priorBecause: String
+    public var evidence: String
+    public var at: Date
+
+    public init(priorStance: String, priorBecause: String, evidence: String, at: Date) {
+        self.priorStance = priorStance
+        self.priorBecause = priorBecause
+        self.evidence = evidence
+        self.at = at
     }
 }
 
@@ -718,6 +841,9 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
     /// standing view that outlives the workspace keeps the words that formed
     /// it, not just ids pointing at nodes the field has since evicted.
     public var sourceExcerpts: [String]
+    /// Full peer identities captured with the sources; excerpt labels are presentation only.
+    /// Nil means provenance is unknown, including receipts predating this field.
+    public var sourcePeerIds: [String]?
 
     public init(
         reservationId: UUID? = nil,
@@ -734,7 +860,8 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         requestedAt: Date,
         sourceNodeIds: [UUID] = [],
         materialProvenance: String? = nil,
-        sourceExcerpts: [String] = []
+        sourceExcerpts: [String] = [],
+        sourcePeerIds: [String]? = nil
     ) {
         self.reservationId = reservationId
         self.reason = reason
@@ -747,6 +874,7 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         self.sourceNodeIds = sourceNodeIds
         self.materialProvenance = materialProvenance
         self.sourceExcerpts = sourceExcerpts
+        self.sourcePeerIds = sourcePeerIds
     }
 }
 

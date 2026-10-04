@@ -42,24 +42,10 @@ struct HarnessBenchmarkCheck: Identifiable, Codable, Hashable {
     var detail: String?
 }
 
-// PATCH-2026-05-08: no-terminal-moments — result types for rebuild/push/stash-recover
+// PATCH-2026-05-08: no-terminal-moments — rebuild result
 struct SystemRebuildResult: Codable, Hashable {
     var ok: Bool
     var message: String?
-    var error: String?
-}
-
-struct GitPushResult: Codable, Hashable {
-    var ok: Bool
-    var branch: String?
-    var output: String?
-    var error: String?
-}
-
-struct GitStashRecoverResult: Codable, Hashable {
-    var ok: Bool
-    var stashRef: String?
-    var output: String?
     var error: String?
 }
 

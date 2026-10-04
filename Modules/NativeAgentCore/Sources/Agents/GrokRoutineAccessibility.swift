@@ -16,6 +16,7 @@ import PersistenceCore
         case conversation = "Grok Bot does not expose one unambiguous current chat and empty composer. Open the intended chat with no draft, then Connect again."
         case submission = "Routine request submission is unconfirmed. Check Grok Bot; this app will not resend it automatically."
         case secrets = "Grok Bot's Routines panel did not expose one unambiguous webhook URL and readable key through Accessibility. Close any open routine panel before sending a setup or cleanup request."
+        case cleanup = "Grok Bot's routine panel could not be closed. Close it before continuing."
     }
     static var running: Bool { !NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).isEmpty }
     /// Opens Grok Bot when it is closed and waits for it to be up, so a person
@@ -261,6 +262,7 @@ import PersistenceCore
         } catch { step("the message box never took focus"); throw error }
         // Recheck after focus: never replace a draft or paste into a changed chat.
         guard CFEqual(box, try prepareConversation(bot: bot)) else { step("the message box changed after focus"); throw Blocker.conversation }
+        guard let baseline = GrokDesktopReply.outgoingOccurrences(text, chat: bot) else { throw Blocker.conversation }
         sentLayout = GrokDesktopReply.layout(text, chat: bot)
         let pasteboard = NSPasteboard.general
         let saved = try copyPasteboard(pasteboard)
@@ -283,31 +285,59 @@ import PersistenceCore
             // The box reports the pasted text with its own trailing newline.
             let value = (attribute(box, kAXValueAttribute) as? String) ?? ""
             func flat(_ t: String) -> String { t.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
-            return !isEmptyBox(value, conversation: bot) && flat(value).contains(String(flat(text).prefix(40)))
+            return !isEmptyBox(value, conversation: bot) && flat(value) == flat(text)
         } } catch { step("the pasted text never appeared in the message box"); throw error }
         try requireFrontmost()
         reached = .submitted
         submit.forEach { NativeAgentMotorEpoch.notePostedHIDEvent(); $0.post(tap: .cghidEventTap) }
-        do { try await verifySubmission(text, bot: bot) }
+        do { try await verifySubmission(text, bot: bot, baseline: baseline) }
         catch { step("Return was pressed, but the message was not seen in the chat"); throw Blocker.submission }
     }
-    static func verifySubmission(_ message: String, bot: String) async throws {
-        func normalized(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+    static func verifySubmission(_ message: String, bot: String, baseline: Int) async throws {
         for _ in 0..<20 {
             guard try isCurrentBotChat(bot) else { throw Blocker.conversation }
             let tree = nodes(try window())
             let boxes = tree.filter { string($0, kAXRoleAttribute) == kAXTextAreaRole
                 && string($0, kAXDescriptionAttribute).lowercased() == "prompt" }
-            let visible = tree.filter { string($0, kAXRoleAttribute) == kAXStaticTextRole }
-                .map { string($0, kAXValueAttribute) }
             if boxes.count == 1, let value = attribute(boxes[0], kAXValueAttribute) as? String,
-               isEmptyBox(value, conversation: bot), visible.contains(where: { normalized($0).contains(normalized(String(message.prefix(40)))) }) { return }
+               isEmptyBox(value, conversation: bot),
+               let count = GrokDesktopReply.outgoingOccurrences(message, chat: bot), count > baseline { return }
             try await Task.sleep(for: .milliseconds(500))
         }
         throw Blocker.submission
     }
     static func importRoutine(peer: String, dataRoot: URL) async throws {
-        try await restoringForeground { try await importRoutineInForeground(peer: peer, dataRoot: dataRoot) }
+        try await restoringForeground {
+            do { try await importRoutineInForeground(peer: peer, dataRoot: dataRoot) }
+            catch {
+                guard await closeRoutinePanel() else { throw Blocker.cleanup }
+                throw error
+            }
+            guard await closeRoutinePanel() else { throw Blocker.cleanup }
+        }
+    }
+    private static func closeRoutinePanel() async -> Bool {
+        // This bounded cleanup has its own cancellation lifetime so a canceled
+        // import still hides the credential fields before restoring focus.
+        await Task { @MainActor in
+            for _ in 0..<6 {
+                guard let window = try? window() else { return !running }
+                let tree = nodes(window)
+                @MainActor func button(_ name: String) -> AXUIElement? {
+                    let found = tree.filter {
+                        string($0, kAXRoleAttribute) == kAXButtonRole
+                            && (string($0, kAXTitleAttribute) == name || string($0, kAXDescriptionAttribute) == name)
+                    }
+                    return found.count == 1 ? found[0] : nil
+                }
+                let control = button("Back to Routines") ?? button("Back to details") ?? button("Close details")
+                if let control { _ = AXUIElementPerformAction(control, kAXPressAction as CFString) }
+                else if (try? requireChatOnly()) != nil { return true }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            step("the routine panel could not be closed")
+            return false
+        }.value
     }
     private static func importRoutineInForeground(peer: String, dataRoot: URL) async throws {
         _ = try await awake()
@@ -355,10 +385,6 @@ import PersistenceCore
             }
             try await Task.sleep(for: .seconds(1))
         }
-        // Leave Grok Bot as it was found: the secrets never stay on screen.
-        let after = nodes(try window())
-        if let back = buttons(after, "Back to Routines").first { _ = press(back) }
-        if let close = buttons(nodes(try window()), "Close details").first { _ = press(close) }
         guard let url, let key else { throw Blocker.secrets }
         try AgentPeerStore(dataRoot: dataRoot).updateGrok(peer) { contact in
             var credential = try GrokLinkCredential.read(peer: peer)

@@ -56,8 +56,9 @@ public enum ChatUpdateNote {
 
     /// Stamp the record delivered. Best-effort on purpose: failing to stamp must
     /// not fail the turn, and the worst case is the note appearing once more.
-    public static func markDelivered(dataRoot: URL, now: Date = Date()) {
+    public static func markDelivered(dataRoot: URL, now: Date = Date(), expectedNote: String? = nil) {
         guard var record = load(dataRoot: dataRoot), record.deliveredAt == nil else { return }
+        if let expectedNote, record.note.trimmingCharacters(in: .whitespacesAndNewlines) != expectedNote { return }
         record.deliveredAt = ISO8601DateFormatter().string(from: now)
         write(record, dataRoot: dataRoot)
     }

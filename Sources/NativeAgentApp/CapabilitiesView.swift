@@ -2,6 +2,7 @@ import Foundation
 import Research
 import SwiftUI
 import TrustCenter
+import ApprovalInbox
 
 
 enum CapabilitiesDisclosurePreference {
@@ -13,13 +14,6 @@ enum CapabilitiesDisclosurePreference {
 
     static func setNextGenExpanded(_ isExpanded: Bool, in defaults: UserDefaults) {
         defaults.set(isExpanded, forKey: nextGenKey)
-    }
-}
-
-enum CapabilitiesPresentation {
-    /// Missing metadata is privileged ambiguity, never permission to run.
-    static func runRequiresApproval(_ action: NativeActionRecord) -> Bool {
-        action.requiresApproval != false
     }
 }
 
@@ -112,102 +106,6 @@ struct CapabilitiesStatusTextLine: View {
             .fixedSize(horizontal: false, vertical: true)
             .textSelection(.enabled)
             .accessibilityIdentifier("capabilities.statusText")
-    }
-}
-
-/// The compact MCP Builder depends on three separately-read authorities. Do
-/// not collapse a failed registry/session/consent read into an empty builder;
-/// the detailed MCP hub remains the canonical full surface.
-enum CapabilityMCPBuilderPresentation {
-    enum ReadState: Equatable {
-        case loading
-        case empty
-        case available
-        case stale
-        case unavailable
-    }
-
-    struct State: Equatable {
-        let servers: ReadState
-        let sessions: ReadState
-        let consents: ReadState
-        let sessionErrorCount: Int
-
-        var collapsedAttentionBadge: String? {
-            if sessionErrorCount > 0 {
-                return "\(sessionErrorCount) error\(sessionErrorCount == 1 ? "" : "s")"
-            }
-            if servers == .unavailable || sessions == .unavailable || consents == .unavailable {
-                return "MCP unavailable"
-            }
-            if servers == .stale || sessions == .stale || consents == .stale {
-                return "MCP stale"
-            }
-            return nil
-        }
-
-        var serverEmptyCopy: String? {
-            switch servers {
-            case .loading:
-                return "MCP servers have not loaded yet."
-            case .empty:
-                return "No MCP servers configured."
-            case .unavailable:
-                return "The server list is unavailable. Refresh Capabilities to try again."
-            case .available, .stale:
-                return nil
-            }
-        }
-
-        var detailNotice: String? {
-            if sessions == .unavailable || consents == .unavailable {
-                return "Live MCP session or consent details are unavailable; do not rely on missing status rows."
-            }
-            if sessions == .stale || consents == .stale {
-                return "Some MCP session or consent details are from the last successful refresh."
-            }
-            if servers == .stale {
-                return "Showing the last loaded list of connected tool services."
-            }
-            return nil
-        }
-    }
-
-    static func resolve(
-        serverCount: Int,
-        sessionCount: Int,
-        consentCount: Int,
-        sessionErrorCount: Int,
-        hasRefreshAttempt: Bool,
-        failedEndpoints: [String]
-    ) -> State {
-        let failures = Set(failedEndpoints.map {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        })
-        return State(
-            servers: readState(
-                count: serverCount,
-                hasRefreshAttempt: hasRefreshAttempt,
-                failed: failures.contains("mcp servers")
-            ),
-            sessions: readState(
-                count: sessionCount,
-                hasRefreshAttempt: hasRefreshAttempt,
-                failed: failures.contains("mcp sessions")
-            ),
-            consents: readState(
-                count: consentCount,
-                hasRefreshAttempt: hasRefreshAttempt,
-                failed: failures.contains("mcp consent")
-            ),
-            sessionErrorCount: max(0, sessionErrorCount)
-        )
-    }
-
-    private static func readState(count: Int, hasRefreshAttempt: Bool, failed: Bool) -> ReadState {
-        if failed { return count > 0 ? .stale : .unavailable }
-        if !hasRefreshAttempt { return count > 0 ? .available : .loading }
-        return count > 0 ? .available : .empty
     }
 }
 
@@ -1397,7 +1295,7 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 .accessibilityIdentifier("capabilities.run-gauntlet.outcome")
 
                 if !presentation.failedCheckTitles.isEmpty {
-                    Text("Failed: \(presentation.failedCheckTitles.joined(separator: ", "))")
+                    Text("Checks not passed: \(presentation.failedCheckTitles.joined(separator: ", "))")
                         .font(ShellType.caption)
                         .foregroundStyle(NativeAgentShell.trouble)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1454,9 +1352,13 @@ struct CapabilitiesRunActionPresentation: Equatable {
 struct CapabilitiesApprovalInboxPanel: View {
     @Environment(AppModel.self) private var appModel
 
+    private var pendingApprovals: [ApprovalRecord] {
+        appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }
+    }
+
     private var readState: CapabilitiesApprovalInboxPresentation.ReadState {
         CapabilitiesApprovalInboxPresentation.readState(
-            approvalCount: appModel.engine.approvals.records.count,
+            approvalCount: pendingApprovals.count,
             refresh: appModel.panelRefreshStatus[.capabilities]
         )
     }
@@ -1499,20 +1401,32 @@ struct CapabilitiesApprovalInboxPanel: View {
     }
 
     private var approvalRows: some View {
-            ForEach(appModel.engine.approvals.records.prefix(8)) { approval in
+            ForEach(pendingApprovals.prefix(8)) { approval in
                 HStack(alignment: .top, spacing: 8) {
-                    CapabilityDetailRow(
-                        title: approval.title,
-                        detail: approval.reason,
-                        status: approval.status.lowercased() == "pending" ? approval.risk : approval.status
-                    )
+                    VStack(alignment: .leading, spacing: 6) {
+                        CapabilityDetailRow(
+                            title: approval.title,
+                            detail: approval.reason,
+                            status: approval.status.lowercased() == "pending" ? approval.risk : approval.status
+                        )
+                        switch ApprovalPayloadPreviewPresentation.state(for: approval) {
+                        case .available(let preview):
+                            ApprovalPayloadPreviewView(preview: preview)
+                        case .unavailable:
+                            Text(ApprovalPayloadPreviewPresentation.unavailableText)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.trouble)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
                     Spacer()
                     if approval.status.lowercased() == "pending" {
                         Button("Approve") {
                             Task { await appModel.resolveCapabilitiesApprovalInbox(approval, decision: "approved") }
                         }
                         .controlSize(.small)
-                        .disabled(appModel.isResolvingApproval(id: approval.id))
+                        .disabled(appModel.isResolvingApproval(id: approval.id)
+                            || !ApprovalPayloadPreviewPresentation.canResolve(approval))
                         .accessibilityIdentifier("capabilities.approvals.approve.\(approval.id)")
                         .accessibilityHint(appModel.isResolvingApproval(id: approval.id)
                             ? "This approval is already being decided."

@@ -69,6 +69,7 @@ final class VoiceInputController {
     @ObservationIgnored private var desiredListening = false
     @ObservationIgnored private var startGeneration = 0
     @ObservationIgnored private var waitingForFinalAfterStop = false
+    @ObservationIgnored private var finalResultTimeout: Task<Void, Never>?
     @ObservationIgnored private var hasStartedAudioSession = false
     @ObservationIgnored private let requestSpeechAuthorization: () async -> SFSpeechRecognizerAuthorizationStatus
     @ObservationIgnored private let requestMicrophoneAuthorization: () async -> Bool
@@ -108,10 +109,12 @@ final class VoiceInputController {
     // MARK: - Public API
 
     func start() async {
-        guard !isStarting else { return }
+        guard !isStarting, !waitingForFinalAfterStop else { return }
         // If already listening, cancel the previous session first so we never
         // leak the audio engine across multiple rapid presses.
-        if isListening { teardownAudio(cancelTask: true) }
+        finalResultTimeout?.cancel()
+        finalResultTimeout = nil
+        if recognitionTask != nil { teardownAudio(cancelTask: true) }
         startGeneration += 1
         let generation = startGeneration
         isStarting = true
@@ -235,17 +238,15 @@ final class VoiceInputController {
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self, generation] result, err in
             guard let self else { return }
             if let result {
+                let isFinal = result.isFinal
                 Task { @MainActor in
                     guard self.startGeneration == generation
                         || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1)
                     else { return }
                     let text = result.bestTranscription.formattedString
                     self.transcript = text
-                    if self.waitingForFinalAfterStop && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        self.lastFinalTranscript = text
-                        self.waitingForFinalAfterStop = false
-                        self.statusText = nil
-                        self.error = nil
+                    if self.waitingForFinalAfterStop && isFinal {
+                        self.publishStoppedTranscript()
                     }
                 }
             }
@@ -254,12 +255,16 @@ final class VoiceInputController {
                 // Code 216 / 203 = cancelled/no-speech — suppress; they're normal on stop.
                 let suppressed = nsErr.domain == "kAFAssistantErrorDomain"
                     && (nsErr.code == 216 || nsErr.code == 203 || nsErr.code == 1110)
-                if !suppressed {
-                    Task { @MainActor in
-                        guard self.startGeneration == generation
-                            || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1)
-                        else { return }
+                Task { @MainActor in
+                    guard self.startGeneration == generation
+                        || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1)
+                    else { return }
+                    if !suppressed {
                         self.error = err.localizedDescription
+                    }
+                    if self.waitingForFinalAfterStop {
+                        self.publishStoppedTranscript()
+                    } else if !suppressed {
                         self.teardownAudio(cancelTask: true)
                     }
                 }
@@ -288,17 +293,13 @@ final class VoiceInputController {
         statusText = "Listening..."
     }
 
-    /// Call on touch-up. Captures lastFinalTranscript from whatever partial we have,
-    /// then tears everything down.
+    /// End audio on touch-up, then allow recognition to finalize before publishing.
     func stop() {
+        guard !waitingForFinalAfterStop else { return }
         let hadRecordingSession = isListening || hasStartedAudioSession
         desiredListening = false
         startGeneration += 1
-        let cleanTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        waitingForFinalAfterStop = hadRecordingSession && cleanTranscript.isEmpty
-        if !cleanTranscript.isEmpty {
-            lastFinalTranscript = cleanTranscript
-        }
+        waitingForFinalAfterStop = hadRecordingSession
         teardownAudio(cancelTask: !hadRecordingSession)
         isListening = false
         isStarting = false
@@ -307,20 +308,30 @@ final class VoiceInputController {
             waitingForFinalAfterStop = false
             return
         }
-        if cleanTranscript.isEmpty, error == nil {
-            let stopGeneration = startGeneration
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 900_000_000)
-                if self.startGeneration == stopGeneration,
-                   self.waitingForFinalAfterStop,
-                   self.lastFinalTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.waitingForFinalAfterStop = false
-                    self.error = self.hasReceivedAudio
-                        ? "No words were recognized. Try speaking a little longer."
-                        : "No microphone audio detected. Check iOS microphone privacy and the selected audio route."
-                }
-            }
+        let stopGeneration = startGeneration
+        finalResultTimeout = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: 900_000_000) }
+            catch { return }
+            guard let self, self.startGeneration == stopGeneration,
+                  self.waitingForFinalAfterStop else { return }
+            self.publishStoppedTranscript()
         }
+    }
+
+    private func publishStoppedTranscript() {
+        guard waitingForFinalAfterStop else { return }
+        waitingForFinalAfterStop = false
+        finalResultTimeout?.cancel()
+        finalResultTimeout = nil
+        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty {
+            lastFinalTranscript = text
+        } else if error == nil {
+            error = hasReceivedAudio
+                ? "No words were recognized. Try speaking a little longer."
+                : "No microphone audio detected. Check iOS microphone privacy and the selected audio route."
+        }
+        teardownAudio(cancelTask: true)
     }
 
     // MARK: - Private
@@ -329,10 +340,10 @@ final class VoiceInputController {
         recognitionRequest?.endAudio()
         if cancelTask {
             recognitionTask?.cancel()
+            recognitionTask = nil
         } else {
             recognitionTask?.finish()
         }
-        recognitionTask = nil
         recognitionRequest = nil
 
         if tapInstalled {

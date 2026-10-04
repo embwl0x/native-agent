@@ -38,17 +38,4 @@ extension NativeClient {
         return try ScheduledJob(row: job)
     }
 
-    func cancelSchedulerJob(id: String) async throws -> ScheduledJob {
-        let writer = makeSchedulerJobWriter(
-            connectorActionIDs: Self.connectorActionIDSet(),
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-        let result = try await writer.cancelJob(jobId: id)
-        guard case .object(let object) = result,
-              let job = object["job"] else {
-            throw SchedulerJobsFeedError.unavailable("scheduler cancellation returned no job")
-        }
-        return try ScheduledJob(row: job)
-    }
-
 }

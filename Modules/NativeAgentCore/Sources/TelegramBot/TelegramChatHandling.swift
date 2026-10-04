@@ -1,7 +1,9 @@
 import Foundation
 import PersistenceCore
+import ChatSessionWork
 
 public typealias TelegramChatHandler = @Sendable (_ chatId: Int, _ text: String) async throws -> String
+public typealias TelegramCompactionHandler = @Sendable (_ sessionId: String) async throws -> ChatSessionCompactionOutcome
 
 public enum TelegramChatProgressEvent: Sendable, Equatable {
     case replyTextSettled(Bool)

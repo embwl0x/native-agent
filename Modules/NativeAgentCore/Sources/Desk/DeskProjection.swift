@@ -13,7 +13,7 @@ import PersistenceCore
 //
 // TOP-LEVEL ITEM (open, most recently active first)
 //   `<alias> <token2> <project> · <title>[ · <summary>][ · <now|next child>]`
-//   `[ · refs:N][ · ⚑ drift:<kind>][ · stale:<dur>][ · archives in <dur>]`
+//   `[ · refs:N][ · ⚑ drift:<kind>][ · stale:<dur>][ · archive eligible [in <dur>]]`
 //   `[ · <level>/event]`
 //   • token2 = the STATUS, except when status is the neutral default `.watch`,
 //     where the KIND renders instead (reconciles the build plan's literal
@@ -190,7 +190,7 @@ public enum DeskProjection {
 
         // Origin marker (additive): a self-authored pursuit reads as hers, with
         // her private name when she gave it one. User-origin items render unchanged.
-        if item.origin == .agent {
+        if item.isPursuit {
             if let priv = item.pursuit?.privateName, !priv.isEmpty {
                 segs.append("✦pursuit “\(priv)”")
             } else {
@@ -220,9 +220,7 @@ public enum DeskProjection {
         if let stale = staleSegment(item, now: now) {
             segs.append(stale)
         }
-        // Terminal, not `.done` alone — canceled rows are swept on the same
-        // grace clock (archiveSweep), so they get the same countdown.
-        if item.status.isTerminal, let archives = archiveCountdown(item, now: now, archiveGrace: archiveGrace) {
+        if let archives = archiveCountdown(item, in: state, now: now, archiveGrace: archiveGrace) {
             segs.append(archives)
         }
         if item.cadence.mode == .event {
@@ -300,12 +298,16 @@ public enum DeskProjection {
         return "stale:\(humanDuration(elapsed))"
     }
 
-    /// `archives in <dur>` for a done item still inside its grace window.
-    static func archiveCountdown(_ item: DeskItem, now: Date, archiveGrace: TimeInterval) -> String? {
-        guard !item.pinned, let closedRaw = item.closedAt, let closed = DeskClock.parseISO(closedRaw) else { return nil }
+    /// Archival eligibility after the grace window; archival is explicit.
+    static func archiveCountdown(_ item: DeskItem, in state: DeskState, now: Date, archiveGrace: TimeInterval) -> String? {
+        guard item.status.isTerminal, item.kind != .standing, !item.pinned,
+              item.continuation?.pending.isEmpty ?? true,
+              let closedRaw = item.closedAt, let closed = DeskClock.parseISO(closedRaw) else { return nil }
+        guard !SwiftNativeDeskStore.descendants(of: item.handle, in: state).contains(where: {
+            $0.kind == .standing || !$0.status.isTerminal || !($0.continuation?.pending.isEmpty ?? true)
+        }) else { return nil }
         let remaining = archiveGrace - now.timeIntervalSince(closed)
-        guard remaining > 0 else { return nil }
-        return "archives in \(humanDuration(remaining))"
+        return remaining > 0 ? "archive eligible in \(humanDuration(remaining))" : "archive eligible"
     }
 
     // MARK: - Duration helpers
@@ -316,22 +318,25 @@ public enum DeskProjection {
     /// drift of an ISO round-trip rather than tipping a day down by 1ms.
     static func humanDuration(_ seconds: TimeInterval) -> String {
         let s = max(0, seconds)
-        if s < 3600 { return "\(Int((s / 60).rounded()))m" }
-        if s < 86_400 { return "\(Int((s / 3600).rounded()))h" }
-        return "\(Int((s / 86_400).rounded()))d"
+        if s < 3600 { return String(format: "%.0f", (s / 60).rounded()) + "m" }
+        if s < 86_400 { return String(format: "%.0f", (s / 3600).rounded()) + "h" }
+        return String(format: "%.0f", (s / 86_400).rounded()) + "d"
     }
 
     /// Parse a duration string like "30m" / "2h" / "1d" into seconds.
     static func parseDuration(_ s: String) -> TimeInterval? {
         let trimmed = s.trimmingCharacters(in: .whitespaces)
-        guard let unit = trimmed.last, let value = Int(trimmed.dropLast()) else { return nil }
+        guard let unit = trimmed.last, let integer = Int(trimmed.dropLast()), integer > 0 else { return nil }
+        let value = TimeInterval(integer)
+        let seconds: TimeInterval
         switch unit {
-        case "s": return TimeInterval(value)
-        case "m": return TimeInterval(value * 60)
-        case "h": return TimeInterval(value * 3600)
-        case "d": return TimeInterval(value * 86_400)
+        case "s": seconds = value
+        case "m": seconds = value * 60
+        case "h": seconds = value * 3600
+        case "d": seconds = value * 86_400
         default: return nil
         }
+        return seconds.isFinite ? seconds : nil
     }
 }
 
@@ -448,6 +453,11 @@ public extension DeskProjection {
             return "trace \(id)" + (kind.map { " (\($0))" } ?? "")
         case let .note(text):
             return "note \(text)"
+        case let .step(step):
+            return "queued \(step.when)" + (step.card.map { " \($0)" } ?? "") + ": \(step.words)"
+                + (step.action.map { " · then \($0)" } ?? "")
+                + (step.source.map { " · inferred from \"\($0)\"" } ?? "")
+                + (step.peers + step.elevated).map { " · from \($0)'s turn" }.joined()
         }
     }
 }

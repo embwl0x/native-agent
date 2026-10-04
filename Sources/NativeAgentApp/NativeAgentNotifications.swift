@@ -1,4 +1,5 @@
 import AppToolRuntime
+import AttentionRouting
 import Foundation
 import MacControl
 import PersistenceCore
@@ -73,6 +74,15 @@ enum NativeAgentNotifications {
         userInfo: [String: String] = [:],
         soundName: String? = nil
     ) async -> NativeAgentNotificationPostResult {
+        // Her resident wake runs in his quiet hours; its banners wait in the
+        // inbox until they end (AttentionRouter.releaseHeld).
+        let root = PersistenceCore.defaultDataRoot()
+        if AttentionRouter.holdsResidentWake(session: userInfo[NativeAgentNotificationActions.sessionKey], dataRoot: root) {
+            await AttentionRouter.hold(dataRoot: root, title: title, body: body, ways: ["mac"])
+            return NativeAgentNotificationPostResult(identifier: UUID().uuidString, status: "held", delivery: "held_for_quiet_hours",
+                posted: false, visibleAlertsEnabled: false, authorizationStatus: "", alertSetting: "", soundSetting: "",
+                badgeSetting: "", error: nil)
+        }
         let notificationTitle = NativeAgentNotificationDefaults.title(title)
         let center = UNUserNotificationCenter.current()
         var settings = await notificationSettings(center)

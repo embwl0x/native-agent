@@ -5,7 +5,7 @@ const crypto = require("crypto");
 // Assemble wire parameters; settings, execution policy and prompts stay with their owners.
 function createCodexWakeRequestParams({
   brainControlsForEntries, executionPolicyForEntries, formatBatchPrompt,
-  enumStringSetting, stringSetting,
+  stringSetting,
 }) {
 function clientUserMessageIdForEntries(entries) {
   const retryCount = Math.max(0, ...entries.map((entry) => Number(entry && entry.hangRetryCount || 0)));
@@ -25,13 +25,7 @@ function freshThreadStartParams(config, entries = []) {
   const execution = executionPolicyForEntries(entries, config);
   const params = {
     cwd: execution.cwd,
-    approvalPolicy: enumStringSetting(
-      config,
-      "approvalPolicy",
-      "NATIVE_AGENT_CODEX_WAKEUP_APPROVAL_POLICY",
-      "never",
-      new Set(["untrusted", "on-failure", "on-request", "never"])
-    ),
+    approvalPolicy: execution.approvalPolicy,
     sandbox: execution.sandbox,
     ephemeral: false,
     sessionStartSource: "startup",
@@ -66,10 +60,9 @@ function turnStartParams(threadId, entries, config) {
   if (brain.model) params.model = brain.model;
   if (brain.reasoningEffort) params.effort = brain.reasoningEffort;
   if (brain.serviceTier) params.serviceTier = brain.serviceTier;
-  if (execution.sandboxPolicy) {
-    params.cwd = execution.cwd;
-    params.sandboxPolicy = execution.sandboxPolicy;
-  }
+  if (execution.executionProfile) params.cwd = execution.cwd;
+  params.approvalPolicy = execution.approvalPolicy;
+  params.sandboxPolicy = execution.sandboxPolicy;
   return params;
 }
 

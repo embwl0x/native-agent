@@ -1,6 +1,6 @@
 import Foundation
 
-// Stable identifier normalization shared by field, prediction, and reflex records.
+// Stable identifier normalization shared by field and prediction records.
 enum OrganismToken {
     static func canonicalToken(_ raw: String) -> String {
         let lower = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

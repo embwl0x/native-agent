@@ -57,6 +57,11 @@ public protocol EvolutionToolBridge: Sendable {
 
 public protocol MacIntegrationToolBridge: Sendable {
     func calendarListUpcoming(input: [String: JSONValue]) async throws -> JSONValue
+    func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue
+    func calendarFreeBusy(input: [String: JSONValue]) async throws -> JSONValue
+    func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue
+    func remindersRead(input: [String: JSONValue]) async throws -> JSONValue
+    func remindersUpdate(input: [String: JSONValue]) async throws -> JSONValue
     func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue
     func macNotify(input: [String: JSONValue]) async throws -> JSONValue
     func mobileNotify(input: [String: JSONValue]) async throws -> JSONValue
@@ -74,6 +79,8 @@ public protocol MacIntegrationToolBridge: Sendable {
 
     /// List recent messages from Apple Mail's primary inbox. Read.
     func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue
+    func mailReadBatch(input: [String: JSONValue]) async throws -> JSONValue
+    func mailTriageBatch(input: [String: JSONValue]) async throws -> JSONValue
     /// Search Apple Mail across mailboxes. Read.
     func mailSearch(input: [String: JSONValue]) async throws -> JSONValue
     /// Compose and send an email through Apple Mail. Write.

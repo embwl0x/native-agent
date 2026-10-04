@@ -1,4 +1,5 @@
 import Foundation
+import ToolRegistry
 import Privacy
 import NativeAgentCore
 import TurnTrace
@@ -240,6 +241,7 @@ public enum MacChatStreamAdapter {
         continuation: AsyncThrowingStream<MacChatStreamUpdate, Error>.Continuation
     ) async {
         var terminalError: NSError?
+        let shown = ShownToolNames()
         do {
             for try await event in swiftStream {
                 try Task.checkCancellation()
@@ -263,6 +265,7 @@ public enum MacChatStreamAdapter {
                     if let activity = MacChatTurnActivityBoundary.activity(
                         from: event,
                         identity: activityIdentity,
+                        shown: shown,
                         at: Date()
                     ) {
                         await onTurnActivity(activity)

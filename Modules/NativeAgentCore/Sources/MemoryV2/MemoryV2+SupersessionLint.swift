@@ -68,11 +68,15 @@ public struct MemorySupersessionPair: Sendable, Equatable {
     public let retirerId: String
     public let targetId: String
     public let evidence: Evidence
+    public let retirerContentHash: String
+    public let targetContentHash: String
 
-    public init(retirerId: String, targetId: String, evidence: Evidence) {
-        self.retirerId = retirerId
-        self.targetId = targetId
+    public init(retirer: StoredMemory, target: StoredMemory, evidence: Evidence) {
+        self.retirerId = retirer.id
+        self.targetId = target.id
         self.evidence = evidence
+        self.retirerContentHash = MemoryStorage.contentFingerprint(retirer.content)
+        self.targetContentHash = MemoryStorage.contentFingerprint(target.content)
     }
 }
 
@@ -95,6 +99,15 @@ public struct MemorySupersessionLintResult: Sendable, Equatable {
 // MARK: - Lint
 
 public enum MemorySupersessionLint {
+    static func sameDisclosureScope(_ left: StoredMemory, _ right: StoredMemory) -> Bool {
+        let leftPersona = left.personaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let rightPersona = right.personaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard leftPersona == rightPersona,
+              let leftScope = MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: left)),
+              let rightScope = MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: right)) else { return false }
+        return leftScope.privacy == rightScope.privacy
+            && leftScope.permittedSurfaces == rightScope.permittedSurfaces
+    }
 
     /// Does this row read as a retirement record?
     ///
@@ -171,6 +184,7 @@ public enum MemorySupersessionLint {
             guard let retirerDate = MemoryRecallScoring.parseTimestamp(retirer.createdAt) else { continue }
             let candidates = eligible.filter { candidate in
                 guard candidate.id != retirer.id, !retirerIDs.contains(candidate.id) else { return false }
+                guard sameDisclosureScope(retirer, candidate) else { return false }
                 guard !claimed.contains(candidate.id) else { return false }
                 guard let created = MemoryRecallScoring.parseTimestamp(candidate.createdAt) else { return false }
                 return created < retirerDate
@@ -197,7 +211,7 @@ public enum MemorySupersessionLint {
                 if let target = quoted.first {
                     claimed.insert(target.id)
                     pairs.append(MemorySupersessionPair(
-                        retirerId: retirer.id, targetId: target.id, evidence: .quotedPhrase
+                        retirer: retirer, target: target, evidence: .quotedPhrase
                     ))
                     continue
                 }
@@ -206,8 +220,12 @@ public enum MemorySupersessionLint {
             // (b) No usable quote: the single nearest older row, and only if
             // nothing else is nearly as close.
             let scored = candidates
+                .filter {
+                    guard let epoch = retirer.embeddingEpoch, !epoch.isEmpty,
+                          let candidateEpoch = $0.embeddingEpoch, !candidateEpoch.isEmpty else { return false }
+                    return epoch == candidateEpoch
+                }
                 .map { (candidate: $0, cosine: VectorMath.cosine(retirer.embedding, $0.embedding)) }
-                .filter { $0.cosine >= memorySupersessionLintCosineFloor }
                 .sorted {
                     if $0.cosine != $1.cosine { return $0.cosine > $1.cosine }
                     return $0.candidate.id < $1.candidate.id
@@ -218,9 +236,10 @@ public enum MemorySupersessionLint {
                 ambiguous += 1
                 continue
             }
+            guard best.cosine >= memorySupersessionLintCosineFloor else { continue }
             claimed.insert(best.candidate.id)
             pairs.append(MemorySupersessionPair(
-                retirerId: retirer.id, targetId: best.candidate.id, evidence: .cosine
+                retirer: retirer, target: best.candidate, evidence: .cosine
             ))
         }
         return (pairs, ambiguous)
@@ -252,7 +271,9 @@ public enum MemorySupersessionLint {
                 id: pair.targetId,
                 by: pair.retirerId,
                 reason: "superseded by retirement record (\(pair.evidence.rawValue))",
-                supersededBy: pair.retirerId
+                supersededBy: pair.retirerId,
+                expectedContentHash: pair.targetContentHash,
+                expectedReplacementContentHash: pair.retirerContentHash
             )
             if marked { applied += 1 }
         }

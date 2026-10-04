@@ -38,7 +38,8 @@ public enum AgentConversationDelivery: String, Sendable {
 
     /// `read`: the recipient's inbox marked this send read.
     public static func of(_ row: AgentConversationRecord, read: Bool) -> Self {
-        if row.phase != "sending", row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return .answered }
+        if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) { return .notDelivered }
+        if row.phase == "ready", row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return .answered }
         switch row.phase {
         case "sending": return .sending
         case "attention":
@@ -268,8 +269,42 @@ public struct AgentConversationStore: Sendable {
             let text = AgentConversationExchange.clipped(reply, limit: AgentConversationExchange.textLimit)
             history[j].reply = text.text; history[j].replyTruncated = text.truncated
             history[j].status = "answered"; history[j].phase = "ready"; history[j].settledAt = Date()
+            let before = rows[i]
             rows[i].exchanges = try AgentConversationExchange.bounded(history)
             try save(rows)
+            noteReplies(was: before, now: rows[i])
+        }
+    }
+
+    /// At launch: Dot keeps no records (his sends go straight to his
+    /// session), and a send to a contact no longer saved can never settle,
+    /// so neither stays to show a stale state or have its queue retried.
+    /// Each one dropped is first kept whole in `conversations-dropped.jsonl`.
+    @discardableResult public func dropUnsettleable(dot: Set<String>, saved: Set<String>) throws -> Int {
+        try locked {
+            let rows = try load()
+            let dropped = rows.filter { row in
+                if dot.contains(row.agent) { return true }
+                guard row.agent.hasPrefix("peer:"), !saved.contains(row.agent) else { return false }
+                return ["sending", "waiting"].contains(row.phase) || !(row.queued ?? []).isEmpty || row.queueReservation != nil
+            }
+            guard !dropped.isEmpty else { return 0 }
+            let archive = fileURL.deletingLastPathComponent().appendingPathComponent("conversations-dropped.jsonl")
+            var lines = Data()
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            for row in dropped { lines += try encoder.encode(row) + Data([0x0A]) }
+            if !FileManager.default.fileExists(atPath: archive.path) {
+                FileManager.default.createFile(atPath: archive.path, contents: nil, attributes: [.posixPermissions: 0o600])
+            }
+            let handle = try FileHandle(forWritingTo: archive)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: lines)
+            try handle.synchronize()
+            let ids = Set(dropped.map(\.id))
+            try save(rows.filter { !ids.contains($0.id) })
+            return dropped.count
         }
     }
 
@@ -312,7 +347,32 @@ public struct AgentConversationStore: Sendable {
                 }
             }
             try save(rows)
+            noteReplies(was: identity, now: rows[i])
             return rows[i]
+        }
+    }
+
+    /// A contact's answer that settled in this write goes into the contact's
+    /// own session, unless her turn carries it there (being handed over, or
+    /// handed over by a turn already). There it is an arrival for her too
+    /// (ResidentWake), unless it came as a turn or is the person's own send.
+    private func noteReplies(was before: AgentConversationRecord, now row: AgentConversationRecord, wake: Bool = true) {
+        let lane = ["codex", "claude", "omp"].contains(row.agent)
+        guard lane || row.agent.hasPrefix("peer:") else { return }
+        let earlier = Dictionary((before.exchanges ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        for exchange in row.exchanges ?? [] {
+            guard let reply = exchange.reply, let at = exchange.settledAt,
+                  earlier[exchange.id].map({ $0.reply == nil || $0.settledAt == nil }) ?? true,
+                  exchange.id != row.operationID || (row.deliveryState != "delivering" && row.deliveryRunID == nil) else { continue }
+            let entry = ContactThread.Entry.reply(owner: lane ? row.agent : String(row.agent.dropFirst(5)), name: row.name,
+                                                  text: reply, replyID: "agent-conversation:" + exchange.id, at: at)
+            // Its own task, carrying none of the writer's turn with it.
+            Task.detached { await ContactThread.write(entry, dataRoot: root) }
+            guard wake, row.personInitiated != true, row.shownInline != row.operationID + ":" + row.phase else { continue }
+            ResidentWake.shared.request(dataRoot: root, reason: "what resolved", items: [.init(
+                id: "reply:" + exchange.id, line: row.name + " replied in \"" + String(row.label.prefix(60)) + "\"", thread: row.id,
+                session: row.scopeSessionID)])
         }
     }
 
@@ -328,12 +388,16 @@ public struct AgentConversationStore: Sendable {
     /// bridge) settles the send it names by its exact accepted message id, and
     /// only that one; an answer naming nothing settles nothing. Returns whether
     /// a waiting send was settled.
-    @discardableResult public func settleReply(agent: String, messageID: String, text: String) throws -> Bool {
+    /// `landedIn`: the chat the answer itself arrived in; in the contact's own
+    /// session it is already there.
+    @discardableResult public func settleReply(agent: String, messageID: String, text: String,
+                                               landedIn: String? = nil) throws -> Bool {
         try locked {
             var rows = try load()
             guard !messageID.isEmpty, let index = rows.firstIndex(where: {
                 $0.agent == agent && $0.phase == "waiting" && $0.readInput?["message_id"] == .string(messageID)
             }) else { return false }
+            let before = rows[index]
             let limit = AgentConversationExchange.textLimit
             let reply = JSONValue.string(String(text.prefix(limit)))
             var root: [String: JSONValue] = if case .object(let fields)? = rows[index].receipt { fields } else { [:] }
@@ -350,6 +414,7 @@ public struct AgentConversationStore: Sendable {
             rows[index].updatedAt = Date()
             try Self.absorbExchange(into: &rows[index])
             try save(rows)
+            if landedIn != ContactThread.session(owner: agent) { noteReplies(was: before, now: rows[index], wake: false) }
             return true
         }
     }
@@ -361,6 +426,7 @@ public struct AgentConversationStore: Sendable {
         try locked {
             var rows = try load()
             var changed = 0
+            var before: [(Int, AgentConversationRecord)] = []
             for index in rows.indices {
                 let row = rows[index]
                 guard ["waiting", "attention"].contains(row.phase), !row.automaticRead,
@@ -387,10 +453,13 @@ public struct AgentConversationStore: Sendable {
                         || (AgentConversationSession.liveHandOff(next) && !AgentConversationSession.liveHandOff(row)) else { continue }
                 next.updatedAt = Date()
                 try Self.absorbExchange(into: &next)
+                before.append((index, row))
                 rows[index] = next
                 changed += 1
             }
             if changed > 0 { try save(rows) }
+            // A lane's answer here came back as a turn (or to its caller).
+            for (index, row) in before { noteReplies(was: row, now: rows[index], wake: false) }
             return changed
         }
     }
@@ -494,12 +563,17 @@ public struct AgentConversationStore: Sendable {
 
     private func select(_ rows: [AgentConversationRecord], scope: String, agent: String, label: String?) throws -> AgentConversationRecord? {
         let matches = rows.filter { $0.scopeSessionID == scope && $0.agent == agent }
-        if let label { return matches.first { $0.label.caseInsensitiveCompare(label) == .orderedSame } }
-        if let selected = matches.first(where: { $0.selected }) { return selected }
-        guard matches.count <= 1 else {
-            throw Failure(message: "Choose a conversation: " + matches.map(\.label).joined(separator: ", "))
+        // 2026-10-03 (Agent live): only a name that fits several asks; no name
+        // is her current thread, else the latest activity (say, new_conversation).
+        if let label {
+            let named = matches.filter { $0.id == label || $0.label.caseInsensitiveCompare(label) == .orderedSame }
+            guard named.count <= 1 else {
+                throw Failure(message: "Choose a conversation: more than one is named “\(label)”; name it by id: "
+                    + named.map(\.id).joined(separator: ", "))
+            }
+            return named.first
         }
-        return matches.first
+        return matches.first(where: { $0.selected }) ?? matches.max { $0.updatedAt < $1.updatedAt }
     }
 
     private func locked<T>(_ work: () throws -> T) throws -> T {
@@ -526,55 +600,49 @@ public struct AgentConversationStore: Sendable {
             throw Failure(message: "Saved conversations exceed their storage limit; existing records were preserved.")
         }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
+        if rows.contains(where: { $0.phase == "attention" }) {
+            let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+            Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
+        }
         try? AgentConversationLiveStore(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()).merge([])
         AgentConversationRunning.shared.changed() // wakes queued follow-ups
     }
 }
 
 extension AgentConversationStore {
-    /// The contact's newest retained exchange in words ("last answered 06:31",
-    /// "last send unavailable 03:17 — …"), across every chat. Nil when none is
-    /// retained. Keyed by peer id, in one pass over the records.
-    public static func lastExchanges(peers: [AgentPeerContact],
-                                     records: [AgentConversationRecord]) -> [String: (summary: String, count: Int)] {
-        var byPeer: [String: [AgentConversationRecord]] = [:]
-        for row in records where row.agent.hasPrefix("peer:") {
-            let id = String(row.agent.dropFirst(5))
-            if peers.contains(where: { $0.id == id }) { byPeer[id, default: []].append(row); continue }
-            // A contact reconnected under a new id keeps its old records, only
-            // when exactly one current contact has that name and the same route.
-            let named = peers.filter { $0.name.caseInsensitiveCompare(row.name) == .orderedSame }
-            // Only a fingerprint that carries the whole route proves it; older ones stay unmatched.
-            if named.count == 1, row.peerRouteFingerprint == routeFingerprint(named[0]) {
-                byPeer[named[0].id, default: []].append(row)
-            }
+    /// What last passed with each contact, in words ("last answered 06:31",
+    /// "last send unavailable 03:17 — …"), from its own session; its newest
+    /// record says only where a send of hers still stands. Nil when nothing
+    /// passed. Keyed by peer id; `count` is the lines its session keeps.
+    public static func lastExchanges(peers: [AgentPeerContact], records: [AgentConversationRecord],
+                                     dataRoot: URL) -> [String: (summary: String, count: Int)] {
+        var found: [String: (summary: String, count: Int)] = [:]
+        for peer in peers {
+            let lines = ContactThread.lines(dataRoot: dataRoot, owner: peer.id)
+            guard let last = lines.last else { continue }
+            let row = records.filter { $0.agent == "peer:" + peer.id }.max { $0.updatedAt < $1.updatedAt }
+            // Its exchanges are the times it spoke, not every line both sides wrote.
+            found[peer.id] = (summary(last, answering: lines.dropLast().contains(where: \.mine), row: row),
+                              lines.filter { !$0.mine }.count)
         }
-        return byPeer.compactMapValues(summary)
+        return found
     }
 
-    private static func summary(_ rows: [AgentConversationRecord]) -> (summary: String, count: Int)? {
-        let all = rows.flatMap { row in (row.exchanges ?? []).map { (row, $0) } }
-        guard let (row, last) = all.max(by: { ($0.1.settledAt ?? $0.1.sentAt) < ($1.1.settledAt ?? $1.1.sentAt) }) else { return nil }
-        let at = last.settledAt ?? last.sentAt
+    private static func summary(_ last: ContactThread.Line, answering: Bool, row: AgentConversationRecord?) -> String {
         let clock = DateFormatter()
-        clock.dateFormat = Calendar.current.isDateInToday(at) ? "HH:mm" : "MMM d HH:mm"
-        let when = clock.string(from: at)
-        let inFlight = ["waiting", "sending"].contains(last.phase)
-        let summary: String
-        if last.reply != nil { summary = "last answered \(when)" }
-        else if inFlight, last.id == row.operationID { summary = "last message \(when), reply still coming" }
-        else if inFlight { summary = "last message \(when), no reply came" }
-        else {
-            var detail: String?
-            if last.id == row.operationID {
-                if case .object(let receipt)? = row.receipt, case .string(let text)? = receipt["detail"] { detail = text }
-                // A sentence, not a word like "delivering" or "interrupted".
-                if let state = row.deliveryState, state.contains(" ") { detail = state }
-            }
-            let status = last.status == "unknown" ? last.phase : last.status
-            summary = "last send \(status.replacingOccurrences(of: "_", with: " ")) \(when)"
-                + (detail.map { " — " + String($0.prefix(160)) } ?? "")
+        clock.dateFormat = Calendar.current.isDateInToday(last.at) ? "HH:mm" : "MMM d HH:mm"
+        let when = clock.string(from: last.at)
+        if !last.mine { return answering ? "last answered \(when)" : "last heard from them \(when)" }
+        guard let row, let current = row.exchanges?.last(where: { $0.id == row.operationID }) else {
+            return "last message \(when), no reply came"
         }
-        return (summary, all.count)
+        if ["waiting", "sending"].contains(current.phase) { return "last message \(when), reply still coming" }
+        var detail: String?
+        if case .object(let receipt)? = row.receipt, case .string(let text)? = receipt["detail"] { detail = text }
+        // A sentence, not a word like "delivering" or "interrupted".
+        if let state = row.deliveryState, state.contains(" ") { detail = state }
+        let status = current.status == "unknown" ? current.phase : current.status
+        return "last send \(status.replacingOccurrences(of: "_", with: " ")) \(when)"
+            + (detail.map { " — " + String($0.prefix(160)) } ?? "")
     }
 }

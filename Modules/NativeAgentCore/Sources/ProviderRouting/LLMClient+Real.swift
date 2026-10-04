@@ -170,54 +170,29 @@ public enum LLMError: Error, Equatable, LocalizedError {
 
 // MARK: - SwiftNativeLLMClient
 
-/// Routes `complete()` / `stream()` to the right backend by model-id prefix.
+/// Routes completions and streams using one checked `ProviderRoutingSnapshot`
+/// for the surface's provider, model preferences and execution controls.
 ///
-/// Dispatch precedence (top-to-bottom; first match wins):
-///   - bare `claude-*`                   -> Anthropic OAuth-direct when present, otherwise Anthropic api-key
-///   - bare `gpt-*`                      -> OpenAI    OAuth-direct when present, otherwise OpenAI api-key
-///   - `anthropic/...` (with slash)      -> OpenRouter
-///   - `openai/...`    (with slash)      -> OpenRouter
-///   - any other slash-namespaced id     -> OpenRouter (meta-llama/, mistral/, qwen/, ...)
-///   - anything else                     -> Codex CLI (which has its own resolver)
+/// A selected provider is required. Model families and account catalogs validate
+/// compatibility with that explicit route; they do not choose a backend.
+/// Missing adapters, unavailable routing and provider/model mismatches fail
+/// without substituting a compatible model or another credential route.
 ///
-/// Why slashes mean OpenRouter: `anthropic/claude-...` and `openai/...` are the
-/// canonical OpenRouter namespacing for a model served by an upstream provider.
-/// First-party Anthropic IDs are bare (`claude-opus-4-8`) and first-party OpenAI
-/// IDs are bare (`gpt-5.5`). Treating `anthropic/...` as first-party Anthropic
-/// would silently 404 against the Anthropic API.
-///
-/// If a per-surface `active.json` pins a provider (`{"telegram":"anthropic"}`),
-/// that explicit provider selection is authoritative for that surface. When
-/// an old/stale model pick belongs to a different provider family, the router
-/// swaps to a provider-compatible default instead of silently calling the
-/// wrong backend.
-///
-/// If `model` is nil/empty we resolve via `router.computeModelPreferences()["chat"]`
-/// to honor the per-surface picker. The protocol's `complete(model:)` arg here
-/// is treated as a literal modelId — surface lookup is the fallback path.
+/// An admitted turn's model takes precedence over the literal `model` argument.
+/// With neither, the model comes from the same snapshot's surface preferences,
+/// using Chat preferences when the surface has no entry.
 public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
     private let router: any ProviderRoutingProtocol
     private let codex: any LLMAdapter
     private let anthropic: any LLMAdapter
     private let openAI: any LLMAdapter
-    /// WAVE 27 (2026-06-01): preferred adapter for `gpt-*` / `openai/*` model
-    /// ids when the user's production environment is OAuth-only. The OAuth-direct
-    /// adapter consults `data/codex_home/auth.json::tokens.access_token` and
-    /// POSTs to `chatgpt.com/backend-api/codex/responses`. When this adapter
-    /// is installed, OAuth errors surface directly; NativeAgent must not
-    /// silently swap to an API-key adapter. When this is nil, the legacy
-    /// api-key-only path is used for OpenAI calls (older tests /
-    /// non-production wiring).
+    /// Adapter for the explicit ChatGPT OAuth route. Reads the bound root's
+    /// credentials and calls the ChatGPT Codex Responses backend. If absent,
+    /// that route fails as not configured; it never borrows the API-key route.
     private let openAIOAuthDirect: (any LLMAdapter)?
-    /// WAVE 28 (2026-06-01): preferred adapter for `claude*` / `anthropic/*`
-    /// model ids when the user's production environment is OAuth-only (no
-    /// ANTHROPIC_API_KEY). The OAuth-direct adapter consults
-    /// `data/providers/anthropic_oauth_direct.json::setup_token` and POSTs to
-    /// `api.anthropic.com/v1/messages` with the OAuth bearer. When this adapter
-    /// is installed, OAuth errors surface directly; nil means the legacy
-    /// api-key-only path (older tests / non-production wiring). Unlike the
-    /// OpenAI OAuth-direct, this adapter has a real SSE streaming implementation
-    /// so it's used for stream() too, not just complete().
+    /// Adapter for the explicit Anthropic OAuth route, including streaming.
+    /// If absent, that route fails as not configured; it never borrows the
+    /// API-key route.
     private let anthropicOAuthDirect: (any LLMAdapter)?
     /// NativeAgent-owned xAI OAuth provider for first-party Grok models. This
     /// is separate from the X/Twitter connector; it calls api.x.ai as a model
@@ -571,46 +546,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         if lower.hasPrefix("grok") { return "xai" }
         if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower) { return "kimi-code" }
         if lower.hasPrefix("kimi-") || lower.hasPrefix("moonshot-") { return "moonshot" }
-        // M-F3 (symmetry): a non-prefixed pinned Moonshot catalog id belongs
-        // to moonshot for the active-provider compatibility check too, so an
-        // incompatible active provider swaps to a moonshot-served default
-        // instead of shipping a Kimi model to the wrong backend. Same
-        // membership oracle as routing: static rows + live disk cache.
+        // Non-prefixed Moonshot catalog IDs participate in the same provider
+        // compatibility check: a mismatched explicit route must fail before
+        // dispatch. Membership includes static rows and the live disk cache.
         if isMoonshotCatalogModel(lower) {
             return "moonshot"
-        }
-        return nil
-    }
-
-    private func defaultModel(forProviderId providerId: String) async -> String? {
-        if let provider = try? await router.getProvider(id: providerId),
-           let model = Self.defaultModel(from: provider) {
-            return model
-        }
-        // 2026-09-13: the route's OWN catalog answers, first row, computed — the
-        // per-family literals that used to sit here were models chosen in code.
-        // A route whose catalog this build does not ship answers nil, and the
-        // caller keeps whatever it had rather than being re-pointed.
-        return FirstPartyModelCatalog.models(forProviderID: providerId).first?.id
-    }
-
-    private static func defaultModel(from provider: Provider) -> String? {
-        if case .object(let extras)? = provider.extras {
-            for key in ["default_model", "defaultModel"] {
-                if case .string(let value)? = extras[key],
-                   !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return value
-                }
-            }
-        }
-        if case .array(let models)? = provider.modelCatalog {
-            for item in models {
-                guard case .object(let obj) = item else { continue }
-                if case .string(let value)? = obj["id"],
-                   !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return value
-                }
-            }
         }
         return nil
     }

@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - PersonalityPacket
@@ -7,8 +8,7 @@ import PersistenceCore
 // Mirrors the retired daemon `compiled_personality_packet(surface)`
 // (~L35364-35550). Phase-B+ scope: load canonical persona docs, apply
 // custom-persona dir overrides, append surface guidance, concatenate in
-// canonical order, derive a stable fingerprint, surface trait metadata
-// parsed from GROWTH.md frontmatter. Deliberately simplified vs. daemon:
+// canonical order, derive a stable fingerprint. Deliberately simplified vs. daemon:
 //   - no REM-pin retrieval (subsystem #10).
 //   - no chat-turn-time slotting (`compiled_personality_packet_for_turn`
 //     additions like KG snippets) — that's the next layer.
@@ -21,7 +21,6 @@ public struct PersonalityPacket: Sendable, Codable, Equatable {
     public let fingerprint: String       // SHA-256 hex prefix (16 chars)
     public let compiledSystemPrompt: String
     public let activeDocs: [String: String]
-    public let traits: [String: JSONValue]
     public let extras: JSONValue?
 
     public init(
@@ -31,7 +30,6 @@ public struct PersonalityPacket: Sendable, Codable, Equatable {
         fingerprint: String,
         compiledSystemPrompt: String,
         activeDocs: [String: String],
-        traits: [String: JSONValue],
         extras: JSONValue? = nil
     ) {
         self.surface = surface
@@ -40,7 +38,6 @@ public struct PersonalityPacket: Sendable, Codable, Equatable {
         self.fingerprint = fingerprint
         self.compiledSystemPrompt = compiledSystemPrompt
         self.activeDocs = activeDocs
-        self.traits = traits
         self.extras = extras
     }
 }
@@ -329,31 +326,42 @@ public actor PersonaCompiler {
 
     // MARK: Public API
 
-    public func compile(surface: String) async throws -> PersonalityPacket {
-        return try await compile(surface: surface, personaOverride: nil)
-    }
-
-    /// Same as `compile(surface:)` but honours a per-turn persona override
+    /// Honours a per-turn persona override
     /// (Mac UI's `UserDefaults["chatPersona"]`). When `personaOverride` names
     /// a subdir under the persona root that contains at least one marker doc,
     /// that subdir wins over the on-disk `active.json` / scan resolution.
     /// Override resolution failures fall through to the normal resolver — a
     /// typo can't blank the persona.
-    public func compile(surface: String, personaOverride: String?) async throws -> PersonalityPacket {
+    public func compile(
+        surface: String,
+        personaOverride: String? = nil,
+        userMemoryCore: [String]? = nil
+    ) async throws -> PersonalityPacket {
         try await resolvedCompilation(
             surface: surface,
-            personaOverride: personaOverride
+            personaOverride: personaOverride,
+            userMemoryCore: userMemoryCore
         ).packet
+    }
+
+    /// Identity-only read for persona-scoped procedural recall before selection.
+    public func selectedPersonaID(personaOverride: String?) async throws -> String {
+        try Self.selectedPersonaID(root: await engine.personaRoot, personaOverride: personaOverride, fileManager: fileManager)
+    }
+
+    public static func selectedPersonaID(root: URL, personaOverride: String?, fileManager: FileManager = .default) throws -> String {
+        try resolveActivePersona(root: root, personaOverride: personaOverride, fileManager: fileManager).id
     }
 
     private func resolvedCompilation(
         surface: String,
-        personaOverride: String?
+        personaOverride: String?,
+        userMemoryCore: [String]? = nil
     ) async throws -> ResolvedCompilation {
         let root = await engine.personaRoot
 
-        let (personaKind, personaId, personaSubdir) = try resolveActivePersona(
-            root: root, personaOverride: personaOverride
+        let (personaKind, personaId, personaSubdir) = try Self.resolveActivePersona(
+            root: root, personaOverride: personaOverride, fileManager: fileManager
         )
 
         // Load canonical docs + apply per-doc overrides from the custom
@@ -372,10 +380,9 @@ public actor PersonaCompiler {
         if let surfaceBody = try readSurfaceOverride(root: root, surface: surface) {
             activeDocs["surface:\(surface)"] = surfaceBody
         }
-        let compiledSystemPrompt = Self.renderPrompt(documents: activeDocs, surface: surface)
-
-        // Traits — parsed from GROWTH.md (frontmatter or `TRAIT:` headers).
-        let traits = extractTraits(growth: activeDocs["GROWTH"] ?? "")
+        let compiledSystemPrompt = Self.renderPrompt(
+            documents: activeDocs, surface: surface, userMemoryCore: userMemoryCore
+        )
 
         // Fingerprint — SHA-256 over (sorted ids + their contents + surface).
         let fingerprint = computeFingerprint(activeDocs: activeDocs, surface: surface)
@@ -387,7 +394,6 @@ public actor PersonaCompiler {
             fingerprint: fingerprint,
             compiledSystemPrompt: compiledSystemPrompt,
             activeDocs: activeDocs,
-            traits: traits,
             extras: nil
         )
         return ResolvedCompilation(
@@ -404,13 +410,23 @@ public actor PersonaCompiler {
     /// 2026-09-18: one ordering for cold compilation and the resident kernel.
     /// A relaunch must not move surface guidance across the remaining persona
     /// documents and invalidate an otherwise unchanged provider prefix.
-    public static func renderPrompt(documents: [String: String], surface: String) -> String {
-        let order = canonicalDocOrder + ["surface:\(surface)"]
+    /// Chat, background work and reflection project USER through the same core
+    /// rule. Source documents and their fingerprints remain whole.
+    public static func renderPrompt(
+        documents: [String: String],
+        surface: String? = nil,
+        userMemoryCore: [String]? = nil
+    ) -> String {
+        let surfaceID = surface.map { "surface:\($0)" }
+        let order = canonicalDocOrder + (surfaceID.map { [$0] } ?? [])
         return order.compactMap { id -> String? in
-            guard let body = documents[id], id == "surface:\(surface)" || !body.isEmpty else { return nil }
-            return id == "surface:\(surface)"
-                ? "Surface guidance for \(surface):\n\(body)"
-                : "# \(id)\n\(body)"
+            guard let document = documents[id] else { return nil }
+            let body = id == "USER"
+                ? UserMDAutogenMarkers.promptText(document, pinnedCore: userMemoryCore) : document
+            if let surface, id == surfaceID {
+                return "Surface guidance for \(surface):\n\(body)"
+            }
+            return body.isEmpty ? nil : "# \(id)\n\(body)"
         }.joined(separator: "\n\n")
     }
 
@@ -518,10 +534,7 @@ public actor PersonaCompiler {
     // profile.name: when it's empty, whitespace, or one of the generic
     // labels {"agent", "custom", "ai", "male", "female"} (case-insensitive),
     // the daemon falls back to APP ("NativeAgent"). Real custom names
-    // pass through, truncated to 80 chars. CommandPalette's
-    // makeCommandPaletteContext factory MUST call this instead of the raw
-    // `loadProfile().name` so the chat-subtitle and operating-map-title
-    // surfaces match the daemon for default-named personas.
+    // pass through, truncated to 80 chars.
 
     /// Generic labels the daemon treats as "no real name set" — see
     /// the retired daemon. Case-insensitive comparison; keep this set
@@ -561,7 +574,7 @@ public actor PersonaCompiler {
 
     /// Convenience wrapper: load the profile from disk and return its
     /// daemon-equivalent display name. Use this from non-actor callers
-    /// (e.g. NativeClient.makeCommandPaletteContext) that previously read
+    /// that previously read
     /// `loadProfile(dataRoot:).name` raw — that path skipped the
     /// generic-label fallback. Matches daemon `agent_display_name()` 1:1.
     public nonisolated static func agentDisplayName(
@@ -584,9 +597,10 @@ public actor PersonaCompiler {
     ///   2. Otherwise scan immediate subdirs; pick the first (sorted)
     ///      that contains a marker doc → Custom.
     ///   3. None found → Default / "canonical".
-    private func resolveActivePersona(
+    private static func resolveActivePersona(
         root: URL,
-        personaOverride: String?
+        personaOverride: String?,
+        fileManager: FileManager
     ) throws -> (kind: String, id: String, subdir: URL?) {
         // 0. Per-turn override (Mac UI chatPersona pick). Trim, then look
         //    for a subdir with at least one marker doc. Misses fall through
@@ -594,8 +608,8 @@ public actor PersonaCompiler {
         if let raw = personaOverride {
             let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !name.isEmpty {
-                let candidate = root.appendingPathComponent(name, isDirectory: true)
-                if subdirHasMarker(candidate) {
+                let candidate = try selectedPersonaDirectory(name: name, root: root)
+                if subdirHasMarker(candidate, fileManager: fileManager) {
                     return ("Custom", name, candidate)
                 }
                 // Override naming the canonical persona by display name (e.g.
@@ -617,7 +631,7 @@ public actor PersonaCompiler {
                         reason: "active.json must contain a non-empty persona string"
                     )
                 }
-                name = rawName
+                name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
             } catch let error as PersonaEngineError {
                 throw error
             } catch {
@@ -625,8 +639,8 @@ public actor PersonaCompiler {
                     reason: "cannot read active.json: \(error.localizedDescription)"
                 )
             }
-            let candidate = root.appendingPathComponent(name, isDirectory: true)
-            if subdirHasMarker(candidate) {
+            let candidate = try selectedPersonaDirectory(name: name, root: root)
+            if subdirHasMarker(candidate, fileManager: fileManager) {
                 return ("Custom", name, candidate)
             }
         }
@@ -639,14 +653,31 @@ public actor PersonaCompiler {
         let dirs = entries
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for dir in dirs where subdirHasMarker(dir) {
-            return ("Custom", dir.lastPathComponent, dir)
+        for dir in dirs {
+            guard let candidate = try? selectedPersonaDirectory(name: dir.lastPathComponent, root: root),
+                  subdirHasMarker(candidate, fileManager: fileManager) else { continue }
+            return ("Custom", dir.lastPathComponent, candidate)
         }
         // 3. Default
         return ("Default", "canonical", nil)
     }
 
-    private func subdirHasMarker(_ dir: URL) -> Bool {
+    private static func selectedPersonaDirectory(name: String, root: URL) throws -> URL {
+        guard !name.isEmpty, name != ".", name != "..",
+              !name.contains("/"), !name.contains("\\"),
+              !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            throw PersonaEngineError.rootUnreadable(reason: "persona name must be a safe directory name")
+        }
+        let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let candidate = root.appendingPathComponent(name, isDirectory: true)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        guard candidate.path.hasPrefix(resolvedRoot.path + "/") else {
+            throw PersonaEngineError.rootUnreadable(reason: "selected persona directory is outside the persona root")
+        }
+        return candidate
+    }
+
+    private static func subdirHasMarker(_ dir: URL, fileManager: FileManager) -> Bool {
         guard (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
             return false
         }
@@ -673,94 +704,12 @@ public actor PersonaCompiler {
 
     private func readPersonaDocument(at url: URL) throws -> String {
         do {
-            return try String(contentsOf: url, encoding: .utf8)
+            return try SwiftNativePersonaEngine.readPersonaDocument(at: url)
         } catch {
             throw PersonaEngineError.rootUnreadable(
                 reason: "cannot read \(url.lastPathComponent): \(error.localizedDescription)"
             )
         }
-    }
-
-    /// Trait parser. Two supported shapes:
-    ///   1. YAML-ish frontmatter at the top of GROWTH.md:
-    ///        ---
-    ///        traits:
-    ///          curiosity: 0.7
-    ///          warmth: high
-    ///        ---
-    ///   2. Inline `TRAIT: <name> = <value>` lines anywhere in the body.
-    /// Anything that fails to parse → empty dict. Daemon parses additional
-    /// shapes (LLM-distilled KG entries); those are deferred to Phase C
-    /// (DreamREMCycle owns the rich GROWTH.md schema).
-    private func extractTraits(growth: String) -> [String: JSONValue] {
-        var out: [String: JSONValue] = [:]
-        guard !growth.isEmpty else { return out }
-
-        // 1. Frontmatter.
-        if growth.hasPrefix("---\n") {
-            let rest = growth.dropFirst(4)
-            if let endRange = rest.range(of: "\n---") {
-                let block = String(rest[..<endRange.lowerBound])
-                parseYamlishTraits(block: block, into: &out)
-            }
-        }
-
-        // 2. Inline TRAIT lines.
-        for raw in growth.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("TRAIT:") else { continue }
-            let body = line.dropFirst("TRAIT:".count).trimmingCharacters(in: .whitespaces)
-            guard let eq = body.firstIndex(of: "=") else { continue }
-            let key = body[..<eq].trimmingCharacters(in: .whitespaces)
-            let valueRaw = body[body.index(after: eq)...].trimmingCharacters(in: .whitespaces)
-            if !key.isEmpty {
-                out[key] = parseScalar(valueRaw)
-            }
-        }
-
-        return out
-    }
-
-    private func parseYamlishTraits(block: String, into out: inout [String: JSONValue]) {
-        // Only inspect the `traits:` sub-section. Indented `key: value`
-        // pairs underneath are read until a non-indented line.
-        let lines = block.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var inTraits = false
-        for raw in lines {
-            if raw.trimmingCharacters(in: .whitespaces) == "traits:" {
-                inTraits = true
-                continue
-            }
-            if inTraits {
-                // End of section when we hit an unindented non-empty line.
-                if !raw.isEmpty && !raw.hasPrefix(" ") && !raw.hasPrefix("\t") {
-                    break
-                }
-                let trimmed = raw.trimmingCharacters(in: .whitespaces)
-                if trimmed.isEmpty { continue }
-                guard let colon = trimmed.firstIndex(of: ":") else { continue }
-                let key = trimmed[..<colon].trimmingCharacters(in: .whitespaces)
-                let valueRaw = trimmed[trimmed.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-                if !key.isEmpty {
-                    out[String(key)] = parseScalar(valueRaw)
-                }
-            }
-        }
-    }
-
-    private func parseScalar(_ s: String) -> JSONValue {
-        if s.isEmpty { return .string("") }
-        if s == "true" { return .bool(true) }
-        if s == "false" { return .bool(false) }
-        if s == "null" || s == "~" { return .null }
-        if let i = Int64(s) { return .int(i) }
-        if let d = Double(s) { return .double(d) }
-        // Strip surrounding quotes if present.
-        if s.count >= 2,
-           (s.hasPrefix("\"") && s.hasSuffix("\"")) || (s.hasPrefix("'") && s.hasSuffix("'")) {
-            return .string(String(s.dropFirst().dropLast()))
-        }
-        return .string(s)
     }
 
     private func computeFingerprint(activeDocs: [String: String], surface: String) -> String {

@@ -7,13 +7,20 @@ import PersistenceCore
 // description, and required-asterisk hints. Unknown / union types fall back
 // to a raw-JSON TextEditor. Submit is owned by the caller.
 struct MCPInputSchemaForm: View {
+    struct Draft {
+        var strings: [String: String] = [:]
+        var input: String = ""
+    }
+
     let schema: JSONValue?
     @Binding var values: [String: JSONValue]
+    @Binding var jsonErrors: [String: String]
+    @Binding var draft: Draft
 
-    @State private var stringStore: [String: String] = [:]
-    @State private var fallbackText: String = ""
-    @State private var fallbackError: String? = nil
-    @State private var jsonErrors: [String: String] = [:]
+    private var fallbackError: String? {
+        get { jsonErrors["$input"] }
+        nonmutating set { jsonErrors["$input"] = newValue }
+    }
     @State private var didApplyDefaults: Bool = false
 
     var body: some View {
@@ -102,12 +109,12 @@ struct MCPInputSchemaForm: View {
     private func stringField(name: String, description: String?) -> some View {
         let binding = Binding<String>(
             get: {
-                if let s = stringStore[name] { return s }
+                if let s = draft.strings[name] { return s }
                 if case .string(let v) = values[name] ?? .null { return v }
                 return ""
             },
             set: { newValue in
-                stringStore[name] = newValue
+                draft.strings[name] = newValue
                 values[name] = .string(newValue)
             }
         )
@@ -138,12 +145,12 @@ struct MCPInputSchemaForm: View {
     private func intField(name: String, description: String?) -> some View {
         let binding = Binding<String>(
             get: {
-                if let s = stringStore[name] { return s }
+                if let s = draft.strings[name] { return s }
                 if case .int(let v) = values[name] ?? .null { return String(v) }
                 return ""
             },
             set: { newValue in
-                stringStore[name] = newValue
+                draft.strings[name] = newValue
                 if let parsed = Int64(newValue) {
                     values[name] = .int(parsed)
                     jsonErrors[name] = nil
@@ -176,13 +183,13 @@ struct MCPInputSchemaForm: View {
     private func numberField(name: String, description: String?) -> some View {
         let binding = Binding<String>(
             get: {
-                if let s = stringStore[name] { return s }
+                if let s = draft.strings[name] { return s }
                 if case .double(let v) = values[name] ?? .null { return String(v) }
                 if case .int(let v) = values[name] ?? .null { return String(v) }
                 return ""
             },
             set: { newValue in
-                stringStore[name] = newValue
+                draft.strings[name] = newValue
                 if newValue.isEmpty {
                     values.removeValue(forKey: name)
                     jsonErrors[name] = nil
@@ -215,9 +222,9 @@ struct MCPInputSchemaForm: View {
 
     private func jsonEditor(name: String, accept: @escaping (JSONValue) -> Bool) -> some View {
         let binding = Binding<String>(
-            get: { stringStore[name] ?? "" },
+            get: { draft.strings[name] ?? "" },
             set: { newValue in
-                stringStore[name] = newValue
+                draft.strings[name] = newValue
                 let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
                 if trimmed.isEmpty {
                     values.removeValue(forKey: name)
@@ -251,9 +258,9 @@ struct MCPInputSchemaForm: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Input (JSON)").font(.caption)
             TextEditor(text: Binding(
-                get: { fallbackText },
+                get: { draft.input },
                 set: { newValue in
-                    fallbackText = newValue
+                    draft.input = newValue
                     let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
                     if trimmed.isEmpty {
                         values = [:]
@@ -278,7 +285,7 @@ struct MCPInputSchemaForm: View {
             .font(.system(.caption, design: .monospaced))
             .frame(minHeight: 80, maxHeight: 200)
             .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
-            if fallbackText.isEmpty {
+            if draft.input.isEmpty {
                 Text("e.g. {\"path\": \"/tmp/x\"}")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -292,11 +299,11 @@ struct MCPInputSchemaForm: View {
             // pre-existing values on (re-)appear. Otherwise re-expanding a
             // tool with prior input shows a blank editor while `values` still
             // holds the data, which the Run button then submits invisibly.
-            if fallbackText.isEmpty && !values.isEmpty {
+            if draft.input.isEmpty && !values.isEmpty {
                 let obj = JSONValue.object(values)
                 if let data = try? obj.serializedData(pretty: true),
                    let text = String(data: data, encoding: .utf8) {
-                    fallbackText = text
+                    draft.input = text
                 }
             }
         }
@@ -308,7 +315,7 @@ struct MCPInputSchemaForm: View {
         guard !didApplyDefaults else { return }
         didApplyDefaults = true
         for (key, propSchema) in props {
-            guard values[key] == nil else { continue }
+            guard values[key] == nil, draft.strings[key] == nil else { continue }
             // Explicit schema "default" wins.
             if let def = propDefault(propSchema) {
                 values[key] = def
@@ -338,7 +345,7 @@ struct MCPInputSchemaForm: View {
         // form session). Without this, re-expanding a tool form shows blank
         // editors even though values still holds the data.
         for (key, propSchema) in props {
-            if stringStore[key] != nil { continue }
+            if draft.strings[key] != nil { continue }
             let typeStr = propType(propSchema)
             let typeIsUnion = propTypeIsArray(propSchema)
             let hasUnionKeyword = propHasAnyOfOneOf(propSchema)
@@ -352,7 +359,7 @@ struct MCPInputSchemaForm: View {
             guard usesJsonEditor, let v = values[key] else { continue }
             if let data = try? v.serializedData(pretty: true),
                let text = String(data: data, encoding: .utf8) {
-                stringStore[key] = text
+                draft.strings[key] = text
             }
         }
     }
@@ -372,14 +379,14 @@ struct MCPInputSchemaForm: View {
             return "This tool's input schema is unavailable because it is not an object."
         }
 
-        let properties: [String: JSONValue]?
+        let properties: [String: JSONValue]
         if let rawProperties = root["properties"] {
             guard case .object(let decodedProperties) = rawProperties else {
                 return "This tool's input schema has malformed properties."
             }
             properties = decodedProperties
         } else {
-            properties = nil
+            properties = [:]
         }
 
         let required: [String]
@@ -394,22 +401,27 @@ struct MCPInputSchemaForm: View {
             required = []
         }
 
-        guard let properties else {
-            return required.isEmpty ? nil : "This tool's input schema cannot identify its required fields."
-        }
-
         for field in required {
-            guard properties[field] != nil else {
-                return "This tool's input schema requires an unknown field ‘\(displayField(field))’."
-            }
             guard values[field] != nil else {
                 return "Enter a value for required field ‘\(displayField(field))’."
             }
         }
 
         for (field, value) in values {
-            guard let propertySchema = properties[field] else {
-                return "Input field ‘\(displayField(field))’ is not accepted by this tool."
+            let propertySchema: JSONValue
+            if let declaredSchema = properties[field] {
+                propertySchema = declaredSchema
+            } else {
+                switch root["additionalProperties"] {
+                case nil, .bool(true)?:
+                    continue
+                case .bool(false)?:
+                    return "Input field ‘\(displayField(field))’ is not accepted by this tool."
+                case .object(let additionalSchema)?:
+                    propertySchema = .object(additionalSchema)
+                default:
+                    return "This tool's input schema has malformed additional properties."
+                }
             }
             if let reason = propertyValidationMessage(value: value, schema: propertySchema) {
                 return "Input ‘\(displayField(field))’ \(reason)."
@@ -431,9 +443,10 @@ struct MCPInputSchemaForm: View {
                 guard case .array(let branches) = union, !branches.isEmpty else {
                     return "has a malformed \(keyword) schema"
                 }
-                return branches.contains { propertyValidationMessage(value: value, schema: $0) == nil }
-                    ? nil
-                    : "does not match the \(keyword) schema"
+                let matches = branches.filter { propertyValidationMessage(value: value, schema: $0) == nil }.count
+                guard keyword == "oneOf" ? matches == 1 : matches > 0 else {
+                    return "does not match the \(keyword) schema"
+                }
             }
         }
 

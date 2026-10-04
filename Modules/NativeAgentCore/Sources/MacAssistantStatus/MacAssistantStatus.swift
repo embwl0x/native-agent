@@ -487,6 +487,8 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
         func templateStatus(_ required: [String]) -> String {
             let states = required.map { statusById[$0] ?? "needs_setup" }
             if !states.isEmpty && states.allSatisfy({ $0 == "ready" }) { return "ready" }
+            if states.contains("failed") { return "failed" }
+            if states.contains("needs_setup") { return "needs_setup" }
             if states.contains("needs_proof") { return "needs_proof" }
             if states.contains("needs_policy") { return "needs_policy" }
             if states.contains("needs_permission") { return "needs_permission" }

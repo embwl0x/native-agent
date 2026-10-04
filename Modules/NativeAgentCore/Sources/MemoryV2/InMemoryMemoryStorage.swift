@@ -39,6 +39,7 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupSto
             if case .string(let s)? = obj["text"] { rec.text = s }
             if case .string(let s)? = obj["content"] { rec.text = s }
             if case .string(let s)? = obj["status"] { rec.status = s }
+            if case .string(let s)? = obj["lifecycle"] { rec.lifecycle = MemoryLifecycle.normalized(s) }
             if case .double(let d)? = obj["confidence"] { rec.confidence = d }
             if case .int(let i)? = obj["confidence"] { rec.confidence = Double(i) }
             if case .string(let s)? = obj["validFrom"] { rec.validFrom = s }
@@ -198,6 +199,24 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupSto
         p.metadata = metadata
         proposals[id] = p
         return p
+    }
+
+    public func supersedeProposal(id: String, by successorId: String) async throws -> Bool {
+        guard id != successorId else { return false }
+        guard var proposal = proposals[id] else { throw MemoryV2Error.recordNotFound }
+        guard proposal.status == "pending" else { return proposal.status == "superseded" }
+        var metadata: [String: JSONValue] = [:]
+        if case .object(let existing)? = proposal.metadata { metadata = existing }
+        let now = MemoryStorage.nowISO8601()
+        metadata["supersededBy"] = .string(successorId)
+        metadata["supersededAt"] = .string(now)
+        proposal.metadata = .object(metadata)
+        proposal.status = "superseded"
+        proposal.resolvedAt = now
+        proposal.rejectionReason = SwiftNativeMemoryV2.supersessionReasonPrefix + successorId
+        tombstones.remove(Self.normalize(proposal.content))
+        proposals[id] = proposal
+        return true
     }
 
     public func countMomentProposals(status: String?) async throws -> Int {

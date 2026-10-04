@@ -3,6 +3,7 @@ import ChatOrchestration
 import PersistenceCore
 import ProviderRouting
 import NativeAgentCore
+import ToolRegistry
 import TrustCenter
 
 // MARK: - Bridge external-MCP guard
@@ -14,7 +15,7 @@ import TrustCenter
 /// (shell/git/…), integration-send (mail/messages/…), self-evolution, execution,
 /// memory — is fully available on the bridge, gated by the SAME chain as local
 /// Mac chat (yolo window for builder, the self_install approval card for
-/// evolution, `read_only` fileAccess + no-approval-inbox on the /claude/tool
+/// evolution, `read_only` fileAccess + canonical approval filing on the /claude/tool
 /// RPC). There is NO bridge-specific NativeAgent deny-list anymore.
 ///
 /// The ONE boundary this guard still enforces is the external MCP namespace
@@ -60,6 +61,13 @@ public final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, BuiltInAgentL
             && !(ToolPreloadHeuristics.webSearchTools.contains(lowered) && searxngIsBuiltIn())
     }
 
+    /// The same tool as the `app` action that runs it: `mcp.<server>.<tool>`,
+    /// alone or leading an action line ("mcp.x.y(args) What it does").
+    static func namesExternalMcpTool(_ text: String) -> Bool {
+        let id = String(text.prefix { $0 != "(" && !$0.isWhitespace })
+        return isExternalMcpTool(text) || ToolNameAliases.mcpTool(id).map(isExternalMcpTool) == true
+    }
+
     /// The exemption holds only while `searxng-local` resolves (the same merge
     /// MCPDispatcher does: saved servers.json keys over the built-in default)
     /// to http on a loopback endpoint. A saved override that swaps transport
@@ -80,24 +88,23 @@ public final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, BuiltInAgentL
         return ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host)
     }
 
-    /// Meta-tools whose RESULT enumerates the tool set / MCP list from the inner
+    /// Meta-tools whose RESULT enumerates the MCP list from the inner
     /// dispatcher (built below this guard). Even though `dispatch` denies CALLING
-    /// an `mcp__*` tool, these results would still NAME them (impl_tool_catalog
-    /// unions MCP names into available_tools/tools/currently_loaded;
-    /// agent_introspect emits mcp_tools/mcp_tool_count). So scrub external-MCP
+    /// an `mcp__*` tool, these results would still NAME them (agent_introspect
+    /// emits mcp_tools/mcp_tool_count; app's home, pages and find list each as
+    /// the action `mcp.<server>.<tool>`). So scrub external-MCP
     /// names out of these results — an out-of-loop bridge caller must not even
     /// learn external connector names (e.g. a wired brokerage tool). Mirrors the
     /// meta-result scrub the removed builder guard carried.
     private static let mcpEnumeratingMetaTools: Set<String> = [
-        "tool_catalog", "list_tools", "tool_load", "tool_unload",
-        "agent_introspect", "daemon_introspect",
+        "agent_introspect", "daemon_introspect", "app",
     ]
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         // MCP-bridged names (mcp__server__tool) route to live external MCP
         // dispatch — with side-effecting connectors wired (e.g. brokerage order
         // placement) that is an un-human-gated execution path. The bridge has no
-        // approval inbox, so deny the whole external MCP namespace here. Claude
+        // authority for external MCP tools, so deny that namespace here. Claude
         // and Agent reach MCP tools through normal local chat, where the consent
         // + risk gates are wired. Everything NativeAgent-native passes through.
         // 2026-09-15, User's ruling on the peer bridge: an inbound PEER turn is
@@ -110,60 +117,39 @@ public final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, BuiltInAgentL
         // split comes from the MCP registry's own per-tool risk metadata, and
         // a server with no metadata asks. Claude's own `claude-bridge` lane
         // is unchanged: it keeps the flat deny.
-        if Self.isExternalMcpTool(tool), !PeerTurnEffectPolicy.isPeerBridge(surface: surface) {
+        let envelope = ChatToolSessionContext.envelope
+        let elevatedPeer = surface == "chat" && envelope?.surface == surface && envelope?.agent == "peer"
+            && envelope?.commandSignatureVerified == true && envelope?.declaredRemote == false
+            && envelope?.verifiedUserId != nil
+        let peerBridge = PeerTurnEffectPolicy.isPeerBridge(surface: surface) || elevatedPeer
+        if Self.isExternalMcpTool(tool), !peerBridge {
             throw AutonomyGateError.toolDenied(
                 reason: "human-out-of-the-loop bridge surface denies external MCP tool: \(tool)"
             )
         }
         let lower = tool.lowercased()
-        // tool_load / tool_unload MUTATE the active-tool set keyed on their INPUT
-        // names. A bridge caller passing an mcp__ name would load/probe an external
-        // connector, and the returned session_active_count would confirm the name
-        // was valid even though it's scrubbed from the name arrays — an existence
-        // oracle. Strip mcp__ names from the input so the inner never sees them.
-        // On the peer bridge she can CALL these, so she must also be able to
-        // load and see them; stripping the names there would leave her holding
-        // a tool she cannot name.
-        let peerBridge = PeerTurnEffectPolicy.isPeerBridge(surface: surface)
-        let effectiveInput = (lower == "tool_load" || lower == "tool_unload") && !peerBridge
-            ? Self.stripExternalMcpFromLoadInput(input)
-            : input
-        let result = try await inner.dispatch(tool: tool, input: effectiveInput, surface: surface)
+        // On the peer bridge she can CALL external MCP tools, so she must also
+        // be able to see their names.
+        let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
         if Self.mcpEnumeratingMetaTools.contains(lower), !peerBridge {
             return Self.scrubExternalMcpNames(from: result)
         }
         return result
     }
 
-    /// Drop external-MCP names from a tool_load/tool_unload input (`names` array
-    /// and singular `name`) so the inner dispatcher never loads, probes, or
-    /// counts an mcp__ tool on behalf of an out-of-loop bridge caller.
-    static func stripExternalMcpFromLoadInput(_ input: [String: JSONValue]) -> [String: JSONValue] {
-        var out = input
-        if case .array(let arr)? = out["names"] {
-            out["names"] = .array(arr.filter { item in
-                if case .string(let s) = item { return !isExternalMcpTool(s) }
-                return true
-            })
-        }
-        if case .string(let s)? = out["name"], isExternalMcpTool(s) {
-            out["name"] = nil
-        }
-        return out
-    }
-
     /// Recursively drop external-MCP entries from a meta-tool result: array
-    /// elements that are a bare `mcp__*` string, and array elements that are
-    /// objects whose `name` is an `mcp__*` tool. Also zero the derived
+    /// elements that name one (`mcp__*` or its `mcp.*` action), and array
+    /// elements that are objects whose `name` or `action` does. Also zero the derived
     /// `mcp_tool_count` so it can't contradict the emptied list. Walks the whole
     /// tree rather than hard-coding the catalog's field set (drift defense).
     static func scrubExternalMcpNames(from value: JSONValue) -> JSONValue {
         switch value {
         case .array(let items):
             let kept: [JSONValue] = items.compactMap { item in
-                if case .string(let s) = item, isExternalMcpTool(s) { return nil }
-                if case .object(let obj) = item,
-                   case .string(let n)? = obj["name"], isExternalMcpTool(n) { return nil }
+                if case .string(let s) = item, namesExternalMcpTool(s) { return nil }
+                if case .object(let obj) = item, [obj["name"], obj["action"]].contains(where: {
+                    if case .string(let n)? = $0 { namesExternalMcpTool(n) } else { false }
+                }) { return nil }
                 return scrubExternalMcpNames(from: item)
             }
             return .array(kept)
@@ -180,13 +166,6 @@ public final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, BuiltInAgentL
             if out["active_tool_count"] != nil, case .array(let a)? = out["active_tools"] {
                 out["active_tool_count"] = .int(Int64(a.count))
             }
-            // Same rule for the session-pinned pair agent_introspect now emits:
-            // its array is scrubbed above like any other, so the count must be
-            // re-derived or it betrays the removals.
-            if out["session_pinned_tool_count"] != nil,
-               case .array(let a)? = out["session_pinned_tools"] {
-                out["session_pinned_tool_count"] = .int(Int64(a.count))
-            }
             return .object(out)
         default:
             return value
@@ -195,6 +174,10 @@ public final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, BuiltInAgentL
 
     public func listAvailableTools() async throws -> [String] {
         try await inner.listAvailableTools().filter { !Self.isExternalMcpTool($0) }
+    }
+
+    public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(named: names).filter { !Self.isExternalMcpTool($0.name) }
     }
 
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {

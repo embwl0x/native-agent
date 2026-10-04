@@ -121,39 +121,11 @@ public struct MacControlBridgeAuditAppendReceipt: Sendable, Equatable {
     }
 }
 
-enum MacControlBridgeAuditEvidenceState: String, Sendable, Equatable {
-    case missing
-    case ready
-    case incompleteEvidence = "incomplete_evidence"
-    case unavailable
-}
-
-/// Read-only observation of the live bridge audit file. `physicalRowCount`
-/// includes damaged rows, so a malformed file cannot masquerade as an empty
-/// healthy feed merely because its parser skipped evidence.
-struct MacControlBridgeAuditReport: Sendable, Equatable {
-    let state: MacControlBridgeAuditEvidenceState
-    let dataRoot: String
-    let path: String
-    let byteCount: Int?
-    let physicalRowCount: Int?
-    let validRowCount: Int?
-    let malformedRowCount: Int
-    let trailingPartialRow: Bool
-    let argv0Counts: [String: Int]
-    let statusCounts: [String: Int]
-    let repeatedZeroEffectReasons: [String: Int]
-    let leads: [String]
-    let error: String?
-}
-
 /// One bounded owner for the bridge's terminal-exec audit evidence. The bridge
-/// remains the producer; this store only makes write outcome, retention, and
-/// read evidence explicit and testable.
+/// remains the producer; this store makes write outcome and retention explicit.
 enum MacControlBridgeAuditStore {
     static let filename = "mac_control_bridge_audit.jsonl"
     static let retentionLimit = 500
-    static let dominantArgv0ShareLead = 0.80
 
     static func path(dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent(filename)
@@ -254,93 +226,4 @@ enum MacControlBridgeAuditStore {
         }
     }
 
-    static func readReport(dataRoot: URL) async -> MacControlBridgeAuditReport {
-        let auditPath = path(dataRoot: dataRoot)
-        guard FileManager.default.fileExists(atPath: auditPath.path) else {
-            return MacControlBridgeAuditReport(
-                state: .missing,
-                dataRoot: dataRoot.path,
-                path: auditPath.path,
-                byteCount: 0,
-                physicalRowCount: 0,
-                validRowCount: 0,
-                malformedRowCount: 0,
-                trailingPartialRow: false,
-                argv0Counts: [:],
-                statusCounts: [:],
-                repeatedZeroEffectReasons: [:],
-                leads: [],
-                error: nil
-            )
-        }
-        do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: auditPath.path)
-            if (attributes[.type] as? FileAttributeType) == .typeDirectory {
-                throw PersistenceCoreError.ioFailure("bridge audit path is a directory")
-            }
-            guard let byteCount = (attributes[.size] as? NSNumber)?.intValue else {
-                throw PersistenceCoreError.ioFailure("bridge audit size is unavailable")
-            }
-            let scan = try await SwiftNativePersistenceCore().readJSONLReporting(auditPath)
-            var argv0Counts: [String: Int] = [:]
-            var statusCounts: [String: Int] = [:]
-            var zeroEffectReasons: [String: Int] = [:]
-            for row in scan.rows {
-                guard case .object(let object) = row else { continue }
-                let argv0 = string(object["argv0"]) ?? "<missing>"
-                let status = string(object["status"]) ?? "<missing>"
-                argv0Counts[argv0, default: 0] += 1
-                statusCounts[status, default: 0] += 1
-                if let reason = string(object["reason"]), reason.hasSuffix(": 0") {
-                    zeroEffectReasons["\(argv0) / \(status) / \(reason)", default: 0] += 1
-                }
-            }
-            let repeats = zeroEffectReasons.filter { $0.value > 1 }
-            var leads: [String] = repeats.keys.sorted().map { "repeated_zero_effect: \($0)" }
-            if let dominant = argv0Counts.max(by: { $0.value < $1.value }),
-               !scan.rows.isEmpty,
-               Double(dominant.value) / Double(scan.rows.count) >= dominantArgv0ShareLead {
-                leads.append("argv0_dominates: \(dominant.key) \(dominant.value)/\(scan.rows.count)")
-            }
-            let evidenceState: MacControlBridgeAuditEvidenceState = scan.report.isClean
-                ? .ready
-                : .incompleteEvidence
-            return MacControlBridgeAuditReport(
-                state: evidenceState,
-                dataRoot: dataRoot.path,
-                path: auditPath.path,
-                byteCount: byteCount,
-                physicalRowCount: scan.report.physicalLineCount,
-                validRowCount: scan.rows.count,
-                malformedRowCount: scan.report.malformedLineCount,
-                trailingPartialRow: scan.report.trailingPartialLine,
-                argv0Counts: argv0Counts,
-                statusCounts: statusCounts,
-                repeatedZeroEffectReasons: repeats,
-                leads: leads.sorted(),
-                error: nil
-            )
-        } catch {
-            return MacControlBridgeAuditReport(
-                state: .unavailable,
-                dataRoot: dataRoot.path,
-                path: auditPath.path,
-                byteCount: nil,
-                physicalRowCount: nil,
-                validRowCount: nil,
-                malformedRowCount: 0,
-                trailingPartialRow: false,
-                argv0Counts: [:],
-                statusCounts: [:],
-                repeatedZeroEffectReasons: [:],
-                leads: [],
-                error: error.localizedDescription
-            )
-        }
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let value)? = value, !value.isEmpty else { return nil }
-        return value
-    }
 }

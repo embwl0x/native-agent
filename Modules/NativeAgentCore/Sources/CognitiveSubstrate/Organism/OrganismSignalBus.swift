@@ -6,7 +6,7 @@ public protocol SomaticSignalObserving: Sendable {
 
 extension OrganismKernel: SomaticSignalObserving {
     public func observe(_ signal: SomaticSignal) async {
-        await ingest(signal)
+        await ingest(signal, movesFeelings: CognitiveSomaticSignalAdapter.movesFeelings(signal.kind))
     }
 }
 

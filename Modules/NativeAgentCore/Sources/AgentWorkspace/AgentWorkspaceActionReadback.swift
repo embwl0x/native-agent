@@ -20,7 +20,7 @@ enum AgentWorkspaceActionReadback {
     private static let computerEffects: Set<String> = ["go", "act", "menu_press"]
     private static let calendarReminderEffects: Set<String> = [
         "mac_calendar_create_event", "mac_calendar_modify_event", "mac_calendar_delete_event",
-        "mac_reminders_create", "mac_reminders_complete", "mac_reminders_delete",
+        "mac_reminders_create", "mac_reminders_update", "mac_reminders_complete", "mac_reminders_delete",
     ]
 
     static func dispatchEffect(tool: String, input: [String: JSONValue], perform: AgentWorkspace.Perform) async throws -> JSONValue {
@@ -57,6 +57,16 @@ enum AgentWorkspaceActionReadback {
         }
         if calendarReminderEffects.contains(tool), status == "completed",
            owner["source"] == .string("eventkit"), !hasError(owner) {
+            if tool.hasPrefix("mac_reminders_"), tool != "mac_reminders_delete", let id = string(owner["reminderId"]) {
+                let arguments: [String: JSONValue] = ["id": .string(id)]
+                let source = AgentWorkspaceLocation.record(tool: "mac_reminders_read", input: arguments, title: "Reminder")
+                do {
+                    let current = try await perform("mac_reminders_read", arguments)
+                    return .init(location: source, result: attaching(current, receipt: receipt))
+                } catch is CancellationError { throw CancellationError() }
+                catch { return .init(location: source, result: unavailable(receipt: receipt,
+                    detail: "The change completed, but the exact reminder could not be read: " + error.localizedDescription + ". Do not repeat the change.")) }
+            }
             let placeID = tool.hasPrefix("mac_calendar_") ? "calendar" : "reminders"
             if let place = AgentWorkspaceActivity.destinations.first(where: { $0.id == placeID }), let reader = place.tool {
                 let source = AgentWorkspaceLocation.record(tool: reader, input: place.input, title: place.title)
@@ -65,7 +75,7 @@ enum AgentWorkspaceActionReadback {
                     var row = object(attaching(current, receipt: receipt))
                     row["workspace_readback_scope"] = .string(placeID == "calendar"
                         ? "Upcoming events, within this reader's normal limit. The action receipt identifies the changed event; absence from this window does not mean the write failed."
-                        : "Reminders due today, within this reader's normal limit. The action receipt identifies the changed reminder; completed or later reminders may not appear here.")
+                        : "Incomplete reminders across all dates, within this reader's normal limit. Completed or deleted reminders may not appear here.")
                     return .init(location: source, result: .object(row))
                 } catch is CancellationError { throw CancellationError() }
                 catch { return .init(location: source, result: unavailable(receipt: receipt, detail: "The change completed, but its current list could not be read: " + error.localizedDescription + ". Do not repeat the change.")) }

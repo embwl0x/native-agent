@@ -282,7 +282,21 @@ extension ChatStore {
     func restorePendingExchanges(for sessionID: String?) -> [String] {
         let session = Self.cleanSessionID(sessionID)
         var restored: [String] = []
-        for record in pendingExchanges.values where record.sessionID == session {
+        let records = pendingExchanges.values.filter { $0.sessionID == session }
+        for record in records {
+            pendingSendArgs[record.correlationID] = resendArgs(for: record.correlationID)
+        }
+        func position(_ record: ChatPendingExchange) -> Int {
+            guard let user = pendingUserMessage(for: record.correlationID) else { return messages.endIndex }
+            return indexOfUserOccurrence(user, in: messages) ?? messages.endIndex
+        }
+        let ordered = records.sorted {
+            let left = position($0), right = position($1)
+            if left != right { return left < right }
+            if $0.updatedAt != $1.updatedAt { return $0.updatedAt < $1.updatedAt }
+            return $0.correlationID < $1.correlationID
+        }
+        for record in ordered {
             if let retained = record.expiredRequest {
                 restoreExpiredExchange(record, retained: retained)
                 continue
@@ -303,16 +317,17 @@ extension ChatStore {
                 // it. Re-create the bubble from the record instead: same
                 // placeholder id, whatever partial text had arrived, still
                 // streaming. Only a terminal receipt closes an exchange.
-                messages.append(
+                insertRestoredPlaceholder(
                     ChatMessage(
                         id: record.placeholderID,
                         role: .assistant,
                         text: record.partialText,
                         isStreaming: true
-                    )
+                    ), for: record
                 )
             }
             pendingICloudPlaceholders[record.correlationID] = record.placeholderID
+            pendingSendArgs[record.correlationID] = resendArgs(for: record.correlationID)
             // The record's own existence is the proof this turn never reached a
             // terminal state, so a live reply for it is welcome again.
             resolvedICloudReplyIds.remove(record.correlationID)
@@ -321,6 +336,16 @@ extension ChatStore {
             restored.append(record.correlationID)
         }
         return restored
+    }
+
+    private func insertRestoredPlaceholder(_ bubble: ChatMessage, for record: ChatPendingExchange) {
+        insertPendingUserIfNeeded(pendingId: record.correlationID, before: nil)
+        if let user = pendingUserMessage(for: record.correlationID),
+           let index = indexOfUserOccurrence(user, in: messages) {
+            messages.insert(bubble, at: messages.index(after: index))
+        } else {
+            messages.append(bubble)
+        }
     }
 
     /// An expired exchange is restored as what it actually is: a finished
@@ -339,13 +364,13 @@ extension ChatStore {
             }
             messages[index] = bubble
         } else {
-            messages.append(
+            insertRestoredPlaceholder(
                 ChatMessage(
                     id: record.placeholderID,
                     role: .assistant,
                     text: retained.message,
                     isStreaming: false
-                )
+                ), for: record
             )
         }
         pendingICloudPlaceholders.removeValue(forKey: record.correlationID)

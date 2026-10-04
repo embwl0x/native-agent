@@ -21,10 +21,8 @@ import PersistenceCore
 // motor-action projection over runs, and every Mac-UI control that drove them.
 //
 // What stayed and why:
-//   • The workflow REGISTRY (this file's protocol): `GET /v1/workflows` still
-//     backs the Capabilities panel's workflow list, and `createWorkflow` is
-//     still the canonical registry writer used by script/smoke_all.sh and
-//     script/test.sh.
+//   • The workflow REGISTRY (this file's protocol) still backs the Capabilities
+//     panel's workflow list. The unused creation path has been removed.
 //   • The APPROVALS half is a different module (ApprovalInbox) writing
 //     data/workflows/approvals/requests.json. It is LIVE — written today — and
 //     was never part of the run engine. Nothing here touches it.
@@ -38,8 +36,7 @@ import PersistenceCore
 //   4. WRITE BACK the merged (unsorted) list to registry.json when it changed,
 //   5. RETURN the merged list sorted by (updatedAt | createdAt | "") DESC.
 //
-// Registry writes are wrapped in the Swift persistence lock so create/list
-// mutations do not trample each other or a concurrent external writer.
+// Registry write-back shares the Swift persistence lock with external writers.
 
 // MARK: - Client protocol
 
@@ -48,8 +45,4 @@ public protocol WorkflowOrchestrationClient: Sendable {
     /// (updatedAt | createdAt | "") DESC. As a side effect, persists the merged
     /// (unsorted) registry back to disk when it differs from the saved bytes.
     func listWorkflows() async throws -> [JSONValue]
-    /// POST /v1/workflows — normalize the request body into a workflow record,
-    /// persist it into the registry (replacing any same-id row), and emit the
-    /// activity + trace side-effects.
-    func createWorkflow(_ body: JSONValue) async throws -> JSONValue
 }

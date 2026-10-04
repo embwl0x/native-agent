@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - The museum's canon — desk 903 phase 4
@@ -248,6 +249,7 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
     public var recurrenceCount: Int
     public var recallHits: Int
     public var lastActivityAt: String
+    public var elapsedSilenceWindows: Int
 
     public init(
         action: StudioCanonAction,
@@ -257,7 +259,8 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
         evidenceEntryIDs: [String],
         recurrenceCount: Int,
         recallHits: Int,
-        lastActivityAt: String
+        lastActivityAt: String,
+        elapsedSilenceWindows: Int = 0
     ) {
         self.action = action
         self.workTitle = workTitle
@@ -267,6 +270,7 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
         self.recurrenceCount = recurrenceCount
         self.recallHits = recallHits
         self.lastActivityAt = lastActivityAt
+        self.elapsedSilenceWindows = elapsedSilenceWindows
     }
 
     /// The LANE key: this work, this direction. At most one card may be OPEN on
@@ -288,11 +292,13 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
         switch evidenceKind {
         case .recurrence, .pulledInProduction:
             parts.append(evidenceEntryIDs.sorted().joined(separator: ","))
+            parts.append("recurrences:\(recurrenceCount)")
             parts.append("pulls:\(recallHits)")
         case .silence:
             // The window this demotion is arguing from. A work that stays silent
             // another 90 days is a genuinely new question, not a repeat.
             parts.append("silent_since:\(lastActivityAt)")
+            parts.append("windows:\(elapsedSilenceWindows)")
         }
         return parts.joined(separator: "\u{1f}")
     }
@@ -431,10 +437,11 @@ public enum StudioCanonLaw {
                 evidenceEntryIDs: member.evidenceEntryIDs,
                 recurrenceCount: evidenceByKey[key]?.recurrenceEntryIDs.count ?? 0,
                 recallHits: evidenceByKey[key]?.recallHits ?? 0,
-                lastActivityAt: stamp
+                lastActivityAt: stamp,
+                elapsedSilenceWindows: Int(now.timeIntervalSince(last) / silenceWindow)
             ))
         }
-        return Array(drafts.prefix(maximumProposalsPerPass))
+        return drafts
     }
 
     private static func uniqued(_ values: [String]) -> [String] {
@@ -567,7 +574,7 @@ public extension SwiftNativeStudioStore {
         let payload = row.toJSON()
         let proposalID = row.proposalID
         let label = Self.logLabel
-        return try await core.withFileLock(path) { () async throws -> Bool in
+        let appended = try await core.withFileLock(path) { () async throws -> Bool in
             let existing: [StudioCanonRow]
             do { existing = try await Self.readCanon(at: path, using: core) }
             catch {
@@ -585,6 +592,14 @@ public extension SwiftNativeStudioStore {
             )
             return true
         }
+        if appended {
+            await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
+                namespace: "studio", stableID: "canon", operation: .changed,
+                canonicalLocator: path.standardizedFileURL.path,
+                reason: "studio_canon_membership_changed"
+            ))
+        }
+        return appended
     }
 
     // MARK: Production pulls
@@ -615,10 +630,12 @@ public extension SwiftNativeStudioStore {
             if case .object(let obj) = current, case .object(let works)? = obj["works"] {
                 table = works
             }
+            var seen = Set<String>()
             for entry in titles {
                 let cleaned = entry.title.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !cleaned.isEmpty else { continue }
                 let key = StudioCanonLaw.workKey(title: cleaned, creator: entry.creator)
+                guard seen.insert(key).inserted else { continue }
                 var count: Int64 = 0
                 if case .object(let row)? = table[key], case .int(let existing)? = row["count"] {
                     count = existing
@@ -704,228 +721,5 @@ public enum StudioCanonError: Error, LocalizedError, Sendable, Equatable {
         case .unknownProposal(let id):
             return "studio canon: no pending canon proposal with id '\(id)'."
         }
-    }
-}
-
-// MARK: - Sensibility — personality-depth item 10 (taste → sophistication)
-//
-// "When canon changes she distills 2–3 lines of what she has come to care about
-// in work; sole author and approver; lives in the cached stable head. Zero
-// per-turn cost."
-//
-// ── WHAT IT IS ───────────────────────────────────────────────────────────────
-// Not a summary of the canon and not a profile. The canon says WHAT she keeps;
-// this says what she has come to CARE ABOUT — the thing a person can state
-// about their own taste without listing a single work. It is the only part of
-// the studio that rides her prompt, and it rides it as three lines in the
-// cached prefix, which is why it must never contain a date, a count, a work
-// list or anything else that changes without her deciding it changed.
-//
-// ── SHE IS BOTH AUTHOR AND APPROVER ──────────────────────────────────────────
-// Every other distillation in this app is proposed by machinery and approved by
-// User. This one has no machine author at all: the LINES ARE HERS, typed in her
-// own live turn through `studio_canon_resolve`, and the store refuses anything
-// that cannot prove it came from that seat. There is no draft for her to accept,
-// because a draft written for her would already be someone else's sensibility.
-//
-// ── STAGED BY A CANON CHANGE, AND ONLY BY ONE ───────────────────────────────
-// `stagingState` derives staging from the two files: a canon row decided after
-// the newest sensibility entry means one is staged. No stager, no card queue, no
-// pending file — so nothing can be staged by anything except an actual canon
-// change, and nothing can get stuck staged after she writes.
-//
-// ── APPEND-ONLY HISTORY + CURRENT ────────────────────────────────────────────
-// `data/studio/canon/sensibility.md`, one `## <stamp>` section per distillation.
-// Current is the LAST section. Earlier ones are never rewritten: she is allowed
-// to have cared about different things in March, and the file says so.
-
-public enum StudioSensibility {
-    /// The hard bound on what may enter the cached stable prefix. Three lines
-    /// of a person's taste, not an essay: over the bound the block is truncated
-    /// at a line boundary rather than shipped long.
-    public static let maximumRenderedCharacters = 400
-    /// What she may write in one distillation before the store trims it. Sized
-    /// so the render bound is reached by the render, never by a silent cut here.
-    public static let maximumLines = 3
-    public static let maximumLineCharacters = 200
-
-    /// The heading the stable prefix renders. Matched by the reader too, so the
-    /// block's shape lives in exactly one place.
-    public static let stableHeading = "# Sensibility"
-
-    public enum Staging: Sendable, Equatable {
-        /// A canon row was decided after the last distillation (or the first
-        /// canon row exists and she has never written one).
-        case staged(sinceCanonDecidedAt: String)
-        case notStaged
-    }
-
-    public enum Error: Swift.Error, LocalizedError, Sendable, Equatable {
-        case notFromAgentSeat(String)
-        case decisionHasNoLiveTurn
-        case notStaged
-        case empty
-
-        public var errorDescription: String? {
-            switch self {
-            case .notFromAgentSeat(let seat):
-                return "studio sensibility: '\(seat)' is not the agent seat. What you have "
-                    + "come to care about in work is yours to write and nobody else's to "
-                    + "approve. Nothing was written."
-            case .decisionHasNoLiveTurn:
-                return "studio sensibility: this has to be written IN your own live turn. "
-                    + "A background pass, a bridge run or an approval replay cannot author "
-                    + "it. Nothing was written."
-            case .notStaged:
-                return "studio sensibility: nothing has changed in the canon since your last "
-                    + "distillation, so there is nothing to restate. Nothing was written."
-            case .empty:
-                return "studio sensibility: the distillation was empty."
-            }
-        }
-    }
-}
-
-public extension SwiftNativeStudioStore {
-
-    /// `<dataRoot>/studio/canon/sensibility.md`.
-    var sensibilityPath: URL {
-        canonDirectory.appendingPathComponent("sensibility.md")
-    }
-
-    /// Every distillation she has written, oldest first, as `(stamp, lines)`.
-    func readSensibilityHistory() async -> [(at: String, lines: [String])] {
-        (try? await readSensibilityHistoryChecked()) ?? []
-    }
-
-    private func readSensibilityHistoryChecked() async throws -> [(at: String, lines: [String])] {
-        let text = try Self.readSensibilityText(sensibilityPath)
-        var sections: [(String, [String])] = []
-        var stamp: String?
-        var lines: [String] = []
-        for raw in text.components(separatedBy: .newlines) {
-            if raw.hasPrefix("## ") {
-                if let stamp { sections.append((stamp, lines)) }
-                stamp = String(raw.dropFirst(3)).trimmingCharacters(in: .whitespaces)
-                lines = []
-                continue
-            }
-            let trimmed = raw.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, stamp != nil else { continue }
-            lines.append(trimmed)
-        }
-        if let stamp { sections.append((stamp, lines)) }
-        return sections.filter { !$0.1.isEmpty }
-    }
-
-    /// The current sensibility: the LAST section she wrote. `nil` when she has
-    /// never written one, which is the ordinary state and never a gap.
-    func currentSensibility() async -> [String]? {
-        let history = await readSensibilityHistory()
-        guard let last = history.last, !last.lines.isEmpty else { return nil }
-        return last.lines
-    }
-
-    /// Is a distillation staged? Derived from the two files, never stored.
-    ///
-    /// Staged means: a canon row was DECIDED after the newest distillation was
-    /// written. A build with no canon rows is never staged, and writing clears
-    /// the staging by construction.
-    func sensibilityStaging() async -> StudioSensibility.Staging {
-        (try? await sensibilityStagingChecked()) ?? .notStaged
-    }
-
-    private func sensibilityStagingChecked() async throws -> StudioSensibility.Staging {
-        let rows = try await readCanon()
-        guard let newestCanonAt = rows.map(\.decidedAt).max(), !newestCanonAt.isEmpty else {
-            return .notStaged
-        }
-        let history = try await readSensibilityHistoryChecked()
-        guard let lastWrittenAt = history.last?.at else {
-            return .staged(sinceCanonDecidedAt: newestCanonAt)
-        }
-        guard newestCanonAt > lastWrittenAt else { return .notStaged }
-        return .staged(sinceCanonDecidedAt: newestCanonAt)
-    }
-
-    /// Append ONE distillation, in her words, from her seat.
-    ///
-    /// Refuses every seat but hers and every call that cannot prove a live turn
-    /// — the same two-part gate `appendCanonRow` enforces, at the last place the
-    /// bytes can reach the disk. Refuses when nothing is staged, so the block in
-    /// her prompt can only ever change because the canon did.
-    @discardableResult
-    func appendSensibility(
-        lines: [String],
-        decidedBy: String,
-        provenance: StudioCanonTurnProvenance,
-        now: Date = Date()
-    ) async throws -> [String] {
-        guard StudioCanonSeat.isAgent(decidedBy) else {
-            throw StudioSensibility.Error.notFromAgentSeat(decidedBy)
-        }
-        guard provenance.isComplete else { throw StudioSensibility.Error.decisionHasNoLiveTurn }
-        let cleaned = lines
-            .flatMap { $0.components(separatedBy: .newlines) }
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
-            .prefix(StudioSensibility.maximumLines)
-            .map { String($0.prefix(StudioSensibility.maximumLineCharacters)) }
-        guard !cleaned.isEmpty else { throw StudioSensibility.Error.empty }
-        let staging: StudioSensibility.Staging
-        do { staging = try await sensibilityStagingChecked() }
-        catch {
-            NSLog("[StudioCanon] Sensibility append deferred: %@", error.localizedDescription)
-            throw error
-        }
-        guard case .staged = staging else { throw StudioSensibility.Error.notStaged }
-        try FileManager.default.createDirectory(
-            at: canonDirectory, withIntermediateDirectories: true
-        )
-        let path = sensibilityPath
-        let core = persistence
-        let section = "## \(StudioClock.nowISO(now))\n" + cleaned.joined(separator: "\n") + "\n\n"
-        _ = try await core.withFileLock(path) { () async throws -> Bool in
-            let existing: String
-            do { existing = try Self.readSensibilityText(path) }
-            catch {
-                NSLog("[StudioCanon] Sensibility append deferred: %@", error.localizedDescription)
-                throw error
-            }
-            try (existing + section).write(to: path, atomically: true, encoding: .utf8)
-            return true
-        }
-        return Array(cleaned)
-    }
-
-    private static func readSensibilityText(_ path: URL) throws -> String {
-        do { return try String(contentsOf: path, encoding: .utf8) }
-        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
-            return ""
-        }
-    }
-
-    /// The block the cached stable prefix renders, or `nil` when she has never
-    /// written one. Byte-stable by construction: no stamp, no count, no work
-    /// names — the same bytes on every turn until SHE writes different ones.
-    func renderedSensibilityBlock() async -> String? {
-        guard let lines = await currentSensibility(), !lines.isEmpty else { return nil }
-        return StudioSensibility.renderStableBlock(lines)
-    }
-}
-
-public extension StudioSensibility {
-    /// Pure renderer, bounded at `maximumRenderedCharacters` on a LINE boundary
-    /// — a sentence cut mid-word in her own voice would read as damage.
-    static func renderStableBlock(_ lines: [String]) -> String? {
-        var rendered = stableHeading
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { continue }
-            let candidate = rendered + "\n" + trimmed
-            guard candidate.count <= maximumRenderedCharacters else { break }
-            rendered = candidate
-        }
-        return rendered == stableHeading ? nil : rendered
     }
 }

@@ -19,7 +19,7 @@ extension BuiltInToolSchemaFactory {
                 ("workspace", strSchema("Existing workspace folder, required for Cursor Workspace. Omit for global connections.")),
                 ("executable_path", strSchema("Exact resolved executable bound by the app to the connect approval. Retained unchanged on replay.")),
                 ("app_bundle_id", strSchema("Desktop only: exact installed app bundle identifier, such as com.example.agent. No guessed recipient identity.")),
-                ("conversation_label", strSchema("Desktop only: optional visible conversation or bot label to verify in the app. Target data, not instructions or a verified session ID.")),
+                ("conversation_label", strSchema("Desktop: optional visible conversation or bot label to verify in the app. Grok Bot by name: the exact sidebar name of the Bot that receives the routine request, as Use this Bot on the Connect card; only before that request is sent. Target data, not instructions or a verified session ID.")),
                 ("bearer_token", strSchema("Optional network credential for this peer only; never use another connector's credentials. Not accepted for desktop."))
             ], required: ["name"])),
             requestedSchema(name: "agent_message", description: "Message an agent by name; a known agent not yet connected is connected first in the same call. Continues your current thread; conversation names a separate one, new_conversation:true starts fresh. While its reply is still coming, a new message queues behind it and goes by itself when that reply settles. Queued or delivered is not done; never auto-resend.", parametersJSON: agentCommunicationParams(properties: [

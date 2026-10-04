@@ -73,12 +73,6 @@ public struct ActivityWorkspaceObserverSource: @unchecked Sendable {
 /// **It owns no span logic.** Every span decision lives in `ActivitySpanEngine`,
 /// which this class drives with `ActivityInputEvent`s and whose
 /// `ActivityStoreCommand`s it forwards verbatim to `ActivitySpanStore.apply`.
-/// That is deliberate and it is the whole verification story: the machine this
-/// was built on has a locked screen, so the live path cannot be exercised —
-/// but `activity-probe simulate` drives the SAME engine through the SAME store,
-/// so what the simulation proves, the live path inherits. A parallel copy of the
-/// state machine here would make every simulation test worthless.
-///
 /// What DOES live here: threading, AX, and the platform signals.
 ///
 ///  1. A dedicated `Thread` with its own `CFRunLoop` owns every `AXUIElement`
@@ -610,7 +604,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// startup/tick requests coalesce into one run.
     private func scheduleRetentionIfDue() {
         let policy = withLock { () -> ActivityPolicy? in
-            guard !_retentionRunning, _captureEnabled else { return nil }
+            guard !_retentionRunning else { return nil }
             _retentionRunning = true
             return _lastKnownPolicy
         }
@@ -705,11 +699,7 @@ public final class ActivityWatcher: @unchecked Sendable {
             // closed under a policy that forbids capture (the engine's
             // updatePolicy emits the close), then remove every event source.
             if installed {
-                onCaptureThread { [weak self] in
-                    guard let self else { return }
-                    let commands = self.engine.updatePolicy(policy, at: self.safeNow())
-                    self.emit(commands)
-                }
+                applyPolicyOnCaptureThread()
                 Task { [weak self] in await self?.stopForPolicyDisable() }
             } else {
                 applyPolicyToEngineDirectly(policy)
@@ -718,22 +708,14 @@ public final class ActivityWatcher: @unchecked Sendable {
             // ON, from cold. Seed the engine before the observers exist so the
             // first activation is evaluated against the new policy.
             if stopPending {
-                onCaptureThread { [weak self] in
-                    guard let self else { return }
-                    let commands = self.engine.updatePolicy(policy, at: self.safeNow())
-                    self.emit(commands)
-                }
+                applyPolicyOnCaptureThread()
             } else {
                 applyPolicyToEngineDirectly(policy)
                 Task { [weak self] in _ = await self?.startBounded() }
             }
         case (true, true):
             if installed {
-                onCaptureThread { [weak self] in
-                    guard let self else { return }
-                    let commands = self.engine.updatePolicy(policy, at: self.safeNow())
-                    self.emit(commands)
-                }
+                applyPolicyOnCaptureThread()
             } else {
                 applyPolicyToEngineDirectly(policy)
                 Task { [weak self] in _ = await self?.startBounded() }
@@ -747,7 +729,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// `updatePolicy` makes the in-app Trust Center toggle an instant pause, but
     /// it is only reached when something in THIS process calls it. A running
     /// watcher was blind to every other writer of `activity_policy.json`: a live
-    /// run disabled capture with `activity-probe policy --disable` and the
+    /// run disabled capture through an out-of-band policy write and the
     /// watcher kept recording, adding 4 more rows over the next 40 seconds.
     ///
     /// **Worst-case bound: an out-of-band disable takes effect within one tick**
@@ -843,6 +825,18 @@ public final class ActivityWatcher: @unchecked Sendable {
     private func applyPolicyToEngineDirectly(_ policy: ActivityPolicy) {
         let commands = engine.updatePolicy(policy, at: clock.wallNow())
         emit(commands)
+    }
+
+    private func applyPolicyOnCaptureThread() {
+        let apply: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            // A queued UI update must not restore a policy superseded by a poll.
+            let policy = self.withLock { self._lastKnownPolicy }
+            self.emit(self.engine.updatePolicy(policy, at: self.safeNow()))
+        }
+        let runLoop = withLock { _runLoop }
+        if let runLoop, CFRunLoopGetCurrent() === runLoop { apply() }
+        else { onCaptureThread(apply) }
     }
 
     public func status() -> Status {
@@ -1430,7 +1424,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         // a second process, a hand edit, a restore) is otherwise invisible to a
         // watcher that is already running. One `stat`; decodes only on change.
         if pollPolicySource(), !isCaptureEnabled {
-            // Capture just went off. `updatePolicy` has already enqueued the
+            // Capture just went off. `updatePolicy` has already applied the
             // engine close and the teardown; nothing further belongs on this
             // tick, least of all a heartbeat that would extend the row.
             return

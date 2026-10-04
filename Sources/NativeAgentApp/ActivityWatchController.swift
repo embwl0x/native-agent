@@ -65,6 +65,11 @@ enum ActivityCaptureIssueNotificationPresentation {
 @MainActor
 @Observable
 final class ActivityWatchController {
+    enum DeletionResult: Sendable {
+        case deleted(rows: Int)
+        case failed(message: String)
+    }
+
     static let shared = ActivityWatchController(
         criticalIssueNotifier: { title, body in
             NativeAgentNotifications.post(title: title, body: body)
@@ -111,6 +116,8 @@ final class ActivityWatchController {
     private let criticalIssueNotifier: @MainActor (String, String) -> Void
     private var spanStore: ActivitySpanStore?
     private var watcher: ActivityWatcher?
+    private var retentionTask: Task<Void, Never>?
+    private var retentionRunning = false
 
     init(
         dataRoot: URL = NativeAgentPaths.dataRoot,
@@ -148,6 +155,15 @@ final class ActivityWatchController {
     /// all, so the disk carries no activity store until consent exists. The
     /// inner gate protects the observers; this one protects the filesystem.
     func startAtLaunch() {
+        if retentionTask == nil {
+            retentionTask = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    if let self, !self.policy.captureEnabled { await self.runRetention() }
+                    do { try await Task.sleep(for: .seconds(ActivityRetentionRunner.defaultInterval)) }
+                    catch { return }
+                }
+            }
+        }
         guard policy.captureEnabled else {
             // Nothing to start, and deliberately nothing constructed either:
             // a fresh install with capture off never even opens the SQLite
@@ -167,6 +183,8 @@ final class ActivityWatchController {
     }
 
     func shutdown() async {
+        retentionTask?.cancel()
+        retentionTask = nil
         await watcher?.stop()
         refreshCapturingFlag()
     }
@@ -180,6 +198,8 @@ final class ActivityWatchController {
     /// stop run independently; UI state no longer matters once termination has
     /// begun.
     func makeTerminationDrain() -> Task<Void, Never> {
+        retentionTask?.cancel()
+        retentionTask = nil
         let watcher = watcher
         return Task.detached(priority: .utility) {
             await watcher?.stop()
@@ -237,7 +257,7 @@ final class ActivityWatchController {
 
     /// The store, but ONLY if it already exists on disk.
     ///
-    /// `try? ActivitySpanStore(dataRoot:)` is not a read — it CREATES the
+    /// `ActivitySpanStore(dataRoot:)` is not a read — it CREATES the
     /// directory and the SQLite file. Using it to answer "is there anything to
     /// purge?" would therefore manufacture the very thing it is asking about:
     /// hitting Exclude or Wipe on a fresh install, with capture never once
@@ -245,12 +265,18 @@ final class ActivityWatchController {
     /// the promise `startAtLaunch` makes — no activity store until consent
     /// exists — and it is exactly the sort of file a privacy-minded user would
     /// find later and reasonably assume had been recording.
-    private func existingStore() -> ActivitySpanStore? {
+    private func existingStore() throws -> ActivitySpanStore? {
         if let spanStore { return spanStore }
-        guard FileManager.default.fileExists(
-            atPath: ActivityWatchPaths.databaseURL(dataRoot: dataRoot).path
-        ) else { return nil }
-        let store = try? ActivitySpanStore(dataRoot: dataRoot)
+        do {
+            _ = try FileManager.default.attributesOfItem(
+                atPath: ActivityWatchPaths.databaseURL(dataRoot: dataRoot).path
+            )
+        } catch CocoaError.fileReadNoSuchFile {
+            return nil
+        } catch CocoaError.fileNoSuchFile {
+            return nil
+        }
+        let store = try ActivitySpanStore(dataRoot: dataRoot)
         spanStore = store
         return store
     }
@@ -287,6 +313,7 @@ final class ActivityWatchController {
         // Lifecycle invalidations keep this exact after asynchronous teardown;
         // this immediate read covers the mutation edge itself without a timer.
         refreshCapturingFlag()
+        if !next.captureEnabled { Task { await runRetention() } }
         return true
     }
 
@@ -336,6 +363,7 @@ final class ActivityWatchController {
     /// VACUUMs, because rows deleted but still legible in the `-wal` sidecar
     /// are not deleted, they are hidden.
     func addExclusion(bundleID: String) async {
+        lastPurgedRowCount = nil
         let trimmed = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         var next = policy
@@ -343,14 +371,9 @@ final class ActivityWatchController {
         // Never purge rows unless the exclusion first became durable.
         guard apply(next) else { return }
 
-        guard let store = existingStore() else {
-            // Nothing on disk to purge — capture has never been on, so no store
-            // was ever created. Not an error, and NOT a reason to create one.
-            lastPurgedRowCount = 0
-            return
-        }
         do {
-            lastPurgedRowCount = try await store.purge(bundleID: trimmed)
+            // An absent store has no rows; an unavailable store throws.
+            lastPurgedRowCount = try await existingStore()?.purge(bundleID: trimmed) ?? 0
         } catch {
             recordIssue("Excluded \(trimmed), but could not delete its recorded rows: \(error.localizedDescription)", severity: .critical)
         }
@@ -376,26 +399,31 @@ final class ActivityWatchController {
     /// Deletes every recorded span. The policy survives — this is "forget what
     /// you saw", not "reset my settings", and conflating the two would silently
     /// re-enable capture defaults the user had changed.
-    func wipeAll() async {
-        guard let store = existingStore() else {
-            // Nothing recorded, nothing to forget.
-            lastPurgedRowCount = 0
-            return
-        }
+    @discardableResult
+    func wipeAll() async -> DeletionResult {
+        lastPurgedRowCount = nil
         do {
-            lastPurgedRowCount = try await store.wipeAll()
+            let removed = try await existingStore()?.wipeAll() ?? 0
+            lastPurgedRowCount = removed
+            return .deleted(rows: removed)
         } catch {
-            recordIssue("Wipe failed: \(error.localizedDescription)", severity: .critical)
+            let message = "Wipe failed: \(error.localizedDescription)"
+            recordIssue(message, severity: .critical)
+            return .failed(message: message)
         }
     }
 
     func runRetention() async {
-        guard let store = spanStore else { return }
+        guard !retentionRunning else { return }
+        retentionRunning = true
+        defer { retentionRunning = false }
         let runner = ActivityRetentionRunner(dataRoot: dataRoot)
         do {
+            let current = try policyStore.loadChecked()
+            guard let store = try existingStore() else { return }
             _ = try await runner.runIfDue(
                 store: store,
-                policy: policy,
+                policy: current,
                 now: Date().timeIntervalSince1970
             )
         } catch {

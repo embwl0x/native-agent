@@ -1,4 +1,5 @@
 import SwiftUI
+import ToolRegistry
 import Foundation
 import ChatOrchestration
 import MacControl
@@ -49,61 +50,38 @@ enum ToolPillPresentation {
     static func outcome(toolName: String = "", result: String? = nil, ok: Bool? = nil) -> Outcome {
         guard let result else { return ok == nil ? .pending : .unknown }
         guard let value = try? JSONValue.parse(Data(result.utf8)) else { return .unknown }
-        // A Mac action carries its own operation record. That state is what the
-        // effect actually is; the transport `ok` bit is only how the answer
-        // travelled. An unverified effect stays unconfirmed so the reader does
-        // not repeat an action that may already have landed.
-        if let projected = MacControlReceiptOutcome.projecting(envelope: value) {
-            switch projected {
-            case .succeeded: return .succeeded
-            case .failed: return .failed
-            case .refused: return .refused
-            case .running: return .pending
-            case .cancelled, .timedOut, .effectUnconfirmed: return .unknown
+        let classification = ChatToolOutcome.exactResultClass(value)
+        let macOutcome = MacControlReceiptOutcome.projecting(envelope: value)
+        let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
+        let status = fields["status"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let error = fields["error"]?.stringValue
+        switch classification {
+        case .succeeded:
+            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
+            if fields["partial"] == .bool(true) { return .partial }
+            return .succeeded
+        case .failed:
+            if macOutcome == .refused || ["refused", "denied", "rejected"].contains(status ?? "") { return .refused }
+            if status == "failed", let error, error.hasPrefix("tool denied: "), fields["reason"] == .string(error) {
+                return .refused
             }
-        }
-        guard case .object(let fields) = value else {
-            // read_file returns the file text directly; unknown tools have no
-            // registered scalar completion contract.
-            if toolName == "read_file", case .string = value { return .succeeded }
+            if status == "failed", error == "streamClosed", fields["reason"] == .string("streamClosed") {
+                return .connectionFailed
+            }
+            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
+            return .failed
+        case .cancelled, .timeout: return .unknown
+        case .unknown:
+            if fields["streamClosed"] == .bool(true) { return .connectionFailed }
+            if ChatToolOutcome.isWaitingInteraction(value) { return .needsYou }
+            if status == "partial" || fields["partial"] == .bool(true) { return .partial }
+            if status == "running" || macOutcome == .running { return .pending }
             return .unknown
         }
-        let status = fields["status"]?.stringValue?.lowercased()
-        let error = fields["error"]?.stringValue
-        // Before every failure test: a raised need is a question, and it fell
-        // through to "Outcome unknown" until 2026-09-14.
-        if ChatToolOutcome.isWaitingInteraction(value) { return .needsYou }
-        if status == "partial" || fields["partial"] == .bool(true) { return .partial }
-        if ["refused", "denied", "rejected"].contains(status ?? "") { return .refused }
-        if status == "failed", let error, error.hasPrefix("tool denied: "), fields["reason"] == .string(error) {
-            return .refused
-        }
-        if status == "failed", error == "streamClosed", fields["reason"] == .string("streamClosed") {
-            return .connectionFailed
-        }
-        if fields["streamClosed"] == .bool(true) { return .connectionFailed }
-        if fields["isError"] == .bool(true) || fields["ok"] == .bool(false)
-            || fields["success"] == .bool(false)
-            || ["failed", "failure", "error"].contains(status ?? "") { return .failed }
-        if let errorValue = fields["error"], errorValue != .null { return .failed }
-        if status == "running" { return .pending }
-        if fields["dryRun"] == .bool(true) || fields["dry_run"] == .bool(true) { return .unknown }
-        if ["complete", "completed", "delivered", "done", "ok", "passed", "succeeded", "success"].contains(status ?? "") {
-            return .succeeded
-        }
-        return .unknown
     }
 
     static func title(_ name: String) -> String {
-        ["read": "Read a document", "apply_patch": "Edit files", "read_file": "Read a file",
-         "codex_message": "Send a coding request", "restart_app": "Restart the app",
-         "write_file": "Write a file", "git": "Work with version history", "install_app": "Install the app",
-         "shell": "Run a command", "list_dir": "List files", "image_generate": "Create an image",
-         "tool_load": "Enable a tool", "bash": "Run a command", "claude_message": "Send a helper request",
-         "studio_journal": "Write a working note", "tool_catalog": "Find available tools",
-         "omp_message": "Send a helper request", "tool_unload": "Release a tool",
-         "invoke_codex": "Ask a coding helper", "read_skill": "Read a skill",
-         "desk_breakdown": "Break down a task", "mcp__notes__search": "Search notes"][name] ?? name
+        ToolActivityPresentation.title(name)
     }
 
     static func target(_ input: String?) -> String {
@@ -240,7 +218,11 @@ struct ToolPillView: View {
     }
 
     private var meta: ChatMessageMetadata? { message.metadata }
-    private var toolName: String { meta?.toolName ?? "tool" }
+    /// An app call reads as the action it ran, over that action's args.
+    private var call: (name: String, inputJSON: String?) {
+        ToolNameAliases.shown(meta?.toolName ?? "tool", inputJSON: meta?.inputJSON)
+    }
+    private var toolName: String { call.name }
     private var outcome: ToolPillPresentation.Outcome {
         ToolPillPresentation.outcome(toolName: toolName, result: meta?.resultSummary, ok: meta?.ok)
     }
@@ -248,11 +230,12 @@ struct ToolPillView: View {
     private var resultSummary: String { meta?.resultSummary ?? "" }
     private var title: String { ToolPillPresentation.title(toolName) }
     private var target: String {
-        ToolPillPresentation.boundedLine(ToolPillPresentation.target(meta?.inputJSON), limit: 180)
+        ToolPillPresentation.boundedLine(ToolPillPresentation.target(call.inputJSON), limit: 180)
     }
     private var summary: String {
         ToolPillPresentation.boundedLine(
-            ToolPillPresentation.summary(outcome: outcome, input: meta?.inputJSON, result: meta?.resultSummary), limit: 240)
+            ToolPillPresentation.summary(outcome: outcome, input: call.inputJSON, result: meta?.resultSummary),
+            limit: 240)
     }
     private var textSize: CGFloat { typeSize.isAccessibilitySize ? 19 : 13 }
 
@@ -302,7 +285,7 @@ struct ToolPillView: View {
             // Expanded detail card
             if expanded {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Tool: \(toolName)")
+                    Text(title)
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
                     if let json = meta?.inputJSON {

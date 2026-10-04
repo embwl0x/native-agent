@@ -19,6 +19,7 @@ struct QueuedChatSend: Identifiable, Codable {
     /// Present once handoff starts; replay retains the exact signed payload.
     var preparedMessage: BridgeMessage? = nil
     var placeholderID: UUID? = nil
+    var userMessageID: UUID? = nil
 
     var preview: String {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -54,10 +55,17 @@ final class ChatStore: ObservableObject {
     }
     @Published var isLoading = false {
         didSet {
+            if !isLoading { loadingPlaceholderID = nil }
             if oldValue && !isLoading {
                 scheduleQueuedSendDrain()
             }
         }
+    }
+    var loadingPlaceholderID: UUID?
+
+    func releaseLoading(for placeholderID: UUID) {
+        guard loadingPlaceholderID == placeholderID else { return }
+        isLoading = false
     }
     @Published var isSwitchingSession = false
     @Published var isPollingFallback = false   // true after 10s waiting — drives "still waiting…" hint
@@ -115,6 +123,8 @@ final class ChatStore: ObservableObject {
     @Published var pausedQueueSessionKeys: Set<String> = [] {
         didSet { persistPausedQueueSessionKeys() }
     }
+    /// Transport failures wait for recovery; user pauses survive it and launch.
+    @Published var transportPausedQueueSessionKeys: Set<String> = []
     /// 2026-09-06: the pause set was in-memory while the queue it pauses is
     /// persisted, so a relaunch drained (and sent) messages the user had
     /// explicitly stopped. Persist it alongside the queue.
@@ -400,7 +410,7 @@ final class ChatStore: ObservableObject {
     var macPublishedMessageIDs: Set<UUID> = []
     /// 2026-09-06: assistant ids removed locally for a regenerate. They are
     /// deliberately absent until the Mac's replacement lands, which is exactly
-    /// the shape `newestMacAssistantReply`'s fallback reads as "the awaited
+    /// the shape snapshot reply selection reads as "the awaited
     /// reply" — a stale snapshot would otherwise complete the regeneration
     /// with the answer being replaced.
     var regeneratedAwayAssistantIDs: Set<UUID> = []
@@ -471,14 +481,15 @@ final class ChatStore: ObservableObject {
     }
 
     var isSelectedQueuePaused: Bool {
-        pausedQueueSessionKeys.contains(queueSessionKey(selectedSessionID))
+        let key = queueSessionKey(selectedSessionID)
+        return pausedQueueSessionKeys.contains(key) || transportPausedQueueSessionKeys.contains(key)
     }
 
     // 2026-09-06: Mac snapshots cannot retire an unaccepted local handoff.
     var retainedSendMessageIDs: Set<UUID> {
         let key = queueSessionKey(selectedSessionID)
         return Set(queuedSends.filter { queueSessionKey($0.sessionID) == key }
-            .flatMap { [$0.id, $0.placeholderID].compactMap { $0 } })
+            .flatMap { [$0.id, $0.placeholderID, $0.userMessageID].compactMap { $0 } })
     }
 
     /// B2: bumped when a straggler reply lands after its bubble already timed

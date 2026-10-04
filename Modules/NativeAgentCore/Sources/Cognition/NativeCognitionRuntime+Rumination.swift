@@ -49,8 +49,8 @@ extension NativeCognitionRuntime {
     /// external, so neither source outranks the other.
     ///
     /// A moment leaves this set when it heals (a warm moment later in the same
-    /// conversation) or when it ages past three days, and LEAVING the set is
-    /// what mints the relief — the same door the Desk's close already uses.
+    /// conversation) or when it ages past three days. A complete owner read
+    /// confirms that release; exclusion by the window never does.
     private static let maximumMomentRuminations = 4
 
     /// Ask the clock, claim the window, read off the turn path. Cheap enough to
@@ -69,16 +69,15 @@ extension NativeCognitionRuntime {
     }
 
     /// Map canonical Desk rows to the payload-free shape the lane consumes, and
-    /// push. The push is also the heal: anything that has left this set has
-    /// closed, and the substrate stages one relief for whatever was itching.
+    /// push, with canonical terminal handles as confirmed closures.
     func applyDeskRuminations(from state: DeskState) async {
         guard !isFlushedForTermination else { return }
         let now = self.now()
         let items: [CognitiveSubstrate.CognitiveExternalRumination] = state.items
             .filter { item in
-                item.origin == .agent
+                item.isPursuit
                     && !item.status.isTerminal
-                    && !Self.deskItemIsDeferred(item, at: now)
+                    && !DeskSequencing.isDeferred(item, now: now)
             }
             .compactMap { item in
                 let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -104,7 +103,15 @@ extension NativeCognitionRuntime {
             .prefix(Self.maximumDeskRuminations)
             .map { $0 }
 
-        await substrate.setExternalRuminations(items + momentRuminations(at: now), at: now)
+        let priorIDs = await substrate.externalRuminationIDs()
+        let moments = await momentRuminations(at: now, priorIDs: priorIDs)
+        let closedIDs = Set(state.items.filter { $0.status.isTerminal }.map(\.handle))
+            .union(moments.closedIDs)
+        await substrate.setExternalRuminations(
+            (items + moments.items).sorted {
+                if $0.lastTouchedAt != $1.lastTouchedAt { return $0.lastTouchedAt < $1.lastTouchedAt }
+                return $0.id < $1.id
+            }, confirmedClosedIDs: closedIDs, at: now)
         // The heal rides the same drain the seed lane uses.
         await drainRuminationReleasesIntoSubstrate()
     }
@@ -113,33 +120,34 @@ extension NativeCognitionRuntime {
     /// rule (admission, healing, window) and is pure; this only reads her own
     /// store and maps into the payload-free shape. A read failure yields an
     /// empty half, never a fabricated one — and never disturbs the Desk half.
-    func momentRuminations(at now: Date) async -> [CognitiveSubstrate.CognitiveExternalRumination] {
-        guard let moments = try? await SwiftNativeMemoryV2.shared.listMemory(
+    func momentRuminations(
+        at now: Date, priorIDs: Set<String>
+    ) async -> (items: [CognitiveSubstrate.CognitiveExternalRumination], closedIDs: Set<String>) {
+        guard let moments = try? await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).listMemory(
             kind: MemoryMoments.kind
-        ) else { return [] }
-        return MemoryMoments.ruminationCandidates(
+        ) else { return ([], []) }
+        let candidates = MemoryMoments.ruminationCandidates(
             from: moments,
             now: now,
-            limit: Self.maximumMomentRuminations
-        ).map { candidate in
-            CognitiveSubstrate.CognitiveExternalRumination(
+            limit: moments.count
+        )
+        let currentIDs = Set(candidates.map(\.id))
+        let closedIDs = Set(priorIDs.filter { $0.hasPrefix("moment:") }).subtracting(currentIDs)
+        let recordsByID = Dictionary(uniqueKeysWithValues: moments.map { ("moment:" + $0.id, $0) })
+        let items = candidates.compactMap { candidate -> CognitiveSubstrate.CognitiveExternalRumination? in
+            guard let record = recordsByID[candidate.id],
+                  let disclosure = MemoryRecordDisclosurePolicy.classify(record) else { return nil }
+            return CognitiveSubstrate.CognitiveExternalRumination(
                 id: candidate.id,
                 label: candidate.label,
-                lastTouchedAt: candidate.occurredAt
+                lastTouchedAt: candidate.occurredAt,
+                permittedSurfaces: disclosure.permittedSurfaces
             )
-        }
+        }.prefix(Self.maximumMomentRuminations)
+        return (Array(items), closedIDs)
     }
 
-    /// An item parked until a future day is not an open loop.
-    private static func deskItemIsDeferred(_ item: DeskItem, at now: Date) -> Bool {
-        guard let raw = item.deferUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else { return false }
-        guard let until = deskDate(raw) else { return false }
-        return until > now
-    }
-
-    /// Desk stamps are ISO-8601, with or without fractional seconds, and
-    /// `deferUntil` may be a bare `yyyy-MM-dd` day.
+    /// Desk touch stamps are ISO-8601, with or without fractional seconds.
     static func deskDate(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }

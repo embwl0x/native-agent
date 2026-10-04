@@ -56,18 +56,6 @@ struct CapabilityUpdateCheck: Codable, Hashable {
 
 typealias PersonalityGrowthSummary = EngineRuntime.PersonalityGrowthSummary
 
-struct NativePowerSurface: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String
-    var status: String
-    var detail: String?
-}
-
-struct NativePowerSummary: Codable, Hashable {
-    var surfaces: [NativePowerSurface]
-    var createdAt: String?
-}
-
 struct NativeActionRegistry: Codable, Hashable {
     var status: String
     var actions: [NativeActionRecord]

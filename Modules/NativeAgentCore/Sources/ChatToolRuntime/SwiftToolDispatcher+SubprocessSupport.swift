@@ -227,19 +227,22 @@ extension SwiftToolDispatcher {
                     discardingLine = true
                 }
             }
-            if storage.count >= cap { _truncated = true; return lines }
-            let room = cap - storage.count
-            if chunk.count <= room {
-                storage.append(chunk)
-            } else {
-                storage.append(chunk.prefix(room))
+            storage.append(chunk)
+            if storage.count > cap {
+                let headEnd = storage.index(storage.startIndex, offsetBy: cap / 2)
+                let tailStart = storage.index(storage.endIndex, offsetBy: -(cap - cap / 2))
+                storage.removeSubrange(headEnd..<tailStart)
                 _truncated = true
             }
             return lines
         }
         var data: Data {
             lock.lock(); defer { lock.unlock() }
-            return storage
+            guard _truncated else { return storage }
+            var output = Data(storage.prefix(cap / 2))
+            output.append(Data("\n[output truncated; head and tail retained]\n".utf8))
+            output.append(storage.suffix(cap - cap / 2))
+            return output
         }
         var truncated: Bool {
             lock.lock(); defer { lock.unlock() }

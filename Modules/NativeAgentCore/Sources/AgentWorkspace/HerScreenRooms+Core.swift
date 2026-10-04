@@ -36,7 +36,7 @@ extension HerScreen {
 
     /// Home's PLACES row for this slice's families; the other slices' families
     /// sit on their own rows (and open here by name only if nothing claims them).
-    static let familyLine = ["notify", "status", "activity", "app", "tools"].joined(separator: " · ")
+    static let familyLine = ["notify", "status", "activity", "app"].joined(separator: " · ")
 
     /// A family's actions as a text room, or nil when the name is not a family.
     static func familyRoom(_ raw: String, catalog: AgentWorkspace.Catalog) async throws -> String? {
@@ -46,8 +46,10 @@ extension HerScreen {
             family.tools.contains { $0 == tool || (($0.hasSuffix("_") || $0.hasSuffix(".")) && tool.hasPrefix($0)) }
         }
         let schemas = try await catalog().filter { member($0.name) }
-        let visible = AgentWorkspacePorts.current.tools.modelVisibleCatalogToolNames(Set(schemas.map(\.name)))
-        let tools = schemas.filter { visible.contains($0.name) }.sorted { $0.name < $1.name }
+        let port = AgentWorkspacePorts.current.tools
+        let visible = port.modelVisibleCatalogToolNames(Set(schemas.map(\.name)))
+        // A tool folded into app is that app action: the line names it so.
+        let tools = schemas.filter { visible.contains($0.name) || port.appAction($0.name) != nil }.sorted { $0.name < $1.name }
         // A room, not a schema dump (desk walk 09-24): what each thing does in
         // words, what it needs, and the one call that does it.
         let shown = tools.prefix(8)
@@ -58,12 +60,13 @@ extension HerScreen {
             let needs = args.required.isEmpty ? "needs nothing" : "needs " + args.required.joined(separator: ", ")
             let also = args.optional.isEmpty ? "" : " · also " + args.optional.prefix(4).joined(separator: ", ")
                 + (args.optional.count > 4 ? " +\(args.optional.count - 4)" : "")
-            rows.append("    " + clip(schema.name + " · " + needs + also, 100))
+            let action = port.appAction(schema.name)
+            rows.append("    " + clip((action.map { "app " + $0 } ?? schema.name) + " · " + needs + also, 100))
             let example = args.required.isEmpty ? "{}" : "{" + args.required.map { "\"\($0)\":…" }.joined(separator: ",") + "}"
-            verbs.append((schema.name + " " + example, "one call"))
+            verbs.append((action.map { "app {\"action\":\"\($0)\",\"args\":\(example)}" } ?? schema.name + " " + example, "one call"))
         }
         if tools.count > shown.count {
-            rows.append("+\(tools.count - shown.count) more · tool_catalog query \"\(family.name)\"")
+            rows.append("+\(tools.count - shown.count) more · app {\"find\":\"\(family.name)\"}")
         }
         return screen([family.name.uppercased(), family.about, tools.isEmpty ? "not available here" : "\(tools.count) things to do"],
             [tools.isEmpty ? ["none of its tools are on in this session (a connection or a Trust setting is off)"] : rows],
@@ -71,28 +74,27 @@ extension HerScreen {
     }
 }
 
-/// Her own places as rooms like mail and music (desk walk 2, 09-24): notify,
-/// status and tools read as what the place is and its verbs in words
-/// (`notify.mac`, `status.doctor`, `tools.find`), never raw tool names.
+/// Her own places as rooms like mail and music (desk walk 2, 09-24): notify
+/// and status read as what the place is and its verbs in words
+/// (`notify.mac`, `status.doctor`), never raw tool names. Finding an action
+/// is app {find}; there is no tools room.
 extension HerScreen {
     static let coreDestinations: [AgentWorkspaceDestination] = [
         .init(id: "notify", title: "Notify", summary: "Send a notification to this Mac or to the paired phone. Both send at once; nothing is read here.",
               tool: nil, tools: ["mac_notify", "mobile_notify"]),
-        .init(id: "status", title: "Status", summary: "How the app and its links are doing: the doctor check, Telegram, this Mac, recent turns, the time.",
-              tool: nil, tools: ["doctor_status", "telegram_status", "system_info", "recent_trace_summary", "time_now"]),
-        .init(id: "tools", title: "Tools", summary: "Every tool, found by what you want to do. A found tool is called by name; calling loads it.",
-              tool: nil, tools: ["tool_catalog", "tool_load", "tool_unload"]),
+        .init(id: "status", title: "Status", summary: "How the app and its links are doing: the doctor check, Telegram, this Mac. Recent turns and the time are app trace.recent and app time.now.",
+              tool: nil, tools: ["system_info"]),
         // A room, not a tool listing (walk 4: "1 things to do"). Nothing is read until a verb asks.
         .init(id: "activity", title: "Activity", summary: "Which Mac apps were in use, and for how long, from the on-device activity record. Nothing is read until you ask.",
               tool: nil, tools: ["activity_query"]),
     ]
 
     /// activity_query: the activity family's read, which its room (buildRecordRoom) lays out.
-    static let coreReadTools: Set<String> = ["doctor_status", "telegram_status", "system_info", "recent_trace_summary", "time_now", "tool_catalog",
-                                             "activity_query"]
+    static let coreReadTools: Set<String> = ["system_info", "recent_trace_summary", "time_now", "activity_query"]
 
-    /// A reading of these shows in its room; the rest keep their frame.
-    static let coreRooms: [String: String] = ["doctor_status": "status", AgentWorkspaceKnowledge.webSearchTool: "research"]
+    /// A reading of these shows in its room; the rest keep their frame. The
+    /// only `app` reads opened as records are Status's Doctor and Telegram.
+    static let coreRooms: [String: String] = ["app": "status", AgentWorkspaceKnowledge.webSearchTool: "research"]
 
     /// The verb a room shows for one of its tools, in words.
     static func coreAction(tool: String) -> AgentWorkspaceButton? {
@@ -102,29 +104,17 @@ extension HerScreen {
             let label = tool == "mac_notify" ? "Mac notification" : "Phone notification"
             return .init(label: label, action: .perform(tool: tool, input: ["title": .string("NativeAgent")], title: label,
                                                         textField: "message", isEffect: true), needsText: true)
-        case "doctor_status": return read("Doctor check of the whole app")
-        case "telegram_status": return read("Telegram link")
         case "system_info": return read("System info for this Mac")
-        case "recent_trace_summary": return read("Recent turns, traced")
-        case "time_now": return read("Time now")
         case "activity_query":
             return .init(label: "Today", action: .open(.record(tool: tool, input: ["range": .string("today")], title: "Activity today")))
-        case "tool_catalog":
-            return .init(label: "Find a tool for a job", action: .perform(tool: tool, input: [:], title: "Find a tool",
-                                                                         textField: "query", isEffect: false), needsText: true)
-        case "tool_load":
-            return .init(label: "Load a tool by name", action: .perform(tool: tool, input: [:], title: "Load a tool",
-                                                                       textField: "name", isEffect: true), needsText: true)
-        case "tool_unload":
-            return .init(label: "Unload every loaded tool", action: .perform(tool: tool, input: ["all": .bool(true)], title: "Unload tools",
-                                                                            textField: nil, isEffect: true))
         default: return nil
         }
     }
 
     /// The doctor check as a room: the overall word, then what is not ok first.
     static func coreProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
-        guard tool == "doctor_status", case .object(let row) = result else { return nil }
+        guard tool == "app", input["item"] == .string("doctor"), case .object(let read) = result,
+              case .object(let row)? = read["item"] else { return nil }
         func text(_ value: JSONValue?) -> String? { if case .string(let s)? = value, !s.isEmpty { return s }; return nil }
         let checks: [[String: JSONValue]] = { if case .array(let list)? = row["checks"] { return list.compactMap { if case .object(let o) = $0 { o } else { nil } } }; return [] }()
         let bad = checks.filter { text($0["status"]) != "ok" }

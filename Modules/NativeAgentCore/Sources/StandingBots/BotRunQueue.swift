@@ -16,6 +16,20 @@ public enum BotRunOrigin: String, Codable, Sendable {
     case manual, event
 }
 
+/// Transport identity travels in the same durable request as its event text.
+/// A nil source marks a legacy event whose sender was not recorded.
+public struct BotEventProvenance: Codable, Equatable, Sendable {
+    public let source: BotEventSource?
+    public let verifiedChatID: String?
+    public let verifiedUserID: String?
+
+    public init(source: BotEventSource?, verifiedChatID: String? = nil, verifiedUserID: String? = nil) {
+        self.source = source
+        self.verifiedChatID = verifiedChatID
+        self.verifiedUserID = verifiedUserID
+    }
+}
+
 public enum BotRunAdmissionError: String, Error {
     case paused, overBudget = "over_budget", alreadyRunning = "already_running"
 }
@@ -41,6 +55,7 @@ public struct BotRunQueue: Sendable {
         /// unattended gates after an upgrade. Carrying event context IS the
         /// evidence; a bare legacy run id stays manual.
         var origin: BotRunOrigin? = nil
+        var provenance: BotEventProvenance? = nil
         var isEvent: Bool { origin.map { $0 == .event } ?? (context?.isEmpty == false) }
     }
     private static let admission = Admission()
@@ -62,6 +77,8 @@ public struct BotRunQueue: Sendable {
     /// it because the wait was not cancellable. Such a claim is refused instead
     /// of parked.
     @TaskLocal static var ancestry: Set<UUID> = []
+    @TaskLocal public static var eventProvenance: BotEventProvenance?
+    @TaskLocal public static var eventContext: String?
 
     public init(dataRoot: URL) {
         self.dataRoot = dataRoot.standardizedFileURL
@@ -73,7 +90,8 @@ public struct BotRunQueue: Sendable {
     /// `context` is the event text that woke the bot, if any. It is the run's
     /// input, never an instruction to the app.
     public func enqueue(bot id: UUID, context: String? = nil,
-                        origin: BotRunOrigin = .manual) throws -> BotRunReceipt {
+                        origin: BotRunOrigin = .manual,
+                        provenance: BotEventProvenance? = nil) throws -> BotRunReceipt {
         let runID = UUID()
         do {
             try disk.locked {
@@ -82,7 +100,7 @@ public struct BotRunQueue: Sendable {
                 var requests = try readRequests()
                 guard requests[id] == nil else { throw BotRunAdmissionError.alreadyRunning }
                 let text = (context?.isEmpty ?? true) ? nil : context
-                requests[id] = QueuedRequest(runID: runID, context: text, origin: origin)
+                requests[id] = QueuedRequest(runID: runID, context: text, origin: origin, provenance: provenance)
                 try disk.write(requests, at: path)
             }
             NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
@@ -114,11 +132,16 @@ public struct BotRunQueue: Sendable {
     }
 
     public func activeOrQueuedIDs(locked: Bool = true) throws -> Set<UUID> {
-        // Unlocked: a read-only look at the queue file for a glance that must not wait.
-        let queued = locked ? try pending() : try readRequests()
+        let ids = try activeAndQueuedIDs(locked: locked)
+        return ids.active.union(ids.queued)
+    }
+
+    public func activeAndQueuedIDs(locked: Bool = true) throws -> (active: Set<UUID>, queued: Set<UUID>) {
         Self.admission.lock.lock()
         defer { Self.admission.lock.unlock() }
-        return Set(queued.keys).union(Self.admission.active[rootKey]?.keys.map { $0 } ?? [])
+        // Unlocked: a read-only look at the queue file for a glance that must not wait.
+        let queued = locked ? try pending() : try readRequests()
+        return (Set(Self.admission.active[rootKey]?.keys.map { $0 } ?? []), Set(queued.keys))
     }
 
     public enum RequestPresence: Sendable { case queued, running, absent }
@@ -162,6 +185,7 @@ public struct BotRunQueue: Sendable {
     struct ClaimedRun {
         let bot: BotDefinition
         let context: String?
+        let provenance: BotEventProvenance?
     }
 
     func claim(bot id: UUID, requestID: UUID?, manual: Bool = false) throws -> ClaimedRun {
@@ -235,10 +259,15 @@ public struct BotRunQueue: Sendable {
             // Claiming a queued request consumes it even if settings now reject
             // it. A budget edit must not leave a request to replay later.
             var context: String? = nil
+            var provenance: BotEventProvenance? = nil
             if !enqueue, let runID {
                 guard requests[id]?.runID == runID else { throw BotRunAdmissionError.alreadyRunning }
                 // Consumed with the request: the text reaches this run only.
-                context = requests.removeValue(forKey: id)?.context
+                let request = requests.removeValue(forKey: id)
+                context = request?.context
+                if request?.isEvent == true {
+                    provenance = request?.provenance ?? BotEventProvenance(source: nil)
+                }
                 try disk.write(requests, at: path)
             }
             let bot = try disk.definition(id).definition
@@ -257,7 +286,7 @@ public struct BotRunQueue: Sendable {
                 Self.admission.active[rootKey, default: [:]][id] = descriptor
                 retained = true
             }
-            return ClaimedRun(bot: bot, context: context)
+            return ClaimedRun(bot: bot, context: context, provenance: provenance)
         }
     }
 

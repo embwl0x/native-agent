@@ -120,7 +120,8 @@ extension CognitiveSubstrate {
             terms: terms,
             unresolvedQuestion: unresolvedQuestion,
             memoryActivation: memoryActivation,
-            workingMemoryRecordIDs: workingMemoryRecordIDs
+            workingMemoryRecordIDs: workingMemoryRecordIDs,
+            suppressedMemory: suppressedMemoryAssociations()
         )
         // Empty → nil, so the default inert path stays byte-identical. Never
         // return an empty struct (that would still be a distinct packet input).

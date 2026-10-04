@@ -3,7 +3,8 @@ import Dispatch
 import Foundation
 
 /// kqueue-backed append-file watcher. Missing files are watched through their
-/// parent directories; rename/delete events re-arm the target vnode.
+/// nearest existing ancestors; directory creation and rename/delete events
+/// re-arm the target vnode.
 public final class FileChangeWatcher: @unchecked Sendable {
     public typealias Handler = @Sendable (URL) -> Void
     private struct Armed { let source: DispatchSourceFileSystemObject }
@@ -117,8 +118,22 @@ public final class FileChangeWatcher: @unchecked Sendable {
             )
             return
         }
-        let parent = path.deletingLastPathComponent()
-        let parentFD = open(parent.path, O_EVTONLY)
+        // A target that exists but cannot be opened for events (a Unix socket,
+        // e.g. ~/.codex/ipc/ipc.sock) is watched through its directory only.
+        // Re-arming it on "exists" recursed, opening the directory again each
+        // pass until the process ran out of descriptors (10,000 on 2026-10-01,
+        // which aborted SwiftUI's RenderBox at launch).
+        let missing = errno == ENOENT
+        var parent = path.deletingLastPathComponent()
+        var child = path
+        var parentFD = open(parent.path, O_EVTONLY)
+        while parentFD < 0, errno == ENOENT {
+            let ancestor = parent.deletingLastPathComponent()
+            guard ancestor != parent else { return }
+            child = parent
+            parent = ancestor
+            parentFD = open(parent.path, O_EVTONLY)
+        }
         guard parentFD >= 0 else { return }
         install(
             fd: parentFD,
@@ -130,9 +145,9 @@ public final class FileChangeWatcher: @unchecked Sendable {
         // vnode source was installed. A directory event for that creation may
         // already have been delivered by then, so close the race with an
         // immediate post-arm check and move onto the target vnode ourselves.
-        if FileManager.default.fileExists(atPath: path.path) {
+        if missing, FileManager.default.fileExists(atPath: child.path) {
             arm(path)
-            handler(path)
+            if FileManager.default.fileExists(atPath: path.path) { handler(path) }
         }
     }
 
@@ -151,17 +166,15 @@ public final class FileChangeWatcher: @unchecked Sendable {
             guard let self, let source, !self.isStopped else { return }
             let event = source.data
             if directory {
+                // An intermediate directory may have appeared. Move onto the
+                // nearest ancestor before waiting for the next creation edge.
+                self.arm(targetPath)
                 if FileManager.default.fileExists(atPath: targetPath.path) {
                     // Arm the new inode before publishing the edge. If a
                     // second atomic replacement lands while the consumer is
                     // reading the first edge, the newly armed vnode observes
                     // it instead of leaving a re-arm loss window.
-                    self.arm(targetPath)
                     self.handler(targetPath)
-                } else if event.contains(.rename)
-                            || event.contains(.delete)
-                            || event.contains(.revoke) {
-                    self.arm(targetPath)
                 }
             } else {
                 if event.contains(.rename) || event.contains(.delete) || event.contains(.revoke) {

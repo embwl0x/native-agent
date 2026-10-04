@@ -20,9 +20,7 @@ import Desk
 // Because ChatOrchestration builds a turn's tool schemas from the dispatcher's
 // `listAvailableToolSchemas()` (ChatOrchestration+TurnEngine.swift:583), this
 // wrapper ALSO decides what the model even sees: the allowlisted read/desk
-// tools plus `workshop_artifact_write`. Anything outward is not a tool here —
-// it is a desk approval ref (M6), filed through the normal approval queue by a
-// later wave, never executed inline.
+// tools plus `workshop_artifact_write`. Anything outward is not a tool here.
 
 /// Records the artifact paths a session wrote, so the pump can put them on the
 /// session receipt. One collector per session (the profile is built per run).
@@ -30,9 +28,13 @@ public actor WorkshopArtifactCollector {
     private var paths: [String] = []
     private var closed = false
     public init() {}
-    func record(_ path: String) { guard !closed else { return }; paths.append(path) }
+    func write(relativePath: String, content: String, using writer: WorkshopArtifactWriter) throws -> String {
+        guard !closed else { throw WorkshopMembraneError.sessionClosed }
+        let written = try writer.write(relativePath: relativePath, content: content)
+        paths.append(written.relativePath)
+        return written.relativePath
+    }
     public func written() -> [String] { paths }
-    func isOpen() -> Bool { !closed }
     /// User, 2026-09-06: seal the session's artifact set and hand back what it
     /// wrote, in one hop. The deadline racer cancels the turn but cannot stop
     /// a detached executor that ignores cancellation, so an uncancelled tool
@@ -239,7 +241,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
             description:
                 "Write a workshop artifact (notes, findings, drafts) into this pursuit's own "
                 + "folder. The ONLY file write available in a workshop session — sandboxed to "
-                + "data/workshop/<handle>/. Anything outward requires a desk approval, not this tool.",
+                + "data/workshop/<handle>/.",
             parametersJSON: data
         )
     }()
@@ -296,14 +298,10 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         }
         // User, 2026-09-06: the session's receipt is already written once the
         // deadline passes; a write accepted after that would not be on it.
-        guard await collector.isOpen() else {
-            throw WorkshopMembraneError.sessionClosed
-        }
-        let written = try artifactWriter.write(relativePath: rawPath, content: content)
-        await collector.record(written.relativePath)
+        let path = try await collector.write(relativePath: rawPath, content: content, using: artifactWriter)
         return .object([
             "status": .string("ok"),
-            "path": .string(written.relativePath),
+            "path": .string(path),
             "bytes": .int(Int64(content.utf8.count)),
         ])
     }
@@ -354,7 +352,7 @@ public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
         case .toolNotPermitted(let tool):
             return "tool '\(tool)' is not permitted in a Desk work session "
                 + "(allowlist: \(WorkshopToolProfile.allowed.sorted().joined(separator: ", ")), "
-                + "plus \(WorkshopToolProfile.artifactToolName)). Anything outward is a desk approval, not a tool call."
+                + "plus \(WorkshopToolProfile.artifactToolName))."
         case .badArtifactArgs(let why):
             return "workshop_artifact_write: \(why)"
         case .pathEscapesRoot(let p):
@@ -502,7 +500,20 @@ public struct WorkshopArtifactWriter: Sendable {
         return target
     }
 
+    /// Check bounded byte access without interpreting a partial UTF-8 scalar.
+    public func isReadable(relativePath: String) -> Bool {
+        (try? readBytes(relativePath: relativePath, maximumBytes: 1)) != nil
+    }
+
     public func read(relativePath: String, maximumBytes: Int = 65_536) throws -> Read {
+        let result = try readBytes(relativePath: relativePath, maximumBytes: maximumBytes)
+        guard let content = String(data: result.data, encoding: .utf8) else {
+            throw WorkshopMembraneError.badArtifactArgs("artifact is not UTF-8 text")
+        }
+        return Read(relativePath: result.relativePath, content: content, bytes: result.data.count, truncated: result.truncated)
+    }
+
+    private func readBytes(relativePath: String, maximumBytes: Int) throws -> (relativePath: String, data: Data, truncated: Bool) {
         let components = try Self.validatedPathComponents(relativePath)
         let dataFD = Darwin.open(dataRoot.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard dataFD >= 0 else { throw Self.posixError("open data root") }
@@ -541,11 +552,20 @@ public struct WorkshopArtifactWriter: Sendable {
             data.append(contentsOf: buffer.prefix(count))
         }
         let truncated = data.count > limit
-        if truncated { data = data.prefix(limit) }
-        guard let content = String(data: data, encoding: .utf8) else {
-            throw WorkshopMembraneError.badArtifactArgs("artifact is not UTF-8 text")
+        if truncated {
+            data = data.prefix(limit)
+            // Remove only a scalar cut by the byte limit; invalid text elsewhere
+            // still fails the UTF-8 decode at the artifact boundary.
+            var start = data.count - 1
+            while start > 0, data[start] & 0xC0 == 0x80 { start -= 1 }
+            let lead = data[start]
+            let width = lead < 0x80 ? 1
+                : (0xC2...0xDF).contains(lead) ? 2
+                : (0xE0...0xEF).contains(lead) ? 3
+                : (0xF0...0xF4).contains(lead) ? 4 : 0
+            if width > data.count - start { data = data.prefix(start) }
         }
-        return Read(relativePath: components.joined(separator: "/"), content: content, bytes: data.count, truncated: truncated)
+        return (relativePath: components.joined(separator: "/"), data: data, truncated: truncated)
     }
 
     private static func validatedPathComponents(_ rawPath: String) throws -> [String] {

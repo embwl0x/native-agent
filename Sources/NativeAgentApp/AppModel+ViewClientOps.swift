@@ -272,6 +272,22 @@ extension AppModel {
         return response
     }
 
+    func saveProviderGroupSelection(
+        group: ProviderSurfaceGroup, providerID: String? = nil, model: String? = nil,
+        reasoningEffort: String? = nil, serviceTier: String? = nil, clearOverride: Bool = false
+    ) async throws -> ProviderGroupWriteResult {
+        let result = try await engine.providers.routing.saveGroupSelection(
+            group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier, clearOverride: clearOverride
+        )
+        applySurfacePickerSnapshot(result.snapshot)
+        if group.surfaces.contains("cognition_reflection") {
+            await NativeAgentEngine.liveCognition.refreshConfiguration()
+        }
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
+        return result
+    }
+
     func configureSurfaceSelection(
         surface: String,
         providerID: String,
@@ -349,6 +365,49 @@ extension AppModel {
         let response = try await client.clearProvider(id)
         Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         return response
+    }
+
+    /// The provider sheet's Remove the key, which provider.disconnect runs
+    /// too: the registry row, then the sign-in. `detail` is the sheet's status
+    /// line; `ok` false claims no removal.
+    func disconnectProvider(_ id: String) async -> (ok: Bool, detail: String) {
+        do {
+            _ = try await clearProvider(id)
+            // User, 2026-09-06: for an OAuth provider the credential does not
+            // live in providers/<id>.json — ChatGPT's is in codex_home/auth.json
+            // and the others in their adapters' own token files — so removing
+            // the registry row left the account connected while the sheet said
+            // it had been disconnected. Go through the same path the OAuth
+            // "Sign out" button uses; it no-ops for non-OAuth providers.
+            let clearedOAuth = NativeOAuthFlow.clearTokens(
+                providerId: id,
+                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            )
+            let oauthID = NativeOAuthFlow.normalizedOAuthProviderId(id)
+            if ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].contains(oauthID),
+               !clearedOAuth {
+                _ = await loadProvidersForChat()
+                return (false, "Clear failed: the OAuth credential could not be removed.")
+            }
+            // The shared ~/.codex/auth.json belongs to the Codex CLI and is
+            // never deleted here, so say so rather than claiming a removal
+            // that did not happen (same wording the Sign out button uses).
+            // User, 2026-09-06: this asked `isSignedIn`, which reads the auth
+            // path chat will USE — and the removal just flipped CLI adoption to
+            // declined, so the normal case answered false and reported
+            // "Credentials removed" with the shared file still on disk. The
+            // disclosure now keys off the shared file itself.
+            let detail = NativeOAuthFlow.sharedCodexCLISessionRemains(providerId: id)
+                ? "Shared Codex auth is still signed in. Sign out from Codex to remove it."
+                : "Credentials removed."
+            // S.5: propagate cleared credentials to the provider list so the
+            // parent ProviderSettingsView and the chat brain bar reflect the
+            // new auth_status (needs_key / needs_oauth) immediately.
+            _ = await loadProvidersForChat()
+            return (true, detail)
+        } catch {
+            return (false, "Clear failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: Integrations / inbox

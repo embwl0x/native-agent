@@ -110,7 +110,7 @@ extension MacAppleScriptBridge {
                 result.merge(history) { _, new in new }
             }
             // People by their Contacts names where known; handles stay the identity.
-            return .object(MacContactsAdapter.naming(result))
+            return .object(await MacContactsAdapter.naming(result))
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "messages", app: app)
         } catch {
@@ -216,14 +216,21 @@ extension MacAppleScriptBridge {
     }
 
     /// Search Apple Notes by title/body; blank query lists recent notes, and
-    /// `title` (exact) reads that note's whole text in the same call. A single
-    /// hit carries its text too (2026-09-24).
-    /// Returns: {status, count, total, notes: [{name, body_preview | body, modified_at, folder}]}
+    /// `title` (exact) or `id` reads a body page. Continuation requires `id`.
     public static func notesSearch(input: [String: JSONValue]) async throws -> JSONValue {
         let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
+        let id = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var offset = 0
+        if let value = input["body_offset"] {
+            guard let id, !id.isEmpty, case .int(let number) = value,
+                  number >= 0, let position = Int(exactly: number) else {
+                return failedEnvelope(integration: "notes", reason: "invalid_note_body_offset")
+            }
+            offset = position
+        }
         // A note's own id reads exactly that note, whatever else shares its title.
-        if let id = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
-            return await notesRead(selection: "notes whose id is \"\(escapeForAppleScript(id))\"", limit: 1, whole: true)
+        if let id, !id.isEmpty {
+            return await notesRead(selection: "notes whose id is \"\(escapeForAppleScript(id))\"", limit: 1, whole: true, offset: offset)
         }
         if let title = inputString(input["title"])?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
             return await notesRead(selection: "notes whose name is \"\(escapeForAppleScript(title))\"", limit: 1, whole: true)
@@ -235,10 +242,12 @@ extension MacAppleScriptBridge {
         return await notesRead(selection: "notes whose (name contains \"\(q)\") or (body contains \"\(q)\")", limit: limit, whole: false)
     }
 
-    /// Plain text (not the HTML body): 200 characters a row, up to 4000 when
-    /// one note is the answer.
-    private static func notesRead(selection: String, limit: Int, whole: Bool) async -> JSONValue {
+    /// JSON protects all fields. Offsets count UTF-16 units; page boundaries
+    /// expand to whole composed characters so Unicode is never split.
+    private static func notesRead(selection: String, limit: Int, whole: Bool, offset: Int = 0) async -> JSONValue {
         let source = """
+        use framework "Foundation"
+        use scripting additions
         tell application "Notes"
             if (count of accounts) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
             if (count of folders) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
@@ -246,57 +255,47 @@ extension MacAppleScriptBridge {
             set totalHits to count of hits
             set previewChars to 200
             if \(whole ? "true" : "false") or totalHits is 1 then set previewChars to 4000
-            set output to "__TOTAL__" & (totalHits as text) & "###"
+            set bodyKey to "body_preview"
+            if \(whole ? "true" : "false") or totalHits is 1 then set bodyKey to "body"
+            set output to current application's NSMutableArray's array()
             set countNote to 0
             repeat with i from 1 to totalHits
                 if countNote ≥ \(limit) then exit repeat
                 set n to item i of hits
-                set nm to ""
-                set bp to ""
-                set md to ""
-                set fd to ""
-                set nid to ""
-                try
-                    set nid to (id of n) as string
-                end try
-                try
-                    set nm to (name of n) as string
-                end try
-                try
-                    set bp to (plaintext of n) as string
-                    if (count of bp) > previewChars then set bp to text 1 thru previewChars of bp
-                end try
-                try
-                    set md to ((modification date of n) as string)
-                end try
-                try
-                    set fd to (name of container of n) as string
-                end try
-                set output to output & nm & "|||" & bp & "|||" & md & "|||" & fd & "|||" & nid & "###"
+                set nid to (id of n) as string
+                set nm to (name of n) as string
+                set md to (modification date of n) as string
+                set fd to (name of container of n) as string
+                set fullBody to current application's NSString's stringWithString:((plaintext of n) as string)
+                set bodyTotal to (fullBody's |length|()) as integer
+                if \(offset) > bodyTotal then return "__NATIVEAGENT_NOTES_INVALID_OFFSET__"
+                set pageLength to bodyTotal - \(offset)
+                if pageLength > previewChars then set pageLength to previewChars
+                set pageRange to {location:\(offset), |length|:pageLength}
+                if pageLength > 0 then set pageRange to fullBody's rangeOfComposedCharacterSequencesForRange:pageRange
+                set bp to (fullBody's substringWithRange:pageRange) as string
+                set nextOffset to (location of pageRange) + (|length| of pageRange)
+                set row to current application's NSMutableDictionary's dictionaryWithObjects:{nm, bp, md, fd, nid, location of pageRange, bodyTotal} forKeys:{"name", bodyKey, "modified_at", "folder", "id", "body_offset", "body_total"}
+                row's setObject:(current application's NSNumber's numberWithBool:(nextOffset < bodyTotal)) forKey:"truncated"
+                if nextOffset < bodyTotal then row's setObject:nextOffset forKey:"next_body_offset"
+                output's addObject:row
                 set countNote to countNote + 1
             end repeat
-            return output
         end tell
+        set payload to current application's NSDictionary's dictionaryWithObjects:{totalHits, output} forKeys:{"total", "notes"}
+        set jsonData to current application's NSJSONSerialization's dataWithJSONObject:payload options:0 |error|:(missing value)
+        return (current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)) as string
         """
         do {
-            var raw = try await runAppleScript(source)
+            let raw = try await runAppleScript(source)
             if let setup = readSetupEnvelope(raw: raw, integration: "notes") { return setup }
-            var total: Int64?
-            if raw.hasPrefix("__TOTAL__"), let end = raw.range(of: "###") {
-                total = Int64(raw[raw.index(raw.startIndex, offsetBy: 9)..<end.lowerBound])
-                raw = String(raw[end.upperBound...])
+            if raw == "__NATIVEAGENT_NOTES_INVALID_OFFSET__" {
+                return failedEnvelope(integration: "notes", reason: "invalid_note_body_offset")
             }
-            var notes = parseNoteRecords(raw)
+            let (total, notes) = try parseNoteRecords(raw)
             if whole && notes.isEmpty { return failedEnvelope(integration: "notes", reason: "no_matching_note") }
-            if notes.count == 1, case .object(var row) = notes[0], let text = row.removeValue(forKey: "body_preview") {
-                row["body"] = text
-                notes[0] = .object(row)
-            }
-            var result: [String: JSONValue] = ["status": .string("completed"), "count": .int(Int64(notes.count)), "notes": .array(notes)]
-            if let total {
-                result["total"] = .int(total)
-                if total > Int64(notes.count) { result["message"] = .string("Showing \(notes.count) of \(total); narrow with query, or read one with title.") }
-            }
+            var result: [String: JSONValue] = ["status": .string("completed"), "count": .int(Int64(notes.count)), "total": .int(total), "notes": .array(notes)]
+            if total > Int64(notes.count) { result["message"] = .string("Showing \(notes.count) of \(total); narrow with query, or read one with title.") }
             return .object(result)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "notes", app: app)
@@ -325,7 +324,7 @@ extension MacAppleScriptBridge {
         let folder = (requestedFolder?.isEmpty == false) ? requestedFolder! : "Notes"
         let folderWasRequested = requestedFolder?.isEmpty == false
         let titleAS = escapeForAppleScript(title)
-        let bodyAS = escapeForAppleScript(body)
+        let bodyAS = escapeForAppleScript(notesHTML(body))
         let folderAS = escapeForAppleScript(folder)
         let missingFolderBranch = folderWasRequested ? """
                 set folderNames to ""
@@ -426,12 +425,12 @@ extension MacAppleScriptBridge {
                 set body of targetNote to "<div>" & titleHTML & "</div>"
                 """
             } else {
-                let bodyAS = escapeForAppleScript(body)
+                let bodyAS = escapeForAppleScript(notesHTML(body))
                 bodyStmt = "set body of targetNote to \"\(bodyAS)\""
             }
         } else if let append = append {
-            let appendAS = escapeForAppleScript(append)
-            bodyStmt = "set body of targetNote to ((body of targetNote) as string) & return & \"\(appendAS)\""
+            let appendAS = escapeForAppleScript(notesHTML(append))
+            bodyStmt = "set body of targetNote to ((body of targetNote) as string) & \"<br>\(appendAS)\""
         } else {
             // Rename-only path — no body mutation.
             bodyStmt = ""
@@ -480,6 +479,17 @@ extension MacAppleScriptBridge {
         } catch {
             return failedEnvelope(integration: "notes", error: error)
         }
+    }
+
+    private static func notesHTML(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "\n", with: "<br>")
     }
 
 }

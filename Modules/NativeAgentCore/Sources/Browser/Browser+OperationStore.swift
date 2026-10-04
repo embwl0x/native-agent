@@ -116,6 +116,13 @@ public enum BrowserOperationStoreError: Error, Sendable, Equatable {
     case capacityExceeded
 }
 
+/// Cancellation committed even though its derived receipt could not be written.
+public struct BrowserCancellationProjectionError: Error, LocalizedError {
+    public let run: JSONValue
+    public let underlyingError: any Error
+    public var errorDescription: String? { underlyingError.localizedDescription }
+}
+
 private struct BrowserPendingProjection: Sendable {
     let runID: String
     let projectionID: String
@@ -158,7 +165,15 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
         case .projectPendingReceipts:
             result = BrowserOperationCommandResult(run: nil, didTransition: false)
         }
-        try await projectPendingBrowserReceipts()
+        do {
+            try await projectPendingBrowserReceipts()
+        } catch {
+            if case .cancel = command, let run = result.run,
+               Self.objectString(run, "status") == "canceled" {
+                throw BrowserCancellationProjectionError(run: run, underlyingError: error)
+            }
+            throw error
+        }
         return result
     }
 

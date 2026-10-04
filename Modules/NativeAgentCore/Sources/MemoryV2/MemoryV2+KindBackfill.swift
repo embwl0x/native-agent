@@ -25,6 +25,7 @@
 // layer (NativeClient).
 
 import Foundation
+import GRDB
 import NativeAgentCore
 import PersistenceCore
 
@@ -246,11 +247,9 @@ public enum MemoryKindBackfill {
     ///   - row no longer classifiable (a deliberate kind landed meanwhile)
     ///     → skippedStale;
     ///   - proposed kind not in the taxonomy → failed (never write junk).
-    /// Metadata is read-merge-written through MemoryStorage.updateMemory so
-    /// the UserMD/Spotlight/KG hooks fire. KNOWN narrow race (same as the
-    /// bridge's pin path): a concurrent metadata write between read and
-    /// write loses — acceptable for a user-tapped approval apply.
-    /// NOTE: updateMemory bumps updated_at, so a row backfilled into a
+    /// Guards and metadata merge share one storage transaction; the usual
+    /// UserMD/Spotlight/KG hooks fire after it commits.
+    /// NOTE: applying bumps updated_at, so a row backfilled into a
     /// decaying kind starts its decay clock at apply time — conservative
     /// (decay fires later, never earlier; recall quality never reduced).
     public static func apply(
@@ -259,33 +258,15 @@ public enum MemoryKindBackfill {
     ) async throws -> ApplyOutcome {
         var outcome = ApplyOutcome()
         for row in rows {
-            guard let mem = try await storage.memory(id: row.id) else {
-                outcome.failed[row.id] = "row not found"
-                continue
-            }
-            guard MemoryStorage.contentHash(mem.content) == row.contentHash else {
-                outcome.skippedStale.append(row.id)
-                continue
-            }
-            guard MemoryKindStamp.isClassifiable(mem.metadata) else {
-                outcome.skippedStale.append(row.id)
-                continue
-            }
             guard MemoryKindStamp.taxonomy.contains(row.proposedKind) else {
                 outcome.failed[row.id] = "proposed kind not in taxonomy: \(row.proposedKind)"
                 continue
             }
-            var meta: [String: JSONValue] = [:]
-            if case .object(let existing)? = mem.metadata { meta = existing }
-            meta["kind"] = .string(row.proposedKind)
-            meta["kind_source"] = .string(MemoryKindStamp.backfillSource)
-            meta["kind_backfilled_at"] = .string(MemoryStorage.nowISO8601())
-            let patch = MemoryPatch(metadata: .object(meta))
-            guard try await storage.updateMemory(id: row.id, patch: patch) != nil else {
-                outcome.failed[row.id] = "update returned no row"
-                continue
+            switch try await storage.applyKindBackfill(row) {
+            case true?: outcome.applied.append(row.id)
+            case false?: outcome.skippedStale.append(row.id)
+            case nil: outcome.failed[row.id] = "row not found"
             }
-            outcome.applied.append(row.id)
         }
         return outcome
     }
@@ -310,7 +291,7 @@ public enum MemoryKindBackfill {
             .map { "\($0.key) ×\($0.value)" }
             .joined(separator: ", ")
         let detail = rows
-            .map { "[\($0.id)]\nPROPOSED KIND: \($0.proposedKind)\nMEMORY: \($0.contentPreview)" }
+            .map { "Memory: \($0.contentPreview)\nProposed category: \($0.proposedKind)" }
             .joined(separator: "\n\n")
         let card: JSONValue = .object([
             "id": .string(approvalId),
@@ -382,5 +363,37 @@ public enum MemoryKindBackfill {
     /// pass re-detects and re-stages a fresh card.
     public static func clearStamp(dataRoot: URL) {
         try? FileManager.default.removeItem(at: stampPath(dataRoot: dataRoot))
+    }
+}
+
+extension MemoryStorage {
+    /// Nil means missing; false means the approved classification is stale.
+    func applyKindBackfill(_ proposal: MemoryKindBackfill.RowProposal) async throws -> Bool? {
+        let result = try await dbPool.write { db -> (Bool?, StoredMemory?) in
+            guard var memory = try Row.fetchOne(
+                db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [proposal.id]
+            ).map(Self.decodeMemory) else { return (nil, nil) }
+            guard Self.contentHash(memory.content) == proposal.contentHash,
+                  MemoryKindStamp.isClassifiable(memory.metadata) else { return (false, nil) }
+            var metadata: [String: JSONValue] = [:]
+            if case .object(let existing)? = memory.metadata { metadata = existing }
+            let now = Self.nowISO8601()
+            metadata["kind"] = .string(proposal.proposedKind)
+            metadata["kind_source"] = .string(MemoryKindStamp.backfillSource)
+            metadata["kind_backfilled_at"] = .string(now)
+            memory.metadata = .object(metadata)
+            memory.updatedAt = now
+            try Self.validateTemporalEvidence(memory)
+            try db.execute(sql: """
+                UPDATE memories SET metadata_json = ?, updated_at = ? WHERE id = ?
+                """, arguments: [Self.encodeMetadata(memory.metadata), now, memory.id])
+            return (true, memory)
+        }
+        if let memory = result.1 {
+            invalidateRecallCache()
+            pokeUserMDRegen(persona: memory.personaId)
+            await pokeProjectionHooks(memory)
+        }
+        return result.0
     }
 }

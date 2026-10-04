@@ -18,63 +18,18 @@ import ToolRegistry
 
 extension SwiftToolDispatcher {
     /// Read-only skill-manifest/body tools. This is the canonical taxonomy
-    /// exported by `tool_catalog`; transcript summaries must not carry a
+    /// exported by the Tools page manifest; transcript summaries must not carry a
     /// second hand-maintained spelling of these names.
     public static let skillReaderToolNames: Set<String> = ["list_skills", "read_skill"]
 
     public static let alwaysOnCoreNames: Set<String> = [
-        "agent_contacts", "agent_message",
-        "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
-        "list_skills", "read_skill",
-        // One compact workspace entry carries work, documents and discussions.
-        // Detailed readers remain lazy behind their normal permission gates.
-        "recall_memory", "workspace",
-        // commit_memory — the memory WRITE counterpart to recall_memory.
-        // Daemon parity (always_on + AUTO). Must be hot/always-loaded so the
-        // model can durably save a fact mid-turn WITHOUT a tool_load dance —
-        // the symmetric partner of the always-on recall surface.
-        "commit_memory",
-        // scratchpad_write was listed here but has no schema or dispatch
-        // case — only scratchpad_read exists. Listing it would advertise
-        // a tool the LLM can't actually load or call. (gpt-5.5 review-2
-        // NEEDS_FIX 5)
-        // scratchpad_read, save_skill, search_kg, omp_message
-        // left the always-on floor on 2026-09-11 (Agent's working-set ruling
-        // after the tools review): zero to two real calls in eleven days each,
-        // all still discoverable and loadable through tool_catalog / tool_load.
-        "context_expand",
-        "time_now",
-        "recent_trace_summary",
-        // Self-introspection must be always-loaded: it was discovery_only,
-        // gated behind a tool_load that needs the chat session id — a
-        // chicken-and-egg where the agent can't load the very tool that reports
-        // its runtime/model. An agent should always be able to ask "what am I
-        // running on" without a load dance. (2026-06-09, found via live test.)
-        "agent_introspect",
-        // Native computer use is four small verbs. They stay hot whenever the
-        // matching Trust Center gates make them available; the old mac_* organ
-        // tools remain callable by diagnostics but never enter Agent's normal
-        // model prompt.
-        "screen", "act", "go", "wait",
-        "claude_message",
-        // Agent Desk — desk_read is ALWAYS-ON so "update me on what you're
-        // tracking" / "what's on the desk" works regardless of phrasing (User's
-        // pull-to-retrieve flow, 2026-06-29). The nine desk MUTATIONS stay lazy
-        // (preload on tracking intent — the capture flow).
-        "desk_read",
-        // Personality depth item 3 (2026-09-02) — `inner_state`. ALWAYS-ON for
-        // the same reason `agent_introspect` is: a tool she must `tool_load`
-        // before she can answer "how are you" is a tool she will not reach for
-        // mid-sentence, and the load dance is exactly what makes her compose an
-        // answer instead of reading one. Clause 6 is honored by REACH: one
-        // catalog row, zero prompt bytes until she pulls it.
-        "inner_state",
-        // User 2026-09-29: measured working set. The floor is emitted in
-        // alphabetical order by canonicalToolOrder, independent of this set's
-        // iteration order, session load order, or tool usage.
-        "read_file", "list_dir", "write_file", "search_chat_history",
-        "delegation_status", "agent_read", "agent_connect", "codex_message",
-        "shelf_entry", "mac_calendar_list_upcoming", "mail_list_recent",
+        // User 2026-10-01: "NativeAgent is her tool." One door to the whole
+        // app; its pages and actions travel in its results, not its schema.
+        // The app's executor contributes it (AppToolExecutor+AppDoor).
+        // User 10-02, one-door phase 2: every other tool folded into it, step
+        // by step (ToolNameAliases.foldedTools). Step 7: workspace is app's
+        // home and tool_catalog/tool_load are gone, so app is the only name.
+        "app",
     ]
 
     /// Always-on tool names wired in SwiftToolDispatcher+Impls.swift.
@@ -84,14 +39,14 @@ extension SwiftToolDispatcher {
         "read_page", "read_file", "list_dir", "write_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
         "search_chat_history", "session_search", "workspace", "work_context", "artifact_find",
         "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
-        "agent_introspect", "daemon_introspect", "tool_catalog",
-        "list_tools", "tool_load", "tool_unload", "tool_result_page", "request_interaction", "list_skills", "read_skill", "save_skill", "craft_run",
+        "agent_introspect", "daemon_introspect",
+        "tool_result_page", "request_interaction", "list_skills", "read_skill", "save_skill",
         "context_lookup", "context_expand", "scratchpad_read", "recent_trace_summary",
         // 2026-06-08: time_now + Claude-bridge return-channel tools were
         // added to dispatch/catalog but missing from builtInToolNames, so
         // listAvailableTools() didn't include them → tool_catalog's nameSet
         // intersection dropped them from currently_loaded. Add here.
-        "time_now", "claude_message", "invoke_claude",
+        "time_now", "claude_message",
         // Personality depth item 3 (2026-09-02): the introspection pull. Also in
         // alwaysOnCoreNames — listed here so listAvailableTools() reports it as
         // currently_loaded rather than dropping it from tool_catalog.
@@ -105,7 +60,7 @@ extension SwiftToolDispatcher {
         // OAuth/token-backed cloud connectors. Read tools stay lazy and use
         // the dispatcher's exact data root; connection setup is Mac-owned.
         "gmail_status", "gmail_search", "gmail_read",
-        "google_calendar_status", "google_calendar_list",
+        "google_calendar_status", "google_calendar_list", "google_calendar_calendars", "google_calendar_free_busy", "google_calendar_read", "google_calendar_send_invitations",
         "notion_status", "notion_search", "notion_read_page",
         // GitHub — PAT-backed tools. Repo visibility writes are confirm-gated.
         "github_status", "github_list_repos", "github_list_notifications", "github_get_repository",
@@ -126,14 +81,14 @@ extension SwiftToolDispatcher {
         // Read-default surfaces (calendar/reminders/spotlight) plus the two notification
         // channels the user trusts (mac.notify + mobile.notify). Phase 1 — read-only macs;
         // Contacts/Mail/Messages/Notes/Music adapters come in Phase 2.
-        "mac_calendar_list_upcoming", "mac_reminders_list_due_today",
+        "mac_calendar_list_upcoming", "mac_calendar_calendars", "mac_calendar_free_busy", "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mac_reminders_update",
         "mac_notify", "mobile_notify", "phone_request", "mac_spotlight_search",
         // 2026-06-07 Phase 2 — Contacts + AppleScript backends. Gated through
         // MacIntegrationPermissionStore. Write-default-OFF for the sensitive 5
         // (mail/messages/notes send + contacts create) — the user wants explicit toggle
         // in Settings → Mac Integration before she can send anything.
         "contacts_search", "contacts_create_or_update",
-        "mail_list_recent", "mail_search", "mail_send",
+        "mail_list_recent", "mail_read_batch", "mail_triage_batch", "mail_search", "mail_send",
         "messages_recent_threads", "messages_send",
         "notes_search", "notes_create",
         "music_now_playing", "music_control",
@@ -226,11 +181,11 @@ extension SwiftToolDispatcher {
         // her memory WRITE (accept promotes a proposal into her own store).
         "memory_moments_pending", "memory_moment_review",
         // User, 2026-09-05: curation of her own store, a deliberate pass.
-        "list_memories", "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
+        "forget_memory", "rebuild_knowledge_graph",
         // Agent, 2026-09-06: the whole of one message search only previewed.
         // LAZY — reaching past a preview is a deliberate follow-up to a search,
         // not per-turn business; work_context and history return exact locators.
-        "read_chat_message", "chat_conversations",
+        "read_chat_message",
     ]
 
     /// The READ half of the Full-Mac file surface. Every entry only observes:
@@ -378,15 +333,32 @@ extension SwiftToolDispatcher {
             .subtracting(fourVerbToolNames)
     }
 
+    /// Names her catalog never shows: the legacy Mac organs, the tools
+    /// folded into `app` or retired from it, and `workspace` (app's home).
+    /// All stay callable by name for internal callers; the deleted discovery
+    /// names never return from an old session's pinned row.
+    package static var modelHiddenToolNames: Set<String> {
+        legacyMacModelToolNames.union(ToolNameAliases.foldedTools.keys).union(ToolNameAliases.mergedTools)
+            .union(ToolNameAliases.retiredAppTools)
+    }
+
+    /// `modelHiddenToolNames`, and every MCP server's tools: each is an `app`
+    /// action (`mcp.<server>.<tool>`) generated from its live list.
+    package static func isModelHidden(_ name: String) -> Bool {
+        modelHiddenToolNames.contains(name) || ToolNameAliases.mcpAction(name) != nil
+    }
+
     /// Keep the retained UI and studio tools out of the conversational catalog.
     public static func modelVisibleCatalogToolNames(
         _ availableToolNames: Set<String>
     ) -> Set<String> {
-        availableToolNames.subtracting(legacyMacModelToolNames)
+        availableToolNames.filter { !isModelHidden($0) }
     }
 
+    /// A tool a session loaded before it folded into `app` is never offered
+    /// by its old name again.
     package static func normalModelToolNames(activeTools: Set<String>) -> Set<String> {
-        alwaysOnCoreNames.union(activeTools.subtracting(legacyMacModelToolNames))
+        alwaysOnCoreNames.union(activeTools.filter { !isModelHidden($0) })
     }
 
     /// The advertised tool contract for one turn, split into the part that can
@@ -424,37 +396,15 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// Canonical advertised order for `names`.
-    ///
-    /// `loadOrder` is the session's append-only tool_load order (from
-    /// `ChatSessionActiveTools.loadOrder`). Names absent from it — MCP and
-    /// registry rows, which are present from the session's first turn — sort
-    /// BEFORE the session-loaded run in incoming order, so a
-    /// later `tool_load` can only ever append.
-    package static func canonicalToolOrder(
-        _ names: some Sequence<String>,
-        loadOrder: [String] = []
-    ) -> ToolContractOrdering {
+    /// Canonical advertised order for `names`: the floor sorted by name, then
+    /// everything else in incoming order.
+    package static func canonicalToolOrder(_ names: some Sequence<String>) -> ToolContractOrdering {
         var seen = Set<String>()
         let ordered = names.filter { seen.insert($0).inserted }
-        let floor = ordered.filter { alwaysOnCoreNames.contains($0) }.sorted()
-        var rank: [String: Int] = [:]
-        for (index, name) in loadOrder.enumerated() where rank[name] == nil {
-            rank[name] = index
-        }
-        let appended = ordered
-            .filter { !alwaysOnCoreNames.contains($0) }
-            .enumerated()
-            .sorted { lhs, rhs in
-                // Unranked rows (MCP membership, pinned from the first turn)
-                // sit AHEAD of the session load run, so a load only appends.
-                let lrank = rank[lhs.element] ?? -1
-                let rrank = rank[rhs.element] ?? -1
-                if lrank != rrank { return lrank < rrank }
-                return lhs.offset < rhs.offset
-            }
-            .map(\.element)
-        return ToolContractOrdering(floor: floor, appended: appended)
+        return ToolContractOrdering(
+            floor: ordered.filter { alwaysOnCoreNames.contains($0) }.sorted(),
+            appended: ordered.filter { !alwaysOnCoreNames.contains($0) }
+        )
     }
 
     // Builder tools (agent-builder-tools, 2026-06-08). Gated on Full Mac
@@ -537,10 +487,10 @@ extension SwiftToolDispatcher {
     ]
 
     private static let macIntegrationToolNames: Set<String> = [
-        "mac_calendar_list_upcoming", "mac_reminders_list_due_today",
+        "mac_calendar_list_upcoming", "mac_calendar_calendars", "mac_calendar_free_busy", "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mac_reminders_update",
         "mac_notify", "mobile_notify", "phone_request", "mac_spotlight_search",
         "contacts_search", "contacts_create_or_update", "mail_list_recent",
-        "mail_search", "mail_send", "messages_recent_threads", "messages_send",
+        "mail_read_batch", "mail_triage_batch", "mail_search", "mail_send", "messages_recent_threads", "messages_send",
         "notes_search", "notes_create", "music_now_playing", "music_control",
         "mac_calendar_create_event", "mac_calendar_modify_event", "mac_calendar_delete_event",
         "mac_reminders_create", "mac_reminders_complete", "mac_reminders_delete", "mail_mark_read",
@@ -559,18 +509,18 @@ extension SwiftToolDispatcher {
         "agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel",
         "read_page",
         "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
-        "tool_catalog", "tool_load", "tool_unload", "tool_result_page", "request_interaction",
-        "list_skills", "read_skill", "save_skill", "craft_run", "recall_memory",
+        "tool_result_page", "request_interaction",
+        "list_skills", "read_skill", "save_skill", "recall_memory",
         "recall_search", "commit_memory", "search_kg", "search_chat_history",
         "session_search", "workspace", "work_context", "artifact_find", "get_persona_doc", "persona_read", "persona_write",
         "persona_append_section", "agent_introspect", "inner_state", "daemon_introspect",
-        "list_tools", "context_lookup", "context_expand", "scratchpad_read",
-        "recent_trace_summary", "time_now", "claude_message", "invoke_claude",
+        "context_lookup", "context_expand", "scratchpad_read",
+        "recent_trace_summary", "time_now", "claude_message",
         "codex_message", "invoke_codex", "omp_message", "agent_swarm",
         "market_status", "market_watchlists", "tradingview_watchlist", "market_quote",
         "x_status", "x_me", "x_search", "x_timeline", "x_user_tweets",
         "gmail_status", "gmail_search", "gmail_read", "google_calendar_status",
-        "google_calendar_list", "notion_status", "notion_search", "notion_read_page",
+        "google_calendar_list", "google_calendar_calendars", "google_calendar_free_busy", "google_calendar_read", "google_calendar_send_invitations", "notion_status", "notion_search", "notion_read_page",
         "github_status", "github_list_repos", "github_list_notifications",
         "github_get_repository", "github_read_repository_content", "github_list_commits",
         "github_list_issues", "github_search", "github_list_pull_requests",
@@ -594,8 +544,8 @@ extension SwiftToolDispatcher {
         "studio_canon", "studio_canon_resolve",
         "hold_view", "release_view",
         "memory_moments_pending", "memory_moment_review",
-        "list_memories", "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
-        "read_chat_message", "chat_conversations",
+        "forget_memory", "rebuild_knowledge_graph",
+        "read_chat_message",
     ]
 
 }

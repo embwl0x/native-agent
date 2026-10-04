@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 
 // Telegram keeps source-compatible names while the authoritative value model
 // and lifecycle reducer live in the surface-neutral NativeAgentCore target.
@@ -78,7 +79,7 @@ public enum TelegramTurnPresentationReducer {
             )
 
         case .toolUse(let name, _):
-            let action = TelegramPollLoop.progressMessage(for: event) ?? "Using tool: \(name)"
+            let action = TelegramPollLoop.progressMessage(for: event) ?? ToolActivityPresentation.progress(name)
             if let delegate = delegateName(forTool: name) {
                 return reduce(
                     state,
@@ -88,14 +89,14 @@ public enum TelegramTurnPresentationReducer {
             }
             return reduce(
                 state,
-                lifecycle: .tool(name: name, action: action),
+                lifecycle: .tool(name: ToolActivityPresentation.title(name), action: action),
                 at: instant
             )
 
         case .toolResult(let name, _):
             return reduce(
                 state,
-                lifecycle: .working(action: "Finished tool: \(name)"),
+                lifecycle: .working(action: ToolActivityPresentation.finished(name)),
                 at: instant
             )
 

@@ -665,6 +665,15 @@ extension MacSyncEngine {
     }
 
     // R11-N30: Delete archive/response files older than 7 days; cap directory at 50 MB.
+    private var incomingRejectedDirectory: URL {
+        (stateDataRootOverride ?? PersistenceCore.defaultDataRoot()).appendingPathComponent("icloud/_rejected", isDirectory: true)
+    }
+
+    private var retainedTransactionDirectories: [URL] {
+        [transactionDir, (stateDataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
+    }
+
     func pruneOldArchiveFiles() {
         // Capture the iCloud dirs on main, then do the listing + deletes OFF the
         // main actor — contentsOfDirectory on an iCloud-resident dir can block,
@@ -685,14 +694,19 @@ extension MacSyncEngine {
             Self.pruneCompletedUnarchivedMarkers(in: markerDir)
         }
         let rejectedDir = inboxDir?.appendingPathComponent("_rejected")
-        let dirs = [inboxDir, responsesDir, rejectedDir].compactMap { $0 }
+        let dirs = [inboxDir, responsesDir, rejectedDir, incomingRejectedDirectory].compactMap { $0 }
+        let transactionDirectories = retainedTransactionDirectories
         guard !dirs.isEmpty else { return }
         pruneDeadlineTask?.cancel()
+        // Deletions themselves trigger the watcher, which can replace this
+        // task before it returns. Keep that reschedule bounded too.
+        archiveRetentionRetryAfter = Date().addingTimeInterval(60)
         pruneDeadlineTask = Task { [weak self] in
-            await Task.detached(priority: .background) {
-                Self.pruneArchiveDirs(dirs)
+            let failed = await Task.detached(priority: .background) {
+                Self.pruneArchiveDirs(dirs, transactionDirectories: transactionDirectories)
             }.value
             guard !Task.isCancelled else { return }
+            self?.archiveRetentionRetryAfter = failed ? Date().addingTimeInterval(60) : nil
             self?.rescheduleArchiveRetentionDeadline()
         }
     }
@@ -703,15 +717,19 @@ extension MacSyncEngine {
     /// only when the directories are empty or metadata is unreadable.
     func rescheduleArchiveRetentionDeadline(now: Date = Date()) {
         let rejectedDir = inboxDir?.appendingPathComponent("_rejected")
-        let dirs = [inboxDir, responsesDir, rejectedDir].compactMap { $0 }
+        let dirs = [inboxDir, responsesDir, rejectedDir, incomingRejectedDirectory].compactMap { $0 }
+        let transactionDirectories = retainedTransactionDirectories
         guard isActive, !dirs.isEmpty else { return }
         pruneDeadlineTask?.cancel()
         pruneDeadlineTask = Task { [weak self] in
             let deadline = await Task.detached(priority: .background) {
-                Self.nextArchiveRetentionDeadline(in: dirs, after: now)
+                Self.nextArchiveRetentionDeadline(in: dirs, after: now, transactionDirectories: transactionDirectories)
             }.value
             guard !Task.isCancelled, let self, self.isActive else { return }
-            let next = deadline ?? now.addingTimeInterval(24 * 60 * 60)
+            let next = max(
+                deadline ?? now.addingTimeInterval(24 * 60 * 60),
+                self.archiveRetentionRetryAfter ?? .distantPast
+            )
             let delay = max(0, next.timeIntervalSince(Date()))
             if delay > 0 {
                 try? await Task.sleep(for: .seconds(delay))
@@ -723,7 +741,8 @@ extension MacSyncEngine {
 
     nonisolated static func nextArchiveRetentionDeadline(
         in dirs: [URL],
-        after now: Date
+        after now: Date,
+        transactionDirectories: [URL] = []
     ) -> Date? {
         let fm = FileManager.default
         let maxBytes = 50 * 1024 * 1024
@@ -748,7 +767,27 @@ extension MacSyncEngine {
             }
             if totalBytes > maxBytes { deadlines.append(now) }
         }
+        for transactionDirectory in transactionDirectories {
+            guard let items = try? fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: nil) else { continue }
+            for item in items {
+                if let due = terminalTransactionRetentionDeadline(at: item) {
+                    deadlines.append(max(due, now))
+                }
+            }
+        }
         return deadlines.min()
+    }
+
+    /// Keep active, uncertain action and unreadable rows. Recovered chats are
+    /// terminal even with an unknown outcome; thirty days exceed their window.
+    nonisolated static func terminalTransactionRetentionDeadline(at url: URL) -> Date? {
+        guard url.pathExtension == "json",
+              let data = try? Data(contentsOf: url),
+              let record = try? JSONDecoder().decode(ICloudTransactionRecord.self, from: data),
+              record.state == "completed" || record.state == "failed"
+                || (record.action == "chat" && record.state == "unknown"),
+              let updated = ISO8601DateFormatter().date(from: record.updatedAt) else { return nil }
+        return updated.addingTimeInterval(30 * 24 * 60 * 60)
     }
 
     /// Drops completion markers older than the retention floor. A marker only
@@ -778,10 +817,24 @@ extension MacSyncEngine {
     }
 
     /// nonisolated static — runs the prune scan/delete off the main actor.
-    nonisolated static func pruneArchiveDirs(_ dirs: [URL]) {
+    @discardableResult
+    nonisolated static func pruneArchiveDirs(_ dirs: [URL], transactionDirectories: [URL] = []) -> Bool {
         let fm = FileManager.default
-        let cutoff = Date().addingTimeInterval(-7 * 24 * 3600)
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-7 * 24 * 3600)
         let maxBytes: Int = 50 * 1024 * 1024  // 50 MB
+        var failed = false
+        func remove(_ url: URL) -> Bool {
+            do {
+                try fm.removeItem(at: url)
+                return true
+            } catch {
+                if isNoSuchFileError(error) { return true }
+                failed = true
+                NSLog("[MacSyncEngine] Archive cleanup failed for %@: %@", url.lastPathComponent, error.localizedDescription)
+                return false
+            }
+        }
         for dirURL in dirs {
             guard let items = try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey], options: []) else { continue }
             // Prune FILES ONLY — never delete subdirectories. inboxDir's listing
@@ -792,7 +845,7 @@ extension MacSyncEngine {
             // Delete files older than 7 days
             for url in items where !isDir(url) {
                 if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate, created < cutoff {
-                    try? fm.removeItem(at: url)
+                    _ = remove(url)
                 }
             }
             // Cap at 50 MB — delete oldest first
@@ -808,9 +861,17 @@ extension MacSyncEngine {
             for url in sorted {
                 guard totalSize > maxBytes else { break }
                 let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                try? fm.removeItem(at: url)
-                totalSize -= size
+                if remove(url) { totalSize -= size }
             }
         }
+        for transactionDirectory in transactionDirectories {
+            guard let items = try? fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: nil) else { continue }
+            for item in items {
+                if let due = terminalTransactionRetentionDeadline(at: item), due <= now {
+                    _ = remove(item)
+                }
+            }
+        }
+        return failed
     }
 }

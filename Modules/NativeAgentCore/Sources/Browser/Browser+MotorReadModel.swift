@@ -112,8 +112,8 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
 
         let opaqueID = CausalTransitionEvidence.opaqueIdentity(runID)
         let deadline: MotorActionDeadlineReadModel?
-        if let raw = run["deadlineSeconds"] {
-            guard normalized == "running", case .int(let seconds) = raw,
+        if normalized == "running", let raw = run["deadlineSeconds"] {
+            guard case .int(let seconds) = raw,
                   seconds > 0, seconds <= 86_400 else {
                 throw BrowserMotorReadModelError.invalidDeadline
             }

@@ -32,6 +32,7 @@ public struct NativeAgentEnginePorts: Sendable {
     public let chatPlatform: ChatToolPlatformPort
     public let catalogPosture: @Sendable () async -> OrganismBehaviorPosture?
     public let evolutionBridge: @Sendable (URL) -> any EvolutionToolBridge
+    public let connectorActionStatuses: @Sendable () async throws -> [String: String]
 
     public init(
         cognitionHost: any CognitionHost,
@@ -44,7 +45,8 @@ public struct NativeAgentEnginePorts: Sendable {
         interactions: any ToolInteractionResolving,
         chatPlatform: ChatToolPlatformPort,
         catalogPosture: @escaping @Sendable () async -> OrganismBehaviorPosture?,
-        evolutionBridge: @escaping @Sendable (URL) -> any EvolutionToolBridge
+        evolutionBridge: @escaping @Sendable (URL) -> any EvolutionToolBridge,
+        connectorActionStatuses: @escaping @Sendable () async throws -> [String: String]
     ) {
         self.cognitionHost = cognitionHost
         self.deviceSyncHost = deviceSyncHost
@@ -57,5 +59,6 @@ public struct NativeAgentEnginePorts: Sendable {
         self.chatPlatform = chatPlatform
         self.catalogPosture = catalogPosture
         self.evolutionBridge = evolutionBridge
+        self.connectorActionStatuses = connectorActionStatuses
     }
 }

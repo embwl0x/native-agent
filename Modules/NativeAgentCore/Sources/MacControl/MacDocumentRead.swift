@@ -179,7 +179,7 @@ public enum MacDocumentRead {
     /// Extensions read as plain text. Deliberately a list, not "anything that
     /// decodes": a `.png` decodes to garbage that LOOKS like a short document.
     public static let textExtensions: Set<String> = [
-        "txt", "text", "md", "markdown", "rtf", "csv", "tsv", "log",
+        "txt", "text", "md", "markdown", "csv", "tsv", "log",
         "json", "yaml", "yml", "toml", "xml", "html", "htm", "swift", "py",
         "js", "ts", "c", "h", "cpp", "hpp", "m", "mm", "sh", "rb", "go",
         "rs", "java", "kt", "sql", "ini", "conf", "cfg", "plist", "srt",
@@ -204,12 +204,14 @@ public enum MacDocumentRead {
         /// Secure fields SEEN (never read). Used only to phrase the refusal
         /// when a container turns out to be nothing but a password box.
         public let secureNodes: Int
+        public let didRedact: Bool
 
-        public init(lines: [String], nodes: Int, truncated: Bool, secureNodes: Int) {
+        public init(lines: [String], nodes: Int, truncated: Bool, secureNodes: Int, didRedact: Bool = false) {
             self.lines = lines
             self.nodes = nodes
             self.truncated = truncated
             self.secureNodes = secureNodes
+            self.didRedact = didRedact
         }
     }
 
@@ -221,16 +223,19 @@ public enum MacDocumentRead {
     /// glance's caps, and a glance's caps are what item 33 is about.
     public static func frameLines(
         source: any MacAXElementSource,
-        root: MacAXElementRef
+        root: MacAXElementRef,
+        characterLimit: Int = maxAccumulatedChars,
+        shouldStop: () -> Bool = { Task.isCancelled }
     ) -> Frame {
         var lines: [String] = []
+        var collected: [MacAXNode] = []
         var nodes = 0
         var secure = 0
         var truncated = false
-        var stack: [(ref: MacAXElementRef, depth: Int)] = [(root, 1)]
+        var stack: [(ref: MacAXElementRef, depth: Int, path: [Int])] = [(root, 1, [0])]
 
         while let item = stack.popLast() {
-            if nodes >= maxNodesPerFrame {
+            if shouldStop() || nodes >= maxNodesPerFrame {
                 truncated = true
                 break
             }
@@ -245,28 +250,67 @@ public enum MacDocumentRead {
                 secure += 1
                 continue
             }
-            if textRoles.contains(role) {
-                // The VALUE is the text; the title is the label. For a static
-                // text run macOS puts the words in whichever it likes, so take
-                // the value and fall back to the title rather than choosing.
-                let raw = nonEmpty(attributes.value) ?? nonEmpty(attributes.title)
-                if let raw {
-                    for line in split(raw) { lines.append(line) }
-                }
-            }
+            collected.append(MacAXNode(
+                attributes: attributes,
+                path: item.depth == 1 && role == "AXWindow" ? [] : item.path
+            ))
+            if shouldStop() { truncated = true; break }
             guard item.depth < maxDepthPerFrame else {
                 if source.childCount(of: item.ref) > 0 { truncated = true }
                 continue
             }
             let budget = max(0, maxNodesPerFrame - nodes)
             let total = source.childCount(of: item.ref)
+            if shouldStop() { truncated = true; break }
             let children = source.children(of: item.ref, limit: budget)
             if total > children.count { truncated = true }
-            for child in children.reversed() {
-                stack.append((child, item.depth + 1))
+            for (index, child) in children.enumerated().reversed() {
+                stack.append((child, item.depth + 1, item.path + [index]))
             }
         }
-        return Frame(lines: lines, nodes: nodes, truncated: truncated, secureNodes: secure)
+        // Keep captions and ancestry until the shared screen redactor has
+        // judged every line; values alone cannot identify a CVV.
+        let context = MacScreenViewTextRedaction.nodeSecretContext(collected)
+        let limit = max(0, min(characterLimit, maxAccumulatedChars))
+        var characters = 0
+        var didRedact = false
+        collection: for node in collected where textRoles.contains(node.attributes.role) {
+            let a = node.attributes
+            guard let raw = nonEmpty(a.value) ?? nonEmpty(a.title) else { continue }
+            if raw.count > maxCharsPerNode { truncated = true }
+            let enclosing = MacScreenViewTextRedaction.enclosingKinds(
+                forNodeAt: a.frame, path: node.path, among: context.enclosingCaptions
+            )
+            for line in split(raw) {
+                let redacted: JSONValue
+                if a.value != nil, MacScreenViewBuilder.isSecretField(role: a.role, subrole: a.subrole, label: a.title) {
+                    redacted = MacScreenViewTextRedaction.redactedText(line, reason: "secure_field")
+                } else {
+                    redacted = MacScreenViewTextRedaction.redactedNodeString(
+                        line, valueChars: maxCharsPerNode, frame: a.frame,
+                        under: a.value == nil ? nil : a.title, enclosing: enclosing, context: context
+                    )
+                }
+                let text: String
+                if case .string(let safe) = redacted {
+                    text = safe
+                } else {
+                    didRedact = true
+                    let reason: String
+                    if case .object(let object) = redacted,
+                       case .string(let value)? = object["reason"] { reason = value }
+                    else { reason = "secret" }
+                    text = "[redacted: \(reason)]"
+                }
+                let remaining = limit - characters - (lines.isEmpty ? 0 : 1)
+                guard remaining > 0 else { truncated = true; break collection }
+                let kept = String(text.prefix(remaining))
+                characters += kept.count + (lines.isEmpty ? 0 : 1)
+                lines.append(kept)
+                if kept.count < text.count { truncated = true; break collection }
+            }
+        }
+        return Frame(lines: lines, nodes: nodes, truncated: truncated, secureNodes: secure, didRedact: didRedact)
     }
 
     static func nonEmpty(_ raw: String?) -> String? {
@@ -316,12 +360,28 @@ public enum MacDocumentRead {
         public private(set) var lines: [String] = []
         public private(set) var frames = 0
         public private(set) var sawGap = false
+        public private(set) var characters = 0
+        public private(set) var truncated = false
         private var previousFrame: [String] = []
 
         public init() {}
 
         public var text: String { lines.joined(separator: "\n") }
-        public var characters: Int { text.count }
+        public var remainingCharacters: Int { max(0, maxAccumulatedChars - characters) }
+
+        private mutating func append(_ fresh: [String]) -> Int {
+            var added = 0
+            for line in fresh {
+                let remaining = remainingCharacters - (lines.isEmpty ? 0 : 1)
+                guard remaining > 0 else { truncated = true; break }
+                let kept = String(line.prefix(remaining))
+                characters += kept.count + (lines.isEmpty ? 0 : 1)
+                lines.append(kept)
+                added += 1
+                if kept.count < line.count { truncated = true; break }
+            }
+            return added
+        }
 
         public mutating func absorb(_ frame: [String]) -> Absorption {
             frames += 1
@@ -330,9 +390,9 @@ public enum MacDocumentRead {
                 return .nothingNew
             }
             guard !lines.isEmpty else {
-                lines = frame
+                let added = append(frame)
                 previousFrame = frame
-                return .added(frame.count)
+                return .added(added)
             }
             // 1. The frame is byte-identical to the last one: nothing moved.
             if frame == previousFrame {
@@ -358,10 +418,10 @@ public enum MacDocumentRead {
                 return result
             }
             // 4. Genuinely no shared line. Keep the content and SAY so.
-            lines.append(contentsOf: stripped)
+            let added = append(stripped)
             previousFrame = frame
             sawGap = true
-            return .addedWithGap(stripped.count)
+            return .addedWithGap(added)
         }
 
         private mutating func mergeOnOverlap(_ frame: [String]) -> Absorption? {
@@ -372,8 +432,7 @@ public enum MacDocumentRead {
             where Array(tail.suffix(k)) == Array(frame.prefix(k)) {
                 let fresh = Array(frame.dropFirst(k))
                 guard !fresh.isEmpty else { return .nothingNew }
-                lines.append(contentsOf: fresh)
-                return .added(fresh.count)
+                return .added(append(fresh))
             }
             return nil
         }
@@ -463,10 +522,15 @@ public enum MacDocumentRead {
         }
     }
 
-    /// UTF-8 first, then the two encodings a Mac actually produces. A file that
+    /// Recognize UTF-16 byte order before rejecting binary NULs. A file that
     /// decodes to a run of NULs is a binary that happened to have a text
     /// extension, and saying so beats returning mojibake as a document.
     static func decodeText(_ data: Data) -> String? {
+        let bom = Array(data.prefix(2))
+        if bom == [0xff, 0xfe] || bom == [0xfe, 0xff] {
+            guard let utf16 = String(data: data, encoding: .utf16), !utf16.contains("\0") else { return nil }
+            return utf16
+        }
         let head = data.prefix(4096)
         if head.contains(0) { return nil }
         if let utf8 = String(data: data, encoding: .utf8) { return utf8 }

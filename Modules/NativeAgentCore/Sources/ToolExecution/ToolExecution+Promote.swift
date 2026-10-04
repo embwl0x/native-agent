@@ -118,11 +118,8 @@ public enum SwiftToolValidator {
         "ctypes", "multiprocessing", "pty", "shutil",
         "signal", "socket", "subprocess",
     ]
-    // AUDIT FIX (2026-07-21): Swift-shaped dangerous-symbol rules. The scan
-    // below was Python-syntax-only, but ToolRunSandbox executes `tool.swift`
-    // via /usr/bin/swift with NO sandbox-exec confinement — a Swift
-    // entrypoint carrying Foundation.Process / FileManager writes / Darwin /
-    // dlopen sailed through validation untouched. Python rules are unchanged.
+    // These scans provide early validation feedback. Declared capabilities
+    // are enforced independently by the subprocess's Seatbelt profile.
     /// Swift import roots that hard-fail (direct syscall / FFI surface,
     /// the Swift analogue of Python's `ctypes`).
     public static let dangerousSwiftImports: Set<String> = ["Darwin"]
@@ -159,10 +156,11 @@ public enum SwiftToolValidator {
 
         // Rule (c1): permissions must all be known.
         var perms: [String] = []
-        if case .array(let arr)? = manifest["permissions"] {
-            for v in arr {
-                if case .string(let s) = v { perms.append(s) }
-            }
+        if case .array(let arr)? = manifest["permissions"],
+           arr.allSatisfy({ if case .string = $0 { return true }; return false }) {
+            perms = arr.compactMap { if case .string(let s) = $0 { return s }; return nil }
+        } else {
+            errors.append("Manifest permissions must be an array of strings.")
         }
         let permSet = Set(perms)
         let unknownPerms = permSet.subtracting(knownToolPermissions)
@@ -336,11 +334,8 @@ public actor ToolPromoteEngine {
         afterDirectorySwapForTesting = hook
     }
 
-    /// Mirrors the retired daemon `RISKY_TOOL_PERMISSIONS`. KEEP IN SYNC.
-    public static let riskyToolPermissions: Set<String> = [
-        "app_data_write", "shell", "network_public",
-        "calendar_write", "contacts_write", "location", "mac_control",
-    ]
+    public static let riskyToolPermissions = SwiftToolValidator.knownToolPermissions
+        .subtracting(["app_data_read"])
 
     /// `validator`: pass nil (the default) to validate with the REAL
     /// SwiftToolValidator, resolved per-promote against the proposal dir.

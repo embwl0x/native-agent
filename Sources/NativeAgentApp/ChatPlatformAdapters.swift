@@ -240,8 +240,11 @@ struct TelegramNumericIDParseResult: Equatable {
 }
 
 struct TelegramAllowlistPresentation: Equatable {
-    let acceptedCount: Int
+    let chatIDs: Set<String>
+    let userIDs: Set<String>
     let invalidTokens: [String]
+
+    var acceptedCount: Int { chatIDs.union(userIDs).count }
 
     var isValidAndConfigured: Bool { acceptedCount > 0 && invalidTokens.isEmpty }
     var statusLabel: String {
@@ -253,7 +256,8 @@ func telegramAllowlistPresentation(chats: String, users: String) -> TelegramAllo
     let chat = parseTelegramNumericIDs(chats)
     let user = parseTelegramNumericIDs(users)
     return TelegramAllowlistPresentation(
-        acceptedCount: Set(chat.canonicalIDs + user.canonicalIDs).count,
+        chatIDs: Set(chat.canonicalIDs),
+        userIDs: Set(user.canonicalIDs),
         invalidTokens: chat.invalidTokens + user.invalidTokens
     )
 }
@@ -264,12 +268,16 @@ func telegramAuthorizationHasUnsavedChanges(
     allowlist: TelegramAllowlistPresentation,
     savedEnabled: Bool?,
     savedRequireMention: Bool?,
-    savedAcceptedCount: Int?
+    savedChatIDs: [String]?,
+    savedUserIDs: [String]?
 ) -> Bool {
-    guard let savedEnabled, let savedRequireMention, let savedAcceptedCount else { return true }
+    guard let savedEnabled, let savedRequireMention, let savedChatIDs, let savedUserIDs else { return true }
+    let saved = telegramAllowlistPresentation(chats: savedChatIDs.joined(separator: ","), users: savedUserIDs.joined(separator: ","))
     return enabled != savedEnabled
         || requireMention != savedRequireMention
-        || allowlist.acceptedCount != savedAcceptedCount
+        || allowlist.chatIDs != saved.chatIDs
+        || allowlist.userIDs != saved.userIDs
+        || !saved.invalidTokens.isEmpty
         || !allowlist.invalidTokens.isEmpty
 }
 

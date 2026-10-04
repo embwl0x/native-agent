@@ -7,6 +7,7 @@ public enum ConnectorOAuthRegistry {
         provider: String,
         createIfMissing: Bool,
         prepare: @escaping @Sendable () async throws -> Void = {},
+        publish: @escaping @Sendable (@Sendable () async throws -> Void) async throws -> Void = { try await $0() },
         mutate: @escaping @Sendable (inout [String: JSONValue]) -> Void
     ) async throws -> [String: JSONValue] {
         let providerID = normalizedConnectorID(provider)
@@ -31,7 +32,8 @@ public enum ConnectorOAuthRegistry {
                     rows[idx] = .object(entry)
                     _ = try checkedConnectorRows(from: .array(rows))
                     try await prepare()
-                    try await persistence.writeJSON(.array(rows), to: path)
+                    let updated = JSONValue.array(rows)
+                    try await publish { try await persistence.writeJSON(updated, to: path) }
                     return entry
                 }
                 guard createIfMissing else {
@@ -44,7 +46,8 @@ public enum ConnectorOAuthRegistry {
                 rows.append(.object(entry))
                 _ = try checkedConnectorRows(from: .array(rows))
                 try await prepare()
-                try await persistence.writeJSON(.array(rows), to: path)
+                let updated = JSONValue.array(rows)
+                try await publish { try await persistence.writeJSON(updated, to: path) }
                 return entry
             case .object(var object):
                 var entry: [String: JSONValue]
@@ -67,7 +70,8 @@ public enum ConnectorOAuthRegistry {
                 object[providerID] = .object(entry)
                 _ = try checkedConnectorRows(from: .object(object))
                 try await prepare()
-                try await persistence.writeJSON(.object(object), to: path)
+                let updated = JSONValue.object(object)
+                try await publish { try await persistence.writeJSON(updated, to: path) }
                 return entry
             default:
                 throw PersistenceCoreError.ioFailure("Connector registry is not an array or object")

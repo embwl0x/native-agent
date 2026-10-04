@@ -2,15 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-/// What woke the dream. `schedule` is the 03:30 America/Chicago daily job —
-/// the integrity fallback. `pressure` is the organism's own identity-Dream lane
-/// firing once its residual sleep pressure, quiet window and 24-hour refractory
-/// all resolved (NORTHSTAR clause 4, 2026-09-01). `manual` is a person asking
-/// for a pass now, from the Dreams tab or a tool. Receipts carry it so a dream's
+/// What woke the dream. `schedule` is the 03:30 America/Chicago daily job.
+/// `manual` is a person asking for a pass now, from the Dreams tab or a tool. Receipts carry it so a dream's
 /// provenance is never guessed from its timestamp.
 public enum DreamTrigger: String, Sendable, Equatable, CaseIterable {
     case schedule
-    case pressure
     case manual
 }
 
@@ -23,7 +19,7 @@ public struct DreamReport: Sendable, Equatable {
     /// Set when a run wrote nothing for a reason that is NOT a failure, so the
     /// scheduler's existing skipped-outcome shape can say WHICH honest reason:
     /// `already_dreamt` (the target day's entry exists — typically because a
-    /// pressure-fired dream beat the 03:30 job to it) or `no_new_material`.
+    /// manual dream beat the 03:30 job to it) or `no_new_material`.
     public var skipReason: String?
 
     public init(

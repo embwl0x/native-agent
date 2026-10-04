@@ -77,7 +77,7 @@ public enum SimpleViewMode {
         let defaults = UserDefaults.standard
         return resolved(defaults.string(forKey: key) ?? "") == simple
     }
-    public static let noPagesNote = "No pages in Simple view; raise request_interaction for setup."
+    public static let noPagesNote = "Simple view is on screen and has no pages: set_page switches it to Advanced, so use it only when User asked to see the page; otherwise tell him where it is."
 
     /// Write the first-launch answer down, so the chats a new install goes on
     /// to make never flip it to Advanced later.

@@ -19,7 +19,7 @@ public struct WorkshopScoreView: Equatable, Sendable {
 
 /// The two hard caps a pursuit lives under, with the current draw against each.
 public struct WorkshopBudget: Equatable, Sendable {
-    public let sessionsUsed: Int      // reservations.count over the pursuit's life
+    public let sessionsUsed: Int      // all reservations over the pursuit's life
     public let maxSessions: Int       // pursuit.maxSessions (its doneLooksLike budget)
     public let todayCount: Int        // reservations reserved today
     public let perDayCap: Int         // SwiftNativeDeskStore.maxWorkSessionsPerPursuitPerDay
@@ -73,9 +73,9 @@ public struct WorkshopPursuitRow: Identifiable, Equatable, Sendable {
 
         let budget: WorkshopBudget? = p.map { pursuit in
             WorkshopBudget(
-                sessionsUsed: pursuit.reservations.count,
+                sessionsUsed: pursuit.sessionsUsed,
                 maxSessions: pursuit.maxSessions,
-                todayCount: pursuit.reservations.filter { $0.day == today }.count,
+                todayCount: pursuit.workSessions(on: today),
                 perDayCap: SwiftNativeDeskStore.maxWorkSessionsPerPursuitPerDay
             )
         }
@@ -145,7 +145,7 @@ public struct WorkshopObservatoryModel: Equatable, Sendable {
         // pursuit is excluded — it's closed, nothing to veto.) Ordered by live
         // score, highest first, so the pursuit the pump would pick sits on top.
         let openPursuits = state.items
-            .filter { $0.origin == .agent && !$0.status.isTerminal }
+            .filter { $0.isPursuit && !$0.status.isTerminal }
             .map { WorkshopPursuitRow.from(item: $0, now: now) }
             .sorted { ($0.score?.total ?? -.infinity) > ($1.score?.total ?? -.infinity) }
 
@@ -171,11 +171,9 @@ public struct WorkshopObservatoryModel: Equatable, Sendable {
                 cadenceMode: item.cadence.mode.rawValue, nextDue: next, isDue: due)
         }
 
-        // Global sessions-today: EVERY pursuit's reservations (terminal ones still
-        // count — the store measures the 6/day cap that way).
-        let sessionsToday = state.items.reduce(0) { acc, item in
-            acc + (item.pursuit?.reservations.filter { $0.day == today }.count ?? 0)
-        }
+        // Global sessions-today: both Workshop lanes, including retired slots
+        // and archived items — the same durable charges as the store's 6/day cap.
+        let sessionsToday = state.workSessions(on: today)
 
         return WorkshopObservatoryModel(
             openPursuits: openPursuits,
@@ -194,6 +192,8 @@ public struct WorkshopReceiptRow: Identifiable, Equatable, Sendable {
     public let handle: String
     public let reservationId: String
     public let status: String
+    public let isDirectedTask: Bool
+    public let verificationStatus: String?
     public let summary: String
     public let model: String?
     public let artifactCount: Int
@@ -206,6 +206,11 @@ public struct WorkshopReceiptRow: Identifiable, Equatable, Sendable {
               case .string(let handle)? = obj["handle"],
               case .string(let reservationId)? = obj["reservationId"],
               case .string(let status)? = obj["status"] else { return nil }
+        let isDirectedTask = obj["kind"] == .string("directed_task")
+        let verificationStatus: String? = {
+            if case .string(let status)? = obj["verificationStatus"] { return status }
+            return nil
+        }()
         let summary: String = { if case .string(let s)? = obj["summary"] { return s } else { return "" } }()
         let model: String? = { if case .string(let m)? = obj["model"] { return m } else { return nil } }()
         let artifactCount: Int = {
@@ -215,6 +220,7 @@ public struct WorkshopReceiptRow: Identifiable, Equatable, Sendable {
         let ts: String = { if case .string(let t)? = obj["ts"] { return t } else { return "" } }()
         return WorkshopReceiptRow(
             handle: handle, reservationId: reservationId, status: status,
+            isDirectedTask: isDirectedTask, verificationStatus: verificationStatus,
             summary: summary, model: model, artifactCount: artifactCount, ts: ts)
     }
 }
@@ -226,46 +232,25 @@ public enum WorkshopReceiptsState: Equatable, Sendable {
     case rows([WorkshopReceiptRow])
 }
 
-/// Reads + bounds the workshop receipts feed. The parsing is a pure function over
-/// `[String]` lines so it is unit-testable without disk.
+/// Reads a bounded tail of the workshop receipts feed.
 public enum WorkshopReceiptsReader {
     /// Newest-first bound — a busy week can't bloat the panel.
     public static let rowLimit = 20
     public static let maxErrorChars = 240
 
-    /// Pure: fold raw JSONL lines (file/append order, newest LAST) into the panel
-    /// state, newest FIRST and bounded. An empty feed → `.rows([])` (no sessions
-    /// yet, honest). Non-empty bytes that yield ZERO parseable rows → `.unavailable`
-    /// (something is on disk but unreadable — never render that as "no sessions").
-    public static func rows(fromLines lines: [String], limit: Int = rowLimit) -> WorkshopReceiptsState {
-        let nonEmpty = lines
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !nonEmpty.isEmpty else { return .rows([]) }
-        let parsed = nonEmpty.compactMap { line -> WorkshopReceiptRow? in
-            guard let data = line.data(using: .utf8),
-                  let value = try? JSONValue.parse(data) else { return nil }
-            return WorkshopReceiptRow.fromJSON(value)
-        }
-        guard !parsed.isEmpty else {
-            return .unavailable("\(nonEmpty.count) receipt row(s) present but none could be parsed")
-        }
-        // File order is chronological (append) — newest last. Reverse for
-        // newest-first, then bound.
-        let newestFirst = Array(parsed.reversed().prefix(max(0, limit)))
-        return .rows(newestFirst)
-    }
-
     /// Load from the receipts feed. A MISSING file is an honest empty read
     /// (`.rows([])`) — no sessions have run. A read that THROWS (IO error, bad
     /// permissions) is `.unavailable`, never a zero.
-    public static func load(receiptsPath: URL, limit: Int = rowLimit) -> WorkshopReceiptsState {
-        guard FileManager.default.fileExists(atPath: receiptsPath.path) else {
-            return .rows([])
-        }
+    public static func load(receiptsPath: URL, limit: Int = rowLimit) async -> WorkshopReceiptsState {
         do {
-            let contents = try String(contentsOf: receiptsPath, encoding: .utf8)
-            return rows(fromLines: contents.components(separatedBy: "\n"), limit: limit)
+            let receipt = try await SwiftNativePersistenceCore().tailJSONLReadReceipt(
+                receiptsPath, limit: min(rowLimit, max(1, limit)), maxBytes: 1_048_576
+            )
+            let parsed = receipt.rows.compactMap(WorkshopReceiptRow.fromJSON)
+            if parsed.isEmpty, receipt.bytesRead > 0 {
+                return .unavailable("The recent workshop receipts could not be read.")
+            }
+            return .rows(Array(parsed.reversed().prefix(max(0, limit))))
         } catch {
             return .unavailable(String("\(error)".prefix(maxErrorChars)))
         }
@@ -302,7 +287,7 @@ public struct WorkshopObservatorySnapshot: Equatable, Sendable {
             model = nil
             deskUnavailable = String("\(error)".prefix(WorkshopReceiptsReader.maxErrorChars))
         }
-        let receipts = WorkshopReceiptsReader.load(receiptsPath: receiptsPath)
+        let receipts = await WorkshopReceiptsReader.load(receiptsPath: receiptsPath)
         return WorkshopObservatorySnapshot(
             model: model, deskUnavailable: deskUnavailable, receipts: receipts)
     }

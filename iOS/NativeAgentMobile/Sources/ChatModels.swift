@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import PhotosUI
 import NativeAgentShared
 
 // MARK: - Models
@@ -74,6 +75,9 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     /// Tools/skills this assistant turn used (assistant messages only). Drives
     /// the live flip-box while streaming and the collapsed summary when done.
     var toolEvents: [ToolEvent] = []
+    /// A settled bridge receipt that the Mac transcript has not yet published.
+    /// Persist with the row so switching chats cannot expire its protection.
+    var awaitingMacTranscript: Bool = false
 
     init(
         id: UUID = UUID(),
@@ -81,7 +85,8 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         text: String,
         isStreaming: Bool = false,
         attachments: [ChatAttachmentSummary] = [],
-        toolEvents: [ToolEvent] = []
+        toolEvents: [ToolEvent] = [],
+        awaitingMacTranscript: Bool = false
     ) {
         self.id = id
         self.role = role
@@ -89,10 +94,11 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         self.isStreaming = isStreaming
         self.attachments = attachments
         self.toolEvents = toolEvents
+        self.awaitingMacTranscript = awaitingMacTranscript
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, role, text, isStreaming, attachments, toolEvents
+        case id, role, text, isStreaming, attachments, toolEvents, awaitingMacTranscript
     }
 
     init(from decoder: Decoder) throws {
@@ -103,6 +109,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         isStreaming = try c.decodeIfPresent(Bool.self, forKey: .isStreaming) ?? false
         attachments = try c.decodeIfPresent([ChatAttachmentSummary].self, forKey: .attachments) ?? []
         toolEvents = try c.decodeIfPresent([ToolEvent].self, forKey: .toolEvents) ?? []
+        awaitingMacTranscript = try c.decodeIfPresent(Bool.self, forKey: .awaitingMacTranscript) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -113,6 +120,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         try c.encode(isStreaming, forKey: .isStreaming)
         try c.encode(attachments, forKey: .attachments)
         if !toolEvents.isEmpty { try c.encode(toolEvents, forKey: .toolEvents) }
+        if awaitingMacTranscript { try c.encode(true, forKey: .awaitingMacTranscript) }
     }
 }
 
@@ -120,6 +128,7 @@ struct PendingPhotoAttachment: Identifiable, Equatable {
     let id: String
     var attachment: MultimodalAttachment
     var thumbnail: UIImage
+    var pickerItem: PhotosPickerItem? = nil
 
     static func == (lhs: PendingPhotoAttachment, rhs: PendingPhotoAttachment) -> Bool {
         lhs.id == rhs.id
@@ -151,8 +160,9 @@ struct ChatSessionTab: Identifiable, Hashable {
     }
 }
 
-/// The Mac window's current chat, published as `chat_anchor.json` in the same
-/// `.core` snapshot group as `sessions.json`. The phone's main chat follows it.
+/// The conversation User is in — the session he last sent to, at any door —
+/// published as `chat_anchor.json` in the same `.core` snapshot group as
+/// `sessions.json`. The phone's main chat and phone Siri follow it.
 ///
 /// Field-for-field mirror of `PersistenceCore.ConversationAnchorPin`, declared
 /// here because the phone links only `NativeAgentShared`. `source` and
@@ -172,9 +182,8 @@ struct ConversationAnchorPin: Codable, Equatable, Sendable {
     }
 }
 
-/// The phone's half of the anchor rules — the same two pure functions the Mac
-/// consumes (`ConversationAnchor.merged` / `.shouldAdoptAnchor`), over the
-/// phone's own row type.
+/// The phone's anchor-row merge, matching `ConversationAnchor.merged` over
+/// the phone's own row type.
 enum MobileConversationAnchor {
     /// The anchor at the FRONT of the pinned rows, never duplicated.
     ///
@@ -186,24 +195,6 @@ enum MobileConversationAnchor {
         return [anchor] + pinnedSessions.filter { $0.id != anchor.id }
     }
 
-    /// Whether the chat screen should adopt the anchor as its selection.
-    ///
-    /// THE RULE, copied from the Mac verbatim: default to the anchor, but never
-    /// take the human off a session they chose. `liveSessionIds` keeps a stale
-    /// anchor from selecting a session the phone cannot show.
-    static func shouldAdoptAnchor(
-        anchorSessionId: String?,
-        currentSelection: String?,
-        userChoseThisLaunch: Bool,
-        liveSessionIds: Set<String>
-    ) -> Bool {
-        guard !userChoseThisLaunch else { return false }
-        guard let anchor = anchorSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !anchor.isEmpty,
-              liveSessionIds.contains(anchor) else { return false }
-        let selection = (currentSelection ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return selection != anchor
-    }
 }
 
 /// Whether the human has explicitly picked a chat session since this launch.

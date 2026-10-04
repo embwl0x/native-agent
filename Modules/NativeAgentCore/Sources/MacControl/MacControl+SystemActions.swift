@@ -74,7 +74,9 @@ extension SwiftNativeMacControl {
         if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
-        let content = body.stringValue("content") ?? ""
+        guard case .string(let content)? = body["content"] else {
+            throw MacControlError.missingField("content")
+        }
         var append = false
         if case .bool(let b) = body["append"] ?? .null { append = b }
         let started = now()
@@ -166,10 +168,10 @@ extension SwiftNativeMacControl {
         guard let dst = body.stringValue("dst"), !dst.isEmpty else {
             throw MacControlError.missingField("dst")
         }
-        if let reason = MacControlSensitivePathFence.reason(forPath: src) {
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: src) {
             throw MacControlError.sensitivePathDenied(reason)
         }
-        if let reason = MacControlSensitivePathFence.reason(forPath: dst) {
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: dst) {
             throw MacControlError.sensitivePathDenied(reason)
         }
         if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: src) {
@@ -183,10 +185,10 @@ extension SwiftNativeMacControl {
             .resolvingSymlinksInPath()
         let dstURL = URL(fileURLWithPath: (dst as NSString).expandingTildeInPath)
             .resolvingSymlinksInPath()
-        if let reason = MacControlSensitivePathFence.reason(forPath: srcURL.path) {
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: srcURL.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
-        if let reason = MacControlSensitivePathFence.reason(forPath: dstURL.path) {
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: dstURL.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
         if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: srcURL.path) {
@@ -223,7 +225,7 @@ extension SwiftNativeMacControl {
         guard let path = body.stringValue("path"), !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
-        if let reason = MacControlSensitivePathFence.reason(forPath: path) {
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
         if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: path) {
@@ -232,7 +234,7 @@ extension SwiftNativeMacControl {
         let started = now()
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
             .resolvingSymlinksInPath()
-        if let reason = MacControlSensitivePathFence.reason(forPath: url.path) {
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: url.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
         if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: url.path) {
@@ -311,6 +313,19 @@ extension SwiftNativeMacControl {
     func handleFocusApp(_ body: [String: JSONValue]) async throws -> MacControlResult {
         if let rawPid = Self.intValue(body, "pid") {
             return await handleFocusExact(pid: Int32(clamping: rawPid), body: body)
+        }
+        if let continuation = MacWorkContinuation.current, continuation.isPending {
+            if let refusal = continuation.refusal() {
+                return MacControlResult(ok: false, action: "focus_app",
+                    output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
+                    durationMs: 0, viaSwift: true)
+            }
+            guard let app = continuation.app else {
+                return MacControlResult(ok: false, action: "focus_app",
+                    output: .object(["message": .string(continuation.modelContext)]), error: "continuation_unavailable",
+                    durationMs: 0, viaSwift: true)
+            }
+            return await handleFocusExact(pid: app.processIdentifier, body: body)
         }
         let app = try requestedAppName(body)
         let started = now()
@@ -403,16 +418,22 @@ extension SwiftNativeMacControl {
             // back, NSRunningApplication.activate is cooperative on macOS 14+
             // and the raised app never yields, so NativeAgent was never put
             // back (3 of 3 in her traces, 09-24). NSApp's own call still takes it.
-            await MainActor.run { NSApplication.shared.activate(ignoringOtherApps: true) }
-            if accessibilitySource.frontmostApp()?.processIdentifier != pid { _ = app.activate() }
+            let binding = MacDriverContext.binding
+            await MainActor.run {
+                if binding?.allowsEmission == true { NSApplication.shared.activate(ignoringOtherApps: true) }
+            }
+            if accessibilitySource.frontmostApp()?.processIdentifier != pid, binding?.allowsEmission == true { _ = app.activate() }
             for _ in 0..<20 where accessibilitySource.frontmostApp()?.processIdentifier != pid {
                 try? await Task.sleep(nanoseconds: 50_000_000)
             }
             return finish("focused")
         }
         let exact = body.stringValue("frame_id")
-        var identity: MacAXWindowIdentity?
-        if let exact {
+        let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
+        var identity = continuation?.window
+        if continuation != nil {
+            guard identity?.pid == pid else { return finish("continuation_target_mismatch") }
+        } else if let exact {
             identity = await lookFrameStore.frame(frameId: exact)?.windowIdentity
             guard let recorded = identity, recorded.pid == pid else { return finish("front_window_changed") }
         } else if case .object(let recorded)? = body["window"] {
@@ -431,7 +452,7 @@ extension SwiftNativeMacControl {
            case .matched(let hit, _) = MacAXWindowIdentity.match(identity, among: windows.map { ($0, $0.identity) }) {
             chosen = hit
             windowMatched = true
-        } else if exact != nil {
+        } else if exact != nil || continuation != nil {
             return finish("front_window_changed")
         } else {
             chosen = windows.first
@@ -440,11 +461,15 @@ extension SwiftNativeMacControl {
             // Putting back an app that had no window (no window asked for):
             // activate that exact pid; `finish` verifies it is frontmost.
             guard identity == nil, exact == nil else { return finish("app_has_no_window") }
+            guard MacDriverContext.binding?.allowsEmission == true else { return finish("yielded_to_user") }
             _ = app.activate()
             for _ in 0..<20 where accessibilitySource.frontmostApp()?.processIdentifier != pid {
                 try? await Task.sleep(nanoseconds: 50_000_000)
             }
             return finish("focused", ["window_matched": .bool(false)])
+        }
+        if let refusal = continuation?.refusal() {
+            return finish("continuation_unavailable", ["message": .string(refusal)])
         }
         let outcome = accessibilityActSource.raise(chosen)
         guard outcome == .performed else {
@@ -581,6 +606,8 @@ extension SwiftNativeMacControl {
                 "results": .array(lines.map { .string($0) }),
                 "count": .int(Int64(lines.count)),
                 "timed_out": .bool(result.timedOut),
+                "stdout_truncated": .bool(result.stdoutTruncated),
+                "stderr_truncated": .bool(result.stderrTruncated),
             ]),
             error: result.timedOut
                 ? "spotlight timed out"
@@ -616,6 +643,8 @@ extension SwiftNativeMacControl {
                 "stderr": .string(String(result.stderr.prefix(2000))),
                 "exit_code": .int(Int64(result.exitCode)),
                 "timed_out": .bool(result.timedOut),
+                "stdout_truncated": .bool(result.stdoutTruncated || result.stdout.count > 4000),
+                "stderr_truncated": .bool(result.stderrTruncated || result.stderr.count > 2000),
             ]),
             error: result.timedOut
                 ? "shell timed out"

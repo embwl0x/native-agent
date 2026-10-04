@@ -81,34 +81,16 @@ public actor RealMemoryStorage: MemoryV2Storage {
     }
 
     public func insertMemory(_ record: MemoryRecord, embedding: [Float]) async throws {
-        let stored = StoredMemory(
-            id: record.id,
-            content: record.text,
-            personaId: Self.personaID(from: record),
-            source: record.sourceRunId,
-            confidence: record.confidence ?? 1.0,
-            createdAt: record.createdAt,
-            updatedAt: record.updatedAt ?? record.createdAt,
-            embedding: embedding.isEmpty ? nil : embedding,
-            status: record.status ?? "active",
-            metadata: record.extras
-        )
+        let stored = MemoryStorageBridge.toStoredMemory(
+            record, embedding: embedding.isEmpty ? nil : embedding, embeddingEpoch: nil,
+            defaultPersonaID: Self.personaID(from: record))
         _ = try await storage.insertMemory(stored)
     }
 
     public func upsertMemory(_ record: MemoryRecord, embedding: [Float]) async throws -> Bool {
-        let stored = StoredMemory(
-            id: record.id,
-            content: record.text,
-            personaId: Self.personaID(from: record),
-            source: record.sourceRunId,
-            confidence: record.confidence ?? 1.0,
-            createdAt: record.createdAt,
-            updatedAt: record.updatedAt ?? record.createdAt,
-            embedding: embedding.isEmpty ? nil : embedding,
-            status: record.status ?? "active",
-            metadata: record.extras
-        )
+        let stored = MemoryStorageBridge.toStoredMemory(
+            record, embedding: embedding.isEmpty ? nil : embedding, embeddingEpoch: nil,
+            defaultPersonaID: Self.personaID(from: record))
         if try await storage.memory(id: stored.id) == nil {
             _ = try await storage.insertMemory(stored)
             return true
@@ -121,6 +103,11 @@ public actor RealMemoryStorage: MemoryV2Storage {
                 confidence: stored.confidence,
                 embedding: stored.embedding,
                 status: stored.status,
+                lifecycle: stored.lifecycle,
+                validFrom: stored.validFrom,
+                validTo: stored.validTo,
+                observedAt: stored.observedAt,
+                evidence: stored.evidence,
                 metadata: stored.metadata
             )
         )
@@ -133,18 +120,9 @@ public actor RealMemoryStorage: MemoryV2Storage {
         _ record: MemoryRecord,
         embedding: [Float]
     ) async throws -> MemoryLegacyImportOutcome {
-        let stored = StoredMemory(
-            id: record.id,
-            content: record.text,
-            personaId: Self.personaID(from: record),
-            source: record.sourceRunId,
-            confidence: record.confidence ?? 1.0,
-            createdAt: record.createdAt,
-            updatedAt: record.updatedAt ?? record.createdAt,
-            embedding: embedding.isEmpty ? nil : embedding,
-            status: record.status ?? "active",
-            metadata: record.extras
-        )
+        let stored = MemoryStorageBridge.toStoredMemory(
+            record, embedding: embedding.isEmpty ? nil : embedding, embeddingEpoch: nil,
+            defaultPersonaID: Self.personaID(from: record))
         switch try await storage.importLegacyMemory(stored) {
         case .inserted: return .inserted
         case .refreshedEmpty: return .refreshedEmpty

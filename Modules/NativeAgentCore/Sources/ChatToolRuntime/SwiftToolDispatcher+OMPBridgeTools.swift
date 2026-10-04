@@ -107,6 +107,7 @@ extension SwiftToolDispatcher {
         }
         let queuedAt = ISO8601DateFormatter().string(from: Date())
         let originSessionId = Self.extractSessionId(from: input)
+        let origin = Self.agentBridgeReplyOrigin(surface: surface, route: ChatToolSessionContext.replyRoute)
         var row: [String: JSONValue] = [
             "id": .string(messageId),
             "messageId": .string(messageId),
@@ -126,6 +127,7 @@ extension SwiftToolDispatcher {
         if let workingDirectory { row["workingDirectory"] = .string(workingDirectory) }
         if let deskHandle { row["deskHandle"] = .string(deskHandle) }
         if !originSessionId.isEmpty { row["sessionId"] = .string(originSessionId) }
+        row["origin"] = origin
         let inboxEntry = row
 
         let persistence = SwiftNativePersistenceCore()
@@ -179,7 +181,7 @@ extension SwiftToolDispatcher {
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
-            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from desk_read.")
+            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
         }
         if appendResult.status == "duplicate" && !appendResult.retryWake {
             response["wakeup"] = .object(["status": .string("deduplicated")])
@@ -194,6 +196,7 @@ extension SwiftToolDispatcher {
                 queuedAt: appendResult.queuedAt,
                 inboxPath: inboxURL.path,
                 originSessionId: originSessionId,
+                origin: origin,
                 timeoutSeconds: timeoutSeconds,
                 workingDirectory: workingDirectory,
                 deskHandle: deskHandle
@@ -202,13 +205,14 @@ extension SwiftToolDispatcher {
         // A wake that failed admitted nothing to act on the row; "queued" would
         // tell her the answer is coming (the Claude lane already says so).
         if Self.claudeReceiptStatus(response["wakeup"]) == "failed" { response["status"] = .string("failed") }
-        Self.markWakeStartedNothing(&response, agent: "OMP")
+        Self.markWakeStartedNothing(&response, agent: "OMP", dataRoot: dataRoot)
         return .object(response)
     }
 
     /// omp_thread_wakeup.js's resume rule: a saved session pointer with an id
     /// under wake-sessions/<topicSlug(topic)>.json or, with no pointer file,
-    /// a failed delivery of that topic that names the session OMP kept.
+    /// a retained wake-unanswered/<slug>.json identity naming the session OMP
+    /// kept, with failed deliveries as a legacy fallback.
     static func ompSessionSaved(topic: String?, directory: URL) -> Bool {
         // topicSlug exactly: lowercase, every run of non-[a-z0-9] (per code
         // point, so "İ" → "i" + a separator) is one "-", trimmed, 64 long.
@@ -227,6 +231,8 @@ extension SwiftToolDispatcher {
         }
         let file = directory.appendingPathComponent("wake-sessions").appendingPathComponent(slug + ".json")
         if let data = try? Data(contentsOf: file) { return session(try? JSONSerialization.jsonObject(with: data)) }
+        let unanswered = directory.appendingPathComponent("wake-unanswered").appendingPathComponent(slug + ".json")
+        if let data = try? Data(contentsOf: unanswered) { return session(try? JSONSerialization.jsonObject(with: data)) }
         guard let deliveries = try? String(contentsOf: directory.appendingPathComponent("wake-deliveries.jsonl"), encoding: .utf8) else { return false }
         return deliveries.split(separator: "\n").contains { line in
             guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
@@ -243,6 +249,7 @@ extension SwiftToolDispatcher {
         queuedAt: String,
         inboxPath: String,
         originSessionId: String,
+        origin: JSONValue,
         timeoutSeconds: Int,
         workingDirectory: String?,
         deskHandle: String?
@@ -259,6 +266,7 @@ extension SwiftToolDispatcher {
         if let topic { payload["topic"] = .string(topic) }
         if requireExistingConversation { payload["requireExistingConversation"] = .bool(true) }
         if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
+        payload["origin"] = origin
         if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
         if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
         Self.stampDelegationProducer(on: &payload)

@@ -30,11 +30,36 @@ extension SwiftToolDispatcher {
             return nil
         }
         func failed(_ reason: String, _ detail: String) -> JSONValue {
-            .object([
+            let path: String
+            let accepted: String
+            switch reason {
+            case "missing_kind", "unknown_kind":
+                path = "$.kind"
+                accepted = "connector, permission, model_choice, api_key, capability, choose"
+            case "missing_why":
+                path = "$.why"
+                accepted = "A nonblank string explaining why this is needed; reason or message is also accepted."
+            case "missing_question":
+                path = "$.title"
+                accepted = "A nonblank question string; question is also accepted."
+            case "missing_consequence":
+                path = "$.decline_consequence"
+                accepted = "A nonblank string saying what happens if the person declines."
+            case "missing_target":
+                path = "$.target"
+                accepted = "A canonical ID supported by the selected kind in request_interaction. Inspect its tool contract; do not invent an ID or widen permission."
+            default:
+                path = "$"
+                accepted = "A supported kind, target and additional targets with an available control in this app. Inspect request_interaction's tool contract."
+            }
+            return .object([
                 "status": .string("failed"),
                 "tool": .string(InlineInteractionWire.toolName),
                 "reason": .string(reason),
                 "error": .string(detail),
+                "argument_path": .string(path),
+                "accepted": .string(accepted),
+                "effects": .string("none"),
             ])
         }
 

@@ -218,7 +218,6 @@ extension MemoryStorage {
                 (sim + lexicalBoost)
                     * decay
                     * MemoryLifecycle.rankingFactor(m.lifecycle)
-                    * MemoryRecallScoring.useCountFactor(m.useCount)
             ))
         }
         scored.sort { $0.1 > $1.1 }
@@ -301,7 +300,6 @@ extension MemoryStorage {
                 lexical
                     * decay
                     * MemoryLifecycle.rankingFactor(memory.lifecycle)
-                    * MemoryRecallScoring.useCountFactor(memory.useCount)
             ))
         }
         scored.sort { $0.1 > $1.1 }
@@ -361,13 +359,15 @@ extension MemoryStorage {
     ) -> [(memory: StoredMemory, similarity: Double)] {
         let cappedLimit = max(0, limit)
         guard cappedLimit > 0 else { return [] }
-        var seen: Set<String> = []
+        var seen: [String: [MemoryDisclosureClassification?]] = [:]
         // Lazy uniqueness retains the prior early stop: do not normalize an
         // entire corpus when the bounded result has already been filled.
         let unique = scored.lazy.filter { candidate in
             let key = normalizedRecallContent(candidate.0.content)
             if !key.isEmpty {
-                return seen.insert(key).inserted
+                let scope = MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: candidate.0))
+                guard !(seen[key]?.contains(scope) ?? false) else { return false }
+                seen[key, default: []].append(scope)
             }
             return true
         }
@@ -378,7 +378,7 @@ extension MemoryStorage {
         }
     }
 
-    private static func normalizedRecallContent(_ content: String) -> String {
+    static func normalizedRecallContent(_ content: String) -> String {
         content
             .lowercased()
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)

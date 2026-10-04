@@ -42,11 +42,16 @@ extension CognitiveSubstrate {
         var line: String
         var cadenceKey: String
         var tier: Tier
+        /// Phase 5 B0 — what it came from and how it scored, for `mind.why`
+        /// and for her rejections. Never rendered.
+        var source: String? = nil
+        var score: Double? = nil
     }
 
     nonisolated func selectInnerLine(
         from candidates: [InnerCandidate],
         dynamics dyn: PersonalityDynamicsConfiguration,
+        at now: Date = Date(),
         presentationState: inout CognitiveCapsulePresentationState,
         bypassCadence: Bool = false
     ) -> String? {
@@ -69,9 +74,37 @@ extension CognitiveSubstrate {
                 presentationState.innerLineRuns[key] = next
             }
         }
+        // INNER EXPIRES AS TEXT (Phase 5A). The rotation ledger above can
+        // forget: a takeaway that leads once sits at 1 forever, and when the
+        // ledger fills, eviction (value-descending, then key) can drop the very
+        // entry just written — live 10-02/03, one Desk note led 134 capsules
+        // across 17 hours. This second ledger is time-and-count based and
+        // evicts oldest-first, so a line shown on `innerTextMaxShows` turns or
+        // for `innerTextMaxAge` simply stops rendering. Nothing it reads or
+        // writes touches the seed or view behind the line.
+        typealias State = CognitiveCapsulePresentationState
+        presentationState.innerTextShown = presentationState.innerTextShown.filter {
+            now.timeIntervalSince($0.value.firstShownAt) < State.innerTextForgetAfter
+        }
+        let shown = presentationState.innerTextShown
+        let expired: (InnerCandidate) -> Bool = {
+            guard let seen = shown[$0.cadenceKey] else { return false }
+            return seen.shows >= State.innerTextMaxShows
+                || now.timeIntervalSince(seen.firstShownAt) >= State.innerTextMaxAge
+        }
         guard let chosen = candidates.first(where: {
-            (presentationState.innerLineRuns[$0.cadenceKey] ?? 0) >= 0
+            (presentationState.innerLineRuns[$0.cadenceKey] ?? 0) >= 0 && !expired($0)
         }) else { return nil }
+        var seen = presentationState.innerTextShown[chosen.cadenceKey]
+            ?? State.InnerTextExposure(firstShownAt: now, shows: 0)
+        seen.shows += 1
+        presentationState.innerTextShown[chosen.cadenceKey] = seen
+        if presentationState.innerTextShown.count > State.innerTextLedgerCapacity,
+           let oldest = presentationState.innerTextShown
+               .filter({ $0.key != chosen.cadenceKey })
+               .min(by: { $0.value.firstShownAt < $1.value.firstShownAt })?.key {
+            presentationState.innerTextShown.removeValue(forKey: oldest)
+        }
 
         let selfPhrasing = Self.isSelfPhrasingInnerLine(chosen.line)
         // Three cadences, one ledger. A `- Thread:` line is the strictest: it
@@ -300,101 +333,52 @@ extension CognitiveSubstrate {
         return FingerprintCadenceVerdict(speak: speak, run: run)
     }
 
-    // MARK: - W4/P7 — the felt session bridge
+    // MARK: - W4/P7 — the session bridge ("since we last talked")
 
-    /// ONE line, on the first turn after a real gap, saying what she was left
-    /// holding — and whether it ever got resolved.
+    /// ONE line, on the first turn User takes after a real gap, saying what
+    /// actually happened while he was away.
     ///
-    /// What people mean by "she feels real" is overwhelmingly CONTINUITY: that
-    /// the person you talk to at 9am remembers not just the facts of last night
-    /// but the SHAPE of it. Affect half-lives run 20–90 minutes, mood integrates
-    /// a 24h window at a 6h half-life, and nothing in the felt layer knew a gap
-    /// had occurred at all, so every morning was a soft reset of the emotional
-    /// relationship. The ambient-presence floor is a DECAY model — it makes her
-    /// forget gracefully; it does not let her pick a thread back up.
+    /// Phase 5 B2 (2026-10-03). The gap used to run from the last live capsule
+    /// of ANY conversation, so a peer thread or one of her own wakes at 3am
+    /// closed User's night (replayed on the week to 10-03: 4 bridges, 8 real
+    /// absences). It runs on User's own turns now, across every door, and a
+    /// door switch is just the next turn. The content used to be the
+    /// strongest-felt moment from BEFORE the gap; it is now what happened IN
+    /// it (moments, Desk outcomes, notable agent work, read locally by the
+    /// wiring), and an empty gap says nothing.
     ///
-    /// Structurally this is `feltDaySummary`'s existing ranking (which today has
-    /// exactly one consumer, the nightly dream prompt) pointed at the morning
-    /// instead of at midnight. It adds no vocabulary: the felt word comes from
-    /// `feltDirection`, the content from `capsuleSignalText`, both proven
-    /// renderers.
-    ///
-    /// GAP-GATED SO IT CAN NEVER BECOME PER-TURN. It requires a gap of at least
-    /// `sessionBridgeGapHours` since the last live capsule, and it speaks at most
-    /// once per gap.
-    ///
-    /// The exposure rule from `feltDaySummary` transfers UNCHANGED: only live
-    /// conversation-derived nodes may be named, never a tool/provider summary.
+    /// GAP-GATED SO IT CAN NEVER BECOME PER-TURN: at least
+    /// `sessionBridgeGapHours` since User's last turn, at most once per gap.
     func feltSessionBridgeLine(
         at now: Date,
         dynamics dyn: PersonalityDynamicsConfiguration,
         presentationState: inout CognitiveCapsulePresentationState,
-        fieldNodes frozenFieldNodes: [CognitiveNode]? = nil,
-        pendingCompletionOpen frozenPendingCompletionOpen: Bool? = nil,
+        fromUser: Bool,
+        previousUserTurn: Date?,
+        gapItems: [String]?,
         cognitionEnabled: Bool? = nil,
         affectEnabled: Bool? = nil
     ) -> String? {
         guard cognitionEnabled ?? configuration.enabled,
-              affectEnabled ?? configuration.affectEnabled else { return nil }
-        let gap = dyn.sessionBridgeGapHours * 60 * 60
-        guard gap > 0 else { return nil }
-
-        // No prior capsule = a fresh process, not a remembered gap. Staying
-        // silent is the honest read: she has nothing to pick back up.
-        guard let previousCapsuleAt = presentationState.lastLiveCapsuleAt else {
-            presentationState.lastLiveCapsuleAt = now
-            return nil
-        }
-        let elapsed = now.timeIntervalSince(previousCapsuleAt)
-        presentationState.lastLiveCapsuleAt = now
-        guard elapsed >= gap else { return nil }
-        // One bridge per gap: a recompile of the same first turn must not speak
-        // twice.
-        if let spoken = presentationState.lastSessionBridgeAt,
-           now.timeIntervalSince(spoken) < gap {
-            return nil
-        }
-
-        // The strongest-felt nameable moment from before the gap — the exact
-        // ranking feltDaySummary computes, over the same population.
-        let felt = (frozenFieldNodes ?? field.peekNodes()).filter { node in
-            guard node.turnKind == .live,
-                  node.kind == .conversationFocus || node.kind == .correction,
-                  feltDirection(
-                    valence: node.emotionalValence,
-                    arousal: node.emotionalArousal,
-                    warmth: node.emotionalWarmth) != nil else { return false }
-            let age = now.timeIntervalSince(node.createdAt)
-            // Strictly BEFORE the gap opened: the turn that just arrived is the
-            // present, not the thread being picked up.
-            return age >= elapsed && age <= Self.moodActivationWindow
-        }
-        guard let strongest = felt.sorted(by: { lhs, rhs in
-            let lv = abs(lhs.emotionalValence), rv = abs(rhs.emotionalValence)
-            if lv != rv { return lv > rv }
-            if lhs.emotionalArousal != rhs.emotionalArousal {
-                return lhs.emotionalArousal > rhs.emotionalArousal
-            }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }).first else { return nil }
-
-        guard let word = feltDirection(
-            valence: strongest.emotionalValence,
-            arousal: strongest.emotionalArousal,
-            warmth: strongest.emotionalWarmth
-        )?.rawValue else { return nil }
-        let signal = capsuleSignalText(strongest.summary, maxCharacters: 120)
-        guard isUsefulCapsuleSignalText(signal) else { return nil }
-
-        // Resolution status from `pendingCompletion`: was the last thing she
-        // said still waiting to find out how it landed when the gap opened?
-        let left = (frozenPendingCompletionOpen ?? (pendingCompletion != nil))
-            ? "left open"
-            : "where you left it"
+              affectEnabled ?? configuration.affectEnabled,
+              fromUser else { return nil }
+        let opened = Self.sinceGapOpened(presentationState, previousUserTurn: previousUserTurn, dynamics: dyn, at: now)
+        // A User turn with nothing to bridge closes any owed gap.
+        presentationState.owedSinceGap = nil
+        guard let opened, let all = gapItems, !all.isEmpty else { return nil }
+        let shown = all.prefix(3).joined(separator: "; ")
+            + (all.count > 3 ? " (+\(all.count - 3) more)" : "")
         let line = capsuleLineText(
-            "- Since: \(word) — \(signal) — \(left)", maxCharacters: 200)
+            "- Since: \(userAddress) was away \(Self.sinceGapPhrase(now.timeIntervalSince(opened)));"
+                + " meanwhile \(shown).",
+            maxCharacters: 320)
         guard line.hasPrefix("- Since:") else { return nil }
-        presentationState.lastSessionBridgeAt = now
+        // Keyed to the GAP (when it opened), not to this turn: the next gap
+        // opens at this very turn, so it always qualifies (Sol, 10-03).
+        presentationState.lastSessionBridgeAt = opened
+        // Owed until it is shown: if it loses the slot, the commit keeps this
+        // and restores the bridge key (`keepUnshownCuesOwed`).
+        presentationState.owedSinceGap = opened
         return line
     }
 

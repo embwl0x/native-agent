@@ -16,22 +16,25 @@ public enum TriggerSchedulerBackgroundWork {
         runDueJobs: @escaping @Sendable (Int) async -> [String],
         activityFailure: @escaping @Sendable () async -> String?,
         nextDeadline: @escaping @Sendable (Date) async -> Date?,
-        bots: BotRunnerScheduler
+        bots: BotRunnerScheduler,
+        continuations: DeskContinuationScheduler? = nil
     ) -> JobWork {
         JobWork(
             runDueJobs: {
                 let jobs = await runDueJobs(5)
-                return jobs + (await bots.runDue())
+                return jobs + (await bots.runDue()) + (await continuations?.runDue() ?? [])
             },
             activityFailure: {
                 let jobs = await activityFailure()
                 let botFailure = await bots.failure
-                return jobs ?? botFailure
+                let continuationFailure = await continuations?.failure
+                return jobs ?? botFailure ?? continuationFailure
             },
             nextDeadline: { date in
                 let jobs = await nextDeadline(date)
                 let botDeadline = await bots.nextDeadline(after: date)
-                return [jobs, botDeadline].compactMap { $0 }.min()
+                let continuationDeadline = await continuations?.nextDeadline(after: date)
+                return [jobs, botDeadline, continuationDeadline].compactMap { $0 }.min()
             }
         )
     }
@@ -51,7 +54,7 @@ public enum TriggerSchedulerBackgroundWork {
     // here — the one place that fires the brief, which is what "no second
     // brief" was protecting in the first place.
     public static let morningBriefObjective = "Prepare today's concise briefing from canonical calendar, inbox, project, and Desk state. Cite the evidence used, identify unknowns, and surface the completed report in NativeAgent without sending externally unless separately approved."
-    public static let morningBriefTools = ["mac_calendar_list_upcoming", "mail_list_recent", "workshop_status"]
+    public static let morningBriefTools = ["app calendar.upcoming", "app mail.recent", "app workshop.status"]
 
     /// Hard ceiling on the synthesis turn. The scheduler tick that awaits this
     /// has a 1800s timeout of its own; a brief is not worth holding it for
@@ -255,6 +258,9 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     public func physiologyEvents() -> AsyncStream<Void> {
         events([
             schedulerJobsPath,
+            dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
+            dataRoot.appendingPathComponent("desk/desk_ops_base.json"),
+            dataRoot.appendingPathComponent("bots/shelf-index.json"),
             dataRoot.appendingPathComponent("bots/definitions"),
             dataRoot.appendingPathComponent("bots/runner-jobs.json"),
             dataRoot.appendingPathComponent("bots/run-queue.json"),
@@ -296,9 +302,13 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         }
 
         let fires = await triggerScheduler.evaluateAndFireDetailed()
+        var mirrorFailures = 0
         for fire in fires {
             guard !Task.isCancelled else { return .skipped(reason: "cancelled") }
-            _ = await mirrorFire(fire)
+            if !(await mirrorFire(fire)) { mirrorFailures += 1 }
+        }
+        guard mirrorFailures == 0 else {
+            return .failed(error: "Could not add \(mirrorFailures) trigger notification(s) to the inbox.")
         }
 
         let active = (fires.compactMap(\.name) + dueJobs).sorted()

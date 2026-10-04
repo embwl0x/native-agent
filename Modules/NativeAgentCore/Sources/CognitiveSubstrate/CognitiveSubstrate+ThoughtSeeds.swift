@@ -42,7 +42,12 @@ extension CognitiveSubstrate {
         kind: CognitiveThoughtSeedKind,
         text: String,
         priority: Double,
-        sourceNodeIds: [UUID] = []
+        sourceNodeIds: [UUID] = [],
+        sourcePeerIds: [String]? = nil,
+        materialProvenances: [String] = [],
+        // Phase 5 B0: only HER thoughts are undoable (reflection, encounters).
+        // User's pinned concern is his, and is never recorded.
+        undoable: Bool = false
     ) async -> CognitiveThoughtSeed? {
         await waitForMaintenanceTransition()
         return await addThoughtSeed(
@@ -50,7 +55,12 @@ extension CognitiveSubstrate {
             text: text,
             priority: priority,
             sourceNodeIds: sourceNodeIds,
-            marksSubstrateDirty: true
+            sourcePeerIds: sourcePeerIds.flatMap {
+                $0.count <= Self.maximumThoughtSeedSourceIds ? $0 : nil
+            },
+            materialProvenances: materialProvenances,
+            marksSubstrateDirty: true,
+            undoable: undoable
         )
     }
 
@@ -63,7 +73,10 @@ extension CognitiveSubstrate {
         text: String,
         priority: Double,
         sourceNodeIds: [UUID],
-        marksSubstrateDirty: Bool
+        sourcePeerIds: [String]? = nil,
+        materialProvenances: [String] = [],
+        marksSubstrateDirty: Bool,
+        undoable: Bool = false
     ) async -> CognitiveThoughtSeed? {
         guard configuration.enabled, configuration.thoughtSeedsEnabled else { return nil }
         let trimmed = bounded(text.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 240)
@@ -73,6 +86,7 @@ extension CognitiveSubstrate {
         if let existingID = thoughtSeeds.values.first(where: { thoughtSeedKey(kind: $0.kind, text: $0.text) == key })?.id,
            var existing = thoughtSeeds[existingID] {
             let previous = thoughtSeeds
+            let before = existing
             // A re-mint of BYTE-IDENTICAL text carrying no new evidence is not
             // a fresh noticing — it is the same sentence arriving again (the
             // microcycle's pressure seed re-mints it every cycle). Resetting
@@ -82,7 +96,16 @@ extension CognitiveSubstrate {
             // every read decays again from that same anchor. So: a true no-op.
             // The seed keeps ageing from its one honest anchor and can expire.
             let mergedSources = boundedThoughtSeedSources(existing.sourceNodeIds + sourceNodeIds)
-            if existing.text == trimmed, mergedSources == existing.sourceNodeIds {
+            let mergedPeers = existing.sourcePeerIds.flatMap { peers in
+                sourcePeerIds.flatMap { incoming -> [String]? in
+                    let merged = Array(Set(peers + incoming)).sorted()
+                    return merged.count <= Self.maximumThoughtSeedSourceIds ? merged : nil
+                }
+            }
+            let mergedMaterial = Array(Array(Set(existing.materialProvenances + materialProvenances)).sorted()
+                .suffix(Self.maximumThoughtSeedSourceIds))
+            if existing.text == trimmed, mergedSources == existing.sourceNodeIds,
+               mergedPeers == existing.sourcePeerIds, mergedMaterial == existing.materialProvenances {
                 return existing
             }
             // Re-worded text (different wording, same family key) or genuinely
@@ -93,6 +116,8 @@ extension CognitiveSubstrate {
             existing.priority = min(1, max(effectiveThoughtSeedPriority(existing, at: now), priority))
             existing.lastUpdatedAt = now
             existing.sourceNodeIds = mergedSources
+            existing.sourcePeerIds = mergedPeers
+            existing.materialProvenances = mergedMaterial
             thoughtSeeds[existingID] = existing
             if marksSubstrateDirty { markDirty(at: now) }
             thoughtSeedRevision &+= 1
@@ -112,6 +137,8 @@ extension CognitiveSubstrate {
                 }
                 return thoughtSeeds[existingID]
             }
+            if undoable { await recordUndo(key: "seed:\(existingID.uuidString)", what: "re-touched thought: \(existing.text)",
+                             previous: before.toJSON(), stamp: Self.undoStamp(existing)) }
             return existing
         }
 
@@ -123,7 +150,9 @@ extension CognitiveSubstrate {
             priority: priority,
             createdAt: now,
             lastUpdatedAt: now,
-            sourceNodeIds: boundedThoughtSeedSources(sourceNodeIds)
+            sourceNodeIds: boundedThoughtSeedSources(sourceNodeIds),
+            sourcePeerIds: sourcePeerIds,
+            materialProvenances: Array(materialProvenances.suffix(Self.maximumThoughtSeedSourceIds))
         )
         thoughtSeeds[seed.id] = seed
         if marksSubstrateDirty { markDirty(at: now) }
@@ -141,6 +170,10 @@ extension CognitiveSubstrate {
                 thoughtSeedRevision &+= 1
             }
             return nil
+        }
+        if undoable, thoughtSeeds[seed.id] != nil {
+            await recordUndo(key: "seed:\(seed.id.uuidString)", what: "new thought: \(seed.text)",
+                             previous: .null, stamp: Self.undoStamp(seed))
         }
         return thoughtSeeds[seed.id]
     }
@@ -248,6 +281,9 @@ extension CognitiveSubstrate {
     func isUsefulThoughtSeed(_ seed: CognitiveThoughtSeed) -> Bool {
         let lower = seed.text.lowercased()
         guard !isOperationalSubconsciousNoise(lower) else { return false }
+        // Phase 5 D (Agent): a takeaway that is only a reflection's title
+        // ("Reflection: after the dream, 2026-10-02") learned nothing.
+        if seed.kind == .reflectionTakeaway, !Self.isClaimShaped(seed.text) { return false }
         if seed.kind != .reflectionTakeaway, isRuntimeMetaStatement(lower) {
             return false
         }
@@ -352,29 +388,44 @@ extension CognitiveSubstrate {
         // healed when the durable truth is that it itches.
         ruminationReleasedAt.removeAll()
         for payload in payloads {
-            guard case .object(let object) = payload,
-                  let id = uuidValue(object["id"]),
-                  let kindRaw = stringValue(object["kind"]),
-                  let kind = CognitiveThoughtSeedKind(rawValue: kindRaw),
-                  let text = stringValue(object["text"]),
-                  let priority = doubleValue(object["priority"]),
-                  let createdAt = dateValue(object["createdAt"]),
-                  let lastUpdatedAt = dateValue(object["lastUpdatedAt"]) else {
-                continue
-            }
-            thoughtSeeds[id] = CognitiveThoughtSeed(
-                id: id,
-                kind: kind,
-                text: text,
-                priority: priority,
-                createdAt: createdAt,
-                lastUpdatedAt: lastUpdatedAt,
-                // Bounded on restore too (review r1): the seeds persisted before
-                // the cap carried 549 to 711 ids and decay alone never re-mints.
-                sourceNodeIds: boundedThoughtSeedSources(uuidArrayValue(object["sourceNodeIds"]))
-            )
+            guard var seed = thoughtSeed(fromPayload: payload) else { continue }
+            // Bounded on restore too (review r1): the seeds persisted before
+            // the cap carried 549 to 711 ids and decay alone never re-mints.
+            seed.sourceNodeIds = boundedThoughtSeedSources(seed.sourceNodeIds)
+            thoughtSeeds[seed.id] = seed
         }
         enforceThoughtSeedCap(at: dependencies.now())
         thoughtSeedRevision &+= 1
+    }
+
+    /// One persisted seed payload, or nil when a required field is missing.
+    /// Shared by restore and undo (B0).
+    func thoughtSeed(fromPayload payload: JSONValue) -> CognitiveThoughtSeed? {
+        guard case .object(let object) = payload,
+              let id = uuidValue(object["id"]),
+              let kindRaw = stringValue(object["kind"]),
+              let kind = CognitiveThoughtSeedKind(rawValue: kindRaw),
+              let text = stringValue(object["text"]),
+              let priority = doubleValue(object["priority"]),
+              let createdAt = dateValue(object["createdAt"]),
+              let lastUpdatedAt = dateValue(object["lastUpdatedAt"]) else {
+            return nil
+        }
+        return CognitiveThoughtSeed(
+            id: id,
+            kind: kind,
+            text: text,
+            priority: priority,
+            createdAt: createdAt,
+            lastUpdatedAt: lastUpdatedAt,
+            sourceNodeIds: uuidArrayValue(object["sourceNodeIds"]),
+            sourcePeerIds: {
+                guard case .array(let rows)? = object["sourcePeerIds"],
+                      rows.count <= Self.maximumThoughtSeedSourceIds,
+                      rows.allSatisfy({ if case .string = $0 { return true }; return false }) else { return nil }
+                return stringArrayValue(object["sourcePeerIds"])
+            }(),
+            materialProvenances: stringArrayValue(object["materialProvenances"])
+        )
     }
 }

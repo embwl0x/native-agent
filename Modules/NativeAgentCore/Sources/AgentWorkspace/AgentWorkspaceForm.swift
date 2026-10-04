@@ -376,7 +376,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         let allowed: Set<String> = ["write_file", "save_skill", "commit_memory", "recall_memory", "mail_search",
             "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item",
             "mail_send", "mail_reply", "messages_send", "chat_reply", "agent_message",
-            "mac_calendar_create_event", "mac_reminders_create", "image_generate", "bot_create", "bot_update"]
+            "mac_calendar_create_event", "mac_reminders_create", "mac_reminders_query", "mac_reminders_update", "image_generate", "bot_create", "bot_update"]
         let stableTargets: Set<String> = ["path", "expected_content_sha256", "name", "id", "handle", "memory_id", "message_id", "expected_message_id",
             "thread_id", "conversation_session_id", "agent", "conversation"]
         let forbidden = ["token", "secret", "password", "credential", "authorization", "cookie", "header", "lease", "approval", "permission", "trust", "provider", "session_grant"]

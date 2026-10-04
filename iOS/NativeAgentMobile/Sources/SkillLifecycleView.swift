@@ -16,7 +16,7 @@ struct SkillManifestEntry: Codable, Identifiable, Hashable {
     var kind: String?
     var triggers: [String]?
     var use_count: Int?
-    var state: String?          // "drafted" | "installed" | "active" | "dormant" | "quarantined"
+    var state: String?          // Mac lifecycle state; presentation also accepts legacy names.
     var version: String?
 
     private enum CodingKeys: String, CodingKey {
@@ -33,19 +33,8 @@ struct SkillManifestEntry: Codable, Identifiable, Hashable {
         triggers = try? c.decode([String].self, forKey: .triggers)
         use_count = (try? c.decode(Int.self, forKey: .use_count)) ?? (try? c.decode(Int.self, forKey: .useCount))
         let rawState = (try? c.decode(String.self, forKey: .state)) ?? (try? c.decode(String.self, forKey: .status))
-        state = Self.normalizedState(rawState)
+        state = rawState
         version = try? c.decode(String.self, forKey: .version)
-    }
-
-    private static func normalizedState(_ raw: String?) -> String? {
-        switch (raw ?? "").lowercased() {
-        case "enabled", "active": return "active"
-        case "installed", "available", "proposal": return "installed"
-        case "draft", "drafted": return "drafted"
-        case "disabled", "dormant": return "dormant"
-        case "quarantine", "quarantined": return "quarantined"
-        default: return raw
-        }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -72,10 +61,10 @@ private struct SkillListResponse: Decodable {
 
 private enum SkillFilter: String, CaseIterable, Identifiable {
     case all      = "All"
-    case drafted  = "Drafted"
-    case installed = "Installed"
-    case active   = "Active"
-    case dormant  = "Dormant"
+    case draft    = "Draft"
+    case on       = "On"
+    case archived = "Archived"
+    case off      = "Off"
     case quarantined = "Quarantined"
     case unknown = "Unknown"
     var id: String { rawValue }
@@ -83,7 +72,7 @@ private enum SkillFilter: String, CaseIterable, Identifiable {
 
 enum SkillLifecyclePresentation {
     enum CanonicalState: Equatable {
-        case drafted, installed, active, dormant, quarantined
+        case draft, on, archived, off, quarantined
         case unknown(String?)
     }
 
@@ -93,11 +82,11 @@ enum SkillLifecyclePresentation {
 
     static func canonicalState(raw: String?) -> CanonicalState {
         switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "drafted": return .drafted
-        case "installed": return .installed
-        case "active": return .active
-        case "dormant": return .dormant
-        case "quarantined": return .quarantined
+        case "draft", "drafted", "available", "proposal": return .draft
+        case "on", "enabled", "installed", "active": return .on
+        case "archived": return .archived
+        case "off", "disabled", "dormant": return .off
+        case "quarantine", "quarantined": return .quarantined
         default: return .unknown(raw)
         }
     }
@@ -110,7 +99,7 @@ enum SkillLifecyclePresentation {
                 return false
             }
         }
-        return skills.filter { $0.state?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == state }
+        return skills.filter { canonicalState(for: $0) == canonicalState(raw: state) }
     }
 
     static func stateLabel(for skill: SkillManifestEntry) -> String {
@@ -119,10 +108,10 @@ enum SkillLifecyclePresentation {
 
     static func stateLabel(for state: CanonicalState) -> String {
         switch state {
-        case .drafted: return "Drafted"
-        case .installed: return "Installed"
-        case .active: return "Active"
-        case .dormant: return "Dormant"
+        case .draft: return "Draft"
+        case .on: return "On"
+        case .archived: return "Archived"
+        case .off: return "Off"
         case .quarantined: return "Quarantined"
         case .unknown(let raw):
             let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -136,10 +125,9 @@ enum SkillLifecyclePresentation {
 
     static func stateColor(for state: CanonicalState) -> Color {
         switch state {
-        case .active: return .green
-        case .installed: return .blue
-        case .drafted: return .orange
-        case .dormant: return .gray
+        case .on: return .green
+        case .draft: return .orange
+        case .archived, .off: return .gray
         case .quarantined: return .red
         case .unknown: return .secondary
         }
@@ -192,19 +180,21 @@ final class SkillLifecycleStore: ObservableObject {
 
     // MARK: Fetch (iCloud snapshot)
 
-    func refresh(pairingStore: PairingStore) async {
+    func refresh(pairingStore: PairingStore, pollIncoming: Bool = true) async {
         isLoading = true
         defer { isLoading = false }
 
         guard applyPairingGate(isPaired: pairingStore.isPaired) else { return }
 
         let engine = iCloudSyncEngine.shared
-        await iCloudBridge.shared.pollIncomingNow()
+        if pollIncoming { await iCloudBridge.shared.pollIncomingNow() }
         if let arr: [SkillManifestEntry] = await engine.loadSnapshotArrayAsync(named: "skills_snapshot.json") {
+            guard !Task.isCancelled else { return }
             withAnimation(AppMotion.snappy) { skills = Self.mergedSkills(learned: arr, manifest: []) }
             return
         }
         if let wrapped: SkillListResponse = await engine.loadSnapshotObjectAsync(named: "skills_snapshot.json") {
+            guard !Task.isCancelled else { return }
             withAnimation(AppMotion.snappy) { skills = Self.mergedSkills(learned: wrapped.skills, manifest: []) }
             return
         }
@@ -259,6 +249,7 @@ struct SkillLifecycleView: View {
     var accessory: AnyView = AnyView(EmptyView())
     @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = SkillLifecycleStore()
+    @ObservedObject private var sync = iCloudSyncEngine.shared
 
     @State private var filter: SkillFilter = .all
     @State private var selectedSkill: SkillManifestEntry?
@@ -309,8 +300,9 @@ struct SkillLifecycleView: View {
         .refreshable {
             await store.refresh(pairingStore: pairingStore)
         }
-        .task {
-            await store.refresh(pairingStore: pairingStore)
+        .task(id: sync.groupTransportDeliveryAt["catalog"]) {
+            await store.refresh(pairingStore: pairingStore,
+                                pollIncoming: sync.groupTransportDeliveryAt["catalog"] == nil)
             #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-designDetail") { selectedSkill = allSkills.first }
             #endif
@@ -358,10 +350,10 @@ struct SkillLifecycleView: View {
     private var emptyDescription: String {
         switch filter {
         case .all:       return "No skills found. The Mac's skill manifest is empty or unreachable."
-        case .drafted:   return "No drafted skills. Skills drafted by the agent appear here before installation."
-        case .installed: return "No installed skills. Skills move to Installed after you approve them."
-        case .active:    return "No active skills. Skills become Active the first time the agent calls them."
-        case .dormant:   return "No dormant skills. Dormant skills haven't been called in a while."
+        case .draft:    return "No drafts. New skills and upgrades wait here until they are turned on."
+        case .on:       return "No skills are on. Turn on a skill on the Mac to make it available."
+        case .archived: return "No archived skills. Unused skills are archived, kept and available to restore on the Mac."
+        case .off:      return "No skills are off. Skills turned off on the Mac remain here."
         case .quarantined: return "No quarantined skills. Quarantined skills require Mac review before they can run again."
         case .unknown: return "No skills with unknown state. Their original Mac state is preserved when present."
         }
@@ -433,7 +425,7 @@ struct SkillLifecycleDetailSheet: View {
                         .padding(.top, -12)
                 }
 
-                AliveSection("About", footer: "Install, activate, quarantine and delete skills in Skills on the Mac, where the registry and sign-ins can confirm the result.") {
+                AliveSection("About", footer: "Skills move from draft to on to archived. Manage skills on the Mac; archived skills are kept and can be restored.") {
                     AliveRow("State") { value(SkillLifecyclePresentation.stateLabel(for: skill)) }
                     AliveDivider()
                     AliveRow("Source") {

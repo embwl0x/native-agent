@@ -81,10 +81,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
     public static let studioWorkEntityType = "work"
     public static let studioCreatorEntityType = "creator"
     public static let studioCreatedByRelationType = "created_by"
-    /// Bound on how many entry ids one edge records. An edge asserted by more
-    /// entries than this is still one edge; the list is provenance, not a log.
-    static let studioMaximumEntryIDsPerEdge = 24
-
     /// Re-derive the whole studio subgraph from the journal.
     ///
     /// Idempotent: calling it twice with the same entries leaves the same rows.
@@ -256,7 +252,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let creatorRelation = Self.studioCreatedByRelationType
         // Convert database-owned rows before crossing the async boundary.
         return try await dbPool.read { db in
-            let rows = try Row.fetchAll(db, sql: """
+            let rows = try Row.fetchCursor(db, sql: """
                 SELECT e.id AS id, e.name AS name, e.first_seen AS first_seen,
                        (SELECT c.name FROM kg_relationships r
                           JOIN kg_entities c ON c.id = r.to_id
@@ -266,11 +262,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 WHERE lower(e.type) = lower(?)
                   AND TRIM(COALESCE(e.name, '')) <> ''
                 ORDER BY e.first_seen ASC, e.id ASC
-                LIMIT ?
-                """, arguments: [creatorRelation, workType, limit * 4])
+                """, arguments: [creatorRelation, workType])
             var candidates: [StudioEncounterCandidate] = []
-            for row in rows {
-                guard candidates.count < limit else { break }
+            while candidates.count < limit, let row = try rows.next() {
                 let name = Self.studioClean(row["name"] ?? "")
                 guard !name.isEmpty else { continue }
                 let creator = (row["creator"] as String?).map(Self.studioClean)
@@ -378,9 +372,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
 
         for key in graph.edges.keys {
-            graph.edges[key] = Array(
-                studioUnique(graph.edges[key] ?? []).prefix(studioMaximumEntryIDsPerEdge)
-            )
+            graph.edges[key] = studioUnique(graph.edges[key] ?? [])
         }
         return graph
     }

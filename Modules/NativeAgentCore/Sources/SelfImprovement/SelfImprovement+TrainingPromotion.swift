@@ -97,10 +97,9 @@ extension SwiftNativeSelfImprovement {
         trainingJournalDir().appendingPathComponent("audit_ledger.jsonl")
     }
 
-    /// `<root>/memory` — the personality-doc directory the daemon's TrainingLoop
-    /// is constructed against.
-    private func trainingMemoryDir() -> URL {
-        trainingPromotionDataRoot().appendingPathComponent("memory", isDirectory: true)
+    /// Resolve training targets under the canonical persona root.
+    private func trainingPersonaDir() -> URL {
+        PersistenceCore.defaultPersonaRoot(dataRoot: trainingPromotionDataRoot())
     }
 
     /// Run `body` under the cross-process `withFileLock(path)`.
@@ -132,6 +131,21 @@ extension SwiftNativeSelfImprovement {
             }
         }
         return nil
+    }
+
+    private func promotionProposalURL(delta: [String: JSONValue], candidateId: String) async throws -> URL {
+        guard case .string(let id)? = delta["proposal_id"], !id.isEmpty,
+              let found = try await findProposalFile(id) else {
+            throw TrainingProposalWriteError.promotionStageMalformed(candidateId)
+        }
+        let directory = trainingProposalsDir().standardizedFileURL.resolvingSymlinksInPath()
+        let url = found.url.standardizedFileURL.resolvingSymlinksInPath()
+        guard url.deletingLastPathComponent() == directory,
+              (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true,
+              found.data["promotion_candidate_id"] == .string(candidateId) else {
+            throw TrainingProposalWriteError.promotionStageMalformed(candidateId)
+        }
+        return url
     }
 
     /// ISO-8601 UTC timestamp matching the daemon's `_now_iso()` =
@@ -269,14 +283,14 @@ extension SwiftNativeSelfImprovement {
         // existence check, AND the content all from that single snapshot. We
         // reproduce that single-snapshot consistency: EVERY target_doc-derived
         // check now runs inside the lock off `freshData`.
-        let memoryDir = trainingMemoryDir()
+        let memoryDir = trainingPersonaDir()
         let p = trainingPromotionPersistence()
         let ledgerPath = trainingLedgerPath()
         let allowedDocs: Set<String> = ["SOUL.md", "VOICE.md", "GROWTH.md", "AGENTS.md"]
         let candidatesDir = promotionCandidatesDir()
         let stagesDir = promotionStagesDir()
 
-        // Lock the PROPOSAL FILE (stable across target_doc churn), not the doc:
+        // Lock the PROPOSAL FILE first (stable across target_doc churn):
         // the doc path is derived from the mutable `target_doc`, so locking it
         // pre-lock would hold the wrong token if a concurrent writer flipped
         // target_doc (gpt-5.5 wave-34 stale-lock-token finding). The proposal file
@@ -351,29 +365,41 @@ extension SwiftNativeSelfImprovement {
             let current = Self.pythonStr(freshData["current"], defaultWhenAbsent: "")
             let rationale: JSONValue = freshData["rationale"] ?? .string("")  // daemon: data.get("rationale","")
 
-            // STRICT read — the daemon's `doc_path.read_text()` raises on a
-            // read/decode failure and aborts (doc untouched). Degrading to "" here
-            // would let `append` overwrite a valid doc with only the proposed
-            // snippet, so a failed read THROWS .targetDocUnreadable instead.
-            let beforeText: String
-            do {
-                beforeText = try String(contentsOf: docPath, encoding: .utf8)
-            } catch {
-                throw TrainingProposalWriteError.targetDocUnreadable(targetDoc)
-            }
-            let beforeHash = Self.sha256Hex(beforeText)
+            let (beforeHash, afterHash) = try await p.withFileLock(docPath) {
+                // STRICT read — the daemon's `doc_path.read_text()` raises on a
+                // read/decode failure and aborts (doc untouched). Degrading to "" here
+                // would let `append` overwrite a valid doc with only the proposed
+                // snippet, so a failed read THROWS .targetDocUnreadable instead.
+                let beforeText: String
+                do {
+                    beforeText = try String(contentsOf: docPath, encoding: .utf8)
+                } catch {
+                    throw TrainingProposalWriteError.targetDocUnreadable(targetDoc)
+                }
+                let beforeHash = Self.sha256Hex(beforeText)
 
-            // Apply change (daemon L1014-1019).
-            let afterText: String
-            if changeType == "append" {
-                let trimmed = Self.pythonRStrip(beforeText)
-                afterText = trimmed + "\n\n" + proposed + "\n"
-            } else if changeType == "edit" && !current.isEmpty && beforeText.contains(current) {
-                afterText = Self.replaceFirst(current, with: proposed, in: beforeText)
-            } else {
-                throw TrainingProposalWriteError.cannotApplyChange(changeType: changeType)
+                // Apply change (daemon L1014-1019).
+                let afterText: String
+                if changeType == "append" {
+                    let trimmed = Self.pythonRStrip(beforeText)
+                    afterText = trimmed + "\n\n" + proposed + "\n"
+                } else if changeType == "edit" && !current.isEmpty && beforeText.contains(current) {
+                    afterText = Self.replaceFirst(current, with: proposed, in: beforeText)
+                } else {
+                    throw TrainingProposalWriteError.cannotApplyChange(changeType: changeType)
+                }
+                let afterHash = Self.sha256Hex(afterText)
+
+                if !routeThroughPromotion {
+                    // Atomic backup (daemon L1007 _atomic_write_text). writeJSON is for
+                    // JSON; the backup is raw .md text, so write atomically by hand.
+                    try Self.atomicWriteText(beforeText, to: backupPath)
+
+                    // Atomic write the doc (daemon L1022-1024).
+                    try Self.atomicWriteText(afterText, to: docPath)
+                }
+                return (beforeHash, afterHash)
             }
-            let afterHash = Self.sha256Hex(afterText)
 
             if routeThroughPromotion {
                 let stagedAt = Self.nowISO()
@@ -384,9 +410,10 @@ extension SwiftNativeSelfImprovement {
                     "after_sha": .string(afterHash),
                 ])
                 let harness: JSONValue = .object([
-                    "test_passed": .bool(true),
-                    "smoke_passed": .bool(true),
-                    "eval_delta": .double(0),
+                    "test_passed": .null,
+                    "smoke_passed": .null,
+                    "eval_delta": .null,
+                    "validation": .string("Target document read and change applicability checked; before and after hashes recorded."),
                 ])
                 let delta: JSONValue = .object([
                     "kind": .string("training_proposal"),
@@ -467,13 +494,6 @@ extension SwiftNativeSelfImprovement {
                 ]
             }
 
-            // Atomic backup (daemon L1007 _atomic_write_text). writeJSON is for
-            // JSON; the backup is raw .md text, so write atomically by hand.
-            try Self.atomicWriteText(beforeText, to: backupPath)
-
-            // Atomic write the doc (daemon L1022-1024).
-            try Self.atomicWriteText(afterText, to: docPath)
-
             // Update proposal status (daemon L1027-1030). writeJSON re-reads via
             // freshData (the in-lock copy) so concurrent extras are preserved.
             freshData["status"] = .string("approved")
@@ -542,7 +562,7 @@ extension SwiftNativeSelfImprovement {
         }
         let stageURL = found.url
         let p = trainingPromotionPersistence()
-        let memoryDir = trainingMemoryDir()
+        let memoryDir = trainingPersonaDir()
         let ledgerPath = trainingLedgerPath()
         let allowedDocs: Set<String> = ["SOUL.md", "VOICE.md", "GROWTH.md", "AGENTS.md"]
         let candidatePath = promotionCandidatesDir().appendingPathComponent("\(candidateId).json")
@@ -566,101 +586,109 @@ extension SwiftNativeSelfImprovement {
                 throw TrainingProposalWriteError.promotionStageMalformed(candidateId)
             }
 
-            let docPath = memoryDir.appendingPathComponent(targetDoc)
-            let resolvedDoc = docPath.resolvingSymlinksInPath().standardizedFileURL
-            let resolvedMem = memoryDir.resolvingSymlinksInPath().standardizedFileURL
-            let memPrefix = resolvedMem.path.hasSuffix("/") ? resolvedMem.path : resolvedMem.path + "/"
-            guard resolvedDoc.path == resolvedMem.path || resolvedDoc.path.hasPrefix(memPrefix) else {
-                throw TrainingProposalWriteError.targetDocEscapesMemoryDir(targetDoc)
-            }
-            guard FileManager.default.fileExists(atPath: docPath.path) else {
-                throw TrainingProposalWriteError.targetDocMissing(targetDoc)
-            }
-
-            let beforeText: String
-            do {
-                beforeText = try String(contentsOf: docPath, encoding: .utf8)
-            } catch {
-                throw TrainingProposalWriteError.targetDocUnreadable(targetDoc)
-            }
-            let actualBeforeHash = Self.sha256Hex(beforeText)
-            guard actualBeforeHash == beforeHash else {
-                throw TrainingProposalWriteError.promotionStageStale(expected: beforeHash, actual: actualBeforeHash)
-            }
-
-            let changeType = Self.pythonStr(delta["change_type"], defaultWhenAbsent: "append")
-            let proposed = Self.pythonStr(delta["proposed"], defaultWhenAbsent: "")
-            let current = Self.pythonStr(delta["current"], defaultWhenAbsent: "")
-            let afterText: String
-            if changeType == "append" {
-                afterText = Self.pythonRStrip(beforeText) + "\n\n" + proposed + "\n"
-            } else if changeType == "edit" && !current.isEmpty && beforeText.contains(current) {
-                afterText = Self.replaceFirst(current, with: proposed, in: beforeText)
-            } else {
-                throw TrainingProposalWriteError.cannotApplyChange(changeType: changeType)
-            }
-            let afterHash = Self.sha256Hex(afterText)
-            guard afterHash == expectedAfterHash else {
-                throw TrainingProposalWriteError.promotionStageMalformed(candidateId)
-            }
-
-            let backupPath = docPath.deletingPathExtension()
-                .appendingPathExtension("backup-\(candidateId).md")
-            try Self.atomicWriteText(beforeText, to: backupPath)
-            try Self.atomicWriteText(afterText, to: docPath)
-
-            let resolvedAt = Self.nowISO()
-            stage["status"] = .string("approved")
-            stage["resolved_at"] = .string(resolvedAt)
-            stage["resolution_reason"] = .string("approved")
-            try await p.writeJSON(.object(stage), to: stageURL)
-
-            let candidateRaw = try await p.readJSON(candidatePath, ifMissing: .object([:]))
-            var candidate: [String: JSONValue] = [:]
-            if case .object(let existing) = candidateRaw { candidate = existing }
-            candidate["candidate_id"] = .string(candidateId)
-            candidate["status"] = .string("promoted")
-            candidate["decision"] = .string("APPROVED")
-            candidate["decision_reason"] = .string("Approved through Swift-native promotion stage.")
-            candidate["finished_at"] = .string(resolvedAt)
-            try await p.writeJSON(.object(candidate), to: candidatePath)
-
-            if case .string(let proposalPath)? = delta["proposal_path"] {
-                let proposalURL = URL(fileURLWithPath: proposalPath)
-                let proposalRaw = try await p.readJSON(proposalURL, ifMissing: .object([:]))
-                if case .object(var proposal) = proposalRaw {
-                    proposal["status"] = .string("approved")
-                    proposal["approved_at"] = .string(resolvedAt)
-                    proposal["promotion_resolved_at"] = .string(resolvedAt)
-                    try await p.writeJSON(.object(proposal), to: proposalURL)
+            let proposalURL = try await self.promotionProposalURL(delta: delta, candidateId: candidateId)
+            let pendingStage = stage
+            return try await p.withFileLock(proposalURL) {
+                var stage = pendingStage
+                let proposalRaw = try await p.readJSON(proposalURL, ifMissing: .null)
+                guard case .object(var proposal) = proposalRaw,
+                      proposal["proposal_id"] == delta["proposal_id"],
+                      proposal["promotion_candidate_id"] == .string(candidateId) else {
+                    throw TrainingProposalWriteError.promotionStageMalformed(candidateId)
                 }
+                let docPath = memoryDir.appendingPathComponent(targetDoc)
+                let resolvedDoc = docPath.resolvingSymlinksInPath().standardizedFileURL
+                let resolvedMem = memoryDir.resolvingSymlinksInPath().standardizedFileURL
+                let memPrefix = resolvedMem.path.hasSuffix("/") ? resolvedMem.path : resolvedMem.path + "/"
+                guard resolvedDoc.path == resolvedMem.path || resolvedDoc.path.hasPrefix(memPrefix) else {
+                    throw TrainingProposalWriteError.targetDocEscapesMemoryDir(targetDoc)
+                }
+                guard FileManager.default.fileExists(atPath: docPath.path) else {
+                    throw TrainingProposalWriteError.targetDocMissing(targetDoc)
+                }
+
+                let backupPath = docPath.deletingPathExtension()
+                    .appendingPathExtension("backup-\(candidateId).md")
+                let afterHash = try await p.withFileLock(docPath) {
+                    let beforeText: String
+                    do {
+                        beforeText = try String(contentsOf: docPath, encoding: .utf8)
+                    } catch {
+                        throw TrainingProposalWriteError.targetDocUnreadable(targetDoc)
+                    }
+                    let actualBeforeHash = Self.sha256Hex(beforeText)
+                    guard actualBeforeHash == beforeHash else {
+                        throw TrainingProposalWriteError.promotionStageStale(expected: beforeHash, actual: actualBeforeHash)
+                    }
+
+                    let changeType = Self.pythonStr(delta["change_type"], defaultWhenAbsent: "append")
+                    let proposed = Self.pythonStr(delta["proposed"], defaultWhenAbsent: "")
+                    let current = Self.pythonStr(delta["current"], defaultWhenAbsent: "")
+                    let afterText: String
+                    if changeType == "append" {
+                        afterText = Self.pythonRStrip(beforeText) + "\n\n" + proposed + "\n"
+                    } else if changeType == "edit" && !current.isEmpty && beforeText.contains(current) {
+                        afterText = Self.replaceFirst(current, with: proposed, in: beforeText)
+                    } else {
+                        throw TrainingProposalWriteError.cannotApplyChange(changeType: changeType)
+                    }
+                    let afterHash = Self.sha256Hex(afterText)
+                    guard afterHash == expectedAfterHash else {
+                        throw TrainingProposalWriteError.promotionStageMalformed(candidateId)
+                    }
+
+                    try Self.atomicWriteText(beforeText, to: backupPath)
+                    try Self.atomicWriteText(afterText, to: docPath)
+                    return afterHash
+                }
+
+                let resolvedAt = Self.nowISO()
+                stage["status"] = .string("approved")
+                stage["resolved_at"] = .string(resolvedAt)
+                stage["resolution_reason"] = .string("approved")
+                try await p.writeJSON(.object(stage), to: stageURL)
+
+                let candidateRaw = try await p.readJSON(candidatePath, ifMissing: .object([:]))
+                var candidate: [String: JSONValue] = [:]
+                if case .object(let existing) = candidateRaw { candidate = existing }
+                candidate["candidate_id"] = .string(candidateId)
+                candidate["status"] = .string("promoted")
+                candidate["decision"] = .string("APPROVED")
+                candidate["decision_reason"] = .string("Approved through Swift-native promotion stage.")
+                candidate["finished_at"] = .string(resolvedAt)
+                try await p.writeJSON(.object(candidate), to: candidatePath)
+
+                proposal["status"] = .string("approved")
+                proposal["approved_at"] = .string(resolvedAt)
+                proposal["promotion_resolved_at"] = .string(resolvedAt)
+                try await p.writeJSON(.object(proposal), to: proposalURL)
+
+                let proposalId = Self.pythonStr(delta["proposal_id"], defaultWhenAbsent: "")
+                let ledgerEntry: [String: JSONValue] = [
+                    "ts": .string(resolvedAt),
+                    "proposal_id": .string(proposalId),
+                    "candidate_id": .string(candidateId),
+                    "target_doc": .string(targetDoc),
+                    "before_hash": .string(beforeHash),
+                    "after_hash": .string(afterHash),
+                    "approved_by": .string("user"),
+                    "status": .string("promotion_approved"),
+                ]
+                // M6 (2026-07-09): capped — this audit ledger grew unbounded.
+                try await appendJSONLCapped(
+                    .object(ledgerEntry), to: ledgerPath, using: p,
+                    maxLines: JSONLLineCaps.trainingAudit, logLabel: "TrainingPromotion.auditLedger"
+                )
+
+                return [
+                    "ok": .bool(true),
+                    "status": .string("approved"),
+                    "candidate_id": .string(candidateId),
+                    "proposal_id": .string(proposalId),
+                    "target_doc": .string(targetDoc),
+                    "backup": .string(backupPath.path),
+                ]
             }
-
-            let proposalId = Self.pythonStr(delta["proposal_id"], defaultWhenAbsent: "")
-            let ledgerEntry: [String: JSONValue] = [
-                "ts": .string(resolvedAt),
-                "proposal_id": .string(proposalId),
-                "candidate_id": .string(candidateId),
-                "target_doc": .string(targetDoc),
-                "before_hash": .string(beforeHash),
-                "after_hash": .string(afterHash),
-                "approved_by": .string("user"),
-                "status": .string("promotion_approved"),
-            ]
-            // M6 (2026-07-09): capped — this audit ledger grew unbounded.
-            try await appendJSONLCapped(
-                .object(ledgerEntry), to: ledgerPath, using: p,
-                maxLines: JSONLLineCaps.trainingAudit, logLabel: "TrainingPromotion.auditLedger"
-            )
-
-            return [
-                "ok": .bool(true),
-                "status": .string("approved"),
-                "candidate_id": .string(candidateId),
-                "proposal_id": .string(proposalId),
-                "target_doc": .string(targetDoc),
-                "backup": .string(backupPath.path),
-            ]
         }
         return .object(out)
     }
@@ -682,40 +710,47 @@ extension SwiftNativeSelfImprovement {
             guard status == "pending" else {
                 throw TrainingProposalWriteError.promotionStageNotPending(id: candidateId, status: status)
             }
-            let resolvedAt = Self.nowISO()
-            stage["status"] = .string("rejected")
-            stage["resolved_at"] = .string(resolvedAt)
-            stage["resolution_reason"] = .string(effectiveReason)
-            try await p.writeJSON(.object(stage), to: stageURL)
-
-            let candidateRaw = try await p.readJSON(candidatePath, ifMissing: .object([:]))
-            var candidate: [String: JSONValue] = [:]
-            if case .object(let existing) = candidateRaw { candidate = existing }
-            candidate["candidate_id"] = .string(candidateId)
-            candidate["status"] = .string("rejected")
-            candidate["decision"] = .string("BLOCK")
-            candidate["decision_reason"] = .string(effectiveReason)
-            candidate["finished_at"] = .string(resolvedAt)
-            try await p.writeJSON(.object(candidate), to: candidatePath)
-
-            if case .object(let delta)? = stage["delta"],
-               case .string(let proposalPath)? = delta["proposal_path"] {
-                let proposalURL = URL(fileURLWithPath: proposalPath)
-                let proposalRaw = try await p.readJSON(proposalURL, ifMissing: .object([:]))
-                if case .object(var proposal) = proposalRaw {
-                    proposal["status"] = .string("rejected")
-                    proposal["rejection_reason"] = .string(effectiveReason)
-                    proposal["resolved_at"] = .string(resolvedAt)
-                    try await p.writeJSON(.object(proposal), to: proposalURL)
-                }
+            guard case .object(let delta)? = stage["delta"] else {
+                throw TrainingProposalWriteError.promotionStageMalformed(candidateId)
             }
+            let proposalURL = try await self.promotionProposalURL(delta: delta, candidateId: candidateId)
+            let pendingStage = stage
+            return try await p.withFileLock(proposalURL) {
+                var stage = pendingStage
+                let proposalRaw = try await p.readJSON(proposalURL, ifMissing: .null)
+                guard case .object(var proposal) = proposalRaw,
+                      proposal["proposal_id"] == delta["proposal_id"],
+                      proposal["promotion_candidate_id"] == .string(candidateId) else {
+                    throw TrainingProposalWriteError.promotionStageMalformed(candidateId)
+                }
+                let resolvedAt = Self.nowISO()
+                stage["status"] = .string("rejected")
+                stage["resolved_at"] = .string(resolvedAt)
+                stage["resolution_reason"] = .string(effectiveReason)
+                try await p.writeJSON(.object(stage), to: stageURL)
 
-            return [
-                "ok": .bool(true),
-                "status": .string("rejected"),
-                "candidate_id": .string(candidateId),
-                "reason": .string(effectiveReason),
-            ]
+                let candidateRaw = try await p.readJSON(candidatePath, ifMissing: .object([:]))
+                var candidate: [String: JSONValue] = [:]
+                if case .object(let existing) = candidateRaw { candidate = existing }
+                candidate["candidate_id"] = .string(candidateId)
+                candidate["status"] = .string("rejected")
+                candidate["decision"] = .string("BLOCK")
+                candidate["decision_reason"] = .string(effectiveReason)
+                candidate["finished_at"] = .string(resolvedAt)
+                try await p.writeJSON(.object(candidate), to: candidatePath)
+
+                proposal["status"] = .string("rejected")
+                proposal["rejection_reason"] = .string(effectiveReason)
+                proposal["resolved_at"] = .string(resolvedAt)
+                try await p.writeJSON(.object(proposal), to: proposalURL)
+
+                return [
+                    "ok": .bool(true),
+                    "status": .string("rejected"),
+                    "candidate_id": .string(candidateId),
+                    "reason": .string(effectiveReason),
+                ]
+            }
         }
         return .object(out)
     }

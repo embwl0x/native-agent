@@ -624,6 +624,7 @@ async function waitForPage(payload, actionId) {
 async function performSnapshotMutation({ lease, route, payload, actionId, action, pageMessage }) {
   const startedAt = new Date().toISOString();
   let response;
+  leaseManager.requireForPageAction(payload);
   try {
     response = await chrome.tabs.sendMessage(lease.tabId, pageMessage, { frameId: route.frameId });
   } catch {
@@ -713,7 +714,7 @@ async function scrollPage(payload, actionId) {
   }) : { frameId: 0, localSnapshotId: payload.snapshotId, localNodeId: undefined };
   // Only when the host says the person is away (idle or locked): the
   // debugging bar must never appear while they are using the Mac.
-  const stopRendering = payload.renderHidden === true ? await renderWhileHidden(lease.tabId) : async () => {};
+  const stopRendering = payload.renderHidden === true ? await renderWhileHidden(lease.tabId, payload) : async () => {};
   try {
     return await performSnapshotMutation({
       lease, route, payload, actionId, action: "scroll",
@@ -736,28 +737,27 @@ async function scrollPage(payload, actionId) {
 // hidden tab render as if shown (Chrome counts it as captured) while it stays
 // a background tab, off the person's screen. Chrome shows its "started
 // debugging this browser" bar while attached; it goes when this detaches. A
-// tab with DevTools or another debugger already attached keeps the old path.
-async function renderWhileHidden(tabId) {
+// An unavailable debugger reports its failure to the caller.
+async function renderWhileHidden(tabId, payload) {
   const none = async () => {};
-  if (!chrome.debugger) return none;
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.active) {
-      const window = await chrome.windows.get(tab.windowId);
-      if (window.state !== "minimized") return none;
-    }
-    const target = { tabId };
-    await chrome.debugger.attach(target, "1.3");
-    try {
-      await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
-    } catch {
-      await chrome.debugger.detach(target).catch(() => {});
-      return none;
-    }
-    return async () => { await chrome.debugger.detach(target).catch(() => {}); };
-  } catch {
-    return none;
+  const tab = await chrome.tabs.get(tabId);
+  leaseManager.requireForPageAction(payload);
+  if (tab.active) {
+    const window = await chrome.windows.get(tab.windowId);
+    leaseManager.requireForPageAction(payload);
+    if (window.state !== "minimized") return none;
   }
+  const target = { tabId };
+  await chrome.debugger.attach(target, "1.3");
+  try {
+    leaseManager.requireForPageAction(payload);
+    await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
+    leaseManager.requireForPageAction(payload);
+  } catch (error) {
+    await chrome.debugger.detach(target).catch(() => {});
+    throw error;
+  }
+  return async () => { await chrome.debugger.detach(target).catch(() => {}); };
 }
 
 async function sendPageMessage(tabId, message, options = undefined) {

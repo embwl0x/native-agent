@@ -47,15 +47,6 @@ public let memoryDecayHalfLifeDays: [String: Double] = [
     "moment": 60,
 ]
 
-/// Bounded use-frequency nudge applied to the recall score. `recordRecallHits`
-/// bumps `use_count` on every recall, so this term FEEDS BACK on itself — a row
-/// that surfaces once scores fractionally higher next time. The log scale plus
-/// a HARD cap is the entire safety: at most +10%, and only around ~100 recalls,
-/// which can reorder near-ties but never promote a row past a materially better
-/// match. Deliberately well under the lexical boost (0.25).
-public let memoryUseCountBoostCap: Double = 0.10
-public let memoryUseCountBoostWeight: Double = 0.05
-
 /// Additive lexical boost used by hybrid recall. The base dense cosine remains
 /// intact, then normalized BM25 can add up to this amount before kind-recency
 /// decay is applied. This keeps old cosine score semantics mostly stable while
@@ -102,15 +93,6 @@ public enum MemoryRecallScoring {
     /// still win without burying an old direct answer under newer tangents.
     public static func recallRecencyFactor(kind: String?, updatedAt: String, now: Date = Date()) -> Double {
         0.9 + 0.1 * decayFactor(kind: kind, updatedAt: updatedAt, now: now)
-    }
-
-    /// Multiplier in [1, 1 + memoryUseCountBoostCap]: log10-scaled use count,
-    /// hard-capped. Zero/negative counts return exactly 1.0, so an unused row
-    /// is never penalised — the term only ever nudges upward, bounded.
-    public static func useCountFactor(_ useCount: Int64) -> Double {
-        guard useCount > 0 else { return 1.0 }
-        let raw = log10(1 + Double(useCount)) * memoryUseCountBoostWeight
-        return 1 + min(memoryUseCountBoostCap, raw)
     }
 
     /// Extract the kind stamped by the #1 signal-carry (metadata.kind).

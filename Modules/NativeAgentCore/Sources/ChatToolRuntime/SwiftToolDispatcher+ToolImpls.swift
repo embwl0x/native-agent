@@ -21,7 +21,7 @@ extension SwiftToolDispatcher {
         throw AutonomyGateError.toolDenied(
             reason: "\(tool): '\(url.path)' is under a sensitive data sub-tree "
                 + "(OAuth tokens, pairing secrets, provider credentials, trust policy). "
-                + "Use dedicated runtime tools such as agent_introspect or recall_search instead."
+                + "Use dedicated runtime tools such as app agent.introspect or memory.recall instead."
         )
     }
 
@@ -57,7 +57,7 @@ extension SwiftToolDispatcher {
     /// window exposes its scope. Replay the authorized caller path spelling.
     static func fileReadPresentation(_ result: JSONValue, callerPath: String, continuing: Bool) -> JSONValue {
         guard case .object(var object) = result, case .string(let content)? = object["content"] else { return result }
-        if !FileReadEvidence.required, !continuing, object["truncated"] == .bool(false), object["offset"] == .int(0) { return .string(content) }
+        if !continuing, object["truncated"] == .bool(false), object["offset"] == .int(0) { return .string(content) }
         if case .object(var next)? = object["next"] {
             next["path"] = .string(callerPath)
             object["next"] = .object(next)

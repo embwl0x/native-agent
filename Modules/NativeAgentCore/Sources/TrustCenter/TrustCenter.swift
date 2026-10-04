@@ -12,20 +12,9 @@ import PersistenceCore
 // gate surfaces, and signs autonomous-tool manifests through
 // SwiftNativeManifestSigner using data/tools/.manifest_signing_key.
 
-// MARK: - Protocol
-
-/// TrustCenter surface. SwiftNative reads and writes the on-disk trust policy
-/// directly.
-public protocol TrustCenterProtocol: Sendable {
-    func getTrust() async throws -> TrustPolicy
-    func updateTrust(_ update: JSONValue) async throws -> TrustPolicy
-    func simulateTrust(_ scenario: JSONValue) async throws -> TrustSimulationResult
-    func getAutonomyPolicy() async throws -> AutonomyPolicy
-}
-
 // MARK: - SwiftNative impl
 
-public actor SwiftNativeTrustCenter: TrustCenterProtocol {
+public actor SwiftNativeTrustCenter {
     let dataRoot: URL
     let persistence: any PersistenceCoreProtocol
     let clock: @Sendable () -> Date
@@ -157,53 +146,10 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
         }
     }
 
-    public func simulateTrust(_ scenario: JSONValue) async throws -> TrustSimulationResult {
-        guard case .object(let obj) = scenario else {
-            throw TrustCenterError.invalidRequest
-        }
-        let action = Self.firstString(obj, keys: ["action", "tool", "tool_name", "name"]) ?? ""
-        let policy = try await loadTrustPolicyChecked()
-        let toolOverrides: [String: JSONValue] = {
-            if case .object(let o)? = policy["toolAutonomy"] { return o }
-            return [:]
-        }()
-        let defaultLevel: JSONValue = toolOverrides["default"] ?? .string("send_approval")
-        let autonomyBundle: [String: JSONValue] = [
-            "autonomyOverrides": .object(toolOverrides),
-            "autonomyDefault": defaultLevel,
-        ]
-        let level = autonomyForTool(action, policy: autonomyBundle)
-        let allowed = level != "blocked"
-        let requiresApproval = ["send_approval", "confirm", "destructive_strong"].contains(level)
-        let risk: String = {
-            switch level {
-            case "blocked": return "blocked"
-            case "destructive_strong": return "critical"
-            case "confirm", "send_approval": return "medium"
-            default: return "low"
-            }
-        }()
-        return TrustSimulationResult(rawResponse: .object([
-            "allowed": .bool(allowed),
-            "requiresApproval": .bool(requiresApproval),
-            "requires_approval": .bool(requiresApproval),
-            "risk": .string(risk),
-            "action": .string(action),
-            "reasons": .array([.string("tool autonomy: \(level)")]),
-            "policy": .object(policy),
-        ]))
-    }
-
     public func getAutonomyPolicy() async throws -> AutonomyPolicy {
         let policy = try await loadTrustPolicyChecked()
         let permission = Self.string(policy["permissionLevel"]) ?? "balanced"
-        let filePolicy: [String: JSONValue] = {
-            if case .object(let obj)? = policy["filePolicy"] { return obj }
-            return [:]
-        }()
-        let outsideDefault = Self.string(filePolicy["outsideWorkspaceDefault"]) ?? "deny"
-        let fullMacActive = permission == "full_mac_os"
-            || (permission == "wide_open_receipts" && outsideDefault == "allow")
+        let fullMacActive = SwiftNativeSecurityCenter.fullMacActive(policy: policy)
         let enableAutonomy: Bool = {
             if case .bool(let b)? = policy["enableAutonomy"] { return b }
             return false
@@ -270,26 +216,4 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
         if case .string(let s)? = value { return s }
         return nil
     }
-
-    private nonisolated static func firstString(
-        _ obj: [String: JSONValue],
-        keys: [String]
-    ) -> String? {
-        for key in keys {
-            if case .string(let s)? = obj[key],
-               !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return s
-            }
-        }
-        return nil
-    }
-
-}
-
-// MARK: - Factory
-
-/// SwiftNative owns the trust store. Manifest HMAC signing has its own
-/// Swift-native actor (`SwiftNativeManifestSigner`) below.
-public func makeTrustCenter() -> any TrustCenterProtocol {
-    return SwiftNativeTrustCenter()
 }

@@ -1,9 +1,11 @@
 import Foundation
+import AgentWorkspace
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import Transcripts
+import Desk
 import PersonaEngine
 import MemoryV2
 import MCPDispatcher
@@ -16,6 +18,9 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
+import Context
+import ToolRegistry
+import StandingBots
 
 struct ResidentTurnPreparation: Sendable {
     let turnPlan: TurnPlan?
@@ -82,16 +87,20 @@ extension SwiftNativeChatOrchestrationClient {
         let failed = result.toolDispatches.filter {
             !ChatToolOutcome.outputLooksSuccessful($0.result)
                 && !ChatToolOutcome.wasCancelled($0.result)
+                && !ToolLoopTraceObservation.wasStopped($0.result)
                 && !ChatToolOutcome.isWaitingOnPerson($0.result)
         }.count
-        let expansions = result.toolDispatches.filter { $0.name == "context_expand" }.count
+        let expansions = result.toolDispatches.filter { ToolNameAliases.ranTool($0.name, input: $0.input) == "context_expand" }.count
+        // Discovery is `app {find}`: the rounds spent finding an action.
         let discovery = result.toolDispatches.filter {
-            ["tool_catalog", "list_tools", "tool_load"].contains($0.name)
+            $0.name == "app" && $0.input["find"] != nil && $0.input["action"] == nil
                 && !ChatToolOutcome.wasCancelled($0.result)
         }
+        let terminalReason = result.resolvedTerminalReason(dataRoot: dataRoot)
         var payload: [String: JSONValue] = [
             "schema": .string("metacognition.observed.v1"),
-            "status": .string("completed"),
+            "status": .string(terminalReason.state.rawValue),
+            "terminalReason": .string(terminalReason.rawValue),
             // The one loop every turn runs on (S8), named so turn.terminal
             // rows before and after the move stay comparable.
             "loop": .string("streaming_tool_loop"),
@@ -100,11 +109,15 @@ extension SwiftNativeChatOrchestrationClient {
             "recalledMemoryCount": .int(Int64(result.recalledIds.count)),
             "toolDispatchCount": .int(Int64(result.toolDispatches.count)),
             "discoveryToolDispatchCount": .int(Int64(discovery.count)),
-            "toolCatalogDispatchCount": .int(Int64(discovery.filter { $0.name != "tool_load" }.count)),
-            "toolLoadDispatchCount": .int(Int64(discovery.filter { $0.name == "tool_load" }.count)),
+            // Retain the legacy slot counter; attempted failures exclude synthetic skips.
             "failedToolDispatchCount": .int(Int64(failed)),
+            "failedToolSlotCount": .int(Int64(failed)),
             "contextExpansionCount": .int(Int64(expansions)),
         ]
+        payload.merge(ToolLoopTraceObservation.toolCounts(result.toolDispatches), uniquingKeysWith: { _, new in new })
+        if let counters = result.loopCounters {
+            payload.merge(counters.tracePayload, uniquingKeysWith: { _, new in new })
+        }
         let observation = context.map(TurnEngineResult.TerminalObservation.init(context:))
             ?? result.terminalObservation
         if let observation {
@@ -126,14 +139,44 @@ extension SwiftNativeChatOrchestrationClient {
 
     // 2026-09-22 WHY: a structured turn that threw (retry ladder spent)
     // left no terminal row, so the trace read as an unexplained hang.
-    func emitTurnFailedTrace(turnId: String, sessionId: String, surface: String, error: Error) {
+    func emitTurnFailedTrace(
+        turnId: String, sessionId: String, surface: String, error: Error,
+        observation: ToolLoopTraceObservation? = nil,
+        terminalReasonOverride: TurnEngineResult.TerminalReason? = nil
+    ) {
         let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        let terminalReason: TurnEngineResult.TerminalReason
+        if let terminalReasonOverride {
+            terminalReason = terminalReasonOverride
+        } else if case .streamInterrupted(let partial, _) = error as? TurnEngineError {
+            terminalReason = partial.isEmpty ? .providerFailed : .providerInterrupted
+        } else {
+            terminalReason = .executionFailed
+        }
+        var payload = observation?.tracePayload ?? [:]
+        payload["status"] = .string(terminalReason.state.rawValue)
+        payload["terminalReason"] = .string(terminalReason.rawValue)
+        payload["reason"] = .string(String(reason.prefix(200)))
         TurnTraceBus.fire(TurnTraceEvent(
             turnId: turnId,
             kind: "turn.failed",
             sessionId: sessionId,
             surface: surface,
-            payload: .object(["reason": .string(String(reason.prefix(200)))])
+            payload: .object(payload)
+        ), on: turnTraceBus)
+    }
+
+    func emitTurnCancelledTrace(
+        turnId: String, sessionId: String, surface: String, location: String,
+        observation: ToolLoopTraceObservation? = nil
+    ) {
+        var payload = observation?.tracePayload ?? [:]
+        payload["status"] = .string(TurnEngineResult.TerminalState.interrupted.rawValue)
+        payload["terminalReason"] = .string(TurnEngineResult.TerminalReason.cancelled.rawValue)
+        payload["where"] = .string(location)
+        TurnTraceBus.fire(TurnTraceEvent(
+            turnId: turnId, kind: "turn.cancelled", sessionId: sessionId,
+            surface: surface, payload: .object(payload)
         ), on: turnTraceBus)
     }
 
@@ -152,7 +195,7 @@ extension SwiftNativeChatOrchestrationClient {
         persistToolMessages: Bool,
         /// See `executeTurnWithStreamingToolLoop(rendersProse:)`. False for
         /// chat(): its callers get the final round's reply and the provider's
-        /// own error, and no partial row is saved on a stop or failure.
+        /// own error, and no partial prose is saved on a stop or failure.
         rendersProse: Bool,
         progress: ChatOrchestrationProgressHandler?,
         noticeSink: @escaping @Sendable (String, String) async -> Void
@@ -180,13 +223,14 @@ extension SwiftNativeChatOrchestrationClient {
         // vision off means the images never become blocks, and an attached
         // PDF's text rides in `modelMessage` (model-facing only; the persisted
         // user row below keeps `message`).
-        let attachmentInput = Self.turnAttachmentInput(
+        let attachmentInput = try Self.turnAttachmentInput(
             message: message, attachments: attachments, dataRoot: dataRoot)
         let imageBlocks = attachmentInput.imageBlocks
         let modelMessage = attachmentInput.userMessage
 
+        let origin: AfterTurnOrigin?
         if !suppressUserAppend {
-            try await appendMessage(
+            origin = try await appendMessage(
                 sessionId: resolvedSession,
                 role: "user",
                 content: message,
@@ -199,6 +243,28 @@ extension SwiftNativeChatOrchestrationClient {
                 // surface, which a person steering in also arrives on.
                 mechanicalRow: ChatTurnExecution.transcriptRowKind
             )
+        } else {
+            origin = try afterTurnOrigin(sessionId: resolvedSession, runId: runId)
+        }
+        var afterTurnStarted = false
+        let incomingTraceId = TurnTraceContext.turnId ?? runId
+        defer {
+            // Incoming appraisal belongs to the accepted message even when no
+            // assistant completion survives. This task is not cancelled by Stop.
+            if !afterTurnStarted {
+                Task { [engine, turnTraceBus] in
+                    await AfterTurnSource.$origin.withValue(origin) {
+                        await TurnTraceContext.$bus.withValue(turnTraceBus) {
+                            await TurnTraceContext.$turnId.withValue(incomingTraceId) {
+                                let ticket = await engine.deferMemoryPromotion(
+                                    userMessage: message, assistantMessage: "", toolDispatches: [],
+                                    sessionId: resolvedSession, surface: surface)
+                                await engine.startDeferredMemoryPromotion(ticket: ticket)
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Item 5 (third conversation pass): this turn is now steerable — a
@@ -206,7 +272,7 @@ extension SwiftNativeChatOrchestrationClient {
         // next tool boundary instead of waiting for the session to go idle.
         // The window closes in the defer below; anything the turn never took
         // is left for its sender to re-queue as an ordinary turn.
-        let steeringPersister: ChatTurnSteering.Persister = { [weak self] sid, text in
+        let steeringPersister: ChatTurnSteering.Persister = { [weak self] sid, text, enqueueRunID in
             guard let self else { return false }
             do {
                 // The delivery is only allowed to happen because this row is on
@@ -214,8 +280,20 @@ extension SwiftNativeChatOrchestrationClient {
                 // message that was absent after reload and already gone from
                 // the queue — so the write decides, and a failure both tells
                 // the person and sends the offer back to be re-queued.
-                _ = try await self.enqueueUserMessage(
-                    message: text, sessionId: sid, persona: nil, surface: surface)
+                let steeringOrigin = try await self.enqueueSteeringMessage(
+                    message: text, sessionId: sid, surface: surface, runId: enqueueRunID)
+                // A consumed offer never runs its own structured turn. Appraise
+                // its durable incoming row without borrowing the working turn's reply.
+                await AfterTurnSource.$origin.withValue(steeringOrigin) {
+                    await TurnTraceContext.$bus.withValue(self.turnTraceBus) {
+                        await TurnTraceContext.$turnId.withValue(enqueueRunID) {
+                            let ticket = await self.engine.deferMemoryPromotion(
+                                userMessage: text, assistantMessage: "", toolDispatches: [],
+                                sessionId: sid, surface: surface)
+                            await self.engine.startDeferredMemoryPromotion(ticket: ticket)
+                        }
+                    }
+                }
                 return true
             } catch {
                 await Self.reportTranscriptWriteFailure(
@@ -259,7 +337,11 @@ extension SwiftNativeChatOrchestrationClient {
             // after their last tool; a cancellation left nothing on paper.
             TurnTraceBus.fireFromContext(
                 kind: "turn.cancelled", surface: surface,
-                payload: .object(["where": .string("structured_chat.\(#line)")])
+                payload: .object([
+                    "where": .string("structured_chat.\(#line)"),
+                    "status": .string("interrupted"),
+                    "terminalReason": .string(TurnEngineResult.TerminalReason.cancelled.rawValue),
+                ])
             )
             throw CancellationError()
         }
@@ -268,6 +350,12 @@ extension SwiftNativeChatOrchestrationClient {
             fileAccess: fileAccess, verifiedSessionId: resolvedSession
         )
         let boundTurnId = StructuredTurnTraceIdentity.currentOrMint()
+        let workTitle = String(TurnTraceRedactor.redactText(message)
+            .split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(96) ?? "".prefix(96))
+        TurnTraceBus.fire(TurnTraceEvent(
+            turnId: boundTurnId, kind: "work.identified", sessionId: resolvedSession,
+            surface: surface, payload: .object(["title": .string(workTitle)])
+        ), on: turnTraceBus)
         TurnLifecycleTelemetry.emit(
             .turnAccepted,
             surface: surface,
@@ -280,12 +368,9 @@ extension SwiftNativeChatOrchestrationClient {
             message: message,
             surface: surface,
             sessionId: resolvedSession,
+            runId: runId,
             fileAccess: fileAccess
         )
-        // TURN START: advance the session turn clock and batch-drop tools that
-        // went unused for two completed turns, before anything reads the
-        // catalog. Drops only ever happen here — never mid-turn.
-        async let sessionActiveToolsTask = activeToolsStore.beginTurn(sessionId: resolvedSession)
 
         // Pre-resolve the context with history threading so the engine call
         // inherits prior turns (threaded in via preBuiltContext). PROPAGATE
@@ -315,12 +400,9 @@ extension SwiftNativeChatOrchestrationClient {
                     historyReader: history,
                     personaOverride: persona,
                     excludeHistoryRunId: runId,
-                    // The /new carry-over: on this session's FIRST turn only,
-                    // two lines naming the previous session on THIS surface
-                    // and the call that reopens it. Same data root as the
-                    // history reader, so a fixture-rooted test never reads
-                    // the live index.
-                    sessionDigest: SessionDigestProvider(dataRoot: history.dataRoot),
+                    // First-turn handoff from the same participant, through
+                    // the existing transcript and admitted provider route.
+                    sessionDigest: SessionDigestProvider(dataRoot: history.dataRoot, llm: llm),
                     imageBlocks: imageBlocks
                 )
             }
@@ -329,9 +411,9 @@ extension SwiftNativeChatOrchestrationClient {
         } catch is CancellationError {
             // Two turns died silently on 2026-09-05 (00:34, 10:12) with no trace
             // after their last tool; a cancellation left nothing on paper.
-            TurnTraceBus.fireFromContext(
-                kind: "turn.cancelled", surface: surface,
-                payload: .object(["where": .string("structured_chat.\(#line)")])
+            emitTurnCancelledTrace(
+                turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
+                location: "structured_chat.\(#line)"
             )
             throw CancellationError()
         } catch {
@@ -343,7 +425,8 @@ extension SwiftNativeChatOrchestrationClient {
                     runId: runId,
                     errorMessage: message,
                     failure: error,
-                    persona: persona
+                    persona: persona,
+                    surface: surface
                 )
             }
             throw error
@@ -369,7 +452,7 @@ extension SwiftNativeChatOrchestrationClient {
                 turnTraceBus: turnTraceBus
             )
         }
-        let (threadedCtxWithCognition, pendingProjectionCommit) = await contextByAppendingCognitiveCapsule(
+        let (threadedCtxWithCognition, pendingProjectionCommit) = await Self.contextByAppendingCognitiveCapsule(
             to: threadedCtxWithOverrides,
             surface: surface,
             userMessage: message,
@@ -378,104 +461,13 @@ extension SwiftNativeChatOrchestrationClient {
             fileAccess: fileAccess,
             projection: residentPreparation.cognitiveProjection
         )
-        let sessionLoadout = try await sessionActiveToolsTask
-        let sessionActiveTools = sessionLoadout.activeTools
-        let preloadPrediction = turnPlan?.preloadPrediction
-            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface, dataRoot: dataRoot)
-        // Predictive tool preload consumes the per-turn plan's cached
-        // mechanical prediction; union-only, policy-gate-reusing, no-match
-        // stays a no-op. The union is request-scoped, not session-persisted.
-        let preloadOutcome = await ToolPreloadHeuristics.preloadOutcome(
-            prediction: preloadPrediction,
-            sessionId: resolvedSession,
-            activeTools: sessionActiveTools,
-            availableToolNames: Set((threadedCtxWithCognition?.toolSchemas ?? []).map(\.name)),
-            surface: surface,
-            dataRoot: dataRoot
-        )
-        // Still TURN START, still before the prefix is built: snapshot MCP
-        // membership, freeze a descriptor per slot, and let a confident route
-        // prediction join the load order exactly as a tool_load would, so its
-        // schemas are ADVERTISED on this turn's FIRST call — docs/
-        // ANATOMY_OF_A_TURN.md §3: a GitHub URL prepares the GitHub read tools
-        // with no discovery round. That promise holds on every route.
-        //
-        // A3 (2026-09-11): what differs per route is how the array STAYS
-        // stable afterwards. On the Anthropic defer lane a declared tool need
-        // not be offered, so the frozen declaration is the array and the
-        // offered set is free to move behind the cache breakpoint. Everywhere
-        // else — the OpenAI/ChatGPT lanes included — the `tools` array IS the
-        // cached prefix: live session D53339E5 watched it move 70 → 69 → 68
-        // across three turns (idle drops retiring old promotions) and every
-        // first call read 0 cached tokens. So those routes get the APPEND-ONLY
-        // OFFER FLOOR instead: a name declared once keeps its slot through
-        // idle turns and route-prediction changes, bounded at 40 with
-        // turn-boundary LRU eviction. Gating the PROMOTION was the wrong
-        // half — it cost the first-call preload and never stabilised the
-        // array on its own.
-        let routeHasDeferLane = Self.routeCanDeclareWithoutOffering(
-            providerId: threadedCtxWithCognition?.providerId,
-            modelId: threadedCtxWithCognition?.modelId ?? ""
-        )
-        let contractCommit = await activeToolsStore.commitTurnStartContract(
-            sessionId: resolvedSession,
-            promoting: preloadOutcome.promotable,
-            catalog: threadedCtxWithCognition?.toolSchemas ?? [],
-            turnActiveTools: preloadOutcome.activeTools,
-            stableToolArray: !routeHasDeferLane,
-            codeOwnedToolNames: (tools as? any ActiveToolsStoreProviding)?.codeOwnedToolNames
-        )
-        // A name that was NOT admitted (no headroom, or the write failed) must
-        // not be reported or authorized as loaded: leave it discovery-only so
-        // tool_load stays the honest recovery path.
-        // The floor RESTORE also puts names back in the session loadout that
-        // beginTurn's idle drop had removed. Those are advertised again this
-        // turn, so they must be dispatchable again too — a row the model can
-        // read but not call is worse than no row. Union the commit's own
-        // active set; a promotable that was NOT admitted is still absent from
-        // it, so the honest-recovery invariant above is untouched.
-        let preloadedActiveTools = preloadOutcome.activeTools
-            .subtracting(
-                preloadOutcome.promotable.subtracting(contractCommit?.promoted ?? [])
-            )
-            .union(contractCommit?.state.activeTools ?? [])
-        let turnContract = (contractCommit?.state ?? sessionLoadout).toolContract
-        // preloadedActiveTools authorizes DISPATCH (it is bound through
-        // LLMCallContext.turnActiveTools below). The advertised set is the
-        // frozen contract — which now already contains this turn's promoted
-        // preload and its pinned MCP membership.
-        let lazyFilteredCtx = Self.applyLazyToolFilter(
-            to: threadedCtxWithCognition,
-            activeTools: preloadedActiveTools,
-            contract: turnContract
-        )
-        let providerCtx = lazyFilteredCtx
-
-        // Mid-conversation tool changes (Anthropic api-key structured lane
-        // only). The `tools` array becomes the session's full pinned catalog —
-        // byte-stable across turns — and THIS turn's offered set moves into
-        // `tool_addition` / `tool_removal` blocks behind the cache breakpoint.
-        // nil on every other provider/model, which keeps their wire identical.
-        let toolChangePlan = Self.makeToolChangePlan(
-            offered: providerCtx?.toolSchemas ?? [],
-            contract: turnContract,
-            modelId: providerCtx?.modelId ?? "",
-            providerId: providerCtx?.providerId
-        )
+        // `app` is her one tool (docs/TOOL_LOADING.md): the turn offers it alone.
+        let providerCtx = Self.applyLazyToolFilter(to: threadedCtxWithCognition, activeTools: [])
         Self.traceFinalToolContract(
             turnId: boundTurnId,
-            wire: toolChangePlan?.array ?? (providerCtx?.toolSchemas ?? []),
-            offeredCount: providerCtx?.toolSchemas.count ?? 0,
-            contract: turnContract,
-            declaredWithoutOffering: routeHasDeferLane,
-            floorRebuilt: contractCommit?.floorRebuild != nil,
+            wire: providerCtx?.toolSchemas ?? [],
             surface: surface
         )
-        if let floorRebuild = contractCommit?.floorRebuild {
-            Self.traceFloorRebuild(
-                turnId: boundTurnId, rebuild: floorRebuild, surface: surface
-            )
-        }
 
         let toolProgressRecorder = persistToolMessages ? ToolProgressPersistenceBuffer() : nil
         let receiptWriter = ToolReceiptWriter(
@@ -518,6 +510,8 @@ extension SwiftNativeChatOrchestrationClient {
             effectiveProgress = nil
         }
 
+        let loopObservation = ToolLoopTraceObservation()
+        var terminalFailureReason: TurnEngineResult.TerminalReason?
         let result: TurnEngineResult
         do {
             // Turn Inspector W1: bind the per-turn trace id around the engine
@@ -525,10 +519,12 @@ extension SwiftNativeChatOrchestrationClient {
             // memory.commit) inherits one turnId. The streaming facade has
             // already bound this same id; chat() has not, so this is where its
             // turn gets one spine. Same turnId as the context build above.
-            result = try await TurnTraceContext.$bus.withValue(turnTraceBus) {
+            result = try await AfterTurnSource.$origin.withValue(origin) {
+            do {
+            return try await ToolLoopTraceObservation.$current.withValue(loopObservation) {
+            try await TurnTraceContext.$bus.withValue(turnTraceBus) {
             try await TurnTraceContext.$turnId.withValue(boundTurnId) {
-            try await LLMCallContext.$turnActiveTools.withValue(preloadedActiveTools) {
-                try await StructuredToolChangeContext.$plan.withValue(toolChangePlan) {
+            try await LLMCallContext.$turnActiveTools.withValue(Set(providerCtx?.toolSchemas.map(\.name) ?? [])) {
                 do {
                     return try await engine.executeTurnWithStreamingToolLoop(
                         surface: surface,
@@ -542,22 +538,58 @@ extension SwiftNativeChatOrchestrationClient {
                         preBuiltContext: providerCtx,
                         progress: effectiveProgress,
                         rendersProse: rendersProse,
-                        cancelFlagPath: cancelFlagPath
+                        cancelFlagPath: cancelFlagPath,
+                        fileAccess: fileAccess,
+                        capabilityProfile: continuationCapabilityProfile
                     )
                 } catch TurnEngineError.streamCancelled where !rendersProse {
-                    // No partial is kept for a caller that renders none: a
+                    // No partial prose is kept for a caller that renders none: a
                     // stop is a plain cancellation, handled below.
                     throw CancellationError()
                 } catch TurnEngineError.streamInterrupted(_, let underlying) where !rendersProse {
                     // Likewise: the provider failure itself, handled below.
+                    terminalFailureReason = .providerFailed
                     throw underlying
                 }
-                }
             }
+            }
+            }
+            }
+            } catch {
+                let partial: String
+                let cancelled: Bool
+                switch error {
+                case TurnEngineError.streamInterrupted(let text, _):
+                    partial = text
+                    cancelled = false
+                case TurnEngineError.streamCancelled(let text, _):
+                    partial = text
+                    cancelled = true
+                default:
+                    partial = ""
+                    cancelled = error is CancellationError
+                }
+                await persistPartialIfNeeded(
+                    sessionId: resolvedSession,
+                    runId: runId,
+                    text: partial,
+                    attachments: ChatGeneratedImageArtifacts.attachments(
+                        from: loopObservation.toolDispatches, dataRoot: dataRoot
+                    ),
+                    cancelled: cancelled,
+                    failure: error,
+                    source: surface,
+                    outcomeContext: providerCtx,
+                    onNotice: noticeSink
+                )
+                throw error
             }
             }
         } catch let e as ChatOrchestrationError {
-            emitTurnFailedTrace(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: e)
+            emitTurnFailedTrace(
+                turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: e,
+                observation: loopObservation, terminalReasonOverride: terminalFailureReason
+            )
             if Self.shouldPersistFailureMessage(surface: surface) {
                 try? await appendFailureMessageIfNeeded(
                     sessionId: resolvedSession,
@@ -565,6 +597,7 @@ extension SwiftNativeChatOrchestrationClient {
                     errorMessage: Self.errorText(e),
                     failure: e,
                     persona: persona,
+                    surface: surface,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
                 )
@@ -572,46 +605,19 @@ extension SwiftNativeChatOrchestrationClient {
             throw e
         } catch let e as TurnEngineError {
             let message = (e as LocalizedError).errorDescription ?? String(describing: e)
-            // #5: persist the visible partial the stream produced before failing
-            // so it survives the reload like the compat path's partial (the
-            // structured path used to drop it entirely).
-            if case .streamInterrupted(let partial, _) = e {
-                await persistPartialIfNeeded(
-                    sessionId: resolvedSession,
-                    runId: runId,
-                    text: partial,
-                    cancelled: false,
-                    failure: e,
-                    source: surface,
-                    outcomeContext: providerCtx,
-                    onNotice: noticeSink
-                )
-            }
-            // 2026-07-21 audit fix: a user stop carries its visible partial
-            // through streamCancelled — persist it with cancelled:true (the
-            // row must not read as a failure), skip the failure-message row,
-            // and propagate CancellationError semantics upstream.
-            if case .streamCancelled(let partial, _) = e {
-                await persistPartialIfNeeded(
-                    sessionId: resolvedSession,
-                    runId: runId,
-                    text: partial,
-                    cancelled: true,
-                    source: surface,
-                    outcomeContext: providerCtx,
-                    onNotice: noticeSink
-                )
-                // User, 2026-09-06: this catch persisted the partial and threw
-                // without a terminal row, so a mid-stream Stop on the
-                // structured lane left the trace looking like an unexplained
-                // death. Every other cancellation catch already fires this.
-                TurnTraceBus.fireFromContext(
-                    kind: "turn.cancelled", surface: surface,
-                    payload: .object(["where": .string("structured_chat.\(#line)")])
+            // The partial output is already saved. A user stop closes the
+            // trace and propagates cancellation without a failure-message row.
+            if case .streamCancelled = e {
+                emitTurnCancelledTrace(
+                    turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
+                    location: "structured_chat.\(#line)", observation: loopObservation
                 )
                 throw CancellationError()
             }
-            emitTurnFailedTrace(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: e)
+            emitTurnFailedTrace(
+                turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: e,
+                observation: loopObservation, terminalReasonOverride: terminalFailureReason
+            )
             if Self.shouldPersistFailureMessage(surface: surface) {
                 try? await appendFailureMessageIfNeeded(
                     sessionId: resolvedSession,
@@ -619,6 +625,7 @@ extension SwiftNativeChatOrchestrationClient {
                     errorMessage: message,
                     failure: e,
                     persona: persona,
+                    surface: surface,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
                 )
@@ -629,13 +636,16 @@ extension SwiftNativeChatOrchestrationClient {
             // persist a "Chat error: CancellationError" row; just propagate
             // (gpt-5.5 review of #19, 2026-06-14). It still needs a terminal
             // row, or the turn reads as an unexplained death (2026-09-06).
-            TurnTraceBus.fireFromContext(
-                kind: "turn.cancelled", surface: surface,
-                payload: .object(["where": .string("structured_chat.\(#line)")])
+            emitTurnCancelledTrace(
+                turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
+                location: "structured_chat.\(#line)", observation: loopObservation
             )
             throw CancellationError()
         } catch {
-            emitTurnFailedTrace(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error)
+            emitTurnFailedTrace(
+                turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error,
+                observation: loopObservation, terminalReasonOverride: terminalFailureReason
+            )
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
                 try? await appendFailureMessageIfNeeded(
@@ -644,6 +654,7 @@ extension SwiftNativeChatOrchestrationClient {
                     errorMessage: message,
                     failure: error,
                     persona: persona,
+                    surface: surface,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
                 )
@@ -658,7 +669,8 @@ extension SwiftNativeChatOrchestrationClient {
             pendingProjectionCommit,
             surface: surface,
             userMessage: message,
-            sessionId: resolvedSession
+            sessionId: resolvedSession,
+            turnId: boundTurnId
         )
 
         let generatedAttachments = ChatGeneratedImageArtifacts.attachments(
@@ -666,7 +678,8 @@ extension SwiftNativeChatOrchestrationClient {
             dataRoot: dataRoot
         )
 
-        let transcriptRow = TurnSettle.transcriptRow(for: result.reply)
+        let reply = BotRunner.conditionReply(result.reply, sessionID: resolvedSession)
+        let transcriptRow = TurnSettle.transcriptRow(for: reply)
         try await appendMessage(
             sessionId: resolvedSession,
             role: "assistant",
@@ -680,9 +693,17 @@ extension SwiftNativeChatOrchestrationClient {
             outcomeResult: result,
             outcomeContext: providerCtx,
             outcomeTurnID: boundTurnId,
-            mechanicalRow: transcriptRow.mechanicalRow
+            mechanicalRow: transcriptRow.mechanicalRow,
+            requestedResultIntent: TurnSettle.requestedResultIntent(
+                message: message, plan: turnPlan, result: result,
+                sessionID: resolvedSession, runID: runId, surface: surface,
+                resumedRequest: suppressUserAppend && (
+                    message.hasPrefix("[NativeAgent internal interaction continuation]") ||
+                    message.hasPrefix("[NativeAgent internal approval continuation]")
+                )
+            )
         )
-        if !result.reply.isEmpty, await outputMilestoneGate.claim() {
+        if !reply.isEmpty, await outputMilestoneGate.claim() {
             TurnLifecycleTelemetry.emit(
                 .surfaceOutputEnqueued,
                 surface: surface,
@@ -703,6 +724,7 @@ extension SwiftNativeChatOrchestrationClient {
         // promotion completes on its own (Slack, Mac and iOS never drain).
         // The ticket starts THIS turn's promotion and no other turn's.
         await engine.startDeferredMemoryPromotion(ticket: result.memoryPromotionTicket)
+        afterTurnStarted = result.memoryPromotionTicket != nil
         emitMetacognitiveTerminalTrace(
             turnId: boundTurnId,
             sessionId: resolvedSession,
@@ -715,7 +737,7 @@ extension SwiftNativeChatOrchestrationClient {
             model: result.modelUsed,
             requestedModel: model.isEmpty ? nil : model,
             reasoningEffort: reasoningEffort.isEmpty ? nil : reasoningEffort,
-            output: result.reply,
+            output: reply,
             sessionId: resolvedSession,
             personaFingerprint: Self.personaFingerprint(dataRoot: dataRoot),
             contextFingerprint: Self.contextFingerprint(recalledIds: result.recalledIds),
@@ -730,25 +752,25 @@ extension SwiftNativeChatOrchestrationClient {
             response.runtimeStatus = ChatTurnExecution.current?.waitingForInteraction == true
                 ? "waiting on you" : "interrupted"
         }
+        if result.terminalReason == .replyCompleted,
+           let journal = DeskContinuationScope.current,
+           await journal.snapshot().runID == runId {
+            try await journal.completeResponse(JSONValue.fromEncodable(response), reply: response.output,
+                peerSources: PeerDataTaint.current?.checkpointSources ?? [])
+        }
         return StructuredChatExecution(response: response, turn: result)
     }
 
-    /// Measure the tools array THIS TURN ACTUALLY SENDS, after the turn-start
-    /// contract commit and the lazy filter have both run.
+    /// Measure the tools array THIS TURN ACTUALLY SENDS, after the lazy
+    /// filter has run.
     ///
     /// Comb 3 lane 3 item 2: the preflight instrument in the turn engine reads
     /// the loadout on disk at context-assembly time, so it reported 20/48/19
     /// while the request that followed carried 85 schemas and an unchanged
     /// `component.toolsSHA256`.
     ///
-    /// `wire` is THE ARRAY THE REQUEST CARRIES: on the Anthropic defer lane that
-    /// is `toolChangePlan.array` (the session's pinned declaration,
-    /// ChatOrchestration+ToolLoop.swift:636 builds the provider name map from the
-    /// same array), everywhere else it is `providerCtx.toolSchemas` — the two are
-    /// the same array off that lane. Floor/appended and both fingerprints are
-    /// computed over it; the offered set is reported alongside so the defer
-    /// lane's declared-vs-offered split stays visible instead of being folded
-    /// into one count.
+    /// `wire` is THE ARRAY THE REQUEST CARRIES, `providerCtx.toolSchemas`.
+    /// Floor/appended and both fingerprints are computed over it.
     ///
     /// Two digests on purpose. The contract digest hashes ORDERED NAMES, which
     /// is what a prefix-cache question is about. The schema digest hashes the
@@ -759,16 +781,9 @@ extension SwiftNativeChatOrchestrationClient {
     static func traceFinalToolContract(
         turnId: String,
         wire: [LLMToolSchema],
-        offeredCount: Int,
-        contract: SessionToolContract,
-        declaredWithoutOffering: Bool,
-        floorRebuilt: Bool,
         surface: String?
     ) {
-        let ordering = SwiftToolDispatcher.canonicalToolOrder(
-            wire.map(\.name),
-            loadOrder: contract.order
-        )
+        let ordering = SwiftToolDispatcher.canonicalToolOrder(wire.map(\.name))
         // THE APPENDED COST, MEASURED (Astra comb 4, lane3 finding 2). The
         // snapshot's per-tool array is the first casualty of oversized-payload
         // truncation, so no retained row could separate the floor from the
@@ -798,25 +813,15 @@ extension SwiftNativeChatOrchestrationClient {
         // binding opens, so the context-derived firing dropped every row.
         var payload: [String: JSONValue] = [
                 "tools.finalWireCount": .int(Int64(wire.count)),
-                "tools.finalOfferedCount": .int(Int64(offeredCount)),
                 "tools.finalFloorCount": .int(Int64(ordering.floor.count)),
                 "tools.finalAppendedCount": .int(Int64(ordering.appended.count)),
                 "tools.finalFingerprintSHA256":
                     .string(SwiftNativeTurnEngine.toolSchemaFingerprint(wire)),
                 "tools.finalNameOrderSHA256": .string(ordering.fingerprintSHA256),
-                // On the Anthropic defer lane the array is the pinned
-                // declaration and the offered set moves behind the cache
-                // breakpoint; everywhere else these are the same array.
-                "tools.declaredWithoutOffering": .bool(declaredWithoutOffering),
-                "tools.declaredCount": .int(Int64(contract.declaredOrder.count)),
                 // Schema-material bytes, not HTTP body size and not tokens.
                 "tools.finalFloorBytes": .int(Int64(weight.floorBytes)),
                 "tools.finalAppendedBytes": .int(Int64(weight.appendedBytes)),
                 "tools.finalWireBytes": .int(Int64(weight.wireBytes)),
-                // Whether THIS turn followed an idle-boundary floor rebuild —
-                // the one legitimate reason the offer floor SHRANK this turn,
-                // next to the fingerprint it moved.
-                "tools.followedFloorRebuild": .bool(floorRebuilt),
         ]
         if let share = weight.appendedShareOfWireBytes {
             payload["tools.finalAppendedShareOfWireBytes"] = .double(share)
@@ -830,277 +835,44 @@ extension SwiftNativeChatOrchestrationClient {
         ))
     }
 
-    /// RECEIPT for one idle-boundary offer-floor rebuild (Astra comb 4 lane 3,
-    /// Agent trial 2026-09-12). Fired only on the turn a rebuild ran, so the
-    /// trial can be measured: how much retention the rule retired, how much it
-    /// kept on real dispatch evidence, and the gap that opened it.
-    static func traceFloorRebuild(
-        turnId: String,
-        rebuild: ActiveToolsStore.FloorRebuild,
-        surface: String?
-    ) {
-        TurnTraceBus.fire(TurnTraceEvent(
-            turnId: turnId,
-            kind: "tools.floorRebuilt",
-            sessionId: LLMCallContext.sessionId,
-            surface: surface,
-            payload: .object([
-                "tools.floorRebuilt.retiredCount": .int(Int64(rebuild.retired.count)),
-                "tools.floorRebuilt.retiredNames":
-                    .array(rebuild.retired.map { .string($0) }),
-                "tools.floorRebuilt.keptCount": .int(Int64(rebuild.kept)),
-                "tools.floorRebuilt.idleGapSeconds": .double(rebuild.idleGapSeconds),
-            ])
-        ))
-    }
-
-    /// True when this route can DECLARE a tool without OFFERING it — the
-    /// Anthropic structured lane's `defer_loading` + tool-change blocks.
-    ///
-    /// It is the same gate `makeToolChangePlan` uses, named separately because
-    /// it answers a different question at a different point in the turn: may a
-    /// route-preload GUESS join the session contract at all? Only here, where
-    /// the `tools` array is the session's pinned declaration and an addition
-    /// rides behind the cache breakpoint, is that free. Everywhere else the
-    /// array IS the cached prefix and a guess moving it costs the entire
-    /// prefix at full price on the next turn's first call.
-    static func routeCanDeclareWithoutOffering(
-        providerId: String?,
-        modelId: String
-    ) -> Bool {
-        let provider = (providerId ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return provider == "anthropic"
-            && supportsMidConversationToolChanges(forModel: modelId)
-    }
-
-    /// Build the turn's mid-conversation tool-change plan, or nil to keep
-    /// today's churning-`tools`-array behavior.
-    ///
-    /// GATED THREE WAYS, all fail-closed:
-    ///   1. the ANTHROPIC API-KEY structured lane (`providerId == "anthropic"`)
-    ///      — the only transport whose adapter emits `defer_loading` and the
-    ///      tool-change blocks. OAuth-direct, kimi-code, OpenAI and xAI keep
-    ///      their existing shape byte for byte. The OpenAI Responses lane has
-    ///      NO equivalent feature — there is no way to declare a tool without
-    ///      offering it — so it keeps a churn-on-load `tools` array with its
-    ///      drops batched at turn start, and pays a prefix rebuild per load;
-    ///   2. `supportsMidConversationToolChanges(forModel:)` — an unknown or
-    ///      unsupported model answers false and falls back;
-    ///   3. a session contract carrying a non-empty FROZEN DECLARATION.
-    ///
-    /// THE ARRAY IS THE SESSION'S PINNED DECLARATION, NOT THIS TURN'S CATALOG.
-    /// `contract.declaredToolSchemas` was frozen — names and descriptors —
-    /// at first declaration by `commitTurnStartContract`, so Full-Mac posture,
-    /// activity capture, registry readiness flaps and MCP cache churn cannot
-    /// move a byte of it. They still move what is OFFERED and what may
-    /// DISPATCH, which is exactly where they belong. A genuinely new built-in
-    /// joins by an explicit turn-start re-pin, which bumps
-    /// `declarationGeneration` and is reported as an array change.
-    ///
-    /// ORDER: floor sorted by name (those are the array's own defaults), then
-    /// the rest in DECLARATION APPEND ORDER — so a re-pin appends at the tail
-    /// instead of reshuffling every row ahead of it.
-    ///
-    /// NO EMPTY-DELTA BAILOUT: the plan stands whenever the gates pass, even on
-    /// a floor-only turn. Returning nil there would ship the lazy-filtered
-    /// array on that turn and the full deferred declaration on the next one,
-    /// which is the array moving — the whole failure this lane prevents. It is
-    /// the tool-change MESSAGE that may be nil.
-    ///
-    /// VALIDATION: referencing a name that is not declared in `tools` is a
-    /// 400, so the offered set is checked against the array here. A name that
-    /// is not declared is dropped from the addition list and recorded in
-    /// `droppedUnknown` — never sent.
-    /// NOTE the absent `catalog:` parameter. This function deliberately cannot
-    /// see the live catalog — that is the guarantee, not an omission.
-    static func makeToolChangePlan(
-        offered: [LLMToolSchema],
-        contract: SessionToolContract?,
-        modelId: String,
-        providerId: String?
-    ) -> StructuredToolChangePlan? {
-        let provider = (providerId ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard provider == "anthropic",
-              supportsMidConversationToolChanges(forModel: modelId),
-              // No pinned declaration means no stable array — fall back rather
-              // than ship one derived from live, policy-gated catalog state.
-              let contract, !contract.declaredOrder.isEmpty else { return nil }
-
-        let floor = SwiftToolDispatcher.alwaysOnCoreNames
-        let declaredSchemas = contract.declaredSchemas
-        let declaredNames = contract.declaredOrder.filter { declaredSchemas[$0] != nil }
-        let orderedNames = declaredNames.filter { floor.contains($0) }.sorted()
-            + declaredNames.filter { !floor.contains($0) }
-        let array = orderedNames.compactMap { name -> LLMToolSchema? in
-            guard let pinned = declaredSchemas[name] else { return nil }
-            // Floor tools are offered from the start of the conversation;
-            // everything else waits for a `tool_addition` block.
-            return pinned.schema(named: name).deferringLoad(!floor.contains(name))
-        }
-        guard !array.isEmpty else { return nil }
-        let declared = Set(array.map(\.name))
-
-        let offeredNames = offered.map(\.name)
-        let droppedUnknown = offeredNames.filter { !declared.contains($0) }
-        let offeredDeclared = Set(offeredNames).intersection(declared)
-        // Re-declared in FULL every turn, relative to the array's own
-        // defaults, because history is rebuilt from the transcript each turn
-        // and there is no ledger of what an earlier turn declared.
-        let additions = orderedNames.filter {
-            offeredDeclared.contains($0) && !floor.contains($0)
-        }
-        // Only an array DEFAULT can need withdrawing. A deferred tool that is
-        // not offered simply never gets its addition block.
-        let removals = orderedNames.filter {
-            floor.contains($0) && !offeredDeclared.contains($0)
-        }
-        return StructuredToolChangePlan(
-            array: array,
-            offered: offeredNames.filter { offeredDeclared.contains($0) },
-            additions: additions,
-            removals: removals,
-            droppedUnknown: droppedUnknown,
-            declarationGeneration: contract.declarationGeneration
-        )
-    }
-
     /// Lazy-tool-loading filter AND the single owner of the advertised tool
-    /// order. With a `contract` the admitted set is
-    /// `alwaysOnCoreNames ∪ contract.order ∪ the Full-Mac resident family`,
-    /// and `mcp__*` passes only if the turn-start snapshot pinned it — being
-    /// merely ACTIVE admits nothing, and neither does the `mcp__` prefix.
-    /// Without a contract (no session) the legacy rule still applies: anything
-    /// `normalModelToolNames` authorizes, plus every `mcp__*` row.
-    /// Returns nil if the input ctx was nil so callers can short-circuit
-    /// the same as before. See docs/build_plans/lazy-tool-skill-loading.md.
-    /// C3: promoted from `private` to `internal` so the engine's
-    /// `lazyFilteredTurnContext` (the deriving variant used by both structured
-    /// loops + `streamTurn`) reuses this ONE filter+rebuild instead of
-    /// hand-inlining it. The 15-field rebuild now routes through
-    /// `TurnContext.withToolSchemas(_:)` (the single manual-copy site).
+    /// order: anything `normalModelToolNames` authorizes, which for her chat
+    /// is `app` alone. No `mcp__*` row is ever advertised: each MCP tool is an
+    /// `app` action. Returns nil if the input ctx was nil so callers can
+    /// short-circuit the same as before.
     ///
     /// ORDER (2026-09-01): the surviving schemas come back in
     /// `SwiftToolDispatcher.canonicalToolOrder` — always-on floor sorted by
-    /// name, then everything else in the session's LOAD order. The structured
-    /// lane's `tools` array and the text lane's rendered catalog both derive
-    /// from this one array, so the two lanes cannot disagree about the
-    /// contract and a load can only APPEND to it.
-    ///
-    /// `contract` is the session's FROZEN contract, and passing it makes this
-    /// the ADVERTISING boundary. What gets advertised is the floor, the
-    /// Full-Mac resident family, the pinned MCP members, and the session's
-    /// loaded tools IN CONTRACT ORDER — nothing else, and nothing read live
-    /// from a catalog that can change underneath a session.
-    ///
-    /// Three things are deliberately NOT trusted here:
-    ///   * `mcp__*` no longer passes on prefix. MCP schemas come from a
-    ///     detached-refresh disk cache, so prefix admission let membership
-    ///     change between two turns that loaded nothing. Only names in the
-    ///     turn-start snapshot are advertised.
-    ///   * A slot missing from THIS turn's catalog is re-materialized from its
-    ///     pinned descriptor. A registry tool whose readiness flaps keeps its
-    ///     row; dispatch still rereads readiness and answers honestly.
-    ///   * A confident preload is advertised only because turn start actually
-    ///     promoted it into the contract — never because it was predicted.
-    ///
-    /// nil keeps the legacy behavior (advertise everything authorized, MCP by
-    /// prefix) for callers that have no session.
-    ///
-    /// The Full-Mac resident family is admitted from the CATALOG rather than
-    /// from any session row: it is derived purely from the available tool names
-    /// and the Trust Center posture, so it is already identical turn to turn,
-    /// and persisting ~30 speculative names would consume the whole per-session
-    /// budget. It sorts ahead of the contract run so a later `tool_load` still
-    /// appends at the tail.
+    /// name, then everything else in incoming order. The structured lane's
+    /// `tools` array and the text lane's rendered catalog both derive from
+    /// this one array, so the two lanes cannot disagree about the contract.
     static func applyLazyToolFilter(
         to context: TurnContext?,
-        activeTools: Set<String>,
-        contract: SessionToolContract? = nil
+        activeTools: Set<String>
     ) -> TurnContext? {
         guard let context else { return nil }
         let allowed = SwiftToolDispatcher.normalModelToolNames(activeTools: activeTools)
-        let resident = ToolPreloadHeuristics.immediateFullMacTools(
-            availableToolNames: Set(context.toolSchemas.map(\.name))
-        ).subtracting(SwiftToolDispatcher.alwaysOnCoreNames)
-        // MCP membership is pinned by the turn-start SNAPSHOT (declarationGeneration
-        // > 0). A store-derived contract that has never taken one carries an
-        // empty MCP set that means "not yet snapshotted", not "no MCP": treat it
-        // like the no-contract arm so the pinned and unpinned turn-start paths
-        // agree (LazyFilterPinnedActiveToolsTests.turnStartEquivalence…).
-        let pinnedMCP: Set<String>? = (contract?.declarationGeneration ?? 0) > 0
-            ? contract?.pinnedMCPNames
-            : nil
-        // `order` IS the contract. A name that is merely ACTIVE — a live load
-        // row that turn start never admitted into the advertised order — stays
-        // dispatch-only. Advertising it would add a row the contract never
-        // declared, and as an UNRANKED slot it would land ahead of the whole
-        // load run, shifting every row the prefix already cached.
-        let advertisable: Set<String>? = contract.map { pinned in
-            SwiftToolDispatcher.alwaysOnCoreNames
-                .union(pinned.order)
-                .union(resident)
-        }
         var bySlot: [String: LLMToolSchema] = [:]
-        for schema in context.toolSchemas where bySlot[schema.name] == nil {
-            if schema.name.hasPrefix("mcp__") {
-                guard pinnedMCP?.contains(schema.name) ?? true else { continue }
-                bySlot[schema.name] = contract?.pinnedSchemas[schema.name]?.schema(named: schema.name) ?? schema
-                continue
-            }
-            guard allowed.contains(schema.name) else { continue }
-            guard advertisable?.contains(schema.name) ?? true else { continue }
+        for schema in context.toolSchemas where bySlot[schema.name] == nil && allowed.contains(schema.name) {
             bySlot[schema.name] = schema
         }
-        // A pinned slot whose schema is absent from this turn's catalog is
-        // restored from the descriptor it entered the contract with, so a
-        // readiness flap or a cache rewrite cannot silently shrink the prefix.
-        //
-        // 2026-09-06: through the MODEL-VISIBILITY boundary, the same one the
-        // catalog walk above applies via `normalModelToolNames`. A legacy
-        // `mac_*` organ left in an old session's load order is excluded from
-        // that walk, which left `bySlot[name] == nil` and made this restore
-        // declare it to the model — the retired organ arriving by the pin
-        // route the walk had just refused. Readiness and policy-catalogue
-        // flaps are untouched: this set is the fixed four-verb cutover list,
-        // not anything that moves turn to turn, so a legitimately pinned tool
-        // missing from THIS catalog is still restored.
-        if let contract {
-            let restorable = SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(contract.order))
-            for name in contract.order where bySlot[name] == nil {
-                guard restorable.contains(name) else { continue }
-                guard let pinned = contract.pinnedSchemas[name] else { continue }
-                bySlot[name] = pinned.schema(named: name)
-            }
-        }
-        // Preserve the catalog's incoming order for unbound turns, then add
-        // restored slots. Persisted contract ranks still own bound turns.
-        var admittedNames = context.toolSchemas.map(\.name).filter { bySlot[$0] != nil }
-        let fromCatalog = Set(admittedNames)
-        admittedNames += (contract?.order ?? [])
-            .filter { bySlot[$0] != nil && !fromCatalog.contains($0) }
-        let residentOrder = resident.sorted()
-        // MCP arrivals have persisted slots too. Keep them ranked so catalog
-        // enumeration changes and late server arrivals cannot move old rows.
         let ordering = SwiftToolDispatcher.canonicalToolOrder(
-            admittedNames,
-            loadOrder: residentOrder
-                + (contract?.order ?? []).filter {
-                    !resident.contains($0)
-                }
+            context.toolSchemas.map(\.name).filter { bySlot[$0] != nil }
         )
-        let ordered = ordering.advertised.compactMap { bySlot[$0] }
-        return context.withToolSchemas(ordered)
+        return context.withToolSchemas(ordering.advertised.compactMap { bySlot[$0] })
     }
 
     func prepareCognitiveTurnProjection(
         surface: String,
         userMessage: String,
-        sessionId: String
+        sessionId: String,
+        runId: String
     ) async -> CognitiveTurnProjection? {
+        // Phase 5 E2: every verified User turn stamps the time, on both turn
+        // paths and whatever the capsule does — initiative reads only this.
+        if Self.isUsersTurn(surface: surface, sessionId: sessionId, dataRoot: dataRoot) {
+            UserTurnStamp.record(dataRoot: dataRoot, key: runId)
+        }
         guard let cognitiveContextProvider else { return nil }
         return await cognitiveContextProvider.prepareTurnProjection(
             cognitiveTurnProjectionRequest(
@@ -1121,6 +893,7 @@ extension SwiftNativeChatOrchestrationClient {
         message: String,
         surface: String,
         sessionId: String,
+        runId: String,
         fileAccess: String
     ) async -> ResidentTurnPreparation {
         async let turnPlanTask = makeTurnPlan(
@@ -1132,7 +905,8 @@ extension SwiftNativeChatOrchestrationClient {
         async let cognitiveProjectionTask = prepareCognitiveTurnProjection(
             surface: surface,
             userMessage: message,
-            sessionId: sessionId
+            sessionId: sessionId,
+            runId: runId
         )
         let (turnPlan, cognitiveProjection) = await (
             turnPlanTask,
@@ -1149,7 +923,8 @@ extension SwiftNativeChatOrchestrationClient {
         userMessage: String,
         sessionId: String
     ) -> CognitiveCapsuleRequest {
-        CognitiveCapsuleRequest(
+        let fromUser = Self.isUsersTurn(surface: surface, sessionId: sessionId, dataRoot: dataRoot)
+        return CognitiveCapsuleRequest(
             surface: surface,
             userMessage: userMessage,
             sessionId: sessionId,
@@ -1172,11 +947,50 @@ extension SwiftNativeChatOrchestrationClient {
                 source: surface,
                 redactedContent: ChatSecretRedactor.redactText(userMessage),
                 origin: ChatPersistenceContext.originProvenance
-            )
+            ),
+            fromUser: fromUser,
+            previousUserTurnAt: fromUser ? UserTurnStamp.previous(dataRoot: dataRoot) : nil
         )
     }
 
-    func contextByAppendingCognitiveCapsule(
+    /// Phase 5 B2: a turn User started himself — the verified OWNER, not
+    /// whoever reached a surface (Sol, 10-03): the Mac app's local user, his
+    /// paired phone (signed command), or the Telegram owner (the bot's one
+    /// allowlisted user, the approval cards' owner rule). Her wakes, peer
+    /// threads, bridge lanes, Slack and any other sender never move his gap.
+    static func isUsersTurn(surface: String, sessionId: String, dataRoot: URL) -> Bool {
+        let envelope = ChatToolSessionContext.envelope
+        guard ChatPersistenceContext.originProvenance == nil,
+              (envelope?.agent ?? "").isEmpty,
+              sessionId != ResidentWake.session,
+              !sessionId.hasPrefix("agent-") else { return false }
+        switch surface.lowercased() {
+        case "chat", "app", "mac":
+            return envelope?.declaredRemote != true
+        case "ios":
+            return envelope?.commandSignatureVerified == true
+                || ChatToolSessionContext.commandSignatureVerified == true
+        case "telegram":
+            guard let sender = envelope?.verifiedUserId ?? ChatToolSessionContext.verifiedUserId,
+                  let owner = telegramOwnerId(dataRoot: dataRoot) else { return false }
+            return sender.trimmingCharacters(in: .whitespacesAndNewlines) == owner
+        default:
+            return false
+        }
+    }
+
+    /// The Telegram bot's owner: its single allowlisted user id, else nobody.
+    static func telegramOwnerId(dataRoot: URL) -> String? {
+        let path = dataRoot.appendingPathComponent("telegram/config.json")
+        guard let data = try? Data(contentsOf: path),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        let ids = Set(["allowed_user_ids", "allowedUserIds"].flatMap { key in
+            ((object[key] as? [Any]) ?? []).map { "\($0)".trimmingCharacters(in: .whitespacesAndNewlines) }
+        }.filter { !$0.isEmpty })
+        return ids.count == 1 ? ids.first : nil
+    }
+
+    static func contextByAppendingCognitiveCapsule(
         to context: TurnContext?,
         surface: String,
         userMessage: String,
@@ -1186,6 +1000,8 @@ extension SwiftNativeChatOrchestrationClient {
         projection: CognitiveTurnProjection?
     ) async -> (context: TurnContext?, pendingProjectionCommit: CognitiveTurnProjection?) {
         guard let context else { return (nil, nil) }
+        let projection = Self.droppingDuplicateRemindedOf(
+            projection, packetMemoryIDs: Set(context.fluidContextTurn?.selectedMemoryRecordIDs ?? []))
         guard let runtimeContext = Self.cognitiveRuntimeContext(
             runId: runId,
             sessionId: sessionId,
@@ -1194,7 +1010,10 @@ extension SwiftNativeChatOrchestrationClient {
             capsule: projection?.capsule,
             posture: projection?.posture
         ) else {
-            return (context, nil)
+            // Phase 5A: nothing to inject ("none" and a default posture) is
+            // still an accepted turn — hand the projection back so its
+            // presentation commit runs and the clocks and rests move.
+            return (context, projection)
         }
         let projectedContext = SwiftNativeTurnEngine.contextByAppendingRuntimeContext(
             context,
@@ -1209,6 +1028,36 @@ extension SwiftNativeChatOrchestrationClient {
         return (projectedContext, projection)
     }
 
+    /// Phase 5 C3: one memory once per turn. Reminded-of (the capsule) and
+    /// the personal lane (the packet) pick concurrently; when both land on the
+    /// same memory id, the packet keeps it and the capsule drops its line. The
+    /// commit still counts it surfaced (it did), and `mind.why` says why.
+    static func droppingDuplicateRemindedOf(
+        _ projection: CognitiveTurnProjection?,
+        packetMemoryIDs: Set<String>
+    ) -> CognitiveTurnProjection? {
+        guard let projection, let capsule = projection.capsule, !packetMemoryIDs.isEmpty,
+              case .object(var why)? = projection.why,
+              case .object(var winner)? = why["winner"],
+              winner["kind"] == .string("reminded_of"),
+              case .string(let source)? = winner["source"], source.hasPrefix("memory:"),
+              packetMemoryIDs.contains(String(source.dropFirst(7))) else { return projection }
+        let lines = capsule.dynamicContext.components(separatedBy: "\n")
+            .filter { !$0.hasPrefix("- Reminded of:") }
+        var trimmed = capsule
+        trimmed.dynamicContext = lines.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        winner["shown"] = .bool(false)
+        winner["dropped"] = .string("same memory as the packet's personal line")
+        why["winner"] = .object(winner)
+        return CognitiveTurnProjection(
+            fixedAt: projection.fixedAt,
+            capsule: trimmed.dynamicContext.isEmpty ? nil : trimmed,
+            posture: projection.posture,
+            capsulePresentationCommit: projection.capsulePresentationCommit,
+            why: .object(why))
+    }
+
     /// Commits presentation-only projection bookkeeping (Body-line suppress
     /// window, Observatory live-capsule cache) AFTER the provider actually
     /// accepted the turn. Called exactly once per successful turn regardless
@@ -1219,9 +1068,17 @@ extension SwiftNativeChatOrchestrationClient {
         _ projection: CognitiveTurnProjection?,
         surface: String,
         userMessage: String,
-        sessionId: String
+        sessionId: String,
+        turnId: String
     ) async {
         guard let projection, let cognitiveContextProvider else { return }
+        // Phase 5 B0: why this turn's felt cue (or none) — trace only.
+        if let why = projection.why {
+            TurnTraceBus.fire(TurnTraceEvent(
+                turnId: turnId, kind: "mind.why", sessionId: sessionId,
+                surface: surface, payload: why
+            ), on: turnTraceBus)
+        }
         await cognitiveContextProvider.commitTurnProjection(
             projection,
             request: cognitiveTurnProjectionRequest(
@@ -1264,21 +1121,10 @@ extension SwiftNativeChatOrchestrationClient {
             naturalExpressionCue: context.naturalExpressionCue,
             historyMessages: context.historyMessages,
             turnVolatileBlock: context.turnVolatileBlock,
-            historyWindowReceipt: context.historyWindowReceipt
+            historyWindowReceipt: context.historyWindowReceipt,
+            preparationMs: context.preparationMs
         )
     }
-
-    // REMOVED 2026-07-25: cleanupTransientActiveTools. It subtracted the
-    // turn-start store snapshot from the turn-end store — but preload never
-    // persists (preloadIfConfident discards the store on purpose), so the
-    // ONLY thing this could ever remove was the model's explicit tool_load
-    // results: the exact state ActiveToolsStore exists to keep. The effect
-    // was self-perpetuating session amnesia — store empty -> baseline empty
-    // -> every load "transient" -> wiped at turn end -> store empty — which
-    // forced a tool_load round-trip (a full extra LLM call) before nearly
-    // every action on tool-heavy days (live finding 2026-07-25: 30 re-loads,
-    // "already_active": [] all day, only .lock files ever on disk). Decay is
-    // owned by the store's 24h TTL and the explicit tool_unload path.
 
     func makeTurnPlan(
         message: String,
@@ -1302,6 +1148,8 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
+    static let cognitiveHeaderLine = "[CognitiveSubstrate] private — it colors you; never quote it."
+
     static func cognitiveRuntimeContext(
         runId: String,
         sessionId: String,
@@ -1311,25 +1159,8 @@ extension SwiftNativeChatOrchestrationClient {
         posture: OrganismBehaviorPosture?
     ) -> String? {
         var sections: [String] = []
-        if let capsule,
-           !capsule.combined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // One functional line, no disclaimers: her guardrails live in her soul
-            // (persona), and actions are hard-gated by TrustCenter regardless of
-            // prompt text (User, 2026-07-01: "she has those guardrails in her
-            // soul... no disclaimer is needed"). The line below only keeps her from
-            // narrating the block itself.
-            sections.append("""
-            [CognitiveSubstrate]
-            run_id: \(runId)
-            session_id: \(sessionId)
-            surface: \(surface)
-            file_access: \(fileAccess)
-
-            Your private inner state — it colors you; never quote or mention it.
-
-            \(capsule.combined)
-            """)
-        }
+        // The ops line rides FIRST and on its own, so it never reads as part of
+        // her private inner state; it is empty on a default posture.
         if let posture {
             sections.append(posture.privateRuntimeContext(
                 runId: runId,
@@ -1337,6 +1168,15 @@ extension SwiftNativeChatOrchestrationClient {
                 surface: surface,
                 fileAccess: fileAccess
             ))
+        }
+        if let capsule,
+           !capsule.combined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // One functional line, no disclaimers: her guardrails live in her soul
+            // (persona), and actions are hard-gated by TrustCenter regardless of
+            // prompt text (User, 2026-07-01). Phase 5A: the run/session/surface
+            // ids were trace plumbing the model paid for on every call; the
+            // trace reader keys on this exact line instead.
+            sections.append(Self.cognitiveHeaderLine + "\n" + capsule.combined)
         }
         let combined = sections
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1353,5 +1193,43 @@ extension SwiftNativeChatOrchestrationClient {
             .lowercased()
         return normalized.hasPrefix("[from: codex, via bridge]")
             || normalized.hasPrefix("[from: claude, via bridge]")
+    }
+}
+
+/// Phase 5 E2: when User last took a turn at one of his verified doors (Mac,
+/// paired phone, Telegram owner), stamped on every such turn as it starts,
+/// and the verified turn before it. The one source both initiative (E) and
+/// "since we last talked" (B2) read; never a feeling. Keyed per turn, so a
+/// recompile of the same turn does not move `previous`.
+public enum UserTurnStamp {
+    struct Stamp: Codable { var at: Double; var previous: Double?; var key: String }
+
+    static func url(_ dataRoot: URL) -> URL { dataRoot.appendingPathComponent("cognition/user_turn.json") }
+
+    static func read(_ dataRoot: URL) -> Stamp? {
+        (try? Data(contentsOf: url(dataRoot))).flatMap { try? JSONDecoder().decode(Stamp.self, from: $0) }
+    }
+
+    public static func record(dataRoot: URL, key: String, at date: Date = Date()) {
+        let old = read(dataRoot)
+        guard old?.key != key else { return }
+        let stamp = Stamp(at: date.timeIntervalSince1970, previous: old?.at, key: key)
+        let url = url(dataRoot)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(stamp).write(to: url, options: .atomic)
+        } catch {
+            NSLog("UserTurnStamp: not kept: %@", error.localizedDescription)
+        }
+    }
+
+    /// His latest verified turn (this one, while it runs).
+    public static func last(dataRoot: URL) -> Date? {
+        read(dataRoot).map { Date(timeIntervalSince1970: $0.at) }
+    }
+
+    /// The verified turn before his latest: where a gap this turn closes opened.
+    public static func previous(dataRoot: URL) -> Date? {
+        read(dataRoot)?.previous.map { Date(timeIntervalSince1970: $0) }
     }
 }

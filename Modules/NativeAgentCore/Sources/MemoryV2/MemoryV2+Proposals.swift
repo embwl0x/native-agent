@@ -62,6 +62,21 @@ extension SwiftNativeMemoryV2 {
         let mergedMetadata: @Sendable (ProposalRecord) throws -> JSONValue? = { existing in
             var merged: [String: JSONValue]
             if case .object(let m)? = existing.metadata { merged = m } else { merged = [:] }
+            // Runs under the pending-proposal write lock, including an `add`
+            // that deduplicates into a correction staged by a newer turn.
+            if kind == "correction" || merged["kind"] == .string("correction") {
+                guard kind == "correction", merged["kind"] == .string("correction"),
+                      case .string(let subject)? = merged["correction_subject"],
+                      extraMetadata["correction_subject"] == .string(subject),
+                      case .string(let priorTimestamp)? = merged["observed_at"],
+                      case .string(let incomingTimestamp)? = extraMetadata["observed_at"],
+                      let priorDate = MemoryRecallScoring.parseTimestamp(priorTimestamp),
+                      let incomingDate = MemoryRecallScoring.parseTimestamp(incomingTimestamp),
+                      priorDate <= incomingDate else {
+                    throw MemoryStorageError.invalidTemporalEvidence(
+                        "pending correction merge requires the same subject and a nonolder originating turn")
+                }
+            }
             var sessionSet = Set<String>()
             if case .array(let arr)? = merged["supporting_session_ids"] {
                 for case .string(let s) in arr { sessionSet.insert(s) }
@@ -308,66 +323,12 @@ extension SwiftNativeMemoryV2 {
     /// threshold, live). Refined is not denied. Status only, no tombstone, and
     /// any tombstone an earlier build wrote for this exact text is removed.
     ///
-    /// THE SUCCESSOR IS WRITTEN DOWN (Astra comb 3, lane1 finding 2,
-    /// 2026-09-12). The reason string handed to `updateProposalStatus` reaches
-    /// `markProposalStatus` for every status except "rejected", and that writes
-    /// status + resolved_at only: live row `CE41D07E-806A-4794-9F98-AFD44E4AAB7E`
-    /// is `superseded` at 20:52:44.849Z with `rejection_reason=NULL` and no
-    /// relationship in its metadata, leaving its link to successor
-    /// `ED6A1402-9C3A-4886-A7B0-B40D51075BFB` recoverable only by guessing from
-    /// wording and timing. The metadata write below is the durable record.
-    ///
-    /// ORDER IS THE RECOVERY STORY. Metadata first (the SQL behind it is
-    /// pending-gated, so it must precede the status flip), then the tombstone,
-    /// and the status LAST: every failure before the flip leaves the row
-    /// pending, which the next attempt retries. The old order flipped first, so
-    /// a failed delete left a retired row with a live tombstone that no later
-    /// pass selected.
+    /// Pending state, successor metadata, tombstone removal and retirement
+    /// commit together so a concurrent review decision cannot be overwritten.
     @discardableResult
     public func supersedeProposal(id: String, by successorId: String) async throws -> Bool {
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        guard let proposal = try await storage.getProposal(id: id) else {
-            throw MemoryV2Error.recordNotFound
-        }
-        guard proposal.status == "pending" else {
-            // Idempotent for a row already retired this way; a refusal for any
-            // other resolved state, because re-retiring an accepted or rejected
-            // row silently is how a review decision disappears.
-            if proposal.status == "superseded" { return true }
-            throw MemoryV2Error.underlying(
-                "proposal \(id) is \(proposal.status), not pending: not superseded by \(successorId)"
-            )
-        }
-        var metadata: [String: JSONValue]
-        if case .object(let existing)? = proposal.metadata { metadata = existing } else { metadata = [:] }
-        metadata["supersededBy"] = .string(successorId)
-        metadata["supersededAt"] = .string(MemoryStorage.nowISO8601())
-        _ = try await storage.updateProposalMetadata(id: id, metadata: .object(metadata))
-        try await storage.removeTombstone(content: proposal.content)
-        // THE FLIP RE-READS THE ROW (Astra comb 3, lane2 finding 3,
-        // 2026-09-12). This actor is reentrant at every `await` above, so a
-        // review can accept or reject this very proposal while the metadata and
-        // tombstone writes are in flight; the unconditional flip that used to
-        // stand here overwrote that decision with `superseded`. A decision that
-        // arrived first wins — supersession is bookkeeping, the person's call is
-        // not — and the successor link written above survives either way, so the
-        // pair stays recoverable.
-        guard let current = try await storage.getProposal(id: id) else {
-            throw MemoryV2Error.recordNotFound
-        }
-        guard current.status == "pending" else {
-            if current.status == "superseded" { return true }
-            NSLog(
-                "MemoryV2: proposal %@ was %@ while being superseded by %@; "
-                + "leaving that decision alone, successor link retained",
-                id, current.status, successorId
-            )
-            return false
-        }
-        try await storage.updateProposalStatus(
-            id: id, status: "superseded", rejectionReason: "superseded by a correction: \(successorId)"
-        )
-        return true
+        return try await storage.supersedeProposal(id: id, by: successorId)
     }
 
     /// Launch repair for rows the 2026-09-11 build retired through the rejection
@@ -387,8 +348,8 @@ extension SwiftNativeMemoryV2 {
     ///   evidence, and it does not depend on a reason string that
     ///   `markProposalStatus` does not persist.
     /// - `pending` rows that already carry `supersededBy` metadata (Astra comb
-    ///   3, lane2 finding 3, 2026-09-12): `supersedeProposal` writes the
-    ///   successor link first and flips the status last, so a crash between the
+    ///   3, lane2 finding 3, 2026-09-12): older builds wrote the
+    ///   successor link first and flipped the status last, so a crash between the
     ///   two leaves a row that is still actionable in the review queue while its
     ///   replacement is already staged. The metadata IS the evidence the
     ///   supersession had begun; this pass finishes it.
@@ -518,7 +479,7 @@ extension SwiftNativeMemoryV2 {
 
     /// A row that already carries a successor link is NOT offered among pending
     /// statements, whatever its status says (Astra comb 4, lane5 finding 2).
-    /// `supersedeProposal` writes the link first and flips the status last, and
+    /// Older builds wrote the link first and flipped the status last, and
     /// the flip is refused outright when a review decision arrived meanwhile —
     /// so "pending with a successor" is a real state, and a statement whose
     /// replacement is already staged must not be offered for approval or fed

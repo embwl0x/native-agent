@@ -111,23 +111,20 @@ public enum VisionTextRedaction {
         // applies before a line is allowed to darken its neighbour.
         let captions = boxes.filter { $0.text.count <= config.maxCaptionChars }
 
-        return boxes.map { box in
-            let caption = captions.first { candidate in
-                isCaption(candidate.rect, forValueAt: box.rect, proximity: proximity)
-                    && (MacScreenViewTextRedaction.looksLikeSecretLabel(candidate.text)
-                        || MacScreenViewTextRedaction.isCardVerificationLabel(candidate.text)
-                        || MacScreenViewTextRedaction.isSeedPhraseLabel(candidate.text))
-            }
-            // The DECISION is the shared redactor's, in both branches: the
-            // standalone shape test, plus (when we found one) the caption that
-            // makes an otherwise-innocuous value a secret. Passing `under:` is
-            // exactly how `mac_view`'s legend hands its control's own caption
-            // to the same code.
-            let json = MacScreenViewTextRedaction.redactedLegendString(
+        var redacted = boxes.map { box in
+            var json = MacScreenViewTextRedaction.redactedLegendString(
                 box.text,
-                valueChars: config.valueChars,
-                under: caption?.text
+                valueChars: config.valueChars
             )
+            // A generic caption must not mask a CVV or recovery-phrase label.
+            for caption in captions where isCaption(
+                caption.rect, forValueAt: box.rect, proximity: proximity
+            ) {
+                guard case .string = json else { break }
+                json = MacScreenViewTextRedaction.redactedLegendString(
+                    box.text, valueChars: config.valueChars, under: caption.text
+                )
+            }
             if case .string = json {
                 return VisionRedactedText(raw: box.text, json: json, secret: false, reason: nil)
             }
@@ -137,5 +134,22 @@ public enum VisionTextRedaction {
             }
             return VisionRedactedText(raw: box.text, json: json, secret: true, reason: reason)
         }
+        // Whole-frame and tile OCR can observe the same secret as different
+        // strings. Withhold every overlapping fragment before any text escapes.
+        var pending = redacted.indices.filter { redacted[$0].secret }
+        while let secretIndex = pending.popLast() {
+            for index in boxes.indices where !redacted[index].secret
+                && boxes[index].rect.intersection(boxes[secretIndex].rect).area > 0 {
+                let reason = "overlapping_secret"
+                redacted[index] = VisionRedactedText(
+                    raw: boxes[index].text,
+                    json: MacScreenViewTextRedaction.redactedText(boxes[index].text, reason: reason),
+                    secret: true,
+                    reason: reason
+                )
+                pending.append(index)
+            }
+        }
+        return redacted
     }
 }

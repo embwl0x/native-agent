@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ToolRegistry
 
 /// One tool receipt on its way to the transcript, fully redacted at the
 /// point of production so the writer can drain the queue off the dispatch
@@ -47,8 +48,9 @@ extension SwiftNativeChatOrchestrationClient {
                 inputJSON: receipt.inputJSON,
                 resultSummary: receipt.resultJSON,
                 ok: receipt.ok,
+                // An app call of a folded action is that tool's outcome.
                 cognitiveResult: ChatToolOutcome.cognitiveResult(
-                    tool: receipt.toolName,
+                    tool: ToolNameAliases.shown(receipt.toolName, inputJSON: receipt.inputJSON).name,
                     output: receipt.cognitiveOutput
                 ),
                 source: writer.surface

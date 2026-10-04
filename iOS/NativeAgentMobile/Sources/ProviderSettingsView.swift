@@ -99,9 +99,8 @@ enum ProviderConnectionTestPresentation {
     }
 }
 
-/// Provider/model changes are optimistic. A response may arrive after the user
-/// has picked another tuple, so only the request that still owns a surface may
-/// restore its former selection.
+/// A response may arrive after the user has picked another tuple, so only the
+/// request that still owns a surface may restore its former selection.
 enum ProviderSelectionRollbackPresentation {
     struct Selection: Equatable {
         let providerID: String
@@ -133,29 +132,20 @@ struct ProviderSettingsView: View {
     @StateObject private var sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
 
-    // CANONICAL SURFACE LIST — SOURCE OF TRUTH is the Mac's `MODEL_SURFACES`
-    // (Modules/NativeAgentCore/Sources/ProviderRouting/ProviderRouting.swift,
-    // Swift-native model routing). iOS cannot import ProviderRouting (it pulls
-    // in the macOS-only NativeAgentCore graph), so this list is mirrored by hand
-    // and defended by ProviderSettingsSurfaceContractTests, which requires
-    // exact equality with the Mac action router's accepted surfaces.
-    // If you add a surface to MODEL_SURFACES, append it here too (keep order).
-    // Last synced 2026-07-15.
-    static let canonicalSurfaces = [
-        "chat", "ios", "telegram", "slack", "desk", "workshop", "autonomy", "swarms",
-        "dream", "rem", "training", "memory", "heartbeat", "diagnostics",
-        "cognition_reflection", "compaction", "self_improvement",
-        // Added 2026-09-02 with MODEL_SURFACES (personality depth item 9).
-        "studio_wander",
-    ]
-
-    /// Exact ordered surfaces accepted by the signed Mac action router.
+    // Presentation mirror of ProviderSurfaceGroups. Submit one representative
+    // surface; the Mac applies the choice to every member of its group.
     private var renderedSurfaces: [String] {
-        Self.canonicalSurfaces
+        ["chat", "desk", "memory"]
     }
 
-    /// The first few activities show; the rest fold behind one row.
-    private static let foldedSurfaceCount = 3
+    private func groupCaption(_ surface: String) -> String {
+        switch surface {
+        case "chat": "Chat, iPhone, Telegram and Slack"
+        case "desk": "Desk, Task execution, Independent tasks, Coordinated tasks, Skill practice, Background check-ins and Diagnostics"
+        case "memory": "Memory, Dreams, REM, Reflection, Conversation summaries, Learning and Creative exploration"
+        default: ""
+        }
+    }
 
     // Active provider per surface (local UI state; saves on change)
     @State private var activeSurface: [String: String] = [:]
@@ -165,7 +155,6 @@ struct ProviderSettingsView: View {
     @State private var configSheet: ProviderInfo? = nil
     @State private var statusText = ""
     @State private var isRefreshing = false
-    @State private var showsAllSurfaces = false
 
     /// The Mac's provider projection (a DEBUG design sample when there is none).
     private var providers: [ProviderInfo] {
@@ -212,12 +201,6 @@ struct ProviderSettingsView: View {
         .sheet(item: $configSheet) { provider in
             ProviderDetailSheet(provider: provider, onDone: {
                 configSheet = nil
-                statusText = "Action sent to Mac."
-                // Trigger snapshot refresh after a short delay to pick up Mac updates
-                Task {
-                    try? await Task.sleep(for: .seconds(3))
-                    await refreshProviders()
-                }
             })
         }
         .onAppear {
@@ -273,46 +256,28 @@ struct ProviderSettingsView: View {
     }
 
     private var modelsSection: some View {
-        AliveSection("Models by activity", footer: pairingStore.isPaired ? "Changes apply on the Mac right away." : nil) {
+        AliveSection("Models", footer: "Each choice applies to every activity listed in its group. Work and Memory and mind follow Chat until configured.") {
             if selectableProviders.isEmpty {
                 Text("Connect a provider on the Mac to choose models here.")
                     .font(.subheadline)
                     .foregroundStyle(AlivePalette.secondary)
                     .aliveRow()
             } else {
-                let visible = showsAllSurfaces ? renderedSurfaces : Array(renderedSurfaces.prefix(Self.foldedSurfaceCount))
-                ForEach(Array(visible.enumerated()), id: \.element) { index, surface in
+                ForEach(Array(renderedSurfaces.enumerated()), id: \.element) { index, surface in
                     if index > 0 { AliveDivider() }
                     surfaceRow(surface)
+                    AliveNote(groupCaption(surface))
                 }
-                AliveDivider()
-                Button {
-                    withAnimation(AppMotion.snappy) { showsAllSurfaces.toggle() }
-                } label: {
-                    AliveRow(showsAllSurfaces ? "Show fewer" : "Show all \(renderedSurfaces.count) activities") {
-                        Image(systemName: showsAllSurfaces ? "chevron.up" : "chevron.down")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(AlivePalette.secondary)
-                    }
-                }
-                .buttonStyle(.plain)
             }
         }
     }
 
-    /// One activity: its name, and the provider and model it uses in secondary
-    /// text. Telegram offers only its published route's models when available;
-    /// older Macs and other surfaces offer every ready provider. Picking submits
-    /// that exact provider/model pair.
+    /// One routing group and its exact provider/model pair.
     private func surfaceRow(_ surface: String) -> some View {
         let providerID = activeSurface[surface] ?? defaultProviderID
         let providerName = selectableProviders.first(where: { $0.provider_id == providerID })?.display_name
-        let routeProviderID = sync.surfaceModels[surface]?.providerId
-        let menuProviders = surface == "telegram" && routeProviderID != nil
-            ? selectableProviders.filter { $0.provider_id == routeProviderID }
-            : selectableProviders
         return Menu {
-            ForEach(menuProviders) { provider in
+            ForEach(selectableProviders) { provider in
                 Section(provider.display_name) {
                     ForEach(provider.models) { model in
                         Button {
@@ -376,13 +341,10 @@ struct ProviderSettingsView: View {
                 requestedModel[surface] = sync.surfaceModels[surface]?.model
             } else if let providerId = synced[surface], readyProviderIds.contains(providerId) {
                 activeSurface[surface] = providerId
-                requestedModel[surface] = selectableModels(for: providerId).first?.id
-            } else if let current = activeSurface[surface],
-                      readyProviderIds.contains(current) {
-                continue
+                requestedModel[surface] = nil
             } else {
                 activeSurface[surface] = defaultProviderID
-                requestedModel[surface] = selectableModels(for: defaultProviderID).first?.id
+                requestedModel[surface] = nil
             }
         }
     }
@@ -391,7 +353,6 @@ struct ProviderSettingsView: View {
         let providerID = activeSurface[surface] ?? defaultProviderID
         let modelID = requestedModel[surface]
             ?? sync.surfaceModels[surface]?.model
-            ?? selectableModels(for: providerID).first?.id
             ?? ""
         return .init(providerID: providerID, modelID: modelID)
     }
@@ -404,8 +365,6 @@ struct ProviderSettingsView: View {
         let requestGeneration = (selectionGeneration[surface] ?? 0) &+ 1
         selectionGeneration[surface] = requestGeneration
         pendingSurfaceReceipts.removeValue(forKey: surface)
-        activeSurface[surface] = selection.providerID
-        requestedModel[surface] = selection.modelID
         sendSelection(
             surface: surface,
             selection: selection,
@@ -473,7 +432,12 @@ struct ProviderSettingsView: View {
     }
 
     private func surfaceLabel(_ surface: String) -> String {
-        MobileProviderSurfaceLabelPresentation.presentation(for: surface).text
+        switch surface {
+        case "chat": "Chat"
+        case "desk": "Work"
+        case "memory": "Memory and mind"
+        default: MobileProviderSurfaceLabelPresentation.presentation(for: surface).text
+        }
     }
 }
 
@@ -544,39 +508,6 @@ private enum ProviderWords {
     }
 }
 
-/// Produces the only provider/model pair the surface picker may submit. A
-/// provider switch retains the current model when possible; otherwise it uses
-/// the provider's first advertised model rather than emitting a mismatched
-/// pair.
-enum SurfaceProviderPickerPresentation {
-    struct Selection: Equatable {
-        let providerID: String
-        let modelID: String
-    }
-
-    static func selection(
-        providerID: String,
-        currentModelID: String?,
-        providers: [ProviderInfo]
-    ) -> Selection? {
-        guard let provider = providers.first(where: { $0.provider_id == providerID }),
-              let fallbackModel = provider.models.first else {
-            return nil
-        }
-        let modelID: String
-        if let currentModelID,
-           provider.models.contains(where: { $0.id == currentModelID }) {
-            modelID = currentModelID
-        } else {
-            modelID = fallbackModel.id
-        }
-        return Selection(providerID: providerID, modelID: modelID)
-    }
-
-    static func rollbackProviderID(previousProviderID: String) -> String {
-        previousProviderID
-    }
-}
 enum ProviderCapabilityPresentation {
     struct Model: Identifiable, Equatable {
         let id: String

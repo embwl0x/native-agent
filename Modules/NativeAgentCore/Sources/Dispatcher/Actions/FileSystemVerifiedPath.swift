@@ -159,6 +159,11 @@ enum VerifiedPath {
 
     /// Walk + open in one step, for callers that do not need the parent after.
     static func open(_ url: URL, flags: Int32, mode: mode_t = 0) throws -> Int32 {
+        if url.standardizedFileURL.path == "/" {
+            let fd = Darwin.open("/", flags | O_NOFOLLOW | O_CLOEXEC, mode)
+            guard fd >= 0 else { throw Failure.posix(errno) }
+            return fd
+        }
         let parent = try openParent(of: url)
         defer { parent.release() }
         return try openFinal(parent, flags: flags, mode: mode)
@@ -176,10 +181,8 @@ enum VerifiedPath {
 
 // MARK: - Image pixels decoded from the verified descriptor
 
-/// `LocalToolImage.readAuthorizedFile` reopens the URL to decode it, which is
-/// exactly the swap window the walk above closes. This decodes the bytes the
-/// verified descriptor already produced and returns the SAME receipt shape
-/// (same keys, same note, same failure strings).
+/// Decode the bytes the verified descriptor already produced, avoiding the
+/// swap window of reopening the path.
 enum VerifiedImageRead {
 
     static let imageExtensions: Set<String> = [
@@ -191,7 +194,7 @@ enum VerifiedImageRead {
     }
 
     private static func failure(_ reason: String) -> JSONValue {
-        .object(["status": .string("failed"), "error": .string(reason)])
+        .object(["ok": .bool(false), "status": .string("failed"), "error": .string(reason)])
     }
 
     static func deliver(data: Data, name: String) -> JSONValue {

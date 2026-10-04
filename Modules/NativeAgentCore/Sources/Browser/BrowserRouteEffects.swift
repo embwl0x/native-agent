@@ -15,12 +15,14 @@ public struct BrowserRouteDecodedRun<Value> {
 
 /// Physical browser work and app integration; route decisions belong to Browser.
 public protocol BrowserRouteEffects: Sendable {
+    @MainActor func acquireBrowser(runID: String) throws
+    @MainActor func releaseBrowser(runID: String)
     @MainActor func navigate(_ url: URL, runID: String) async throws -> BrowserNavigationResult
     @MainActor func currentURL() -> String?
     @MainActor func readText() async throws -> String
     @MainActor func readLinks() async throws -> [BrowserLink]
     @MainActor func screenshot() async throws -> Data
-    func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool) async -> BrowserNavigationTask
+    func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool, dataRoot: URL) async -> BrowserNavigationTask
     @MainActor func finishNavigation(runID: String, token: UUID)
     func cancelNavigation(runID: String) async
     func observeMotorAction(_ model: MotorActionReadModel) async

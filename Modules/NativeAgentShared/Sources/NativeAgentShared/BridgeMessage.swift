@@ -38,12 +38,13 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         sessionID: String? = nil,
         correlationID: String? = nil,
         metadata: [String: String]? = nil,
-        attachments: [MultimodalAttachment]? = nil
+        attachments: [MultimodalAttachment]? = nil,
+        timestamp: Date = Date()
     ) -> BridgeMessage {
         BridgeMessage(
             id: id,
             sender: sender,
-            timestamp: Date(),
+            timestamp: timestamp,
             text: text,
             sessionID: sessionID,
             correlationID: correlationID,

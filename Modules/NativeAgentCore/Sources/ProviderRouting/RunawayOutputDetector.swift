@@ -55,14 +55,21 @@ public struct RunawayOutputDetector: Sendable {
     private var blockSignatures: Set<String> = []
     private var blockCount = 0
 
-    /// Whether a call is a read, safe to run twice in one reply: `(tool name,
-    /// the call has no arguments)`. ProviderRouting cannot see the tool
-    /// tables, so ChatOrchestration registers its read-only classification;
-    /// until then every call counts as an action (fail closed).
-    public static func registerReadOnlyCalls(_ isReadOnly: @escaping @Sendable (String, Bool) -> Bool) {
-        readOnlyCalls.withLock { $0 = isReadOnly }
+    /// Classification receives the complete block so the parser and registry
+    /// owners can distinguish reads from actions without a second XML parser.
+    public static func registerReadOnlyCalls(_ classify: @escaping @Sendable (String) -> Bool) {
+        readOnlyCalls.withLock { $0 = classify }
     }
-    private static let readOnlyCalls = OSAllocatedUnfairLock<(@Sendable (String, Bool) -> Bool)?>(initialState: nil)
+    private static let readOnlyCalls = OSAllocatedUnfairLock<(@Sendable (String) -> Bool)?>(initialState: nil)
+
+    public static func registerAppReadOnlyCalls(_ classify: @escaping @Sendable ([String: JSONValue]) -> Bool) {
+        appReadOnlyCalls.withLock { $0 = classify }
+    }
+    private static let appReadOnlyCalls = OSAllocatedUnfairLock<(@Sendable ([String: JSONValue]) -> Bool)?>(initialState: nil)
+
+    public static func isAppReadOnly(_ input: [String: JSONValue]) -> Bool {
+        appReadOnlyCalls.withLock { $0 }?(input) ?? false
+    }
     private var lastBlockEnd = 0
     /// Where the text after the last complete call starts being checked.
     private var gapStart = 0
@@ -78,6 +85,7 @@ public struct RunawayOutputDetector: Sendable {
     /// The last `window` counted lines: hash and where each starts.
     private var recent: [(key: Int, start: Int)] = []
     private var inFence = false
+    private var fenceStarts: [Int] = []
     private var headers = 0
     private var firstHeader = 0
 
@@ -101,7 +109,7 @@ public struct RunawayOutputDetector: Sendable {
             rest = Substring(rest.unicodeScalars[rest.unicodeScalars.index(after: nl)...])
         }
         pending += rest
-        // After the lines, so a fence opened in this same delta is known.
+        // Record fence positions before checking completed tool blocks.
         if endsAtToolBoundary {
             bytes.append(contentsOf: delta.utf8)
             if scanToolBlocks() { return true }
@@ -114,7 +122,11 @@ public struct RunawayOutputDetector: Sendable {
         // Fences only guard the header rule (a quoted header in a code block is
         // not a fabricated one); loops are loops inside code too, and density
         // keeps real code safe, so an unclosed fence never blinds the guard.
-        if trimmed.hasPrefix("```") { inFence.toggle(); return false }
+        if trimmed.hasPrefix("```") {
+            inFence.toggle()
+            fenceStarts.append(start)
+            return false
+        }
         if !inFence, trimmed.hasPrefix(Self.fabricatedHeader) {
             if headers == 0 { firstHeader = start }
             headers += 1
@@ -156,7 +168,10 @@ public struct RunawayOutputDetector: Sendable {
                 openBlock = nil
                 blockCursor = end
                 // An example inside a code fence is prose, not a call (Sol).
-                if inFence { continue }
+                let fenced = fenceStarts.prefix { $0 <= open.start }.count % 2 != 0
+                let pendingFence = open.start >= lineStart
+                    && pending.trimmingCharacters(in: .whitespaces).hasPrefix("```")
+                if fenced != pendingFence { continue }
                 let block = String(decoding: bytes[open.start..<end], as: UTF8.self)
                 // Runaway repeats are byte-identical; only the outer edges
                 // are trimmed, so "red fox" and "redfox" stay different (Sol).
@@ -207,17 +222,7 @@ public struct RunawayOutputDetector: Sendable {
     /// A complete `<invoke name=…>` / `<tool_use name=…>` block is a read by
     /// the registered classification; no classification means an action.
     static func isReadOnly(_ block: String) -> Bool {
-        guard let classify = readOnlyCalls.withLock({ $0 }),
-              let open = block.range(of: "name=\""),
-              let close = block[open.upperBound...].firstIndex(of: "\""),
-              let tagEnd = block[close...].firstIndex(of: ">")
-        else { return false }
-        let name = String(block[open.upperBound..<close])
-        let body = block[block.index(after: tagEnd)...]
-            .replacingOccurrences(of: "</invoke>", with: "")
-            .replacingOccurrences(of: "</tool_use>", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return classify(name, body.isEmpty || body == "{}")
+        readOnlyCalls.withLock { $0 }?(block) ?? false
     }
 
     static let fabricatedResultMarkers = ["<system>", "<function_results", "<tool_result", "Tool ran without output",
@@ -300,7 +305,15 @@ public struct RunawayOutputDetector: Sendable {
         return (kept, looped ? loopNotice : LLMError.outputLengthLimitNotice)
     }
 
+    private static let diagnosticLock = OSAllocatedUnfairLock(initialState: ())
+
     static func writeDiagnostic(_ raw: String, reason: String) {
+        diagnosticLock.withLock { _ in
+            writeDiagnosticLocked(raw, reason: reason)
+        }
+    }
+
+    private static func writeDiagnosticLocked(_ raw: String, reason: String) {
         let dir = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("diagnostics/cutoffs", isDirectory: true)
         let stamp = Int(Date().timeIntervalSince1970 * 1000)
@@ -315,6 +328,19 @@ public struct RunawayOutputDetector: Sendable {
         let body = "reason: \(reason)\nchars: \(raw.count)\n\n" + String(decoding: raw.utf8.prefix(200_000), as: UTF8.self)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? Data(body.utf8).write(to: file, options: .atomic)
+        if let files = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]
+        ) {
+            let diagnostics = files.compactMap { url -> (URL, Date)? in
+                guard url.pathExtension == "txt",
+                      let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+                      values.isRegularFile == true else { return nil }
+                return (url, values.contentModificationDate ?? .distantPast)
+            }.sorted { $0.1 == $1.1 ? $0.0.lastPathComponent < $1.0.lastPathComponent : $0.1 < $1.1 }
+            for (old, _) in diagnostics.prefix(max(0, diagnostics.count - 100)) {
+                try? FileManager.default.removeItem(at: old)
+            }
+        }
         Logger(subsystem: "NativeAgent", category: "Cutoff")
             .error("cutoff \(reason, privacy: .public) chars=\(raw.count, privacy: .public) raw=\(file.path, privacy: .public)")
     }

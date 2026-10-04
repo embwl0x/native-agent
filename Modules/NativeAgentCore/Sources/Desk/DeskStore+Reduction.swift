@@ -23,6 +23,7 @@ extension SwiftNativeDeskStore {
         var byHandle: [String: DeskItem] = [:]
         var createOrder: [String] = []
         var archived: Set<String> = []
+        var accounting = base?.state ?? DeskState(items: [], generatedTs: "")
         if let base {
             for item in base.state.items {
                 byHandle[item.handle] = item
@@ -42,6 +43,9 @@ extension SwiftNativeDeskStore {
                     openedAt: op.ts, updatedAt: op.ts,
                     origin: origin, pursuit: pursuit
                 )
+                for reservation in pursuit?.reservations ?? [] {
+                    accounting.chargeWorkSlot(handle: op.handle, day: reservation.day, id: reservation.reservationId)
+                }
             case let .openPursuit(alias, project, title, summary, pursuit, notify):
                 // Dedicated agent-pursuit create (H2). Same materialization as a
                 // create_item pinned to origin=.agent/kind=.project.
@@ -53,6 +57,9 @@ extension SwiftNativeDeskStore {
                     openedAt: op.ts, updatedAt: op.ts,
                     origin: .agent, pursuit: pursuit
                 )
+                for reservation in pursuit.reservations {
+                    accounting.chargeWorkSlot(handle: op.handle, day: reservation.day, id: reservation.reservationId)
+                }
             case let .setStatus(status, blockedReason, waitingOn, progress, assignee, laneOf):
                 guard var item = byHandle[op.handle] else { continue }
                 item.status = status
@@ -62,7 +69,7 @@ extension SwiftNativeDeskStore {
                 if let assignee { item.assignee = assignee }
                 if let laneOf { item.laneOf = laneOf }
                 // A terminal status reached via set_status (not close_item) still
-                // needs closedAt, or archiveSweep + the "archives in" countdown
+                // needs closedAt, or archiveSweep + archive eligibility
                 // skip it forever (gpt-5.5 review HIGH). A non-terminal status
                 // re-opens the row, so clear any stale closedAt.
                 if status.isTerminal {
@@ -117,7 +124,9 @@ extension SwiftNativeDeskStore {
                 byHandle[op.handle] = item
             case let .setNotify(policy):
                 guard var item = byHandle[op.handle] else { continue }
+                let lastNotifiedAt = item.notify.lastNotifiedAt
                 item.notify = policy
+                item.notify.lastNotifiedAt = lastNotifiedAt
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .closeItem(outcomeSummary, status):
@@ -141,10 +150,11 @@ extension SwiftNativeDeskStore {
                 // non-pursuit is tolerated (skipped). Dedup by id so a replayed
                 // reserve op is idempotent — the caps count DISTINCT rows.
                 guard var item = byHandle[op.handle], var p = item.pursuit else { continue }
-                if !p.reservations.contains(where: { $0.reservationId == reservationId }) {
+                if !accounting.hasWorkSlot(handle: op.handle, id: reservationId) {
                     p.reservations.append(WorkReservation(reservationId: reservationId, day: day, slot: slot, reservedAt: op.ts))
+                    accounting.chargeWorkSlot(handle: op.handle, day: day, id: reservationId)
                 }
-                Self.recomputePursuitCounters(&p)
+                Self.recomputePursuitCounters(&p, slotsByDay: accounting.workSlotsByDay, handle: op.handle)
                 item.pursuit = p
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
@@ -156,7 +166,7 @@ extension SwiftNativeDeskStore {
                 }
                 Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
                 p.lastWorkedAt = op.ts
-                Self.recomputePursuitCounters(&p)
+                Self.recomputePursuitCounters(&p, slotsByDay: accounting.workSlotsByDay, handle: op.handle)
                 item.pursuit = p
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
@@ -170,13 +180,13 @@ extension SwiftNativeDeskStore {
                 }
                 Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
                 p.lastWorkedAt = op.ts
-                Self.recomputePursuitCounters(&p)
+                Self.recomputePursuitCounters(&p, slotsByDay: accounting.workSlotsByDay, handle: op.handle)
                 item.pursuit = p
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .reserveWorkAttempt(attemptId, lane, day, slot):
                 guard var item = byHandle[op.handle] else { continue }
-                if !item.workAttempts.contains(where: { $0.attemptId == attemptId }) {
+                if !accounting.hasWorkSlot(handle: op.handle, id: attemptId) {
                     item.workAttempts.append(DeskWorkAttempt(
                         attemptId: attemptId,
                         lane: lane,
@@ -184,6 +194,7 @@ extension SwiftNativeDeskStore {
                         slot: slot,
                         reservedAt: op.ts
                     ))
+                    accounting.chargeWorkSlot(handle: op.handle, day: day, id: attemptId)
                 }
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
@@ -196,6 +207,17 @@ extension SwiftNativeDeskStore {
                 item.cadence.lastRefreshAt = op.ts
                 item.cadence.nextRefreshAt = Self.nextCadenceRefresh(after: op.ts, cadence: item.cadence)
                 item.updatedAt = op.ts
+                byHandle[op.handle] = item
+            case let .handOffWorkReceipt(reservationId):
+                guard var item = byHandle[op.handle] else { continue }
+                if let index = item.workAttempts.firstIndex(where: { $0.attemptId == reservationId }),
+                   item.workAttempts[index].completedAt != nil {
+                    item.workAttempts[index].receiptHandedOff = true
+                }
+                if let index = item.pursuit?.reservations.firstIndex(where: { $0.reservationId == reservationId }),
+                   item.pursuit?.reservations[index].completedAt != nil {
+                    item.pursuit?.reservations[index].receiptHandedOff = true
+                }
                 byHandle[op.handle] = item
             case let .setBlockedOn(handles):
                 // Whole-set REPLACE, same orphan tolerance as every other
@@ -218,10 +240,36 @@ extension SwiftNativeDeskStore {
                 item.pursuit = p
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
+            case let .setContinuation(record):
+                guard var item = byHandle[op.handle] else { continue }
+                item.continuation = record
+                byHandle[op.handle] = item
             }
         }
 
-        let live = createOrder.compactMap { byHandle[$0] }.filter { !archived.contains($0.handle) }
+        let live = createOrder.compactMap { byHandle[$0] }.filter { !archived.contains($0.handle) }.map { item in
+            var retained = item
+            let settledAttempts = item.workAttempts.filter { $0.completedAt != nil && $0.receiptHandedOff }
+            let recentAttempts = Set(settledAttempts.suffix(4).map(\.attemptId))
+            retained.workAttempts.removeAll {
+                $0.completedAt != nil && $0.receiptHandedOff && !recentAttempts.contains($0.attemptId)
+            }
+            if var pursuit = retained.pursuit {
+                let settledReservations = pursuit.reservations.filter { $0.completedAt != nil && $0.receiptHandedOff }
+                var recentReservations = Set(settledReservations.suffix(4).map(\.reservationId))
+                if let satisfied = pursuit.reservations.last(where: { $0.disposition == .goalSatisfied }) {
+                    recentReservations.insert(satisfied.reservationId)
+                }
+                for reservation in settledReservations where !recentReservations.contains(reservation.reservationId) {
+                    pursuit.retiredSessionsByDay[reservation.day, default: 0] += 1
+                }
+                pursuit.reservations.removeAll {
+                    $0.completedAt != nil && $0.receiptHandedOff && !recentReservations.contains($0.reservationId)
+                }
+                retained.pursuit = pursuit
+            }
+            return retained
+        }
         let ordered = orderByAlias(live)
         // DETERMINISTIC fold: the rev stamp is the newest of (last op ts, base
         // stamp) — NOT wall-clock — so the same feed always folds to an equal
@@ -232,7 +280,21 @@ extension SwiftNativeDeskStore {
         // maxCommittedTs would floor future commit stamps on the stale value
         // (gpt-5.5 compaction review MED — Lamport floor regression).
         let revision = [ops.last?.ts, base?.state.generatedTs].compactMap { $0 }.max() ?? ""
-        return DeskState(items: ordered, generatedTs: revision)
+        let currentDay = DeskClock.parseISO(revision).map(DeskClock.dayStamp)
+        let liveSlots = DeskState(items: ordered, generatedTs: revision).workSlotsByDay
+        accounting.workSlotsByDay = accounting.workSlotsByDay.reduce(into: [:]) { retained, row in
+            let (day, handles) = row
+            if let currentDay, day >= currentDay {
+                retained[day] = handles
+            } else {
+                let live = handles.reduce(into: [String: [String]]()) { kept, entry in
+                    let ids = entry.value.filter { liveSlots[day]?[entry.key]?.contains($0) == true }
+                    if !ids.isEmpty { kept[entry.key] = ids }
+                }
+                if !live.isEmpty { retained[day] = live }
+            }
+        }
+        return DeskState(items: ordered, generatedTs: revision, workSlotsByDay: accounting.workSlotsByDay)
     }
 
     /// Trailing numeric component of an alias ("2" -> 2, "2.10" -> 10). Defaults
@@ -272,16 +334,16 @@ extension SwiftNativeDeskStore {
         }
         return result
     }
-    /// Recompute a pursuit's derived counters from its reservation ledger — pure
+    /// Recompute a pursuit's derived counters from durable slot identities — pure
     /// (no wall clock): `workSessionsToday` = reservations sharing the NEWEST
-    /// reservation day (lexicographic max on yyyy-MM-dd). The authoritative daily
-    /// cap still counts from the ops feed; this field is the display denorm.
-    static func recomputePursuitCounters(_ p: inout Pursuit) {
-        guard let newestDay = p.reservations.map(\.day).max() else {
+    /// reservation day (lexicographic max on yyyy-MM-dd). Pruning never removes
+    /// those identities; this field is the display denorm.
+    static func recomputePursuitCounters(_ p: inout Pursuit, slotsByDay: [String: [String: [String]]], handle: String) {
+        guard let newestDay = slotsByDay.keys.filter({ slotsByDay[$0]?[handle] != nil }).max() else {
             p.workSessionsToday = 0
             return
         }
-        p.workSessionsToday = p.reservations.filter { $0.day == newestDay }.count
+        p.workSessionsToday = slotsByDay[newestDay]?[handle]?.count ?? 0
     }
 
     static func nextCadenceRefresh(after completedAt: String, cadence: Cadence) -> String? {
@@ -307,7 +369,7 @@ extension SwiftNativeDeskStore {
     /// the WHOLE item tree is re-serialized + fsynced on every desk op AND baked
     /// into the compaction base — so an uncapped note list makes the feed O(n²)
     /// over its life, defeating the exact cost compaction exists to bound.
-    /// Readers only ever want the recent tail: the projection and DeskView read
+    /// Readers only ever want the recent tail: the projection and Desk page read
     /// `notes.last`, the Workshop panel reads them newest-first.
     public static let notesCap = 200
 
@@ -347,9 +409,11 @@ extension SwiftNativeDeskStore {
             default: return false
             }
         }
+        // The newest step owns queue readiness and peer provenance.
+        let newestStep = item.refs.lastIndex { if case .step = $0.kind { return true }; return false }
         let victims = Set(
             item.refs.enumerated()
-                .filter { !isTrackingRef($0.element) }
+                .filter { !isTrackingRef($0.element) && $0.offset != newestStep }
                 .sorted { a, b in
                     a.element.priority == b.element.priority
                         ? a.offset < b.offset

@@ -1,5 +1,154 @@
 import Foundation
 
+/// A reading copy, never a second work or decision owner. References use the
+/// canonical identity rather than a title, alias, path, or chat draft.
+public struct WorkOverviewReference: Codable, Equatable, Sendable {
+    public enum Kind: String, Codable, Sendable {
+        case desk, approval, execution, inbox
+    }
+    public var kind: Kind
+    public var id: String
+    public init(kind: Kind, id: String) { self.kind = kind; self.id = id }
+}
+
+public struct WorkOverviewRow: Codable, Equatable, Identifiable, Sendable {
+    public var id: String { "\(reference.kind.rawValue):\(reference.id)" }
+    public var reference: WorkOverviewReference
+    public var title: String
+    public var summary: String
+    public var detail: String
+    public var state: String
+    public var updatedAt: String
+    public var location: String?
+    public var movementAt: String?
+
+    public init(reference: WorkOverviewReference, title: String, summary: String,
+                detail: String, state: String, updatedAt: String, location: String? = nil,
+                movementAt: String? = nil) {
+        self.reference = reference
+        self.title = title
+        self.summary = summary
+        self.detail = detail
+        self.state = state
+        self.updatedAt = updatedAt
+        self.location = location
+        self.movementAt = movementAt
+    }
+
+    public func stateLabel(at now: Date) -> String {
+        if state == "running" {
+            return DeskActivityState.execution(.init(deskHandle: nil, status: state,
+                updatedAt: updatedAt, lastMovementAt: movementAt), now: now).label
+        }
+        return state
+    }
+}
+
+public struct WorkOverview: Codable, Equatable, Sendable {
+    public var capturedAt: String
+    public var now: [WorkOverviewRow]
+    public var needsYou: [WorkOverviewRow]
+    public var recentlyDone: [WorkOverviewRow]
+    public var unavailable: [String]
+    public var omittedNow: Int
+    public var omittedNeedsYou: Int
+    public var omittedRecentlyDone: Int
+
+    public init(capturedAt: String, now: [WorkOverviewRow], needsYou: [WorkOverviewRow],
+                recentlyDone: [WorkOverviewRow], unavailable: [String],
+                omittedNow: Int = 0, omittedNeedsYou: Int = 0, omittedRecentlyDone: Int = 0) {
+        self.capturedAt = capturedAt
+        self.now = now
+        self.needsYou = needsYou
+        self.recentlyDone = recentlyDone
+        self.unavailable = unavailable
+        self.omittedNow = omittedNow
+        self.omittedNeedsYou = omittedNeedsYou
+        self.omittedRecentlyDone = omittedRecentlyDone
+    }
+
+    /// The one "needs you" number every surface shows.
+    public var needsYouCount: Int { needsYou.count + omittedNeedsYou }
+
+    public var headline: String {
+        guard unavailable.isEmpty else { return "Part of the overview is unavailable." }
+        let waiting = needsYouCount
+        return waiting == 0 ? "Nothing needs you on this overview."
+            : "\(waiting) \(waiting == 1 ? "thing needs" : "things need") you."
+    }
+
+    /// The "and N more" line under the capped Needs-you list.
+    public var needsYouOverflow: String? {
+        omittedNeedsYou > 0 ? "And \(omittedNeedsYou) more waiting in Approvals, Inbox, and Desk." : nil
+    }
+}
+
+/// Execution-owned movement, independent of edits to a Desk row.
+public struct DeskExecutionEvidence: Codable, Equatable, Sendable {
+    public var deskHandle: String?
+    public var status: String
+    public var updatedAt: String?
+    public var lastMovementAt: String?
+
+    public init(deskHandle: String?, status: String, updatedAt: String?, lastMovementAt: String? = nil) {
+        self.deskHandle = deskHandle
+        self.status = status
+        self.updatedAt = updatedAt
+        self.lastMovementAt = lastMovementAt
+    }
+}
+
+public enum DeskActivityState: String, Sendable {
+    case working, queued, watching, deferred, blocked, stale, unknown, finished
+
+    public static let movementWindow: TimeInterval = 5 * 60
+
+    public static func movementDate(_ raw: String?) -> Date? {
+        guard let raw else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    }
+
+    public static func execution(_ evidence: DeskExecutionEvidence?, now: Date) -> Self {
+        guard let evidence else { return .unknown }
+        if evidence.status == "queued" { return .queued }
+        if evidence.status == "blocked_on_approval" { return .blocked }
+        guard evidence.status == "running",
+              let movement = movementDate(evidence.lastMovementAt), movement <= now else { return .unknown }
+        return now.timeIntervalSince(movement) < movementWindow ? .working : .stale
+    }
+
+    public static func item(
+        status: String, kind: String, deferred: Bool, updatedAt: String,
+        evidence: DeskExecutionEvidence?, now: Date
+    ) -> Self {
+        if ["done", "canceled"].contains(status) { return .finished }
+        let execution = execution(evidence, now: now)
+        if execution != .unknown { return execution }
+        if deferred { return .deferred }
+        if status == "blocked" { return .blocked }
+        if status == "watch" || kind == "watch" { return .watching }
+        if ["todo", "next"].contains(status) { return .queued }
+        if status == "now", let updated = movementDate(updatedAt),
+           now.timeIntervalSince(updated) >= movementWindow { return .stale }
+        return .unknown
+    }
+
+    public var label: String {
+        switch self {
+        case .working: "Working"
+        case .queued: "Queued"
+        case .watching: "Watching"
+        case .deferred: "Deferred"
+        case .blocked: "Blocked"
+        case .stale: "Stale — activity unconfirmed"
+        case .unknown: "Activity unknown"
+        case .finished: "Finished"
+        }
+    }
+}
+
 /// Bounded, rebuildable projection of the Mac-owned Desk for companion devices.
 /// Stable handles are used for every mutation; aliases are display-only.
 public struct MobileDeskNote: Codable, Equatable, Sendable {
@@ -33,13 +182,15 @@ public struct MobileDeskItem: Codable, Equatable, Identifiable, Sendable {
     public var origin: String
     public var requiresOwnerInput: Bool
     public var recentNotes: [MobileDeskNote]
+    public var executionEvidence: DeskExecutionEvidence?
 
     public init(
         handle: String, alias: String, parent: String?, kind: String, status: String,
         project: String, title: String, summary: String?, openedAt: String,
         updatedAt: String, closedAt: String?, pinned: Bool, blockedReason: String?,
         waitingOn: String?, blockedOn: [String], deferUntil: String?, origin: String,
-        requiresOwnerInput: Bool, recentNotes: [MobileDeskNote]
+        requiresOwnerInput: Bool, recentNotes: [MobileDeskNote],
+        executionEvidence: DeskExecutionEvidence? = nil
     ) {
         self.handle = handle
         self.alias = alias
@@ -60,6 +211,13 @@ public struct MobileDeskItem: Codable, Equatable, Identifiable, Sendable {
         self.origin = origin
         self.requiresOwnerInput = requiresOwnerInput
         self.recentNotes = recentNotes
+        self.executionEvidence = executionEvidence
+    }
+
+    public func activity(at now: Date) -> DeskActivityState {
+        DeskActivityState.item(
+            status: status, kind: kind, deferred: deferUntil != nil,
+            updatedAt: updatedAt, evidence: executionEvidence, now: now)
     }
 }
 

@@ -20,7 +20,7 @@ public struct GrokInboundReply: Sendable {
               contact.transport == .grokBot, contact.grokSetup == "set up" else { throw GrokLinkCredential.Failure.invalid }
         let store = GrokRequestStore(dataRoot: dataRoot)
         let pending = try store.claimReply(reply, peer: principal.id)
-        let peer = AgentBridgePrincipal(id: principal.id, peerID: principal.id, elevated: false, displayName: contact.name)
+        let peer = AgentBridgePrincipal(id: principal.id, peerID: principal.id, elevated: contact.elevationAllowed, displayName: contact.name)
         var run = ""
         if let deliver {
             do { run = try await deliver(pending, reply.text, peer) } catch {
@@ -104,6 +104,8 @@ public struct GrokInboundReply: Sendable {
     /// off mid-hand-over is marked, never repeated (it may already be her turn).
     func resumeHandOvers(dataRoot: URL) {
         let store = GrokRequestStore(dataRoot: dataRoot)
+        do { try store.pruneSettled() }
+        catch { NSLog("Grok request retention failed: %@", error.localizedDescription) }
         let files = (try? FileManager.default.contentsOfDirectory(at: store.root, includingPropertiesForKeys: nil)) ?? []
         let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
         for file in files where file.pathExtension == "json" {
@@ -117,7 +119,7 @@ public struct GrokInboundReply: Sendable {
                 continue
             }
             guard let contact = contacts.first(where: { $0.id == saved.peerID && $0.transport == .grokBot }) else { continue }
-            handOver(saved, text: text, peer: AgentBridgePrincipal(id: contact.id, peerID: contact.id, elevated: false,
+            handOver(saved, text: text, peer: AgentBridgePrincipal(id: contact.id, peerID: contact.id, elevated: contact.elevationAllowed,
                 displayName: contact.name), dataRoot: dataRoot)
         }
     }
@@ -131,15 +133,19 @@ public struct GrokInboundReply: Sendable {
     private func enqueue(_ pending: GrokPendingRequest, text: String, peer: AgentBridgePrincipal,
                                 dataRoot: URL) async throws -> ChatOrchestration.ChatResponse {
         let client = clients.bridgeChatClient()
-        let envelope = TurnEnvelope(surface: AgentBridgeSurface.id, agent: "peer", verifiedUserId: peer.id,
-            commandSignatureVerified: true, declaredRemote: true)
-        let origin = ChatMessageOrigin(surface: "agent-bridge", agent: "agent", authored: .agent)
+        guard let contact = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peer.id && $0.transport == .grokBot }) else {
+            throw GrokLinkCredential.Failure.invalid
+        }
+        let peer = AgentBridgePrincipal(id: contact.id, peerID: contact.id, elevated: contact.elevationAllowed, displayName: contact.name)
+        let envelope = TurnEnvelope(surface: peer.surface, agent: "peer", verifiedUserId: peer.id,
+            commandSignatureVerified: true, declaredRemote: !peer.elevated)
+        let origin = ChatMessageOrigin(surface: peer.surface, agent: "agent", authored: .agent)
         // This credential can only answer a message this app sent, so say so:
         // unframed, the answer read as a new request and the question was re-asked
         // (driven 09-20).
-        let message = AgentBridgeSurface.turnHeader(peerName: peer.displayName, elevated: false)
+        let message = AgentBridgeSurface.turnHeader(peerName: peer.displayName, elevated: peer.elevated)
             + "[This is \(peer.displayName ?? "the other agent")'s answer to the message you sent it in this conversation. The exchange is complete: do not send the question again. Tell the person the answer once.]\n" + text
-        let request = TurnRequest(message: message, sessionID: pending.conversationID, surface: AgentBridgeSurface.id,
+        let request = TurnRequest(message: message, sessionID: pending.conversationID, surface: peer.surface,
                                   envelope: envelope, origin: origin)
         let enqueued = try await request.enqueue(on: client)
         _ = try? GrokRequestStore(dataRoot: dataRoot).update(pending.messageID, peer: peer.id) {

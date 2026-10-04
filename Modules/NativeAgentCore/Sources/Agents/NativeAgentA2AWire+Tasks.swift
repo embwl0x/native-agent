@@ -6,6 +6,7 @@ import ApprovalInbox
 import Darwin
 import CoreFoundation
 import ProviderRouting
+import CryptoKit
 
 public enum AgentContactTaskState: String, Codable, Sendable {
     case submitted, working, inputRequired = "input-required", completed, failed, canceled
@@ -25,12 +26,28 @@ public struct AgentContactTask: Codable, Sendable {
     public var canonicalSession: String?
     public var canonicalRunID: String?
     public var acceptedOutputModes: [String]?
+    public var toolResult: JSONValue?
+    public var delegatedCompletions: [String: AgentContactPart]?
+    public var approvalIDs: Set<String>?
+    public var replyPayloadExpired: Bool?
+    public var delegatedCompletionDigests: [String: String]?
+
+    var hasReplyPayload: Bool {
+        !text.isEmpty || !parts.isEmpty || toolResult != nil || failure != nil
+            || delegatedCompletions?.isEmpty == false
+    }
+
+    public var replyText: String {
+        ([text] + (delegatedCompletions ?? [:]).sorted { $0.key < $1.key }.compactMap {
+            if case .text(let text) = $0.value { return text }; return nil
+        }).filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
 }
 
 public enum AgentContactEvent: Sendable {
     case snapshot(AgentContactTask)
     case status(AgentContactTask, final: Bool)
-    case artifact(task: AgentContactTask, parts: [AgentContactPart], append: Bool, last: Bool)
+    case artifact(task: AgentContactTask, artifactID: String, parts: [AgentContactPart], append: Bool, last: Bool)
 }
 
 struct AgentContactTurn: Sendable {
@@ -65,6 +82,7 @@ public actor AgentContactTasks {
         var task: AgentContactTask
         var worker: Task<Void, Never>?
         var cancelling = false
+        var rawTool = false
         var approvals: Set<String> = []
         var acceptedOutputModes = ["*/*"]
         var subscribers: [UUID: AsyncStream<AgentContactEvent>.Continuation] = [:]
@@ -81,6 +99,7 @@ public actor AgentContactTasks {
     private let inbox: SwiftNativeApprovalInbox
     private var approvalObservation: Task<Void, Never>?
     private var receiptObservation: AgentContactReceiptObservation?
+    private var terminalPayloadWrites = 32
 
     init(dataRoot: URL, capacity: Int = 128, runner: @escaping Runner) {
         self.dataRoot = dataRoot
@@ -199,6 +218,94 @@ public actor AgentContactTasks {
         return task
     }
 
+    /// Raw tool RPCs retain their receipt in the same caller-owned task store.
+    /// A repeated transport request reads the original receipt, never reruns it.
+    public func beginTool(context: String, request: String, principal: AgentBridgePrincipal,
+                          digest: String) throws -> (task: AgentContactTask, execute: Bool) {
+        let id = "na3.\(context).\(request)"
+        guard NativeAgentA2AWire.locator(id) != nil else { throw AgentContactFailure.missing }
+        let key = AgentPeerReplayClaimStore.key(principal: principal.id, protocolName: "tool", messageID: id)
+        let claim = try claims.claim(key: key, digest: digest)
+        switch claim {
+        case .replay: return (try get(id, owner: principal.id), false)
+        case .claimed: break
+        default: throw AgentContactFailure(code: -32004, message: "This request is already active or was used for different content. Read its retained result; do not resend.")
+        }
+        do {
+            var existing = stat()
+            guard records[id] == nil,
+                  Darwin.lstat(retainedURL(id: id, owner: principal.id).path, &existing) != 0,
+                  errno == ENOENT else {
+                throw AgentContactFailure(code: -32602, message: "That request already has retained task evidence. Read its result; do not resend.")
+            }
+            if records.count >= capacity {
+                guard let oldest = order.first(where: { records[$0]?.task.state.terminal == true }) else {
+                    throw AgentContactFailure(code: -32004, message: "Too much work is active. Try again later.")
+                }
+                records.removeValue(forKey: oldest); order.removeAll { $0 == oldest }
+                pushConfigs.removeValue(forKey: oldest)
+            }
+            var task = AgentContactTask(id: id, context: context, owner: principal.id)
+            task.state = .working
+            task.canonicalSession = principal.storedConversation(context)
+            try retain(task)
+            records[id] = Record(task: task, rawTool: true)
+            order.append(id)
+            claims.recordReceipt(key: key, digest: digest, receipt: ["taskID": id])
+            return (task, true)
+        } catch { claims.release(key: key); throw error }
+    }
+
+    public func finishTool(_ id: String, owner: String, result: JSONValue) throws {
+        var task = try get(id, owner: owner)
+        guard !task.state.terminal, task.toolResult == nil else { return }
+        task.toolResult = result
+        task.text = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+        task.state = .completed
+        task.updated = Date()
+        try retain(task)
+        records[id]?.task = task
+    }
+
+    public func callerResultTarget(_ route: AgentBridgeCompletionRoute) throws -> AgentContactTask {
+        guard route.surface == "caller-result", let owner = route.destinationId,
+              let context = route.threadId, let request = route.correlationId else { throw AgentContactFailure.missing }
+        let task = try get("na3.\(context).\(request)", owner: owner)
+        guard task.context == context, task.canonicalSession == route.sessionId else { throw AgentContactFailure.missing }
+        return task
+    }
+
+    public func appendCallerResult(_ part: AgentContactPart, artifactID: String,
+                                   route: AgentBridgeCompletionRoute) throws {
+        var task = try callerResultTarget(route)
+        guard let accepted = part.accepted(in: task.acceptedOutputModes ?? ["*/*"]) else {
+            throw AgentContactFailure(code: -32602, message: "The caller cannot accept this completion")
+        }
+        if let digest = task.delegatedCompletionDigests?[artifactID] {
+            guard digest == (try Self.completionDigest(accepted)) else {
+                throw AgentContactFailure(code: -32602, message: "Completion identity conflicts with retained content")
+            }
+            return
+        }
+        var completions = task.delegatedCompletions ?? [:]
+        if let retained = completions[artifactID] {
+            guard retained == accepted else { throw AgentContactFailure(code: -32602, message: "Completion identity conflicts with retained content") }
+            return
+        }
+        guard completions.count + (task.delegatedCompletionDigests?.count ?? 0) < 64 else {
+            throw AgentContactFailure(code: -32602, message: "The caller cannot accept this completion")
+        }
+        completions[artifactID] = accepted
+        task.delegatedCompletions = completions
+        task.updated = Date()
+        guard try JSONEncoder().encode(task).count <= AgentContactPart.maximumOutputBytes * 2 else {
+            throw AgentContactFailure(code: -32602, message: "The retained reply reached its size limit")
+        }
+        try retain(task)
+        records[task.id]?.task = task
+        broadcast(task.id, .artifact(task: task, artifactID: artifactID, parts: [accepted], append: false, last: true))
+    }
+
     public func get(_ id: String, owner: String) throws -> AgentContactTask {
         if let record = records[id] {
             guard record.task.owner == owner else { throw AgentContactFailure.missing }
@@ -217,19 +324,40 @@ public actor AgentContactTasks {
               var task = try? JSONDecoder().decode(AgentContactTask.self, from: data),
               task.id == id, task.owner == owner else { throw AgentContactFailure.missing }
         if !task.state.terminal {
-            if let reply = try canonicalReply(task) {
-                task.state = .completed
-                task.parts = reply.compactMap { $0.accepted(in: task.acceptedOutputModes ?? ["*/*"]) }
+            if let recovered = try canonicalReply(task) {
+                task.state = recovered.outcome.state
+                task.approvalIDs = recovered.approvals
+                task.parts = recovered.outcome.parts.compactMap { $0.accepted(in: task.acceptedOutputModes ?? ["*/*"]) }
                 task.text = task.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
-                task.detail = nil
+                task.detail = recovered.outcome.detail
+            } else if let approvals = task.approvalIDs, !approvals.isEmpty {
+                task.state = .inputRequired
+                task.detail = "Waiting for the person to answer the permission card"
             } else {
                 task.state = .failed
                 task.detail = "The app restarted before the turn finished. Do not resend automatically."
             }
             task.updated = Date()
             try retain(task)
+            if !task.state.terminal {
+                guard records.count < capacity else { throw AgentContactFailure(code: -32004, message: "Too much work is active. Try again later.") }
+                records[id] = Record(task: task, approvals: task.approvalIDs ?? [],
+                                     acceptedOutputModes: task.acceptedOutputModes ?? ["*/*"])
+                order.append(id)
+                Task { await self.observeApprovals(); await self.refreshApprovals() }
+            }
         }
         return task
+    }
+
+    /// Called only after a reply-reading door successfully transmitted the reply.
+    public func recordReplyFetch(_ task: AgentContactTask) {
+        guard task.state == .completed, let session = task.canonicalSession, let run = task.canonicalRunID else { return }
+        ContactReplyReads.record(dataRoot: dataRoot, session: session, request: task.id, run: run)
+    }
+
+    public func recordReplyFetch(session: String, request: String, run: String) {
+        ContactReplyReads.record(dataRoot: dataRoot, session: session, request: request, run: run)
     }
 
     private func bindRun(_ id: String, session: String, run: String) throws {
@@ -241,7 +369,7 @@ public actor AgentContactTasks {
         records[id] = record
     }
 
-    private func canonicalReply(_ task: AgentContactTask) throws -> [AgentContactPart]? {
+    private func canonicalReply(_ task: AgentContactTask) throws -> (outcome: AgentContactOutcome, approvals: Set<String>)? {
         guard let session = task.canonicalSession, let run = task.canonicalRunID,
               NativeAgentChatSessionID.normalizedPathComponent(session) == session,
               session.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: task.owner)) else { return nil }
@@ -257,20 +385,70 @@ public actor AgentContactTasks {
               let data = try handle.read(upToCount: limit + 1), data.count <= limit else {
             throw AgentContactFailure(code: -32603, message: "The conversation could not be reconciled")
         }
-        var replies: [String] = []
+        var replies: [AgentContactOutcome] = []
+        var approvals = task.approvalIDs ?? []
         for line in data.split(separator: 10) {
             guard let row = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
             guard row["sessionId"] as? String == session, row["runId"] as? String == run,
-                  row["role"] as? String == "assistant",
-                  let metadata = row["metadata"] as? [String: Any],
-                  metadata["partial"] as? Bool != true, metadata["cancelled"] as? Bool != true,
+                  let metadata = row["metadata"] as? [String: Any] else { continue }
+            if row["role"] as? String == "tool", let approval = metadata["approvalId"] as? String {
+                approvals.insert(approval)
+            }
+            guard row["role"] as? String == "assistant",
                   let outcome = metadata["outcomeObservation"] as? [String: Any],
-                  outcome["responsePersistence"] as? String == "persisted",
                   let content = row["content"] as? String else { continue }
-            replies.append(content)
+            let persistence = outcome["responsePersistence"] as? String
+            if persistence == "cancelled" || metadata["cancelled"] as? Bool == true {
+                replies.append(.init(state: .canceled, parts: [.text(content)]))
+            } else if persistence == "failed" {
+                replies.append(.init(state: .failed, parts: [.text(content)]))
+            } else if persistence == "persisted", metadata["partial"] as? Bool != true {
+                var state: AgentContactTaskState = metadata["completionState"] as? String == "completed" ? .completed : .failed
+                var parts: [AgentContactPart] = content.isEmpty ? [] : [.text(content)]
+                var detail = state == .failed ? "The saved reply does not confirm that the work finished" : nil
+                do {
+                    for key in ["attachments", "outputFiles"] {
+                        guard let raw = metadata[key] else { continue }
+                        guard let attachments = raw as? [[String: Any]], attachments.count <= 64 else {
+                            throw AgentContactFailure(code: -32603, message: "Invalid saved attachments")
+                        }
+                        for saved in attachments {
+                            guard let type = saved["type"] as? String, let mime = saved["mime"] as? String,
+                                  let path = saved["path"] as? String, !path.isEmpty else {
+                                throw AgentContactFailure(code: -32603, message: "Invalid saved attachment")
+                            }
+                            let part = try AgentContactPart.output(.init(type: type, base64: "", mime: mime,
+                                name: saved["name"] as? String, path: path), taskID: task.id)
+                            if key == "outputFiles" {
+                                guard let digest = saved["sha256"] as? String,
+                                      case .file(_, _, let bytes, _) = part,
+                                      SHA256.hash(data: bytes).map({ String(format: "%02x", $0) }).joined() == digest else {
+                                    throw AgentContactFailure(code: -32603, message: "The saved file changed")
+                                }
+                            }
+                            parts.append(part)
+                            guard try JSONSerialization.data(withJSONObject: parts.map(\.wire03)).count <= AgentContactPart.maximumOutputBytes else {
+                                parts.removeLast()
+                                throw AgentContactFailure(code: -32603, message: "Saved attachments exceed the reply limit")
+                            }
+                        }
+                    }
+                } catch {
+                    state = .failed
+                    detail = "The saved reply's files could not be fully recovered. Do not resend automatically."
+                }
+                replies.append(.init(state: state, parts: parts, detail: detail))
+            }
         }
         guard replies.count <= 1 else { throw AgentContactFailure(code: -32603, message: "The conversation has ambiguous completion records") }
-        return replies.first.map { [.text($0)] }
+        if let terminal = replies.first, terminal.state == .canceled {
+            return (terminal, [])
+        }
+        if !approvals.isEmpty {
+            return (.init(state: .inputRequired, parts: replies.first?.parts ?? [],
+                detail: "Waiting for the person to answer the permission card"), approvals)
+        }
+        return replies.first.map { ($0, approvals) }
     }
 
     private func retainedURL(id: String, owner: String) -> URL {
@@ -283,6 +461,50 @@ public actor AgentContactTasks {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(task), to: url)
+        if task.state.terminal, task.hasReplyPayload {
+            terminalPayloadWrites += 1
+            if terminalPayloadWrites >= 32 {
+                try compactReplyPayloads()
+                terminalPayloadWrites = 0
+            }
+        }
+    }
+
+    private func compactReplyPayloads() throws {
+        let directory = dataRoot.appendingPathComponent("agents/a2a-replies")
+        var retained: [(URL, Date)] = []
+        for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+            where url.pathExtension == "json" {
+            var info = stat()
+            guard Darwin.lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+                  info.st_size <= AgentContactPart.maximumOutputBytes * 2,
+                  let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url)),
+                  retainedURL(id: task.id, owner: task.owner) == url,
+                  task.state.terminal, task.hasReplyPayload else { continue }
+            retained.append((url, task.updated))
+        }
+        for (url, updated) in retained.sorted(by: { $0.1 < $1.1 }).prefix(max(0, retained.count - capacity)) {
+            let saved = try JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url))
+            guard saved.state.terminal, saved.updated == updated else { continue }
+            var compact = saved
+            var digests = saved.delegatedCompletionDigests ?? [:]
+            for (id, part) in saved.delegatedCompletions ?? [:] {
+                digests[id] = try Self.completionDigest(part)
+            }
+            compact.delegatedCompletionDigests = digests
+            compact.text = ""; compact.parts = []; compact.toolResult = nil; compact.delegatedCompletions = nil
+            compact.failure = nil
+            compact.replyPayloadExpired = true
+            compact.detail = "The saved reply has expired. This task's outcome is retained; do not resend automatically."
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(compact), to: url)
+            records[compact.id]?.task = compact
+        }
+    }
+
+    private static func completionDigest(_ part: AgentContactPart) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return AgentPeerReplayClaimStore.digest(try encoder.encode(part))
     }
 
     public func subscribe(_ id: String, owner: String) throws -> AsyncStream<AgentContactEvent> {
@@ -291,7 +513,6 @@ public actor AgentContactTasks {
         let pair = AsyncStream<AgentContactEvent>.makeStream(bufferingPolicy: .bufferingOldest(128))
         pair.continuation.yield(.snapshot(task))
         if task.state.terminal || (task.state == .inputRequired && records[id]?.worker == nil) {
-            pair.continuation.yield(.status(task, final: true))
             pair.continuation.finish()
         } else {
             guard (records[id]?.subscribers.count ?? 0) < 16 else {
@@ -478,6 +699,9 @@ public actor AgentContactTasks {
     func cancel(_ id: String, owner: String) async throws -> AgentContactTask {
         let task = try get(id, owner: owner)
         guard !task.state.terminal else { throw AgentContactFailure(code: -32002, message: "This task has already ended") }
+        if records[id]?.rawTool == true {
+            throw AgentContactFailure(code: -32002, message: "This tool call is still running and cannot be canceled through this task")
+        }
         // Only a real approval id holds the task. An inline card (connector,
         // choice) carries none, so input-required alone left it uncancellable.
         if records[id]?.worker == nil, records[id]?.approvals.isEmpty == false {
@@ -500,6 +724,12 @@ public actor AgentContactTasks {
         switch progress {
         case .approval(let approvalID):
             record.approvals.insert(approvalID)
+            record.task.approvalIDs = record.approvals
+            do { try retain(record.task) }
+            catch {
+                record.worker?.cancel()
+                record.task.detail = "The permission card state could not be saved"
+            }
             records[id] = record
             return
         case .working:
@@ -519,7 +749,7 @@ public actor AgentContactTasks {
             }
             let append = !record.task.text.isEmpty
             record.task.text += delta
-            event = .artifact(task: record.task, parts: [.text(delta)], append: append, last: false)
+            event = .artifact(task: record.task, artifactID: id + "-reply", parts: [.text(delta)], append: append, last: false)
         }
         let previousState = records[id]?.task.state
         records[id] = record
@@ -547,7 +777,7 @@ public actor AgentContactTasks {
         records[id] = record
         if !record.cancelling, !parts.isEmpty {
             // Replace the streamed draft with the canonical final artifact.
-            broadcast(id, .artifact(task: record.task, parts: parts, append: false, last: true))
+            broadcast(id, .artifact(task: record.task, artifactID: id + "-reply", parts: parts, append: false, last: true))
         }
         notifyPush(record.task)
         broadcast(id, .status(record.task, final: true))
@@ -608,7 +838,11 @@ extension NativeAgentA2AWire {
     static func task(_ task: AgentContactTask) -> [String: Any] {
         var result: [String: Any] = ["kind": "task", "id": task.id, "contextId": task.context, "status": status(task)]
         let parts = task.parts.isEmpty ? (task.text.isEmpty ? [] : [AgentContactPart.text(task.text)]) : task.parts
-        if !parts.isEmpty { result["artifacts"] = [["artifactId": task.id + "-reply", "parts": parts.map(\.wire03)]] }
+        var artifacts: [[String: Any]] = parts.isEmpty ? [] : [["artifactId": task.id + "-reply", "parts": parts.map(\.wire03)]]
+        artifacts += (task.delegatedCompletions ?? [:]).sorted { $0.key < $1.key }.map {
+            ["artifactId": $0.key, "parts": [$0.value.wire03]]
+        }
+        if !artifacts.isEmpty { result["artifacts"] = artifacts }
         return result
     }
 
@@ -644,9 +878,9 @@ extension NativeAgentA2AWire {
         case .snapshot(let task): return result(id, Self.task(task))
         case .status(let task, let final):
             return result(id, ["kind": "status-update", "taskId": task.id, "contextId": task.context, "status": status(task), "final": final])
-        case .artifact(let task, let parts, let append, let last):
+        case .artifact(let task, let artifactID, let parts, let append, let last):
             let object: [String: Any] = ["kind": "artifact-update", "taskId": task.id, "contextId": task.context,
-                "artifact": ["artifactId": task.id + "-reply", "parts": parts.map(\.wire03)], "append": append, "lastChunk": last]
+                "artifact": ["artifactId": artifactID, "parts": parts.map(\.wire03)], "append": append, "lastChunk": last]
             return result(id, object)
         }
     }

@@ -2,10 +2,7 @@
 //
 // Pure-Swift WordPiece tokenizer compatible with BERT/MiniLM vocabularies.
 //
-// NOTE: The bundled `Resources/minilm_vocab.txt` is a STUB (~200 tokens) for
-// unit tests. Production deployment requires the full 30522-line vocab:
-//   curl -fsSL https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/raw/main/vocab.txt \
-//     -o Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm_vocab.txt
+// Resources/minilm_vocab.txt contains the full 30,522-entry MiniLM vocabulary.
 
 import Foundation
 
@@ -51,7 +48,15 @@ public final class WordPieceTokenizer: @unchecked Sendable {
         var s = text
         if doLowerCase { s = s.lowercased() }
         s = (s as NSString).precomposedStringWithCanonicalMapping
-        s = String(s.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F })
+        if doLowerCase {
+            s = String(String.UnicodeScalarView(s.decomposedStringWithCanonicalMapping.unicodeScalars.filter {
+                $0.properties.generalCategory != .nonspacingMark
+            }))
+        }
+        s = String(String.UnicodeScalarView(s.unicodeScalars.compactMap { scalar in
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) { return UnicodeScalar(0x20) }
+            return scalar.value >= 0x20 && scalar.value != 0x7F ? scalar : nil
+        }))
 
         let words = splitOnWhitespaceAndPunctuation(s)
         var output: [String] = []
@@ -100,7 +105,7 @@ public final class WordPieceTokenizer: @unchecked Sendable {
         for scalar in s.unicodeScalars {
             if CharacterSet.whitespacesAndNewlines.contains(scalar) {
                 if !cur.isEmpty { result.append(cur); cur = "" }
-            } else if isPunctuation(scalar) {
+            } else if isPunctuation(scalar) || isChineseCharacter(scalar) {
                 if !cur.isEmpty { result.append(cur); cur = "" }
                 result.append(String(scalar))
             } else {
@@ -117,6 +122,17 @@ public final class WordPieceTokenizer: @unchecked Sendable {
             return true
         }
         return CharacterSet.punctuationCharacters.contains(scalar)
+    }
+
+    private func isChineseCharacter(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x4E00...0x9FFF, 0x3400...0x4DBF, 0x20000...0x2A6DF,
+             0x2A700...0x2B73F, 0x2B740...0x2B81F, 0x2B820...0x2CEAF,
+             0xF900...0xFAFF, 0x2F800...0x2FA1F:
+            return true
+        default:
+            return false
+        }
     }
 
     private func wordpieceGreedy(_ word: String) -> [String] {

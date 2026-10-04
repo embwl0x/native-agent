@@ -18,5 +18,5 @@ import CapabilityFoundry
 //
 // Transport scope: stdio subprocess plus the two built-in NativeAgent
 // transports configured by default: nativeagent-internal (in-process Swift
-// reads) and searxng-local (Swift Research client). Arbitrary http/sse MCP
-// servers still fail closed until a generic transport client is added.
+// reads) and searxng-local (Swift Research client). Other HTTP MCP servers
+// use the generic streamable HTTP transport, including SSE responses.

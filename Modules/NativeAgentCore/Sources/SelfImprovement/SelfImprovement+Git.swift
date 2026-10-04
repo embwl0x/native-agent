@@ -66,8 +66,16 @@ public actor SelfImprovementGitOps {
             throw SelfImprovementGitError.workTreeNotClean(detail: dirty)
         }
 
+        let head = try await runGit(["rev-parse", "HEAD"])
+        guard head.exit == 0 else { throw SelfImprovementGitError.underlying(head.stderr) }
+        let originalHead = head.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let originalTree = try await checkedIndexTree()
+        let headTree = try await runGit(["rev-parse", "\(originalHead)^{tree}"])
+        guard headTree.exit == 0, headTree.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == originalTree else {
+            throw SelfImprovementGitError.workTreeNotClean(detail: "Index changed during promotion preflight")
+        }
         if let expected = expectedHead, !expected.isEmpty {
-            let actual = try await currentHead()
+            let actual = originalHead
             // Allow either short or long matching (compare common prefix length).
             let n = min(expected.count, actual.count)
             if String(expected.prefix(n)) != String(actual.prefix(n)) {
@@ -77,10 +85,18 @@ public actor SelfImprovementGitOps {
 
         let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
         let patchURL = tmpDir.appendingPathComponent(InstallPaths.current.name("selfimprove-\(UUID().uuidString).patch"))
+        let indexURL = patchURL.appendingPathExtension("index")
         try diffText.write(to: patchURL, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: patchURL) }
+        defer {
+            try? FileManager.default.removeItem(at: patchURL)
+            try? FileManager.default.removeItem(at: indexURL)
+        }
 
-        let apply = try await runGit(["apply", "--3way", patchURL.path])
+        // Resolve against the captured clean tree without touching the real
+        // index or worktree. Failed three-way applications stay disposable.
+        let seed = try await runGit(["read-tree", originalTree], indexURL: indexURL)
+        guard seed.exit == 0 else { throw SelfImprovementGitError.applyFailed(stderr: seed.stderr) }
+        let apply = try await runGit(["apply", "--cached", "--3way", patchURL.path], indexURL: indexURL)
         if apply.exit != 0 {
             let combined = apply.stderr + "\n" + apply.stdout
             if isConflictOutput(combined) {
@@ -89,20 +105,41 @@ public actor SelfImprovementGitOps {
             }
             throw SelfImprovementGitError.applyFailed(stderr: apply.stderr)
         }
+        let approved = try await runGit(["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", originalHead], indexURL: indexURL)
+        guard approved.exit == 0, !approved.stdout.isEmpty else {
+            throw SelfImprovementGitError.applyFailed(stderr: approved.stderr.isEmpty ? "Patch has no changes" : approved.stderr)
+        }
+        try approved.stdout.write(to: patchURL, atomically: true, encoding: .utf8)
+        let names = try await runGit(["diff", "--cached", "--no-renames", "--name-only", "-z", originalHead], indexURL: indexURL)
+        guard names.exit == 0 else { throw SelfImprovementGitError.applyFailed(stderr: names.stderr) }
+        let paths = names.stdout.split(separator: "\0").map(String.init)
+        try await checkPromotionState(head: originalHead, indexTree: originalTree)
+        let worktreeApply = try await runGit(["apply", patchURL.path])
+        guard worktreeApply.exit == 0 else { throw SelfImprovementGitError.applyFailed(stderr: worktreeApply.stderr) }
 
         if let validateAppliedDiff {
             do {
                 try await validateAppliedDiff()
             } catch {
-                _ = try? await runGit(["apply", "-R", "--3way", patchURL.path])
+                let rollback = try await runGit(["apply", "-R", patchURL.path])
+                guard rollback.exit == 0 else {
+                    throw SelfImprovementGitError.underlying("validation failed: \(error.localizedDescription); patch rollback failed: \(rollback.stderr)")
+                }
                 throw SelfImprovementGitError.underlying("validation failed: \(error.localizedDescription)")
             }
         }
 
-        let add = try await runGit(["add", "-A"])
+        try await checkPromotionState(head: originalHead, indexTree: originalTree)
+        let unchanged = try await runGit(["diff", "--quiet", "--"] + paths, indexURL: indexURL)
+        guard unchanged.exit == 0 else {
+            throw SelfImprovementGitError.commitFailed(stderr: "Approved paths changed during validation; commit refused")
+        }
+        let add = try await runGit(["apply", "--cached", patchURL.path])
         if add.exit != 0 {
             throw SelfImprovementGitError.commitFailed(stderr: add.stderr)
         }
+        let approvedTree = try await checkedIndexTree(indexURL: indexURL)
+        try await checkPromotionState(head: originalHead, indexTree: approvedTree)
 
         let commit = try await runGit([
             "-c", "user.name=NativeAgent",
@@ -171,6 +208,23 @@ public actor SelfImprovementGitOps {
 
     // MARK: - Internals
 
+    private func checkedIndexTree(indexURL: URL? = nil) async throws -> String {
+        let result = try await runGit(["write-tree"], indexURL: indexURL)
+        guard result.exit == 0 else { throw SelfImprovementGitError.commitFailed(stderr: result.stderr) }
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func checkPromotionState(head: String, indexTree: String) async throws {
+        let actual = try await runGit(["rev-parse", "HEAD"])
+        let actualHead = actual.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard actual.exit == 0, actualHead == head else {
+            throw SelfImprovementGitError.expectedHeadMismatch(expected: head, actual: actualHead)
+        }
+        guard try await checkedIndexTree() == indexTree else {
+            throw SelfImprovementGitError.commitFailed(stderr: "Staged contents changed during promotion; commit refused")
+        }
+    }
+
     private struct GitResult {
         let stdout: String
         let stderr: String
@@ -184,21 +238,23 @@ public actor SelfImprovementGitOps {
     /// blocking body now runs on a GCD global queue; the actor awaits a
     /// continuation without blocking a thread. Timeout semantics identical
     /// (same DispatchWorkItem terminate).
-    private nonisolated func runGit(_ args: [String]) async throws -> GitResult {
+    private nonisolated func runGit(_ args: [String], indexURL: URL? = nil) async throws -> GitResult {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global().async {
-                cont.resume(with: Result { try self.runGitBlocking(args) })
+                cont.resume(with: Result { try self.runGitBlocking(args, indexURL: indexURL) })
             }
         }
     }
 
-    private nonisolated func runGitBlocking(_ args: [String]) throws -> GitResult {
+    private nonisolated func runGitBlocking(_ args: [String], indexURL: URL? = nil) throws -> GitResult {
         let proc = Process()
         proc.launchPath = "/usr/bin/env"
         proc.arguments = ["git", "-C", repoRoot.path] + args
 
-        if let env = env {
-            proc.environment = env
+        if env != nil || indexURL != nil {
+            var environment = env ?? ProcessInfo.processInfo.environment
+            if let indexURL { environment["GIT_INDEX_FILE"] = indexURL.path }
+            proc.environment = environment
         }
 
         let outPipe = Pipe()

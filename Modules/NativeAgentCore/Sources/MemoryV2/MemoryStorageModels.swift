@@ -258,6 +258,7 @@ public enum MemoryStorageError: Error, LocalizedError {
     case embeddingEpochMismatch(expected: String, actual: String?)
     case embeddingActivationInvalid(EmbeddingActivationRefusal, String)
     case invalidTemporalEvidence(String)
+    case capacityExceeded
 
     /// 2026-09-06: why an activation was refused. The launch reconciler retries
     /// a refusal by re-embedding the entire corpus, which is the right answer
@@ -282,6 +283,8 @@ public enum MemoryStorageError: Error, LocalizedError {
             return "MemoryStorage: embedding epoch activation refused (\(refusal.rawValue)) — \(reason)"
         case .invalidTemporalEvidence(let reason):
             return "MemoryStorage: invalid temporal evidence — \(reason)"
+        case .capacityExceeded:
+            return "MemoryStorage: capacity reached — admission would evict a higher-priority protected memory"
         }
     }
 }

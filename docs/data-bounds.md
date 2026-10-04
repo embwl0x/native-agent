@@ -1,30 +1,20 @@
 # NativeAgent Data Bounds
 
-Runtime pruning is owned by the app-owned Swift runtime. Do not attribute current pruning, TTL, or startup-maintenance behavior to retired runtime paths.
+Selected live limits enforced by the Swift runtime. These are store-specific
+policies, not a global disk quota. Paths are relative to the app's data root.
 
-A row belongs here only while a live writer is bounded by it. Retired
-2026-09-01 (sweep item 21): `data/runs/runs.jsonl` claimed a 10,000-line
-app-owned retention it never had — no code has ever written or read that path
-(`RunLedger` writes `runs/runs.json`), so the file was an unbounded 4 MB fossil
-sitting under a retention row that described nothing.
+| Store | Limit | Enforcement / owner |
+|---|---|---|
+| MemoryV2 memories | 2,000 rows by default | Value/lifecycle rank, then least recent use; pinned/identity rows evicted last. `MemoryV2+Storage.swift` |
+| Approvals | 300 records | On overflow, orphan pending requests unanswered for 24 hours since their last request (creation if never re-asked), then evict oldest eligible terminal records; refuse creation if insufficient space remains. `ApprovalInbox.swift` |
+| Chat compaction backups | 5 per session | Under `chat/sessions/<id>/messages.compact.*.jsonl`; verified fresh backup protected, cleanup best-effort. `ChatSessionAutocompactor.swift` |
+| Cognitive active nodes | 256 by default | Configured by `CognitiveConfiguration.swift` |
+| Cognitive artifacts | Derived from node, thought-seed and reflection budgets; minimum 64 | `CognitiveSubstrate+Persistence.swift` computes the cap; `CognitiveSQLiteStore.swift` prunes by artifact family |
+| Shared traces | 5,000-row trigger → 4,000 retained; 8 MiB → 4 MiB | `traces/events.jsonl`; path-owned append policy |
+| Activity events | 5,000-row trigger → 4,000 retained | `activity/events.jsonl`; retains a sample of rare event kinds |
+| Daily turn traces | 12 MiB → 8 MiB; 14 days | `TurnTrace` append and date-based retention |
+| Browser observations | 128 MiB, 256 capture groups, 7 days | Enforced on capture writes by `BrowserCaptureCache.swift` |
 
-| Subsystem | Cap | Eviction | Notes |
-|-----------|-----|----------|-------|
-| Memory facts | 2000 | Lifecycle/value class, then least-recently-used (`lastUsedAt`/`updatedAt`); pinned/identity evicted only after ordinary rows | Enforced transactionally on direct insert, proposal acceptance, approved consolidation swap, and store open; overflow emits bounded retention receipts and removes stale derived projections |
-| Chat drafts (Swift app) | 50 | LRU by lastTouched | |
-| Toast queue (UI) | 10 | Drop oldest | |
-| Approvals | 300 | Drop oldest resolved | |
-| Improvement runs | 500 | Drop oldest by createdAt | Receipt files unlinked |
-| Inbox items | 1000 | Drop oldest | |
-| Crash reports | 50 | Drop oldest | |
-| Auto-compact trigger | 4000 messages/session | Summarize older | |
-| Mac chat pre-compaction backups (`data/chat/sessions/<id>/messages.compact.*.jsonl`) | 5 per session | Newest filenames retained after the fresh backup is byte-verified; the fresh backup is explicitly protected | Cleanup is best-effort so recovery safety wins over retention on delete failure |
-| Tool result truncation | 30k chars | Per-field cap, list breadth 100 | |
-| CognitiveSubstrate active nodes | 256 default | Deterministic eviction by lowest salience/activation/age | Optional SQLite snapshot under `data/cognition/`; no MemoryV2 writes |
-| CognitiveSubstrate artifacts | Derived from active-node/seed/reflection caps, minimum 64 (604 with the all-phases defaults) | Legacy receipt mirrors first; then rows outside protected family quotas; only then least-durable/oldest protected rows if an unusually small hard cap requires it | Thought-seed decay/cap changes replace the exact family and prune in one SQLite transaction; affect/disposition, seeds, episodes, schema/identity proposals, standing views, developmental timeline, reflection/cue receipts, and experiments each have bounded protected retention |
-| Pairing token TTL | 90 days | Auto-expired | |
-| Trace events (`data/traces/events.jsonl`) | 4 MiB soft trigger; newest 5000 lines after rotation | Oldest whole rows dropped under the append flock | Every writer uses PersistenceCore's path-owned cap |
-| Harness benchmark runs (`data/harness/benchmark/runs.jsonl`) | 5000 lines | Oldest dropped after every append | PersistenceCore path-owned cap |
-| Builder audit receipts (`data/builder_audit/<uuid>.json`) | 500 JSON receipts | Oldest modification time first; filename tie-break | Best-effort prune removes each retired receipt and its matching `<uuid>-*` sidecars; failures surface without changing tool success |
-| Telegram errors (`data/telegram/errors.jsonl`) | 5 MiB live file + one rotated `.1` backup | Replace the prior backup, move the full live file, then resume appends | Byte-owned rotation; there is no 5,000-line cap |
-| Memory proposals (`data/memory_proposals/*.json`) | 30-day TTL | Files deleted by Swift MemoryV2/proposal hygiene if older than 30 days | App-owned memory proposal retention |
+Row triggers on the amortized trace/activity feeds can overshoot by up to 127
+rows between checks. Browser artifacts and diagnostic traces can expire;
+recapture or reread the source when needed.

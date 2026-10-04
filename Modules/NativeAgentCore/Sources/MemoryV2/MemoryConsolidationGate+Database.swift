@@ -291,10 +291,21 @@ extension MemoryConsolidationGate {
                 + "\(row["meta"] as String? ?? "")\n"
             hasher.update(data: Data(line.utf8))
         }
-        let tombstones = try Row.fetchAll(
-            db, sql: "SELECT content_hash FROM main.tombstones ORDER BY content_hash")
+        // Every tombstone field is replaced by the swap, including semantic
+        // forget protection backfilled without changing the content hash.
+        let tombstones = try Row.fetchAll(db, sql: """
+            SELECT content_hash, content, rejected_at, reason, embedding, embedding_epoch
+            FROM main.tombstones ORDER BY content_hash
+        """)
         for row in tombstones {
-            hasher.update(data: Data("T|\(row["content_hash"] as String? ?? "")\n".utf8))
+            let fields: [String?] = [
+                row["content_hash"], row["content"], row["rejected_at"], row["reason"],
+                (row["embedding"] as Data?).map { $0.base64EncodedString() },
+                row["embedding_epoch"]
+            ]
+            hasher.update(data: Data("T|".utf8))
+            hasher.update(data: try JSONEncoder().encode(fields))
+            hasher.update(data: Data("\n".utf8))
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }

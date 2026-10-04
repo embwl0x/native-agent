@@ -2,6 +2,7 @@ import Foundation
 import CoreFoundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
 /// Physical subprocess effects supplied by the Mac app. Policy, admission,
 /// durable operation transitions and response interpretation belong to Core.
@@ -34,7 +35,7 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
     }
 
     public func recoverInterruptedOperations() async throws {
-        _ = try await operationStore.recoverInterruptedOperations()
+        _ = try await operationStore.recoverInterruptedOperations(action: "bridge_exec")
     }
 
     private static let execLimit = 2
@@ -164,14 +165,7 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
     /// produced nothing but an occupied port and an on-disk descriptor
     /// advertising a live token.
     public func startGateAllows() -> Bool {
-        let policyURL = self.dataRoot
-            .appendingPathComponent("trust")
-            .appendingPathComponent("policy.json")
-        let json: [String: Any]? = {
-            guard let data = try? Data(contentsOf: policyURL) else { return nil }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        }()
-        return startGateAllows(policyJSON: json)
+        startGateAllows(policyJSON: currentTrustPolicy())
     }
 
     /// Pure decision seam for `startGateAllows()` — same semantics, no I/O.
@@ -275,6 +269,18 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
                     )
                 }
                 _ = self.processes.requestCancellation(operationId: operationId)
+                // The exec task may acknowledge cancellation before this task
+                // registers it with the process owner. Clear that late request too.
+                if let latest = try await self.operationStore.record(operationId: operationId), latest.state.isTerminal {
+                    _ = self.processes.consumeCancellation(operationId: operationId)
+                    reply(200, [
+                        "ok": latest.state == .cancelAcknowledged,
+                        "operationId": operationId,
+                        "operationState": latest.state.rawValue,
+                        "cancelAcknowledged": latest.state == .cancelAcknowledged,
+                    ])
+                    return
+                }
                 let audit = self.appendExecAudit(
                     argv: ["cancel"],
                     status: "cancel_requested",
@@ -299,13 +305,9 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
     }
 
     private func bridgePolicyAllows(executable exe: String, argv: [String] = []) -> Bool {
-        let policyURL = self.dataRoot
-            .appendingPathComponent("trust")
-            .appendingPathComponent("policy.json")
-        guard let data = try? Data(contentsOf: policyURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let json = currentTrustPolicy(),
               let policy = json["macControlPolicy"] as? [String: Any],
-              policy["enabled"] as? Bool == true
+              bridgeAuthorityFlagAllowed(policy, "enabled")
         else {
             return false
         }
@@ -315,22 +317,22 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
         case "osascript":
             let wantsJXA = osascriptUsesJavaScript(argv)
             if wantsJXA {
-                return policy["jxa_allowed"] as? Bool == true
+                return bridgeAuthorityFlagAllowed(policy, "jxa_allowed")
             }
-            return policy["applescript_allowed"] as? Bool == true
+            return bridgeAuthorityFlagAllowed(policy, "applescript_allowed")
         case "shortcuts":
             // User, 2026-09-13: the bridge and the in-process gate must read the
             // same default; both ship allowed once Mac Control is on.
             return bridgeFlagAllowedWhenAbsent(policy, "shortcuts_allowed")
         case "pmset":
-            return policy["system_control_allowed"] as? Bool == true
+            return bridgeAuthorityFlagAllowed(policy, "system_control_allowed")
                 && bridgeDestructiveActionsAllowed(json)
         case "mdfind":
             return bridgeFlagAllowedWhenAbsent(policy, "spotlight_allowed")
         case "ls":
-            return policy["file_ops_allowed"] as? Bool == true && bridgeFullMacAccessIsActive(json)
+            return bridgeAuthorityFlagAllowed(policy, "file_ops_allowed") && bridgeFullMacAccessIsActive(json)
         case "mv":
-            return policy["file_ops_allowed"] as? Bool == true
+            return bridgeAuthorityFlagAllowed(policy, "file_ops_allowed")
                 && bridgeDestructiveActionsAllowed(json)
                 && bridgeFullMacAccessIsActive(json)
         default:
@@ -363,13 +365,7 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
     }
 
     private func bridgeDestructiveActionsAllowed(_ policy: [String: Any]) -> Bool {
-        policy["developerMode"] as? Bool == true
-    }
-
-    private func tolerantISO8601Date(from value: String) -> Date? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
+        bridgeAuthorityFlagAllowed(policy, "developerMode")
     }
 
     private let allowedExecutablePaths: [String: String] = [
@@ -484,8 +480,36 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
     ) -> String? {
         let args = Array(canonical.dropFirst())
         if exe == "mv" {
-            let operands = args.filter { !$0.hasPrefix("-") }
-            for operand in operands {
+            var optionsEnded = false
+            var preserveDestinationSymlink = false
+            let operands = args.filter { arg in
+                if !optionsEnded, arg == "--" { optionsEnded = true; return false }
+                if !optionsEnded, arg.hasPrefix("-") {
+                    if arg.dropFirst().contains("h") { preserveDestinationSymlink = true }
+                    return false
+                }
+                return optionsEnded || !arg.hasPrefix("-")
+            }
+            var mutationPaths = operands
+            if operands.count >= 2, let destination = operands.last {
+                let destinationURL = URL(fileURLWithPath: destination)
+                var isDirectory: ObjCBool = false
+                let replacesSymlink = preserveDestinationSymlink
+                    && (try? FileManager.default.destinationOfSymbolicLink(atPath: destinationURL.path)) != nil
+                if !replacesSymlink,
+                   FileManager.default.fileExists(atPath: destinationURL.path, isDirectory: &isDirectory),
+                   isDirectory.boolValue {
+                    // mv mutates each child destination, not its containing directory.
+                    let sources = Array(operands.dropLast())
+                    mutationPaths = sources + sources.map {
+                        destinationURL.appendingPathComponent(URL(fileURLWithPath: $0).lastPathComponent).path
+                    }
+                }
+            }
+            for operand in mutationPaths {
+                if let reason = MacControlSensitivePathFence.mutationReason(forPath: operand) {
+                    return reason
+                }
                 if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: operand) {
                     return reason
                 }
@@ -518,6 +542,12 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
         var idx = 0
         while idx < args.count {
             let arg = args[idx]
+            if arg.hasPrefix("-"), arg != "-" {
+                for flag in arg.dropFirst() {
+                    if flag == "i" { return "osascript_stdin_script_denied" }
+                    if "els".contains(flag) { break }
+                }
+            }
             if arg == "-e" {
                 hasInlineSource = true
                 idx += 2          // skip the statement value
@@ -527,7 +557,7 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
                 idx += 2          // flag + its value
                 continue
             }
-            if arg.hasPrefix("-") {
+            if arg.hasPrefix("-"), arg != "-" {
                 idx += 1          // valueless flag (e.g. -i, -ss)
                 continue
             }
@@ -541,10 +571,9 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
         if hasInlineSource {
             return nil
         }
-        guard let path = scriptFile else {
-            // No inline source and no script file — nothing executable here
-            // (flags only). Let the outer scan proceed; it is harmless.
-            return nil
+        guard let path = scriptFile, path != "-" else {
+            // With no source operand, osascript reads a script from stdin.
+            return "osascript_stdin_script_denied"
         }
         let lowerPath = path.lowercased()
         // Opaque/compiled script bundles can't be scanned as text — fail closed.
@@ -580,10 +609,8 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
     }
 
     private func currentTrustPolicy() -> [String: Any]? {
-        let policyURL = self.dataRoot
-            .appendingPathComponent("trust")
-            .appendingPathComponent("policy.json")
-        guard let data = try? Data(contentsOf: policyURL),
+        guard case .present(let policy) = SavedTrustPolicyAuthority.read(dataRoot: dataRoot),
+              let data = try? JSONEncoder().encode(policy),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
             return nil
@@ -635,6 +662,30 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
             operationId: operationId,
             dataRoot: dataRoot
         )
+    }
+
+    private func replyToPreStartCancellation(
+        _ record: MacControlOperationRecord,
+        argv: [String],
+        protocolVersion: Int,
+        reply: @Sendable (Int, [String: Any]) -> Void
+    ) -> Bool {
+        guard record.state == .cancelAcknowledged, record.startedAt == nil else { return false }
+        _ = processes.consumeCancellation(operationId: record.operationId)
+        let audit = appendExecAudit(
+            argv: argv, status: record.state.rawValue,
+            reason: "cancelled_before_start", operationId: record.operationId
+        )
+        reply(200, [
+            "ok": false,
+            "protocolVersion": protocolVersion,
+            "operationId": record.operationId,
+            "operationState": record.state.rawValue,
+            "verification": record.verification.rawValue,
+            "cancelAcknowledged": true,
+            "audit": audit.responseObject(),
+        ])
+        return true
     }
 
     private func execHandler(reply: @escaping @Sendable (Int, [String: Any]) -> Void, body: Data) {
@@ -699,13 +750,15 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
                     break
                 }
                 if let reason = self.validateExecArgv(argv) {
-                    _ = try await self.operationStore.transition(
+                    let record = try await self.operationStore.transition(
                         operationId: operationId,
                         to: .blocked,
                         verification: .notRequired,
                         expectedNextEvidence: nil,
-                        outcomeCode: "bridge_policy_blocked"
+                        outcomeCode: "bridge_policy_blocked",
+                        acknowledgePreStartCancellation: true
                     )
+                    if self.replyToPreStartCancellation(record, argv: argv, protocolVersion: protocolVersion, reply: reply) { return }
                     let audit = self.appendExecAudit(
                         argv: argv,
                         status: "blocked",
@@ -735,13 +788,15 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
                 // deliberately refuses to zero the count, so only an app restart
                 // recovered it.
                 guard let execSlot = self.execSlots.acquire() else {
-                    _ = try await self.operationStore.transition(
+                    let record = try await self.operationStore.transition(
                         operationId: operationId,
                         to: .blocked,
                         verification: .notRequired,
                         expectedNextEvidence: nil,
-                        outcomeCode: "exec_queue_saturated"
+                        outcomeCode: "exec_queue_saturated",
+                        acknowledgePreStartCancellation: true
                     )
+                    if self.replyToPreStartCancellation(record, argv: argv, protocolVersion: protocolVersion, reply: reply) { return }
                     let audit = self.appendExecAudit(
                         argv: argv,
                         status: "blocked",
@@ -761,12 +816,14 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
                     return
                 }
                 do {
-                    _ = try await self.operationStore.transition(
+                    let record = try await self.operationStore.transition(
                         operationId: operationId,
                         to: .started,
                         verification: .pending,
-                        expectedNextEvidence: "Process exit and bounded output"
+                        expectedNextEvidence: "Process exit and bounded output",
+                        acknowledgePreStartCancellation: true
                     )
+                    if self.replyToPreStartCancellation(record, argv: argv, protocolVersion: protocolVersion, reply: reply) { return }
 
                     // Process.waitUntilExit is intentionally kept off Swift's
                     // cooperative executor. The completion returns to a Task only
@@ -907,7 +964,11 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
 /// allowed (the shipped default, matching MacControlGate); a present value that
 /// is not a Bool is damaged authority and denies.
 private func bridgeFlagAllowedWhenAbsent(_ policy: [String: Any], _ key: String) -> Bool {
-    guard let raw = policy[key] else { return true }
-    if let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() { return number.boolValue }
+    guard policy[key] != nil else { return true }
+    return bridgeAuthorityFlagAllowed(policy, key)
+}
+
+private func bridgeAuthorityFlagAllowed(_ policy: [String: Any], _ key: String) -> Bool {
+    if let number = policy[key] as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() { return number.boolValue }
     return false
 }

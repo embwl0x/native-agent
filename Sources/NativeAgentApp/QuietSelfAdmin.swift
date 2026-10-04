@@ -7,8 +7,8 @@ import PersistenceCore
 /// QUIET IS A CONSTRUCTION, NOT A PROMISE. Nothing in this file or its two
 /// siblings calls `NSApp.activate`, `makeKeyAndOrderFront`, `orderFront`,
 /// `NSWindow.level`, `CGEvent`, `CGWarpMouseCursorPosition`, or any other
-/// synthesized input. Reads render the page into an OFFSCREEN host that is
-/// never ordered anywhere (`QuietSelfAdminRender.swift`), and writes call the
+/// synthesized input. Text reads project owner state; screenshots use an
+/// unordered offscreen host (`QuietSelfAdminRender.swift`). Writes call the
 /// very same `AppModel` / `UserDefaults` entry points the visible control
 /// calls when a person clicks it — so the live page updates the same way it
 /// does for a click, and nothing comes forward, moves, or makes a sound.
@@ -79,6 +79,9 @@ struct QuietPage: Sendable, Equatable {
     /// One line for `app_page_read` and the catalog, so the model can choose a
     /// page without screenshotting all of them first.
     let summary: String
+    /// The rail page's tab this page is, when `item` alone does not route to
+    /// it (iPhone pairing has no sidebar item of its own).
+    var tab: String? = nil
 }
 
 enum QuietPages {
@@ -103,6 +106,53 @@ enum QuietPages {
                   summary: "Presets, feature permissions, approvals, and Mac integration access."),
         QuietPage(id: "connectors", title: "Connectors", item: .connectors,
                   summary: "Service connections, with MCP, Telegram and iPhone tabs."),
+        QuietPage(id: "telegram", title: "Telegram", item: .telegram,
+                  summary: "Telegram on or off, who may reach the agent, mention-only, its model, test reply and logs."),
+        QuietPage(id: "mcp", title: "MCP", item: .mcp,
+                  summary: "MCP servers with Warm, Restart and Refresh, the consents granted, and each server's tools as mcp.<server>.<tool> actions."),
+        QuietPage(id: "mac_integration", title: "Mac Integration", item: .macIntegration,
+                  summary: "Read and write access per Mac app: Calendar, Mail, Messages, Notes and the rest."),
+        QuietPage(id: "pairing", title: "iPhone pairing", item: .connectors,
+                  summary: "Paired phones and the iCloud pairing status.", tab: "iphone"),
+        QuietPage(id: "agents", title: "Agents", item: .connectors,
+                  summary: "Agent contacts and coding helpers: message, read, connect, stop, and bridge jobs.", tab: "agents"),
+        // Each Mac app and connector her actions reach is a page of its own:
+        // its access or connection, and its actions. A Mac app's page is
+        // where User sets its access (Trust → Mac integration).
+        QuietPage(id: "mail", title: "Mail", item: .macIntegration,
+                  summary: "Apple Mail, Gmail and AgentMail: read, search, triage, send and reply."),
+        QuietPage(id: "calendar", title: "Calendar", item: .macIntegration,
+                  summary: "Calendar and Google Calendar: events, free/busy, create, change, delete and invitations."),
+        QuietPage(id: "reminders", title: "Reminders", item: .macIntegration,
+                  summary: "Reminders: due today, search, read, create, update, complete and delete."),
+        QuietPage(id: "notes", title: "Notes", item: .macIntegration, summary: "Apple Notes: search, create and update."),
+        QuietPage(id: "contacts", title: "Contacts", item: .macIntegration,
+                  summary: "Contacts: search, create or update, and delete."),
+        QuietPage(id: "messages", title: "Messages", item: .macIntegration, summary: "Messages: recent threads, and send."),
+        QuietPage(id: "github", title: "GitHub", item: .connectors,
+                  summary: "Repositories, issues, pull requests, notifications and project tracking.", tab: "connectors"),
+        QuietPage(id: "slack", title: "Slack", item: .connectors, summary: "Slack channels, search and posting.", tab: "connectors"),
+        QuietPage(id: "notion", title: "Notion", item: .connectors, summary: "Notion search and pages.", tab: "connectors"),
+        QuietPage(id: "x", title: "X", item: .connectors,
+                  summary: "X (Twitter): your account, search, timeline and a user's posts.", tab: "connectors"),
+        QuietPage(id: "markets", title: "Markets", item: .connectors,
+                  summary: "Quotes and watchlists, TradingView's among them.", tab: "connectors"),
+        // Her hands on the Mac and the web. Files, the shell and the browser
+        // are Trust's to allow; the web's search is the SearXNG MCP server.
+        QuietPage(id: "files", title: "Files", item: .trust,
+                  summary: "Read, list, search, excerpt and write files; apply a patch; Spotlight."),
+        QuietPage(id: "shell", title: "Shell", item: .trust,
+                  summary: "Shell commands, git, Swift builds and tests, remote nodes, self-evolution, and restarting or installing the app."),
+        QuietPage(id: "web", title: "Web", item: .mcp,
+                  summary: "Read a public page privately, and search or fetch the web with SearXNG."),
+        QuietPage(id: "browser", title: "Browser", item: .trust,
+                  summary: "The NativeAgent browser and your own Chrome tab: open, read, links, screenshots, clicks and forms."),
+        // Her hands on the Mac itself: Full Mac's accessibility category is
+        // Trust's to allow; Music's access is Mac integration's.
+        QuietPage(id: "mac", title: "Mac", item: .trust,
+                  summary: "The live screen: look, act by name, go to an app, file or URL, wait, read a document, menus, the clipboard, system info and app activity."),
+        QuietPage(id: "music", title: "Music", item: .macIntegration,
+                  summary: "Apple Music: what's playing, play, pause or skip, search the library, tracks and playlists."),
         QuietPage(id: "capabilities", title: "Capabilities", item: .capabilities,
                   summary: "What the agent can actually do, action by action."),
         QuietPage(id: "diagnostics", title: "Diagnostics", item: .diagnostics,
@@ -137,6 +187,7 @@ enum QuietPages {
         case "trust center", "trust_center", "permissions": return page(named: "trust")
         case "setup", "preferences": return page(named: "settings")
         case "skills", "tools": return page(named: "diagnostics")
+        case "iphone", "phone", "pair", "pairing devices": return page(named: "pairing")
         default:
             return all.first { $0.title.lowercased() == key || $0.item.rawValue.lowercased() == key }
         }

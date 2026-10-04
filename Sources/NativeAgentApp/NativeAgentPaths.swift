@@ -127,50 +127,6 @@ enum NativeAgentPaths {
         PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
     }
 
-    /// C5 fix: expose stamp validation as a public static method so
-    /// DaemonProcessController (and any other caller that reads REPO_PATH)
-    /// can validate the stamp before trusting it as a CLI argument to a child
-    /// process — preventing a tampered stamp from redirecting the repo root to
-    /// an arbitrary path.
-    ///
-    /// Returns the validated URL on success, nil if the stamp is invalid.
-    static func validateStampedPath(_ url: URL) -> URL? {
-        return isValidRepoStamp(url) ? url : nil
-    }
-
-    /// Phase 12 audit hardening (revised Phase 13): validate that a REPO_PATH
-    /// stamp points at a NativeAgent source repo before trusting it.
-    ///
-    /// Phase 13 fix: use the CANONICAL (resolved) path for all marker checks,
-    /// mirroring Python's Path.resolve(strict=True) semantics.  The previous
-    /// approach compared resolvingSymlinksInPath() to standardizedFileURL and
-    /// rejected stamps that differed — this caused false-positives on macOS
-    /// where /var is a symlink to /private/var.  A stamp written as
-    /// "/var/folders/…" would fail even though it is a legitimate system path.
-    ///
-    /// Marker list (sync with _repo_paths.py::REPO_MARKER_FILES):
-    ///   - persona/SOUL.template.md
-    ///   - script/init_persona.sh
-    ///   - the retired daemon
-    private static func isValidRepoStamp(_ url: URL) -> Bool {
-        let fm = FileManager.default
-        // Resolve canonical path (follows all symlinks, including /var → /private/var).
-        let canonical = url.resolvingSymlinksInPath()
-        guard fm.fileExists(atPath: canonical.path) else { return false }
-        // Marker files must all exist on the canonical path.
-        // Sync marker list with the retired daemon::REPO_MARKER_FILES.
-        let markers = [
-            "persona/SOUL.template.md",
-            "script/init_persona.sh",
-            "Package.swift",
-        ]
-        for marker in markers {
-            let m = canonical.appendingPathComponent(marker)
-            if !fm.fileExists(atPath: m.path) { return false }
-        }
-        return true
-    }
-
     /// True only for a distributed public build: no REPO_PATH dev stamp, a real
     /// .app bundle, and a VERSION resource. Dev installs from install_app.sh are
     /// always stamped, so they can never read as public-release. Gates blank-slate

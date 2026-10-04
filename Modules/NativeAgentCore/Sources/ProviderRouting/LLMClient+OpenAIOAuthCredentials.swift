@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import NativeAgentCore
 import PersistenceCore
 
@@ -165,6 +166,17 @@ extension OpenAIOAuthDirectAdapter {
             .appendingPathComponent(".codex", isDirectory: true)
     }
 
+    /// Shared CLI credentials stay read-only, including explicit overrides
+    /// and app-owned paths that resolve through a symlink into ~/.codex.
+    static func isUserCodexPath(_ path: URL) -> Bool {
+        let lexicalHome = defaultUserCodexHome().standardizedFileURL.path
+        let lexicalPath = path.standardizedFileURL.path
+        if lexicalPath == lexicalHome || lexicalPath.hasPrefix(lexicalHome + "/") { return true }
+        let home = defaultUserCodexHome().resolvingSymlinksInPath().standardizedFileURL.path
+        let resolved = path.resolvingSymlinksInPath().standardizedFileURL.path
+        return resolved == home || resolved.hasPrefix(home + "/")
+    }
+
     // MARK: - Shared CLI session adoption consent
 
     /// Whether the user has decided about adopting the shared Codex CLI
@@ -320,6 +332,9 @@ extension OpenAIOAuthDirectAdapter {
     /// Atomic writer for the flock-guarded refresh path, whose closure
     /// captures only `Data`/`URL`.
     static func writeAuthBytesAtomically(_ data: Data, to path: URL) throws {
+        guard !isUserCodexPath(path) else {
+            throw LLMError.failure(.codexCLISessionExpired)
+        }
         let parent = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         // Atomic write via a sibling tempfile + rename — same pattern as
@@ -327,13 +342,17 @@ extension OpenAIOAuthDirectAdapter {
         let tmp = parent.appendingPathComponent(
             ".\(path.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString.prefix(8)).tmp"
         )
-        try data.write(to: tmp, options: [.atomic])
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        try handle.write(contentsOf: data)
+        try handle.close()
         if FileManager.default.fileExists(atPath: path.path) {
-            _ = try? FileManager.default.replaceItemAt(path, withItemAt: tmp)
+            _ = try FileManager.default.replaceItemAt(path, withItemAt: tmp, options: [.usingNewMetadataOnly])
         } else {
             try FileManager.default.moveItem(at: tmp, to: path)
         }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
     }
 
     /// Decode the (unverified) payload of a JWT. Mirrors `_jwt_payload`

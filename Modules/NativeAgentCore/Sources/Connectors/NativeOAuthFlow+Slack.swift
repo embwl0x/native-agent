@@ -60,47 +60,39 @@ extension NativeOAuthFlow {
         let persistence = SwiftNativePersistenceCore()
 
         do {
-            try await persistence.withFileLock(legacyPath) {
-                var obj: [String: Any] = (try? NativeOAuthSupport.loadJSONObject(legacyPath)) ?? [:]
-                obj["provider"] = "slack"
-                obj["access_token"] = token
-                obj["token_type"] = "Bearer"
-                obj["auth_mode"] = "manual_oauth_token"
-                obj["saved_at"] = now
-                mergeSlackSocketModeFields(appToken: appToken, into: &obj)
-                mergeSlackIngressFields(
-                    allowedChannelIds: channels,
-                    allowedUserIds: users,
-                    requireMention: requireMention,
-                    into: &obj
-                )
-                mergeSlackAuthFields(authFields, into: &obj)
-                try NativeOAuthSupport.writeJSONObject(obj, to: legacyPath)
-            }
-
-            try await persistence.withFileLock(connectorPath) {
-                var obj: [String: Any] = (try? NativeOAuthSupport.loadJSONObject(connectorPath)) ?? [:]
-                obj["provider"] = "slack"
-                obj["access_token"] = token
-                obj["token_type"] = "Bearer"
-                obj["auth_mode"] = "manual_oauth_token"
-                obj["saved_at"] = now
-                obj["validated_at"] = validateWithSlack ? now : nil
-                mergeSlackSocketModeFields(appToken: appToken, into: &obj)
-                mergeSlackIngressFields(
-                    allowedChannelIds: channels,
-                    allowedUserIds: users,
-                    requireMention: requireMention,
-                    into: &obj
-                )
-                mergeSlackAuthFields(authFields, into: &obj)
-                try NativeOAuthSupport.writeJSONObject(obj, to: connectorPath)
-            }
-
             _ = try await ConnectorOAuthRegistry.mutateConnectorRegistryEntry(
                 root: root,
                 provider: "slack",
-                createIfMissing: true
+                createIfMissing: true,
+                prepare: {
+                    try await persistence.withFileLock(legacyPath) {
+                        try await persistence.withFileLock(connectorPath) {
+                            // Check both authorities before publishing either destination.
+                            var legacy = try ConnectorOAuthRegistry.checkedCredentialObject(at: legacyPath)
+                            var connector = try ConnectorOAuthRegistry.checkedCredentialObject(at: connectorPath)
+                            for path in [legacyPath, connectorPath] {
+                                var obj = path == legacyPath ? legacy : connector
+                                obj["provider"] = .string("slack")
+                                obj["access_token"] = .string(token)
+                                obj["token_type"] = .string("Bearer")
+                                obj["auth_mode"] = .string("manual_oauth_token")
+                                obj["saved_at"] = .string(now)
+                                mergeSlackSocketModeFields(appToken: appToken, into: &obj)
+                                mergeSlackIngressFields(
+                                    allowedChannelIds: channels,
+                                    allowedUserIds: users,
+                                    requireMention: requireMention,
+                                    into: &obj
+                                )
+                                mergeSlackAuthFields(authFields, into: &obj)
+                                if path == legacyPath { legacy = obj } else { connector = obj }
+                            }
+                            connector["validated_at"] = validateWithSlack ? .string(now) : nil
+                            try await persistence.writeJSON(.object(legacy), to: legacyPath)
+                            try await persistence.writeJSON(.object(connector), to: connectorPath)
+                        }
+                    }
+                }
             ) { entry in
                 entry["id"] = .string("slack")
                 entry["name"] = .string("Slack")
@@ -193,33 +185,33 @@ extension NativeOAuthFlow {
         return fields
     }
 
-    private static func mergeSlackAuthFields(_ authFields: [String: String], into obj: inout [String: Any]) {
+    private static func mergeSlackAuthFields(_ authFields: [String: String], into obj: inout [String: JSONValue]) {
         for (key, value) in authFields {
-            obj[key] = value
+            obj[key] = .string(value)
         }
     }
 
-    private static func mergeSlackSocketModeFields(appToken: String, into obj: inout [String: Any]) {
+    private static func mergeSlackSocketModeFields(appToken: String, into obj: inout [String: JSONValue]) {
         guard !appToken.isEmpty else { return }
-        obj["app_token"] = appToken
-        obj["socket_mode_app_token"] = appToken
-        obj["socket_mode_enabled"] = true
+        obj["app_token"] = .string(appToken)
+        obj["socket_mode_app_token"] = .string(appToken)
+        obj["socket_mode_enabled"] = .bool(true)
     }
 
     private static func mergeSlackIngressFields(
         allowedChannelIds: Set<String>?,
         allowedUserIds: Set<String>?,
         requireMention: Bool?,
-        into obj: inout [String: Any]
+        into obj: inout [String: JSONValue]
     ) {
         if let allowedChannelIds {
-            obj["allowed_channel_ids"] = allowedChannelIds.sorted()
+            obj["allowed_channel_ids"] = .array(allowedChannelIds.sorted().map(JSONValue.string))
         }
         if let allowedUserIds {
-            obj["allowed_user_ids"] = allowedUserIds.sorted()
+            obj["allowed_user_ids"] = .array(allowedUserIds.sorted().map(JSONValue.string))
         }
         if let requireMention {
-            obj["require_mention"] = requireMention
+            obj["require_mention"] = .bool(requireMention)
         }
     }
 

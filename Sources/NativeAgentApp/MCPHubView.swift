@@ -136,6 +136,8 @@ struct MCPHubView: View {
     @State private var perToolValues: [String: [String: JSONValue]] = [:]
     @State private var expandedTool: Set<String> = []
     @State private var inputValidationErrors: [String: String] = [:]
+    @State private var perToolParseErrors: [String: [String: String]] = [:]
+    @State private var perToolDrafts: [String: MCPInputSchemaForm.Draft] = [:]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private func valuesKey(for tool: MCPToolRecord) -> String {
@@ -198,6 +200,8 @@ struct MCPHubView: View {
             perToolValues.removeAll()
             expandedTool.removeAll()
             inputValidationErrors.removeAll()
+            perToolParseErrors.removeAll()
+            perToolDrafts.removeAll()
         }
     }
 
@@ -298,17 +302,7 @@ struct MCPHubView: View {
                 }
                 .accessibilityIdentifier("mcp.server.restart.\(server.id)")
                 Button("Refresh") {
-                    // gpt-5.5 review: refreshMCPCache updates the cache on
-                    // disk but doesn't reload the in-memory mcpTools /
-                    // mcpResources arrays. User clicked Refresh and saw the
-                    // UI not change. Chain a loadMCPDetails so the visible
-                    // inventory reflects the refreshed cache.
-                    Task {
-                        await appModel.refreshMCPCache(server)
-                        if appModel.selectedMCPServerId == server.id {
-                            await appModel.loadMCPDetails(server)
-                        }
-                    }
+                    Task { await appModel.refreshMCPCache(server) }
                 }
                 Spacer(minLength: 0)
                 if let updated = server.updatedAt, !updated.isEmpty {
@@ -397,14 +391,16 @@ struct MCPHubView: View {
                 let consentRisk = appModel.selectedMCPServer.map {
                     appModel.mcpConsentRisk(server: $0, toolName: tool.name)
                 }
-                // gpt-5.5 review: pin form identity to (tool.name, schema-hash)
-                // so a daemon refresh that changes a tool's schema forces fresh
-                // local @State (stringStore, didApplyDefaults, fallbackText).
-                // The binding key uses the SAME composite so the values dict
-                // invalidates in lockstep — without that, the form resets but
-                // Run still reads stale wrong-typed args (v2 review BUG).
+                // Values, drafts and parse errors share the schema key so
+                // hiding the form preserves them together.
                 let key = valuesKey(for: tool)
-                MCPInputSchemaForm(schema: tool.inputSchema, values: binding(for: tool))
+                MCPInputSchemaForm(schema: tool.inputSchema, values: binding(for: tool), jsonErrors: Binding(
+                    get: { perToolParseErrors[key] ?? [:] },
+                    set: { perToolParseErrors[key] = $0 }
+                ), draft: Binding(
+                    get: { perToolDrafts[key] ?? .init() },
+                    set: { perToolDrafts[key] = $0 }
+                ))
                     .id(key)
                 if let consentRisk {
                     Text("Consent risk: \(consentRisk)")
@@ -417,6 +413,7 @@ struct MCPHubView: View {
                         Task { await appModel.grantMCPConsent(server: server, toolName: tool.name, risk: consentRisk) }
                     }
                     Button("Run") {
+                        guard (perToolParseErrors[key] ?? [:]).isEmpty else { return }
                         guard let server = appModel.selectedMCPServer else { return }
                         let input = perToolValues[key] ?? [:]
                         if let validation = MCPInputSchemaForm.validationMessage(
@@ -429,6 +426,7 @@ struct MCPHubView: View {
                         inputValidationErrors.removeValue(forKey: key)
                         Task { await appModel.callMCPToolWithInput(server: server, tool: tool, input: input) }
                     }
+                    .disabled(!(perToolParseErrors[key] ?? [:]).isEmpty)
                     Spacer(minLength: 0)
                 }
                 .buttonStyle(.bordered)

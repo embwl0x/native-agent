@@ -80,11 +80,7 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
     /// parameters in the procedure ledger.
     public let operationBindingIdentity: String
 
-    private let workspaceRootURL: URL
-    private let sourceURL: URL
-    private let destinationURL: URL
-    private let destinationParentURL: URL
-    private let sourceContentIdentity: String
+    public let binding: WorkshopCompiledFileCopyBinding
 
     private let encodedPlan: String
 
@@ -154,7 +150,7 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
                 description: "Read the reviewed workspace source file",
                 toolOrAction: "read_file",
                 args: .object([
-                    "max_bytes": .string(String(Self.maximumSourceBytes)),
+                    "max_bytes": .int(Int64(Self.maximumSourceBytes)),
                     "path": .string(sourceToolPath),
                 ]),
                 autonomy: "needs_approval"
@@ -164,7 +160,7 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
                 description: "Write the exact source bytes to the reviewed workspace destination",
                 toolOrAction: "write_file",
                 args: .object([
-                    "append": .string("false"),
+                    "append": .bool(false),
                     "content": .string("{{step:step-1}}"),
                     "path": .string(destinationToolPath),
                 ]),
@@ -207,11 +203,11 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
         self.sourceToolPath = sourceToolPath
         self.destinationToolPath = destinationToolPath
         self.contract = contract
-        self.workspaceRootURL = workspace
-        self.sourceURL = source
-        self.destinationURL = destination
-        self.destinationParentURL = destinationParent
-        self.sourceContentIdentity = CausalTransitionEvidence.opaqueIdentity(sourceText)
+        let sourceContentIdentity = CausalTransitionEvidence.opaqueIdentity(sourceText)
+        self.binding = WorkshopCompiledFileCopyBinding(
+            workspaceRootURL: workspace, sourceURL: source, destinationURL: destination,
+            destinationParentURL: destinationParent, sourceContentIdentity: sourceContentIdentity,
+            sourceToolPath: sourceToolPath, destinationToolPath: destinationToolPath)
         self.operationBindingIdentity = CausalTransitionEvidence.opaqueIdentity([
             artifact.id,
             sourceRelative,
@@ -253,7 +249,8 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
     }
 
     public static func isEligibleArtifact(_ artifact: DeclarativeProcedureArtifact) -> Bool {
-        guard artifact.schema == DeclarativeProcedureArtifact.schema,
+        guard (artifact.schema == DeclarativeProcedureArtifact.schema
+                || artifact.schema == "declarative-procedure-transition-table.v1"),
               artifact.domain == "workshop_execution",
               artifact.canonicalOracle == .workshopRecordAndTimeline,
               artifact.authorityClass == "low_risk",
@@ -301,6 +298,38 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
             && rules[4].terminalClass == .verifiedSuccess
     }
 
+    private static func validatedRelativePath(
+        _ raw: String,
+        field: String
+    ) throws -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let components = trimmed.split(separator: "/", omittingEmptySubsequences: false)
+        guard !trimmed.isEmpty,
+              !trimmed.hasPrefix("/"),
+              !trimmed.hasPrefix("~"),
+              !trimmed.contains("\0"),
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw WorkshopCompiledProcedurePlanError.invalidRelativePath(field)
+        }
+        return trimmed
+    }
+
+    fileprivate static func isContained(_ candidate: URL, by root: URL) -> Bool {
+        let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
+        let candidatePath = candidate.standardizedFileURL.resolvingSymlinksInPath().path
+        return candidatePath == rootPath || candidatePath.hasPrefix(rootPath + "/")
+    }
+}
+
+public struct WorkshopCompiledFileCopyBinding: Codable, Sendable, Equatable {
+    let workspaceRootURL: URL
+    let sourceURL: URL
+    let destinationURL: URL
+    let destinationParentURL: URL
+    let sourceContentIdentity: String
+    let sourceToolPath: String
+    let destinationToolPath: String
+
     /// Rechecks the immutable invocation binding at the last shared point
     /// before each canonical tool dispatch. The tools keep file authority;
     /// this guard only refuses to run the compiled shortcut when its exact
@@ -313,13 +342,17 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
         switch tool {
         case "read_file":
             guard arguments["path"] == .string(sourceToolPath),
-                  arguments["max_bytes"] == .string(String(Self.maximumSourceBytes)) else {
+                  arguments["max_bytes"] == .int(Int64(WorkshopCompiledLocalFileCopyPlanner.maximumSourceBytes)) else {
                 throw WorkshopCompiledProcedurePlanError.artifactShapeMismatch
+            }
+            guard workspaceRootURL.appendingPathComponent(String(sourceToolPath.dropFirst("workspace/".count)))
+                .standardizedFileURL.resolvingSymlinksInPath() == sourceURL else {
+                throw WorkshopCompiledProcedurePlanError.sourceChangedAfterPreflight
             }
             try validateCurrentSource(fileManager: fileManager)
         case "write_file":
             guard arguments["path"] == .string(destinationToolPath),
-                  arguments["append"] == .string("false"),
+                  arguments["append"] == .bool(false),
                   case .string(let content)? = arguments["content"],
                   CausalTransitionEvidence.opaqueIdentity(content) == sourceContentIdentity else {
                 throw WorkshopCompiledProcedurePlanError.toolResultMismatch
@@ -333,11 +366,13 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
                 .resolvingSymlinksInPath()
             var isDirectory: ObjCBool = false
             guard currentParent == destinationParentURL,
-                  Self.isContained(currentParent, by: workspaceRootURL),
+                  workspaceRootURL.appendingPathComponent(String(destinationToolPath.dropFirst("workspace/".count)))
+                    .standardizedFileURL.resolvingSymlinksInPath() == destinationURL,
+                  WorkshopCompiledLocalFileCopyPlanner.isContained(currentParent, by: workspaceRootURL),
                   fileManager.fileExists(atPath: currentParent.path, isDirectory: &isDirectory),
                   isDirectory.boolValue,
                   currentDestination == destinationURL,
-                  Self.isContained(currentDestination, by: workspaceRootURL),
+                  WorkshopCompiledLocalFileCopyPlanner.isContained(currentDestination, by: workspaceRootURL),
                   currentDestination != sourceURL else {
                 throw WorkshopCompiledProcedurePlanError.destinationChangedAfterPreflight
             }
@@ -356,14 +391,16 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
 
     private func validateCurrentSource(fileManager: FileManager) throws {
         let current = sourceURL.standardizedFileURL.resolvingSymlinksInPath()
-        guard current == sourceURL, Self.isContained(current, by: workspaceRootURL),
+        guard workspaceRootURL.appendingPathComponent(String(sourceToolPath.dropFirst("workspace/".count)))
+                .standardizedFileURL.resolvingSymlinksInPath() == sourceURL,
+              current == sourceURL, WorkshopCompiledLocalFileCopyPlanner.isContained(current, by: workspaceRootURL),
               let values = try? current.resourceValues(
                 forKeys: [.isRegularFileKey, .fileSizeKey, .isReadableKey]
               ),
               values.isRegularFile == true, values.isReadable != false,
-              (values.fileSize ?? Int.max) <= Self.maximumSourceBytes,
+              (values.fileSize ?? Int.max) <= WorkshopCompiledLocalFileCopyPlanner.maximumSourceBytes,
               let data = try? Data(contentsOf: current, options: [.mappedIfSafe]),
-              data.count <= Self.maximumSourceBytes,
+              data.count <= WorkshopCompiledLocalFileCopyPlanner.maximumSourceBytes,
               let text = String(data: data, encoding: .utf8),
               Data(text.utf8) == data,
               CausalTransitionEvidence.opaqueIdentity(text) == sourceContentIdentity else {
@@ -371,25 +408,4 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
         }
     }
 
-    private static func validatedRelativePath(
-        _ raw: String,
-        field: String
-    ) throws -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let components = trimmed.split(separator: "/", omittingEmptySubsequences: false)
-        guard !trimmed.isEmpty,
-              !trimmed.hasPrefix("/"),
-              !trimmed.hasPrefix("~"),
-              !trimmed.contains("\0"),
-              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
-            throw WorkshopCompiledProcedurePlanError.invalidRelativePath(field)
-        }
-        return trimmed
-    }
-
-    private static func isContained(_ candidate: URL, by root: URL) -> Bool {
-        let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidatePath = candidate.standardizedFileURL.resolvingSymlinksInPath().path
-        return candidatePath == rootPath || candidatePath.hasPrefix(rootPath + "/")
-    }
 }

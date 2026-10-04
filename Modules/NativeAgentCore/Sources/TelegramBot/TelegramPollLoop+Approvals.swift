@@ -68,6 +68,40 @@ extension TelegramPollLoop {
 
     func handleApprovalCallback(update: TelegramUpdate, callback: JSONValue) async -> Bool {
         guard let parsed = TelegramApprovalCallback(callback) else { return false }
+        await turnCoordinator.beginUpdateProcessing(update.updateId)
+        let admitted = await turnCoordinator.runCommandUntilAdmitted(destination: parsed.destination) { admissionReady in
+            admissionReady()
+            _ = await resolveApprovalCallback(update: update, callback: callback)
+            // Cancellation cannot prevent settlement of the durable ingress
+            // claim after its command finishes.
+            await Task {
+                do {
+                    _ = try await TelegramUpdateInbox(offsetURL: offsetURL).transition(
+                        updateId: update.updateId, from: [.processing, .queued], to: .completed
+                    )
+                } catch {
+                    await recordError(context: "update_inbox_complete", error: String(describing: error), update: update)
+                }
+                await turnCoordinator.endUpdateProcessing(update.updateId)
+            }.value
+        }
+        if !admitted {
+            await Task {
+                do {
+                    _ = try await TelegramUpdateInbox(offsetURL: offsetURL).transition(
+                        updateId: update.updateId, from: [.processing, .queued], to: .pending
+                    )
+                } catch {
+                    await recordError(context: "approval_callback_release", error: String(describing: error), update: update)
+                }
+                await turnCoordinator.endUpdateProcessing(update.updateId)
+            }.value
+        }
+        return true
+    }
+
+    private func resolveApprovalCallback(update: TelegramUpdate, callback: JSONValue) async -> Bool {
+        guard let parsed = TelegramApprovalCallback(callback) else { return false }
         // Fail-closed perimeter, same contract as the message gate (2026-08-13
         // gpt-5.5 BLOCKING: with an empty allowlist a stale/forged approval
         // button could resolve an approval and start a chat continuation while
@@ -117,6 +151,7 @@ extension TelegramPollLoop {
             let resolution = try await approvalHandler.resolveTelegramApproval(
                 id: parsed.command.id,
                 decision: parsed.command.decision,
+                choice: parsed.command.choice,
                 chatId: parsed.chatId,
                 fromUserId: parsed.fromUserId
             )
@@ -126,12 +161,12 @@ extension TelegramPollLoop {
                 context: "approval_callback_answer",
                 update: update
             )
-            await terminalizeApprovalKeyboard(
-                chatId: parsed.chatId,
-                messageId: parsed.messageId,
-                text: resolution.acknowledgement,
-                update: update
-            )
+            if let record = try? await approvalInbox.get(parsed.command.id), record.status != "pending" {
+                await terminalizeApprovalKeyboard(
+                    chatId: parsed.chatId, messageId: parsed.messageId,
+                    text: resolution.acknowledgement, update: update
+                )
+            }
             if let prompt = resolution.continuationPrompt {
                 await deliverApprovalContinuation(
                     approvalId: parsed.command.id,
@@ -152,12 +187,11 @@ extension TelegramPollLoop {
                 context: "approval_callback_error_answer",
                 update: update
             )
-            await terminalizeApprovalKeyboard(
-                chatId: parsed.chatId,
-                messageId: parsed.messageId,
-                text: reply,
-                update: update
-            )
+            if let record = try? await approvalInbox.get(parsed.command.id), record.status != "pending" {
+                await terminalizeApprovalKeyboard(
+                    chatId: parsed.chatId, messageId: parsed.messageId, text: reply, update: update
+                )
+            }
         }
         return true
     }

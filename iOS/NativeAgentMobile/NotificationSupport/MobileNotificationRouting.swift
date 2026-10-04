@@ -56,7 +56,7 @@ enum MobileNotificationRouting {
                 userInfo: [NSLocalizedDescriptionKey: "The notified record has no notification routing envelope."])
         }
         let copy = content.mutableCopy() as! UNMutableNotificationContent
-        for key in ["approvalId", "sessionId", "screen", "source", "eventId", "correlationId", "taskId"] {
+        for key in ["itemId", "approvalId", "sessionId", "screen", "source", "eventId", "correlationId", "taskId"] {
             if let value = nonEmpty(metadata["userInfo.\(key)"]) { copy.userInfo[key] = value }
         }
         return categorized(copy)

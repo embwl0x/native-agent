@@ -30,6 +30,8 @@ public struct AgentHostRow: Sendable, Equatable {
         case codexTOML
         /// Reply tools supplied to session/new; no settings file is edited.
         case sessionMCP
+        /// NativeAgent-owned credentials sourced by an inbound command-line contact.
+        case shellEnvironment
 
         var containerKey: String {
             switch self {
@@ -60,7 +62,7 @@ public struct AgentHostRow: Sendable, Equatable {
     public var requiresWorkspace: Bool = false
     public var settingsSupported: Bool = true
     public var declaredRoute: Route? = nil
-    public var outboundRoute: String { route == .desktopChat ? "desktop-chat" : route == .grokBot ? "grok-webhook" : acpLaunch == nil ? (commandLine == nil ? "none" : "command") : "acp" }
+    public var outboundRoute: String { route == .dotIPC ? "chatgpt-dot-ipc" : route == .desktopChat ? "desktop-chat" : route == .grokBot ? "grok-webhook" : acpLaunch == nil ? (commandLine == nil ? "none" : "command") : "acp" }
     /// Compatibility projection of the transport's single launch declaration.
     public var acpLaunch: (executable: String, arguments: [String], version: String)? {
         acp.map { ($0.executable, $0.arguments, $0.referenceVersion) }
@@ -77,7 +79,7 @@ public struct AgentHostRow: Sendable, Equatable {
     /// the same one rather than a second copy.
     public var commandLine: AgentHostCommandLine? { AgentHostCommandLines.byHostID[id] }
     public var acp: AgentHostACP? { AgentHostACP.byHostID[id] }
-    public enum Route: String, Sendable { case acp, a2a, grokBot = "grok-bot", desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
+    public enum Route: String, Sendable { case acp, a2a, dotIPC = "chatgpt-dot-ipc", grokBot = "grok-bot", desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
     public var route: Route { declaredRoute ?? (acp != nil ? .acp : commandLine != nil ? .commandLine : .mcpSettingsOnly) }
 
     public func matches(_ name: String) -> Bool {
@@ -172,6 +174,13 @@ public enum AgentHostDirectory {
     // /v2/docs/mcp-servers uses mcp.servers.<name> and different enablement keys.
     // A version-free name does not establish which published contract to write.
     public static let rows: [AgentHostRow] = [
+        AgentHostRow(id: "chatgpt-dot", displayName: "ChatGPT Dot",
+            description: "Your ChatGPT agent, distinct from Codex. In-house messaging checks the running app and Dot's current conversation before sending.",
+            aliases: ["dot", "openai dot", "chatgpt agent"], installMarkers: [],
+            configPath: "~/.config/nativeagent-link/contacts/chatgpt-dot.env", format: .shellEnvironment,
+            restartRequired: false, restartNote: "Nothing to restart. Give Dot the local message command.",
+            documentation: "", settingsSupported: false,
+            declaredRoute: .dotIPC, bundleIDs: ["com.openai.codex"]),
         AgentHostRow(id: "grok-bot", displayName: "Grok Bot",
             description: "A cloud assistant that answers through its desktop app.", aliases: ["grok"],
             installMarkers: [], configPath: "", format: .sessionMCP,
@@ -357,6 +366,10 @@ public enum AgentHostDirectory {
     }
 
     // MARK: - Paths
+
+    package static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
 
     static func expand(_ path: String) -> String {
         guard path.hasPrefix("~") else { return path }

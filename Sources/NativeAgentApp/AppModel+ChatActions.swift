@@ -7,6 +7,7 @@ import AppKit
 import SwiftUI
 import NativeAgentShared
 import PersistenceCore
+import Transcripts
 import TurnTrace
 import NativeAgentCore
 import MemoryV2
@@ -24,7 +25,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -63,14 +63,33 @@ extension AppModel {
         guard !activeChatSessionId.isEmpty else {
             return .failure("No active session to compact")
         }
+        let sessionID = activeChatSessionId
         do {
-            _ = try await client.compactSession(
-                sessionId: activeChatSessionId,
+            let outcome = try await client.compactSession(
+                sessionId: sessionID,
                 model: chatModel,
                 providerID: chatProvider,
                 force: true
             )
-            chatMessages = (try? await engine.transcripts.loadMessages(sessionId: activeChatSessionId, cached: true)) ?? chatMessages
+            if let failure = ContextFillCompactionPresentation.failureMessage(for: outcome) {
+                statusText = failure
+                return .failure(failure)
+            }
+            let lifecycleBeforeReload = engine.turns.lifecycle(for: sessionID)
+            let messagesBeforeReload = engine.transcripts.messages(for: sessionID)
+            let messages: [ChatMessage]
+            do {
+                messages = try await engine.transcripts.loadMessages(sessionId: sessionID, cached: true)
+            } catch {
+                statusText = "Session compacted, but transcript refresh failed: \(error.localizedDescription)"
+                return .failure(statusText)
+            }
+            let lifecycleAfterReload = engine.turns.lifecycle(for: sessionID)
+            if !engine.turns.streamingSessions.contains(sessionID),
+               lifecycleAfterReload == lifecycleBeforeReload,
+               engine.transcripts.messages(for: sessionID) == messagesBeforeReload {
+                engine.transcripts.setMessages(messages, for: sessionID)
+            }
             statusText = "Session compacted"
             return .success(statusText)
         } catch {
@@ -82,8 +101,9 @@ extension AppModel {
     // PATCH-2026-05-08: wave2-chat-ux slash /clear support
     @MainActor
     @discardableResult
-    func clearActiveChatMessages() async -> AppMutationResult {
+    func clearActiveChatMessages(sessionId: String? = nil) async -> AppMutationResult {
         await clearActiveChatMessages(
+            sessionId: sessionId,
             clear: { [transcripts = engine.transcripts] in try await transcripts.clear(sessionId: $0) },
             loadMessages: { [transcripts = engine.transcripts] in try await transcripts.loadMessages(sessionId: $0, cached: true) },
             loadSessions: { [transcripts = engine.transcripts] in try await transcripts.list() }
@@ -92,11 +112,14 @@ extension AppModel {
 
     @MainActor
     func clearActiveChatMessages(
+        sessionId: String? = nil,
         clear: (String) async throws -> Void,
         loadMessages: (String) async throws -> [ChatMessage],
         loadSessions: () async throws -> [ChatSession]
     ) async -> AppMutationResult {
-        let clearingSessionID = activeChatSessionId
+        // nil: the conversation on screen, as /clear clears it; chat.clear
+        // passes the one it names.
+        let clearingSessionID = sessionId ?? activeChatSessionId
         guard !clearingSessionID.isEmpty else {
             statusText = "Clear failed: no active chat session"
             return .failure(statusText)
@@ -231,15 +254,20 @@ extension AppModel {
                 engine.turns.busySessions.insert(sessionId)
                 defer { engine.turns.busySessions.remove(sessionId) }
                 let reply = try await TurnTraceContext.$turnId.withValue(lifecycleIdentity.turnId) {
-                    try await client.chat(
-                        message: priorText,
-                        sessionId: sessionId,
-                        model: chatModel,
-                        reasoningEffort: chatReasoningEffort,
-                        fileAccess: chatFileAccess,
-                        suppressUserAppend: suppressUserRow,
-                        replacementAssistantMessageId: isSyntheticNotice ? nil : message.id
-                    )
+                    try await TurnRequest(message: priorText, sessionID: sessionId, surface: "chat",
+                        envelope: .some(nil), verifiedSessionID: .some(nil), verifiedChatID: .some(nil),
+                        verifiedUserID: .some(nil), origin: .some(retrySnapshot.priorUserOrigin)).bind {
+                        try await client.chat(
+                            message: priorText,
+                            sessionId: sessionId,
+                            // Ordinary retries use the checked saved Chat choice.
+                            model: "",
+                            reasoningEffort: "",
+                            fileAccess: chatFileAccess,
+                            suppressUserAppend: suppressUserRow,
+                            replacementAssistantMessageId: isSyntheticNotice ? nil : message.id
+                        )
+                    }
                 }
                 try Task.checkCancellation()
                 let freshMessages = try? await engine.transcripts.loadMessages(sessionId: sessionId, cached: true)
@@ -285,10 +313,6 @@ extension AppModel {
                     statusText = "Regenerate outcome could not be confirmed"
                 }
                 engine.transcripts.sessions = (try? await engine.transcripts.list()) ?? engine.transcripts.sessions
-                setLatestContextReceipt(
-                    try? await client.getLatestContextReceipt(sessionId: sessionId),
-                    for: sessionId
-                )
             } catch {
                 let freshMessages = try? await engine.transcripts.loadMessages(sessionId: sessionId, cached: true)
                 let settlement = await settleMacChatRetry(identity: lifecycleIdentity, error: error)
@@ -382,9 +406,10 @@ extension AppModel {
 
     // PATCH-phase-3c: /scratch slash command handler.
     // POSTs to /v1/scratch → daemon dispatches scratchpad_write via Dispatcher.run().
-    func writeScratch(key: String, value: String) async -> AppMutationResult {
+    /// `sessionId` nil writes into the conversation on screen.
+    func writeScratch(key: String, value: String, sessionId: String? = nil) async -> AppMutationResult {
         do {
-            let sessionId = activeChatSessionId.isEmpty ? nil : activeChatSessionId
+            let sessionId = sessionId ?? (activeChatSessionId.isEmpty ? nil : activeChatSessionId)
             let body = try await client.postScratch(key: key, value: value, sessionId: sessionId)
             // FIX 5a (2026-06-10 audit): postScratch reports refusals as
             // {ok:false, error} WITHOUT throwing (no-session, bad sid).
@@ -403,14 +428,16 @@ extension AppModel {
         }
     }
 
+    /// Archives the chat on screen, or `sessionId` when the agent names one
+    /// (chat_session); only the chat on screen chooses a replacement.
     @MainActor
     @discardableResult
-    func archiveActiveChat() async -> AppMutationResult {
-        guard !activeChatSessionId.isEmpty else {
+    func archiveActiveChat(sessionId: String? = nil) async -> AppMutationResult {
+        let archivingId = sessionId ?? activeChatSessionId
+        guard !archivingId.isEmpty else {
             statusText = "Archive failed: no active chat session"
             return .failure(statusText)
         }
-        let archivingId = activeChatSessionId
         do {
             guard try await engine.transcripts.archive(id: archivingId) != nil else {
                 statusText = "Archive failed: that chat session is no longer available"
@@ -485,13 +512,13 @@ extension AppModel {
            expectedSessionId.isEmpty || expectedSessionId != targetSessionId {
             return rejectChatTurn("The active chat changed before send. Your message was not sent.")
         }
-        return await startChatTurn(
+        return publishConversationAnchor(for: await startChatTurn(
             text,
             attachments: attachments,
             sessionId: targetSessionId,
             hideUserBubble: false,
             requireActiveSession: true
-        ).acceptance
+        ).acceptance)
     }
 
     /// Fixed-session acceptance boundary for detached chat panels. Like the
@@ -503,13 +530,31 @@ extension AppModel {
         attachments: [MultimodalAttachment] = [],
         sessionId: String
     ) async -> ChatTurnAcceptance {
-        await startChatTurn(
+        publishConversationAnchor(for: await startChatTurn(
             text,
             attachments: attachments,
             sessionId: sessionId,
             hideUserBubble: false,
             requireActiveSession: false
-        ).acceptance
+        ).acceptance)
+    }
+
+    /// User sent this from the Mac, so its session is now the conversation he
+    /// is in — the anchor the phone, both Siris and Simple follow. Best-effort
+    /// like every publisher: a failed publish never fails his message.
+    @discardableResult
+    func publishConversationAnchor(for acceptance: ChatTurnAcceptance) -> ChatTurnAcceptance {
+        let sessionId: String
+        switch acceptance {
+        case .accepted(let id), .queued(let id, _): sessionId = id
+        case .rejected: return acceptance
+        }
+        Task.detached {
+            _ = try? await ConversationAnchor.publish(
+                sessionId: sessionId, source: "mac", conversationKind: .direct
+            )
+        }
+        return acceptance
     }
 
     @MainActor
@@ -548,6 +593,7 @@ extension AppModel {
                 requireIdleAndEmpty: requireIdleAndEmpty
             )
         }
+        if !hideUserBubble { publishConversationAnchor(for: started.acceptance) }
         await started.task?.value
         return started.acceptance
     }
@@ -737,9 +783,18 @@ extension AppModel {
         // Retain only the accepted local request and its preceding conversation
         // row. If routing fails before the core writes the user, an unchanged
         // canonical tail can prove that this request still needs persistence.
-        let originalUserBubble = ChatMessage(
+        var originalUserBubble = ChatMessage(
             id: userTurnId, sessionId: requestSessionId, role: "user", content: userContent
         )
+        if let origin = ChatPersistenceContext.originProvenance {
+            var recorded = ChatMessageOriginMetadata(surface: origin.surface, agent: origin.agent)
+            recorded.authored = origin.authored?.rawValue
+            recorded.peerSources = PeerDataTaint.current?.checkpointSources ?? []
+            recorded.elevatedPeerSources = PeerDataTaint.current?.elevatedSources ?? []
+            var metadata = ChatMessageMetadata()
+            metadata.origin = recorded
+            originalUserBubble.metadata = metadata
+        }
         let originalRequestPredecessor = engine.transcripts.messages(for: requestSessionId)
             .last(where: { $0.role == "user" || $0.role == "assistant" })
 
@@ -770,6 +825,9 @@ extension AppModel {
         }
         var streamingBubble = ChatMessage(sessionId: requestSessionId, role: "assistant", content: "")
         streamingBubble.id = bubbleId
+        var streamingMetadata = ChatMessageMetadata()
+        streamingMetadata.turnTraceId = activityIdentity.turnId
+        streamingBubble.metadata = streamingMetadata
         appendChatMessage(streamingBubble, to: requestSessionId)
         engine.turns.busySessions.insert(requestSessionId)
         defer {
@@ -793,8 +851,9 @@ extension AppModel {
             let stream = client.chatStream(
                 message: trimmed.isEmpty ? "(see attachments)" : trimmed,
                 sessionId: requestSessionId,
-                model: botContract?.model ?? chatModel,
-                reasoningEffort: botContract?.reasoningEffort ?? chatReasoningEffort,
+                // Empty overrides leave the current saved tuple to core admission.
+                model: botContract?.model ?? "",
+                reasoningEffort: botContract?.reasoningEffort ?? "",
                 fileAccess: chatFileAccess,
                 attachments: attachments,
                 metaBox: metaBox,
@@ -872,7 +931,7 @@ extension AppModel {
                     // generation counter value).
                     //
                     // Correct move: drop ONLY this placeholder's transient
-                    // optimistic UI (message/receipt/draft slots). Leave the
+                    // optimistic UI (message/draft slots). Leave the
                     // placeholder's task/generation/busy/streaming bookkeeping
                     // INTACT and `requestSessionId` UNCHANGED so the OUTER
                     // sendChat cleanup (keyed off the unchanged placeholder
@@ -883,7 +942,6 @@ extension AppModel {
                     // disk under `sid`; sid's own refresh path / next
                     // selectChatSession surfaces it.
                     engine.transcripts.messagesBySession.removeValue(forKey: requestSessionId)
-                    latestContextReceiptBySession.removeValue(forKey: requestSessionId)
                     chatDrafts.removeValue(forKey: requestSessionId)
                     chatDraftLastEdited.removeValue(forKey: requestSessionId)
                     _ = await settleChatTurnLifecycle(
@@ -906,9 +964,6 @@ extension AppModel {
                     // stash from the placeholder id to the confirmed `sid`.
                     if let placeholderMessages = engine.transcripts.messagesBySession.removeValue(forKey: requestSessionId) {
                         engine.transcripts.messagesBySession[sid] = placeholderMessages
-                    }
-                    if let placeholderReceipt = latestContextReceiptBySession.removeValue(forKey: requestSessionId) {
-                        latestContextReceiptBySession[sid] = placeholderReceipt
                     }
                     if let v = engine.turns.streamingTexts.removeValue(forKey: requestSessionId) {
                         engine.turns.streamingTexts[sid] = v
@@ -1027,13 +1082,6 @@ extension AppModel {
                 }
             }
             engine.transcripts.sessions = (try? await engine.transcripts.list()) ?? engine.transcripts.sessions
-            // 2026-06-08 W0.3: receipt refresh runs for the request session
-            // regardless of active state, so a detached panel for `req` sees
-            // the new context-receipt without waiting for a focus change.
-            setLatestContextReceipt(
-                try? await client.getLatestContextReceipt(sessionId: requestSessionId),
-                for: requestSessionId
-            )
             compiledPersonality = try? await client.getCompiledPersonality(surface: "chat")
         } catch {
             guard await joinFailedMacChatStream(

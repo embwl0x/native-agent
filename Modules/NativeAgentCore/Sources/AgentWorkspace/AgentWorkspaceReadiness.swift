@@ -20,6 +20,18 @@ package enum AgentWorkspaceReadiness {
         return try await $snapshot.withValue(Snapshot(permissions: permissions), operation: operation)
     }
 
+    static func allows(tool name: String) -> Bool {
+        guard let gate = AgentWorkspacePorts.current.tools.macIntegrationGate(name)
+            ?? AgentWorkspacePorts.current.tools.macIntegrationGate(name.replacingOccurrences(of: ".", with: "_")) else { return true }
+        guard let permissions = snapshot?.permissions else { return false }
+        return !(gate.mode == .read ? permissions.operatorReadOff : permissions.operatorWriteOff).contains(gate.integration)
+    }
+
+    static func allows(_ action: AgentWorkspaceAction) -> Bool {
+        if case .window(let inner) = action { return allows(inner) }
+        return tool(action).map { allows(tool: $0) } ?? true
+    }
+
     /// Remove misleading active controls from every projected surface, including
     /// Mail reply items and generic capability forms. This never grants access;
     /// changes after presentation are still enforced by the actual dispatcher.
@@ -28,13 +40,7 @@ package enum AgentWorkspaceReadiness {
         var hidden = 0
         func buttons(_ buttons: [AgentWorkspaceButton]) -> [AgentWorkspaceButton] {
             buttons.filter { button in
-                guard let name = tool(button.action),
-                      let gate = AgentWorkspacePorts.current.tools.macIntegrationGate(name)
-                        ?? AgentWorkspacePorts.current.tools.macIntegrationGate(name.replacingOccurrences(of: ".", with: "_")) else { return true }
-                let allowed: Bool
-                if let permissions = snapshot?.permissions {
-                    allowed = !(gate.mode == .read ? permissions.operatorReadOff : permissions.operatorWriteOff).contains(gate.integration)
-                } else { allowed = false }
+                let allowed = allows(button.action)
                 if !allowed { hidden += 1 }
                 return allowed
             }

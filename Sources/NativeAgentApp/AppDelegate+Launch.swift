@@ -16,6 +16,7 @@ import Desk
 import Transcripts
 import TurnTrace
 import PersonaEngine
+import Skills
 import MCPDispatcher
 import GitHubConnector
 import Browser
@@ -24,13 +25,34 @@ import OSLog
 import os
 import DeviceSync
 
+private struct AppDerivedStateInvalidationSink: DerivedStateInvalidationSink {
+    let dataRoot: URL
+
+    func sourceDidChange(_ changes: [DerivedSourceChange]) async {
+        let memoryPath = dataRoot.appendingPathComponent("memory/memory.sqlite").standardizedFileURL.path
+        if changes.contains(where: {
+            $0.namespace == "memory-v2" && $0.canonicalLocator == memoryPath
+        }) {
+            await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots(includeMemories: true)
+        }
+        await DerivedPersonaPinInvalidationSink(dataRoot: dataRoot).sourceDidChange(changes)
+    }
+}
+
 extension AppDelegate {
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() {
+            previousWorkApp = app
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(self,
+            selector: #selector(continuationAppActivated(_:)),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil)
         // A clicked banner has to reach the app: without a delegate, the
         // identity a Desk reminder carries goes nowhere.
         UNUserNotificationCenter.current().delegate = self
         NativeAgentNotificationActions.register()
+        AnchorReplyMirror.start()
         NativeAgentShortcuts.updateAppShortcutParameters()
         approvalNotificationTask = Task { @MainActor in
             await NativeAgentApprovalNotifications.observe()
@@ -53,6 +75,12 @@ extension AppDelegate {
             NSLog("[workspace] canonical work root unavailable: %@", error.localizedDescription)
         }
         Task { await finishLaunching() }
+    }
+
+    @MainActor @objc func continuationAppActivated(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.processIdentifier != getpid() else { return }
+        previousWorkApp = app
     }
 
     @MainActor
@@ -137,7 +165,7 @@ extension AppDelegate {
             // cycle. Install it here, before the runtime starts; Context Flow
             // then subscribes its coordinator to it.
             await DerivedStateInvalidationCenter.shared.install(
-                DerivedPersonaPinInvalidationSink(dataRoot: NativeAgentPaths.dataRoot)
+                AppDerivedStateInvalidationSink(dataRoot: NativeAgentPaths.dataRoot)
             )
             await NativeAgentEngine.live.contextFlow.start()
         }
@@ -283,6 +311,8 @@ extension AppDelegate {
             if downloadDescriptor?.distribution != "separate-download" {
                 await reconcileMemoryEmbeddingEpochAtLaunch()
             }
+            // One-time skill registry repairs, before recall reads the registry.
+            await SkillRegistryMigration.runIfNeeded(dataRoot: PersistenceCore.defaultDataRoot())
             await syncSkillPointerIndex()
         }
         // The transcript-aging lane defers through the same body throttle as
@@ -368,14 +398,6 @@ extension AppDelegate {
                     BackgroundLoopsAssembly.makeSharedLLMClient()
                 }),
                 
-                // The moments lane (2026-09-02): a SECOND pass over the same
-                // turn, asking what happened between them rather than what is
-                // true about him. User, 2026-09-05: on the agent's real mind
-                // (the Providers "Memory" row, else the chat pick), on-device
-                // only as the fallback. There is no regex conformer, by design.
-                momentExtractor: MindMomentExtractor(makeLLMClient: {
-                    BackgroundLoopsAssembly.makeSharedLLMClient()
-                }),
                 // Setup ▸ "Moments she keeps". The module never reads
                 // UserDefaults; the switch reaches it as this closure, read
                 // fresh on every turn so flipping it takes effect at once.
@@ -595,9 +617,8 @@ extension AppDelegate {
     @MainActor private static var quitWaitingForTurns = false
 
     /// restart_app's quit waits for no turns: its grace was their allowance,
-    /// and the relauncher reopens the bundle relauncherPollSeconds after it
-    /// spawned whether or not we are gone — a quit still waiting then leaves
-    /// nothing running. A quit already held just stops waiting.
+    /// and the relauncher reopens the bundle once we exit.
+    /// A quit already held just stops waiting.
     @MainActor
     static func terminateForRestart() {
         restartQuit.withLock { $0 = true }

@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import NativeAgentCore
+import PersonaEngine
 
 /// One fail-closed secret-shape policy for material entering derived context.
 /// Callers may reject content; this policy never redacts or authorizes it.
@@ -139,10 +140,15 @@ public struct ContextMarkdownCompiler: Sendable {
                 maximumBytes: limits.maxSourceUTF8Bytes
             )
         }
-        guard let source = String(data: sourceData, encoding: .utf8) else {
+        guard let rawSource = String(data: sourceData, encoding: .utf8) else {
             throw ContextMarkdownCompilerError.malformedUTF8
         }
-        guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let source = descriptor.kind == .persona && descriptor.canonicalLocator.hasSuffix("/GROWTH.md")
+            ? SwiftNativePersonaEngine.filterEpisodicGrowthLines(rawSource) : rawSource
+        let contextData = Data(source.utf8)
+        // A document consisting only of legacy log lines must replace its
+        // previous atoms with an empty set, rather than retain them on failure.
+        guard source != rawSource || !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ContextMarkdownCompilerError.emptySource
         }
         guard !Self.isForbiddenLocator(descriptor.canonicalLocator) else {
@@ -167,12 +173,14 @@ public struct ContextMarkdownCompiler: Sendable {
         // dropped them. Bump this version whenever compiled OUTPUT shape
         // changes for identical input; the cost is one full refresh per
         // source, with embeddings still reused via content matching.
+        // Hash the filtered bytes so existing GROWTH atoms are replaced even
+        // when the canonical file itself has not changed since the last build.
         let sourceHash = Self.sha256(
-            Data("\(Self.compilerFormatVersion)\u{0}".utf8) + sourceData
+            Data("\(Self.compilerFormatVersion)\u{0}".utf8) + contextData
         )
         let documentName = Self.documentName(for: descriptor.canonicalLocator)
         let parsed = try parse(
-            sourceData,
+            contextData,
             atomizingGeneratedUserFacts: Self.isGeneratedUserProjection(
                 descriptor: descriptor,
                 documentName: documentName

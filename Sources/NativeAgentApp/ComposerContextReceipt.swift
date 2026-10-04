@@ -69,6 +69,7 @@ enum ComposerContextReceiptState: Equatable, Sendable {
     case loading
     /// A fresh conversation, or a turn that has not reached its context yet.
     case noTurn
+    case outsideSearch
     case unavailable(String)
     case receipt(ComposerContextReceipt)
 }
@@ -117,7 +118,14 @@ enum ComposerContextReceiptReader {
         do {
             let earlier = try await reader.read(now: now.addingTimeInterval(-86_400))
             let today = try await reader.read(now: now)
-            return project(events: earlier.events + today.events, sessionId: sessionId)
+            let events = earlier.events + today.events
+            let projected = project(events: events, sessionId: sessionId)
+            if projected == .noTurn, !events.contains(where: {
+                $0.kind == TurnLifecycleMilestone.turnAccepted.rawValue && $0.sessionId == sessionId
+            }) {
+                return .outsideSearch
+            }
+            return projected
         } catch {
             return .unavailable(String("\(error)".prefix(maxErrorChars)))
         }
@@ -337,9 +345,7 @@ enum ComposerContextReceiptReader {
         case "unknown": return "not recorded"
         case "zeroHits": return "no hits"
         case "hits", "contextFlow":
-            let retrieved = int(recall, "retrievedHitCount") ?? injected
-            let hits = max(retrieved, injected)
-            return hits == 1 ? "1 memory injected" : "\(hits) memories injected"
+            return injected == 1 ? "1 memory injected" : "\(injected) memories injected"
         default: return nil
         }
     }
@@ -454,8 +460,7 @@ enum ComposerContextReceiptPresentation {
     /// split, bytes as assembled otherwise (image turns, older traces).
     static func value(_ row: ComposerContextReceiptRow) -> String? {
         if let count = row.tokens { return tokens(count, approximate: !row.measured) }
-        // No provider count to split (an old or image turn): still tokens, estimated.
-        return row.bytes.map { tokens(estimatedTokens($0), approximate: true) }
+        return row.bytes.map { "\(exact($0)) bytes" }
     }
 
     static func ranAt(_ date: Date, now: Date = Date()) -> String {
@@ -469,7 +474,7 @@ enum ComposerContextReceiptPresentation {
     /// has no provider count for this turn.
     static func total(_ receipt: ComposerContextReceipt) -> (label: String, value: String, share: String?) {
         guard let last = receipt.lastRequestTokens else {
-            return ("Assembled", tokens(estimatedTokens(receipt.assembledBytes), approximate: true), nil)
+            return ("Assembled", "\(exact(receipt.assembledBytes)) bytes", nil)
         }
         return ("Last request", exact(last), share(receipt.share(tokens: last)))
     }
@@ -501,6 +506,7 @@ enum ComposerContextReceiptPresentation {
         switch state {
         case .loading: return [("loading", "Reading the last turn…")]
         case .noTurn: return [("no-turn", "No turn yet")]
+        case .outsideSearch: return [("outside-search", "No receipt found in today's or yesterday's trace. Older turns are outside this search.")]
         case .unavailable(let reason): return [("unavailable", "The turn trace could not be read: \(reason)")]
         case .receipt(let receipt):
             var lines = receipt.rows.map { ($0.id, rowAccessibility($0, share: receipt.share($0))) }
@@ -520,7 +526,7 @@ enum ComposerContextReceiptPresentation {
         if let tokens = row.tokens {
             parts.append(row.measured ? "\(exact(tokens)) tokens" : "about \(exact(tokens)) tokens")
         } else if let bytes = row.bytes {
-            parts.append("about \(exact(estimatedTokens(bytes))) tokens")
+            parts.append("\(exact(bytes)) bytes")
         }
         if let percent = share(fraction) { parts.append("\(percent) of your window") }
         if let detail = row.detail { parts.append(detail) }
@@ -540,6 +546,8 @@ struct ComposerContextReceiptBody: View {
                 caption("Reading the last turn…")
             case .noTurn:
                 caption("No turn yet. Send a message and the receipt lands here.")
+            case .outsideSearch:
+                caption("No receipt found in today's or yesterday's trace. Older turns are outside this search.")
             case .unavailable(let reason):
                 caption("The turn trace could not be read: \(reason)")
             case .receipt(let receipt):

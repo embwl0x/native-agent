@@ -508,39 +508,3 @@ extension UserMDGenerator {
         try await self.regenerate(persona: MemoryV2Defaults.personaID)
     }
 }
-
-// MARK: - SelfImprovementOrchestrator integration
-//
-// F5+F6 cross-merge (2026-06-03): the previous app-local stub shadowed
-// Core's real `actor SelfImprovementOrchestrator`, returning [] from
-// list_pending() and no-op from runSweepOnce(). The shadow is now
-// deleted; Core's actor answers `.shared.runSweepOnce()` directly. The
-// snake_case `list_pending()` extension preserves the "What's Running"
-// panel call site without forcing it to depend on Core's full
-// ImprovementRun shape.
-
-import SelfImprovement
-
-public struct SelfImprovementPendingSummary: Sendable, Equatable {
-    public let id: String
-    public let objective: String
-    public let stage: String
-    public init(id: String, objective: String, stage: String) {
-        self.id = id
-        self.objective = objective
-        self.stage = stage
-    }
-}
-
-public extension SelfImprovementOrchestrator {
-    func list_pending() async -> [SelfImprovementPendingSummary] {
-        let runs = (try? await listPending()) ?? []
-        return runs.map {
-            SelfImprovementPendingSummary(
-                id: $0.id,
-                objective: $0.objective ?? "",
-                stage: $0.phase ?? ($0.status ?? "")
-            )
-        }
-    }
-}

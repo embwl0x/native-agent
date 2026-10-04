@@ -120,7 +120,7 @@ extension SwiftToolDispatcher {
         ))
     }
 
-    private static func codexReplyOrigin(
+    static func agentBridgeReplyOrigin(
         surface: String,
         route: ChatToolSessionContext.ReplyRoute?
     ) -> JSONValue {
@@ -207,7 +207,7 @@ extension SwiftToolDispatcher {
         case .success(let controls): brain = controls
         case .failure(let error): return error.envelope
         }
-        let origin = Self.codexReplyOrigin(
+        let origin = Self.agentBridgeReplyOrigin(
             surface: surface,
             route: ChatToolSessionContext.replyRoute
         )
@@ -339,7 +339,24 @@ extension SwiftToolDispatcher {
         do {
             appendResult = try await Self.withCodexInboxDirectoryLock(bridgeDirectory: dir) {
                 try await persistence.withFileLock(inboxURL) {
-                    let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantineNote)
+                    let live = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantineNote)
+                    let existing: JSONValue?
+                    if let live { existing = live }
+                    else {
+                        let historyURL = Self.codexInboxHistoryURL(messageId, inboxURL: inboxURL)
+                        let archived: JSONValue?
+                        do { archived = try JSONValue.parse(Data(contentsOf: historyURL)) }
+                        catch CocoaError.fileReadNoSuchFile { archived = nil }
+                        if let archived {
+                            guard case .object(let row) = archived,
+                                  row["id"] == nil || row["messageId"] == nil || row["id"] == row["messageId"],
+                                  row["messageId"] == .string(messageId) || row["id"] == .string(messageId) else {
+                                throw PersistenceCoreError.ioFailure("codex inbox retry identity is unreadable; original bytes preserved")
+                            }
+                            existing = archived
+                        } else { existing = nil }
+                    }
+                    try await Self.compactCodexInbox(inboxURL: inboxURL, persistence: persistence)
                     if case .object(let object)? = existing {
                         // Inbox persistence precedes helper admission. An explicit
                         // retry must keep that exact work order, including its
@@ -363,6 +380,8 @@ extension SwiftToolDispatcher {
                     return ("appended", false, timestamp)
                 }
             }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -407,7 +426,7 @@ extension SwiftToolDispatcher {
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
-            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from desk_read.")
+            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
         }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
         if let executionProfile {
@@ -444,6 +463,7 @@ extension SwiftToolDispatcher {
             // accepted but has not reached an idle point yet.
             if retryUnacceptedWake { response["wakeupRetried"] = .bool(true) }
             let wakeup = await postCodexThreadWakeup(
+                surface: surface,
                 messageId: messageId,
                 text: text,
                 priority: priority,
@@ -483,8 +503,53 @@ extension SwiftToolDispatcher {
         // A wake that failed admitted nothing to act on the row; "queued" would
         // tell her the answer is coming (the Claude lane already says so).
         if Self.claudeReceiptStatus(response["wakeup"]) == "failed" { response["status"] = .string("failed") }
-        Self.markWakeStartedNothing(&response, agent: "Codex")
+        Self.markWakeStartedNothing(&response, agent: "Codex", dataRoot: dataRoot)
         return .object(response)
+    }
+
+    private static func codexInboxHistoryURL(_ messageID: String, inboxURL: URL) -> URL {
+        let key = SHA256.hash(data: Data(messageID.utf8)).map { String(format: "%02x", $0) }.joined()
+        return inboxURL.deletingLastPathComponent().appendingPathComponent("codex-inbox-history", isDirectory: true)
+            .appendingPathComponent(key + ".json")
+    }
+
+    /// Caller holds both inbox locks. Archive consumed briefs and terminal
+    /// delivery failures with their full retry identity before removing them
+    /// from the hot inbox. Pending deliveries and reply jobs are never pruned here.
+    private static func compactCodexInbox(inboxURL: URL, persistence: SwiftNativePersistenceCore) async throws {
+        let scan = try await persistence.readJSONLReporting(inboxURL)
+        guard scan.report.isClean, scan.rows.allSatisfy({ if case .object = $0 { true } else { false } }) else {
+            throw PersistenceCoreError.ioFailure("codex inbox cannot be compacted; original bytes preserved")
+        }
+        let completed = scan.rows.indices.filter { index in
+            guard case .object(let row) = scan.rows[index] else { return false }
+            return (row["read"] == .bool(true) && stringField("consumedAt", in: scan.rows[index])?.isEmpty == false)
+                || (row["deliveryStatus"] == .string("dead_letter")
+                    && stringField("deliveryTerminalAt", in: scan.rows[index])?.isEmpty == false)
+        }
+        let removing = Set(completed.dropLast(256))
+        guard !removing.isEmpty else { return }
+        var identities = Set<String>()
+        for value in scan.rows {
+            guard case .object(let row) = value,
+                  let id = stringField("messageId", in: value) ?? stringField("id", in: value), !id.isEmpty,
+                  identities.insert(id).inserted,
+                  row["id"] == nil || row["messageId"] == nil || row["id"] == row["messageId"] else {
+                throw PersistenceCoreError.ioFailure("codex inbox retry identity conflicts; original bytes preserved")
+            }
+        }
+        for index in removing.sorted() {
+            let value = scan.rows[index]
+            guard let id = stringField("messageId", in: value) ?? stringField("id", in: value), !id.isEmpty else {
+                throw PersistenceCoreError.ioFailure("codex inbox retry identity conflicts; original bytes preserved")
+            }
+            let destination = codexInboxHistoryURL(id, inboxURL: inboxURL)
+            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            try await persistence.writeDataAtomicDurable(try value.serializedData(pretty: false), to: destination)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+        }
+        try await persistence.replaceJSONL(scan.rows.enumerated().filter { !removing.contains($0.offset) }.map(\.element), to: inboxURL)
     }
 
     /// The Codex inbox has TWO writers with two different locks: this process
@@ -524,6 +589,7 @@ extension SwiftToolDispatcher {
         let deadline = Date().addingTimeInterval(waitSeconds)
         var held = false
         while true {
+            try Task.checkCancellation()
             if mkdir(lockDir.path, 0o700) == 0 {
                 held = true
                 try? Data("\(getpid())\n\(ISO8601DateFormatter().string(from: Date()))\n\n".utf8)
@@ -550,11 +616,12 @@ extension SwiftToolDispatcher {
                     + "the message was not queued — retry once the Codex helper releases it"
                 )
             }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            try await Task.sleep(nanoseconds: 50_000_000)
         }
         defer {
             if held { try? FileManager.default.removeItem(at: lockDir) }
         }
+        try Task.checkCancellation()
         return try await body()
     }
 
@@ -636,15 +703,17 @@ extension SwiftToolDispatcher {
     }
 
     private static func codexMessageNotificationBody(text: String, topic: String?) -> String {
-        let preview = ChatSecretRedactor.redactText(String(text.prefix(220)))
+        let preview = String(ChatSecretRedactor.redactText(text).prefix(220))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if let topic, !topic.isEmpty {
-            return "[\(topic)] \(preview)"
+            let safeTopic = String(ChatSecretRedactor.redactText(topic).prefix(160))
+            return "[\(safeTopic)] \(preview)"
         }
         return preview
     }
 
     private func postCodexThreadWakeup(
+        surface: String,
         messageId: String,
         text: String,
         priority: String,
@@ -701,6 +770,7 @@ extension SwiftToolDispatcher {
                    for: .codex, configRoot: agentBridgeConfigRoot),
                topic: topic,
                text: text,
+               conversationId: threadId,
                now: Date()
            ) {
             return WakeupReplayGuard.receipt(match)
@@ -766,10 +836,17 @@ extension SwiftToolDispatcher {
             ])
         }
 
+        let launch = await Self.drivenAgentLaunch(tool: "codex_message", surface: surface,
+            contact: Self.drivenAgentContact(host: "codex", dataRoot: dataRoot), name: "Codex", dataRoot: dataRoot)
+        if let denied = launch.deniedResult { return denied }
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
         return await runAgentWakeupHelper(helper: helper, inputData: inputData, cwd: cwd,
-                                         cli: "codex", variable: "CODEX_BIN", timeout: Self.codexWakeupHelperTimeoutSeconds())
+                                         cli: "codex", variable: "CODEX_BIN", timeout: Self.codexWakeupHelperTimeoutSeconds(),
+                                         launch: launch, launchArguments: [
+                                             "--sandbox", launch.permission.codexSandbox,
+                                             "--approval-policy", launch.permission.codexApprovalPolicy,
+                                         ])
     }
 
     /// The Node helper owns an RPC timeout (12 seconds by default). Keep the
@@ -792,8 +869,10 @@ extension SwiftToolDispatcher {
     // work a focused task, then continue with Codex's final reply.
     static func runInvokeCodex(
         input: [String: JSONValue],
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        launch: DrivenAgentLaunch
     ) async throws -> JSONValue {
+        if let denied = launch.deniedResult { return denied }
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
@@ -820,20 +899,17 @@ extension SwiftToolDispatcher {
                     return lower
                 }
             }
-            return "workspace-write"
+            return launch.permission.codexSandbox
         }()
-        if sandbox == "danger-full-access" {
-            // Same root as the audit write below — policy and audit must
-            // never diverge on a privileged path (gpt-5.5 review catch).
-            let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
-            guard codexDangerFullAccessAllowed(policy: policy) else {
-                return .object([
-                    "status": .string("denied"),
-                    "reason": .string("developer_mode_required"),
-                    "sandbox": .string(sandbox),
-                    "message": .string("invoke_codex danger-full-access requires Developer Mode. Retry with workspace-write or enable Developer Mode locally."),
-                ])
-            }
+        if sandbox == "danger-full-access", launch.permission != .fullMac {
+            var denied: [String: JSONValue] = [
+                "status": .string("denied"),
+                "reason": .string("full_mac_required"),
+                "sandbox": .string(sandbox),
+                "message": .string("invoke_codex danger-full-access requires Full Mac. Retry with workspace-write or turn on Full Mac."),
+            ]
+            if let note = launch.note { denied["note"] = .string(note) }
+            return .object(denied)
         }
         let brain: CodexBrainControls
         switch codexBrainControls(from: input) {
@@ -863,7 +939,8 @@ extension SwiftToolDispatcher {
         let lastMessageURL = auditDir.appendingPathComponent("\(runId)-last-message.txt")
 
         let environment = AgentBridgeRuntime.processEnvironment()
-        guard let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: environment) else {
+        guard let codex = launch.executable.map({ URL(fileURLWithPath: $0) })
+                ?? AgentBridgeRuntime.executableURL(named: "codex", environment: environment) else {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("codex_cli_not_found"),
@@ -874,6 +951,7 @@ extension SwiftToolDispatcher {
         process.executableURL = codex
         let args = codexExecArguments(
             sandbox: sandbox,
+            approvalPolicy: launch.permission.codexApprovalPolicy,
             cwd: cwdRaw,
             lastMessagePath: lastMessageURL.path,
             model: model,
@@ -946,6 +1024,7 @@ extension SwiftToolDispatcher {
                         "durationMs": .int(Int64(durationMs)),
                         "exitCode": .int(Int64(exitCode)),
                         "sandbox": .string(sandbox),
+                        "launch": launch.receipt,
                         "brain": brain.jsonValue,
                         "auditPath": .string(auditURL.path),
                     ]))
@@ -1004,6 +1083,7 @@ extension SwiftToolDispatcher {
 
     static func codexExecArguments(
         sandbox: String,
+        approvalPolicy: String,
         cwd: String,
         lastMessagePath: String,
         model: String?,
@@ -1015,6 +1095,7 @@ extension SwiftToolDispatcher {
             "codex", "exec",
             "--ephemeral",
             "--sandbox", sandbox,
+            "-c", "approval_policy=\"\(approvalPolicy)\"",
             "-C", cwd,
             "--color", "never",
             "-o", lastMessagePath,
@@ -1030,12 +1111,5 @@ extension SwiftToolDispatcher {
         }
         args.append(prompt)
         return args
-    }
-
-    static func codexDangerFullAccessAllowed(policy: [String: JSONValue]) -> Bool {
-        if case .bool(true)? = policy["developerMode"] {
-            return true
-        }
-        return false
     }
 }

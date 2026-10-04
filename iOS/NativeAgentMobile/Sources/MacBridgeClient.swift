@@ -3,7 +3,7 @@
 // HTTP fallbacks are removed; iOS talks to the Mac through signed iCloud
 // messages and snapshots. Public surface preserved for view compatibility:
 //   - chat: sendMessage / cancelChat / observeICloudReplies → iCloudBridge
-//   - refreshChatHistory → reads from iCloudSyncEngine snapshots.
+//   - readChatTranscript → reads from iCloudSyncEngine snapshots.
 
 import Foundation
 import Combine
@@ -242,9 +242,14 @@ final class MacBridgeClient: ObservableObject {
 
     init(bridge: iCloudBridge = .shared) {
         self.bridge = bridge
-        bridgeAvailabilityCancellable = bridge.$available.combineLatest(bridge.$accountFailure)
-            .sink { [weak self] _ in
-                Task { @MainActor in self?.refreshBridgeStatus() }
+        bridgeAvailabilityCancellable = bridge.$available.combineLatest(bridge.$accountFailure, bridge.$lastMacConfirmationAt)
+            .sink { [weak self] _, _, _ in
+                Task { @MainActor in
+                    if let timestamp = self?.bridge.lastMacConfirmationAt {
+                        self?.recordMacConfirmation(at: timestamp)
+                    }
+                    self?.refreshBridgeStatus()
+                }
             }
         // E8: replaces the unconditional 5s forever-timer. refreshBridgeStatus
         // re-arms this with an interval derived from the current ages, and
@@ -305,11 +310,42 @@ final class MacBridgeClient: ObservableObject {
         refreshBridgeStatus()
     }
 
+    func repairConnection() async throws {
+        guard let pairingStore else { throw SyncError.notSetup }
+        guard !pairingStore.isRepairingConnection else {
+            throw SyncError.busy("Connection repair is in progress.")
+        }
+        let sync = iCloudSyncEngine.shared
+        try bridge.requireIdleSendForConnectionRepair()
+        try sync.requireIdleActionForConnectionRepair()
+        pairingStore.isRepairingConnection = true
+        defer { pairingStore.isRepairingConnection = false }
+        let mailboxes = sync.connectionRepairMailboxes()
+        try await iCloudSyncEngine.reconcileActionsForConnectionRepair(
+            transactions: mailboxes.transactions, responses: mailboxes.responses, inbox: mailboxes.inbox
+        )
+        try bridge.requireIdleSendForConnectionRepair()
+        try sync.requireIdleActionForConnectionRepair()
+        try pairingStore.clearPairingForConnectionRepair()
+        reconnectGeneration += 1
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        statusRefreshTask?.cancel()
+        connectingStartedAt = nil
+        bridgeUnavailableSince = nil
+        lastSeenAt = nil
+        bridge.clearMacConfirmationForConnectionRepair()
+        bridge.tearDown(preservingConsumers: true)
+        sync.clearConnectionDeliveryHistory()
+        refreshBridgeStatus()
+        bridge.setup()
+        refreshBridgeStatus()
+    }
+
     // MARK: - Chat
 
     enum ChatSendResult {
         case queuedMessageId(String)
-        case reply(text: String, sessionID: String?)
     }
 
     func sendMessage(
@@ -366,13 +402,16 @@ final class MacBridgeClient: ObservableObject {
             sourceKey: hasExplicitSession ? nil : NativeAgentICloudBridgeConstants.mobileSourceKey,
             runIDs: runIDs
         )
-        recordMacConfirmation()
     }
 
     @discardableResult
     func observeICloudReplies(onMessage: @escaping (BridgeMessage) -> Void) -> UUID? {
         return bridge.observeIncomingMessages { [weak self] msg in
-            Task { @MainActor in self?.recordMacConfirmation() }
+            let generation = self?.reconnectGeneration
+            Task { @MainActor in
+                guard self?.reconnectGeneration == generation else { return }
+                self?.recordMacConfirmation(at: msg.timestamp)
+            }
             onMessage(msg)
         }
     }
@@ -380,7 +419,11 @@ final class MacBridgeClient: ObservableObject {
     @discardableResult
     func observeICloudReplyRejections(onReject: @escaping (ICloudBridgeRejectedMessage) -> Void) -> UUID? {
         return bridge.observeRejectedMessages { [weak self] rejection in
-            Task { @MainActor in self?.recordMacConfirmation() }
+            let generation = self?.reconnectGeneration
+            Task { @MainActor in
+                guard self?.reconnectGeneration == generation else { return }
+                self?.recordMacConfirmation()
+            }
             onReject(rejection)
         }
     }
@@ -390,7 +433,11 @@ final class MacBridgeClient: ObservableObject {
     @discardableResult
     func observeICloudResyncHints(onHint: @escaping (BridgeMessage) -> Void) -> UUID? {
         return bridge.observeResyncHints { [weak self] hint in
-            Task { @MainActor in self?.recordMacConfirmation() }
+            let generation = self?.reconnectGeneration
+            Task { @MainActor in
+                guard self?.reconnectGeneration == generation else { return }
+                self?.recordMacConfirmation()
+            }
             onHint(hint)
         }
     }
@@ -417,9 +464,10 @@ final class MacBridgeClient: ObservableObject {
     /// Only Mac-originated activity or a confirmed Mac action may refresh the
     /// status chip. Queuing an iPhone message proves iCloud accepted it, not
     /// that the Mac is awake to process it.
-    private func recordMacConfirmation() {
+    func recordMacConfirmation(at timestamp: Date = Date()) {
+        guard timestamp > (lastSeenAt ?? .distantPast) else { return }
         connectingStartedAt = nil
-        lastSeenAt = Date()
+        lastSeenAt = timestamp
     }
 
     func refreshBridgeStatus(now: Date = Date()) {
@@ -526,14 +574,6 @@ final class MacBridgeClient: ObservableObject {
         // The snapshot reader retains last-good rows if the read is unavailable.
         await engine.refreshChatTranscriptsSnapshot()
         return engine.transcriptRead(for: sid)
-    }
-
-    /// The pre-2026-09-06 array projection: an empty published transcript reads
-    /// as nil, exactly as before. Kept for callers that only want rows to show
-    /// and have no business clearing anything.
-    func refreshChatHistory(sessionID: String?) async -> [ChatMessage]? {
-        let messages = await readChatTranscript(sessionID: sessionID).messages
-        return messages.isEmpty ? nil : messages
     }
 
     static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {

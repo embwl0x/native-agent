@@ -16,6 +16,7 @@ public struct ExternalSendApprovalRequest: Sendable, Equatable {
     public let input: [String: JSONValue]
     public let idempotencyKey: String
     public let sessionID: String?
+    public let userID: String?
     public let remoteChatID: String?
     public let commandSignatureVerified: Bool
 
@@ -56,6 +57,7 @@ public struct ExternalSendApprovalRequest: Sendable, Equatable {
         self.idempotencyKey = idempotencyKey
         self.sessionID = Self.nonEmptyString(origin["sessionId"])
             ?? Self.nonEmptyString(telegram["sessionId"])
+        self.userID = Self.nonEmptyString(origin["userId"])
         self.remoteChatID = Self.nonEmptyString(origin["chatId"])
             ?? Self.nonEmptyString(telegram["chatId"])
         if case .bool(let verified)? = origin["commandSignatureVerified"] {
@@ -184,6 +186,7 @@ public enum ExternalSendApprovalLifecycle {
         let idempotencyKey = try resolvedIdempotencyKey(suppliedIdempotencyKey)
 
         let sessionID = nonEmpty(ChatToolSessionContext.verifiedSessionId)
+        let userID = nonEmpty(ChatToolSessionContext.verifiedUserId)
         let chatID = nonEmpty(ChatToolSessionContext.verifiedChatId)
         var payload: [String: JSONValue] = [
             "kind": .string(ExternalSendApprovalRequest.payloadKind),
@@ -195,6 +198,7 @@ public enum ExternalSendApprovalLifecycle {
             "idempotencyKey": .string(idempotencyKey),
             "origin": .object([
                 "sessionId": sessionID.map(JSONValue.string) ?? .null,
+                "userId": userID.map(JSONValue.string) ?? .null,
                 "chatId": chatID.map(JSONValue.string) ?? .null,
                 "commandSignatureVerified": .bool(ChatToolSessionContext.commandSignatureVerified == true),
             ]),

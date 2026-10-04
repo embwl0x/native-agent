@@ -86,7 +86,9 @@ public extension GitHubConnectorActions {
             throw GitHubConnectorError.invalidResponse("pull request was not an object")
         }
         let limit = clamp(int(input["limit"], default: 20), min: 1, max: GitHubToolProjection.collectionLimit)
-        let reviews = try await call(path: "repos/\(repo)/pulls/\(number)/reviews", params: ["per_page": String(limit)], dataRoot: dataRoot)
+        let reviews = try await paginatedArray(
+            path: "repos/\(repo)/pulls/\(number)/reviews", dataRoot: dataRoot
+        )
         let commits = try await call(path: "repos/\(repo)/pulls/\(number)/commits", params: ["per_page": String(limit)], dataRoot: dataRoot)
         var fields: [String: JSONValue] = [
             "repository": .string(repo), "number": .int(Int64(number)),
@@ -585,19 +587,30 @@ private extension TrackingSnapshot {
     var digestEnvelope: JSONValue {
         let changed = entities.filter { changedKeys.contains($0.key) }
         let newEntities = entities.filter { newKeys.contains($0.key) }
-        let needsUser = entities.filter(\.needsUser)
-        let blocked = entities.filter(\.blocked)
-        let stale = entities.filter(\.stale)
+        let openEntities = entities.filter { $0.state == "open" }
+        let needsUser = openEntities.filter(\.needsUser)
+        let blocked = openEntities.filter(\.blocked)
+        let stale = openEntities.filter(\.stale)
         let sampleLimit = 10
         func sample(_ rows: [TrackingEntity]) -> JSONValue {
             .array(rows.prefix(sampleLimit).map(\.json))
         }
         let next: String
-        if let first = needsUser.first { next = "Review \(first.repo)#\(first.number): \(first.title)" }
+        let refreshFailed = refreshedRepositories?.isEmpty == true
+        let degraded = !refreshFailures.isEmpty || !skippedRepositories.isEmpty
+        if refreshFailed { next = "No repository was fully refreshed. Retry the GitHub refresh before choosing an action." }
+        else if degraded { next = "GitHub refresh is incomplete. Retry before relying on the current action list." }
+        else if let first = needsUser.first { next = "Review \(first.repo)#\(first.number): \(first.title)" }
         else if let first = blocked.first { next = "Unblock \(first.repo)#\(first.number): \(first.title)" }
         else if let first = stale.first { next = "Triage stale \(first.kind) \(first.repo)#\(first.number): \(first.title)" }
         else { next = "No immediate GitHub action is required." }
         return GitHubConnectorActions.envelope("github.project_digest", fields: [
+            "ok": .bool(!refreshFailed),
+            "status": .string(refreshFailed ? "failed" : degraded ? "partial" : "completed"),
+            "freshness": .string(degraded || refreshFailed ? "degraded" : "current"),
+            "refreshedRepositories": refreshedRepositories.map { .array($0.map(JSONValue.string)) } ?? .null,
+            "refreshFailures": .object(refreshFailures.mapValues(JSONValue.string)),
+            "skippedRepositories": .array(skippedRepositories.map(JSONValue.string)),
             "project": .string(project), "refreshedAt": .string(refreshedAt),
             "mode": mode.map { .string($0.rawValue) } ?? .string("legacy"),
             "contributorLogin": contributorLogin.map(JSONValue.string) ?? .null,
@@ -633,7 +646,7 @@ private enum GitHubProjectTracker {
     static func loadConfig(dataRoot: URL) throws -> TrackingConfig {
         let path = configPath(dataRoot)
         guard let data = try? Data(contentsOf: path), let config = try? JSONValue.parse(data), let decoded = TrackingConfig.fromJSON(config) else {
-            throw GitHubConnectorError.invalidInput("GitHub project tracking is not configured. Run github_discover_tracking with a query or repository list first.")
+            throw GitHubConnectorError.invalidInput("GitHub project tracking is not configured. Use app {action: \"github.discover_tracking\"} with a query or repository list first.")
         }
         return decoded
     }
@@ -744,6 +757,7 @@ private enum GitHubProjectTracker {
         var completed: [String] = []
         var failed: [(repo: String, error: String)] = []
         var skippedForBudget: [String] = []
+        var unavailableObservations: Set<String> = []
 
         var isPartial: Bool { !failed.isEmpty || !skippedForBudget.isEmpty }
         /// Repos whose current-cycle work did not land, in either lane. Their
@@ -753,6 +767,7 @@ private enum GitHubProjectTracker {
 
         static func == (lhs: RepositoryPassOutcome, rhs: RepositoryPassOutcome) -> Bool {
             lhs.completed == rhs.completed
+                && lhs.unavailableObservations == rhs.unavailableObservations
                 && lhs.skippedForBudget == rhs.skippedForBudget
                 && lhs.failed.map(\.repo) == rhs.failed.map(\.repo)
                 && lhs.failed.map(\.error) == rhs.failed.map(\.error)
@@ -855,7 +870,7 @@ private enum GitHubProjectTracker {
             guard let contributor = config.contributorLogin,
                   contributor.caseInsensitiveCompare(actor) == .orderedSame else {
                 throw GitHubConnectorError.invalidInput(
-                    "GitHub contribution tracking is configured for a different account. Re-run github_discover_tracking with the authenticated contributor login."
+                    "GitHub contribution tracking is configured for a different account. Use app {action: \"github.discover_tracking\"} with the authenticated contributor login."
                 )
             }
             built = try await contributionEntities(
@@ -897,6 +912,17 @@ private enum GitHubProjectTracker {
             )
         }
         var sortedEntities = built.entities
+        let priorEntities = Dictionary((previous?.entities ?? []).map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+        sortedEntities = sortedEntities.map { entity in
+            var observed = entity
+            if ["closed", "merged"].contains(entity.state.lowercased()) {
+                observed.reopenedObservedAt = nil
+            } else if entity.state == "open", let prior = priorEntities[entity.key] {
+                observed.reopenedObservedAt = ["closed", "merged"].contains(prior.state.lowercased())
+                    ? entity.detailFetchedAt : prior.reopenedObservedAt
+            }
+            return observed
+        }
         sortedEntities.sort { $0.updatedAt > $1.updatedAt }
         let commandItems = (try await commandStore.liveState()).items
         let existingCommandIDs = Set(commandItems.map(\.itemId))
@@ -906,19 +932,18 @@ private enum GitHubProjectTracker {
         // 2026-09-22: dropping a repo from tracking left its items open in the
         // command feed forever (121 hermes-agent items after the switch to
         // User's repos). An open item from an untracked repo resolves here.
-        var untrackedClosures: [GitHubCommandObservation] = []
-        if config.mode == .repository {
-            let tracked = Set(config.repositories.map { $0.fullName.lowercased() })
-            untrackedClosures = commandItems.compactMap { item in
-                guard !item.state.isTerminal, !tracked.contains(item.repository.lowercased()) else { return nil }
-                return GitHubCommandObservation(
-                    repository: item.repository, number: item.number, kind: item.kind, title: item.title,
-                    isOpen: false, observedVersion: "untracked",
-                    finalReceipt: "\(item.repository) is no longer tracked."
-                )
-            }
+        let tracked = Set(config.repositories.map { $0.fullName.lowercased() })
+        let untrackedClosures: [GitHubCommandObservation] = commandItems.compactMap { item in
+            guard !item.state.isTerminal, !tracked.contains(item.repository.lowercased()) else { return nil }
+            return GitHubCommandObservation(
+                repository: item.repository, number: item.number, kind: item.kind, title: item.title,
+                isOpen: false, observedVersion: "untracked",
+                finalReceipt: "\(item.repository) is no longer tracked."
+            )
         }
         let observations = untrackedClosures + sortedEntities.compactMap { entity -> GitHubCommandObservation? in
+            guard !built.pass.unavailableObservations.contains(entity.key) else { return nil }
+            guard entity.reviewState != "not_expanded" else { return nil }
             guard let observation = entity.commandObservation else { return nil }
             // Contribution snapshots retain bounded closed PR history. Historical
             // closures are not newly tracked work; only open items, existing
@@ -950,7 +975,10 @@ private enum GitHubProjectTracker {
             newKeys: fresh,
             deskCreated: desk.created,
             deskUpdated: desk.updated,
-            deskArchived: desk.archived
+            deskArchived: desk.archived,
+            refreshedRepositories: built.pass.completed,
+            refreshFailures: Dictionary(built.pass.failed.map { ($0.repo, $0.error) }, uniquingKeysWith: { $0 + "; " + $1 }),
+            skippedRepositories: built.pass.skippedForBudget
         )
         let persistence = SwiftNativePersistenceCore()
         let path = snapshotPath(dataRoot)
@@ -967,35 +995,66 @@ private enum GitHubProjectTracker {
         dataRoot: URL
     ) async throws -> (entities: [TrackingEntity], detailFetched: Int, carriedForward: Int, pass: RepositoryPassOutcome) {
         var entities: [TrackingEntity] = []
-        var detailedPullRequests: [GitHubTrackedPullRequest] = []
-        var remainingPRBudget = 25
+        var candidates: [TrackingEntity] = []
+        let priorByKey = Dictionary(previousEntities.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+        var skippedDetails = Set<String>()
         // W6/L4-03: the issue-list call now throws INTO the per-repo isolator
         // instead of out of refresh(). A 404 on one archived/renamed repo used
         // to discard every other repo's rows for the whole tick.
-        let pass = await runRepositoryPass(config.repositories, budget: budget, name: \.fullName) { repo in
+        var pass = await runRepositoryPass(config.repositories, budget: budget, name: \.fullName) { repo in
             guard let rows = try await GitHubConnectorActions.call(
                 path: "repos/\(repo.fullName)/issues",
                 params: ["state": "all", "sort": "updated", "direction": "desc", "per_page": "100", "page": "1"],
                 dataRoot: dataRoot
-            ) as? [[String: Any]] else { return }
+            ) as? [[String: Any]] else {
+                throw GitHubConnectorError.invalidResponse("tracked issue list was not an array of objects")
+            }
             for row in rows {
                 let isPR = row["pull_request"] != nil
-                if isPR && remainingPRBudget > 0, let number = row["number"] as? Int {
-                    remainingPRBudget -= 1
-                    detailedPullRequests.append(GitHubTrackedPullRequest(
-                        repository: repo.fullName,
-                        number: number
-                    ))
-                } else if isPR, let entity = basicPREntity(row, repo: repo.fullName, staleHours: config.staleAfterHours) {
-                    entities.append(entity)
+                if isPR, let entity = basicPREntity(row, repo: repo.fullName, staleHours: config.staleAfterHours) {
+                    candidates.append(entity)
                 } else if !isPR, let entity = issueEntity(row, repo: repo.fullName, staleHours: config.staleAfterHours, actor: actor) {
                     entities.append(entity)
                 }
             }
+            // The latest page is not evidence that older tracked work closed.
+            let listedNumbers = Set(rows.compactMap { $0["number"] as? Int })
+            for prior in previousEntities where prior.repo.caseInsensitiveCompare(repo.fullName) == .orderedSame
+                && prior.state == "open" && !listedNumbers.contains(prior.number) {
+                if budget.isExhausted {
+                    skippedDetails.insert(repo.fullName)
+                    continue
+                }
+                if prior.kind == "pull_request" {
+                    candidates.append(prior)
+                } else {
+                    guard let row = try await GitHubConnectorActions.call(
+                        path: "repos/\(repo.fullName)/issues/\(prior.number)", dataRoot: dataRoot
+                    ) as? [String: Any],
+                          let entity = issueEntity(row, repo: repo.fullName, staleHours: config.staleAfterHours, actor: actor) else {
+                        throw GitHubConnectorError.invalidResponse("tracked issue was not an object")
+                    }
+                    entities.append(entity)
+                }
+            }
         }
-        // Thread evidence is a single batched GraphQL call for the whole pass.
-        // Degrade to the prior snapshot's evidence rather than failing the
-        // refresh: stale threads are recoverable next tick, a lost pass is not.
+        candidates = candidates.filter { pass.completed.contains($0.repo) }
+        candidates.sort {
+            // A prior-open row still needs its closure settled alongside open work.
+            let leftOpen = $0.state == "open" || priorByKey[$0.key]?.state == "open"
+            let rightOpen = $1.state == "open" || priorByKey[$1.key]?.state == "open"
+            if leftOpen != rightOpen { return leftOpen }
+            let left = priorByKey[$0.key]?.detailFetchedAt.flatMap(DeskClock.parseISO) ?? .distantPast
+            let right = priorByKey[$1.key]?.detailFetchedAt.flatMap(DeskClock.parseISO) ?? .distantPast
+            return left == right ? $0.key < $1.key : left < right
+        }
+        let detailedPullRequests = candidates.prefix(25).map {
+            GitHubTrackedPullRequest(repository: $0.repo, number: $0.number)
+        }
+        for entity in candidates.dropFirst(25) {
+            entities.append(priorByKey[entity.key] ?? entity)
+            skippedDetails.insert(entity.repo)
+        }
         let evidence: [String: [GitHubCommandReviewThreadEvidence]]
         do {
             evidence = try await GitHubConnectorActions.reviewThreadEvidence(
@@ -1004,23 +1063,34 @@ private enum GitHubProjectTracker {
                 dataRoot: dataRoot
             )
         } catch {
-            NSLog("[github-tracking] review-thread evidence failed, reusing prior: %@", error.localizedDescription)
-            evidence = previousReviewThreads
+            NSLog("[github-tracking] review-thread evidence failed, preserving observations: %@", error.localizedDescription)
+            evidence = [:]
+            for repository in Set(detailedPullRequests.map(\.repository)) {
+                pass.failed.append((repo: repository, error: error.localizedDescription))
+            }
         }
         var detailFetched = 0
         for pullRequest in detailedPullRequests {
-            if budget.isExhausted { break }
+            guard let threads = evidence[pullRequest.itemId] else {
+                pass.unavailableObservations.insert("\(pullRequest.repository.lowercased())#pr#\(pullRequest.number)")
+                continue
+            }
+            if budget.isExhausted {
+                skippedDetails.insert(pullRequest.repository)
+                continue
+            }
             do {
                 entities.append(try await detailedPREntity(
                     repo: pullRequest.repository,
                     number: pullRequest.number,
                     staleHours: config.staleAfterHours,
                     actor: actor,
-                    reviewThreads: evidence[pullRequest.itemId] ?? [],
+                    reviewThreads: threads,
                     dataRoot: dataRoot
                 ))
                 detailFetched += 1
             } catch {
+                pass.failed.append((repo: pullRequest.repository, error: error.localizedDescription))
                 // One unreachable PR is not a reason to lose the pass. Its prior
                 // row (if any) is carried forward with the rest below.
                 NSLog(
@@ -1029,6 +1099,9 @@ private enum GitHubProjectTracker {
                 )
             }
         }
+        pass.skippedForBudget = Array(Set(pass.skippedForBudget).union(skippedDetails)).sorted()
+        let degraded = Set(pass.degraded)
+        pass.completed.removeAll { degraded.contains($0) }
         let carried = carryForwardEntities(for: pass.degraded, from: previousEntities)
             .filter { prior in !entities.contains { $0.key == prior.key } }
         entities.append(contentsOf: carried)
@@ -1083,7 +1156,7 @@ private enum GitHubProjectTracker {
             NSLog("[github-tracking] mergeability evidence failed, preserving prior: %@", error.localizedDescription)
             mergeability = [:]
         }
-        let detailedPullRequests = repositoryRows.flatMap { entry in
+        var detailedPullRequests = repositoryRows.flatMap { entry in
             entry.authored.compactMap { row -> GitHubTrackedPullRequest? in
                 guard (row["state"] as? String) == "open",
                       let number = row["number"] as? Int else { return nil }
@@ -1105,6 +1178,12 @@ private enum GitHubProjectTracker {
                 )
             }
         }
+        let selectedRepositories = Set(config.repositories.map { $0.fullName.lowercased() })
+        let missingOpenPullRequests = priorOpenKeysMissing(from: previousEntities, freshKeys: freshPRKeys)
+            .filter { selectedRepositories.contains($0.repo.lowercased()) }
+        detailedPullRequests += missingOpenPullRequests.map {
+            GitHubTrackedPullRequest(repository: $0.repo, number: $0.number)
+        }
         let evidence: [String: [GitHubCommandReviewThreadEvidence]]
         do {
             evidence = try await GitHubConnectorActions.reviewThreadEvidence(
@@ -1113,8 +1192,8 @@ private enum GitHubProjectTracker {
                 dataRoot: dataRoot
             )
         } catch {
-            NSLog("[github-tracking] review-thread evidence failed, reusing prior: %@", error.localizedDescription)
-            evidence = previousReviewThreads
+            NSLog("[github-tracking] review-thread evidence failed, preserving observations: %@", error.localizedDescription)
+            evidence = [:]
         }
         // W6/L4-03 phase 2 — the detail fan-out, the expensive half. Same
         // isolation and same budget: a repository that 404s or runs the clock
@@ -1123,7 +1202,9 @@ private enum GitHubProjectTracker {
         let detailPass = await runRepositoryPass(repositoryRows, budget: budget, name: { $0.repository.fullName }) { entry in
             let (repo, authored, linkedNumbers) = entry
             for row in authored {
-                if budget.isExhausted { break }
+                if budget.isExhausted {
+                    throw GitHubConnectorError.invalidResponse("repository detail read stopped at the refresh budget")
+                }
                 guard let number = row["number"] as? Int else { continue }
                 let state = row["state"] as? String ?? "unknown"
                 if state == "open" {
@@ -1146,14 +1227,17 @@ private enum GitHubProjectTracker {
                         carriedForward += 1
                         continue
                     }
+                    guard let threads = evidence[
+                        GitHubCommandObservation.itemId(repository: repo.fullName, number: number)
+                    ] else {
+                        throw GitHubConnectorError.invalidResponse("Current review-thread evidence is unavailable for \(repo.fullName)#\(number).")
+                    }
                     let entity = try await detailedPREntity(
                         repo: repo.fullName,
                         number: number,
                         staleHours: config.staleAfterHours,
                         actor: contributor,
-                        reviewThreads: evidence[
-                            GitHubCommandObservation.itemId(repository: repo.fullName, number: number)
-                        ] ?? [],
+                        reviewThreads: threads,
                         mergeabilityEvidence: mergeability[
                             GitHubCommandObservation.itemId(repository: repo.fullName, number: number)
                         ],
@@ -1180,14 +1264,23 @@ private enum GitHubProjectTracker {
                     // must both still belong to the configured contributor.
                     guard entity.author?.caseInsensitiveCompare(contributor) == .orderedSame else { continue }
                     entities.append(entity)
-                } else if let entity = basicPREntity(row, repo: repo.fullName, staleHours: config.staleAfterHours) {
-                    // Closed authored PRs remain bounded snapshot history. They
-                    // are deliberately never created as current Desk work.
-                    entities.append(entity)
+                } else {
+                    let key = "\(repo.fullName.lowercased())#pr#\(number)"
+                    if let prior = priorByKey[key], ["closed", "merged"].contains(prior.state),
+                       prior.commandObservation != nil, prior.detailFetchedAt != nil,
+                       prior.updatedAt == row["updated_at"] as? String {
+                        entities.append(prior)
+                        carriedForward += 1
+                    } else {
+                        entities.append(try await closedPREntity(repo: repo.fullName, number: number, staleHours: config.staleAfterHours, dataRoot: dataRoot))
+                        detailFetched += 1
+                    }
                 }
             }
             for number in linkedNumbers.sorted() {
-                if budget.isExhausted { break }
+                if budget.isExhausted {
+                    throw GitHubConnectorError.invalidResponse("repository detail read stopped at the refresh budget")
+                }
                 let key = "\(repo.fullName.lowercased())#issue#\(number)"
                 if let carried = carriedForwardLinkedIssue(
                     prior: priorByKey[key],
@@ -1201,34 +1294,44 @@ private enum GitHubProjectTracker {
                     path: "repos/\(repo.fullName)/issues/\(number)",
                     dataRoot: dataRoot
                 ) as? [String: Any], row["pull_request"] == nil,
-                      let entity = issueEntity(row, repo: repo.fullName, staleHours: config.staleAfterHours, actor: contributor) else { continue }
+                      let entity = issueEntity(row, repo: repo.fullName, staleHours: config.staleAfterHours, actor: contributor) else {
+                    throw GitHubConnectorError.invalidResponse("linked issue was not an issue object")
+                }
                 entities.append(entity)
             }
         }
         // Contract 2c: a prior-open PR that vanished from search entirely (not even
         // returned as a closed history row) still needs its closure observed.
         // Detail-fetch it once so the merge/close settles instead of silently
-        // disappearing. Closed PRs still returned by search settle via basicPREntity.
+        // disappearing. Closed search rows receive an exact merge-evidence read.
         //
         // Budget-aware: an unsettled closure is carried forward as its prior
         // (still-open) row and retried next tick — strictly better than losing
         // the whole pass to the tick timeout while chasing it.
-        for prior in priorOpenKeysMissing(from: previousEntities, freshKeys: freshPRKeys) {
-            if budget.isExhausted { break }
+        var unsettled: [TrackingEntity] = []
+        for prior in missingOpenPullRequests {
+            if budget.isExhausted {
+                unsettled.append(prior)
+                continue
+            }
             do {
+                guard let threads = evidence[
+                    GitHubCommandObservation.itemId(repository: prior.repo, number: prior.number)
+                ] else {
+                    throw GitHubConnectorError.invalidResponse("Current review-thread evidence is unavailable for \(prior.repo)#\(prior.number).")
+                }
                 let entity = try await detailedPREntity(
                     repo: prior.repo,
                     number: prior.number,
                     staleHours: config.staleAfterHours,
                     actor: contributor,
-                    reviewThreads: previousReviewThreads[
-                        GitHubCommandObservation.itemId(repository: prior.repo, number: prior.number)
-                    ] ?? [],
+                    reviewThreads: threads,
                     dataRoot: dataRoot
                 )
                 detailFetched += 1
                 entities.append(entity)
             } catch {
+                unsettled.append(prior)
                 NSLog(
                     "[github-tracking] closure settle failed %@#%d: %@",
                     prior.repo, prior.number, error.localizedDescription
@@ -1241,11 +1344,21 @@ private enum GitHubProjectTracker {
         var pass = RepositoryPassOutcome(
             completed: searchPass.completed.filter { detailPass.completed.contains($0) },
             failed: searchPass.failed + detailPass.failed,
-            skippedForBudget: Array(Set(searchPass.skippedForBudget + detailPass.skippedForBudget)).sorted()
+            skippedForBudget: Array(Set(searchPass.skippedForBudget + detailPass.skippedForBudget)).sorted(),
+            unavailableObservations: Set(detailedPullRequests.filter { evidence[$0.itemId] == nil }.map {
+                "\($0.repository.lowercased())#pr#\($0.number)"
+            })
         )
         // A repo skipped in phase 1 never reached phase 2, so it is not in
         // detailPass at all — keep it named exactly once.
         pass.skippedForBudget = pass.skippedForBudget.filter { !pass.failed.map(\.repo).contains($0) }
+        for prior in unsettled {
+            if !pass.degraded.contains(prior.repo) {
+                pass.failed.append((repo: prior.repo, error: "prior open pull request could not be refreshed"))
+            }
+        }
+        let degraded = Set(pass.degraded)
+        pass.completed.removeAll { degraded.contains($0) }
         let carried = carryForwardEntities(for: pass.degraded, from: previousEntities)
         entities.append(contentsOf: carried)
         // Dedup keeps the FIRST row per key, and carried rows are appended last,
@@ -1270,6 +1383,20 @@ private enum GitHubProjectTracker {
             if pageRows.count < 100 { break }
         }
         return rows
+    }
+
+    private static func closedPREntity(
+        repo: String, number: Int, staleHours: Int, dataRoot: URL
+    ) async throws -> TrackingEntity {
+        guard let pull = try await GitHubConnectorActions.call(
+            path: "repos/\(repo)/pulls/\(number)", dataRoot: dataRoot
+        ) as? [String: Any], pull["state"] as? String == "closed",
+              pull["merged_at"] is String || pull["merged_at"] is NSNull,
+              var entity = basicPREntity(pull, repo: repo, staleHours: staleHours) else {
+            throw GitHubConnectorError.invalidResponse("closed pull request did not contain closure and merge evidence")
+        }
+        entity.detailFetchedAt = DeskClock.nowISO()
+        return entity
     }
 
     private static func detailedPREntity(
@@ -1375,10 +1502,7 @@ private enum GitHubProjectTracker {
         expectedIssueCommentIdentifier: String? = nil,
         expectedIssueCommentHeadSHA: String? = nil
     ) -> TrackingEntity {
-        let reviewState = GitHubCommandObservationBuilder.reviewState(
-            reviews,
-            reviewThreads: reviewThreads
-        )
+        let reviewState = GitHubCommandObservationBuilder.latestReviewState(reviews as? [[String: Any]] ?? [])
         let state = pull["merged_at"] is String ? "merged" : (pull["state"] as? String ?? "unknown")
         let updated = pull["updated_at"] as? String ?? ""
         let observation = GitHubCommandObservationBuilder.pullRequest(
@@ -1634,7 +1758,7 @@ private enum GitHubProjectTracker {
                 _ = try await store.addRef(item.handle, ref: ref)
                 _ = try await store.addRef(item.handle, ref: DeskRef(kind: .url(url: entity.url, title: entity.title)))
                 _ = try await store.setCadence(item.handle, cadence: Cadence(mode: .event, interval: "\(config.refreshIntervalMinutes)m", staleAfter: "\(config.staleAfterHours)h", refreshSources: ["github"]))
-                _ = try await store.setNotify(item.handle, policy: NotifyPolicy(level: .digest, on: ["state_change", "blocked", "unblocked", "user_next"], cooldown: "6h"))
+                _ = try await store.setNotify(item.handle, policy: NotifyPolicy(level: .digest, on: ["state_change", "blocked"], cooldown: "6h"))
                 if desiredStatus != .watch { _ = try await store.setStatus(item.handle, status: desiredStatus, blockedReason: entity.blocked ? "GitHub checks or review state are blocking progress." : nil, waitingOn: entity.needsUser ? "owner" : nil) }
                 created += 1
                 state = try await store.liveState()
@@ -1678,7 +1802,6 @@ private enum GitHubProjectTracker {
         store: SwiftNativeDeskStore,
         dataRoot: URL
     ) async {
-        guard !entities.isEmpty else { return }
         let now = Date()
         let observedAt = DeskClock.nowISO()
         let observations = entities.map { entity -> DeskObservedRef in
@@ -1699,7 +1822,8 @@ private enum GitHubProjectTracker {
                 // local clock can move (see `observationFingerprint`): an
                 // unchanged PR polled ten times records ten observations and
                 // zero changes, which is what lets the learner stretch.
-                fingerprint: entity.observationFingerprint
+                fingerprint: entity.observationFingerprint,
+                reopenedObservedAt: entity.reopenedObservedAt
             )
         }
 
@@ -1912,15 +2036,7 @@ private extension GitHubConnectorActions {
 
     static func derivedReviewState(_ raw: Any) -> String {
         guard let rows = raw as? [[String: Any]] else { return "review_required" }
-        var latest: [String: String] = [:]
-        for row in rows {
-            guard let user = (row["user"] as? [String: Any])?["login"] as? String, let state = row["state"] as? String else { continue }
-            latest[user] = state.uppercased()
-        }
-        if latest.values.contains("CHANGES_REQUESTED") { return "changes_requested" }
-        if latest.values.contains("APPROVED") { return "approved" }
-        if latest.values.contains("COMMENTED") { return "commented" }
-        return "review_required"
+        return GitHubCommandObservationBuilder.latestReviewState(rows)
     }
 
     static func boundedChecks(_ runs: Any, combinedStatus: Any) -> JSONValue {
@@ -1986,28 +2102,32 @@ private func issueEntity(_ row: [String: Any], repo: String, staleHours: Int, ac
 
 private func basicPREntity(_ row: [String: Any], repo: String, staleHours: Int) -> TrackingEntity? {
     guard let number = row["number"] as? Int else { return nil }
-    let state = row["state"] as? String ?? "unknown"
+    let merged = row["merged_at"] is String
+    let state = merged ? "merged" : (row["state"] as? String ?? "unknown")
     let updated = row["updated_at"] as? String ?? ""
-    let observation = GitHubCommandObservation(
+    let closureKnown = state != "open" && (row["merged_at"] is String || row["merged_at"] is NSNull)
+    let observation: GitHubCommandObservation? = closureKnown ? GitHubCommandObservation(
         repository: repo,
         number: number,
         kind: .pullRequest,
         title: row["title"] as? String ?? "Pull request #\(number)",
         isOpen: state == "open",
-        observedVersion: "\(updated)|\(state)|not_expanded",
+        isMerged: merged,
+        observedVersion: "\(updated)|\(state)",
         waitingKind: .maintainer,
         isStale: isStale(updated, hours: staleHours) && state == "open",
-        finalReceipt: state == "open" ? nil : "\(repo) #\(number) closed."
-    )
+        finalReceipt: "\(repo) #\(number) \(merged ? "merged" : "closed")."
+    ) : nil
     return TrackingEntity(
         key: "\(repo.lowercased())#pr#\(number)", repo: repo, number: number, kind: "pull_request",
         title: row["title"] as? String ?? "Pull request #\(number)", state: state, updatedAt: updated,
         url: row["html_url"] as? String ?? "https://github.com/\(repo)/pull/\(number)",
         author: (row["user"] as? [String: Any])?["login"] as? String,
-        reviewState: "not_expanded", checks: "not_expanded", mergeable: nil,
+        reviewState: closureKnown ? nil : "not_expanded", checks: closureKnown ? nil : "not_expanded", mergeable: nil,
         needsUser: false, blocked: false,
         stale: isStale(updated, hours: staleHours) && state == "open",
-        commandObservation: observation
+        commandObservation: observation,
+        detailFetchedAt: DeskClock.nowISO()
     )
 }
 

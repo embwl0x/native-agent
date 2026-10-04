@@ -74,12 +74,10 @@
 import Foundation
 import ProviderRouting
 import PersistenceCore
+import TrustCenter
 
-/// Error sentinels mirroring the daemon `_VisionClient.tts` / `multimodal_tts`
-/// failure strings, so a caller can surface the same user-facing messages on
-/// either path. Conforms to `LocalizedError` so the Mac caller's
-/// `error.localizedDescription` (VoiceOutputController.speakOpenAI) yields the
-/// daemon-equivalent text instead of a generic Swift enum description.
+/// Typed failures retain diagnostic details while `LocalizedError` supplies
+/// plain messages for the read-aloud UI.
 public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
     /// Trust Center denies `multimodalPolicy.tts_openai` (default OFF). Mirrors
     /// the daemon's `_multimodal_policy_check("tts_openai")` "[trust_denied]" path.
@@ -103,23 +101,21 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .trustDenied:
-            // Matches the retired daemon _multimodal_policy_check trust_denied string.
-            return "[trust_denied] Capability 'tts_openai' is disabled in Trust Center. "
-                + "To enable: POST /v1/trust with multimodalPolicy.tts_openai=true"
+            return "OpenAI read-aloud is disabled in Trust Center."
         case .notConfigured:
-            return "[tts_unavailable] No OpenAI API key found. "
+            return "OpenAI read-aloud needs an API key. "
                 + "Add one in Settings → Providers → OpenAI."
         case .authRejected:
-            return "[tts_auth_error] HTTP 401: API token rejected. "
+            return "OpenAI rejected the read-aloud API key. "
                 + "Check the key in Settings → Providers → OpenAI."
-        case .apiError(let status):
-            return "[tts_api_error] HTTP \(status)"
-        case .transport(let message):
-            return "[tts_error] \(message)"
+        case .apiError:
+            return "OpenAI could not create read-aloud audio. Try again later."
+        case .transport:
+            return "OpenAI read-aloud could not finish. Check your connection and try again."
         case .emptyText:
-            return "text is required"
+            return "There is no text to read aloud."
         case .routeHasNoSpeech(let route):
-            return "[tts_route_has_no_speech] \(route) offers no read-aloud voice."
+            return "\(route) offers no read-aloud voice."
         }
     }
 }
@@ -155,58 +151,32 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
     private let endpoint: URL
     private let apiKeyOverride: String?
     private let dataRoot: URL
-    private let persistence: any PersistenceCoreProtocol
 
     public init(
         model: String,
         session: URLSession = .shared,
         endpoint: URL = SwiftOpenAITTSClient.ttsURL,
         apiKeyOverride: String? = nil,
-        dataRoot: URL? = nil,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        dataRoot: URL? = nil
     ) {
         self.model = model
         self.session = session
         self.endpoint = endpoint
         self.apiKeyOverride = apiKeyOverride
         self.dataRoot = dataRoot ?? PersistenceCore.defaultDataRoot()
-        self.persistence = persistence
     }
 
-    /// Reproduces the daemon's `_multimodal_policy_check("tts_openai")`
-    ///. Reads `<dataRoot>/trust/policy.json` ->
-    /// `multimodalPolicy.tts_openai`, defaulting to FALSE (deny) when the file
-    /// is missing, the key is absent, or the value is non-bool — EXACTLY the
-    /// daemon's `defaults["tts_openai"] = False` semantics. This is the trust
-    /// gate the daemon runs BEFORE any TTS work; the native path must enforce it
-    /// too, or flipping `.multimodalTTS` ON would let a user whose Trust Center
-    /// has NOT enabled tts_openai (the default) bypass the gate. Path convention
-    /// pinned at the retired daemon `trust_path = root / "trust" / "policy.json"`.
-    ///
-    /// FAIL-CLOSED on malformed values: the daemon's Python `if not allowed`
-    /// truthiness would *accept* a malformed truthy value (the string "false",
-    /// the int 1, a non-empty list) for `tts_openai`; this Swift gate requires a
-    /// real JSON bool and DENIES anything else. That is intentionally STRICTER
-    /// and safer for a sensitive-capability trust gate — fail-closed is the
-    /// correct bias, and the Trust Center only ever writes a real bool, so no
-    /// well-formed policy differs. (gpt-5.5 review NIT, wave 35 W18.)
-    private func ttsOpenAIAllowed() async throws -> Bool {
-        let path = dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        let policy = try await persistence.readJSON(path, ifMissing: .object([:]))
-        guard case let .object(root) = policy,
-              case let .object(mm)? = root["multimodalPolicy"],
-              case let .bool(allowed)? = mm["tts_openai"] else {
-            return false
-        }
-        return allowed
+    /// Read the flag through canonical saved authority; damaged policies deny.
+    private func ttsOpenAIAllowed() -> Bool {
+        SavedTrustPolicyAuthority.flag(
+            block: "multimodalPolicy", key: "tts_openai", default: false, dataRoot: dataRoot
+        )
     }
 
     public func synthesize(text: String, voice: String, format: String) async throws -> Data {
         // Daemon runs _multimodal_policy_check("tts_openai") FIRST
         // — before empty-text/key/network. Default OFF.
-        guard try await ttsOpenAIAllowed() else { throw MultimodalTTSError.trustDenied }
+        guard ttsOpenAIAllowed() else { throw MultimodalTTSError.trustDenied }
 
         // Daemon: handler returns {"ok": false, "error": "text is required"} for
         // empty text BEFORE calling _vision_client.tts.

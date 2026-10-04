@@ -12,9 +12,15 @@ import PersistenceCore
 // seeds the baseline silently — a cold start must not blast pushes for PRs
 // approved long ago.
 public actor GitHubApprovalEdgeNotifier {
+    public enum DeliveryOutcome: Sendable {
+        case delivered
+        case previouslyHandled
+        case undelivered
+    }
+
     public typealias NotificationSender = @Sendable (
         _ eventId: String, _ title: String, _ body: String, _ userInfo: [String: String]
-    ) async throws -> Void
+    ) async throws -> DeliveryOutcome
 
     private let notificationSender: NotificationSender
 
@@ -25,6 +31,7 @@ public actor GitHubApprovalEdgeNotifier {
     private struct State: Codable {
         var seeded: Bool
         var reviewStates: [String: String]
+        var pendingApprovalIDs: [String: String]?
     }
 
     // Keyed by data root: a temp-root test run must never bleed cached state
@@ -67,7 +74,11 @@ public actor GitHubApprovalEdgeNotifier {
         }
 
         var state = load(dataRoot)
-        defer { save(state, dataRoot) }
+        state.pendingApprovalIDs = state.pendingApprovalIDs ?? [:]
+        defer {
+            do { try save(state, dataRoot) }
+            catch { NSLog("github_approval_notify: state save failed: \(error.localizedDescription)") }
+        }
 
         guard state.seeded else {
             state = State(seeded: true, reviewStates: open.mapValues(\.reviewState))
@@ -79,23 +90,32 @@ public actor GitHubApprovalEdgeNotifier {
         // re-ping every approved PR when the full snapshot returns (review
         // finding). Entries drop only when the snapshot explicitly shows the
         // PR closed/merged; a reopened PR then re-earns its edge.
-        for itemId in closed { state.reviewStates.removeValue(forKey: itemId) }
+        for itemId in closed {
+            state.reviewStates.removeValue(forKey: itemId)
+            state.pendingApprovalIDs?.removeValue(forKey: itemId)
+        }
         for (itemId, info) in open {
             let prior = state.reviewStates[itemId]?.lowercased()
             let isNewApproval = info.reviewState.lowercased() == "approved" && prior != "approved"
             if isNewApproval {
                 do {
+                    let approvalID = state.pendingApprovalIDs?[itemId] ?? UUID().uuidString
+                    state.pendingApprovalIDs?[itemId] = approvalID
+                    // Persist the transition before sending so a restart retries
+                    // the same delivery rather than creating another knock.
+                    try save(state, dataRoot)
                     // Item 26: news, not work (see the header) — informational,
                     // so it lands on the phone once and the card is the receipt.
-                    try await notificationSender(
-                        "pr_approved:\(itemId)",
+                    let outcome = try await notificationSender(
+                        "pr_approved:\(itemId):\(approvalID)",
                         "PR approved",
                         "\(info.title) (\(itemId)) was approved.",
                         [
                             "kind": "github_pr_approved",
-                            "dedupKey": "pr_approved+\(itemId)",
+                            "dedupKey": "pr_approved+\(itemId)+\(approvalID)",
                         ]
                     )
+                    if case .undelivered = outcome { continue }
                 } catch {
                     // The contract is "the phone gets the edge": keep the prior
                     // entry so the next cycle retries instead of losing the
@@ -104,6 +124,7 @@ public actor GitHubApprovalEdgeNotifier {
                     continue
                 }
             }
+            state.pendingApprovalIDs?.removeValue(forKey: itemId)
             state.reviewStates[itemId] = info.reviewState
         }
     }
@@ -119,14 +140,13 @@ public actor GitHubApprovalEdgeNotifier {
         return state
     }
 
-    private func save(_ state: State, _ dataRoot: URL) {
-        cached[dataRoot.standardizedFileURL.path] = state
+    private func save(_ state: State, _ dataRoot: URL) throws {
         let url = stateURL(dataRoot)
-        try? FileManager.default.createDirectory(
+        try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        if let data = try? JSONEncoder().encode(state) {
-            try? data.write(to: url, options: .atomic)
-        }
+        let data = try JSONEncoder().encode(state)
+        try data.write(to: url, options: .atomic)
+        cached[dataRoot.standardizedFileURL.path] = state
     }
 }

@@ -169,7 +169,7 @@ public enum KnowledgeGraphReadProjection {
             kind: graphString(object["type"]) ?? graphString(object["kind"]),
             confidence: graphDouble(object["confidence"]),
             mentions: {
-                let value = graphInt(object["mentions"])
+                let value = graphInt(object["mention_count"])
                 return value == 0 ? nil : value
             }(),
             sourceNodeIds: {
@@ -178,7 +178,7 @@ public enum KnowledgeGraphReadProjection {
                 let camel = graphStringArray(object["sourceNodeIds"])
                 return camel.isEmpty ? nil : camel
             }(),
-            updatedAt: graphString(object["updated_at"]) ?? graphString(object["updatedAt"])
+            updatedAt: graphString(object["last_seen"])
         )
     }
 

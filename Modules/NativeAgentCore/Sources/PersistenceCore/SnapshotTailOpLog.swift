@@ -332,7 +332,7 @@ public enum SnapshotTailOpLog {
     }
 
     /// Atomic snapshot-BEFORE-truncate. Writes the compaction base first (via
-    /// `writeJSON`'s temp+rename, so readers never see a partial base), THEN
+    /// the durable writer's full flush + rename), THEN
     /// rewrites the op-log to exactly `tailRows`. Desk passes an EMPTY tail;
     /// GitHubCommand and TaskLedger pass the kept newest-K. The caller must hold
     /// the ops flock.
@@ -343,7 +343,13 @@ public enum SnapshotTailOpLog {
         opsPath: URL,
         persistence: any PersistenceCoreProtocol
     ) async throws {
-        try await persistence.writeJSON(baseJSON, to: basePath)
-        try await persistence.replaceJSONL(tailRows, to: opsPath)
+        let baseData = try baseJSON.serializedData(pretty: true)
+        var tailData = Data()
+        for row in tailRows {
+            tailData.append(contentsOf: try row.serialize(pretty: false).utf8)
+            tailData.append(0x0A)
+        }
+        try await persistence.writeDataAtomicDurable(baseData, to: basePath)
+        try await persistence.writeDataAtomicDurable(tailData, to: opsPath)
     }
 }

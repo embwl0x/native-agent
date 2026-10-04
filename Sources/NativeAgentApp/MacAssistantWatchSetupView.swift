@@ -43,8 +43,8 @@ struct MacAssistantWatchSetupView: View {
     @Environment(AppModel.self) private var appModel
     @State private var readState = MacAssistantWatchSetupReadState()
     /// The last Check Mail result. The status read has no Mail source of its
-    /// own (it can only say "not checked yet"), so the check's real outcome
-    /// is what the Mac Mail row shows once it has run.
+    /// own (it can only say "not checked yet"). Current access failures still
+    /// override this cached outcome.
     @State private var mailCheck: (status: String, word: String, next: String?)?
     @State private var isCheckingMail = false
 
@@ -182,7 +182,7 @@ struct MacAssistantWatchSetupView: View {
     private func accessRow(_ item: MacAssistantAccessItem) -> some View {
         let plain = Self.plainAccess[item.id]
         let title = plain?.title ?? item.title
-        let check = item.id == "local_mail" ? mailCheck : nil
+        let check = item.id == "local_mail" && ["probe_needed", "ready"].contains(item.status) ? mailCheck : nil
         let status = check?.status ?? item.status
         let notConnected = item.nextStep == "Configure connector proof in the NativeAgent app"
         // The macOS prompt note matters only until access is ready.

@@ -147,8 +147,8 @@ async function readCanonicalTurnResult(client, threadId, turnId, config, eventTu
       if (fromThread) {
         // The app-server marks provider-failed turns "completed" with no
         // items, which reads as an unknown outcome. The rollout's
-        // task_complete row carries the actual error — let its failed
-        // verdict override the ambiguous no-reply classification.
+        // task_complete row carries the actual outcome — let its terminal
+        // result override the ambiguous no-reply classification.
         // A different app-server can hydrate a completed resumed turn as
         // interrupted. Its exact durable terminal event wins over that view;
         // retained answer text by itself never establishes completion.
@@ -168,11 +168,19 @@ async function readCanonicalTurnResult(client, threadId, turnId, config, eventTu
               fromRollout = extractTurnResultFromRollout(livePath, turnId);
             }
           }
-          if (fromRollout && (fromRollout.status === "failed" || fromThread.status === "aborted")) {
-            return fromRollout;
-          }
+          if (fromRollout) return fromRollout;
         }
-        return fromThread;
+        const activity = rolloutPath
+          ? extractTurnResultFromRollout(rolloutPath, turnId, { includeNonTerminal: true }) : null;
+        return {
+          ...fromThread,
+          toolActivityCount: activity && (activity.status !== "in_flight" || activity.sawTurnStart)
+            ? activity.toolActivityCount : null,
+          noWorkObserved: activity && activity.status === "in_flight"
+            ? (activity.sawTurnStart ? activity.toolActivityCount === 0 && !activity.hasMessage : null)
+            : activity ? activity.noWorkObserved ?? null : null,
+          connectorDiagnostics: activity ? activity.connectorDiagnostics || null : null,
+        };
       }
     } catch {
       // The rollout is the durable repair path when the app-server connection
@@ -271,7 +279,7 @@ function forwardTurnLive(client, threadId, turnId, live) {
   });
 }
 
-async function waitForTurnResultEventFirst(threadId, turnId, config, client = null, windowMs = null, live = null) {
+async function waitForTurnResultEventFirst(threadId, turnId, config, client = null, windowMs = null, live = null, onObservation = null) {
   const timeoutMs = numberSetting(
     config,
     "replyWaitTimeoutMs",
@@ -296,7 +304,8 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
   if (live && client) {
     try { await client.request("thread/resume", { threadId, excludeTurns: true }); } catch {}
   }
-  while (Date.now() < deadline) {
+  // Always close the registration race, even if resuming consumed the window.
+  do {
     // Register both exact event sources before rereading canonical truth. A
     // completion racing registration is therefore caught by the initial read.
     const waiter = createTurnCompletionEventWaiter(
@@ -315,6 +324,10 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
       waiter.close();
       return { ...initial, waitSource: "initial_canonical_read" };
     }
+    if (onObservation) {
+      try { await onObservation(); }
+      catch (error) { waiter.close(); throw error; }
+    }
 
     const event = await waiter.promise;
     if (event.source === "exact_timeout") break;
@@ -330,7 +343,7 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
     if (result) return { ...result, waitSource: event.source };
     // A file edge may precede the terminal line becoming visible. Re-arm the
     // event sources and close that race with another canonical read; never poll.
-  }
+  } while (Date.now() < deadline);
   } finally { stopLive(); }
 
   return {
@@ -343,7 +356,7 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
   };
 }
 
-async function waitForTurnResult(threadId, turnId, config, windowMs = null, live = null) {
+async function waitForTurnResult(threadId, turnId, config, windowMs = null, live = null, onObservation = null) {
   const requestTimeoutMs = numberSetting(
     config,
     "requestTimeoutMs",
@@ -357,7 +370,7 @@ async function waitForTurnResult(threadId, turnId, config, windowMs = null, live
     // The vnode-backed durable rollout path still provides event-first repair.
   }
   try {
-    return await waitForTurnResultEventFirst(threadId, turnId, config, client, windowMs, live);
+    return await waitForTurnResultEventFirst(threadId, turnId, config, client, windowMs, live, onObservation);
   } finally {
     if (client) client.close();
   }
@@ -371,7 +384,7 @@ async function waitForTurnResultWithEmptyRetry(job, config, options = {}) {
   const threadId = job.threadId;
   const turnId = job.turnId;
   const wait = options.waitForTurnResult || waitForTurnResult;
-  const turnResult = await wait(threadId, turnId, config, options.windowMs || null, options.live || null);
+  const turnResult = await wait(threadId, turnId, config, options.windowMs || null, options.live || null, options.onObservation || null);
   return { threadId, turnId, turnResult, attempts: [{ threadId, turnId, turnResult }] };
 }
 
@@ -394,8 +407,8 @@ function stallSnapshotsEqual(a, b) {
 
 /// Ask the app-server whether it still claims this turn is running. Distinct
 /// outcomes matter: an unreachable server or a turn missing from its thread
-/// can never produce a terminal row, while a claimed-inProgress turn gets the
-/// benefit of the doubt for one extra window.
+/// can never produce a terminal row, while any found turn without an authoritative
+/// terminal result gets the longer bounded wait, including unloaded interruptions.
 async function probeTurnLiveness(threadId, turnId, config) {
   const probeTimeoutMs = numberSetting(
     config,
@@ -471,12 +484,33 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     // threshold. Rollout vnode edges still wake the inner waiter earlier; the
     // post-wait stat below then observes the new mtime and rearms from it.
     const beforeWait = snapshotFn(job.threadId, config);
+    const priorProbe = job.stallProbe && job.stallProbe.lastProbe;
+    const nextIdleThresholdMs = priorProbe && priorProbe.serverReachable && priorProbe.turnFound
+      ? stallWedgedIdleMs : Math.min(stallIdleMs, hangWatchdogMs);
     const watchdogRemainingMs = beforeWait && Number.isFinite(beforeWait.mtimeMs)
-      ? Math.max(1, beforeWait.mtimeMs + hangWatchdogMs - nowFn())
-      : hangWatchdogMs;
+      ? Math.max(1, beforeWait.mtimeMs + nextIdleThresholdMs - nowFn())
+      : judgingWindowMs;
     const waitOptions = {
       ...options,
       windowMs: Math.min(judgingWindowMs, watchdogRemainingMs),
+      onObservation: async () => {
+        const snapshot = snapshotFn(job.threadId, config);
+        const prior = job.stallProbe;
+        if (prior && stallSnapshotsEqual(prior.rolloutSnapshot, snapshot)) return;
+        const activity = snapshot
+          ? extractTurnResultFromRollout(snapshot.path, job.turnId, { includeNonTerminal: true }) : null;
+        job.stallProbe = {
+          rolloutSnapshot: snapshot,
+          stagnantWindows: 0,
+          toolActivityCount: activity && activity.sawTurnStart ? activity.toolActivityCount : null,
+          noWorkObserved: activity && activity.sawTurnStart
+            ? activity.toolActivityCount === 0 && !activity.hasMessage : null,
+          idleThresholdMs: stallWedgedIdleMs,
+          observedAt: nowISO(),
+        };
+        await onTimeout({ threadId: job.threadId, turnId: job.turnId,
+          turnResult: { waitSource: "rollout_observation" } });
+      },
     };
     const observed = await waitForTurnResultWithEmptyRetry(job, config, waitOptions);
     if (observed.turnResult.status !== "timeout") return observed;
@@ -492,45 +526,15 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     const idleMs = currentSnapshot && Number.isFinite(currentSnapshot.mtimeMs)
       ? Math.max(0, nowFn() - currentSnapshot.mtimeMs)
       : null;
-    if (currentSnapshot && idleMs >= hangWatchdogMs) {
-      const activity = extractTurnResultFromRollout(
-        currentSnapshot.path,
-        observed.turnId,
-        { includeNonTerminal: true }
-      );
-      if (activity && activity.status === "in_flight" && activity.sawTurnStart) {
-        const declaredAt = new Date(nowFn()).toISOString();
-        const lastWriteAt = new Date(currentSnapshot.mtimeMs).toISOString();
-        const receipt = {
-          turnId: observed.turnId,
-          rolloutPath: currentSnapshot.path,
-          lastWriteAt,
-          declaredAt,
-        };
-        const receiptsPath = await appendHangWatchdogReceipt(receipt, config);
-        return {
-          ...observed,
-          turnResult: {
-            ...observed.turnResult,
-            status: "failed_hung",
-            reason: "failed-hung",
-            completedAt: declaredAt,
-            rolloutPath: currentSnapshot.path,
-            waitSource: "hang_watchdog",
-            errorMessage: `hang_watchdog: rollout unchanged for ${Math.round(idleMs)} ms`,
-            noWorkObserved: activity.toolActivityCount === 0 && !activity.hasMessage,
-            toolActivityCount: activity.toolActivityCount,
-            connectorDiagnostics: activity.connectorDiagnostics || null,
-            hangEvidence: {
-              ...receipt,
-              idleMs,
-              idleThresholdMs: hangWatchdogMs,
-              receiptsPath,
-            },
-          },
-        };
-      }
+    const activity = currentSnapshot
+      ? extractTurnResultFromRollout(currentSnapshot.path, observed.turnId, { includeNonTerminal: true })
+      : null;
+    if (activity && activity.status !== "in_flight") {
+      return { ...observed, turnResult: activity };
     }
+    const toolActivityCount = activity && activity.sawTurnStart ? activity.toolActivityCount : null;
+    const noWorkObserved = activity && activity.sawTurnStart
+      ? activity.toolActivityCount === 0 && !activity.hasMessage : null;
     const prior = job.stallProbe || null;
     let effectiveStagnant;
     if (!prior) {
@@ -549,7 +553,7 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
       4
     ));
     // Idle-time gates when the rollout is discoverable; window counts otherwise.
-    const idleReady = idleMs != null ? idleMs >= stallIdleMs : effectiveStagnant >= 1;
+    const idleReady = idleMs != null ? idleMs >= Math.min(stallIdleMs, hangWatchdogMs) : effectiveStagnant >= 1;
     const wedgedReady = idleMs != null
       ? idleMs >= stallWedgedIdleMs
       : effectiveStagnant >= wedgedWindows;
@@ -572,24 +576,41 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
         }
         liveness = confirm;
       }
-      const wedgedInProgress = liveness.turnClaimsInProgress && wedgedReady;
-      if (deadLiveness || wedgedInProgress) {
-        const rolloutPath = currentSnapshot ? currentSnapshot.path : null;
-        const activity = rolloutPath
-          ? extractTurnResultFromRollout(rolloutPath, observed.turnId, { includeNonTerminal: true })
+      const wedgedLiveness = !deadLiveness && wedgedReady;
+      if (deadLiveness || wedgedLiveness) {
+        // The confirmation wait can race a tool result or terminal write.
+        // Reconcile the exact turn and require the same rollout before repair.
+        const confirmedSnapshot = snapshotFn(observed.threadId, config);
+        const reconciled = confirmedSnapshot
+          ? extractTurnResultFromRollout(confirmedSnapshot.path, observed.turnId, { includeNonTerminal: true })
           : null;
-        const inFlight = activity && activity.status === "in_flight" ? activity : null;
-        const noWorkObserved = !inFlight || !inFlight.sawTurnStart
-          ? null
-          : (inFlight.toolActivityCount === 0 && !inFlight.hasMessage);
+        if (reconciled && reconciled.status !== "in_flight") return { ...observed, turnResult: reconciled };
+        if (!stallSnapshotsEqual(currentSnapshot, confirmedSnapshot)) continue;
+        const rolloutPath = currentSnapshot ? currentSnapshot.path : null;
+        const failedHung = Boolean(activity && activity.sawTurnStart && idleMs >= hangWatchdogMs);
+        const detectedAt = new Date(nowFn()).toISOString();
+        const hangEvidence = failedHung ? {
+          turnId: observed.turnId,
+          rolloutPath,
+          lastWriteAt: new Date(currentSnapshot.mtimeMs).toISOString(),
+          declaredAt: detectedAt,
+          idleMs,
+          idleThresholdMs: wedgedLiveness ? stallWedgedIdleMs : hangWatchdogMs,
+          toolActivityCount,
+          noWorkObserved,
+        } : null;
+        if (hangEvidence) hangEvidence.receiptsPath = await appendHangWatchdogReceipt(hangEvidence, config);
         return {
           ...observed,
           turnResult: {
             ...observed.turnResult,
-            status: "stalled",
+            status: failedHung ? "failed_hung" : "stalled",
+            completedAt: detectedAt,
+            message: activity ? activity.message || "" : "",
+            hangEvidence,
             noWorkObserved,
-            toolActivityCount: inFlight ? inFlight.toolActivityCount : null,
-            connectorDiagnostics: inFlight ? inFlight.connectorDiagnostics || null : null,
+            toolActivityCount,
+            connectorDiagnostics: activity ? activity.connectorDiagnostics || null : null,
             stallEvidence: {
               stagnantWindows: effectiveStagnant,
               rolloutPath,
@@ -597,13 +618,13 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
               turnFound: liveness.turnFound,
               turnClaimsInProgress: liveness.turnClaimsInProgress,
               idleMs,
-              idleThresholdMs: liveness.turnClaimsInProgress && !(!liveness.serverReachable || !liveness.turnFound)
+              idleThresholdMs: liveness.serverReachable && liveness.turnFound
                 ? stallWedgedIdleMs
-                : stallIdleMs,
+                : Math.min(stallIdleMs, hangWatchdogMs),
               lastActivityAt: currentSnapshot && Number.isFinite(currentSnapshot.mtimeMs)
                 ? new Date(currentSnapshot.mtimeMs).toISOString()
                 : null,
-              detectedAt: nowISO(),
+              detectedAt,
             },
           },
         };
@@ -613,6 +634,9 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
       rolloutSnapshot: currentSnapshot,
       stagnantWindows: effectiveStagnant,
       lastProbe: liveness,
+      toolActivityCount,
+      noWorkObserved,
+      idleThresholdMs: stallWedgedIdleMs,
       observedAt: nowISO(),
     };
     await onTimeout(observed);
@@ -632,333 +656,4 @@ return {
 };
 }
 
-function createClaudeTurnObservation({
-  KILL_GRACE_MS,
-  STALL_SAMPLE_MS,
-  STDERR_CAP,
-  STDOUT_CAP,
-  envNumber,
-  processTreePids,
-  redactDiagnosticText,
-  spawn,
-  tail
-}) {
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-
-/// Exact canonical transcript path for one Claude session. Claude derives its
-/// project directory by replacing non path-name characters in the absolute cwd
-/// with `-`; the explicit path override is a narrow end-to-end test seam.
-function claudeTranscriptPath(cwd, sessionId) {
-  const override = process.env.NATIVE_AGENT_CLAUDE_WAKE_TRANSCRIPT_PATH;
-  if (override) return override;
-  const safeId = path.basename(String(sessionId || ""));
-  if (!safeId || safeId !== String(sessionId || "")) return null;
-  const projectKey = path.resolve(cwd).replace(/[^A-Za-z0-9_-]/g, "-");
-  const projectsRoot = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_PROJECTS_DIR ||
-    path.join(os.homedir(), ".claude", "projects");
-  return path.join(projectsRoot, projectKey, `${safeId}.jsonl`);
-}
-
-/// Read only filesystem metadata: transcript contents can contain secrets and
-/// never belong in a liveness record. `missing` means no canonical movement has
-/// appeared; `unreadable` means the observer lacks evidence and must fail open
-/// to the hard deadline rather than kill on uncertainty.
-function transcriptSnapshot(cwd, sessionId) {
-  const file = claudeTranscriptPath(cwd, sessionId);
-  if (!file) return { state: "unreadable" };
-  try {
-    const stat = fs.statSync(file);
-    return { state: "present", path: file, bytes: stat.size, mtimeMs: stat.mtimeMs };
-  } catch (error) {
-    return error && error.code === "ENOENT"
-      ? { state: "missing", path: file }
-      : { state: "unreadable", path: file };
-  }
-}
-
-class TranscriptProgress {
-  constructor() {
-    this.last = null;
-  }
-
-  observe(snapshot) {
-    if (!snapshot || snapshot.state !== "present") return null;
-    const advanced = this.last == null
-      || snapshot.bytes !== this.last.bytes
-      || snapshot.mtimeMs !== this.last.mtimeMs;
-    this.last = snapshot;
-    return { advanced, bytes: snapshot.bytes, mtimeMs: snapshot.mtimeMs };
-  }
-}
-
-/// Parse `ps -o time=` ("MM:SS.ss", "HH:MM:SS", "D-HH:MM:SS") to milliseconds.
-function parseCpuTimeMs(raw) {
-  const text = String(raw || "").trim();
-  if (!text) return 0;
-  let days = 0;
-  let rest = text;
-  const dash = text.indexOf("-");
-  if (dash > 0) {
-    days = Number(text.slice(0, dash)) || 0;
-    rest = text.slice(dash + 1);
-  }
-  const parts = rest.split(":").map((p) => Number(p));
-  if (parts.some((p) => !Number.isFinite(p))) return 0;
-  let seconds = 0;
-  for (const part of parts) seconds = seconds * 60 + part;
-  return (days * 86400 + seconds) * 1000;
-}
-
-/// Spawn `claude -p` and settle EXACTLY once. Four racers can finish this
-/// run — the exit handler, the deadline watchdog, the stall watchdog, and a
-/// spawn error — and any double-settle would double-post a completion to the agent.
-function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallSeconds, onProgress, live, messageId }) {
-  return new Promise((resolve) => {
-    const started = Date.now();
-    const binOverride = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN;
-    const command = binOverride || "/usr/bin/env";
-    // the user, 2026-09-04: a wake session is a worker, and workers run Opus 5.
-    const model = process.env.NATIVE_AGENT_CLAUDE_WAKE_MODEL || "claude-opus-5-5";
-    // 2026-09-25: when the app is listening, stream events so the reply shows
-    // as it is written. The reply is still exactly the CLI's final result
-    // (the `result` event's text, which plain -p prints); a stdout that is not
-    // stream-json falls back to the raw text as before.
-    const streamJSON = Boolean(live) && process.env.NATIVE_AGENT_WAKE_LIVE === "1"
-      && process.env.NATIVE_AGENT_CLAUDE_WAKE_STREAM !== "0";
-    const streamArgs = streamJSON ? ["--output-format", "stream-json", "--verbose", "--include-partial-messages"] : [];
-    const args = binOverride
-      ? [...sessionArgs, ...streamArgs, "-p", prompt, "--model", model]
-      : ["claude", ...sessionArgs, ...streamArgs, "-p", prompt, "--model", model];
-
-    let settled = false;
-    let timedOut = false;
-    let stalled = false;
-    let killTimer = null;
-    let timeoutTimer = null;
-    let stallTimer = null;
-    let stdoutText = "";
-    let stderrText = "";
-    // Set once a stream-json event is seen: { result, message, said }.
-    // result stays null until a `result` event arrives ("" is an empty result).
-    let stream = null;
-    let lineBuffer = "";
-    const onStreamLine = (line) => {
-      let event;
-      try { event = JSON.parse(line); } catch { return; }
-      if (!event || typeof event !== "object" || typeof event.type !== "string") return;
-      if (!stream) stream = { result: null, message: "", said: "" };
-      if (event.type === "result") {
-        if (typeof event.result === "string") stream.result = event.result;
-        return;
-      }
-      // A subagent's own stream is not this reply.
-      if (event.parent_tool_use_id) { live.activity(); return; }
-      if (event.type === "stream_event" && event.event) {
-        const inner = event.event;
-        if (inner.type === "message_start") stream.message = "";
-        else if (inner.type === "content_block_delta" && inner.delta && inner.delta.type === "text_delta"
-          && typeof inner.delta.text === "string") {
-          stream.message += inner.delta.text;
-          live.partial(stream.message);
-        } else live.activity();
-        return;
-      }
-      if (event.type === "assistant" && event.message && Array.isArray(event.message.content)) {
-        for (const block of event.message.content) {
-          if (block && block.type === "tool_use" && typeof block.name === "string") live.note(`Using ${block.name}`);
-          if (block && block.type === "text" && typeof block.text === "string" && block.text) {
-            // Bounded fallback for a run that ends without a `result`.
-            stream.said = `${stream.said}${stream.said ? "\n\n" : ""}${block.text}`.slice(-STDOUT_CAP);
-            stream.message = "";
-          }
-        }
-      }
-    };
-
-    const settle = (extra) => {
-      if (settled) return;
-      settled = true;
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (killTimer) clearTimeout(killTimer);
-      if (stallTimer) clearInterval(stallTimer);
-      if (lineBuffer.trim()) onStreamLine(lineBuffer);
-      resolve({
-        durationMs: Date.now() - started,
-        // No `result` (killed, crashed, interrupted): keep what it had said,
-        // as the plain path kept its stdout. An empty result stays empty.
-        stdout: !stream ? stdoutText
-          : stream.result !== null ? stream.result
-          : `${stream.said}${stream.said && stream.message ? "\n\n" : ""}${stream.message}`.slice(-STDOUT_CAP),
-        stderr: stderrText,
-        timedOut,
-        stalled,
-        command,
-        args: binOverride ? args : args.slice(0, args.length - 1),
-        ...extra,
-      });
-    };
-
-    let child;
-    try {
-      // The wake's own message id, so Claude's inbox hook in this session can
-      // mark just that row read and leave the rest for the sessions they are for.
-      const env = messageId ? { ...process.env, NATIVE_AGENT_CLAUDE_WAKE_MESSAGE_ID: messageId } : process.env;
-      child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
-    } catch (error) {
-      settle({ exitCode: null, signal: null, spawnError: String((error && error.message) || error) });
-      return;
-    }
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      if (!stream && stdoutText.length < STDOUT_CAP) stdoutText += chunk;
-      if (!streamJSON) return;
-      lineBuffer += chunk;
-      let newline;
-      while ((newline = lineBuffer.indexOf("\n")) >= 0) {
-        const line = lineBuffer.slice(0, newline);
-        lineBuffer = lineBuffer.slice(newline + 1);
-        if (line.trim()) onStreamLine(line);
-      }
-      // One event line is never this large; drop rather than grow unbounded.
-      if (lineBuffer.length > STDOUT_CAP * 8) lineBuffer = "";
-    });
-    child.stderr.on("data", (chunk) => {
-      if (stderrText.length < STDERR_CAP) stderrText += chunk;
-    });
-
-    child.on("error", (error) => {
-      settle({ exitCode: null, signal: null, spawnError: String((error && error.message) || error) });
-    });
-    child.on("close", (code, signal) => {
-      settle({ exitCode: code, signal: signal || null });
-    });
-
-    // Both watchdogs escalate identically: SIGTERM, then SIGKILL after the
-    // grace window, so a child that ignores TERM still provably dies.
-    const killChild = () => {
-      // Snapshot the tree BEFORE signalling: after SIGTERM the root may be
-      // gone and its orphaned descendants un-enumerable, but those are exactly
-      // the ones holding the stdout pipe open.
-      const treePids = processTreePids(child.pid).filter(
-        (pid) => pid !== process.pid && pid !== child.pid
-      );
-      const signalTree = (signal) => {
-        for (const pid of treePids) {
-          try { process.kill(pid, signal); } catch {}
-        }
-        try { child.kill(signal); } catch {}
-      };
-      signalTree("SIGTERM");
-      killTimer = setTimeout(() => { signalTree("SIGKILL"); }, KILL_GRACE_MS);
-      if (killTimer.unref) killTimer.unref();
-    };
-
-    timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      killChild();
-    }, timeoutSeconds * 1000);
-    if (timeoutTimer.unref) timeoutTimer.unref();
-
-    // Stall watchdog. Progress is canonical Claude transcript movement. Any
-    // append resets the clock even when the child is blocked and burns no CPU.
-    const stallMs = Number(stallSeconds) > 0 ? Number(stallSeconds) * 1000 : 0;
-    if (stallMs > 0) {
-      const progress = new TranscriptProgress();
-      const first = transcriptSnapshot(cwd, sessionId);
-      if (first.state === "present") progress.observe(first);
-      let lastAdvanceAt = Date.now();
-      let observationReadable = first.state !== "unreadable";
-      const sampleMs = Math.max(
-        250,
-        Math.min(envNumber("NATIVE_AGENT_CLAUDE_WAKE_STALL_SAMPLE_MS", STALL_SAMPLE_MS), stallMs)
-      );
-      stallTimer = setInterval(() => {
-        if (settled) return;
-        const snapshot = transcriptSnapshot(cwd, sessionId);
-        if (snapshot.state === "unreadable") {
-          observationReadable = false;
-          return;
-        }
-        observationReadable = true;
-        const sample = progress.observe(snapshot);
-        if (sample && sample.advanced) {
-          lastAdvanceAt = Date.now();
-          if (typeof onProgress === "function") {
-            try {
-              onProgress({
-                transcriptBytes: sample.bytes,
-                transcriptMtimeMs: sample.mtimeMs,
-                at: new Date(lastAdvanceAt).toISOString(),
-              });
-            } catch {}
-          }
-          return;
-        }
-        if (observationReadable && Date.now() - lastAdvanceAt >= stallMs) {
-          // If the deadline already fired, that is the true cause; a transcript-
-          // silent child in the 2s kill grace must not be relabelled a stall.
-          if (timedOut) { clearInterval(stallTimer); return; }
-          stalled = true;
-          clearInterval(stallTimer);
-          killChild();
-        }
-      }, sampleMs);
-      if (stallTimer.unref) stallTimer.unref();
-    }
-  });
-}
-
-/// Honest classification. Every observable outcome maps to exactly one status;
-/// there is no "unknown" bucket and no state where a completed run is reported
-/// as anything but what the exit code and stdout actually said.
-function classify(run, timeoutSeconds, stallSeconds) {
-  const reply = String(run.stdout || "").trim();
-  const stderrTail = tail(run.stderr, 2000);
-  const base = {
-    exitCode: run.exitCode,
-    signal: run.signal || null,
-    durationMs: run.durationMs,
-    reply,
-    stderrTail,
-    // Threaded through so receipts and completion text can distinguish "the
-    // watchdog killed a confirmed-dead runner" from other failures. classify
-    // only ever runs after the child's close event — death is proven, not
-    // assumed.
-    timedOut: run.timedOut === true,
-    // Kept separate from timedOut: "ran the full hour" and "went dark for ten
-    // minutes" are different diagnoses and must not be reported as one.
-    stalled: run.stalled === true,
-  };
-  if (run.spawnError) {
-    return { ...base, status: "failed", reason: "claude_spawn_failed", detail: redactDiagnosticText(run.spawnError) };
-  }
-  if (run.stalled) {
-    return { ...base, status: "failed", reason: `stalled_after_${stallSeconds}s` };
-  }
-  if (run.timedOut) {
-    return { ...base, status: "failed", reason: `timeout_after_${timeoutSeconds}s` };
-  }
-  if (run.exitCode !== 0) {
-    return { ...base, status: "failed", reason: `claude_exit_${run.exitCode == null ? "null" : run.exitCode}` };
-  }
-  if (reply === "") {
-    return { ...base, status: "completed_without_reply", reason: "empty_stdout" };
-  }
-  return { ...base, status: "completed", reason: null };
-}
-
-return {
-  claudeTranscriptPath,
-  transcriptSnapshot,
-  TranscriptProgress,
-  parseCpuTimeMs,
-  runClaude,
-  classify
-};
-}
-
-module.exports = { createCodexTurnObservation, createClaudeTurnObservation };
+module.exports = { createCodexTurnObservation };

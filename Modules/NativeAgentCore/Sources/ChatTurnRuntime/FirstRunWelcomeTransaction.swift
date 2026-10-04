@@ -84,6 +84,7 @@ public protocol FirstRunWelcomeMessage {
     var role: String { get }
     var content: String { get }
     var firstRunMechanicalKind: String? { get }
+    var firstRunTurnCompleted: Bool { get }
 }
 
 /// Presentation and existing chat ingress supplied by the Mac surface. All
@@ -99,7 +100,6 @@ public protocol FirstRunWelcomePort: AnyObject {
     var chatMessages: [FirstRunMessage] { get }
     var firstRunSessionIsBusy: Bool { get }
     var firstConversationPersonName: String { get }
-    var firstRunGreetingSendIsOverridden: Bool { get }
     var firstRunSyntheticErrorIDPrefix: String { get }
     func firstRunGreetingHasReadyProvider() async -> Bool
     func sendFirstRunGreeting(_ kickoff: String, sessionID: String) async -> MacChatTurnAcceptance
@@ -188,7 +188,7 @@ public final class FirstRunWelcomeTransaction {
             if FirstConversationPersonaExemption.bodyHasRoleSection(body) { return false }
         }
 
-        return port.chatMessages.isEmpty
+        return !Self.hasConversationRows(port.chatMessages, syntheticErrorIDPrefix: port.firstRunSyntheticErrorIDPrefix)
     }
 
     /// The opener may only speak into a conversation that is idle and empty
@@ -296,7 +296,7 @@ public final class FirstRunWelcomeTransaction {
         """
         [First conversation. You have just asked this person what they want you to be. \
         When they answer, repeat it back in THEIR words — no praise, no label — and write \
-        ONE line with persona_append_section(kind: "soul", title: "\(title)"): a single \
+        ONE line with app {action: "persona.append", args: {kind: "soul", title: "\(title)", content}}: a single \
         first-person sentence, on one line, built only from what they actually said. Use \
         that title exactly. Then, in the same reply, ask the natural next thing: \
         \(firstConversationVoiceQuestion) \
@@ -424,8 +424,8 @@ public final class FirstRunWelcomeTransaction {
         never guess, invent, or use a placeholder like "User".
 
         THE ONE THING TO CAPTURE. When they answer, repeat it back in THEIR words and nothing \
-        else, then write ONE line with persona_append_section(kind: "soul", title: \
-        "\(Self.firstConversationRoleSectionPrefix)<their name, or "them">"). The content is a \
+        else, then write ONE line with app {action: "persona.append", args: {kind: "soul", title: \
+        "\(Self.firstConversationRoleSectionPrefix)<their name, or "them">", content}}. The content is a \
         single first-person sentence built only from what they actually said — a one-word \
         answer gets a one-clause line. You may say once that you are writing it as who you \
         are rather than as a setting.
@@ -508,21 +508,14 @@ public final class FirstRunWelcomeTransaction {
         case .accepted(let acceptedSessionID):
             // sendChat awaits its task, so its completion notification has
             // already fired by the time an accepted handoff returns.
-            if port.firstRunGreetingSendIsOverridden
-                || firstRunGreetingTurnSucceeded(port: port, sessionID: acceptedSessionID) {
+            if firstRunGreetingTurnSucceeded(port: port, sessionID: acceptedSessionID) {
                 completeFirstRunGreeting(port: port, sessionID: acceptedSessionID)
                 return .delivered(sessionId: acceptedSessionID)
             }
-            // Accepted but no real reply came back: say so on the receipt
-            // instead of reporting a greeting nobody received.
+            // An accepted handoff is not proof of a completed greeting.
             restoreFirstRunWelcomeMarkerAfterRejectedSend(port: port)
-            return .rejected(message: "the first turn ended without a reply")
+            return .rejected(message: "the first greeting did not complete")
         case .queued:
-            // 2026-09-18: production admission requires idle and empty, so
-            // only the isolated send override can report a queued greeting.
-            if port.firstRunGreetingSendIsOverridden {
-                completeFirstRunGreeting(port: port, sessionID: sid)
-            }
             return .queued(sessionId: sid)
         case .rejected(let message):
             restoreFirstRunWelcomeMarkerAfterRejectedSend(port: port)
@@ -531,12 +524,12 @@ public final class FirstRunWelcomeTransaction {
         }
     }
 
-    /// True when the greeting's turn has produced a real assistant reply in
-    /// this session — the only thing that counts as the agent having spoken.
+    /// A completed greeting needs both a completed turn and a real reply.
     @MainActor
     private func firstRunGreetingTurnSucceeded(port: some FirstRunWelcomePort, sessionID: String) -> Bool {
         return port.firstRunMessages(for: sessionID).contains {
             $0.role == "assistant"
+                && $0.firstRunTurnCompleted
                 && !$0.id.hasPrefix(port.firstRunSyntheticErrorIDPrefix)
                 && !Self.isPersistedFailureRow($0)
                 && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

@@ -115,6 +115,52 @@ public struct SwiftNativeDeskStore: Sendable {
 
     // MARK: - Op append (mirrors SwiftNativeTaskLedger.append)
 
+    public func continuation(_ handle: String) async throws -> DeskContinuation? {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            guard feed.integrity.isClean else { throw DeskContinuationError.unsafe }
+            return Self.compact(base: feed.base, feed.ops).items.first { $0.handle == handle }?.continuation
+        }
+    }
+
+    /// Commit a continuation revision (CAS). A newly blocked continuation
+    /// also stops and asks on the task itself: status blocked, waiting on the
+    /// owner. Reopening the task re-checks pending steps through their domain.
+    public func setContinuation(_ handle: String, expectedRevision: String?, record: DeskContinuation,
+                                requiresActive: Bool = false) async throws {
+        guard DeskContinuation.fromJSON(record.toJSON()) != nil else { throw DeskContinuationError.unsafe }
+        try await persistence.withFileLock(opsPath) {
+            var feed = try await readFeedUnlocked()
+            guard feed.integrity.isClean else { throw DeskContinuationError.unsafe }
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }),
+                  item.continuation?.revision == expectedRevision else { throw DeskContinuationError.conflict }
+            guard !item.status.isTerminal || item.continuation != nil else {
+                throw DeskContinuationError.conflict
+            }
+            if requiresActive {
+                guard item.status != .blocked, !item.requiresOwnerInput,
+                      DeskSequencing.compute(state).byHandle[item.handle]?.isReady == true else {
+                    throw DeskContinuationError.parked
+                }
+            }
+            if record.state == .blocked, !item.status.isTerminal,
+               item.status != .blocked || !item.requiresOwnerInput {
+                let ask = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle,
+                    body: .setStatus(status: .blocked,
+                        blockedReason: "Continuation stopped (\(record.reason ?? "blocked")). Check the unfinished step through its own domain, then set this task back to todo to continue, or cancel it.",
+                        waitingOn: "owner", progress: nil, assignee: nil, laneOf: nil))
+                try Self.validateHierarchyTransition(ask, in: state, allowArchive: false)
+                try Self.validatePursuitInvariants(ask, in: state, viaGenericPath: true)
+                _ = try await appendAndRecompactUnlocked(ask, feed: feed)
+                feed = try await readFeedUnlocked()
+            }
+            let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
+                            handle: handle, body: .setContinuation(record: record))
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+        }
+    }
+
     /// Append one op under the ops-feed flock, then recompact the derived state
     /// file IN THE SAME LOCK.
     @discardableResult
@@ -167,6 +213,18 @@ public struct SwiftNativeDeskStore: Sendable {
         _ op: DeskOp,
         feed: DeskFeed
     ) async throws -> (state: DeskState, feed: DeskFeed) {
+        switch op.body {
+        case let .setNotify(policy), let .openPursuit(_, _, _, _, _, policy):
+            let supported: Set<String> = ["state_change", "blocked", "done", "explicit"]
+            for trigger in policy.on {
+                let normalized = trigger.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !normalized.isEmpty, !supported.contains(normalized) {
+                    throw DeskError.notifyTriggerUnsupported(trigger)
+                }
+            }
+        default:
+            break
+        }
         try await persistence.appendJSONLDurable(op.toJSON(), to: opsPath)
         changeBus.emit(StoreChange(store: .desk, path: opsPath))
         // `integrity` CARRIES FORWARD: this is the post-append view of the SAME
@@ -426,6 +484,62 @@ public struct SwiftNativeDeskStore: Sendable {
         )
     }
 
+    /// Queue lookup, provenance and budget checks share the write transaction.
+    func addQueueStep(_ incoming: DeskStep) async throws -> (entry: MyQueue.Entry, change: MyQueue.Change) {
+        try await persistence.withFileLock(opsPath) {
+            var feed = try await readFeedUnlocked()
+            var state = Self.compact(base: feed.base, feed.ops)
+            let open = MyQueue.entries(state)
+            let words = Self.equivalentDeskText(incoming.words)
+            let same = open.first { Self.equivalentDeskText($0.step.words) == words }
+            var step = incoming
+            if let same {
+                if incoming.source != nil { step = same.step }
+                step.peers = same.step.peers + incoming.peers.filter { !same.step.peers.contains($0) }
+                step.elevated = same.step.elevated + incoming.elevated.filter { !same.step.elevated.contains($0) }
+                step.filedAt = same.step.filedAt
+                if incoming.source == nil, case .userWrites? = MyQueue.When(step.when, card: step.card) {
+                    step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+                }
+                if step == same.step { return (same, .reused) }
+                if step.when != same.step.when || step.card != same.step.card {
+                    step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+                }
+            } else {
+                if step.source != nil, open.filter({ $0.step.source != nil }).count >= MyQueue.inferredCap {
+                    throw MyQueue.Full()
+                }
+                step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+            }
+            let title = step.peers.isEmpty && step.elevated.isEmpty
+                ? String(step.words.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
+                : "A step from \((step.peers + step.elevated).joined(separator: ", "))'s turn"
+            let handle = same?.item.handle ?? DeskClock.newHandle()
+            var bodies: [DeskOpBody] = []
+            if same == nil {
+                let alias = Self.nextAlias(parentHandle: nil, parentAlias: nil, base: feed.base, ops: feed.ops)
+                bodies.append(.createItem(alias: alias, kind: .plan, project: MyQueue.project, title: title,
+                    parent: nil, summary: nil, assignee: nil, laneOf: nil, origin: .agent, pursuit: nil))
+            }
+            bodies.append(.addRef(ref: DeskRef(kind: .step(step))))
+            if let same, same.item.title != title { bodies.append(.updateTitle(title: title, summary: nil)) }
+            if same == nil {
+                bodies.append(.setStatus(status: .todo, blockedReason: nil, waitingOn: nil,
+                    progress: nil, assignee: nil, laneOf: nil))
+            }
+            for body in bodies {
+                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: body)
+                try Self.validateHierarchyTransition(op, in: state, allowArchive: false)
+                try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+                (state, feed) = try await appendAndRecompactUnlocked(op, feed: feed)
+            }
+            guard let entry = state.items.first(where: { $0.handle == handle }).flatMap(MyQueue.entry) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            return (entry, same == nil ? .added : .updated)
+        }
+    }
+
     private func createItemTransaction(
         kind: DeskKind,
         project: String,
@@ -434,8 +548,12 @@ public struct SwiftNativeDeskStore: Sendable {
         summary: String?,
         assignee: String?,
         laneOf: String?,
-        reuseEquivalent: Bool
+        reuseEquivalent: Bool,
+        origin: DeskOrigin = .owner
     ) async throws -> CreateResult {
+        guard Self.equivalentDeskText(project) != MyQueue.project else {
+            throw DeskError.queueCreationRequiresQueuePath
+        }
         return try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let priorState = Self.compact(base: feed.base, feed.ops)
@@ -469,10 +587,11 @@ public struct SwiftNativeDeskStore: Sendable {
             // The generic create path is HARD-PINNED to origin=.owner with no
             // pursuit (H2) — an origin=agent pursuit can ONLY be minted through
             // openPursuit, which builds the create op with a validated dossier.
+            // MY QUEUE's agent-origin create is owned by addQueueStep.
             let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: .createItem(
                 alias: alias, kind: kind, project: project, title: title, parent: parent, summary: summary,
                 assignee: assignee, laneOf: laneOf,
-                origin: .owner, pursuit: nil
+                origin: origin, pursuit: nil
             ))
             try Self.validateHierarchyTransition(op, in: priorState, allowArchive: false)
             try Self.validatePursuitInvariants(op, in: priorState, viaGenericPath: true)
@@ -559,8 +678,8 @@ public struct SwiftNativeDeskStore: Sendable {
     /// one durable work slot on a pursuit. IDEMPOTENT per (handle, day, slot):
     /// a repeat returns the SAME reservation id without a new op or a cap charge.
     /// REFUSES when the pursuit already has 2 reservations today, or the whole
-    /// workshop already has 6 today — both counted from the ops feed, never a
-    /// mutable counter. Returns the reservation id.
+    /// workshop already has 6 today — both counted from durable slot identities
+    /// folded from the ops feed and preserved through pruning. Returns the id.
     @discardableResult
     public func reserveWorkSession(_ handle: String, day: String, slot: String) async throws -> String {
         try await persistence.withFileLock(opsPath) {
@@ -572,7 +691,7 @@ public struct SwiftNativeDeskStore: Sendable {
             guard item.isPursuit else { throw DeskError.notAPursuit(handle: handle) }
             let reservationId = DeskClock.reservationId(handle: handle, day: day, slot: slot)
             // Idempotent short-circuit: the exact slot already exists → no charge.
-            if item.pursuit?.reservations.contains(where: { $0.reservationId == reservationId }) == true {
+            if state.hasWorkSlot(handle: handle, id: reservationId) {
                 return reservationId
             }
             let op = DeskOp(
@@ -649,7 +768,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 throw DeskError.notAPursuit(handle: handle)
             }
             let attemptId = DeskClock.workAttemptId(handle: handle, lane: lane, day: day, slot: slot)
-            if item.workAttempts.contains(where: { $0.attemptId == attemptId }) { return attemptId }
+            if state.hasWorkSlot(handle: handle, id: attemptId) { return attemptId }
             let op = DeskOp(
                 ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
@@ -676,6 +795,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 throw DeskError.unknownHandle(handle)
             }
             guard let attempt = item.workAttempts.first(where: { $0.attemptId == attemptId }) else {
+                if state.hasWorkSlot(handle: handle, id: attemptId) { return nil }
                 throw DeskError.unknownReservation(reservationId: attemptId, handle: handle)
             }
             if attempt.completedAt != nil { return nil }
@@ -683,6 +803,29 @@ public struct SwiftNativeDeskStore: Sendable {
                 ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
                 body: .completeWorkAttempt(attemptId: attemptId, receipt: receipt)
+            )
+            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return op
+        }
+    }
+
+    @discardableResult
+    public func handOffWorkReceipt(_ handle: String, reservationId: String) async throws -> DeskOp? {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            let handedOff = item.workAttempts.first(where: { $0.attemptId == reservationId })?.receiptHandedOff
+                ?? item.pursuit?.reservations.first(where: { $0.reservationId == reservationId })?.receiptHandedOff
+            if handedOff == true { return nil }
+            if handedOff == nil, state.hasWorkSlot(handle: handle, id: reservationId) { return nil }
+            let op = DeskOp(
+                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
+                handle: handle,
+                body: .handOffWorkReceipt(reservationId: reservationId)
             )
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
             _ = try await appendAndRecompactUnlocked(op, feed: feed)
@@ -763,6 +906,35 @@ public struct SwiftNativeDeskStore: Sendable {
     @discardableResult
     public func appendNote(_ handle: String, text: String) async throws -> DeskOp {
         try await appendValidated(DeskOp(handle: handle, body: .appendNote(text: text)))
+    }
+
+    enum ObservationNoteResult: Sendable { case appended, unchanged, raced, missing }
+
+    /// Validate the verdict and note tail in the same transaction as the append.
+    func appendObservationNote(_ handle: String, fingerprint: String?, signature: String,
+                               text: String, clearing: Bool = false) async throws -> ObservationNoteResult {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else { return .missing }
+            if let fingerprint, DeskObservationEvaluator.verdictFingerprint(item, in: state) != fingerprint {
+                return .raced
+            }
+            if clearing {
+                guard let last = item.notes.last,
+                      DeskObservationEvaluator.signature(inNote: last.text) == signature else { return .unchanged }
+            } else {
+                let marker = "\(DeskObservationEvaluator.driftMarker)[\(signature)]"
+                let trailing = item.notes.reversed().prefix { DeskObservationEvaluator.driftKind(inNote: $0.text) != nil }
+                guard !trailing.contains(where: { $0.text.hasPrefix(marker) }) else { return .unchanged }
+            }
+            let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle,
+                            body: .appendNote(text: text))
+            try Self.validateHierarchyTransition(op, in: state, allowArchive: false)
+            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return .appended
+        }
     }
 
     /// Append a receipt exactly once, with the existence check and append in
@@ -966,6 +1138,43 @@ public struct SwiftNativeDeskStore: Sendable {
         return try await appendValidated(DeskOp(handle: handle, body: .closeItem(outcomeSummary: outcomeSummary, status: status)))
     }
 
+    /// Settle only the most recently linked Workshop execution, under the same
+    /// lock that admits new references and lifecycle changes.
+    public func settleWorkshopExecution(
+        _ handle: String, executionId: String, note: String, status: DeskStatus,
+        summary: String, waitingOn: String? = nil
+    ) async throws -> Bool {
+        try await persistence.withFileLock(opsPath) {
+            var feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else { return false }
+            let executions = item.refs.compactMap { ref -> String? in
+                if case .trace(let id, "workshop_execution") = ref.kind { return id }
+                return nil
+            }
+            guard executions.contains(executionId) else { return false }
+            guard executions.last == executionId else { return true }
+            if !item.notes.contains(where: { $0.text == note }) {
+                var op = DeskOp(handle: handle, body: .appendNote(text: note))
+                op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+                _ = try await appendAndRecompactUnlocked(op, feed: feed)
+                feed = try await readFeedUnlocked()
+            }
+            guard !item.status.isTerminal else { return true }
+            if status == .done, let continuation = item.continuation,
+               ![.complete, .canceled].contains(continuation.state) { return true }
+            var op = DeskOp(handle: handle, body: status == .blocked
+                ? .setStatus(status: .blocked, blockedReason: summary, waitingOn: waitingOn,
+                             progress: nil, assignee: nil, laneOf: nil)
+                : .closeItem(outcomeSummary: summary, status: status))
+            try Self.validateHierarchyTransition(op, in: state, allowArchive: false)
+            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+            op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return true
+        }
+    }
+
     /// CAS close for operator sweeps (2026-07-21 audit): re-read the item
     /// UNDER the ops flock and close only if it is still live and untouched
     /// since the caller planned (updatedAt equality). DeskSweepCLI's staleness
@@ -1156,6 +1365,9 @@ public struct SwiftNativeDeskStore: Sendable {
             if let nonTerminal = subtree.first(where: { !$0.status.isTerminal }) {
                 throw DeskError.archiveRefusedNonTerminalChild(handle: handle, childHandle: nonTerminal.handle)
             }
+            if let unresolved = ([item] + subtree).first(where: { !($0.continuation?.pending.isEmpty ?? true) }) {
+                throw DeskError.archiveRefusedUnresolvedContinuation(handle: unresolved.handle)
+            }
             let now = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
             // Idempotency: never double-write a record for a handle that already
             // has one — a retry after a crash between the record append and the
@@ -1229,9 +1441,9 @@ public struct SwiftNativeDeskStore: Sendable {
 
     /// archiveSweep — RETURN the handles eligible for archival (TERMINAL — done
     /// OR canceled — not pinned, past the grace window, terminal children only,
-    /// not standing). Does NOT mutate anything; a background loop decides whether
-    /// to call archiveItem on each. Pure query (state read + deterministic
-    /// predicate).
+    /// not standing, no unresolved continuation steps). Does NOT mutate anything;
+    /// callers must call archiveItem explicitly. Pure query (state read +
+    /// deterministic predicate).
     ///
     /// The guard is `status.isTerminal`, matching archiveItem (which accepts any
     /// terminal item) and makeArchiveRecord (which maps `.canceled` to a canceled
@@ -1247,11 +1459,14 @@ public struct SwiftNativeDeskStore: Sendable {
             guard item.parent == nil else { return nil }       // only sweep top-level
             guard item.status.isTerminal, !item.pinned else { return nil }
             guard item.kind != .standing else { return nil }
+            guard item.continuation?.pending.isEmpty ?? true else { return nil }
             guard let closedAt = item.closedAt, let closed = DeskClock.parseISO(closedAt) else { return nil }
             guard now.timeIntervalSince(closed) >= grace else { return nil }
             // Parent cannot archive with a standing or non-terminal descendant (recursive —
             // matches archiveItem's subtree check).
-            if Self.descendants(of: item.handle, in: state).contains(where: { $0.kind == .standing || !$0.status.isTerminal }) { return nil }
+            if Self.descendants(of: item.handle, in: state).contains(where: {
+                $0.kind == .standing || !$0.status.isTerminal || !($0.continuation?.pending.isEmpty ?? true)
+            }) { return nil }
             return item.handle
         }
     }
@@ -1389,11 +1604,15 @@ public struct SwiftNativeDeskStore: Sendable {
         viaGenericPath: Bool
     ) throws {
         switch op.body {
-        case let .createItem(_, _, _, _, _, _, _, _, origin, _):
+        case let .createItem(_, kind, project, _, parent, _, _, _, origin, pursuit):
+            if viaGenericPath, Self.equivalentDeskText(project) == MyQueue.project {
+                throw DeskError.queueCreationRequiresQueuePath
+            }
             // A create_item can NEVER mint an agent pursuit — that path is
             // open_pursuit only (H2). An origin=agent create_item is refused
-            // regardless of who calls it.
+            // regardless of who calls it, but for a top-level MY QUEUE plan.
             guard origin == .agent else { return }   // owner/system creates are unconstrained here
+            if !viaGenericPath, kind == .plan, project == MyQueue.project, parent == nil, pursuit == nil { return }
             throw DeskError.genericPathCannotCreateAgent(handle: op.handle)
 
         case let .openPursuit(_, _, _, _, pursuit, _):
@@ -1419,18 +1638,14 @@ public struct SwiftNativeDeskStore: Sendable {
             // reservation id is idempotent (compaction dedups) — allowed. A NEW
             // reservation must clear both caps and target a live pursuit.
             guard let item = state.items.first(where: { $0.handle == op.handle }),
-                  item.isPursuit, let p = item.pursuit else {
+                  item.isPursuit, item.pursuit != nil else {
                 throw DeskError.notAPursuit(handle: op.handle)
             }
-            if p.reservations.contains(where: { $0.reservationId == reservationId }) { return }
-            if p.reservations.filter({ $0.day == day }).count >= maxWorkSessionsPerPursuitPerDay {
+            if state.hasWorkSlot(handle: op.handle, id: reservationId) { return }
+            if state.workSessions(on: day, handle: op.handle) >= maxWorkSessionsPerPursuitPerDay {
                 throw DeskError.workSessionCapReached(scope: "per-pursuit (2/day)", limit: maxWorkSessionsPerPursuitPerDay, handle: op.handle)
             }
-            let global = state.items.reduce(0) { count, row in
-                count
-                    + (row.pursuit?.reservations.filter { $0.day == day }.count ?? 0)
-                    + row.workAttempts.filter { $0.day == day }.count
-            }
+            let global = state.workSessions(on: day)
             if global >= maxWorkSessionsGlobalPerDay {
                 throw DeskError.workSessionCapReached(scope: "workshop (6/day)", limit: maxWorkSessionsGlobalPerDay, handle: op.handle)
             }
@@ -1456,15 +1671,11 @@ public struct SwiftNativeDeskStore: Sendable {
                   !item.status.isTerminal, !item.isPursuit else {
                 throw DeskError.unknownHandle(op.handle)
             }
-            if item.workAttempts.contains(where: { $0.attemptId == attemptId }) { return }
-            if item.workAttempts.filter({ $0.day == day }).count >= 1 {
+            if state.hasWorkSlot(handle: op.handle, id: attemptId) { return }
+            if state.workSessions(on: day, handle: op.handle) >= 1 {
                 throw DeskError.workSessionCapReached(scope: "per-owner-item (1/day)", limit: 1, handle: op.handle)
             }
-            let global = state.items.reduce(0) { count, row in
-                count
-                    + (row.pursuit?.reservations.filter { $0.day == day }.count ?? 0)
-                    + row.workAttempts.filter { $0.day == day }.count
-            }
+            let global = state.workSessions(on: day)
             if global >= maxWorkSessionsGlobalPerDay {
                 throw DeskError.workSessionCapReached(scope: "workshop (6/day)", limit: maxWorkSessionsGlobalPerDay, handle: op.handle)
             }
@@ -1476,6 +1687,16 @@ public struct SwiftNativeDeskStore: Sendable {
             }
             if attempt.completedAt != nil {
                 throw DeskError.reservationAlreadyComplete(reservationId: attemptId, handle: op.handle)
+            }
+
+        case let .handOffWorkReceipt(reservationId):
+            guard let item = state.items.first(where: { $0.handle == op.handle }) else {
+                throw DeskError.unknownHandle(op.handle)
+            }
+            let completed = item.workAttempts.first(where: { $0.attemptId == reservationId })?.completedAt
+                ?? item.pursuit?.reservations.first(where: { $0.reservationId == reservationId })?.completedAt
+            guard completed != nil else {
+                throw DeskError.unknownReservation(reservationId: reservationId, handle: op.handle)
             }
 
         case let .setStatus(status, _, _, _, _, _):
@@ -1662,6 +1883,132 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
 
+}
+
+// MARK: - Holds (skills-as-code PR 4)
+
+/// Who is working a Desk item, so two of her conversations never work one
+/// item at once (desk.3402). Kept beside the feed in holds.json and changed
+/// only under the ops flock, compare-and-set; not Desk state (no op, no
+/// updatedAt, no notify). A conversation holds an item it works until
+/// `holdLease` after its last touch. A stopped skill run holds what it touched
+/// while its MY QUEUE resume step is open (and its checkpoint kept), at most
+/// `runHoldLimit`; the conversation it ran in still works them.
+public struct DeskHold: Codable, Sendable, Equatable {
+    /// "conversation <session id>" or "run <run id>".
+    public var by: String
+    /// The conversation working it, or the one whose stopped run holds it.
+    public var session: String
+    public var at: Date
+}
+
+extension SwiftNativeDeskStore {
+    public static let holdLease: TimeInterval = 30 * 60
+    /// The backstop: no stopped run holds anything longer than this.
+    public static let runHoldLimit: TimeInterval = 7 * 24 * 3600
+
+    var holdsPath: URL { deskDir.appendingPathComponent("holds.json") }
+
+    /// A stopped skill run's checkpoint (`SkillRunStore`); the run holds its items while it exists.
+    public static func skillRunFile(_ id: String, dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent("skills/runs/\(id).json")
+    }
+
+    /// Whether a hold still binds. A run's binds while a resume step queued
+    /// since the hold is open in MY QUEUE (or, before any is queued, for
+    /// `holdLease` while the turn that stopped it queues one), its checkpoint
+    /// kept and it younger than `runHoldLimit`. One whose step was closed or
+    /// never came is void, and its checkpoint goes with it, here: no closing
+    /// path has to remember the hold.
+    func isLive(_ hold: DeskHold, now: Date, state: DeskState) -> Bool {
+        guard hold.by.hasPrefix("run ") else { return now.timeIntervalSince(hold.at) < Self.holdLease }
+        let run = String(hold.by.dropFirst(4)), file = Self.skillRunFile(run, dataRoot: dataRoot)
+        let age = now.timeIntervalSince(hold.at)
+        // Only its steps queued since this hold count: a run resumed and stopped
+        // again keeps its id, and the step its first stop queued is closed.
+        let steps = state.items.filter { item in
+            item.project == MyQueue.project && (DeskClock.parseISO(item.openedAt).map { $0 >= hold.at.addingTimeInterval(-0.001) } ?? false)
+                && item.refs.contains { if case .step(let step) = $0.kind { MyQueue.skillRun(in: step.words) == run } else { false } }
+        }
+        let bound = steps.isEmpty ? age < Self.holdLease : steps.contains { !$0.status.isTerminal }
+        guard FileManager.default.fileExists(atPath: file.path), age < Self.runHoldLimit, bound else {
+            try? FileManager.default.removeItem(at: file)
+            return false
+        }
+        return true
+    }
+
+    /// Conversation `session` takes `ref` (desk.N, N or a handle) to work it.
+    /// Who holds it instead, or nil when it is free, this conversation's, or
+    /// its own stopped run's. An item that is not open holds nothing.
+    public func hold(_ ref: String, session: String, now: Date = Date()) async throws -> String? {
+        try await hold([ref], session: session, now: now)
+    }
+
+    /// Acquire the entire group only when none is held by another conversation.
+    public func hold(_ refs: [String], session: String, now: Date = Date()) async throws -> String? {
+        try await editHolds(now: now) { holds, state in
+            let items = refs.compactMap { Self.holdItem($0, state) }
+            for item in items {
+                if let held = holds[item.handle], isLive(held, now: now, state: state), held.session != session {
+                    return held.by
+                }
+            }
+            for item in items {
+                if let held = holds[item.handle], isLive(held, now: now, state: state), held.by.hasPrefix("run ") { continue }
+                holds[item.handle] = DeskHold(by: "conversation " + session, session: session, at: now)
+            }
+            return nil
+        }
+    }
+
+    /// A stopped run holds the items it touched, for the conversation it ran
+    /// in: the ones it holds, by name. One another conversation holds stays theirs.
+    public func hold(_ refs: [String], run: String, session: String, now: Date = Date()) async throws -> [String] {
+        try await editHolds(now: now) { holds, state in
+            var names: [String] = []
+            for ref in refs {
+                guard let item = Self.holdItem(ref, state), !names.contains("desk." + item.alias) else { continue }
+                if let held = holds[item.handle], isLive(held, now: now, state: state), held.session != session { continue }
+                holds[item.handle] = DeskHold(by: "run " + run, session: session, at: now)
+                names.append("desk." + item.alias)
+            }
+            return names
+        }
+    }
+
+    /// A resumed run's holds pass to the conversation resuming it.
+    public func passHolds(run: String, to session: String, now: Date = Date()) async throws {
+        try await editHolds(now: now) { holds, _ in
+            for (handle, held) in holds where held.by == "run " + run {
+                holds[handle] = DeskHold(by: "conversation " + session, session: session, at: now)
+            }
+        }
+    }
+
+    static func holdItem(_ ref: String, _ state: DeskState) -> DeskItem? {
+        var key = ref.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.lowercased().hasPrefix("desk.") { key = String(key.dropFirst(5)) }
+        return state.items.first { !$0.status.isTerminal && ($0.handle == key || $0.alias == key) }
+    }
+
+    /// One compare-and-set under the ops flock; what no longer binds (lapsed,
+    /// or on an item closed or gone) is dropped as it is written.
+    private func editHolds<T: Sendable>(now: Date, _ edit: @Sendable (inout [String: DeskHold], DeskState) -> T) async throws -> T {
+        try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            var holds = (try? Data(contentsOf: holdsPath)).flatMap { try? JSONDecoder().decode([String: DeskHold].self, from: $0) } ?? [:]
+            let before = holds
+            let result = edit(&holds, state)
+            let open = Set(state.items.filter { !$0.status.isTerminal }.map(\.handle))
+            holds = holds.filter { open.contains($0.key) && isLive($0.value, now: now, state: state) }
+            if holds != before {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(try JSONEncoder().encode(holds), to: holdsPath)
+            }
+            return result
+        }
+    }
 }
 
 // MARK: - liveState() replay memo (perf wave 2, F5)

@@ -142,7 +142,7 @@ public enum MCPToolBridge {
                 var description = t.description
                 if serverId == "searxng-local" {
                     switch t.name {
-                    case "search": description = "Search the web and news (SearXNG); use categories=news and time_range=day|week|month for recent results. Returns titles, URLs and snippets."
+                    case "search": description = "Search the web and news: Codex web search for general queries, SearXNG for code-shaped ones; use categories=news and time_range=day|week|month (SearXNG) for recent results. Returns titles, URLs and snippets, the route that ran and its time."
                     case "fetch": description = "Fetch and read a web page by URL and return its extracted text."
                     default: break
                     }

@@ -13,6 +13,7 @@ import Context
 import SwarmRuns
 import WorkshopExecution
 import Skills
+import ChatTurnContracts
 
 // MARK: - Skill body tools
 
@@ -33,103 +34,64 @@ extension SwiftToolDispatcher {
     }
 
     func impl_list_skills(input: [String: JSONValue]) async throws -> JSONValue {
-        var rows = InstalledSkillInventory.list(
+        let rows = InstalledSkillInventory.list(
             dataRoot: dataRoot,
             sourceRoot: rootForRead,
             personaRoot: personaRootForTools()
         )
-        for method in CraftMethod.supported {
-            guard let candidate = try craftStore?.candidate(method) else { continue }
-            rows.append(.object(["id": .string(method.skillName),
-                "name": .string(method.skillName), "status": .string("candidate"),
-                "description": .string(candidate.method.summary)]))
-        }
         return .array(rows)
     }
 
     func impl_read_skill(input: [String: JSONValue]) async throws -> JSONValue {
         let name = try requireString(input, "name")
-        if let supported = CraftMethod.supported.first(where: { $0.skillName == name }) {
-            guard let candidate = try craftStore?.candidate(supported) else { throw CraftFailure("No verified craft candidate for this agent.") }
-            let method = try candidate.method.shareableMethod()
-            return .object(["method": .string(String(decoding: method, as: UTF8.self)),
-                "status": .string("candidate"), "verified_inputs": .int(Int64(candidate.verifiedInputDigests.count)),
-                "local_evidence_refs": .array(candidate.evidenceRefs.map(JSONValue.string))])
-        }
-        // A registered display name may contain punctuation that is not safe
-        // in a body path. Resolve that alias to its canonical id first; only
-        // validated handles below may participate in filesystem resolution.
-        var handles = [name]
-        let registry = InstalledSkillInventory.list(
-            dataRoot: dataRoot,
-            sourceRoot: rootForRead,
-            personaRoot: personaRootForTools()
-        )
-        func registeredMatch(_ requested: String) -> JSONValue? {
-            registry.first { row in
-                guard case .object(let object) = row else { return false }
-                let rowName: String = if case .string(let value)? = object["name"] { value } else { "" }
-                let rowID: String = if case .string(let value)? = object["id"] { value } else { "" }
-                return rowName.caseInsensitiveCompare(requested) == .orderedSame
-                    || rowID.caseInsensitiveCompare(requested) == .orderedSame
-            }
-        }
-        // '.md' may be part of an actual display name, not a filename suffix.
+        let entries = try InstalledSkillInventory.entries(
+            dataRoot: dataRoot, sourceRoot: rootForRead, personaRoot: personaRootForTools())
         // Exact registered spelling wins; stripping is legacy fallback only.
-        let match = registeredMatch(name)
-            ?? (name.hasSuffix(".md") ? registeredMatch(String(name.dropLast(3))) : nil)
-        if let match, case .object(let object) = match,
-           case .string(let id)? = object["id"], !id.isEmpty {
-            handles.insert(id, at: 0)
+        let entry = InstalledSkillInventory.match(name, in: entries)
+            ?? (name.hasSuffix(".md") ? InstalledSkillInventory.match(String(name.dropLast(3)), in: entries) : nil)
+        if entry == nil, name.contains("/") || name.contains("..") || name.hasPrefix(".") {
+            throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: invalid skill name '\(name)'")
         }
-        handles = handles.filter {
-            !$0.contains("/") && !$0.contains("..") && !$0.hasPrefix(".")
+        guard let url = entry?.bodyURL, let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else {
+            throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: skill body not found for '\(name)'")
         }
-        guard !handles.isEmpty else {
+        let violations = SkillBodyHygiene.violations(in: text)
+        guard violations.isEmpty else {
             throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: invalid skill name '\(name)'"
-            )
+                reason: "SwiftToolDispatcher: skill body hygiene failed for '\(name)': \(SkillBodyHygiene.failureMessage(for: violations))")
         }
-        var seen: Set<String> = []
-        let fileNames = handles
-            .map { $0.hasSuffix(".md") ? $0 : "\($0).md" }
-            .filter { seen.insert($0.lowercased()).inserted }
-        let bodyRoots = canonicalSkillBodyDirectories
-        for fileName in fileNames {
-            for bodyRoot in bodyRoots {
-                let resolvedRoot = bodyRoot.standardizedFileURL.resolvingSymlinksInPath()
-                let resolvedURL = bodyRoot
-                    .appendingPathComponent(fileName)
-                    .standardizedFileURL
-                    .resolvingSymlinksInPath()
-                guard resolvedURL.path.hasPrefix(resolvedRoot.path + "/"),
-                      let data = try? Data(contentsOf: resolvedURL),
-                      let text = String(data: data, encoding: .utf8) else {
-                    continue
-                }
-                let hygieneViolations = SkillBodyHygiene.violations(in: text)
-                if !hygieneViolations.isEmpty {
-                    throw AutonomyGateError.toolDenied(
-                        reason: "SwiftToolDispatcher: skill body hygiene failed for '\(name)': \(SkillBodyHygiene.failureMessage(for: hygieneViolations))"
-                    )
-                }
-                if data.count > Self.maxFileBytes {
-                    let head = data.prefix(Self.maxFileBytes)
-                    let headText = String(data: head, encoding: .utf8) ?? text
-                    return .string(headText + "\n... [truncated, \(data.count) bytes total]")
-                }
-                return .string(text)
-            }
+        let body: String
+        if data.count > Self.maxFileBytes {
+            let headText = String(data: data.prefix(Self.maxFileBytes), encoding: .utf8) ?? text
+            body = headText + "\n... [truncated, \(data.count) bytes total]"
+        } else {
+            body = text
         }
-        throw AutonomyGateError.toolDenied(
-            reason: "SwiftToolDispatcher: skill body not found for '\(name)'"
-        )
+        // A read is a use: its unused clock starts over (`CapabilityLifecycle`).
+        if let entry, entry.row["source"] == .string("runtime_registry") {
+            try? await SwiftNativeSkillsClient(root: dataRoot).recordUse(id: entry.id)
+        }
+        // A script skill reads with its script: header, source (at most 8 KB),
+        // digest, and whether it is on and admitted for that digest; and its
+        // current, previous and last clean versions.
+        guard let row = entry?.row, case .object(var script)? = row["script"] else { return .string(body) }
+        script["digest"] = SkillScript.digest(row["script"]).map(JSONValue.string) ?? .null
+        script["status"] = row["status"] ?? .null
+        script["runnable"] = .bool(SkillScript.isRunnable(row))
+        script["admission"] = row["admission"] ?? .null
+        script["params_arrive_as"] = .string("input, frozen (e.g. input.name); args is the same object")
+        if let suspended = row["suspended"] { script["suspended"] = suspended }
+        return .object(["content": .string(body), "script": .object(script),
+                        "versions": await SwiftNativeSkillsClient(root: dataRoot).scriptVersions(row)])
     }
 
     /// Canonical conversational skill writer. This deliberately reuses the
     /// Skills module that owns the Mac UI lifecycle instead of teaching the
     /// model registry paths or file formats.
-    func impl_save_skill(input: [String: JSONValue]) async throws -> JSONValue {
+    /// A `script` makes it repeatable: it lands drafted, with the origin of
+    /// who steered this turn, hers or the peers' (`PeerDataTaint.carried`).
+    func impl_save_skill(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let name = try requireString(input, "name").trimmingCharacters(in: .whitespacesAndNewlines)
         let description = try requireString(input, "description").trimmingCharacters(in: .whitespacesAndNewlines)
         var content = try requireString(input, "content").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -158,6 +120,8 @@ extension SwiftToolDispatcher {
             triggers = []
         }
 
+        let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                                          peerID: ChatToolSessionContext.envelope?.verifiedUserId)
         do {
             let saved = try await SwiftNativeSkillsClient(root: dataRoot).createSkill(body: .object([
                 "name": .string(name),
@@ -168,15 +132,24 @@ extension SwiftToolDispatcher {
                 // not gain any tool, approval, or TrustCenter authority.
                 "autoCreated": .bool(true),
                 "status": .string("active"),
-            ]))
+                "script": input["script"] ?? .null,
+            ]), steer: SkillScript.origin(steeredBy: steer.sources + steer.elevated))
             guard case .object(let record) = saved else { return saved }
             var receipt: [String: JSONValue] = [
                 "status": .string("saved"),
-                "skill": .object(record.filter { $0.key != "bodyPath" }),
+                "skill": .object(record.filter { !["bodyPath", "script", "admission"].contains($0.key) }),
                 "body_verified": .bool(true),
-                "loading": .string("lazy; use read_skill only when this skill is relevant"),
+                "loading": .string("lazy; read it with app skill.read only when this skill is relevant"),
                 "authority": .string("guidance_only; TrustCenter, approvals, and effect-time validation remain authoritative"),
             ]
+            if let script = record["script"] {
+                receipt["script"] = .object([
+                    "digest": .string(SkillScript.digest(script) ?? ""),
+                    "runnable": .bool(SkillScript.isRunnable(record)),
+                    "note": .string(SkillScript.isRunnable(record) ? "unchanged and still on"
+                        : "drafted: it runs only once skill.enable turns it on (User's for a peer's or a pack's script, or below Full Mac)"),
+                ])
+            }
             do {
                 let sync = try await memoryV2.syncSkillPointersRecordingReceipt(
                     bodiesDirs: canonicalSkillBodyDirectories,

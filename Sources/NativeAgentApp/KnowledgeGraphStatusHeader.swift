@@ -16,25 +16,20 @@ public struct KGNativeStackStatus: Equatable, Sendable {
     public var embeddingDim: Int
     public var spotlightIndexed: Int
     public var cloudKitState: String
-    public var lastUpdated: Date?
+    public var lastChecked: Date?
     public static let empty = KGNativeStackStatus(
         sqliteEntities: 0, embeddingDim: 0, spotlightIndexed: 0,
-        cloudKitState: "unknown", lastUpdated: nil
+        cloudKitState: "unknown", lastChecked: nil
     )
 
     /// Read-only probe of the apple-native stack. Mirrors the
     /// `MemoryV2NativeStackSnapshot.load()` pattern in ContentView (same data
     /// root, same SQLite store, same Spotlight sentinel) but scoped to the KG
     /// view's compact header.
-    /// Render-cost audit F9: this was annotated `@MainActor`, which forced the
-    /// two `FileManager` stat syscalls below onto the main thread on every
-    /// KG-view appear. Nothing in here touches main-actor state — it reads a
-    /// path from `PersistenceCore`, stats two files, and awaits a detached
-    /// CloudKit probe — so the annotation only cost main-thread time. Callers
-    /// already `await` it, so dropping the isolation needs no call-site change.
     public static func load(graphCounts: (entities: Int, edges: Int)) async -> KGNativeStackStatus {
         let dataRoot = PersistenceCore.defaultDataRoot()
         var status = KGNativeStackStatus.empty
+        status.lastChecked = Date()
         status.embeddingDim = (await SwiftNativeMemoryV2.shared.embedderDimensions()) ?? 0
 
         status.sqliteEntities = graphCounts.entities
@@ -62,13 +57,6 @@ public struct KGNativeStackStatus: Equatable, Sendable {
         } else {
             status.cloudKitState = nativeAgentCloudKitDisabledStatus
         }
-        let sqlitePath = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("memory.sqlite")
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: sqlitePath.path),
-           let mtime = attrs[.modificationDate] as? Date {
-            status.lastUpdated = mtime
-        }
         return status
     }
 }
@@ -85,7 +73,7 @@ struct KGNativeStackHeader: View {
             Text("·").foregroundStyle(NativeAgentShell.secondary)
             Text("\(totalEdges) relationships").font(.caption.weight(.semibold))
             Text("·").foregroundStyle(NativeAgentShell.secondary)
-            Text("last-updated \(Self.relative(status.lastUpdated))").font(.caption).foregroundStyle(NativeAgentShell.secondary)
+            Text("Last checked \(Self.relative(status.lastChecked))").font(.caption).foregroundStyle(NativeAgentShell.secondary)
             Spacer()
             Group {
                 Label("\(status.sqliteEntities) SQLite", systemImage: "cylinder.split.1x2")

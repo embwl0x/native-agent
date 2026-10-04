@@ -275,22 +275,12 @@ verify_minilm_swiftpm_resources() {
 }
 
 verify_bridge_helper_source_resources() {
-  local repo_root="$1" codex_helper claude_helper omp_helper
+  local repo_root="$1" codex_helper omp_helper
   codex_helper="$repo_root/script/codex_thread_wakeup.js"
   [[ -f "$codex_helper" && ! -L "$codex_helper" ]] \
     || fail "source tree missing required Codex bridge helper: $codex_helper"
-  claude_helper=""
-  if [[ -f "$repo_root/script/claude_thread_wakeup.js" && ! -L "$repo_root/script/claude_thread_wakeup.js" ]]; then
-    claude_helper="$repo_root/script/claude_thread_wakeup.js"
-  elif [[ -f "$repo_root/script/claude_thread_wakeup.js" && ! -L "$repo_root/script/claude_thread_wakeup.js" ]]; then
-    claude_helper="$repo_root/script/claude_thread_wakeup.js"
-  fi
-  [[ -n "$claude_helper" ]] \
-    || fail "source tree missing required Claude Code bridge helper"
   [[ "$(wc -c < "$codex_helper" | tr -d '[:space:]')" -gt 10000 ]] \
     || fail "Codex bridge helper is unexpectedly small: $codex_helper"
-  [[ "$(wc -c < "$claude_helper" | tr -d '[:space:]')" -gt 10000 ]] \
-    || fail "Claude Code bridge helper is unexpectedly small: $claude_helper"
   omp_helper="$repo_root/script/omp_thread_wakeup.js"
   [[ -f "$omp_helper" && ! -L "$omp_helper" ]] \
     || fail "source tree missing required OMP bridge helper: $omp_helper"
@@ -300,31 +290,22 @@ verify_bridge_helper_source_resources() {
 }
 
 verify_bridge_helper_bundle_resources() {
-  local contents_resources="$1" codex_hits claude_hits omp_hits codex_count claude_count omp_count
+  local contents_resources="$1" codex_hits omp_hits codex_count omp_count
   codex_hits="$(release_find_checked "Codex bridge helper" "$contents_resources" -type f -name 'codex_thread_wakeup.js' -print)" \
     || fail "Codex bridge helper scan of $contents_resources did not run correctly"
-  claude_hits="$(release_find_checked "Claude bridge helper" "$contents_resources" -type f \
-    \( -name 'claude_thread_wakeup.js' -o -name 'claude_thread_wakeup.js' \) \
-    -print)" \
-    || fail "Claude bridge helper scan of $contents_resources did not run correctly"
   omp_hits="$(release_find_checked "OMP bridge helper" "$contents_resources" -type f -name 'omp_thread_wakeup.js' -print)" \
     || fail "OMP bridge helper scan of $contents_resources did not run correctly"
   codex_count="$(printf '%s\n' "$codex_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
-  claude_count="$(printf '%s\n' "$claude_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
   omp_count="$(printf '%s\n' "$omp_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
   [[ "$codex_count" == "1" ]] \
     || fail "release resources require exactly one Codex bridge helper; found $codex_count"
-  [[ "$claude_count" == "1" ]] \
-    || fail "release resources require exactly one Claude Code bridge helper; found $claude_count"
   [[ "$omp_count" == "1" ]] \
     || fail "release resources require exactly one OMP bridge helper; found $omp_count"
   [[ "$(wc -c < "$codex_hits" | tr -d '[:space:]')" -gt 10000 ]] \
     || fail "bundled Codex bridge helper is unexpectedly small: $codex_hits"
-  [[ "$(wc -c < "$claude_hits" | tr -d '[:space:]')" -gt 10000 ]] \
-    || fail "bundled Claude Code bridge helper is unexpectedly small: $claude_hits"
   [[ "$(wc -c < "$omp_hits" | tr -d '[:space:]')" -gt 10000 ]] \
     || fail "bundled OMP bridge helper is unexpectedly small: $omp_hits"
-  echo "[resources] verified staged Codex, Claude Code, and OMP bridge helpers"
+  echo "[resources] verified staged Codex and OMP bridge helpers"
 }
 
 verify_data_bounds_bundle_resource() {

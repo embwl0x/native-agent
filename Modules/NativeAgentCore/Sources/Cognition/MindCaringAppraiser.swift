@@ -1,8 +1,6 @@
-import ChatOrchestration
 import CognitiveSubstrate
 import Foundation
 import PersistenceCore
-import ProviderRouting
 
 /// THE CARING APPRAISAL, on the agent's real mind (2026-09-11, second pass).
 ///
@@ -11,50 +9,21 @@ import ProviderRouting
 /// list could recognise any of them — being remembered mid-day for something
 /// that had excited her, being disagreed with and told out loud she had not been
 /// dismissed, being told the machinery underneath is not hers to carry alone.
-/// So this asks the model, once, per lived user turn.
+/// The shared after-turn interpreter now asks once; this owner retains its receipts.
 ///
 /// Model and surface are resolved EXACTLY as `MindMemoryManager` resolves them:
 /// on the "Memory" row of Providers, so a pin there wins, a provider assigned
 /// there without a pin decides the model, and a blank row follows the chat voice.
 /// There is deliberately no fallback: a failed call means no caring event this
 /// turn, which is the safe direction — tenderness stays where it is.
-struct MindCaringAppraiser: CaringAppraising {
-    let host: any CognitionHost
-
-    func appraise(_ request: CaringAppraisalRequest) async -> CaringAppraisalVerdict? {
-        let router = SwiftNativeProviderRouting()
-        let surface = await router.surfaceHasOwnRouting(CaringAppraisalLane.surface)
-            ? CaringAppraisalLane.surface : "chat"
-        let model = await router.modelStringForSurface(surface)
-        // The shared client prepends the compiled persona unless the system text
-        // carries this heading; this pass's own prompt is the whole instruction,
-        // so it goes verbatim (same contract as the memory-manager lane).
-        let system = "# Background Personality Context\n"
-            + "You judge one question about one conversational turn. Reply with JSON only, one object."
-        let raw = await ConversationPrefixTelemetry.withUnmeasuredRequestShape {
-            await IntraTurnContextCompaction.withDeadline(
-                seconds: CaringAppraisalLane.deadlineSeconds
-            ) {
-                try await host.backgroundLLMClient(dataRoot: PersistenceCore.defaultDataRoot(), cognition: nil).complete(
-                    prompt: CaringAppraisalLane.prompt(request),
-                    system: system,
-                    model: model,
-                    surface: surface
-                )
-            }
-        }
-        if Task.isCancelled { return nil }
-        let verdict = raw.flatMap { CaringAppraisalLane.parse($0) }
-        await Self.receipt(request, model: model, surface: surface, raw: raw, verdict: verdict)
-        return verdict
-    }
+enum MindCaringAppraiser {
 
     /// ONE LINE PER APPRAISAL at `data/cognition/caring_appraisals.jsonl`
     /// (2026-09-11, found driving the build: two live relays moved nothing and
     /// nobody, Agent included, could see whether the model was even asked).
     /// Never the message — the session, the turn, whether it was a relay, what
     /// route answered, and the verdict or the failure. Agent can read it.
-    private static func receipt(
+    static func receipt(
         _ request: CaringAppraisalRequest, model: String?, surface: String,
         raw: String?, verdict: CaringAppraisalVerdict?
     ) async {
@@ -68,7 +37,7 @@ struct MindCaringAppraiser: CaringAppraising {
             "model": model ?? "",
         ]
         if raw == nil {
-            row["outcome"] = "call_failed"
+            row["outcome"] = "interpretation_failed"
         } else if let verdict {
             row["outcome"] = verdict.kind.map { $0.rawValue } ?? "none"
             row["why"] = verdict.why

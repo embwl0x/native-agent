@@ -188,15 +188,20 @@ struct LivingStatusPanel: View {
                 return
             }
             guard refreshCoalescer.completePass() else { return }
+            if !refreshCoalescer.trailingPassConsumed {
+                do {
+                    try await Task.sleep(for: .milliseconds(500))
+                } catch {
+                    refreshCoalescer.cancel()
+                    return
+                }
+            }
         }
     }
 
     @MainActor
     private func refreshOnce() async {
-        let outcome = await LivingStatusRefreshOperation.run(
-            appModel: appModel,
-            dataRoot: dataRoot
-        )
+        let outcome = await LivingStatusRefreshOperation.run(appModel: appModel)
         snapshot = outcome.applying(to: snapshot)
         refreshStatus = outcome.status(previous: refreshStatus)
     }

@@ -26,6 +26,7 @@ import NativeAgentShared
 @MainActor
 final class InboxStore: ObservableObject {
     @Published var items: [InboxItemRecord] = []
+    @Published private(set) var hasLoadedSnapshot = false
     @Published var isLoading = false
     @Published var bannerError: String? = nil
 
@@ -73,6 +74,7 @@ final class InboxStore: ObservableObject {
             return
         }
         applyFetchedItems(fetched, animated: animated, notifyNewArrivals: notifyNewArrivals)
+        if iCloudSyncEngine.shared.inboxSnapshotLoaded { hasLoadedSnapshot = true }
         bannerError = iCloudSyncEngine.shared.syncError
     }
 
@@ -287,8 +289,9 @@ struct InboxView: View {
     /// immediately pop back, leaving the user staring at a blank slide-out.
     let embedInNavigationStack: Bool
 
-    init(embedInNavigationStack: Bool = true) {
+    init(embedInNavigationStack: Bool = true, initialGroup: InboxRelatedGroup? = nil) {
         self.embedInNavigationStack = embedInNavigationStack
+        _groupFilter = State(initialValue: initialGroup)
     }
 
     private var visibleItems: [InboxItemRecord] {
@@ -615,8 +618,9 @@ struct InboxCardRow: View {
                         }
                     }
 
-                    if actionIDs.contains("act") {
-                        Button(item.source.hasPrefix("trigger:file_watch") ? "Open file" : "Go ahead") {
+                    if let action = item.presentableActions.first(where: { $0.id == "act" }) {
+                        Button(item.source == "interaction" ? action.label
+                               : item.source.hasPrefix("trigger:file_watch") ? "Open file" : "Go ahead") {
                             onAction("act")
                         }
                         .aliveSecondaryButton()

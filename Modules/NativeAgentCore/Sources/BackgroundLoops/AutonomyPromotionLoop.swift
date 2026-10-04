@@ -86,7 +86,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
         "shell", "bash", "git", "apply_patch",
         "swift_build", "swift_test",
         // app/agent control surfaces
-        "restart_app", "install_app", "invoke_claude", "invoke_codex",
+        "restart_app", "install_app", "invoke_codex",
         // U4 Wave D (gpt-5.5 review BLOCKER): the self-evolution chat tools.
         // evolution_propose files a self-mod proposal, self_install stages the
         // install card, evolution_status reads. They ship at `confirm` (a

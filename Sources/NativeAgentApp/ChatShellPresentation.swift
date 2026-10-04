@@ -1,5 +1,6 @@
 import AppToolRuntime
 import Foundation
+import ToolRegistry
 import SwiftUI
 import ChatOrchestration
 import NativeAgentShared
@@ -150,16 +151,13 @@ enum ChatShellConversationRow {
     static let titleLimit = 30
 
     /// True for the bridge/agent sessions that collapse into one "Working" row.
+    @MainActor
     static func isWorking(_ session: ChatSession) -> Bool {
-        hasBridgePrefix(session.title) || hasBridgePrefix(session.lastMessagePreview)
-            || isProbe(session.title)
-    }
-
-    /// Routing probes and tool-catalog prompts: a system spoke, not a person.
-    static func isProbe(_ title: String?) -> Bool {
-        guard let title else { return false }
-        let value = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return value.hasPrefix("reply with exactly") || value.hasPrefix("use your tool catalog")
+        let source = session.source?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return ["bridge", "agent_bridge", "claude", "codex"].contains(source)
+            || source.hasSuffix("-bridge")
+            // Bridge turns can use the chat surface and persist as source "app".
+            || ChatShellOpeningLine.shared.isBridgeRouted(for: session)
     }
 
     /// Whether the STORED row says it arrived through the agent bridge.
@@ -216,21 +214,25 @@ enum ChatShellConversationRow {
     }
 
     /// A stored title that is really a machine id, not a name a person chose.
-    static func isMachineTitle(_ title: String) -> Bool {
+    static func isMachineTitle(_ title: String, session: ChatSession) -> Bool {
         let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty || value == ChatSession.placeholderTitle { return true }
         // Recovery names a session after the fact; it is a label, not a title.
-        if value.caseInsensitiveCompare("Recovered Chat") == .orderedSame { return true }
-        // "Telegram 1394548068", "iOS chat 03108B46", "Slack C01ABCD".
-        let words = value.split(separator: " ")
-        if let last = words.last,
-           words.count >= 2,
-           last.count >= 5,
-           last.allSatisfy({ $0.isHexDigit }) {
-            return true
+        if value == "Recovered Chat" { return true }
+        if session.source == "ios", value == "iOS chat \(session.id.prefix(8))" { return true }
+        let key = (session.sourceKey ?? "").split(separator: ":")
+        if session.source == "telegram", key.first == "telegram", key.count == 2 || key.count == 3 {
+            let generated = "Telegram \(key[1])" + (key.count == 3 ? " topic \(key[2])" : "")
+            return value == generated
         }
-        // A bare id with no prose at all.
-        if words.count == 1, value.count >= 5, value.allSatisfy({ $0.isHexDigit }) { return true }
+        if session.source == "slack", key.count >= 3 {
+            if (key[0] == "conversation" || key[0] == "thread"), key[2].hasPrefix("D"),
+               value.hasPrefix("Slack DM "), !value.dropFirst("Slack DM ".count).isEmpty { return true }
+            if key[0] == "thread" { return value == "Slack Thread \(key[2])" }
+            if key[0] == "conversation" {
+                return value == "Slack \(key[2])" || value == "Slack MPIM \(key[2])"
+            }
+        }
         return false
     }
 
@@ -255,10 +257,14 @@ enum ChatShellConversationRow {
     /// The last message is never a source. No summarizer, no model call.
     static func title(for session: ChatSession, openingLine: String?) -> String {
         let stored = stripBridgePrefix(session.title)
-        if !isMachineTitle(stored) { return clamp(plainText(stored)) }
+        if !isMachineTitle(stored, session: session) { return clamp(plainText(stored)) }
         let opening = stripBridgePrefix(openingLine ?? "")
         if !opening.isEmpty { return clamp(plainText(opening)) }
         return "New conversation"
+    }
+
+    static func preview(for session: ChatSession) -> String {
+        plainText(stripBridgePrefix(session.lastMessagePreview ?? ""))
     }
 
     /// Titles carry whatever the person typed, including markdown. A row is
@@ -288,6 +294,7 @@ enum ChatShellConversationRow {
     }
 
     /// Where the conversation is happening, in the words a person uses.
+    @MainActor
     static func surface(for session: ChatSession) -> String {
         if isWorking(session) { return "Connected agent" }
         switch session.source?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -403,13 +410,19 @@ enum ChatShellEnvelope {
         if let title = codexTitle(content), !title.hasPrefix("codex replied to ") {
             return "The connected agent didn't finish"
         }
-        let line = content.split(whereSeparator: \.isNewline)
+        let text = ChatShellConversationRow.stripBridgePrefix(content)
+        let boundary = (replyMarkers + ["\nCodex result:\n"])
+            .compactMap { text.range(of: $0)?.lowerBound }.min() ?? text.endIndex
+        let header = text[..<boundary]
+        let line = header.split(whereSeparator: \.isNewline)
             .first { $0.lowercased().hasPrefix("duration:") }
             .map { $0.dropFirst("duration:".count).trimmingCharacters(in: .whitespaces) } ?? ""
         let seconds = Int(line.filter(\.isNumber)) ?? 0
-        let lowered = content.lowercased()
-        if lowered.contains("[claude-wake] [notice]") { return "Delivered to Claude" }
-        if lowered.contains("status: failed") || lowered.contains("was rejected") {
+        if header.lowercased().hasPrefix("[claude-wake] [notice]") { return "Delivered to Claude" }
+        let status = header.split(whereSeparator: \.isNewline)
+            .first { $0.lowercased().hasPrefix("status:") }
+            .map { $0.dropFirst("status:".count).trimmingCharacters(in: .whitespaces).lowercased() }
+        if ["failed", "rejected", "stalled", "cancelled", "canceled"].contains(status ?? "") {
             return "The connected agent didn't finish"
         }
         guard seconds > 0 else { return "The connected agent finished" }
@@ -596,6 +609,7 @@ enum ChatShellToolSummary {
                 "check what \(AgentVoice.live.subject) \(AgentVoice.live.verb("remember"))"
             )
         case "commit_memory": return ("Saved something to memory", "save something to memory")
+        case "tool_catalog", "tool_load", "list_tools": return ("Looking up tools", "look up tools")
         case "desk_add_item": return ("Added it to the Desk", "add it to the Desk")
         case "inner_state":
             return (
@@ -604,12 +618,9 @@ enum ChatShellToolSummary {
             )
         case "": return ("Used a tool", "use a tool")
         default:
-            let words = raw.split(whereSeparator: { $0 == "_" || $0 == "-" }).map(String.init)
-            guard let first = words.first else { return ("Used a tool", "use a tool") }
-            let rest = words.dropFirst().joined(separator: " ")
-            let phrase = first + (rest.isEmpty ? "" : " " + rest)
-            let sentence = phrase.prefix(1).uppercased() + phrase.dropFirst()
-            return (String(sentence.prefix(48)), "run " + String(phrase.prefix(44)))
+            let title = ToolActivityPresentation.title(raw)
+            let phrase = title.prefix(1).lowercased() + title.dropFirst()
+            return (String(title.prefix(48)), String(phrase.prefix(48)))
         }
     }
 
@@ -648,6 +659,9 @@ enum ChatShellToolSummary {
     static func detailLine(
         toolName: String?, inputJSON: String?, status: Status = .plain
     ) -> String {
+        // An app call reads as the action it ran, over that action's args.
+        let call = toolName.map { ToolNameAliases.shown($0, inputJSON: inputJSON) }
+        let toolName = call?.name ?? toolName, inputJSON = call?.inputJSON ?? inputJSON
         let name: String
         switch status {
         case .failed: name = failedName(toolName)
@@ -679,10 +693,13 @@ enum ChatShellToolSummary {
     static func personaReceipt(
         toolName: String?, inputJSON: String?, status: Status, requiredTitle: String
     ) -> (outcome: String, meta: String)? {
-        guard toolName == "persona_append_section", status == .plain else { return nil }
+        guard toolName == "persona_append_section" || toolName == "app", status == .plain else { return nil }
         guard let inputJSON,
               let data = inputJSON.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let call = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              // Through the app door the write is persona.append, its input under args.
+              let object = toolName == "app"
+                ? (call["action"] as? String == "persona.append" ? call["args"] as? [String: Any] : nil) : call,
               let kind = (object["kind"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               let title = (object["title"] as? String)?
@@ -780,13 +797,15 @@ enum ChatShellTroubleState {
 
 /// How a conversation OPENED, for the rows whose stored title cannot say.
 ///
-/// Persistence titles a session once, from its first user message, so this is
-/// only consulted for the two rows that have no such title: a provider row
+/// Persistence titles a session once, from its first user message, so the line
+/// is only needed for the two rows that have no such title: a provider row
 /// stamped with a machine id (`Telegram 1394548068`) and a session that never
 /// had a user turn at all (a proactive greeting or brief). For those the
 /// answer lives in the transcript and nowhere cheaper — `ChatSession` carries
 /// only the LAST message preview, which is the very thing that made a row's
 /// name change every turn.
+/// The same read projects recorded opening bridge provenance for Working, since a
+/// bridge conversation can have the same session source as a local chat.
 ///
 /// The read is bounded and memoized: the first 200 rows of
 /// `<dataRoot>/chat/messages/<id>.jsonl`, keyed by session id AND message
@@ -807,32 +826,50 @@ final class ChatShellOpeningLine {
     private static let byteCeiling = 1 << 20
     /// Read granularity; a transcript row is rarely larger than this.
     private static let chunkSize = 64 * 1024
-    private var cache: [String: String] = [:]
+    private struct Projection {
+        var line: String? = nil
+        var isBridgeRouted = false
+    }
+    private var cache: [String: (revision: String, value: Projection)] = [:]
+    private var cacheOrder: [String] = []
 
     private init() {}
 
     /// The first user line of the session, or its first line of any role when
     /// no user ever spoke. nil when there is nothing to read.
     func line(for session: ChatSession) -> String? {
-        let key = "\(session.id)#\(session.messageCount ?? -1)"
-        if let hit = cache[key] { return hit.isEmpty ? nil : hit }
-        let resolved = Self.read(sessionID: session.id) ?? ""
-        cache[key] = resolved
-        return resolved.isEmpty ? nil : resolved
+        projection(for: session).line
     }
 
-    private static func read(sessionID: String) -> String? {
+    func isBridgeRouted(for session: ChatSession) -> Bool {
+        projection(for: session).isBridgeRouted
+    }
+
+    private func projection(for session: ChatSession) -> Projection {
+        let revision = "\(session.transcriptGeneration ?? -1)#\(session.messageCount ?? -1)"
+        if let hit = cache[session.id], hit.revision == revision { return hit.value }
+        let resolved = Self.read(sessionID: session.id)
+        if cache[session.id] == nil {
+            cacheOrder.append(session.id)
+            if cacheOrder.count > 128 { cache.removeValue(forKey: cacheOrder.removeFirst()) }
+        }
+        cache[session.id] = (revision, resolved)
+        return resolved
+    }
+
+    private static func read(sessionID: String) -> Projection {
         guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
-            return nil
+            return Projection()
         }
         let url = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeID).jsonl")
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return Projection() }
         defer { try? handle.close() }
 
         var firstBridge: String? = nil
+        var projection = Projection()
         var buffer = Data()
         var read = 0
         var rows = 0
@@ -850,25 +887,37 @@ final class ChatShellOpeningLine {
             for line in whole.split(separator: newline) {
                 rows += 1
                 if rows > rowBudget { break }
-                guard let spoken = spokenLine(line) else { continue }
-                if !ChatShellConversationRow.hasBridgePrefix(spoken) { return spoken }
-                if firstBridge == nil {
+                guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+                if let metadata = object["metadata"] as? [String: Any] {
+                    // Recorded provenance only: a typed routing prefix is not evidence.
+                    for key in ["origin", "envelope"] {
+                        guard let provenance = metadata[key] as? [String: Any],
+                              let surface = provenance["surface"] as? String else { continue }
+                        if ChatShellConversationRow.isBridgeRouted(.init(surface: surface)) {
+                            projection.isBridgeRouted = true
+                        }
+                    }
+                }
+                guard let spoken = spokenLine(object) else { continue }
+                if !ChatShellConversationRow.hasBridgePrefix(spoken) {
+                    projection.line = spoken
+                    return projection
+                } else if firstBridge == nil {
                     firstBridge = ChatShellConversationRow.stripBridgePrefix(spoken)
                 }
             }
         }
         // Nobody human spoke, but an agent opened the thread: that line is
         // still a better name than "New conversation".
-        return firstBridge
+        projection.line = firstBridge
+        return projection
     }
 
     /// One transcript row's user text, or nil when the row is not a person
     /// speaking (a system block, a tool result, her own turn) or does not
     /// parse — a clipped tail row is simply skipped.
-    private static func spokenLine(_ line: Data) -> String? {
-        guard let object = try? JSONSerialization.jsonObject(with: Data(line))
-                as? [String: Any],
-              let content = object["content"] as? String
+    private static func spokenLine(_ object: [String: Any]) -> String? {
+        guard let content = object["content"] as? String
         else { return nil }
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -892,14 +941,19 @@ final class ChatShellOpeningLine {
 @MainActor
 final class ChatShellLastTurn {
     static let shared = ChatShellLastTurn()
-    private var cache: [String: String] = [:]
+    private var cache: [String: (revision: String, value: String)] = [:]
+    private var cacheOrder: [String] = []
     private let tailBytes = 8_192
 
     func stamp(for session: ChatSession) -> String? {
-        let key = "\(session.id)#\(session.messageCount ?? -1)"
-        if let hit = cache[key] { return hit.isEmpty ? nil : hit }
+        let revision = "\(session.transcriptGeneration ?? -1)#\(session.messageCount ?? -1)"
+        if let hit = cache[session.id], hit.revision == revision { return hit.value.isEmpty ? nil : hit.value }
         let resolved = readTail(sessionID: session.id) ?? ""
-        cache[key] = resolved
+        if cache[session.id] == nil {
+            cacheOrder.append(session.id)
+            if cacheOrder.count > 128 { cache.removeValue(forKey: cacheOrder.removeFirst()) }
+        }
+        cache[session.id] = (revision, resolved)
         return resolved.isEmpty ? nil : resolved
     }
 
@@ -937,14 +991,17 @@ enum ChatShellNaming {
     static func settle(_ session: ChatSession, appModel: AppModel) {
         guard !settled.contains(session.id),
               ChatShellConversationRow.isMachineTitle(
-                ChatShellConversationRow.stripBridgePrefix(session.title)),
+                ChatShellConversationRow.stripBridgePrefix(session.title), session: session),
               let line = ChatShellOpeningLine.shared.line(for: session)
         else { return }
         settled.insert(session.id)
         let title = ChatShellConversationRow.plainText(
             ChatShellConversationRow.stripBridgePrefix(line))
         guard !title.isEmpty else { return }
-        Task { await appModel.renameChatSession(id: session.id, title: title) }
+        Task {
+            guard appModel.engine.transcripts.sessions.first(where: { $0.id == session.id })?.title == session.title else { return }
+            await appModel.renameChatSession(id: session.id, title: title)
+        }
     }
 }
 
@@ -953,7 +1010,7 @@ extension ChatShellConversationRow {
     /// and other things she started on her own.
     @MainActor
     static func isHerOwn(_ session: ChatSession) -> Bool {
-        guard isMachineTitle(stripBridgePrefix(session.title)),
+        guard isMachineTitle(stripBridgePrefix(session.title), session: session),
               (session.messageCount ?? 0) > 0 else { return false }
         return ChatShellOpeningLine.shared.line(for: session) == nil
     }
@@ -963,7 +1020,7 @@ extension ChatShellConversationRow {
     @MainActor
     static func title(for session: ChatSession) -> String {
         let stored = stripBridgePrefix(session.title)
-        guard isMachineTitle(stored) else { return title(for: session, openingLine: nil) }
+        guard isMachineTitle(stored, session: session) else { return title(for: session, openingLine: nil) }
         return title(for: session, openingLine: ChatShellOpeningLine.shared.line(for: session))
     }
 }

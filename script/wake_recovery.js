@@ -3,26 +3,29 @@
 // Lane-specific recovery; entrypoints supply runtime policy and effects.
 
 function createCodexRecovery({
+  DEFAULT_WAKE_CONCURRENCY,
+  WAKE_CAPACITY_DIR,
   PINNED_THREAD_MODE,
   REPLY_DELIVERIES_PATH,
   REPLY_JOBS_DIR,
   REPLY_RECOVERY_LOCK_DIR,
   appendHangWatchdogReceipt,
-  appendPending,
   appendStaleWakeRecoveryReceipt,
   boolSetting,
+  connectRpcOnce,
   deadLetterPath,
   deliverReplyJob,
   dirLockOwnerAlive,
   entryLaneKey,
+  isUnhealthyThreadState,
   markInboxConsumed,
   markInboxTerminal,
   markPendingStaleRecovery,
   messageIdForPayload,
-  nonnegativeIntegerSetting,
   numberSetting,
   pidAlive,
   probeTurnLiveness,
+  readCanonicalTurnResult,
   processStartIdentity,
   readWakeJSONLines,
   redactDiagnosticText,
@@ -30,7 +33,7 @@ function createCodexRecovery({
   sleep,
   socketOwnerPid,
   startDaemon,
-  startDrainProcess,
+  threadStateFromThread,
   unicodePrefix,
   wakeLaneKey,
   wakeLaneLockPath,
@@ -96,6 +99,58 @@ async function terminateKnownHungAppServer(job, operations = {}) {
   return { action: "app_server_kill_failed_still_alive", pidKilled: null };
 }
 
+async function recoverExactHungTurn(job, threadId, turnId, operations = {}) {
+  let client;
+  const connect = operations.connectRpcOnce || connectRpcOnce;
+  try {
+    client = await connect(12000);
+    try {
+      await client.request("turn/interrupt", { threadId, turnId });
+      return { action: "hung_turn_interrupted", pidKilled: null };
+    } catch {}
+
+    // Hold every admission slot while checking the shared server, so another
+    // wake cannot start between the inventory and termination.
+    const capacityRoot = operations.capacityRoot || WAKE_CAPACITY_DIR;
+    fs.mkdirSync(capacityRoot, { recursive: true, mode: 0o700 });
+    async function withAllSlots(index, fn) {
+      if (index === DEFAULT_WAKE_CONCURRENCY) return await fn();
+      return await withDirLock(path.join(capacityRoot, `slot-${index}.lock`),
+        async () => withAllSlots(index + 1, fn),
+        { waitMs: 0, preserveLiveOwner: true });
+    }
+    return await withAllSlots(0, async () => {
+      const loaded = await client.request("thread/loaded/list", {});
+      if (!loaded || !Array.isArray(loaded.data) || loaded.nextCursor) {
+        return { action: "app_server_kill_skipped_unverified_lanes", pidKilled: null };
+      }
+      for (const id of loaded.data) {
+        const read = await client.request("thread/read", { threadId: id, includeTurns: true });
+        if (!read || !read.thread || read.thread.id !== id) {
+          return { action: "app_server_kill_skipped_unverified_lanes", pidKilled: null };
+        }
+        const state = threadStateFromThread(read.thread, id);
+        const otherActiveTurn = state.inProgressTurnIds.some((active) => id !== threadId || active !== turnId);
+        if (isUnhealthyThreadState(state) || !["idle", "active"].includes(state.statusType)
+            || otherActiveTurn || (state.active && (id !== threadId || state.inProgressTurnIds.length === 0))) {
+          return { action: "app_server_kill_skipped_other_active_lane", pidKilled: null };
+        }
+      }
+      const confirmed = await client.request("thread/loaded/list", {});
+      if (!confirmed || !Array.isArray(confirmed.data) || confirmed.nextCursor
+          || JSON.stringify([...confirmed.data].sort()) !== JSON.stringify([...loaded.data].sort())) {
+        return { action: "app_server_kill_skipped_unverified_lanes", pidKilled: null };
+      }
+      return await terminateKnownHungAppServer(job, operations);
+    });
+  } catch (error) {
+    return { action: error && error.message === "lock_busy"
+      ? "app_server_kill_skipped_active_admission" : "app_server_kill_skipped_unverified_lanes", pidKilled: null };
+  } finally {
+    if (client) client.close();
+  }
+}
+
 function clearStaleWakeLaneLock(laneKey, lockDir = null, operations = {}) {
   const resolvedLockDir = lockDir || wakeLaneLockPath(laneKey);
   if (!fs.existsSync(resolvedLockDir)) {
@@ -154,16 +209,14 @@ async function recoverHungTurn(job, execution, config, options = {}) {
     return { status: "not_hung", retryCount: Number(job && job.hangRetryCount || 0) };
   }
   const retryCount = Math.max(0, Number(job && job.hangRetryCount || 0));
+  const turnId = execution.turnId || job.turnId;
+  const threadId = execution.threadId || job.threadId;
+  const reconcile = options.readCanonicalTurnResult || readCanonicalTurnResult;
+  const terminal = await reconcile(null, threadId, turnId, config);
+  if (terminal) return { status: "reconciled_terminal", retryCount, turnResult: terminal };
   if (!boolSetting(config, "hangAutoRecover", "NATIVE_AGENT_CODEX_HANG_AUTORECOVER", true)) {
     return { status: "disabled", retryCount };
   }
-  const maxRetries = nonnegativeIntegerSetting(
-    config,
-    "hangMaxRetries",
-    "NATIVE_AGENT_CODEX_HANG_MAX_RETRIES",
-    1
-  );
-  const turnId = execution.turnId || job.turnId;
   const nowFn = options.now || Date.now;
   const writeReceipt = options.appendReceipt || appendHangWatchdogReceipt;
   const receipts = [];
@@ -173,6 +226,8 @@ async function recoverHungTurn(job, execution, config, options = {}) {
       action: result.action,
       pidKilled: result.pidKilled ?? null,
       retryCount: result.retryCount ?? retryCount,
+      toolActivityCount: execution.turnResult.toolActivityCount ?? null,
+      noWorkObserved: execution.turnResult.noWorkObserved ?? null,
       timestamp: new Date(nowFn()).toISOString(),
     };
     if (result.laneKey) receipt.laneKey = result.laneKey;
@@ -184,7 +239,7 @@ async function recoverHungTurn(job, execution, config, options = {}) {
 
   const processOperations = options.processOperations || {};
   const laneKey = wakeLaneKey({}, job && job.threadId, PINNED_THREAD_MODE);
-  const killed = await record(await terminateKnownHungAppServer(job, processOperations));
+  const killed = await record(await recoverExactHungTurn(job, threadId, turnId, processOperations));
   const lock = await record(clearStaleWakeLaneLock(
     laneKey,
     options.laneLockDir || null,
@@ -192,48 +247,20 @@ async function recoverHungTurn(job, execution, config, options = {}) {
       dirLockOwnerAlive: options.dirLockOwnerAlive,
     }
   ));
+  // A terminal write can land during shutdown. Preserve it before repairing
+  // the process; an activity count never proves which effects completed.
+  const settled = await reconcile(null, threadId, turnId, config);
   const respawn = await record(respawnAppServerAfterHang(processOperations));
-
-  if (retryCount >= maxRetries) {
-    await record({ action: "hang_retry_cap_reached", pidKilled: null });
-    return { status: "permanent_failed_hung", retryCount, maxRetries, killed, lock, respawn, receipts };
+  if (settled) {
+    return { status: "reconciled_terminal", retryCount, turnResult: settled, killed, lock, respawn, receipts };
   }
-
-  const append = options.appendPending || appendPending;
-  const nextRetryCount = retryCount + 1;
-  const queued = [];
-  try {
-    for (const entry of Array.isArray(job.entries) ? job.entries : []) {
-      queued.push(await append(entry.payload || {}, job.threadId, {
-        hangRetryCount: nextRetryCount,
-        hungTurnId: turnId,
-      }));
-    }
-    if (queued.length === 0) throw new Error("hang_retry_entries_missing");
-  } catch (error) {
-    await record({ action: "hang_retry_requeue_failed", pidKilled: null });
-    return {
-      status: "permanent_failed_hung",
-      retryCount,
-      maxRetries,
-      killed,
-      lock,
-      respawn,
-      receipts,
-      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
-    };
-  }
-  const drain = (options.startDrainProcess || startDrainProcess)(config);
-  await record({ action: "hung_wake_job_requeued", pidKilled: null, retryCount: nextRetryCount });
+  await record({ action: "hang_effect_reconciliation_required", pidKilled: null });
   return {
-    status: "requeued",
-    retryCount: nextRetryCount,
-    maxRetries,
+    status: "reconciliation_required",
+    retryCount,
     killed,
     lock,
     respawn,
-    queued,
-    drain,
     receipts,
   };
 }
@@ -537,670 +564,4 @@ return {
 };
 }
 
-function createClaudeRecovery({
-  DEFAULT_ABSENT_SETTLE_GRACE_MS,
-  DEFAULT_MAX_AUTO_REARMS,
-  DEFAULT_RECOVERY_MAX_PER_PASS,
-  DEFAULT_SPAWN_GRACE_MS,
-  DEFAULT_TOPIC,
-  DELIVERIES_PATH,
-  KILL_GRACE_MS,
-  PRE_DELIVERY_STATES,
-  WAKE_JOBS_DIR,
-  WEDGED_RUNNER_MARGIN_MS,
-  acquireTopicLock,
-  appendJSONL,
-  bridgeURL,
-  claimJob,
-  confirmDeliveryViaSessionStore,
-  envNumber,
-  jobHeartbeatAgeMs,
-  missingCompletionOrigin,
-  nowISO,
-  pidAlive,
-  postBridgeMessage,
-  processTreePids,
-  readJob,
-  redactDiagnosticText,
-  renameJobAside,
-  sleep,
-  staleThresholdMs,
-  topicSlug,
-  updateJob
-}) {
-const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
-
-/// Replay ONLY the bridge delivery for a job that already holds a completed
-/// reply the agent never received. Deliberately does not re-run claude: the answer
-/// exists, the transport failed.
-///
-/// At-most-once under concurrent duplicates: two helpers can both lose the
-/// O_EXCL claim, both read deliveryLost:true, and both reach here before
-/// either clears completionText — so the POST is fenced by an atomic replay
-/// lock. The loser reports replay_in_progress; a lock whose recorded pid is
-/// dead is stolen (rename-aside, never deleted) so a crashed replayer cannot
-/// poison redelivery.
-async function replayLostDelivery(jobPath, job) {
-  const lockDir = `${jobPath}.replay.lock`;
-  const claimReplayLock = () => {
-    fs.mkdirSync(lockDir, { mode: 0o700 });
-    fs.writeFileSync(path.join(lockDir, "pid"), `${process.pid}\n`, { mode: 0o600 });
-  };
-  try {
-    claimReplayLock();
-  } catch (error) {
-    if (!error || error.code !== "EEXIST") {
-      return {
-        delivery: "claude_thread_wakeup",
-        messageId: job.messageId || (job.payload && job.payload.messageId) || null,
-        jobPath,
-        status: "failed",
-        reason: "replay_lock_failed",
-        deliveryLost: true,
-        error: String((error && error.message) || error),
-      };
-    }
-    let ownerPid = NaN;
-    try {
-      ownerPid = Number(fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim());
-    } catch {}
-    let lockLooksLive = Number.isFinite(ownerPid) && pidAlive(ownerPid);
-    if (!Number.isFinite(ownerPid)) {
-      // A missing pid file is a contender mid-acquire — but only briefly. A
-      // contender that crashed inside the mkdir->pid-write window must not
-      // block redelivery forever, so an aged pid-less lock is stale.
-      let lockMtimeMs = 0;
-      try { lockMtimeMs = fs.statSync(lockDir).mtimeMs; } catch {}
-      const acquireGraceMs = Number(process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAIM_WRITE_GRACE_MS || 5000);
-      lockLooksLive = lockMtimeMs !== 0 && Date.now() - lockMtimeMs < acquireGraceMs;
-    }
-    if (lockLooksLive) {
-      return {
-        delivery: "claude_thread_wakeup",
-        messageId: job.messageId || (job.payload && job.payload.messageId) || null,
-        jobPath,
-        status: "skipped",
-        reason: "replay_in_progress",
-        deliveryLost: true,
-      };
-    }
-    try {
-      fs.renameSync(lockDir, `${lockDir}.stale-${nowISO().replace(/[:.]/g, "-")}`);
-      claimReplayLock();
-    } catch {
-      return {
-        delivery: "claude_thread_wakeup",
-        messageId: job.messageId || (job.payload && job.payload.messageId) || null,
-        jobPath,
-        status: "skipped",
-        reason: "replay_in_progress",
-        deliveryLost: true,
-      };
-    }
-  }
-  try {
-    // Re-read under the lock: a racing replayer may have finished while we
-    // were acquiring, in which case there is nothing left to redeliver.
-    const fresh = readJob(jobPath);
-    if (!fresh || fresh.deliveryLost !== true
-        || typeof fresh.completionText !== "string" || !fresh.completionText) {
-      return {
-        delivery: "claude_thread_wakeup",
-        messageId: job.messageId || (job.payload && job.payload.messageId) || null,
-        jobPath,
-        status: "skipped",
-        reason: "duplicate",
-        note: "already_redelivered",
-        deliveryLost: false,
-      };
-    }
-    return await replayLostDeliveryLocked(jobPath, fresh);
-  } finally {
-    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
-  }
-}
-
-function markSessionStoreDelivered(jobPath, check) {
-  updateJob(jobPath, {
-    bridgeStatus: "delivered",
-    bridgeReason: "confirmed_by_session_store",
-    deliveryLost: false,
-    completionText: null,
-    sessionStoreCheck: check,
-    unknownSettledAt: nowISO(),
-  });
-}
-
-async function replayLostDeliveryLocked(jobPath, job) {
-  const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
-  // 2026-09-06: jobs written before the rename carry `agentSessionId`; the
-  // live bridge still holds them, and a settled job must stay matchable.
-  const sessionId = job.agentSessionId || job.agentSessionId || (job.payload && job.payload.sessionId) || null;
-  const missingOrigin = missingCompletionOrigin(sessionId);
-  if (missingOrigin) {
-    updateJob(jobPath, { bridgeStatus: "blocked", bridgeReason: missingOrigin.reason, deliveryLost: false });
-    return { status: "blocked", reason: missingOrigin.reason, delivery: "claude_thread_wakeup",
-      messageId, jobPath, bridge: missingOrigin, deliveryLost: false, note: missingOrigin.note };
-  }
-  const settleDelivered = (check) => {
-    markSessionStoreDelivered(jobPath, check);
-    return {
-      delivery: "claude_thread_wakeup",
-      messageId,
-      jobPath,
-      status: "skipped",
-      reason: "duplicate",
-      note: "unknown_confirmed_delivered",
-      deliveryLost: false,
-      sessionStoreCheck: check,
-    };
-  };
-  // Final store read UNDER the replay lock, immediately before the POST: a
-  // late-landing row (or a racing present-settlement by another duplicate)
-  // must beat a stale "absent" observation — replaying a completion that
-  // landed double-delivers it.
-  if (confirmDeliveryViaSessionStore(sessionId, messageId, job.completionText) === "present") {
-    return settleDelivered("present");
-  }
-
-  // Persist uncertainty before the effect: a crash during POST must reconcile
-  // this attempt through the settle grace instead of replaying immediately.
-  const attempting = updateJob(jobPath, {
-    bridgeStatus: "unknown",
-    bridgeReason: "replay_in_flight",
-    deliveryLost: false,
-    lastBridgeAttemptAt: nowISO(),
-  });
-  if (!attempting) {
-    return { status: "failed", reason: "replay_checkpoint_failed",
-      delivery: "claude_thread_wakeup", messageId, jobPath, deliveryLost: true };
-  }
-  const bridge = await postBridgeMessage(job.completionText, sessionId || "");
-  const ok = bridge.status === "delivered" || bridge.status === "dry_run";
-  const base = {
-    delivery: "claude_thread_wakeup",
-    messageId,
-    jobPath,
-    bridge: {
-      status: bridge.status,
-      reason: bridge.reason || null,
-      httpStatus: bridge.httpStatus == null ? null : bridge.httpStatus,
-      url: process.env.NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN === "1" ? null : bridgeURL(),
-    },
-  };
-  if (!ok) {
-    if (bridge.status === "unknown") {
-      // An ambiguous outcome on the REPLAY proves nothing either — same
-      // defect, same rule. present -> delivered. Absent AND unreadable both
-      // send the job BACK to unknown — deliveryLost cleared, completionText
-      // kept — because an absent read here races THIS replay's own append.
-      // The next arrival routes through settle_unknown, whose grace lets a
-      // persisted absence re-arm honestly.
-      const check = confirmDeliveryViaSessionStore(sessionId, messageId, job.completionText);
-      if (check === "present") return settleDelivered(check);
-      updateJob(jobPath, {
-        bridgeStatus: "unknown",
-        bridgeReason: bridge.reason || null,
-        deliveryLost: false,
-        sessionStoreCheck: check,
-        lastBridgeAttemptAt: nowISO(),
-      });
-      return { ...base, status: "unknown", reason: bridge.reason || null, deliveryLost: false, sessionStoreCheck: check };
-    }
-    updateJob(jobPath, {
-      bridgeStatus: bridge.status,
-      bridgeReason: bridge.reason || null,
-      deliveryLost: true,
-    });
-    return { ...base, status: "failed", reason: "redelivery_failed", deliveryLost: true };
-  }
-
-  const receipt = {
-    id: crypto.randomUUID(),
-    createdAt: nowISO(),
-    kind: "redelivery",
-    messageId: base.messageId,
-    topic: (job.payload && job.payload.topic) || DEFAULT_TOPIC,
-    topicSlug: job.topicSlug || topicSlug(job.payload && job.payload.topic),
-    jobPath,
-    status: job.status || "completed",
-    originalReceiptId: job.receiptId || null,
-    bridge: base.bridge,
-    deliveryLost: false,
-  };
-  try { appendJSONL(DELIVERIES_PATH, receipt); } catch {}
-  // Deliberately NOT claim-gated: the replayer never claimed this job, and the
-  // job is already SETTLED — its original runner is finished and will never
-  // write again. Fencing here would make redelivery impossible.
-  updateJob(jobPath, {
-    deliveryLost: false,
-    bridgeStatus: bridge.status,
-    bridgeReason: bridge.reason || null,
-    redeliveredAt: nowISO(),
-    redeliveryReceiptId: receipt.id,
-    completionText: null,
-  });
-
-  return {
-    ...base,
-    status: "redelivered",
-    reason: null,
-    deliveryLost: false,
-    receiptId: receipt.id,
-    receiptPath: DELIVERIES_PATH,
-    ...(bridge.status === "dry_run" ? { wouldSendText: bridge.text } : {}),
-  };
-}
-
-/// Late settlement for a job whose delivery outcome was UNKNOWN (bridge reply
-/// timeout with the session store unreadable at the time). Reads the store
-/// again: present -> the message landed, settle as delivered; provably absent
-/// -> arm deliveryLost and replay; still unreadable -> stay unknown, honest
-/// duplicate, no replay. deliveryLost:true is only ever written here on
-/// store-read evidence — a bare timeout can never produce it.
-async function settleUnknownDelivery(jobPath, job) {
-  const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
-  // 2026-09-06: jobs written before the rename carry `agentSessionId`; the
-  // live bridge still holds them, and a settled job must stay matchable.
-  const sessionId = job.agentSessionId || job.agentSessionId || (job.payload && job.payload.sessionId) || null;
-  const check = confirmDeliveryViaSessionStore(sessionId, messageId, job.completionText);
-  const base = {
-    delivery: "claude_thread_wakeup",
-    messageId,
-    jobPath,
-    sessionStoreCheck: check,
-    deliveryLost: false,
-  };
-  if (check === "present") {
-    markSessionStoreDelivered(jobPath, check);
-    return { ...base, status: "skipped", reason: "duplicate", note: "unknown_confirmed_delivered" };
-  }
-  if (check === "absent" && typeof job.completionText === "string" && job.completionText) {
-    // Absence only counts once it has PERSISTED past the settle grace since
-    // the last bridge attempt — an immediate re-read races the append that
-    // attempt may have started (the false-replay class, gpt-5.5 2026-07-25).
-    const attemptMs = Date.parse(job.lastBridgeAttemptAt || job.completedAt || job.updatedAt || "");
-    const ageMs = Number.isFinite(attemptMs) ? Date.now() - attemptMs : Infinity;
-    const graceMs = envNumber("NATIVE_AGENT_CLAUDE_WAKE_ABSENT_GRACE_MS", DEFAULT_ABSENT_SETTLE_GRACE_MS);
-    if (ageMs < graceMs) {
-      return { ...base, status: "skipped", reason: "duplicate", note: "unknown_absent_within_grace", ageMs, graceMs };
-    }
-    const armed = updateJob(jobPath, {
-      bridgeStatus: "failed",
-      bridgeReason: "absent_from_session_store",
-      deliveryLost: true,
-      sessionStoreCheck: check,
-      unknownSettledAt: nowISO(),
-    });
-    return replayLostDelivery(jobPath, armed || { ...job, deliveryLost: true });
-  }
-  return { ...base, status: "skipped", reason: "duplicate", note: "unknown_unresolved" };
-}
-
-/// Recover only proven-unsent failures and missing-origin completions.
-/// Unknown delivery may already have landed; suppressed delivery is deliberate.
-function terminalUndelivered(job) {
-  if (!job || job.state !== "settled") return false;
-  // Recovery requires the retained reply itself, not just a delivery status.
-  if (typeof job.completionText !== "string" || !job.completionText.trim()) return false;
-  // Durable once-only marker. A job is swept AT MOST ONCE, ever.
-  if (job.deliveryRecoveryAt) return false;
-  if (job.bridgeReason === "missing_origin_session") return true;
-  return job.bridgeStatus === "failed";
-}
-
-async function recoverTerminalUndelivered(jobPath, job) {
-  const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
-  // 2026-09-06: jobs written before the rename carry `agentSessionId`; the
-  // live bridge still holds them, and a settled job must stay matchable.
-  const sessionId = job.agentSessionId || job.agentSessionId || (job.payload && job.payload.sessionId) || null;
-  if (typeof sessionId !== "string" || !sessionId.trim()) {
-    // No origin to post INTO. Deliberately does NOT arm deliveryLost: that
-    // would flip the record out of the `blocked` outcome class the existing
-    // delegation-outcome card already reports it under, and the card is the
-    // whole point of this branch. Stamp the once-only marker and say, on the
-    // record, that the reply exists and where — the card renders the retained
-    // completion head alongside the job id.
-    const marked = updateJob(jobPath, {
-      deliveryRecoveryAt: nowISO(),
-      deliveryRecoveryOutcome: "carded_origin_unresolvable",
-      deliveryRecoveryNote:
-        `Completed reply is retained on ${jobPath}. No origin session is recorded, `
-        + "so it cannot be posted; identify the original conversation and deliver it "
-        + "explicitly. Do not rerun the worker.",
-    });
-    return {
-      messageId, jobPath, posted: false,
-      status: marked ? "carded" : "failed",
-      reason: marked ? "origin_unresolvable" : "recovery_mark_failed",
-    };
-  }
-  // Mark BEFORE posting. At-most-once beats at-least-once here: a crash
-  // between the mark and the POST costs one stranded reply that a human can
-  // still read straight off the record, while a repeat costs the agent a duplicate
-  // completion — the single worst thing this file can produce.
-  const armed = updateJob(jobPath, {
-    deliveryRecoveryAt: nowISO(),
-    deliveryRecoveryOutcome: "reposting",
-    // Proven-undelivered IS deliveryLost; legacy records simply never said so.
-    deliveryLost: true,
-    agentSessionId: sessionId,
-  });
-  if (!armed) {
-    return { messageId, jobPath, posted: false, status: "failed", reason: "recovery_mark_failed" };
-  }
-  // Reuse the existing replay path wholesale: it owns the per-job replay lock,
-  // the under-lock re-read, the final session-store check immediately before
-  // the POST, the redelivery receipt, and clearing completionText on success.
-  const replay = await replayLostDelivery(jobPath, armed);
-  const status = (replay && replay.status) || "unknown";
-  updateJob(jobPath, {
-    deliveryRecoveryOutcome: status,
-    deliveryRecoveryNote: status === "redelivered"
-      ? null
-      : `Completed reply is retained on ${jobPath}; the recovery post did not confirm delivery.`,
-  });
-  return {
-    messageId, jobPath,
-    status,
-    reason: (replay && replay.reason) || null,
-    posted: status === "redelivered",
-    replay,
-  };
-}
-
-/// One bounded pass over the job store. Runs on the TAIL of a real wake (and
-/// via `--recover`), never on the latency-bound foreground helper path.
-async function sweepTerminalUndelivered(limit) {
-  const max = limit == null
-    ? envNumber("NATIVE_AGENT_CLAUDE_WAKE_RECOVERY_MAX", DEFAULT_RECOVERY_MAX_PER_PASS)
-    : limit;
-  const empty = { scanned: 0, eligible: 0, attempted: 0, results: [] };
-  if (!(max > 0)) return empty;
-  let names;
-  try { names = fs.readdirSync(WAKE_JOBS_DIR); } catch { return empty; }
-  const candidates = [];
-  for (const name of names) {
-    // `.stale-<uuid>` takeovers are archived dead runs, never redelivery
-    // targets — the extension test excludes them exactly as the rate limiter's
-    // scan does.
-    if (!name.endsWith(".json")) continue;
-    const jobPath = path.join(WAKE_JOBS_DIR, name);
-    const job = readJob(jobPath);
-    if (!terminalUndelivered(job)) continue;
-    candidates.push({ jobPath, job, at: Date.parse(job.completedAt || job.updatedAt || "") || 0 });
-  }
-  // Oldest first: a backlog drains in the order it stranded.
-  candidates.sort((a, b) => a.at - b.at);
-  const slice = candidates.slice(0, max);
-  const results = [];
-  for (const candidate of slice) {
-    try {
-      results.push(await recoverTerminalUndelivered(candidate.jobPath, candidate.job));
-    } catch (error) {
-      results.push({
-        jobPath: candidate.jobPath,
-        messageId: candidate.job.messageId || null,
-        status: "failed",
-        reason: "recovery_error",
-        posted: false,
-        error: redactDiagnosticText(String((error && error.message) || error)),
-      });
-    }
-  }
-  return { scanned: names.length, eligible: candidates.length, attempted: results.length, results };
-}
-
-/// ------------------------------------------------------ wedged-runner re-arm
-///
-/// A runner is WEDGED when its own advertised deadline has passed by the kill
-/// grace plus a margin and the process is somehow still alive — i.e. both of
-/// its watchdogs failed to end it.
-///
-/// The state gate is the whole safety argument. performWake stamps
-/// `delivering` on the job file BEFORE the bridge POST, so a job still in a
-/// pre-delivery state cannot have delivered anything, and killing it cannot
-/// produce a double completion.
-function preDeliveryWedge(job) {
-  if (!job || !PRE_DELIVERY_STATES.includes(job.state)) return null;
-  const deadlineMs = Date.parse((job && job.deadlineAt) || "");
-  if (!Number.isFinite(deadlineMs)) return null;
-  const marginMs = envNumber("NATIVE_AGENT_CLAUDE_WAKE_WEDGED_MARGIN_MS", WEDGED_RUNNER_MARGIN_MS);
-  const overdueMs = Date.now() - (deadlineMs + KILL_GRACE_MS + marginMs);
-  if (overdueMs <= 0) return null;
-  return { deadlineAt: job.deadlineAt, overdueMs: Math.round(overdueMs), state: job.state };
-}
-
-/// SIGTERM the whole recorded runner tree, then SIGKILL after the same grace
-/// the in-run watchdogs use. Death is PROVEN by polling the recorded roots,
-/// never assumed: a survivor aborts the entire re-arm.
-async function terminateWedgedRunner(job) {
-  const roots = [Number(job && job.runnerPid), Number(job && job.pid)]
-    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
-  const targets = new Set();
-  for (const root of roots) {
-    if (!pidAlive(root)) continue;
-    // Snapshot descendants BEFORE signalling: after SIGTERM the root is gone
-    // and its orphaned children are no longer reachable from it.
-    for (const pid of processTreePids(root)) targets.add(pid);
-    targets.add(root);
-  }
-  targets.delete(process.pid);
-  const signalledPids = [...targets];
-  for (const pid of signalledPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
-  await sleep(KILL_GRACE_MS);
-  for (const pid of signalledPids) {
-    if (pidAlive(pid)) { try { process.kill(pid, "SIGKILL"); } catch {} }
-  }
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline && roots.some((pid) => pidAlive(pid))) await sleep(100);
-  return { terminated: !roots.some((pid) => pidAlive(pid)), signalledPids, roots };
-}
-
-function knownUnstartedWake(job) {
-  const rejectedBeforeExecution = job && job.schemaVersion === 2
-    && job.state === "settled" && job.status === "failed" && job.reason === "rejected_topic_busy";
-  return job && job.schemaVersion >= 2
-    && typeof job.claimId === "string" && job.claimId
-    && (["claimed", "queued", "spawn_failed"].includes(job.state) || rejectedBeforeExecution)
-    && !job.startedAt && !job.attemptSessionId && !job.progressAt
-    && (job.attempts == null || (Array.isArray(job.attempts) && job.attempts.length === 0))
-    && job.payload && job.payload.messageId === job.messageId
-    && typeof job.payload.text === "string" && job.payload.text.trim();
-}
-
-/// A duplicate may recover proven-unstarted work or reconcile delivery, never
-/// infer no effects from a dead process, old heartbeat, or unreadable record.
-async function resolveExistingJob(jobPath, payload, makeClaimRecord) {
-  const job = readJob(jobPath);
-  if (!job) {
-    // Unreadable claim: usually corrupt — but a FRESH unreadable file is a
-    // live claimant between its O_EXCL create and its first JSON write.
-    // Stealing it would rename a live claim aside; give the write a grace.
-    let mtimeMs = 0;
-    try { mtimeMs = fs.statSync(jobPath).mtimeMs; } catch {}
-    const writeGraceMs = Number(process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAIM_WRITE_GRACE_MS || 5000);
-    if (mtimeMs && Date.now() - mtimeMs < writeGraceMs) {
-      return { action: "duplicate", job: null, note: "claimMidWrite" };
-    }
-    return { action: "duplicate", job: null, note: "execution_outcome_unknown" };
-  }
-  if (job.messageId !== payload.messageId) {
-    // The old sanitizer cut UTF-16 units, unlike the Swift producer's graphemes.
-    // Both IDs share the existing 120-unit filename: never adopt/replay a legacy
-    // claim, since distinct accepted IDs may have collapsed into that old ID.
-    const legacyId = payload.messageId.slice(0, 160);
-    return { action: "duplicate", job, note: legacyId !== payload.messageId && job.messageId === legacyId
-      ? "legacy_message_id_ambiguous" : "message_id_conflict" };
-  }
-  if (job.state === "settled" && job.bridgeReason === "missing_origin_session") {
-    return { action: "duplicate", job, note: "missing_origin_session" };
-  }
-
-  // A current-schema topic-busy rejection never admitted Claude execution.
-  // An explicit resend may recover it through the same dead-owner/CAS path;
-  // its original rejection and delivery receipt remain in the archived job.
-  if (job.state === "settled" && !knownUnstartedWake(job)) {
-    if (job.deliveryLost === true && typeof job.completionText === "string" && job.completionText) {
-      return { action: "replay", job };
-    }
-    // An unknown-delivery settlement is re-examined on every duplicate
-    // arrival: the store may be readable now, or the row may have landed.
-    // Unknown NEVER reaches the replay branch above directly — replay
-    // requires store-proven absence (settleUnknownDelivery is the only path
-    // that can arm deliveryLost on such a job).
-    if (job.bridgeStatus === "unknown") {
-      return { action: "settle_unknown", job };
-    }
-    return { action: "duplicate", job };
-  }
-
-  const ownerPid = Number(job.pid);
-  const runnerPid = Number(job.runnerPid);
-  const hasRunnerPid = Number.isInteger(runnerPid) && runnerPid > 0;
-  const ageMs = jobHeartbeatAgeMs(job);
-  const staleMs = staleThresholdMs(job);
-
-  // Takeover requires that EVERY recorded owner pid be provably dead. A stale
-  // heartbeat is NOT sufficient on its own: renaming a live runner's job aside
-  // lets two processes run the same wake and post two completions to the agent.
-  // The tradeoff is deliberate — a wedged-but-alive runner blocks retries of
-  // that messageId until it dies. Safety over availability; a stuck wake costs
-  // one message, a double wake costs the agent's trust in the receipt stream.
-  if (pidAlive(ownerPid) || (hasRunnerPid && pidAlive(runnerPid))) {
-    // The tradeoff above stands, with exactly ONE exception: a runner past its
-    // own advertised deadline whose watchdogs demonstrably failed to end it.
-    // That process is not doing work anybody is waiting on — it is a corpse
-    // holding a messageId hostage — so it is terminated here and the wake is
-    // re-armed once. Everything that makes this safe is checked below and
-    // AFTER the kill, never inferred.
-    const wedge = preDeliveryWedge(job);
-    if (wedge) {
-      const rearmLimit = envNumber("NATIVE_AGENT_CLAUDE_WAKE_MAX_REARMS", DEFAULT_MAX_AUTO_REARMS);
-      const priorRearms = Number(job.autoRearms) || 0;
-      const kill = await terminateWedgedRunner(job);
-      const fresh = readJob(jobPath);
-      if (!kill.terminated || !fresh) {
-        // Could not prove it dead. Two runners on one wake is strictly worse
-        // than one stuck wake; defer exactly as before.
-        return { action: "duplicate", job, note: "wedged_runner_survived", ageMs, staleMs, ownerPid };
-      }
-      // Re-read AFTER the process is provably dead. This closes the only
-      // window that mattered: `delivering` is written durably BEFORE the POST,
-      // so a runner that posted while we were killing it is visible here.
-      if (!preDeliveryWedge(fresh)) {
-        return { action: "duplicate", job: fresh, note: "wedged_runner_delivered", ageMs, staleMs, ownerPid };
-      }
-      if (priorRearms >= rearmLimit) {
-        // Budget spent. Settle it as a failure naming the reason so the
-        // delegation-outcome card fires, instead of leaving the record parked
-        // in `running` behind a pid that no longer exists.
-        updateJob(jobPath, {
-          state: "settled",
-          status: "failed",
-          reason: `wedged_runner_terminated_after_${priorRearms}_rearm${priorRearms === 1 ? "" : "s"}`,
-          bridgeStatus: "suppressed",
-          bridgeReason: "wedged_runner_terminated_no_completion",
-          completedAt: nowISO(),
-          deliveryLost: false,
-          wedgedTerminatedAt: nowISO(),
-          wedgedOverdueMs: wedge.overdueMs,
-          wedgedSignalledPids: kill.signalledPids,
-        });
-        return { action: "duplicate", job: readJob(jobPath), note: "wedged_runner_rearm_exhausted", ageMs, ownerPid };
-      }
-      // Same serialization the unstarted-recovery path uses. The dead runner's
-      // topic lock is reclaimed by acquireTopicLock's own dead-owner check.
-      const wedgeLock = await acquireTopicLock(
-        topicSlug((fresh.payload || job.payload || {}).topic), 0,
-        { messageId: payload.messageId, recoveryOnly: true }
-      );
-      if (!wedgeLock.acquired) return { action: "duplicate", job: fresh, note: "recovery_in_progress" };
-      try {
-        const current = readJob(jobPath);
-        if (!current || current.claimId !== fresh.claimId || !preDeliveryWedge(current)
-            || pidAlive(current.pid) || (current.runnerPid && pidAlive(current.runnerPid))) {
-          return { action: "duplicate", job: current, note: "claim_changed" };
-        }
-        const replacement = makeClaimRecord(current.payload || payload);
-        replacement.autoRearms = priorRearms + 1;
-        replacement.autoRearmAt = nowISO();
-        replacement.autoRearmReason = `wedged_runner_terminated_overdue_${wedge.overdueMs}ms`;
-        const stalePath = renameJobAside(jobPath);
-        if (!stalePath || !claimJob(jobPath, replacement)) {
-          return { action: "duplicate", job: readJob(jobPath), note: "claim_changed" };
-        }
-        return {
-          action: "reclaimed", stalePath, reason: "wedged_runner_terminated",
-          ownerPid, ageMs, claimId: replacement.claimId, payload: replacement.payload,
-          wedge, terminatedPids: kill.signalledPids,
-        };
-      } finally { wedgeLock.release(); }
-    }
-    return {
-      action: "duplicate",
-      job,
-      note: ageMs > staleMs ? "staleHeartbeat" : null,
-      ageMs,
-      staleMs,
-      ownerPid,
-    };
-  }
-
-  // Every recorded pid is dead. One window remains where that is a LIE: the
-  // parent claimed with its own pid, spawned the detached child, and died
-  // before it could record runnerPid. Nothing on disk names the live child, so
-  // give that window a bounded grace before believing the job is orphaned.
-  if (!hasRunnerPid && !knownUnstartedWake(job)) {
-    const graceMs = envNumber("NATIVE_AGENT_CLAUDE_WAKE_SPAWN_GRACE_MS", DEFAULT_SPAWN_GRACE_MS);
-    const createdMs = Date.parse((job && job.createdAt) || "");
-    const createdAgeMs = Number.isFinite(createdMs) ? Date.now() - createdMs : Infinity;
-    const youngestAgeMs = Math.min(ageMs, createdAgeMs);
-    if (graceMs > 0 && youngestAgeMs < graceMs) {
-      return {
-        action: "duplicate",
-        job,
-        note: "spawnGrace",
-        ageMs: youngestAgeMs,
-        graceMs,
-        ownerPid,
-      };
-    }
-  }
-
-  if (!knownUnstartedWake(job) || !Number.isInteger(ownerPid) || ownerPid <= 0) {
-    return { action: "duplicate", job, note: "execution_outcome_unknown", ownerPid, ageMs };
-  }
-  // Serialize the read/rename/reclaim under the EXISTING conversation lock.
-  // A second retry must re-read our new claim rather than rename it using a
-  // stale snapshot of the dead predecessor. Never wait behind active work.
-  const lock = await acquireTopicLock(topicSlug(job.payload.topic), 0, { messageId: payload.messageId, recoveryOnly: true });
-  if (!lock.acquired) return { action: "duplicate", job, note: "recovery_in_progress" };
-  try {
-    const fresh = readJob(jobPath);
-    if (!fresh || fresh.claimId !== job.claimId || !knownUnstartedWake(fresh)
-        || pidAlive(fresh.pid) || (fresh.runnerPid && pidAlive(fresh.runnerPid))) {
-      return { action: "duplicate", job: fresh, note: "claim_changed" };
-    }
-    const replacement = makeClaimRecord(fresh.payload);
-    const stalePath = renameJobAside(jobPath);
-    if (!stalePath || !claimJob(jobPath, replacement)) {
-      return { action: "duplicate", job: readJob(jobPath), note: "claim_changed" };
-    }
-    return { action: "reclaimed", stalePath, reason: "unstarted_owner_dead", ownerPid, ageMs, claimId: replacement.claimId, payload: fresh.payload };
-  } finally { lock.release(); }
-}
-
-return {
-  replayLostDelivery,
-  settleUnknownDelivery,
-  terminalUndelivered,
-  sweepTerminalUndelivered,
-  preDeliveryWedge,
-  resolveExistingJob
-};
-}
-
-module.exports = { createCodexRecovery, createClaudeRecovery };
+module.exports = { createCodexRecovery };

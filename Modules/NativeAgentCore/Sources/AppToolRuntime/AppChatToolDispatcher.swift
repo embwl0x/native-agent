@@ -22,16 +22,12 @@ import ToolRegistry
 /// call: the Security Center gate, trust on the full catalog, the live-body
 /// routes a result hands back (self-window, desktop and Grok sends), and
 /// the settled-result observers (context prewarm, motor outcomes).
-public final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding, PreApprovalToolValidating, BuiltInAgentLaneProviding, @unchecked Sendable {
+public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolValidating, BuiltInAgentLaneProviding, @unchecked Sendable {
     private let interactions: any ToolInteractionResolving
     private let platform: ChatToolPlatformPort
     private let inner: any ToolDispatchClient
     public func builtInAgentLaneUsable(_ name: String) -> Bool {
         (inner as? any BuiltInAgentLaneProviding)?.builtInAgentLaneUsable(name) == true
-    }
-    public let activeToolsStore: ActiveToolsStore
-    public var codeOwnedToolNames: Set<String> {
-        (inner as? any ActiveToolsStoreProviding)?.codeOwnedToolNames ?? SwiftToolDispatcher.catalogRegisteredToolNames
     }
     private let securityCenter: SwiftNativeSecurityCenter
     /// The app's own tool executors: here only for the self-window handoff an
@@ -52,7 +48,6 @@ public final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStorePr
                 dataRoot: PersistenceCore.defaultDataRoot()
             )
         ),
-        activeToolsStore: ActiveToolsStore = .shared,
         securityCenter: SwiftNativeSecurityCenter = SwiftNativeSecurityCenter(),
         enforceAutonomySecurity: Bool = true,
         includeAppOwnedTools: Bool = true,
@@ -70,7 +65,6 @@ public final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStorePr
         self.interactions = interactions
         self.platform = platform
         self.inner = inner
-        self.activeToolsStore = activeToolsStore
         self.securityCenter = securityCenter
         self.enforceAutonomySecurity = enforceAutonomySecurity
         self.includeAppOwnedTools = includeAppOwnedTools
@@ -112,7 +106,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStorePr
         }
         return ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: tool, input: input) { input in
             try await dispatchNormalized(tool: tool, input: input, surface: surface)
-        })
+        }, tool: tool)
     }
 
     private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -268,33 +262,6 @@ public final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStorePr
               !enforceAutonomySecurity || !envelope.requiresApproval else {
             return Self.securityGateResponse(envelope)
         }
-        // `list_tools` is the catalog under its old name: answered as the
-        // always-on `tool_catalog`, so it never loads a slot of its own.
-        if ["tool_catalog", "list_tools"].contains(tool) {
-            if ToolCatalogSelection.wantsLoad(input) {
-                // Select here, so the load crosses this gate as the
-                // `tool_load` call it is.
-                let result = try await inner.dispatch(
-                    tool: "tool_catalog", input: ToolCatalogSelection.searchInput(input), surface: surface)
-                var selected = ToolCatalogSelection.selectedNames(in: result)
-                // A plain query loads only into free room: never evict a preload.
-                if !ToolCatalogSelection.loadWasAsked(input),
-                   try await !activeToolsStore.fitsWithoutEvicting(
-                       sessionId: AppToolExecutor.extractSessionId(input), names: Set(selected)) {
-                    selected = []
-                }
-                let loading: JSONValue?
-                if !selected.isEmpty {
-                    var loadInput = input
-                    for key in ["category", "name", "query", "load", "limit", "detail"] { loadInput.removeValue(forKey: key) }
-                    loadInput["names"] = .array(selected.map(JSONValue.string))
-                    loading = try await dispatch(tool: "tool_load", input: loadInput, surface: surface)
-                } else { loading = nil }
-                return ToolCatalogSelection.finish(result, selected: selected, loading: loading)
-            }
-            let catalog = try await inner.dispatch(tool: "tool_catalog", input: input, surface: surface)
-            return await withTrust(catalog: catalog, surface: surface)
-        }
         let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
         // An ask for something already set up raises no card: a card that
         // reads as its receipt from the start would leave the turn waiting on
@@ -323,8 +290,8 @@ public final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStorePr
             // would read her own pages, the Chat page among them.
             if WorkspaceMacCall.active, case .object(let payload) = result, case .object(let detail)? = payload["detail"],
                detail["status"] == .string("in_process_route") { return WorkspaceMacCall.refusal }
-            return await AppToolExecutor.performMacSelfAppRoute(result) { tool, input in
-                await appTools.runQuietSelfAdminTool(tool: tool, input: input, surface: surface)
+            return await AppToolExecutor.performMacSelfAppRoute(result) { input in
+                await appTools.runSelfAppRoute(input: input, surface: surface)
             }
         }
         // Desktop contacts are send-only: `agent_read` no longer opens or
@@ -341,6 +308,15 @@ public final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStorePr
     /// Each full-catalog row carries what the Security Center would decide for
     /// it right now — the Tools page reads this. Core's rows say what a tool
     /// is; this gate says whether it may run here.
+    /// The Tools page's manifest with each row's Trust decision here. Not a
+    /// tool call: nothing is dispatched, gated or loaded.
+    public func toolManifest(detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
+        guard let swift = inner as? SwiftToolDispatcher else {
+            return .object(["status": .string("unavailable"), "tools": .array([])])
+        }
+        return await withTrust(catalog: try await swift.toolManifest(detail: detail, surface: surface), surface: surface)
+    }
+
     private func withTrust(catalog: JSONValue, surface: String) async -> JSONValue {
         guard case .object(var object) = catalog, case .array(let rows)? = object["tools"], !rows.isEmpty else {
             return catalog
@@ -379,6 +355,10 @@ public final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStorePr
 
     public func listAvailableTools() async throws -> [String] {
         try await inner.listAvailableTools().sorted()
+    }
+
+    public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(named: names).sorted { $0.name < $1.name }
     }
 
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {

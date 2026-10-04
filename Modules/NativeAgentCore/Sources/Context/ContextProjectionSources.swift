@@ -7,13 +7,17 @@ import NativeAgentCore
 public struct ContextCompiledProjectionResult: Sendable, Equatable {
     public let changedSources: [ContextCompiledSource]
     public let removedSourceIDs: Set<ContextSourceID>
+    /// Derived record identities, accepted only with this projection's generation.
+    public let atomRecordIDs: [ContextAtomID: String]
 
     public init(
         changedSources: [ContextCompiledSource],
-        removedSourceIDs: Set<ContextSourceID> = []
+        removedSourceIDs: Set<ContextSourceID> = [],
+        atomRecordIDs: [ContextAtomID: String] = [:]
     ) {
         self.changedSources = changedSources
         self.removedSourceIDs = removedSourceIDs
+        self.atomRecordIDs = atomRecordIDs
     }
 
     public var isEmpty: Bool {
@@ -51,15 +55,35 @@ public protocol ContextCompiledProjectionProvider: Sendable {
     /// Nil preserves namespace-only consumers and unlocated legacy events.
     var invalidationSourceURL: URL? { get }
 
+    /// Point-of-use policy exclusions, including sources in retained generations.
+    var excludedSourceOwners: Set<String> { get }
+
+    func isInvalidated(by change: DerivedSourceChange) -> Bool
+
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult
+
+    /// Synchronous acceptance after arena publication. Nil carries unchanged
+    /// projection state forward; pinned generations must retain their identities.
+    func didPublish(
+        _ result: ContextCompiledProjectionResult?,
+        generation: ContextStoredGeneration,
+        retaining generationIDs: Set<Int64>
+    )
 }
 
 public extension ContextCompiledProjectionProvider {
     var projectionIdentifier: String { String(reflecting: Self.self) }
     var invalidationNamespaces: Set<String> { [] }
     var invalidationSourceURL: URL? { nil }
+    var excludedSourceOwners: Set<String> { [] }
+
+    func didPublish(
+        _ result: ContextCompiledProjectionResult?,
+        generation: ContextStoredGeneration,
+        retaining generationIDs: Set<Int64>
+    ) {}
 
     func isInvalidated(by change: DerivedSourceChange) -> Bool {
         guard change.semantic, invalidationNamespaces.contains(change.namespace) else { return false }

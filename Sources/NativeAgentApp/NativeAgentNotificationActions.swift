@@ -3,6 +3,7 @@ import Foundation
 import AttentionRouting
 import UserNotifications
 import ApprovalInbox
+import ApprovalTransactions
 import NativeAgentCore
 import PersistenceCore
 import NotificationInbox
@@ -179,6 +180,9 @@ enum NativeAgentApprovalNotifications {
     private static func observeApprovals() async {
         let approvals = NativeAgentEngine.live.approvals
         var seen: Set<String>?
+        var startupPendingIDs: Set<String> = []
+        // Cards whose transcript write failed: retried on later passes, a few times.
+        var cardRetries: [String: Int] = [:]
         await ApprovalRequestsLiveRefresh.observe(approvals: approvals) {
             do {
                 let rows = try await approvals.list()
@@ -232,8 +236,24 @@ enum NativeAgentApprovalNotifications {
                     }
                 }
                 guard let previous = seen else {
+                    startupPendingIDs = pendingIDs
+                    for row in rows where row.status == "pending" {
+                        guard !Task.isCancelled else { return }
+                        if await ApprovalChatCards.post(row, dataRoot: approvals.dataRoot,
+                                telegram: TelegramApprovalFilerRef.shared.current(), quiet: true) == .failed {
+                            cardRetries[row.id] = 1
+                        }
+                    }
                     seen = ids
-                    if retired > 0 {
+                    // Finish interrupted card deliveries without replaying old banners.
+                    var restored = false
+                    for row in rows where row.status == "pending" && row.chatCard != nil && !row.chatCardDelivered {
+                        guard !Task.isCancelled else { return }
+                        let outcome = await ApprovalChatCards.post(row, dataRoot: approvals.dataRoot, quiet: true)
+                        if outcome == .failed { cardRetries[row.id] = 1 }
+                        if case .posted = outcome { restored = true }
+                    }
+                    if !pendingIDs.isEmpty || retired > 0 || restored {
                         Task { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
                     }
                     return
@@ -244,26 +264,53 @@ enum NativeAgentApprovalNotifications {
                 // Share the existing quiet-hours policy. Suppressed requests
                 // remain visible in Approvals; no timer replays them later.
                 let held = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: approvals.dataRoot)
+                func filedIn(_ row: ApprovalRecord) -> String? {
+                    if case .object(let payload) = row.payload, case .object(let origin)? = payload["origin"],
+                       case .string(let session)? = origin["sessionId"] { return session }
+                    return nil
+                }
+                for row in rows where row.status == "pending" && previous.contains(row.id) {
+                    guard let tries = cardRetries[row.id] else { continue }
+                    let outcome = await ApprovalChatCards.post(row, dataRoot: approvals.dataRoot,
+                        telegram: TelegramApprovalFilerRef.shared.current(),
+                        quiet: startupPendingIDs.contains(row.id)
+                            || AttentionRouter.holdsResidentWake(session: filedIn(row) ?? "", dataRoot: approvals.dataRoot))
+                    cardRetries[row.id] = outcome == .failed && tries < 3 ? tries + 1 : nil
+                }
                 for row in pending {
                     let title = NativeAppSecretRedactor.redactText(row.title)
                     // The one human line; the raw payload is for Details, not a push.
                     let body = NativeAppSecretRedactor.redactText(row.reason)
-                    do {
-                        try await AttentionRouter.shared.route(
-                            eventId: "approval:\(row.id)",
-                            importance: .ownerWaiting,
-                            title: title,
-                            body: body,
-                            userInfo: [
-                                "screen": "approvals",
-                                "source": "approval",
-                                NativeAgentNotificationActions.approvalKey: row.id,
-                            ],
-                            // Phone delivery accompanies the in-app card.
-                            pinnedTo: .phone
-                        )
-                    } catch {
-                        NSLog("[approval-notification] push failed: %@", error.localizedDescription)
+                    // Filed by her resident wake in his quiet hours: the push
+                    // waits in the inbox for them to end (releaseHeld).
+                    let wakeHeld = AttentionRouter.holdsResidentWake(session: filedIn(row) ?? "", dataRoot: approvals.dataRoot)
+                    // User, 10-03: and its card pops up in his conversation —
+                    // before the snapshot below, so the phone draws it there too.
+                    if await ApprovalChatCards.post(row, dataRoot: approvals.dataRoot,
+                            telegram: TelegramApprovalFilerRef.shared.current(), quiet: wakeHeld) == .failed {
+                        cardRetries[row.id] = 1
+                    }
+                    if wakeHeld {
+                        await AttentionRouter.hold(dataRoot: approvals.dataRoot, title: title, body: body, ways: ["phone"],
+                                                  approvalID: row.id)
+                    } else {
+                        do {
+                            try await AttentionRouter.shared.route(
+                                eventId: "approval:\(row.id)",
+                                importance: .ownerWaiting,
+                                title: title,
+                                body: body,
+                                userInfo: [
+                                    "screen": "approvals",
+                                    "source": "approval",
+                                    NativeAgentNotificationActions.approvalKey: row.id,
+                                ],
+                                // Phone delivery accompanies the in-app card.
+                                pinnedTo: .phone
+                            )
+                        } catch {
+                            NSLog("[approval-notification] push failed: %@", error.localizedDescription)
+                        }
                     }
                     guard !held, ApprovalPayloadPreviewPresentation.canResolve(row) else { continue }
                     let posted = await NativeAgentNotifications.postAndReport(

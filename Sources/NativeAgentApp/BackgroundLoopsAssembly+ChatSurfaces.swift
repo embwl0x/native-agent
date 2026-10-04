@@ -70,6 +70,30 @@ extension BackgroundLoopsAssembly {
             activeProviderPathOverride: providerDir.appendingPathComponent("active.json")
         )
         let telegramSessions = TelegramSessionStore(dataRoot: dataRoot)
+        let approvalFiler = TelegramApprovalFiler(
+            dataRoot: dataRoot,
+            token: cfg.botToken,
+            promptSender: { token, chatId, approval, toolName, payload in
+                try await TelegramApprovalFiler.sendTelegramApprovalPrompt(
+                    token: token, chatId: chatId, approval: approval,
+                    toolName: toolName, payload: payload,
+                    send: TelegramPollLoop.defaultSendMessageWithReplyMarkup
+                )
+            },
+            approvalResolver: { id, decision, provenance in
+                _ = try await NativeClient(baseURL: "").resolveApproval(
+                    id: id, decision: decision.rawValue, provenance: provenance
+                )
+            }
+        )
+        TelegramApprovalFilerRef.shared.configure(approvalFiler)
+        // Keep the exact Telegram profile and approval filer resident for the
+        // loop lifetime. Routing/policy remain per-turn snapshots; only the
+        // stateless orchestration graph and schema caches are reused.
+        let client = NativeAgentEngine.live.chatClient(
+            profile: .telegram,
+            approvalFiler: approvalFiler
+        )
         let telegramBot = SwiftNativeTelegramBot(
             dataRoot: dataRoot,
             completenessDeps: TelegramBotCompletenessDeps(
@@ -104,30 +128,21 @@ extension BackgroundLoopsAssembly {
                     )
                 })
             ),
-            lifecycleObserver: NativeAgentEngine.liveCognition
-        )
-        let approvalFiler = TelegramApprovalFiler(
-            dataRoot: dataRoot,
-            token: cfg.botToken,
-            promptSender: { token, chatId, approval, toolName, payload in
-                try await TelegramApprovalFiler.sendTelegramApprovalPrompt(
-                    token: token, chatId: chatId, approval: approval,
-                    toolName: toolName, payload: payload,
-                    send: TelegramPollLoop.defaultSendMessageWithReplyMarkup
+            compactionHandler: { sessionId in
+                let model = await providerRouting.modelStringForSurface("compaction") ?? ""
+                let outcome = try await client.compactSession(
+                    sessionId: sessionId,
+                    model: model,
+                    surface: "telegram",
+                    force: true
                 )
-            },
-            approvalResolver: { id, decision, provenance in
-                _ = try await NativeClient(baseURL: "").resolveApproval(
-                    id: id, decision: decision.rawValue, provenance: provenance
-                )
+                if outcome.compacted {
+                    Task { @MainActor in
+                        NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionId)
+                    }
+                }
+                return outcome
             }
-        )
-        // Keep the exact Telegram profile and approval filer resident for the
-        // loop lifetime. Routing/policy remain per-turn snapshots; only the
-        // stateless orchestration graph and schema caches are reused.
-        let client = NativeAgentEngine.live.chatClient(
-            profile: .telegram,
-            approvalFiler: approvalFiler
         )
         let handler = ChatSurfaceBackgroundWork.makeTelegramChatHandler(
             dataRoot: dataRoot,
@@ -142,6 +157,7 @@ extension BackgroundLoopsAssembly {
         return TelegramPollLoop(
             interval: 0.25,
             token: cfg.botToken,
+            revokeDriverControl: { await MacAttentionSessionStore.shared.revokeDriverControl() },
             allowedChatIds: cfg.allowedChatIds,
             allowedUserIds: cfg.allowedUserIds,
             requireMention: cfg.requireMention,
@@ -222,4 +238,15 @@ extension BackgroundLoopsAssembly {
         return SwiftAppleSpeechTranscriber(contextualStrings: { [AgentVoice.live.name] })
     }
 
+}
+
+/// The running Telegram loop's approval filer, so an approval follow-up on
+/// Telegram files its cards with the same inline buttons (Wave 2 #8).
+final class TelegramApprovalFilerRef: @unchecked Sendable {
+    static let shared = TelegramApprovalFilerRef()
+    private let lock = NSLock()
+    private var filer: TelegramApprovalFiler?
+
+    func configure(_ filer: TelegramApprovalFiler) { lock.withLock { self.filer = filer } }
+    func current() -> TelegramApprovalFiler? { lock.withLock { filer } }
 }

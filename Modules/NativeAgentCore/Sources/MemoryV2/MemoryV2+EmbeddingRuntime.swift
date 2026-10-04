@@ -61,6 +61,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         var loadCount: Int = 0
         var unloadCount: Int = 0
         var generation: UInt64 = 0
+        /// Activity and idle scheduling must not invalidate a cold load.
+        var loadGeneration: UInt64 = 0
         var idleUnloadTask: Task<Void, Never>?
     }
 
@@ -102,14 +104,18 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     public var dimensions: Int {
+        guard Self.readConfig(dataRoot: dataRoot).backend != Self.mockBackend else { return mock.dimensions }
         if let loaded = lock.withLock({ state.coreMLProvider?.dimensions }) { return loaded }
         // Not resident yet: report the model that WOULD load, not the mock's
         // width, so status surfaces do not read "384d" beside a 1024-d model.
-        if Self.readConfig(dataRoot: dataRoot).backend != Self.mockBackend,
-           let installed = try? CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
+        return resolvedModelDimensions
+    }
+
+    private var resolvedModelDimensions: Int {
+        if let installed = try? CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
             return installed.dimensions
         }
-        return mock.dimensions
+        return 384
     }
 
     public var modelId: String {
@@ -154,6 +160,21 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         try await embedWithEpoch(texts).vectors
     }
 
+    /// Phase 5 D: embed ONLY on the model already resident — never load it,
+    /// never take `loadLock`. Nil when cold, mismatched or mock; the caller
+    /// falls back to what it can do without vectors.
+    public func embedIfResident(_ texts: [String]) async -> [[Float]]? {
+        let config = Self.readConfig(dataRoot: dataRoot)
+        guard config.backend != Self.mockBackend, !texts.isEmpty else { return nil }
+        let lowMemory = Self.usesCPUOnlyCompute(mode: config.mode)
+        guard let provider = lock.withLock({
+            state.coreMLProviderLowMemory == lowMemory ? state.coreMLProvider : nil
+        }) else { return nil }
+        noteUse()
+        defer { scheduleIdleUnloadIfNeeded(mode: config.mode) }
+        return try? await provider.embed(texts)
+    }
+
     public func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
         let config = Self.readConfig(dataRoot: dataRoot)
         guard config.backend != Self.mockBackend else {
@@ -169,9 +190,9 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         // (audit 2026-06-09).
         let provider: any EmbeddingProvider
         do {
-            provider = try loadCoreMLProvider(
-                lowMemory: Self.usesCPUOnlyCompute(mode: config.mode)
-            )
+            provider = try loadCoreMLProvider(config: config)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             if ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1" {
                 return try await mock.embedWithEpoch(texts)
@@ -257,7 +278,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 effectiveBackend: effectiveBackend,
                 mode: config.mode,
                 modelId: modelId,
-                dimensions: loadedProvider?.dimensions ?? mock.dimensions,
+                dimensions: effectiveBackend == Self.mockBackend
+                    ? mock.dimensions : loadedProvider?.dimensions ?? resolvedModelDimensions,
                 embeddingEpoch: loadedProvider?.embeddingEpoch.rawValue
                     ?? (effectiveBackend == Self.mockBackend
                         ? mock.embeddingEpoch.rawValue
@@ -278,6 +300,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     public func setBackend(enabled: Bool) async throws {
+        let previous = Self.readConfig(dataRoot: dataRoot).backend
         try await writeConfigValue(
             path: Self.backendPath(dataRoot: dataRoot),
             key: "backend",
@@ -285,6 +308,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         )
         if !enabled {
             release(reason: "disabled by user")
+        } else if previous != Self.coreMLBackend {
+            lock.withLock { state.loadGeneration &+= 1 }
         }
     }
 
@@ -313,9 +338,10 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         // leave the model hot, exactly as before.
         let flipsComputeUnits =
             Self.usesCPUOnlyCompute(mode: previous) != Self.usesCPUOnlyCompute(mode: normalized)
-        let isLoaded = lock.withLock { state.coreMLProvider != nil }
-        if flipsComputeUnits && isLoaded {
+        if flipsComputeUnits {
             release(reason: "compute units changed for \(normalized) mode")
+        } else if previous != normalized {
+            lock.withLock { state.loadGeneration &+= 1 }
         }
         scheduleIdleUnloadIfNeeded(mode: normalized)
     }
@@ -332,44 +358,49 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             state.lastUnloadedAt = Date()
             state.unloadReason = reason
             state.generation &+= 1
+            state.loadGeneration &+= 1
         }
         return snapshot()
     }
 
-    private func loadCoreMLProvider(lowMemory: Bool) throws -> any EmbeddingProvider {
+    private func loadCoreMLProvider(config: (backend: String, mode: String)) throws -> any EmbeddingProvider {
         // Cold requests must share the resident model instead of compiling and
         // allocating a full model each before choosing a winner. Keep status
         // and release independent of the expensive synchronous loader.
         loadLock.lock()
         defer { loadLock.unlock() }
-        if let existing = lock.withLock({
-            state.coreMLProvider != nil && state.coreMLProviderLowMemory == lowMemory
-                ? state.coreMLProvider : nil
-        }) {
-            return existing
-        }
+        let lowMemory = Self.usesCPUOnlyCompute(mode: config.mode)
         // Either nothing is resident, or the resident provider was loaded
         // under the OTHER compute selection (a flip raced its load, or
         // mode.json changed externally). Evict a mismatched resident before
         // loading so this request's selection is what actually serves.
-        lock.withLock {
+        let (existing, generation) = try lock.withLock {
+            guard Self.readConfig(dataRoot: dataRoot) == config,
+                  config.backend != Self.mockBackend else { throw CancellationError() }
             if state.coreMLProvider != nil, state.coreMLProviderLowMemory != lowMemory {
                 state.coreMLProvider = nil
                 state.lastUnloadedAt = Date()
                 state.unloadReason = "compute units changed (selection mismatch at load)"
                 state.generation &+= 1
+                state.loadGeneration &+= 1
             }
+            return (state.coreMLProvider, state.loadGeneration)
         }
+        if let existing { return existing }
+        let modelID = resolvedModelID
         let provider: any EmbeddingProvider
         do {
             provider = try loader(lowMemory)
         } catch {
             // Record failure before admitting another load, so an older
             // failure cannot evict a newer successful model.
-            recordLoadFailure(error)
+            recordLoadFailure(error, generation: generation)
             throw error
         }
-        return lock.withLock {
+        return try lock.withLock {
+            guard state.loadGeneration == generation,
+                  Self.readConfig(dataRoot: dataRoot) == config,
+                  resolvedModelID == modelID else { throw CancellationError() }
             state.coreMLProvider = provider
             state.coreMLProviderLowMemory = lowMemory
             state.lastLoadedAt = Date()
@@ -390,7 +421,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         }
     }
 
-    private func recordLoadFailure(_ error: Error) {
+    private func recordLoadFailure(_ error: Error, generation: UInt64) {
         // gpt-5.5 review-2 NEEDS_FIX: post-fail-closed wording. Previously
         // this said "using mock fallback" — that was honest when embed()
         // silently mocked on load failure. Now embed() throws unless the
@@ -399,6 +430,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         // snapshot() branch logic so UI panels and the unload reason agree.
         let mockOptIn = ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1"
         lock.withLock {
+            guard state.loadGeneration == generation else { return }
             state.lastLoadError = String(describing: error)
             state.coreMLProvider = nil
             state.lastUnloadedAt = Date()
@@ -438,6 +470,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             state.unloadReason = "idle timeout"
             state.unloadCount += 1
             state.generation &+= 1
+            state.loadGeneration &+= 1
         }
     }
 
@@ -514,9 +547,9 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
 }
 
 private extension NSLock {
-    func withLock<T>(_ work: () -> T) -> T {
+    func withLock<T>(_ work: () throws -> T) rethrows -> T {
         lock()
         defer { unlock() }
-        return work()
+        return try work()
     }
 }

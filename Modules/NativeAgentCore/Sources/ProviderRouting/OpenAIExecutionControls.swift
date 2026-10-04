@@ -39,6 +39,10 @@ public enum OpenAIExecutionControls {
         let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch transport {
         case .publicAPI:
+            if normalizedModel == "gpt-6-sol" || normalizedModel.hasPrefix("gpt-6-sol-")
+                || normalizedModel == "gpt-6-luna" || normalizedModel.hasPrefix("gpt-6-luna-") {
+                return publicGPT56Efforts
+            }
             if normalizedModel.hasPrefix("gpt-6-") || normalizedModel.hasPrefix("gpt-6.") {
                 return publicGPT6AstraEfforts
             }
@@ -56,14 +60,22 @@ public enum OpenAIExecutionControls {
         }
     }
 
+    static func usesResponses(model: String) -> Bool {
+        let normalized = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.hasPrefix("gpt-6-") || normalized.hasPrefix("gpt-6.")
+    }
+
     public static func reasoningEffort(
         model: String,
         requested: String?,
-        transport: Transport = .publicAPI
+        transport: Transport = .publicAPI,
+        supportedEfforts: [String]? = nil
     ) -> String? {
         guard let requested else { return nil }
         let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return supportedReasoningEfforts(model: model, transport: transport).contains(normalized)
+        let supported = supportedEfforts.map { Set($0) }
+            ?? supportedReasoningEfforts(model: model, transport: transport)
+        return supported.contains(normalized)
             ? normalized
             : nil
     }
@@ -77,12 +89,14 @@ public enum OpenAIExecutionControls {
     public static func wireReasoningEffort(
         model: String,
         requested: String?,
-        transport: Transport = .publicAPI
+        transport: Transport = .publicAPI,
+        supportedEfforts: [String]? = nil
     ) -> String? {
         guard let selected = reasoningEffort(
             model: model,
             requested: requested,
-            transport: transport
+            transport: transport,
+            supportedEfforts: supportedEfforts
         ) else { return nil }
         if transport == .chatGPTOAuth,
            selected == "max" || selected == "ultra" {
@@ -108,12 +122,14 @@ public enum OpenAIExecutionControls {
     static func applyResponsesControls(
         to body: inout [String: Any],
         model: String,
-        transport: Transport = .publicAPI
+        transport: Transport = .publicAPI,
+        supportedEfforts: [String]? = nil
     ) {
         if let effort = wireReasoningEffort(
             model: model,
             requested: LLMCallContext.reasoningEffort,
-            transport: transport
+            transport: transport,
+            supportedEfforts: supportedEfforts
         ) {
             body["reasoning"] = ["effort": effort]
         }

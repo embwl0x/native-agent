@@ -75,6 +75,16 @@ extension NativeClient {
 }
 
 private struct NativeBrowserRouteEffects: BrowserRouteEffects {
+    @MainActor
+    func acquireBrowser(runID: String) throws {
+        try BrowserWindowController.shared.acquireBrowser(runID: runID)
+    }
+
+    @MainActor
+    func releaseBrowser(runID: String) {
+        BrowserWindowController.shared.releaseBrowser(runID: runID)
+    }
+
     func appendNativeActionReceipt(action: NativeActionRecord, status: String, dryRun: Bool, output: JSONValue) async throws -> NativeActionReceipt {
         try await NativeClient.appendNativeActionReceipt(action: action, status: status, dryRun: dryRun, output: output)
     }
@@ -85,7 +95,7 @@ private struct NativeBrowserRouteEffects: BrowserRouteEffects {
         // Navigation must not imply fronting (User's 3:30am dream-time popups):
         // load quietly; only the explicit show surfaces front the window.
         controller.ensureWindowLoadedQuietly()
-        let nav = try await controller.navigate(url, runID: runID)
+        let nav = try await controller.navigate(url, runID: runID, ownerID: runID)
         return BrowserNavigationResult(url: nav.url, title: nav.title, httpStatus: nav.httpStatus)
     }
 
@@ -94,7 +104,7 @@ private struct NativeBrowserRouteEffects: BrowserRouteEffects {
     @MainActor func readLinks() async throws -> [BrowserLink] { try await BrowserWindowController.shared.readLinks() }
     @MainActor func screenshot() async throws -> Data { try await BrowserWindowController.shared.screenshot() }
 
-    func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool) async -> BrowserNavigationTask {
+    func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool, dataRoot: URL) async -> BrowserNavigationTask {
         let cancellationLatch = BrowserRunCancellationLatch()
         let activeToken = await BrowserActiveRunRegistry.shared.register(runID: runID) {
             cancellationLatch.cancel()
@@ -105,7 +115,8 @@ private struct NativeBrowserRouteEffects: BrowserRouteEffects {
                     url,
                     runID: runID,
                     captureSource: captureSource,
-                    captureScreenshot: captureScreenshot
+                    captureScreenshot: captureScreenshot,
+                    dataRoot: dataRoot
                 )
             }
             // Creating and attaching are one non-suspending MainActor turn, so

@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import PersistenceCore
 import Privacy
+import NativeAgentCore
 
 enum MCPResultEvidence {
     static let maxProjectionBytes = 8 * 1024
@@ -126,7 +127,8 @@ enum MCPResultEvidence {
         case .array(let values):
             return .array(values.map(redact))
         case .string(let value):
-            return .string(NativeAgentSecretRedactor.redactText(value))
+            let redacted = NativeAgentSecretRedactor.redactText(value)
+            return .string(TurnSecretRedactor.redactText(redacted))
         default:
             return value
         }
@@ -164,5 +166,3 @@ enum MCPResultEvidence {
         return ""
     }
 }
-
-

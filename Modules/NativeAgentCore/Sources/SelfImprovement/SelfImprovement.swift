@@ -632,6 +632,8 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
         // the two reads all mean "a writer was mid-update / freshness not
         // provable" -> return nil so the caller fails closed/retries later.
         let seq1 = try await improvementsCommitSeqLocal()
+        // Never written (a fresh install): nothing to straddle, so an empty store is verified empty.
+        if seq1 == 0, try await listImprovementsLocal().isEmpty, try await improvementsCommitSeqLocal() == 0 { return [] }
         guard seq1 >= 2, seq1 % 2 == 0 else { return nil }
         let runs = try await listImprovementsLocal()
         let seq2 = try await improvementsCommitSeqLocal()

@@ -72,17 +72,9 @@ public enum LLMCallContext {
     /// reconnect reserve. Unbound → the configured wall stands unchanged.
     @TaskLocal public static var remainingTurnSeconds: TimeInterval?
 
-    /// Request-scoped lazy-tool allowance for predictive preloads.
-    ///
-    /// Explicit `tool_load` writes still live in `ActiveToolsStore` and persist
-    /// for the session. Mechanical route predictions bind this set only around
-    /// the current turn so first-call schemas and dispatch agree without
-    /// growing the session's durable active-tool file.
+    /// The tools this turn offers by name: `app` on her chat, a lane's own
+    /// declared list on an ephemeral turn.
     @TaskLocal public static var turnActiveTools: Set<String>?
-
-    /// A turn-only loadout that replaces session tool state without reading,
-    /// promoting, evicting, or recording usage in the persisted loadout.
-    @TaskLocal public static var transientToolLoadout: Set<String>?
 }
 
 // MARK: - Provider lifecycle evidence
@@ -209,64 +201,6 @@ public struct SystemPromptSegments: Sendable, Equatable {
     }
 }
 
-/// Which conversation-prefix wire shape the Anthropic adapters emit.
-///
-/// Lives here (NativeAgentCore) rather than in ProviderRouting so the history
-/// projection that BINDS it per turn and the adapters that READ it share one
-/// type without a module cycle.
-///
-/// - `v1Legacy`: the pre-2026-09 layout — identity block carries its own
-///   cache_control, the stable block carries a second one, conversation
-///   breakpoints only on tool-capable / within-turn-reuse calls, and the
-///   previous-request boundary derived from fixed `count - 3` arithmetic.
-///   Kept BYTE-IDENTICAL as the rollback arm.
-/// - `v2Prefix`: the cross-turn cached-transcript layout — identity is a
-///   strict prefix of `stable`, so it carries NO breakpoint of its own and
-///   one breakpoint at the end of the stable mass covers both; every turn is
-///   treated as a prefix-reuse turn.
-///
-/// TURN-BOUNDARY RULE: `effective` resolves the shape ONCE, at the history
-/// builder's seeding boundary, which then BINDS `override` to the shape it
-/// actually seeded and keeps it bound for the whole turn. Everything below
-/// that boundary — every provider adapter — reads `override` ONLY, and treats
-/// unbound as `.v1Legacy`. Re-deriving the shape from `effective` deeper down
-/// is a bug: a turn that seeded no replayed history seeds and binds
-/// `.v1Legacy`, and an adapter asking `effective` would answer `.v2Prefix`
-/// and emit a differently-shaped request than the one the builder built.
-///
-/// Resolution order for `effective`: task-local `override` (already bound, or
-/// bound by a test) → the `chatConversationPrefixShape` user default →
-/// `.v2Prefix` (production default).
-public enum ConversationPrefixShape: String, Sendable, Equatable, CaseIterable {
-    case v1Legacy
-    case v2Prefix
-
-    /// UserDefaults key. Accepts "v1Legacy"/"v2Prefix" and the bare "v1"/"v2".
-    public static let defaultsKey = "chatConversationPrefixShape"
-
-    /// Per-turn binding — the ONLY thing adapters may read (unbound →
-    /// `.v1Legacy` there). Unbound in `effective` → the user default, then
-    /// `.v2Prefix`.
-    @TaskLocal public static var override: ConversationPrefixShape?
-
-    /// Pure, injectable parser for the persisted value.
-    public static func parse(_ raw: String?) -> ConversationPrefixShape? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              !raw.isEmpty else { return nil }
-        if raw.hasPrefix("v1") { return .v1Legacy }
-        if raw.hasPrefix("v2") { return .v2Prefix }
-        return nil
-    }
-
-    public static var effective: ConversationPrefixShape {
-        if let override { return override }
-        if let stored = parse(UserDefaults.standard.string(forKey: defaultsKey)) {
-            return stored
-        }
-        return .v2Prefix
-    }
-}
-
 /// Where the current turn begins inside the array handed to the adapter.
 ///
 /// The adapters need ONE index to place the cross-turn cache breakpoint: the
@@ -376,6 +310,24 @@ extension LLMClient {
     ) async throws -> String {
         try await complete(prompt: prompt, system: system, model: model)
     }
+}
+
+/// Failure evidence supplied by the owner, never inferred from an error message.
+public struct ToolFailureError: Error, LocalizedError, Sendable {
+    public enum Effects: String, Sendable { case none, occurred, unknown }
+    public let message: String
+    public let argumentPath: String?
+    public let accepted: String?
+    public let effects: Effects
+
+    public init(_ message: String, argumentPath: String? = nil, accepted: String? = nil, effects: Effects) {
+        self.message = message
+        self.argumentPath = argumentPath
+        self.accepted = accepted
+        self.effects = effects
+    }
+
+    public var errorDescription: String? { message }
 }
 
 /// JSON Schema descriptor for a single tool the LLM is allowed to call. Lives

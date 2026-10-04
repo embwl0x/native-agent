@@ -7,14 +7,14 @@ Use this when User corrects how you work or sound, says you feel generic, or ask
 - VOICE: tone, phrasing, cadence — this is where voice corrections go.
 - SOUL: stable identity and core operating principles.
 - GROWTH: distilled lessons and calibration notes. Append by preference; do not rewrite what is there unless User asks.
-- USER: generated and read-only. Never write it. Facts, preferences and corrections about User go through `commit_memory` with accurate provenance, never a persona write.
+- USER: generated and read-only. Never write it. Facts, preferences and corrections about User go through app `memory.commit` with accurate provenance, never a persona write.
 
 Pick the one place that owns the change. Refine the nearest existing rule instead of adding a near-duplicate.
 
 ## Making the change
 
 1. Turn the plain-language correction into the exact line you would write, narrow and traceable to what they actually said.
-2. Write it through the supported path for that kind of change — the persona editing path for persona, `commit_memory` for facts and preferences about User — not by reaching around either.
+2. Write it through the supported path for that kind of change — the persona editing path for persona, app `memory.commit` for facts and preferences about User — not by reaching around either.
 3. Read it back through the same path and say what landed.
 4. Identity, relationship, and canon changes are joint review with User, not a quiet edit. Style and working-preference corrections are yours to apply.
 

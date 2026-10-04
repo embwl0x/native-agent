@@ -446,12 +446,14 @@ public struct ActivitySpanEngine: Sendable {
     ) -> ActivityStoreCommand? {
         guard let span = openSpan else { return nil }
         openSpan = nil
-        let stamp = clamp(at)
+        // Idle is discovered after its threshold, but ends at the last input,
+        // which can precede heartbeats already emitted for this span.
+        let stamp = reason == .idle ? max(span.startedAt, at) : clamp(at)
         return .close(id: span.id, reason: reason, at: stamp)
     }
 
-    /// The monotonic floor. Every emitted timestamp goes through here, so the
-    /// emitted sequence is non-decreasing no matter what the wall clock does.
+    /// The monotonic floor, except for retrospective idle closure. Other
+    /// emitted timestamps are non-decreasing no matter what the wall clock does.
     /// A backwards step degenerates to a zero-length interval — never a negative
     /// one, and never a fabricated positive one.
     private mutating func clamp(_ at: Double) -> Double {

@@ -111,9 +111,7 @@ extension REMConsolidator {
         // `(try? distill) ?? stub-node`: the splice below still ran, so an
         // LLM outage permanently destroyed user-approved persona content into
         // a content-free "LLM unavailable" stub. A distill throw now aborts
-        // this pass's eviction (propagates out of `runWeeklyREM`, whose
-        // marker-restore defer makes the next weekly tick retry) with the
-        // content still intact in GROWTH.md.
+        // this pass's eviction with the content still intact in GROWTH.md.
         let kgNode = try await distillToKGNode(evictedSlice)
         // ITEM 5 — KEEP THE EXACT PASSAGE. Written BEFORE the KG merge and the
         // GROWTH splice, under the same fail-closed rule as everything else in
@@ -145,8 +143,7 @@ extension REMConsolidator {
         // A cancel during the distill above (its own LLM call) must not fall
         // through to the KG+GROWTH commit pair below. One guard here covers both
         // writes: the KG-first ordering means a throw leaves GROWTH.md intact and
-        // the KG untouched, and it propagates to the marker-restore `catch` so the
-        // eviction retries on the next tick.
+        // the KG untouched.
         try Task.checkCancellation()
         // KG-FIRST ORDERING. The GROWTH splice and the KG merge must succeed
         // TOGETHER or NEITHER. Previously the KG append was best-effort and the
@@ -154,8 +151,7 @@ extension REMConsolidator {
         // could leave the slice gone from GROWTH and never landed in KG —
         // PERMANENT DATA LOSS. Now `appendKGNode` THROWS on any failure (no
         // store, unreadable store, write failure), and we let that throw
-        // propagate out of `runWeeklyREM`. The GROWTH eviction RETRIES on the
-        // next REM tick. Worst case: the cap pressure stays high until the
+        // propagate out of `runWeeklyREM`. The cap pressure stays high until the
         // store is healthy again. That is
         // strictly better than silently shredding the user's growth notes.
         try await appendKGNode(kgNode)
@@ -311,15 +307,14 @@ extension REMConsolidator {
         // user's growth text destroyed and replaced by the literal string
         // "empty distillation". Reachable whenever the adapter returns ""
         // (OpenAIAdapter.parseCompletion does, for an empty completion).
-        // Throwing here aborts the eviction with GROWTH.md intact; the
-        // marker-restore defer makes the next weekly tick retry.
+        // Throwing here aborts the eviction with GROWTH.md intact.
         guard !summary.isEmpty else {
             throw NSError(
                 domain: "REMConsolidator",
                 code: -210,
                 userInfo: [NSLocalizedDescriptionKey:
                     "GROWTH distillation returned an empty summary; refusing to "
-                    + "evict the source slice. Retrying on the next REM tick."]
+                    + "evict the source slice."]
             )
         }
         let id = Self.growthDistillationID(text)

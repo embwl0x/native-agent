@@ -12,6 +12,7 @@ import DeviceSync
 import NativeAgentShared
 import Dispatcher
 import TriggerScheduler
+import SchedulerExecution
 
 /// App-side implementation of the `MacIntegrationToolBridge` protocol declared
 /// in ChatOrchestration. The chat tool dispatcher calls this whenever Agent
@@ -36,6 +37,26 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
         try await MacPIMConnectorActions.calendarListUpcoming(input: input)
     }
 
+    func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.calendarCalendars(input: input)
+    }
+
+    func calendarFreeBusy(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.calendarFreeBusy(input: input)
+    }
+
+    func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.remindersQuery(input: input)
+    }
+
+    func remindersRead(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.remindersRead(input: input)
+    }
+
+    func remindersUpdate(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.remindersUpdate(input: input)
+    }
+
     func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue {
         try await MacPIMConnectorActions.remindersListDueToday(input: input)
     }
@@ -48,7 +69,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
         var obj = result.deliveryFields()
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(NativeAppSecretRedactor.redactText(String(message.prefix(200)))),
+            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
         ]) { _, new in new }
         return .object(obj)
     }
@@ -85,7 +106,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
         var obj = receipt.deliveryFields()
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(NativeAppSecretRedactor.redactText(String(message.prefix(200)))),
+            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
         ]) { _, new in new }
         return .object(obj)
     }
@@ -150,6 +171,14 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
 
     func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
         try await MacAppleScriptBridge.mailListRecent(input: input)
+    }
+
+    func mailReadBatch(input: [String: JSONValue]) async throws -> JSONValue {
+        await MacAppleScriptBridge.mailBatch(input: input, effects: false)
+    }
+
+    func mailTriageBatch(input: [String: JSONValue]) async throws -> JSONValue {
+        await MacAppleScriptBridge.mailBatch(input: input, effects: true)
     }
 
     func mailSearch(input: [String: JSONValue]) async throws -> JSONValue {
@@ -269,7 +298,55 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
     }
 
     func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue {
-        try await NativeClient.runSchedulerCreateJob(input: input)
+        // A repeating dream is the nightly reflection, which has one canonical
+        // job. Recreating it goes through Add Nightly Reflection's own path
+        // (reactivating a cancelled job) instead of adding a second daily dream.
+        // A one-time dream is still an ordinary job.
+        if input["kind"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "dream",
+           !Self.schedulerOneShot(input) {
+            return try await nightlyDreamJob()
+        }
+        return try await NativeClient.runSchedulerCreateJob(input: input)
+    }
+
+    /// The scheduler's own one-shot rule: an ISO-8601 string, type once, or one_shot.
+    private static func schedulerOneShot(_ input: [String: JSONValue]) -> Bool {
+        if case .string? = input["schedule"] { return true }
+        if case .object(let schedule)? = input["schedule"], schedule["type"]?.stringValue?.lowercased() == "once" { return true }
+        var payload: [String: JSONValue] = [:]
+        if case .object(let object)? = input["payload"] { payload = object }
+        return [input["one_shot"], input["oneShot"], payload["one_shot"]].contains { $0 == .bool(true) }
+    }
+
+    private func nightlyDreamJob() async throws -> JSONValue {
+        let id = "nativeagent-nightly-dream"
+        let writer = schedulerJobWriter()
+        func current() async throws -> [String: JSONValue]? {
+            for case .object(let job) in try await writer.listJobs() where job["id"] == .string(id) { return job }
+            return nil
+        }
+        let before = try await current()
+        _ = try await SchedulerDueJobRunner.shared.ensureDefaultCycleJobs(now: Date(), reactivateCancelled: true)
+        guard let after = try await current() else {
+            throw NSError(domain: "NativeAgentMacIntegrationBridge", code: -500, userInfo: [
+                NSLocalizedDescriptionKey: "The nightly reflection job was not saved; nothing was added. app schedule.list shows what the scheduler holds.",
+            ])
+        }
+        let operation: String
+        var detail: String
+        if after["enabled"] == .bool(false) {
+            operation = "paused"
+            detail = "The nightly reflection job exists and is paused; nothing was added. Resume it with app schedule.resume, job_id \(id)."
+        } else if before == nil {
+            operation = "added"; detail = "Nightly reflection added."
+        } else if before == after {
+            operation = "already_present"; detail = "Nightly reflection is already scheduled; nothing was added."
+        } else {
+            operation = "reactivated"; detail = "Nightly reflection is scheduled again on its existing job; nothing was duplicated."
+        }
+        detail += " A repeating dream always uses this one job on its own nightly time. For one extra dream, use a once schedule."
+        return .object(["status": .string("completed"), "operation": .string(operation),
+                        "detail": .string(detail), "job": .object(after)])
     }
 
     func schedulerCancelJob(input: [String: JSONValue]) async throws -> JSONValue {

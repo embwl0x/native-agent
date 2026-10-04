@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import NativeAgentCore
 import PersistenceCore
 
@@ -202,17 +203,34 @@ public actor TurnVolatileArchive {
         guard !trimmedRun.isEmpty, !archivable.isEmpty,
               let path = pathFor(sessionId: sessionId),
               let directory = sessionDirectory(sessionId) else { return }
-        try? FileManager.default.createDirectory(
-            at: directory, withIntermediateDirectories: true
-        )
-        try? await persistence.withFileLock(path) {
-            var entries = await self.readLocked(path: path)
-            entries.removeAll { $0.runId == trimmedRun }
-            entries.append(contentsOf: archivable)
-            if entries.count > Self.maxEntries {
-                entries.removeFirst(entries.count - Self.maxEntries)
+        for attempt in 0..<2 {
+            do {
+                try FileManager.default.createDirectory(
+                    at: directory, withIntermediateDirectories: true
+                )
+                try await persistence.withFileLock(path) {
+                    var entries = await self.readLocked(path: path)
+                    entries.removeAll { $0.runId == trimmedRun }
+                    entries.append(contentsOf: archivable)
+                    if entries.count > Self.maxEntries {
+                        entries.removeFirst(entries.count - Self.maxEntries)
+                    }
+                    try await self.writeLocked(entries, path: path)
+                }
+                return
+            } catch {
+                let failure = error as NSError
+                let parentMissing = !FileManager.default.fileExists(atPath: directory.path)
+                    || ((failure.domain == NSPOSIXErrorDomain || failure.domain == "FileLock")
+                        && failure.code == Int(ENOENT))
+                    || (failure.domain == NSCocoaErrorDomain
+                        && failure.code == CocoaError.fileNoSuchFile.rawValue)
+                if attempt == 0, parentMissing { continue }
+                FileHandle.standardError.write(Data(
+                    "TurnVolatileArchive: record not persisted for session \(sessionId): \(error)\n".utf8
+                ))
+                return
             }
-            try? await self.writeLocked(entries, path: path)
         }
     }
 
@@ -276,23 +294,13 @@ public actor TurnVolatileArchive {
                 )
                 return true
             }) ?? false
-            // 2026-09-06: removing the PARENT directory is outside any lock —
-            // the file lock we just held covers `volatile.jsonl`, not the
-            // directory holding it. A writer that arrives for a new turn creates
-            // the directory, and if the sweep unlinks it in between, the
-            // writer's lock open fails with ENOENT and its volatile block is
-            // silently lost. Only reap a directory whose own mtime is older than
-            // the same staleness threshold the transcript had to pass: a
-            // directory a writer has just touched is left for the next sweep.
-            // `values` was sampled BEFORE this pass unlinked anything inside the
-            // directory — our own removals bump the directory's mtime, so a
-            // re-stat here would report every directory as freshly touched.
+            // rmdir only removes an empty directory, including at the instant
+            // of removal. It cannot recursively delete a concurrent writer's
+            // newly created lock or archive. Recording retries a missing parent.
             if reaped,
                let dirMtime = values?.contentModificationDate,
-               now.timeIntervalSince(dirMtime) > Self.ttlSeconds,
-               let leftovers = try? fm.contentsOfDirectory(atPath: url.path),
-               leftovers.isEmpty {
-                try? fm.removeItem(at: url)
+               now.timeIntervalSince(dirMtime) > Self.ttlSeconds {
+                _ = Darwin.rmdir(url.path)
             }
         }
     }

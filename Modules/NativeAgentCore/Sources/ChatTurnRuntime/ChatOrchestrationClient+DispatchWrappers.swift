@@ -84,7 +84,7 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         "read_skill", "shell_", "bash_", "exec_",
     ]
     private static let blockedExact: Set<String> = [
-        "read_file", "list_dir", "read_skill", "list_skills", "save_skill", "craft_run",
+        "read_file", "list_dir", "read_skill", "list_skills", "save_skill",
         "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
         // agent-builder-tools (2026-06-08) — defense in depth. Builder
         // Process-spawn tools must never dispatch when fileAccess=none.
@@ -182,7 +182,7 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         // build-plan W7 decision, rather than a silent 404 that would read as
         // "this tool does not exist" from the phone.
         // `ActivityQueryToolReachabilityTests` pins that refusal.
-        "persona_write", "persona_append_section", "save_skill", "craft_run",
+        "persona_write", "persona_append_section", "save_skill",
     ]
 
     private func isBlocked(_ name: String) -> Bool {
@@ -245,6 +245,11 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         return all.filter { !isBlocked($0) }
     }
 
+    func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+        let all = try await inner.listAvailableToolSchemas(named: names)
+        return mode == .allow ? all : all.filter { !isBlocked($0.name) }
+    }
+
     // Forward schemas when permitted; filter blocked tools by fileAccess mode.
     func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
         let all = try await inner.listAvailableToolSchemas()
@@ -294,6 +299,20 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     /// gave it in Trust → Connected agents. DISPLAY ONLY — nothing here grants
     /// authority, and a nil root simply falls back to the id.
     private let peerDirectoryDataRoot: URL?
+    /// This chain's file access, recorded on any card it files.
+    private let fileAccess: String?
+
+    /// The peer's line for the floor card: its bracketed notes and lane
+    /// label left out, secrets redacted, cut to a glance.
+    static func peerQuote(_ text: String) -> String {
+        var said = text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !($0.hasPrefix("[") && $0.hasSuffix("]")) }
+            .joined(separator: " ")
+        if said.hasPrefix("[from: "), let end = said.firstIndex(of: "]") { said = String(said[said.index(after: end)...]) }
+        said = TurnSecretRedactor.redactText(said).trimmingCharacters(in: .whitespaces)
+        return said.count > 240 ? String(said.prefix(240)) + "…" : said
+    }
 
     /// The peer's contact name, or nil when the directory has none.
     private func peerDisplayName(peerID: String?) -> String? {
@@ -330,8 +349,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil,
         externalToolIsEffect: (@Sendable (String) -> Bool)? = nil,
         firstConversationDataRoot: URL? = nil,
-        peerDirectoryDataRoot: URL? = nil
+        peerDirectoryDataRoot: URL? = nil,
+        fileAccess: String? = nil
     ) {
+        self.fileAccess = fileAccess
         self.externalToolIsEffect = externalToolIsEffect
         self.firstConversationDataRoot = firstConversationDataRoot
         self.peerDirectoryDataRoot = peerDirectoryDataRoot
@@ -394,7 +415,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         let envelope = await securityCenter.evaluateTool(
             tool: tool,
             input: securityInput,
-            origin: Self.securityOrigin(
+            origin: .currentTurn(
                 verifiedSessionId: verifiedSessionId,
                 surface: surface
             ),
@@ -415,12 +436,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             )
         }
 
-        let autonomyLevel = try await gate.autonomyLevel(
+        var autonomyLevel = try await gate.autonomyLevel(
             toolName: tool,
             surface: surface,
             originTrusted: envelope.originTrusted
         )
         let admittedFullMacYolo = envelope.fullMacYoloAuthority == .admitted
+        // The saved posture is Full Mac, whoever is asking (a peer or helper
+        // surface is never admitted, but it is still running under Full Mac).
+        let fullMacOn = [.admitted, .untrustedOrigin].contains(envelope.fullMacYoloAuthority)
         // 2026-09-06: EVERY replay exemption is verified against the approval
         // inbox, not just the injection ones. `ApprovedChatToolReplay` is a
         // public struct with a public init, so field equality proved only that
@@ -459,6 +483,13 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         } else {
             approvedReplayAuthorizes = false
         }
+        // An app door action keeps the level User saved on the old tool it
+        // runs in process; SecurityCenter resolved it from the action, and
+        // the stricter stands. The card files on the app call, and its
+        // approved replay is not asked again.
+        if tool == "app", !approvedReplayAuthorizes {
+            autonomyLevel = SwiftNativeTrustCenter.moreRestrictiveAutonomy(autonomyLevel, envelope.autonomyLevel)
+        }
         // The first conversation's ONE documented line (User, 2026-09-15;
         // hardened after Sol's P0-1/2/3, same day).
         //
@@ -483,6 +514,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         let guardResult = PersonaWriteGuard.apply(
             tool: tool,
             kind: Self.jsonString(input["kind"]),
+            personaSettingWrite: PeerTurnEffectPolicy.isPersonaSettingWrite(tool: tool, input: input),
             resolvedAutonomy: autonomyLevel,
             // A resolved approval is equivalent to the explicit confirmation
             // PersonaWriteGuard was created to require, but only for the exact
@@ -552,14 +584,19 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 resolved: guardResult.autonomy
             )
         let autonomyDecision: AutonomyDecision
-        if guardResult.source == PersonaWriteGuard.autonomySource && !admittedFullMacYolo {
+        if guardResult.source == PersonaWriteGuard.autonomySource
+            && !admittedFullMacYolo && !approvedReplayAuthorizes {
             autonomyDecision = .requireApproval(
                 reason: "autonomy=\(guardResult.autonomy) source=\(PersonaWriteGuard.autonomySource)"
             )
         } else {
-            autonomyDecision = admittedFullMacYolo
+            let mapped = AutonomyGate.map(level: flooredAutonomy, toolName: tool)
+            let approvedAsk: Bool
+            if case .requireApproval = mapped { approvedAsk = approvedReplayAuthorizes }
+            else { approvedAsk = false }
+            autonomyDecision = admittedFullMacYolo || approvedAsk
                 ? .allow
-                : AutonomyGate.map(level: flooredAutonomy, toolName: tool)
+                : mapped
         }
         // Deny outranks every ask; a security .ask outranks autonomy allow
         // (the external-send gate exists precisely to force a human look).
@@ -592,11 +629,14 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         let securityAsked: Bool
         var securityReasonMayBeReplaced = false
         var decision: AutonomyDecision
+        let botDesktop = surface == "bot" && !approvedReplayAuthorizes && injectionReplayApprovalID == nil
+            && Self.requiresDesktopInteraction(tool: tool, capabilities: envelope.capabilities)
         if case .deny = autonomyDecision {
             decision = autonomyDecision
             securityAsked = false
-        } else if surface == "bot", !approvedReplayAuthorizes, injectionReplayApprovalID == nil,
-                  Self.requiresDesktopInteraction(tool: tool, capabilities: envelope.capabilities) {
+        } else if botDesktop, !fullMacOn {
+            // Under Full Mac her helpers use the desktop on her say (User 10-01);
+            // MacAttention still refuses typing over the person.
             // A verified replay is the person having already clicked Approve on
             // exactly this call. The executor keeps surface "bot" and wires no
             // filer, so asking again here spent the approval, demanded another,
@@ -655,18 +695,39 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         case .requireApproval: peerReasonMayReplace = securityReasonMayBeReplaced
         case .deny: peerReasonMayReplace = false
         }
+        if botDesktop, fullMacOn, case .allow = decision {
+            try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow,
+                reason: "Agent decided for a helper"))
+            HarnessDecidedRow.post(requester: "a helper", tool: tool, sessionID: verifiedSessionId,
+                                         dataRoot: peerDirectoryDataRoot ?? defaultDataRoot())
+        }
         let peerTurnID = ChatToolSessionContext.envelope?.verifiedUserId
-        if !approvedReplayAuthorizes, injectionReplayApprovalID == nil,
-           peerReasonMayReplace,
-           let requester = PeerTurnEffectPolicy.peerRequester(
+        let taint = PeerDataTaint.current
+        let requester = PeerTurnEffectPolicy.peerRequester(
             surface: surface,
             peerID: peerTurnID,
             peerName: peerDisplayName(peerID: peerTurnID),
-            taintSource: PeerDataTaint.current.flatMap {
+            taintSource: taint.flatMap {
                 $0.isTainted ? $0.sourceDescription : nil
             }
-           ),
-           PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities,
+        )
+        // A peer the person elevated frees everything but the floor.
+        let elevatedBy = taint?.elevatedSources ?? []
+        if !approvedReplayAuthorizes, injectionReplayApprovalID == nil,
+           peerReasonMayReplace, requester != nil || !elevatedBy.isEmpty {
+            if fullMacOn, PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities,
+                                                                      input: input, fullMac: true) {
+                // The Full Mac floor (Agent 10-02): the card names the peer
+                // and quotes the line of theirs that led here.
+                let sources = taint?.isTainted == true ? taint?.checkpointSources ?? [] : requester == nil ? elevatedBy : []
+                let named = sources.map { source -> String in
+                    if source.hasPrefix("peer:") { return peerDisplayName(peerID: String(source.dropFirst(5))) ?? source }
+                    return source.contains(" ") ? source : source.prefix(1).uppercased() + source.dropFirst()
+                }.joined(separator: ", ")
+                decision = .requireApproval(reason: PeerTurnEffectPolicy.floorReason(
+                    tool: tool, input: input, capabilities: Set(envelope.capabilities), requester: named.isEmpty ? requester ?? "" : named,
+                    quote: Self.peerQuote(taint?.lastLine ?? "")))
+            } else if let requester, PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities,
                                                     externalToolIsEffect: externalToolIsEffect,
                                                     input: input,
                                                     workspaceRoot: NativeAgentWorkspaceRoot.resolve(
@@ -674,9 +735,20 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                                                     // Full Mac file ops resolve relative paths here.
                                                     relativeBases: SwiftToolDispatcher.builderSourceRepoRoot(
                                                         dataRoot: peerDirectoryDataRoot ?? defaultDataRoot()).map { [$0] } ?? []) {
-            decision = .requireApproval(
-                reason: PeerTurnEffectPolicy.approvalReason(tool: tool, requester: requester)
-            )
+                if fullMacOn {
+                    // Hers under Full Mac (User 10-01): no card, and he sees it.
+                    if case .allow = decision {
+                        try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow,
+                            reason: "Agent decided for \(requester)"))
+                        HarnessDecidedRow.post(requester: requester, tool: tool, sessionID: verifiedSessionId,
+                                                     dataRoot: peerDirectoryDataRoot ?? defaultDataRoot())
+                    }
+                } else {
+                    decision = .requireApproval(
+                        reason: PeerTurnEffectPolicy.approvalReason(tool: tool, requester: requester)
+                    )
+                }
+            }
         }
         // THE PERSON'S OWN SEND. Typed in a contact's thread and sent by their
         // click, it needs no card for the send itself. Anything more (running a
@@ -717,7 +789,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 tool: tool,
                 input: input,
                 surface: surface,
-                injectionApprovalID: injectionReplayApprovalID,
+                injectionApprovalID: injectionReplayApprovalID ?? (approvedReplayAuthorizes ? approvedReplay?.approvalID : nil),
                 // Reaching .allow IS the person's go-ahead: their approval, or Full Mac.
                 personApprovedHost: namedConnect
             )
@@ -725,11 +797,8 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: reason))
             throw AutonomyGateError.toolDenied(reason: reason)
         case .requireApproval(let gateReason):
-            // Craft bindings live only in this call. Never file a sub-action
-            // that an approval executor could later replay without them.
-            guard !CraftToolContext.requiresCurrentAuthority else {
-                throw CraftFailure("Craft stopped because a sub-action needs approval. No sub-action approval was filed; authorize craft_run and its required access before running it.")
-            }
+            // A skill's step never files a card: it hands back to her.
+            if SkillRunContext.handsBack { return SkillRunContext.handBack(ApprovalActionText.reason(gateReason, tool: tool)) }
             // THE CARD'S WORDS. A tool that writes into another program's own
             // settings owes the person the exact file, the exact entry and the
             // exact access BEFORE they press anything, and "autonomy=confirm"
@@ -923,10 +992,12 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         _ body: () async throws -> T
     ) async rethrows -> T {
         let filingSessionId = ChatToolSessionContext.verifiedSessionId ?? verifiedSessionId
-        return try await ChatToolSessionContext.$verifiedSessionId.withValue(
-            filingSessionId,
-            operation: body
-        )
+        return try await ChatToolSessionContext.$fileAccess.withValue(fileAccess) {
+            try await ChatToolSessionContext.$verifiedSessionId.withValue(
+                filingSessionId,
+                operation: body
+            )
+        }
     }
 
     /// THE SINGLE EXECUTION DOOR of this dispatcher, and the ONLY place in the
@@ -943,6 +1014,8 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     ///   • injection tools with an approval id: rehydrate the redacted secret
     ///     arguments, mint a capability bound to this action + the exact body
     ///     about to run, and bind it for the duration of the call only.
+    /// Secret-bearing calls restore their approved arguments from memory before
+    /// dispatch, whether or not they use a MacInjectionCapability.
     private func runInner(
         tool: String,
         input: [String: JSONValue],
@@ -952,6 +1025,25 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     ) async throws -> JSONValue {
         var effectiveInput = input
         var capability: MacInjectionCapability?
+
+        if MacInjectionArgRedaction.isRedacted(tool: tool, input: input) {
+            guard let approvalID = injectionApprovalID,
+                  let secrets = await MacInjectionSecretVault.shared.take(approvalID: approvalID),
+                  !secrets.isEmpty else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "injection_secret_unavailable: the approved text for \(tool) is no "
+                        + "longer held in memory (app restarted or already replayed). Ask again."
+                )
+            }
+            effectiveInput = MacInjectionArgRedaction.rehydrated(tool: tool, input: input, secrets: secrets)
+            guard !MacInjectionArgRedaction.isRedacted(tool: tool, input: effectiveInput),
+                  MacInjectionArgRedaction.redacted(tool: tool, input: effectiveInput) == input else {
+                throw AutonomyGateError.toolDenied(reason: "injection_secret_mismatch: approved text for \(tool) could not be verified.")
+            }
+        } else if let approvalID = injectionApprovalID {
+            // An approval resolved in this call still has its original arguments.
+            _ = await MacInjectionSecretVault.shared.take(approvalID: approvalID)
+        }
 
         if MacInjectionToolNames.isInjectionTool(tool) {
             // USER 2026-08-12 — YOLO: nothing approval-gated. A missing approval
@@ -965,26 +1057,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             guard let action = MacInjectionToolNames.action(forTool: tool) else {
                 throw AutonomyGateError.toolDenied(
                     reason: "injection_approval_missing: \(tool) has no mapped action"
-                )
-            }
-            // Replay path: the persisted input is the REDACTED form. Put the
-            // characters back from the vault before the digest is computed, so
-            // the capability binds what actually runs.
-            if let secrets = await MacInjectionSecretVault.shared.take(approvalID: approvalID),
-               !secrets.isEmpty {
-                effectiveInput = MacInjectionArgRedaction.rehydrated(
-                    tool: tool,
-                    input: effectiveInput,
-                    secrets: secrets
-                )
-            } else if MacInjectionArgRedaction.isRedacted(tool: tool, input: effectiveInput) {
-                // The record says characters were redacted but the vault no
-                // longer holds them (app restarted, or they were already
-                // spent). Typing a placeholder into whatever is frontmost would
-                // be worse than refusing.
-                throw AutonomyGateError.toolDenied(
-                    reason: "injection_secret_unavailable: the approved text for \(tool) is no "
-                        + "longer held in memory (app restarted or already replayed). Ask again."
                 )
             }
             guard let minted = MacInjectionCapability.mint(
@@ -1006,7 +1078,9 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // capability left in scope by an enclosing task.
             try await MacInjectionCapabilityContext.$current.withValue(finalCapability) {
                 try await AgentHostConnection.$personApproved.withValue(personApprovedHost) {
-                    try await inner.dispatch(tool: tool, input: finalInput, surface: surface)
+                    try await MacWorkContinuation.$current.withValue(ChatToolSessionContext.envelope?.macContinuation) {
+                        try await inner.dispatch(tool: tool, input: finalInput, surface: surface)
+                    }
                 }
             }
         }
@@ -1019,6 +1093,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     // HOTFIX 2026-06-03: forward schemas. Without this the gate wrapper
     // silently dropped to the default-empty schema list, so the LLM never
     // saw the SwiftToolDispatcher's 7 built-ins behind the autonomy gate.
+    func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(named: names)
+    }
+
     func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
         try await inner.listAvailableToolSchemas()
     }
@@ -1061,50 +1139,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             tool: tool,
             surface: surface,
             input: input
-        )
-    }
-
-    /// THE origin projection. Every security field here comes from the TURN
-    /// ENVELOPE, not from the `surface` the caller happened to dispatch under.
-    ///
-    /// That distinction is the whole point. A remote adapter binds
-    /// `TurnEnvelope(surface: "signal", declaredRemote: true, verifiedUserId: …)`
-    /// while its `client.chat` call still runs with the shared tool surface
-    /// `"chat"` (the bridges deliberately do exactly that). Reading `surface`
-    /// here would then hand a genuinely remote turn a LOCAL, trusted origin —
-    /// `assessOrigin` short-circuits to "local app surface" before any
-    /// allowlist is consulted. The envelope is the one value that knows what
-    /// the turn actually is, so it is the one value this reads.
-    ///
-    /// `TurnEnvelope.current(surface:)` is the ONLY path to the task-locals:
-    /// when no envelope is bound it composes one from them, so a pre-envelope
-    /// adapter keeps its exact behavior and there is no second place that can
-    /// disagree about identity.
-    /// Internal, not private, for the same reason `resolvedChatId` is: this
-    /// projection is a trust boundary and gets tested directly.
-    static func securityOrigin(
-        verifiedSessionId: String?,
-        surface: String
-    ) -> SecurityOriginContext {
-        let sessionId = verifiedSessionId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let usableSessionId = sessionId?.isEmpty == false ? sessionId : nil
-        let envelope = TurnEnvelope.current(surface: surface)
-        // Remoteness only ever WIDENS: the surface profile owns the known
-        // remote set, and `declaredRemote` can add remoteness to a surface the
-        // profile has not heard of yet. Neither can subtract it — see the
-        // same rule restated in `SecurityCenter.assessOrigin`.
-        let remote = ConversationSurfaceProfile(envelope.surface).isRemote
-            || envelope.declaredRemote == true
-        return SecurityOriginContext(
-            surface: envelope.surface,
-            sessionId: usableSessionId,
-            userId: envelope.verifiedUserId,
-            chatId: envelope.verifiedChatId,
-            deviceId: nil,
-            source: "chat_runtime",
-            isRemote: remote,
-            commandSignatureVerified: envelope.commandSignatureVerified
         )
     }
 

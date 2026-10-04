@@ -3,6 +3,11 @@ import NativeAgentCore
 import PersistenceCore
 
 extension CognitiveSubstrate {
+    /// The full redacted reply length and tail let Sound inspect text beyond
+    /// the bounded event summary without retaining another complete reply.
+    public static let replyCharacterCountMetadataKey = "replyCharacterCount"
+    public static let replyTailMetadataKey = "replyTail"
+
     public func ingest(_ event: CognitiveEvent) async {
         _ = await ingest(event, defersPersistenceToMicrocycle: false)
     }
@@ -51,7 +56,9 @@ extension CognitiveSubstrate {
         // semanticAppraisal, emotionTag, applyAffectFromEvent and
         // reconsolidatePendingCompletion below, exactly as before.
         // See CognitiveSubstrate+AppraisalConcerns.swift.
-        let userAppraisal = buildsAffectBundle
+        let defersInterpretation = buildsAffectBundle && Self.isUserAuthored(event.kind)
+            && event.sessionId?.hasPrefix("bot-") == false
+        let userAppraisal = buildsAffectBundle && !defersInterpretation
             ? relationalAppraisal(for: event)
             : AffectAppraisal()
         // Semantic relationship stake historically samples this lexical cue
@@ -59,7 +66,7 @@ extension CognitiveSubstrate {
         // Compute it once without changing either caller's gating.
         // Item 8: the same relational weight applies — warmth from a peer is
         // real warmth, at half the reach of his.
-        let turnWarmthBoost = (buildsAffectBundle || event.kind == .userMessageReceived)
+        let turnWarmthBoost = !defersInterpretation && (buildsAffectBundle || event.kind == .userMessageReceived)
             ? relationalWarmthBoost(
                 for: event,
                 precomputed: relationalWarmthBoost(in: event.summary)
@@ -76,6 +83,15 @@ extension CognitiveSubstrate {
             verificationNodeMayExist = true
         }
         markDirty(at: now)
+        if defersInterpretation, !deferredTurns.contains(where: { $0.context.event.subject == event.subject }) {
+            let context = AfterTurnContext(event: event, caring: caringEventCandidate(for: event),
+                                           generation: caringAppraisalGeneration)
+            deferredTurns.append(DeferredTurn(context: context, completion: pendingCompletion, outcome: ingestOutcome))
+            pendingCompletion = nil
+            // No age eviction: a turn can work for hours, and its own after-turn
+            // (success, stop, or failure) removes the entry. The cap only bounds.
+            if deferredTurns.count > 32 { deferredTurns.removeFirst(deferredTurns.count - 32) }
+        }
         let contributesToLivedState = event.turnKind.contributesToLivedState
         // THE ACCEPTED-TURN TICK for the Sound nudge's cadence (2026-09-01).
         // It used to advance inside the capsule render and stick only through
@@ -111,7 +127,7 @@ extension CognitiveSubstrate {
         // the tag and stamping it (gpt-5.5 concurrency review, 2026-07-02). applyAffect is
         // synchronous; the affect persistence that updateAffectFromEvent used to do is
         // moved below, after the state is already consistent.
-        let updatedAffect = contributesToLivedState
+        let updatedAffect = contributesToLivedState && !defersInterpretation
             ? applyAffectFromEvent(
                 event,
                 precomputedAppraisal: userAppraisal,
@@ -162,7 +178,7 @@ extension CognitiveSubstrate {
         // re-stamp reads the remembered node's tag and writes it back, so a
         // reentrant ingest suspending in between could evict/recreate that node
         // or swap the slot underneath us. Pure, synchronous, no suspension.
-        if contributesToLivedState, configuration.affectEnabled {
+        if contributesToLivedState, configuration.affectEnabled, !defersInterpretation {
             reconsolidatePendingCompletion(
                 with: event,
                 outcome: ingestOutcome,
@@ -246,7 +262,7 @@ extension CognitiveSubstrate {
     /// A completion whose node was evicted between the two turns simply finds
     /// nothing to re-stamp. A user turn with no session id (out-of-band) neither
     /// consumes nor applies — expiry remains its removal.
-    private func reconsolidatePendingCompletion(
+    func reconsolidatePendingCompletion(
         with event: CognitiveEvent,
         outcome: ContinuityField.IngestOutcome?,
         now: Date,
@@ -321,26 +337,6 @@ extension CognitiveSubstrate {
                 nodeKey: outcome.key,
                 recordedAt: now,
                 sessionId: event.sessionId
-            )
-            // W7/P6 — TELEMETRY ONLY. The completion is the first moment the
-            // ACTUAL reply length exists, so this is where the envelope stashed
-            // at capsule compile gets paired with what really happened. It
-            // records the paired row in memory and returns; nothing here reads
-            // the envelope back into the turn, and no flag exists that could.
-            let replyCharacters: Int = {
-                if case .int(let value)? = event.metadata[
-                    Self.replyCharacterCountMetadataKey
-                ], value >= 0 {
-                    return Int(clamping: value)
-                }
-                // Backward-compatible fallback for direct library callers and
-                // older persisted events that predate the count metadata.
-                return event.summary.count
-            }()
-            consumeDeliveryEnvelopeTelemetry(
-                replyCharacters: replyCharacters,
-                sessionId: event.sessionId,
-                at: now
             )
         }
     }

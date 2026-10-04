@@ -137,7 +137,7 @@ enum InlineConnectorSetup {
         for value in typed where value.count >= 6 {
             logged = logged.replacingOccurrences(of: value, with: "[redacted]")
         }
-        NSLog("[inline-setup] \(service) failed: \(logged)")
+        NSLog("%@", "[inline-setup] \(service) failed: \(logged)")
         let text = raw.lowercased()
         func has(_ words: String...) -> Bool { words.contains { text.contains($0) } }
         // App-side allowlist checks, not service text: the person can fix these.

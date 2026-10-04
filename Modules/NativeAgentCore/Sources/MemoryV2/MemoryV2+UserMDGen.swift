@@ -15,6 +15,7 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import PersonaEngine
 
 public enum UserMDGeneratorError: Error, CustomStringConvertible {
     /// USER.md was requested on an install that has not completed onboarding.
@@ -85,39 +86,32 @@ public actor UserMDGenerator {
     /// Two accepted proofs, in order:
     ///   * `<dataRoot>/.onboarded` — the completion sentinel onboarding
     ///     publishes last, after every persona doc verifies.
-    ///   * `SOUL.md` in the persona root — installs that predate the sentinel
-    ///     still carry their identity docs, and must keep regenerating.
+    ///   * The complete legacy persona document bundle, using onboarding's
+    ///     completion predicate at the resolved persona root.
     ///
-    /// USER.md itself is deliberately NOT a proof: it is the file this
-    /// generator writes, so accepting it would be circular — exactly the
-    /// self-satisfying loop that hid the onboarding wizard on blank installs.
+    /// USER.md alone is not proof. A missing legacy document must keep this
+    /// generator from completing a partial bundle itself.
     ///
-    /// gpt-5.5 review NEEDS_FIX 3 (2026-08-02) asked whether that contradicts
-    /// `Onboarding.startOnboarding`, which at the time counted a prose-bearing
-    /// USER.md as already-onboarded. It did, and the contradiction was resolved
-    /// in the OTHER direction: onboarding's start gate no longer accepts USER.md
-    /// either. Both gates now recognize exactly `.onboarded` and `SOUL.md`, so
-    /// no install can be "onboarded enough to hide the wizard" while also
-    /// "un-onboarded enough to refuse regeneration" — the stuck state the review
-    /// described.
-    ///
-    /// The alternative (teach this gate to accept identity-bearing USER.md
-    /// content) was rejected: `regenerate` REPLACES the whole document with its
-    /// own autogen body, so onboarding's prose survives only until the first
-    /// regeneration. A proof this generator can erase — and, with bullets in the
-    /// body, re-forge — is not a proof. An install carrying only a USER.md is
-    /// therefore treated as incomplete, and the wizard (which is now reachable
-    /// for it) is the recovery path.
+    /// A pending completion or reset owns exact bytes until its manifest clears,
+    /// even if SOUL.md or the sentinel already committed. Regeneration before
+    /// then would invalidate the transaction's resumption checks.
     public nonisolated var onboardingHasCompleted: Bool {
         let fm = FileManager.default
+        if fm.fileExists(atPath: dataRoot.appendingPathComponent("onboarding/pending-completion.json").path)
+            || fm.fileExists(atPath: dataRoot.appendingPathComponent("onboarding/pending-reset.json").path) {
+            return false
+        }
         if fm.fileExists(atPath: dataRoot.appendingPathComponent(".onboarded").path) {
             return true
         }
-        let soul = (personaRoot ?? dataRoot
+        let root = personaRoot ?? dataRoot
             .appendingPathComponent("persona", isDirectory: true)
-            .appendingPathComponent(MemoryV2Defaults.personaID, isDirectory: true))
-            .appendingPathComponent("SOUL.md")
-        return fm.fileExists(atPath: soul.path)
+            .appendingPathComponent(MemoryV2Defaults.personaID, isDirectory: true)
+        return NativeAgentPublicSafety.hasLegacyCompletionAnchor(
+            personaRoot: root,
+            profileURL: dataRoot.appendingPathComponent("memory/profile.json"),
+            allowMissingProfile: true
+        )
     }
 
     /// Path the generator writes to for a given persona. A resolved persona
@@ -209,30 +203,35 @@ public actor UserMDGenerator {
         // on `persona_already_exists`. Gating generation on onboarding having
         // completed removes the race entirely — before completion there is
         // simply nothing to write, in either order.
-        guard onboardingHasCompleted else {
-            throw UserMDGeneratorError.onboardingIncomplete
-        }
         let projectionPersona = projectionPersona(for: persona)
         let target = userMDPath(persona: projectionPersona)
         let parent = target.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
 
         await beforeProjectionLockForTesting?()
         let core = SwiftNativePersistenceCore()
-        let generatedAt = try await core.withFileLock(target) { [storage, nowProvider, target] in
-            // Read canonical memory only after owning the projection lock.
-            // Otherwise a waiter can publish an old snapshot after a newer
-            // regeneration won this non-FIFO lock and already wrote new facts.
-            // listMemories is database-only and never acquires the USER lock.
-            let memories = try await storage.listMemories(
-                persona: projectionPersona, status: "active", limit: nil
-            )
-            let now = nowProvider()
-            let body = Self.renderBody(memories: memories, now: now)
-            let preamble = try Self.loadPreambleForRegeneration(at: target)
-            let payload = Self.assemble(preamble: preamble, body: body)
-            try Self.atomicReplaceIfChanged(payload, at: target)
-            return now
+        let manifestPath = dataRoot.appendingPathComponent("onboarding/pending-completion.json")
+        // Match onboarding's lock order and hold its manifest lock from the
+        // completion check through replacement of the derived document.
+        let generatedAt = try await core.withFileLock(manifestPath) { [self, storage, nowProvider, target] in
+            guard onboardingHasCompleted else {
+                throw UserMDGeneratorError.onboardingIncomplete
+            }
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            return try await core.withFileLock(target) {
+                // Read canonical memory only after owning the projection lock.
+                // Otherwise a waiter can publish an old snapshot after a newer
+                // regeneration won this non-FIFO lock and already wrote new facts.
+                // listMemories is database-only and never acquires the USER lock.
+                let memories = try await storage.listMemories(
+                    persona: projectionPersona, status: "active", limit: nil
+                )
+                let now = nowProvider()
+                let body = Self.renderBody(memories: memories, now: now)
+                let preamble = try Self.loadPreambleForRegeneration(at: target)
+                let payload = Self.assemble(preamble: preamble, body: body)
+                try Self.atomicReplaceIfChanged(payload, at: target)
+                return now
+            }
         }
         lastRegen = generatedAt
         return target
@@ -258,9 +257,12 @@ public actor UserMDGenerator {
 
     static func renderBody(memories: [StoredMemory], now: Date) -> String {
         _ = now
+        return "# User Facts (auto-generated from memory SQLite)\n\n"
+            + userFacts(memories: memories).map { "- \($0)\n" }.joined() + "\n"
+    }
 
-        var out = ""
-        out += "# User Facts (auto-generated from memory SQLite)\n\n"
+    static func userFacts(memories: [StoredMemory]) -> [String] {
+        var facts: [String] = []
 
         // Flat list, newest first — no provenance grouping, no per-fact dates.
         // Clean single-signal facts are the substrate Agent reasons from; the
@@ -321,11 +323,8 @@ public actor UserMDGenerator {
             //   * durability — the same precision gate every other write path
             //     applies; a row that is not durable memory is not a user fact.
             //
-            // Gates the projection ALSO applies but this cannot reach from
-            // MemoryV2 (secret-shape policy, per-surface disclosure, atom size)
-            // stay uncovered here on purpose. They are handled the safe way:
-            // the join stays all-or-nothing, so an uncovered fact keeps USER.md
-            // injected in full rather than silently dropping the fact.
+            // The on-disk document is surface-independent. Prompt rendering
+            // filters disclosure before using these facts as its initial core.
             guard MemoryLifecycle.isRecallEligible(m.lifecycle) else { continue }
             guard MemoryCandidateQuality.isDurableCandidate(
                 text: m.content,
@@ -337,10 +336,9 @@ public actor UserMDGenerator {
                 kind: Self.memoryKind(m)
             )
             guard !content.isEmpty else { continue }
-            out += "- \(content)\n"
+            facts.append(content)
         }
-        out += "\n"
-        return out
+        return facts
     }
 
     /// Kinds that describe the PERSON (or the User↔Agent relationship) rather

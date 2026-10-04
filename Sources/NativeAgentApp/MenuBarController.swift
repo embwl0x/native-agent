@@ -29,6 +29,7 @@ final class GlobalHotkeyManager: NSObject {
     // The voice input callback — set by whoever cares (e.g. ChatView)
     var onVoiceStart: (() -> Void)?
     var onVoiceEnd: (() -> Void)?
+    var onVoiceCancel: (() -> Void)?
     var onOpenWindow: (() -> Void)?
 
     // Default: cmd(cmdKey=256) + shift(512) + j(keycode=38)
@@ -82,6 +83,10 @@ final class GlobalHotkeyManager: NSObject {
     }
 
     func unregister() {
+        voiceStartTask?.cancel()
+        voiceStartTask = nil
+        pressState.cancel()
+        onVoiceCancel?()
         if let ref = hotKeyRef {
             UnregisterEventHotKey(ref)
             hotKeyRef = nil
@@ -90,9 +95,6 @@ final class GlobalHotkeyManager: NSObject {
             RemoveEventHandler(handler)
             eventHandlerRef = nil
         }
-        voiceStartTask?.cancel()
-        voiceStartTask = nil
-        pressState.cancel()
         isRegistered = false
     }
 
@@ -129,6 +131,7 @@ final class GlobalHotkeyManager: NSObject {
     }
 
     func handleKeyDown() {
+        guard isRegistered else { return }
         let token = pressState.keyDown(now: Date())
         voiceStartTask?.cancel()
         voiceStartTask = Task { @MainActor in
@@ -139,6 +142,7 @@ final class GlobalHotkeyManager: NSObject {
     }
 
     func handleKeyUp() {
+        guard isRegistered else { return }
         guard let action = pressState.keyUp(now: Date()) else { return }
         voiceStartTask?.cancel()
         voiceStartTask = nil

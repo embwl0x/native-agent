@@ -289,9 +289,9 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
 
     /// User-facing details returned when a Swift pre-check blocks a run.
     public static let dreamDisabledDetail =
-        "Enable the Trust setting 'Run dream cycle nightly' and keep personalityPolicy.dream_cycle_enabled enabled to run a dream cycle."
+        "Enable the Dream cycle toggle in Dreams to run a dream cycle."
     public static let remDisabledDetail =
-        "Enable trainingPolicy.rem_cycle_enabled to run REM consolidation."
+        "Enable the REM cycle toggle in Dreams to run REM consolidation."
 }
 
 /// Pure-compute next-run schedule for the dream + REM loops. NO LLM, NO I/O.
@@ -459,6 +459,7 @@ public struct FileBackedDreamDiary: Sendable {
     /// at the caller identically — and the agent told her she had never dreamt.
     public struct DiaryListing: Sendable {
         public let entries: [DreamEntry]
+        public let totalEntries: Int
         /// The diary (or an archive year) is there and could not be listed.
         public let storageUnreadable: Bool
         /// Files that were listed but could not be read or stat'ed this pass.
@@ -511,7 +512,8 @@ public struct FileBackedDreamDiary: Sendable {
             ))
         }
         return DiaryListing(
-            entries: out, storageUnreadable: scan.unreadableDirectory, unreadableEntries: skipped)
+            entries: out, totalEntries: scan.files.count,
+            storageUnreadable: scan.unreadableDirectory, unreadableEntries: skipped)
     }
 
     /// Mirror `latest_entry()` == `list_entries(limit=1)` first element.
@@ -566,6 +568,9 @@ public struct FileBackedDreamDiary: Sendable {
                 .appendingPathComponent(String(trimmed.prefix(4)), isDirectory: true)
                 .appendingPathComponent("\(trimmed).md")
             guard fm.fileExists(atPath: archived.path) else { return .notFound }
+            guard archived.standardizedFileURL.resolvingSymlinksInPath().path.hasPrefix(dirPrefix) else {
+                return .badPath
+            }
             url = archived
         }
         // A read/stat failure on an EXISTING file is a real error, not a "not
@@ -695,8 +700,8 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
     }
 
     /// The single dream path, with the waking lane named. `runDream(force:)`
-    /// (the protocol requirement) is the `.schedule` case of exactly this; the
-    /// organism's pressure lane calls it with `.pressure`. Same gate, same
+    /// (the protocol requirement) is the `.schedule` case of exactly this; a
+    /// manual pass calls it with `.manual`. Same gate, same
     /// runner, same dedupe — only the receipt and the target day differ.
     public func runDream(force: Bool, trigger: DreamTrigger) async throws -> DreamRunResult {
         // WAVE 35 W15: pure-compute pre-check mirrors the retired daemon

@@ -37,6 +37,22 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
+    /// THE launch decision for an agent NativeAgent drives, for the request's
+    /// real origin: admitted Full Mac runs it with full access, a lower Trust
+    /// or an origin not admitted for Full Mac runs it restricted, and an
+    /// explicit block or an unreadable policy launches nothing.
+    public func drivenAgentLaunchPermission(
+        tool: String,
+        origin: SecurityOriginContext
+    ) async -> DrivenAgentLaunchPermission {
+        let authority = await fullMacYoloAuthority(tool: tool, origin: origin)
+        switch authority.state {
+        case .admitted: return .fullMac
+        case .inactive, .untrustedOrigin: return .restricted
+        case .explicitlyBlocked, .unavailable: return .denied(reason: authority.reason)
+        }
+    }
+
     /// Shared pure evaluator for owners that already hold one checked
     /// authorization generation. This is the single YOLO vocabulary: there is
     /// intentionally no tool exclusion list. Explicit `blocked` is the only

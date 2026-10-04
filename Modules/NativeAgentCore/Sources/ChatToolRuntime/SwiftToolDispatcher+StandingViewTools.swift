@@ -89,6 +89,10 @@ extension SwiftToolDispatcher {
                     return "that view is retired; there is nothing to hold."
                 case .proposed:
                     return "that view could not be held."
+                case .opinion:
+                    return "that is already your opinion."
+                case .interest:
+                    return "that is one of your interests, not a view to hold."
                 }
             }
         )
@@ -114,7 +118,7 @@ extension SwiftToolDispatcher {
                     return "that view is still a proposal; you are not holding it."
                 case .retired:
                     return "that view is already retired."
-                case .held:
+                case .held, .opinion, .interest:
                     return "that view could not be released."
                 }
             }
@@ -165,7 +169,7 @@ extension SwiftToolDispatcher {
             return Self.standingViewRefusal(
                 tool: tool,
                 reason: "missing_view_id",
-                spoken: "\(tool): name the view by its view_id, from inner_state.")
+                spoken: "\(tool): name the view by its view_id, from app mind.inner_state.")
         }
         guard let id = UUID(uuidString: raw) else {
             return Self.standingViewRefusal(
@@ -184,12 +188,21 @@ extension SwiftToolDispatcher {
         }
 
         let transition = await apply(mind, id, seat)
-        guard let resolved = transition.view, resolved.status == expected else {
-            let landed = before.first(where: { $0.id == id })?.status ?? current.status
-            return Self.standingViewRefusal(
+        guard let resolved = transition.view, !transition.conflict, resolved.status == expected else {
+            // Phase 5 B0: refused with the value the view holds NOW, not the
+            // one read before the call — another conversation may have moved
+            // it in between, and that one's change stands.
+            let landed = transition.view?.status ?? current.status
+            var refusal = Self.standingViewRefusal(
                 tool: tool,
-                reason: "wrong_status",
+                reason: transition.conflict ? "conflict" : "wrong_status",
                 spoken: "\(tool): \(wrongStatus(landed))")
+            if case .object(var fields) = refusal {
+                fields["view_id"] = .string(id.uuidString)
+                fields["view_status"] = .string(landed.rawValue)
+                refusal = .object(fields)
+            }
+            return refusal
         }
         // 2026-09-06: the status above is the in-memory one, which cannot see a
         // store write that failed. Reporting ok there told her a view was let go

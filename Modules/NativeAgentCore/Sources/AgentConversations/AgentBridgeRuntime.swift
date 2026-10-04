@@ -48,10 +48,6 @@ public enum AgentBridgeRuntime {
         helperURL(named: "codex_thread_wakeup.js", override: override, dataRoot: dataRoot)
     }
 
-    public static func claudeHelperURL(override: URL? = nil, dataRoot: URL) -> URL? {
-        helperURL(named: "claude_thread_wakeup.js", override: override, dataRoot: dataRoot)
-    }
-
     public static func ompHelperURL(override: URL? = nil, dataRoot: URL) -> URL? {
         helperURL(named: "omp_thread_wakeup.js", override: override, dataRoot: dataRoot)
     }

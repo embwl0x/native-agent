@@ -441,15 +441,11 @@ enum TodayDreamDigest {
 /// main actor because two of the four readers touch the file system.
 struct TodaySnapshot: Sendable, Equatable {
     var loaded = false
-    /// Moments staged for her review, still pending. A count only — the
-    /// moments themselves are hers to read WITH him, in the review flow.
-    var pendingMoments = 0
     /// One folded row: "I kept six moments today", opening onto the quotes.
     var kept: TodayRow?
     var dream: TodayRow?
     var facing: TodayRow?
-    /// Tonight's dream, a day on from the last one. The night is the most
-    /// interesting thing I do; it is always ahead.
+    /// The enabled dream scheduler's next due time.
     var nextDream: TodayRow?
     var recollection: TodayRow?
     /// A lane that could not be READ, as opposed to a lane that was read and
@@ -482,19 +478,13 @@ struct TodaySnapshot: Sendable, Equatable {
         dreamMarkdown: String?,
         dreamAt: Date?,
         dreamDate: String? = nil,
+        dreamEnabled: Bool,
+        nextDreamAt: Date?,
         now: Date
     ) async -> TodaySnapshot {
         var snapshot = TodaySnapshot()
         snapshot.loaded = true
         let calendar = Calendar.current
-
-        // ── Moments awaiting her review ──────────────────────────────────
-        do {
-            snapshot.pendingMoments = try await SwiftNativeMemoryV2.shared
-                .listProposals(status: "pending").count
-        } catch {
-            snapshot.memoryUnreadable = true
-        }
 
         // ── Moments she kept, today — ONE row, folded ────────────────────
         do {
@@ -547,7 +537,7 @@ struct TodaySnapshot: Sendable, Equatable {
         }
         // The chip's day word comes from this date (TodayAhead), never from
         // how soon it is.
-        if let dreamAt, let next = calendar.date(byAdding: .day, value: 1, to: dreamAt), next > now {
+        if dreamEnabled, let next = nextDreamAt {
             snapshot.nextDream = TodayRow(id: "nextDream", title: "I'll dream", line: "", at: next)
         }
 
@@ -555,12 +545,9 @@ struct TodaySnapshot: Sendable, Equatable {
         if let toward = await NativeAgentEngine.live.cognitionView.towardRead() {
             let label = TodayWords.capitalizedFirst(TodayWords.line(toward.displayLabel))
             if label.lowercased().contains("dream") {
-                snapshot.facing = TodayRow(
-                    id: "facingDream",
-                    title: "I'll dream",
-                    line: "",
-                    at: toward.dueAt
-                )
+                if dreamEnabled, let nextDreamAt {
+                    snapshot.facing = TodayRow(id: "facingDream", title: "I'll dream", line: "", at: nextDreamAt)
+                }
             } else if !label.isEmpty, label.split(separator: " ").count > 1 {
                 snapshot.facing = TodayRow(
                     id: "facing",
@@ -572,7 +559,7 @@ struct TodaySnapshot: Sendable, Equatable {
             }
         }
 
-        // ── I wrote up the night ─────────────────────────────────────────
+        // ── Conversation recollection ────────────────────────────────────
         let dataRoot = PersistenceCore.defaultDataRoot()
         let scanned: [ChatSessionRecollection] = recollections ?? sessionIDs
             .prefix(TodayMetrics.sessionsScanned)
@@ -587,8 +574,8 @@ struct TodaySnapshot: Sendable, Equatable {
             if !TodayWords.firstSentence(newest.text).isEmpty {
                 snapshot.recollection = TodayRow(
                     id: "recollection:\(newest.rowId ?? newest.sessionId)",
-                    title: "I wrote up the night",
-                    line: "The day, and where we stand.",
+                    title: "I wrote a conversation recollection",
+                    line: "A summary of earlier conversation.",
                     at: at
                 )
             }
@@ -601,14 +588,6 @@ struct TodaySnapshot: Sendable, Equatable {
 // MARK: - Waiting-for-you copy
 
 enum TodayWaitingCopy {
-    /// The moments row's own sentence. Nil when nothing is pending.
-    static func momentsLine(_ count: Int) -> String? {
-        guard count > 0 else { return nil }
-        let noun = count == 1 ? "memory" : "memories"
-        let verb = count == 1 ? "is" : "are"
-        return "\(TodayWords.spelled(count)) \(noun) I'd like to keep \(verb) waiting for you to read."
-    }
-
     /// An approval's name in plain words. A skill proposal's own title is a
     /// tool sequence ("workspace → workspace"); that is not a name.
     static func approvalTitle(_ approval: ApprovalRecord) -> String {
@@ -618,22 +597,19 @@ enum TodayWaitingCopy {
 
 // MARK: - Waiting on you, defined once
 
-/// "Waiting on you" — ONE definition, read by the Today and Desk headers alike
-/// (Agent, 2026-09-23: the two pages contradicted each other). Something that
-/// needs his decision or action: a pending approval, a memory to review, or a
-/// Desk item waiting on him. Failures and notices are never in it.
+/// "Waiting on you" — the Desk's Needs you count (`AppModel.ownerWaitingCount`,
+/// OwnerAttentionPolicy through WorkOverviewRead), so Today and the Desk say
+/// the same number (Agent, 2026-09-23: the two pages contradicted each other).
+/// The card names the approvals itself; the rest wait on the Desk. Memories
+/// she would like to keep are hers (User, 2026-10-01), on the Memories page.
 @MainActor
 enum WaitingOnYou {
     static func approvals(_ appModel: AppModel) -> [ApprovalRecord] {
         appModel.engine.approvals.records.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }
     }
 
-    static func memories(_ appModel: AppModel) -> Int { appModel.engine.memory.proposals.count }
-
-    static func deskItems(_ items: [DeskItem]) -> [DeskItem] { DeskPageContent.waitingOnOwner(items) }
-
-    static func count(_ appModel: AppModel, deskItems items: [DeskItem]) -> Int {
-        approvals(appModel).count + memories(appModel) + deskItems(items).count
+    static func onDesk(_ appModel: AppModel) -> Int {
+        max(0, (appModel.ownerWaitingCount ?? 0) - approvals(appModel).count)
     }
 }
 
@@ -711,9 +687,6 @@ struct TodayView: View {
     @State private var openedNote: InboxItemRecord?
     @State private var noteFlight = InboxRowActionFlight()
     @State private var earlierOpen = false
-    /// The Desk board, for the one shared "waiting on you" count.
-    @State private var deskItems: [DeskItem] = []
-    @State private var deskUnreadable = false
     /// The full queue a route (⌘⇧A, ⌘⇧I, a notification) or the quiet line
     /// at the foot of the page opened.
     @State private var sheet: ActivitySection?
@@ -728,10 +701,8 @@ struct TodayView: View {
 
                 if hasWaiting {
                     TodayWaitingCard(
-                        momentsLine: TodayWaitingCopy.momentsLine(WaitingOnYou.memories(appModel)),
-                        onReadMoments: openMomentReview,
                         approvals: WaitingOnYou.approvals(appModel),
-                        deskCount: WaitingOnYou.deskItems(deskItems).count,
+                        deskCount: WaitingOnYou.onDesk(appModel),
                         onOpenApprovals: { sheet = .approvals }
                     )
                 }
@@ -868,11 +839,6 @@ struct TodayView: View {
             guard !quietOffscreenRead else { return }
             sheet = nil
         }
-        .onChange(of: snapshot.pendingMoments, initial: true) { _, count in
-            // Nobody is looking at this copy, so it has cleared nothing.
-            guard !quietOffscreenRead else { return }
-            appModel.todayWaitingMemories = count
-        }
         // Queue and memory changes share one coalesced refresh, re-armed
         // whenever the window comes back to the front.
         .liveTask(id: scenePhase) {
@@ -883,6 +849,8 @@ struct TodayView: View {
                 root.appendingPathComponent("notifications/inbox.jsonl"),
                 root.appendingPathComponent("memory/memory.sqlite"),
                 root.appendingPathComponent("memory/memory.sqlite-wal"),
+                root.appendingPathComponent("trust/policy.json"),
+                root.appendingPathComponent("scheduler/jobs.json"),
             ]) {
                 // The Activity queues (approvals + notifications) are AppModel's,
                 // and this page is now their only landing. Reuse the existing
@@ -957,9 +925,9 @@ struct TodayView: View {
         default: day = "I've had a full \(part)."
         }
         // A store that would not open cannot vouch for "nothing".
-        let waiting = WaitingOnYou.count(appModel, deskItems: deskItems)
+        guard let waiting = appModel.ownerWaitingCount else { return day }
         if waiting == 0 {
-            return snapshot.memoryUnreadable || deskUnreadable ? day : "\(day) Nothing is waiting on you."
+            return snapshot.memoryUnreadable ? day : "\(day) Nothing is waiting on you."
         }
         let things = waiting == 1 ? "thing is" : "things are"
         return "\(day) \(DeskPageWords.spelled(waiting)) \(things) waiting on you."
@@ -1012,13 +980,7 @@ struct TodayView: View {
     }
 
     private var hasWaiting: Bool {
-        WaitingOnYou.count(appModel, deskItems: deskItems) > 0
-    }
-
-    /// The Memories page's Pending tab IS the moment review. Same coordinator
-    /// request the classic Activity page's "Memory Proposals" row makes.
-    private func openMomentReview() {
-        _ = NativeAgentAppCoordinator.shared.request(.activity(.memoryProposals))
+        (appModel.ownerWaitingCount ?? 0) > 0
     }
 
     // MARK: what I did today
@@ -1265,6 +1227,16 @@ struct TodayView: View {
         let entry = diary?.entries.first
         let markdown = entry?.text
         let dreamAt = TodayWords.parseTimestamp(entry?.modifiedAt)
+        let dreamEnabled = await appModel.engine.cognitionView.dreamEnabled()
+        var nextDreamAt: Date?
+        if dreamEnabled {
+            switch await appModel.engine.desk.jobsFeed() {
+            case .current(let jobs), .partial(let jobs, _):
+                nextDreamAt = jobs.filter { $0.kind == "dream" && $0.enabled }
+                    .compactMap { TodayWords.parseTimestamp($0.nextRunAt) }.min()
+            case .sourceAbsent, .unavailable: break
+            }
+        }
         dreamUnavailable = diary == nil || (diary?.unreadableEntries ?? 0) > 0
             || (entry != nil && (markdown?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true))
         var loaded: [String: [ChatMessage]] = [:]
@@ -1279,19 +1251,16 @@ struct TodayView: View {
             }
         }
         collaborationMessages = loaded
-        // The same board read the Desk page takes, for the shared count.
-        do {
-            deskItems = try await SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot()).liveState().items
-            deskUnreadable = false
-        } catch {
-            deskUnreadable = true
-        }
+        // The Desk's own overview, for the shared count.
+        await appModel.publishWorkStatus()
         snapshot = await TodaySnapshot.load(
             sessionIDs: Array(sessionIDs),
             recollections: recollections,
             dreamMarkdown: markdown,
             dreamAt: dreamAt,
             dreamDate: entry?.date,
+            dreamEnabled: dreamEnabled,
+            nextDreamAt: nextDreamAt,
             now: Date()
         )
     }
@@ -1373,8 +1342,6 @@ struct TodayAhead: View {
 /// The one card that exists only when something is actually waiting on him.
 /// It NAMES each thing and carries the action beside it.
 struct TodayWaitingCard: View {
-    let momentsLine: String?
-    let onReadMoments: () -> Void
     let approvals: [ApprovalRecord]
     /// Desk items waiting on him; one row that opens the Desk.
     var deskCount = 0
@@ -1385,24 +1352,6 @@ struct TodayWaitingCard: View {
         VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
             AliveEyebrow("Waiting for you")
             AliveGroupCard(waiting: true) {
-                if let momentsLine {
-                    HStack(alignment: .center, spacing: 12) {
-                        AliveWaitingDot()
-                        Text(TodayWords.bounded(momentsLine, limit: 80))
-                            .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(NativeAgentShell.text)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .frame(height: TodayMetrics.rowContentHeightSingle)
-                        Spacer(minLength: 12)
-                        Button(momentsLine.hasPrefix("One ") ? "Read it with me" : "Read them with me", action: onReadMoments)
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .hazeTinted(.button)
-                            .accessibilityIdentifier("today.waiting.read-moments")
-                    }
-                }
-
                 ForEach(approvals) { approval in
                     TodayApprovalRow(approval: approval, onShowFull: onOpenApprovals)
                 }

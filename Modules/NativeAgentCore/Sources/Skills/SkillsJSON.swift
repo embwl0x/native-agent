@@ -5,6 +5,24 @@ import PersistenceCore
 // MARK: - Skills registry shaping (mirror Runtime.list_skills)
 
 public enum SkillsRegistry {
+    static func decode(_ raw: JSONValue) throws -> [JSONValue] {
+        let rows: [JSONValue]
+        switch raw {
+        case .array(let values): rows = values
+        case .object(let object):
+            guard case .array(let values)? = object["skills"] else {
+                throw SkillsError.invalidRegistry("skill registry is not an array or {skills:[...]}")
+            }
+            rows = values
+        default:
+            throw SkillsError.invalidRegistry("skill registry is not an array or {skills:[...]}")
+        }
+        guard rows.allSatisfy({ $0.objectValue != nil }) else {
+            throw SkillsError.invalidRegistry("skill registry contains a non-object row")
+        }
+        return rows
+    }
+
     /// Sort key: `str(item.get("updatedAt") or item.get("createdAt") or "")`.
     /// Empty string sorts last in DESC order. Mirrors Python's `or` truthiness
     /// across non-string scalars exactly (a truthy numeric/bool timestamp sorts
@@ -113,6 +131,10 @@ extension JSONValue {
 // MARK: - Python-semantics helpers for the mutation port
 
 enum SkillMutation {
+    /// The agent's marks on a skill row (skill_manage): who disabled it,
+    /// when she moved it to the trash, and why upkeep retired it.
+    static let agentMarks = ["disabledBy", "trashedAt", "retired"]
+
     /// `urllib.parse.unquote` — percent-decode using UTF-8 (matches Python's
     /// default). Leaves a string with no `%` sequences untouched.
     static func unquote(_ s: String) -> String {
@@ -277,4 +299,3 @@ enum SkillMutation {
         return zulu
     }
 }
-

@@ -17,6 +17,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     case scheduler
     case activity
     case advanced
+    case work
 
     public var statusKey: String {
         "mobile_snapshot_\(rawValue)_v1"
@@ -27,6 +28,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
         case .core:
             [
                 "trust_policy.json",
+                "mac_integration_permissions.json",
                 "personality.json",
                 "health.json",
                 "organism_living_status.json",
@@ -61,10 +63,13 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
             // desk_bounds.json rides with the rows it describes: the phone must
             // never be in a position to guess what the bounds dropped.
             // desk_details.json rides with the board too: the reading copies
-            // are only trustworthy beside the rows they belong to.
-            ["desk.json", "desk_bounds.json", "desk_details.json"]
+            // are only trustworthy beside the rows they belong to. The overview
+            // rides here only: it is built from the same Desk read as desk.json.
+            ["desk.json", "desk_bounds.json", "desk_details.json", "work_overview.json"]
         case .scheduler:
             ["scheduler.json"]
+        case .work:
+            ["work_activity.json"]
         case .activity:
             [
                 "workshop_tasks.json",
@@ -100,7 +105,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     public var trimmableFilenames: [String] {
         switch self {
         case .desk: ["desk_details.json"]
-        case .core, .catalog, .chat, .scheduler, .activity, .advanced: []
+        case .core, .catalog, .chat, .scheduler, .activity, .advanced, .work: []
         }
     }
 
@@ -202,16 +207,13 @@ public enum NAMobileSnapshotStatusCodec {
         }
         let decoded = try JSONDecoder().decode(NAMobileSnapshotPayload.self, from: payload)
         let allowed = Set(expectedGroup.filenames)
-        let known = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames))
         guard !decoded.files.isEmpty,
-              decoded.files.keys.allSatisfy({
-                  (!known.contains($0) || allowed.contains($0))
-                      && URL(fileURLWithPath: $0).lastPathComponent == $0
-              }) else {
+              decoded.files.keys.allSatisfy({ URL(fileURLWithPath: $0).lastPathComponent == $0 }) else {
             throw DeviceSyncError.underlying(message: "mobile snapshot contained an unsupported filename")
         }
-        // New projections may arrive before the phone is upgraded. Ignore
-        // unknown files; known files must still belong to the signed group.
+        // Only the signed group's own files are taken. A file this build does
+        // not know, or one another build carried in a different group (an
+        // older Mac's overview in Activity), is ignored, never written.
         return decoded.files.filter { allowed.contains($0.key) }
     }
 

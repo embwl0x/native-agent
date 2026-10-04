@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 
 // MARK: - One Thread, Many Surfaces — Phase 0 (fences and honest instrumentation)
@@ -220,17 +221,19 @@ public enum SessionIdentityLedger {
     }
 
     /// Count `session.identity` rows in `<dataRoot>/turn_traces/<day>.jsonl`
-    /// newer than `now - window`. Reads today's and yesterday's file only —
-    /// a 24h window cannot span more, and an unbounded scan of the feed
-    /// directory is exactly the kind of cost a health check must not carry.
+    /// within `now - window ... now`. Reads each local calendar day intersecting
+    /// the window once, including a third day when a 24h window spans a short
+    /// DST day. It does not scan the feed directory.
     public static func mintTally(
         dataRoot: URL,
         now: Date = Date(),
         window: TimeInterval = 24 * 60 * 60
     ) -> MintTally {
         let dir = dataRoot.appendingPathComponent("turn_traces", isDirectory: true)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone.current
         let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.calendar = calendar
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone.current
         formatter.dateFormat = "yyyy-MM-dd"
@@ -240,9 +243,12 @@ public enum SessionIdentityLedger {
         var total = 0
         var daysRead = 0
 
-        for dayOffset in [0.0, -1.0] {
-            let day = now.addingTimeInterval(dayOffset * 24 * 60 * 60)
+        var day = calendar.startOfDay(for: cutoff)
+        let lastDay = calendar.startOfDay(for: now)
+        while day <= lastDay {
             let path = dir.appendingPathComponent("\(formatter.string(from: day)).jsonl")
+            guard let nextDay = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+            day = nextDay
             guard let raw = try? String(contentsOf: path, encoding: .utf8) else { continue }
             daysRead += 1
             for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
@@ -258,6 +264,7 @@ public enum SessionIdentityLedger {
                       case .string(let ts)? = row["ts"],
                       let stamp = TurnTraceEvent.parseISO8601(ts),
                       stamp >= cutoff,
+                      stamp <= now,
                       case .object(let payload)? = row["payload"]
                 else { continue }
                 total += 1
@@ -272,6 +279,8 @@ public enum SessionIdentityLedger {
     }
 
     public struct FlappingReport: Sendable, Equatable {
+        /// Whether the index decodes as ChatSession rows with nonempty IDs.
+        public let indexReadable: Bool
         /// Live (non-archived) rows in `chat/sessions.json`.
         public let hotSessionCount: Int
         /// Sessions whose index-row `source` disagrees with the source of their
@@ -317,8 +326,10 @@ public enum SessionIdentityLedger {
             mixedSourceSessionCount: Int,
             unreadableSessionCount: Int,
             continuedElsewhereSessionCount: Int = 0,
-            creationUnmeasuredSessionCount: Int = 0
+            creationUnmeasuredSessionCount: Int = 0,
+            indexReadable: Bool = true
         ) {
+            self.indexReadable = indexReadable
             self.hotSessionCount = hotSessionCount
             self.disagreeingSessionIds = disagreeingSessionIds
             self.mixedSourceSessionCount = mixedSourceSessionCount
@@ -342,13 +353,15 @@ public enum SessionIdentityLedger {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
         guard let data = try? Data(contentsOf: sessionsPath),
+              (try? JSONDecoder().decode([ChatSession].self, from: data)) != nil,
               let parsed = try? JSONValue.parse(data),
               case .array(let rows) = parsed else {
             return FlappingReport(
                 hotSessionCount: 0,
                 disagreeingSessionIds: [],
                 mixedSourceSessionCount: 0,
-                unreadableSessionCount: 0
+                unreadableSessionCount: 0,
+                indexReadable: false
             )
         }
 
@@ -359,11 +372,15 @@ public enum SessionIdentityLedger {
         var unreadable = 0
         var scanned = 0
         var creationUnmeasured = 0
+        var indexReadable = true
 
         for row in rows {
             guard case .object(let object) = row,
                   case .string(let id)? = object["id"],
-                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                indexReadable = false
+                continue
+            }
             if case .bool(true)? = object["archived"] { continue }
             hot += 1
             let indexSource: String = {
@@ -472,7 +489,8 @@ public enum SessionIdentityLedger {
             mixedSourceSessionCount: mixed,
             unreadableSessionCount: unreadable,
             continuedElsewhereSessionCount: continuedElsewhere,
-            creationUnmeasuredSessionCount: creationUnmeasured
+            creationUnmeasuredSessionCount: creationUnmeasured,
+            indexReadable: indexReadable
         )
     }
 

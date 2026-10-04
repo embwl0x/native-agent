@@ -24,7 +24,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -60,8 +59,8 @@ extension NativeClient {
         DoctorStatusProjection.readAutoDoctorConfig(dataRoot: dataRoot)
     }
 
-    static func readModelRoutingConfig(dataRoot: URL) -> ModelRoutingConfig {
-        ProvidersFacade.readModelRoutingConfig(dataRoot: dataRoot)
+    static func readModelRoutingConfig(dataRoot: URL) async throws -> ModelRoutingConfig {
+        try await ProvidersFacade.readModelRoutingConfig(dataRoot: dataRoot)
     }
 
     static func stringValue(_ value: Any?) -> String? {

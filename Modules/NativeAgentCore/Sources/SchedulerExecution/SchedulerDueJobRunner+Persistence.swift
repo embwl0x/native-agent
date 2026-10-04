@@ -92,7 +92,7 @@ extension SchedulerDueJobRunner {
                     NSLocalizedDescriptionKey: "claimed scheduler job disappeared before settlement: \(job.id)"
                 ])
             }
-            try await persistence.writeJSON(.array(rows), to: jobsPath)
+            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
             return parkedAttempts
         }
 
@@ -117,7 +117,7 @@ extension SchedulerDueJobRunner {
             let rows = try Self.readJobRowsChecked(at: jobsPath)
             let result = Self.pruneCompletedOneShotRows(rows, now: now)
             guard result.removed > 0 else { return 0 }
-            try await persistence.writeJSON(.array(result.rows), to: jobsPath)
+            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(result.rows), to: jobsPath)
             return result.removed
         }
     }
@@ -258,10 +258,14 @@ extension SchedulerDueJobRunner {
         for row in rows {
             guard case .object(let obj) = row else { continue }
             guard SchedulerJobRuntime.string(obj["source"]) == source else { continue }
+            let diaryDates = Self.notificationRowDiaryDateKeys(obj)
+            if !diaryDates.isEmpty {
+                if diaryDates.contains(dateKey) { return true }
+                continue
+            }
             guard let created = SchedulerJobRuntime.string(obj["created_at"]),
                   let date = Self.parseISODate(created) else { continue }
-            if Self.notificationRowReferencesDate(obj, dateKey: dateKey)
-                || NativeAgentDreamCycleSchedule.runDateKey(date) == dateKey {
+            if NativeAgentDreamCycleSchedule.runDateKey(date) == dateKey {
                 return true
             }
         }
@@ -291,7 +295,7 @@ extension SchedulerDueJobRunner {
                 rows[idx] = .object(obj)
                 break
             }
-            try await persistence.writeJSON(.array(rows), to: jobsPath)
+            try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
         }
     }
 

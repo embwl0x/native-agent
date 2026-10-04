@@ -11,18 +11,6 @@ import PersonaEngine
 import PersistenceCore
 import ProviderRouting
 
-/// A durable, single-review intent. The organism state and the cognition receipt
-/// live in separate stores, so a completed review is rolled forward from this
-/// journal rather than attempting to restore a stale whole-organism snapshot.
-private struct OrganismReflexReviewIntent: Codable, Sendable {
-    let receiptID: UUID
-    let candidateID: String
-    let decision: OrganismReflexReviewDecision
-    let note: String?
-    let reviewedBy: String
-    let source: String
-}
-
 extension NativeCognitionRuntime {
     func startApprovalLifecycleObservationIfNeeded() async {
         guard !isFlushedForTermination, approvalLifecycleObservationTask == nil else { return }
@@ -125,6 +113,19 @@ extension NativeCognitionRuntime {
     func drainFeltResolutionsIntoSubstrate() async {  // internal for actor extensions (move-only Wave C)
         for felt in await organismKernel.drainResolutionFelt() {
             let isRelief = felt.kind == .relief
+            var metadata: [String: JSONValue] = [
+                "feltValence": .double(isRelief
+                    ? min(0.6, 0.2 + 0.5 * felt.magnitude)
+                    : -min(0.6, 0.2 + 0.6 * felt.magnitude)),
+                "feltArousal": .double(isRelief ? 0.15 : 0.45),
+                "resolutionKind": .string(felt.kind.rawValue),
+            ]
+            if let scope = felt.semanticScope {
+                metadata[OrganismSemanticExpectation.mintMetadataKey] = .object([
+                    OrganismSemanticExpectation.sessionField: .string(scope.sessionID),
+                    OrganismSemanticExpectation.turnField: .string(scope.turnID),
+                ])
+            }
             let feltEvent = CognitiveEvent(
                 id: UUID().uuidString,
                 kind: .organismResolutionFelt,
@@ -144,18 +145,11 @@ extension NativeCognitionRuntime {
                     ? "Relief — the \(felt.sourceOrgan) path I was braced for landed fine."
                     : "Disappointment — the \(felt.sourceOrgan) path I was counting on fell through.",
                 importance: 0.65,
-                metadata: [
-                    "feltValence": .double(isRelief
-                        ? min(0.6, 0.2 + 0.5 * felt.magnitude)
-                        : -min(0.6, 0.2 + 0.6 * felt.magnitude)),
-                    "feltArousal": .double(isRelief ? 0.15 : 0.45),
-                    "resolutionKind": .string(felt.kind.rawValue),
-                ]
+                metadata: metadata
             )
             if await substrate.ingestResident(feltEvent) {
                 scheduleDirtyMicrocycle(
-                    reason: "felt_resolution:\(felt.kind.rawValue)",
-                    turnClass: InstalledPhysiologySoakRecorder.physiologyTurnClass(feltEvent.turnKind)
+                    reason: "felt_resolution:\(felt.kind.rawValue)"
                 )
             }
         }
@@ -183,8 +177,7 @@ extension NativeCognitionRuntime {
         for event in await substrate.drainRuminationReleaseEvents() {
             if await substrate.ingestResident(event) {
                 scheduleDirtyMicrocycle(
-                    reason: "rumination_release",
-                    turnClass: InstalledPhysiologySoakRecorder.physiologyTurnClass(event.turnKind)
+                    reason: "rumination_release"
                 )
             }
         }
@@ -279,13 +272,26 @@ extension NativeCognitionRuntime {
         return outcome
     }
 
+    func finishAfterTurnReaction(_ event: CognitiveEvent, metadata: [String: JSONValue]) async {
+        if !metadata.isEmpty {
+            var enriched = event
+            enriched.metadata.merge(metadata) { _, new in new }
+            if let signal = CognitiveSomaticSignalAdapter.signal(from: enriched, id: UUID()) {
+                await organismKernel.admitAfterTurnReaction(signal)
+                await persistOrganismContinuity(reason: "after_turn_interpretation")
+            }
+        }
+        cachedBodyRead = nil
+        publishRuntimeChange(reason: "after_turn_interpretation")
+    }
+
     private func ingestPreparedOrganismSignalAfterBootstrap(
         _ signal: SomaticSignal,
         persistSynchronously: Bool,
         prewarmContext: Bool
     ) async {
         let kind = signal.kind
-        await organismKernel.ingest(signal)
+        await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignalAdapter.movesFeelings(kind))
         await drainFeltResolutionsIntoSubstrate()
         cachedBodyRead = nil
         if persistSynchronously {
@@ -481,180 +487,6 @@ extension NativeCognitionRuntime {
         return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
     }
 
-    public func reviewOrganismReflexCandidate(
-        id: String,
-        decision: OrganismReflexReviewDecision,
-        note: String? = nil,
-        reviewedBy: String = "operator",
-        source: String = "runtime"
-    ) async -> OrganismSnapshot {
-        await applyOrganismReflexReview(
-            id: id,
-            decision: decision,
-            note: note,
-            reviewedBy: reviewedBy,
-            source: source
-        ).snapshot
-    }
-
-    public func applyOrganismReflexReview(
-        id: String,
-        decision: OrganismReflexReviewDecision,
-        note: String? = nil,
-        reviewedBy: String,
-        source: String
-    ) async -> OrganismReflexReviewApplyOutcome {
-        let normalizedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        if organismReflexReviewTransactionInFlight || organismReflexReviewingIDs.contains(normalizedID) {
-            let snapshot = await organismKernel.snapshot()
-            return OrganismReflexReviewApplyOutcome(
-                status: .reviewInFlight,
-                snapshot: snapshot,
-                candidate: snapshot.reflexCandidates.first { $0.id == normalizedID },
-                receipt: nil,
-                error: "That reflex review is already being saved."
-            )
-        }
-        organismReflexReviewingIDs.insert(normalizedID)
-        organismReflexReviewTransactionInFlight = true
-        defer {
-            organismReflexReviewingIDs.remove(normalizedID)
-            organismReflexReviewTransactionInFlight = false
-        }
-        if FileManager.default.fileExists(atPath: organismReflexReviewIntentURL.path) {
-            await recoverPendingOrganismReflexReviewIfNeeded()
-            if FileManager.default.fileExists(atPath: organismReflexReviewIntentURL.path) {
-                let snapshot = await organismKernel.snapshot()
-                return OrganismReflexReviewApplyOutcome(
-                    status: .persistenceFailed,
-                    snapshot: snapshot,
-                    candidate: snapshot.reflexCandidates.first { $0.id == normalizedID },
-                    receipt: nil,
-                    error: "A prior reflex review is still awaiting durable recovery."
-                )
-            }
-        }
-        let beforeSnapshot = await organismKernel.snapshot()
-        guard beforeSnapshot.enabled else {
-            return OrganismReflexReviewApplyOutcome(
-                status: .organismDisabled,
-                snapshot: beforeSnapshot,
-                candidate: nil,
-                receipt: nil,
-                error: "The organism kernel is disabled."
-            )
-        }
-        guard let candidateBefore = beforeSnapshot.reflexCandidates.first(where: { $0.id == normalizedID }) else {
-            return OrganismReflexReviewApplyOutcome(
-                status: .candidateNotFound,
-                snapshot: beforeSnapshot,
-                candidate: nil,
-                receipt: nil,
-                error: "No active reflex candidate matched \(normalizedID)."
-            )
-        }
-        guard candidateBefore.reviewRequired else {
-            return OrganismReflexReviewApplyOutcome(
-                status: .notAwaitingReview,
-                snapshot: beforeSnapshot,
-                candidate: candidateBefore,
-                receipt: nil,
-                error: "That reflex candidate has already been reviewed."
-            )
-        }
-        guard decision != .approve || candidateBefore.trustClass == .lowRisk else {
-            return OrganismReflexReviewApplyOutcome(
-                status: .approvalRequiresLowRisk,
-                snapshot: beforeSnapshot,
-                candidate: candidateBefore,
-                receipt: nil,
-                error: "Only low-risk reflex candidates can be approved."
-            )
-        }
-        // The journal names a candidate by ID, so make the already-observed
-        // candidate durable before allowing an intent that must survive a
-        // process death. This is a precondition write, not a rollback point.
-        guard await persistOrganismContinuity(reason: "reflex_prepare") else {
-            return OrganismReflexReviewApplyOutcome(
-                status: .persistenceFailed,
-                snapshot: await organismKernel.snapshot(),
-                candidate: candidateBefore,
-                receipt: nil,
-                error: "The reflex candidate could not be prepared for durable review."
-            )
-        }
-        let intent = OrganismReflexReviewIntent(
-            receiptID: UUID(),
-            candidateID: normalizedID,
-            decision: decision,
-            note: note,
-            reviewedBy: reviewedBy,
-            source: source
-        )
-        do {
-            try await writeOrganismReflexReviewIntent(intent)
-        } catch {
-            return OrganismReflexReviewApplyOutcome(
-                status: .persistenceFailed,
-                snapshot: beforeSnapshot,
-                candidate: candidateBefore,
-                receipt: nil,
-                error: "The reflex review journal could not be saved: \(error.localizedDescription)"
-            )
-        }
-        guard let application = await organismKernel.reviewReflexCandidate(
-            id: normalizedID,
-            decision: decision,
-            note: note,
-            reviewedBy: reviewedBy,
-            source: source,
-            receiptID: intent.receiptID.uuidString
-        ) else {
-            try? removeOrganismReflexReviewIntent()
-            return OrganismReflexReviewApplyOutcome(
-                status: .candidateNotFound,
-                snapshot: beforeSnapshot,
-                candidate: nil,
-                receipt: nil,
-                error: "The reflex candidate is no longer reviewable."
-            )
-        }
-
-        // The cognitive receipt is the authority that makes this operator
-        // decision auditable, so it is the first committed half after intent.
-        // If it refuses, the journal remains and no review state is committed.
-        do {
-            try await recordOrganismReflexReviewReceipt(application.receipt, receiptID: intent.receiptID)
-        } catch {
-            return OrganismReflexReviewApplyOutcome(
-                status: .persistenceFailed,
-                snapshot: await organismKernel.snapshot(),
-                candidate: candidateBefore,
-                receipt: nil,
-                error: "The reflex review is journaled and will finish after receipt persistence recovers."
-            )
-        }
-        let persisted = await persistOrganismContinuity(reason: "reflex:\(decision.rawValue)")
-        guard persisted else {
-            return OrganismReflexReviewApplyOutcome(
-                status: .persistenceFailed,
-                snapshot: await organismKernel.snapshot(),
-                candidate: candidateBefore,
-                receipt: nil,
-                error: "The reflex review is journaled and will finish after organism persistence recovers."
-            )
-        }
-        try? removeOrganismReflexReviewIntent()
-        publishRuntimeChange(reason: "organism:reflex_review")
-        return OrganismReflexReviewApplyOutcome(
-            status: .applied,
-            snapshot: await organismKernel.snapshot(),
-            candidate: application.candidate,
-            receipt: application.receipt,
-            error: nil
-        )
-    }
-
     struct OrganismBodySample {  // internal for actor extensions (move-only Wave C)
         let read: OrganismBodyRead
         let integratesChemistry: Bool
@@ -745,12 +577,10 @@ extension NativeCognitionRuntime {
             )
             integratesChemistry = false
         } else {
-            if organismDebugBodyOverride != nil {
-                organismDebugBodyOverride = nil
-                integratesChemistry = false
-            } else {
-                integratesChemistry = true
-            }
+            organismDebugBodyOverride = nil
+            // Phase 5 E3: provider, tool, memory, phone and thermal facts are
+            // health for the ops posture, never a feeling.
+            integratesChemistry = false
             read = liveRead
         }
         return OrganismBodySample(read: read, integratesChemistry: integratesChemistry)
@@ -771,121 +601,9 @@ extension NativeCognitionRuntime {
             .appendingPathComponent("organism_state.json")
     }
 
-    private var organismReflexReviewIntentURL: URL {
-        dataRoot
-            .appendingPathComponent("cognition", isDirectory: true)
-            .appendingPathComponent("organism_reflex_review_pending.json")
-    }
-
-    private func writeOrganismReflexReviewIntent(
-        _ intent: OrganismReflexReviewIntent
-    ) async throws {
-        try await Self.writeOrganismReflexReviewIntent(intent, to: organismReflexReviewIntentURL)
-    }
-
-    private func removeOrganismReflexReviewIntent() throws {
-        let url = organismReflexReviewIntentURL
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try FileManager.default.removeItem(at: url)
-    }
-
-    /// Completes an interrupted two-store reflex review. It never restores a
-    /// whole prior organism state: regular sensory ingestion may have advanced
-    /// while a disk operation was suspended, and the journal's receipt ID makes
-    /// applying this one transition and recording its cognitive receipt safe to
-    /// repeat across relaunches.
-    func recoverPendingOrganismReflexReviewIfNeeded() async {
-        let url = organismReflexReviewIntentURL
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let intent: OrganismReflexReviewIntent
-        do {
-            let data = try Data(contentsOf: url)
-            intent = try JSONDecoder().decode(OrganismReflexReviewIntent.self, from: data)
-        } catch {
-            await substrate.recordReceipt(
-                kind: "organism.reflex_review_recovery_failed",
-                payload: .object(["error": .string(String(describing: error))])
-            )
-            return
-        }
-
-        let receiptID = intent.receiptID.uuidString
-        var persistentState = await organismKernel.exportPersistentState()
-        var receipt = persistentState?.reflexState.reviewReceipts.first { $0.id == receiptID }
-        if receipt == nil {
-            guard let application = await organismKernel.reviewReflexCandidate(
-                id: intent.candidateID,
-                decision: intent.decision,
-                note: intent.note,
-                reviewedBy: intent.reviewedBy,
-                source: intent.source,
-                receiptID: receiptID
-            ) else {
-                await substrate.recordReceipt(
-                    kind: "organism.reflex_review_recovery_failed",
-                    payload: .object([
-                        "candidateId": .string(intent.candidateID),
-                        "receiptId": .string(receiptID),
-                        "reason": .string("candidate_not_reviewable"),
-                    ])
-                )
-                return
-            }
-            guard await persistOrganismContinuity(reason: "reflex_recovery:\(intent.decision.rawValue)") else {
-                return
-            }
-            persistentState = await organismKernel.exportPersistentState()
-            receipt = persistentState?.reflexState.reviewReceipts.first { $0.id == receiptID }
-            guard receipt != nil else { return }
-            _ = application
-        }
-        guard let receipt else { return }
-        do {
-            try await recordOrganismReflexReviewReceipt(receipt, receiptID: intent.receiptID)
-            try? removeOrganismReflexReviewIntent()
-            publishRuntimeChange(reason: "organism:reflex_review_recovered")
-        } catch {
-            // Keep the intent. The exact receipt ID turns the next launch into
-            // an idempotent retry rather than another review transition.
-        }
-    }
-
-    private func recordOrganismReflexReviewReceipt(
-        _ receipt: OrganismReflexReviewReceipt,
-        receiptID: UUID
-    ) async throws {
-        let payload: JSONValue = .object([
-            "receiptId": .string(receipt.id),
-            "candidateId": .string(receipt.candidateID),
-            "decision": .string(receipt.decision.rawValue),
-            "reviewedBy": .string(receipt.reviewedBy),
-            "source": .string(receipt.source),
-            "trustClass": .string(receipt.trustClass.rawValue),
-            "autoActivationAllowed": .bool(receipt.autoActivationAllowed),
-            "permanentlyDeliberate": .bool(receipt.permanentlyDeliberate),
-        ])
-        if let organismReflexReceiptRecorderOverride {
-            try await organismReflexReceiptRecorderOverride(
-                receiptID,
-                "organism.reflex_review",
-                payload
-            )
-        } else {
-            try await substrate.recordReceiptChecked(
-                kind: "organism.reflex_review",
-                payload: payload,
-                id: receiptID
-            )
-        }
-    }
-
     func restoreOrganismContinuityIfAvailable() async {  // internal for actor extensions (move-only Wave C)
         guard !organismContinuityRestored else { return }
         organismContinuityRestored = true
-        // Same continuity lane, once per launch: the studio lane's quiet-outcome
-        // ledger. Restored BEFORE the organism-state guard below so a first boot
-        // with no organism_state.json still picks it up.
-        restoreStudioEncounterStateIfAvailable()
         let url = organismPersistentStateURL
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         do {
@@ -952,7 +670,7 @@ extension NativeCognitionRuntime {
         }
         return await withCheckedContinuation { continuation in
             organismPersistenceWaiters[generation, default: []].append(continuation)
-            // An awaited save (quit, reflex, proof flush) never waits out the debounce.
+            // An awaited save (quit, proof flush) never waits out the debounce.
             organismPersistenceDebounceTask?.cancel()
         }
     }
@@ -1048,20 +766,6 @@ extension NativeCognitionRuntime {
         }.value
     }
 
-    private nonisolated static func writeOrganismReflexReviewIntent(
-        _ intent: OrganismReflexReviewIntent,
-        to url: URL
-    ) async throws {
-        try await Task.detached(priority: .utility) {
-            try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let data = try JSONEncoder().encode(intent)
-            try data.write(to: url, options: .atomic)
-        }.value
-    }
-
     nonisolated static func makeOrganismBodyRead(
         dataRoot: URL,
         now: Date = Date(),
@@ -1101,7 +805,7 @@ extension NativeCognitionRuntime {
         let approvalPathReading = makeApprovalPathReading(dataRoot: dataRoot, now: now)
         let resourcePressureReading = currentResourcePressureReading(dataRoot: dataRoot, now: now)
 
-        let providersAvailable = hasAnyUsableProvider(dataRoot: dataRoot)
+        let providersAvailable = SwiftNativeProviderRouting(dataRoot: dataRoot).hasUsableCredentials()
         return OrganismBodyRead(
             macAwake: true,
             iPhoneReachable: peerPresenceBelief.compatibilityReachable,
@@ -1532,53 +1236,6 @@ extension NativeCognitionRuntime {
                 ),
             ]
         )
-    }
-
-    // G-M3: relocated from +ProviderEvidence into the extension that owns its
-    // only caller (assembleOrganismProviderEvidence below); now file-private.
-    private nonisolated static func hasAnyUsableProvider(dataRoot: URL) -> Bool {
-        let providers = dataRoot.appendingPathComponent("providers", isDirectory: true)
-        let credentialFiles = [
-            "anthropic_oauth_direct.json",
-            "anthropic.json",
-            "openai_oauth_direct.json",
-            "openai.json",
-            "openrouter.json",
-            "xai_oauth_direct.json",
-        ]
-        if credentialFiles.contains(where: { hasReadableContent(providers.appendingPathComponent($0)) }) {
-            return true
-        }
-
-        let rootScopedCodexAuth = dataRoot
-            .appendingPathComponent("codex_home", isDirectory: true)
-            .appendingPathComponent("auth.json")
-        if hasReadableContent(rootScopedCodexAuth) { return true }
-
-        // Process-global credentials are part of the installed personal app
-        // body only. Tests and secondary runtimes with injected roots must not
-        // silently inherit ~/.codex or a globally resolvable
-        // Codex binary and then report a provider that their root does not own.
-        guard dataRoot.standardizedFileURL
-            == PersistenceCore.defaultDataRoot().standardizedFileURL else {
-            return false
-        }
-
-        // The shared CLI session counts only with recorded adoption consent
-        // AND real usable tokens: an unconsented (or token-less) ~/.codex
-        // file must not make the body report a provider the runtime will
-        // fail closed on (gpt-5.5 review 2026-08-06).
-        if OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: dataRoot) == .allowed {
-            let homeCodexAuth = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".codex", isDirectory: true)
-                .appendingPathComponent("auth.json")
-            if OpenAIOAuthDirectAdapter.hasUsableTokens(at: homeCodexAuth) { return true }
-        }
-
-        // A resolvable codex binary with no auth token cannot serve a turn;
-        // counting it here made the organism report providers it cannot use
-        // (same defect as the first-run readiness copy, fixed in lockstep).
-        return false
     }
 
     nonisolated static func hasReadableContent(_ url: URL) -> Bool {  // internal for actor extensions (move-only Wave C)

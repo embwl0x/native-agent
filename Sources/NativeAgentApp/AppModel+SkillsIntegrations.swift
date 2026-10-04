@@ -23,7 +23,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -182,15 +181,17 @@ extension AppModel {
         isLoadingSkillManifests = false
     }
 
+    /// `reviewSheet: false` is the agent's `skill_manage enable`, which also
+    /// turns a disabled skill back on; the sheet installs drafts only.
     @MainActor
     @discardableResult
-    func installReviewedSkill(_ info: SkillInfo) async -> SkillReviewInstallOutcome {
-        if let refusal = SkillReviewInstallPresentation.preflight(for: info) {
+    func installReviewedSkill(_ info: SkillInfo, reviewSheet: Bool = true) async -> SkillReviewInstallOutcome {
+        if reviewSheet, let refusal = SkillReviewInstallPresentation.preflight(for: info) {
             return .refused(detail: refusal)
         }
         let requestedName = info.registry.name
         do {
-            try await client.enableSkill(name: requestedName)
+            try await client.enableSkill(name: requestedName, reviewedDigest: info.scriptDigest)
             await loadSkillManifests()
             let key = requestedName.lowercased()
             let recovered = skillManifests.first { info in
@@ -247,12 +248,9 @@ extension AppModel {
     }
 
     @MainActor
-    func quarantineTool(_ tool: ToolRecord) async {
+    func quarantineTool(_ tool: ToolRecord, reason: String = "User quarantined from NativeAgent UI.") async {
         do {
-            let updated = try await client.quarantineTool(
-                id: tool.id,
-                reason: "User quarantined from NativeAgent UI."
-            )
+            let updated = try await client.quarantineTool(id: tool.id, reason: reason)
             let reloaded = try await engine.tools.listAuthored()
             guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
                   confirmed.status == "quarantined" else {
@@ -294,21 +292,6 @@ extension AppModel {
             recordToolOperationStatus("Tool activated", outcome: .succeeded)
         } catch {
             recordToolOperationStatus("Tool activation failed: \(error.localizedDescription)", outcome: .failed)
-        }
-    }
-
-    @MainActor
-    func runEval() async {
-        do {
-            _ = try await client.runEval(name: "NativeAgent operator workflow eval")
-            disabledFeature = nil
-            statusText = "Eval finished"
-            await refreshAll()
-        } catch let err as NSError where AppModel.isNotImplemented(err) {
-            disabledFeature = AppModel.disabledBadge(for: "Eval run", error: err)
-            statusText = disabledFeature ?? "Eval disabled"
-        } catch {
-            statusText = "Eval failed: \(error.localizedDescription)"
         }
     }
 
@@ -446,6 +429,7 @@ extension AppModel {
             selected: telegramReasoningEffort
         )
         telegramReasoningEffort = normalizedEffort
+        let submittedEnabled = telegramEnabled
         do {
             try await client.configureTelegram(
                 token: telegramToken,
@@ -454,14 +438,14 @@ extension AppModel {
                 requireMention: telegramRequireMention,
                 model: telegramModel,
                 reasoningEffort: normalizedEffort,
-                enabled: telegramEnabled
+                enabled: submittedEnabled
             )
             telegramToken = ""
             await refreshAll()
             statusText = telegramTokenConfigured ? "Telegram settings saved" : "Telegram settings saved. Add a bot token to enable Telegram."
             let outcome = TelegramSettingsSaveOutcome.saved(
                 tokenConfigured: telegramTokenConfigured,
-                enabled: telegramEnabled,
+                enabled: submittedEnabled,
                 allowlistCount: Set(chats.canonicalIDs + users.canonicalIDs).count
             )
             telegramSettingsSaveOutcome = outcome
@@ -475,7 +459,9 @@ extension AppModel {
     }
 
     @MainActor
-    func clearTelegramToken() async {
+    /// `restartPollLoop` false: the caller restarts it (the door's
+    /// telegram.disconnect, which may run inside a Telegram turn the restart awaits).
+    func clearTelegramToken(restartPollLoop: Bool = true) async {
         isSavingTelegram = true
         statusText = "Clearing Telegram bot token..."
         defer { isSavingTelegram = false }
@@ -488,7 +474,8 @@ extension AppModel {
                 model: telegramModel,
                 reasoningEffort: telegramReasoningEffort,
                 enabled: false,
-                clearToken: true
+                clearToken: true,
+                restartPollLoop: restartPollLoop
             )
             telegramToken = ""
             await refreshAll()

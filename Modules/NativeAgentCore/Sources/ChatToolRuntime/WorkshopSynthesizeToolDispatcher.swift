@@ -23,7 +23,7 @@ import PersistenceCore
 //   read_file / list_dir            — the filesystem reads the step needs
 //   search_chat_history / session_search — prior-conversation lookups
 //   recall_memory / recall_search / search_kg / context_lookup — memory reads
-//   read_skill / list_skills / tool_catalog / list_tools — harmless discovery
+//   read_skill / list_skills — harmless discovery
 //   time_now / agent_introspect / daemon_introspect — read-only introspection
 // Explicitly EXCLUDED: write_file, commit_memory, persona_write/append,
 // every Full-Mac shell/builder/restart tool, mail/messages/notes *send*,
@@ -46,7 +46,6 @@ public struct WorkshopSynthesizeReadOnlyToolDispatcher: ToolDispatchClient {
         "search_chat_history", "session_search", "read_chat_message",
         "recall_memory", "recall_search", "search_kg", "context_lookup",
         "read_skill", "list_skills",
-        "tool_catalog", "list_tools",
         "time_now", "agent_introspect", "daemon_introspect",
     ]
 

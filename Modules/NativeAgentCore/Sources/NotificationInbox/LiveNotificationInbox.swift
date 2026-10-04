@@ -212,21 +212,33 @@ public actor LiveNotificationInbox {
     /// identity survives content changes without accumulating duplicates.
     @discardableResult
     public func upsert(_ row: JSONValue, id: String) async throws -> Bool {
+        try await upsert(id: id) { existing in (row, existing == nil) }
+    }
+
+    /// Merge a producer's stable card under the same lock as user disposition.
+    /// The producer returns whether this write represents a new occurrence.
+    @discardableResult
+    public func upsert(
+        id: String,
+        update: @escaping @Sendable (JSONValue?) throws -> (row: JSONValue, isNewOccurrence: Bool)
+    ) async throws -> Bool {
         let now = clock()
-        let inserted = try await persistence.withFileLock(path) { () async throws -> Bool in
+        let isNewOccurrence = try await persistence.withFileLock(path) { () async throws -> Bool in
             var lines = try Self.readLines(path)
-            let raw = Data(try row.serialize(pretty: false).utf8)
-            if let index = lines.firstIndex(where: { Self.id(of: $0.row) == id }) {
-                lines[index] = Line(raw: raw, row: row)
-                try Self.write(retaining: lines, to: path, now: now)
-                return false
+            let index = lines.firstIndex(where: { Self.id(of: $0.row) == id })
+            let result = try update(index.flatMap { lines[$0].row })
+            let raw = Data(try result.row.serialize(pretty: false).utf8)
+            let line = Line(raw: raw, row: result.row)
+            if let index {
+                lines[index] = line
+            } else {
+                lines.append(line)
             }
-            lines.append(Line(raw: raw, row: row))
             try Self.write(retaining: lines, to: path, now: now)
-            return true
+            return result.isNewOccurrence
         }
         invalidate()
-        return inserted
+        return isNewOccurrence
     }
 
     /// Consolidates a producer-declared stream of repeated informational
@@ -283,6 +295,19 @@ public actor LiveNotificationInbox {
             () async throws -> InformationalRollupResult in
             var lines = try Self.readLines(path)
 
+            if let occurrence,
+               let duplicate = lines.last(where: { line in
+                   guard case .object(let object)? = line.row,
+                         Self.string(object["informational_rollup_key"]) == key else { return false }
+                   return Self.stringArray(object["absorbed_occurrence_ids"]).contains(occurrence)
+               }) {
+                return InformationalRollupResult(
+                    inserted: false,
+                    cardID: Self.id(of: duplicate.row) ?? id,
+                    occurrenceCount: Self.recordedOccurrenceCount(duplicate.row)
+                )
+            }
+
             let existingIndex = lines.lastIndex { line in
                 guard case .object(let object)? = line.row,
                       Self.string(object["severity"])?.lowercased() == "info",
@@ -293,15 +318,20 @@ public actor LiveNotificationInbox {
 
             guard let existingIndex,
                   case .object(let existing)? = lines[existingIndex].row else {
-                // Creating the card is append-once by card id, as it always was.
-                if let duplicate = lines.lastIndex(where: { Self.id(of: $0.row) == id }) {
+                if occurrence == nil,
+                   let duplicate = lines.lastIndex(where: { Self.id(of: $0.row) == id }) {
                     return InformationalRollupResult(
                         inserted: false,
                         cardID: id,
                         occurrenceCount: Self.recordedOccurrenceCount(lines[duplicate].row)
                     )
                 }
+                let cardID = lines.contains(where: { Self.id(of: $0.row) == id })
+                    ? "\(id)-\(UUID().uuidString)" : id
                 var inserted = incoming
+                inserted["id"] = .string(cardID)
+                inserted["status"] = .string("unread")
+                inserted["read_at"] = .null
                 inserted["informational_rollup_key"] = .string(key)
                 inserted["occurrence_count"] = .int(1)
                 if let occurrence {
@@ -317,7 +347,7 @@ public actor LiveNotificationInbox {
                     row: insertedRow
                 ))
                 try Self.write(retaining: lines, to: path, now: now)
-                return InformationalRollupResult(inserted: true, cardID: id, occurrenceCount: 1)
+                return InformationalRollupResult(inserted: true, cardID: cardID, occurrenceCount: 1)
             }
 
             let existingID = Self.string(existing["id"]) ?? id
@@ -379,12 +409,39 @@ public actor LiveNotificationInbox {
         return result
     }
 
+    /// Set fields on the newest row `id` in one locked read-and-write; a null
+    /// value removes its key. With `unlessPresent`, nothing is written when the
+    /// row already has that key: the check is the claim. True when written.
     @discardableResult
-    public func updateStatus(id: String, status: String, readAt: String?) async throws -> Bool {
+    public func patch(id: String, unlessPresent: String? = nil, _ fields: [String: JSONValue]) async throws -> Bool {
         let now = clock()
         let changed = try await persistence.withFileLock(path) { () async throws -> Bool in
             var lines = try Self.readLines(path)
-            guard let index = lines.firstIndex(where: { Self.id(of: $0.row) == id }),
+            guard let index = lines.lastIndex(where: { Self.id(of: $0.row) == id }),
+                  case .object(var object)? = lines[index].row else { return false }
+            if let unlessPresent, let held = object[unlessPresent], held != .null { return false }
+            for (key, value) in fields { object[key] = value == .null ? nil : value }
+            let row = JSONValue.object(object)
+            lines[index] = Line(raw: Data(try row.serialize(pretty: false).utf8), row: row)
+            try Self.write(retaining: lines, to: path, now: now)
+            return true
+        }
+        invalidate()
+        return changed
+    }
+
+    /// `metadata` lands on the row with the status (who settled it and why).
+    @discardableResult
+    public func updateStatus(
+        id: String, status: String, readAt: String?, metadata: [String: JSONValue] = [:]
+    ) async throws -> Bool {
+        let now = clock()
+        let changed = try await persistence.withFileLock(path) { () async throws -> Bool in
+            var lines = try Self.readLines(path)
+            // The newest row is the card on screen. A producer that re-files a
+            // settled card appends a fresh row under the same id, and settling
+            // the oldest one instead left the visible card unread.
+            guard let index = lines.lastIndex(where: { Self.id(of: $0.row) == id }),
                   case .object(var object)? = lines[index].row else { return false }
             // A detail sheet may appear more than once while the same card is
             // already open.  Its automatic read action is therefore a
@@ -400,19 +457,18 @@ public actor LiveNotificationInbox {
                 guard case .string(let value)? = object["read_at"] else { return false }
                 return !value.isEmpty
             }()
-            // Retention ages finished history from `read_at`. A caller that
-            // retires a card without supplying one (the Mac archive/dismiss
-            // actions pass nil) would otherwise leave the row dated only by
-            // `created_at` — and a months-old card archived today would be
-            // pruned by the very write that archived it. Stamp the transition
-            // instead, exactly as `archiveActive` already does.
-            let stamp: String? = readAt
-                ?? (Self.isTerminal(status) && !hasReadTimestamp ? Self.iso8601(now) : nil)
-            if existingStatus == status, stamp == nil || hasReadTimestamp {
+            // Retention ages finished history from `read_at`. Stamp a new
+            // terminal transition now, even if the card was read long ago.
+            // Repeated requests for the same state preserve its timestamp.
+            let stamp: String? = Self.isTerminal(status)
+                ? (existingStatus != status || !hasReadTimestamp ? Self.iso8601(now) : nil)
+                : readAt
+            if existingStatus == status, stamp == nil || hasReadTimestamp, metadata.isEmpty {
                 return true
             }
             object["status"] = .string(status)
             if let stamp { object["read_at"] = .string(stamp) }
+            for (key, value) in metadata { object[key] = value }
             let row = JSONValue.object(object)
             lines[index] = Line(raw: Data(try row.serialize(pretty: false).utf8), row: row)
             try Self.write(retaining: lines, to: path, now: now)

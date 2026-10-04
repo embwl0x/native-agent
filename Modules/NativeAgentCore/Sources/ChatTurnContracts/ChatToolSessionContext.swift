@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+import MacControl
 
 // MARK: - Per-turn tool session context
 
@@ -105,6 +106,10 @@ public enum ChatToolSessionContext {
     @TaskLocal public static var envelope: TurnEnvelope?
 
     @TaskLocal public static var verifiedSessionId: String?
+
+    /// The filing turn's file access, bound by the gate while it files a card
+    /// so the card's follow-up runs with the same hands (Wave 2 #8).
+    @TaskLocal public static var fileAccess: String?
 
     /// The transport-verified remote chat identifier (e.g. Telegram chatId),
     /// set by the remote transport around its `chat()` call. Trust resolution
@@ -233,6 +238,8 @@ public struct TurnEnvelope: Sendable, Equatable {
     /// Explicit remoteness for a surface the profile does not know yet. It can
     /// only ADD remoteness — see the widening invariant above.
     public let declaredRemote: Bool?
+    /// Request-time AX evidence, process-local and never restored from history.
+    public let macContinuation: MacWorkContinuation?
 
     public init(
         surface: String,
@@ -241,7 +248,8 @@ public struct TurnEnvelope: Sendable, Equatable {
         verifiedUserId: String? = nil,
         commandSignatureVerified: Bool? = nil,
         deliveryRoute: DeliveryRoute? = nil,
-        declaredRemote: Bool? = nil
+        declaredRemote: Bool? = nil,
+        macContinuation: MacWorkContinuation? = nil
     ) {
         self.surface = surface
         self.agent = agent
@@ -250,6 +258,13 @@ public struct TurnEnvelope: Sendable, Equatable {
         self.commandSignatureVerified = commandSignatureVerified
         self.deliveryRoute = deliveryRoute
         self.declaredRemote = declaredRemote
+        self.macContinuation = macContinuation
+    }
+
+    public func withMacContinuation(_ continuation: MacWorkContinuation) -> TurnEnvelope {
+        TurnEnvelope(surface: surface, agent: agent, verifiedChatId: verifiedChatId,
+            verifiedUserId: verifiedUserId, commandSignatureVerified: commandSignatureVerified,
+            deliveryRoute: deliveryRoute, declaredRemote: declaredRemote, macContinuation: continuation)
     }
 
     /// The delivery projection. `ReplyRoute` predates the envelope and has

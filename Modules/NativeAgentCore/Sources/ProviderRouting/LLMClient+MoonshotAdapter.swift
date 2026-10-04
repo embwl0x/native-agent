@@ -183,14 +183,14 @@ public final class MoonshotAdapter: LLMAdapter {
                         try Task.checkCancellation()
                         let frame = try decoder.consume(payload: event.data)
                         if frame.isDone { break }
+                        if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
+                            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
+                        }
                         if frame.reasoning != nil {
                             continuation.yield(.keepAlive)
                         }
                         if let content = frame.content {
                             sawContent = true
-                            if ttftMs == nil {
-                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
-                            }
                             continuation.yield(.textDelta(content))
                         }
                         for _ in 0..<frame.toolCallDeltaCount {

@@ -9,6 +9,57 @@ public enum CognitiveSomaticSignalAdapter {
     public static let somaticOwnerMetadataKey = "somaticOwner"
     public static let providerLifecycleSomaticOwner = "provider_lifecycle"
 
+    /// Phase 5 E3 (User, Agent 10-03): infrastructure is health, not feeling.
+    /// Provider calls, tool results, phone delivery and reachability, memory
+    /// upkeep, the Mac's wake and thermal state still update the body schema,
+    /// predictions and ops posture, but no longer move the feeling axes.
+    /// Feelings move on human causes: User's words and corrections, caring,
+    /// moments (through warmth), Desk work, approvals, sleep, her interests
+    /// and opinions.
+    public static func movesFeelings(_ kind: SomaticSignalKind) -> Bool {
+        switch kind {
+        case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled,
+             .providerStarted, .providerSucceeded, .providerFailed, .providerCancelled, .providerRecovered,
+             .iPhoneReachable, .iPhoneStale,
+             .phoneDeliveryStarted, .phoneDeliveryReceived, .phoneDeliveryFailed,
+             .memoryCommitted, .memoryHygieneCompleted,
+             .appWake, .appSleep, .resourcePressureChanged:
+            return false
+        default:
+            return true
+        }
+    }
+
+    /// Phase 5 E3: her OWN outcomes are human causes for agency and
+    /// confidence, though their signals are transport-shaped: a verified
+    /// action of hers that landed (the motor owner's `verification:
+    /// satisfied`), an effectful tool call of hers that succeeded (a canonical
+    /// outcome whose risk class is above a read, or that says `effects:
+    /// occurred` — a Desk item closed, a message sent, a file written), a
+    /// clean skill run, finished Workshop work. Her own work failing lowers
+    /// confidence a little. Reads, pings and transport results are nil.
+    public static func ownOutcomeDose(_ event: CognitiveEvent) -> (agency: Double, confidence: Double)? {
+        guard event.turnKind.contributesToLivedState else { return nil }
+        let verification = stringValue(event.metadata["verification"])
+        let risk = stringValue(event.metadata["trustRisk"])
+        let effectful = ["medium", "high", "critical"].contains(risk ?? "")
+            || stringValue(event.metadata["effects"]) == "occurred"
+        let skill = (stringValue(event.metadata["toolName"]) ?? "").hasPrefix("skill")
+        switch event.kind {
+        case .toolSucceeded:
+            if verification == "satisfied" { return (0.05, 0.05) }
+            if skill && risk != nil { return (0.03, 0.04) }
+            return effectful ? (0.04, 0.03) : nil
+        case .toolFailed:
+            return verification == "failed" || effectful || (skill && risk != nil) ? (0, -0.03) : nil
+        case .workshopExecutionCompleted:
+            if event.isPositiveTerminalOutcome { return (0.05, 0.04) }
+            return event.isNegativeTerminalOutcome ? (0, -0.03) : nil
+        default:
+            return nil
+        }
+    }
+
     public static func signal(
         from event: CognitiveEvent,
         id: UUID,

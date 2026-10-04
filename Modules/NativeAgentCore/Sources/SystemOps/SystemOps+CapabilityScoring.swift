@@ -48,17 +48,9 @@ private func isWordCont(_ c: Unicode.Scalar) -> Bool {
 
 // MARK: - Capability scoring (port of select_context_capabilities)
 //
-// Wave 11 (2026-05-31). Byte-for-byte port of Python's
-// `score_context_capability` and
-// `select_context_capabilities` (L15238), restricted to the two capability
-// record sources that already have Swift-native ports:
-//   • featureSurfaceRecords()  — 19 static entries
-//   • connectorActionDescriptors() — 84 static entries
-//
-// Python's `capability_records()` ALSO includes skill, tool, manifest-skill,
-// workflow, and MCP-server records. Those record sources are Python-only
-// today; the Swift router-plan path is FLIPPABLE FOR THE NARROWED INPUT SET
-// only. See SystemOps RESIDUAL CAVEATS block.
+// The deterministic route scorer ranks feature surfaces and connector actions.
+// Skills, authored tools, workflows and MCP sources have their own Swift
+// owners and discovery paths; they are not inputs to this scorer.
 
 /// In-memory capability record used for scoring. Subset of the Python dict
 /// shape — only the fields `score_context_capability` reads + those the
@@ -265,9 +257,8 @@ func selectContextCapabilities(
 ///   • featureSurfaceRecords()
 ///   • connectorActionDescriptors()
 ///
-/// Python additionally includes skill, tool, manifest-skill, workflow, and
-/// MCP-server records — those record sources are Python-only and are NOT
-/// re-implemented here.
+/// Skills, authored tools, workflows and MCP sources are discovered by their
+/// Swift owners rather than this static route-scoring catalog.
 func swiftNativeCapabilityRecords(nowISO: String) -> [CapabilityScoringRecord] {
     var records: [CapabilityScoringRecord] = []
     records.reserveCapacity(featureSurfaceRecordsCount + connectorActionDescriptorsCount)

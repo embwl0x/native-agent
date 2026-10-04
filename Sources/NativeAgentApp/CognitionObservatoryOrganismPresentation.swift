@@ -47,9 +47,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
     let fieldRows: [Row]
     let predictionRows: [Row]
     let dreamRepairRows: [Row]
-    let reflexRows: [Row]
     let bodyRows: [Row]
-    let reflexCandidates: [OrganismReflexCandidate]
 
     init(
         snapshot: OrganismSnapshot?,
@@ -68,9 +66,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             fieldRows = []
             predictionRows = []
             dreamRepairRows = []
-            reflexRows = []
             bodyRows = []
-            reflexCandidates = []
             return
         }
 
@@ -86,9 +82,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             fieldRows = []
             predictionRows = []
             dreamRepairRows = []
-            reflexRows = []
             bodyRows = []
-            reflexCandidates = []
             return
         }
 
@@ -108,9 +102,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             fieldRows = []
             predictionRows = []
             dreamRepairRows = []
-            reflexRows = []
             bodyRows = []
-            reflexCandidates = []
             return
         }
 
@@ -130,7 +122,6 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             snapshot.predictionSummary.bodyConfidence.providerPath,
             snapshot.predictionSummary.bodyConfidence.phonePath,
             snapshot.residualRepairOpportunity.pressure,
-            snapshot.reflexSummary.highestConfidence,
         ]
         guard numericValues.allSatisfy(\.isFinite) else {
             state = .unavailable("The organism body sample contains an invalid value and is withheld.")
@@ -144,9 +135,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             fieldRows = []
             predictionRows = []
             dreamRepairRows = []
-            reflexRows = []
             bodyRows = []
-            reflexCandidates = []
             return
         }
 
@@ -215,14 +204,6 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             .init(label: "Residual evidence", value: "\(snapshot.residualRepairOpportunity.evidenceCount)"),
             .init(label: "Residual repair ready", value: snapshot.residualRepairOpportunity.ready ? "yes" : "no"),
         ]
-        reflexRows = [
-            .init(label: "Reflex candidates", value: "\(snapshot.reflexSummary.candidateCount)"),
-            .init(label: "Need review", value: "\(snapshot.reflexSummary.reviewRequiredCount)"),
-            .init(label: "Low risk", value: "\(snapshot.reflexSummary.lowRiskCount)"),
-            .init(label: "Confirm", value: "\(snapshot.reflexSummary.confirmRequiredCount)"),
-            .init(label: "High risk", value: "\(snapshot.reflexSummary.highRiskCount)"),
-            Self.decimal("Highest confidence", snapshot.reflexSummary.highestConfidence),
-        ]
         bodyRows = [
             .init(label: "Mac awake", value: snapshot.bodySchema.macAwake ? "yes" : "no"),
             .init(label: "iPhone reachable", value: snapshot.bodySchema.iPhoneReachable ? "yes" : "no"),
@@ -234,7 +215,6 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             .init(label: "Notifications", value: snapshot.bodySchema.notificationPathHealthy ? "healthy" : "attention"),
             .init(label: "Resource pressure", value: snapshot.bodySchema.resourcePressure.rawValue),
         ]
-        reflexCandidates = snapshot.reflexCandidates
     }
 
     var collapsedHint: String {
@@ -263,7 +243,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
     var renderedRowText: [String] {
         guard case .live = state else { return [] }
         return ([Row(label: "Last signal", value: lastSignalText)]
-            + chemicalRows + fieldRows + predictionRows + dreamRepairRows + reflexRows + bodyRows
+            + chemicalRows + fieldRows + predictionRows + dreamRepairRows + bodyRows
         ).map(\.text)
     }
 

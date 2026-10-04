@@ -109,7 +109,7 @@ extension MacSyncEngine {
         }.value
     }
 
-    /// Refuse authenticated stale work only when no transaction owns the ID.
+    /// Refuse authenticated stale work only when it has never executed.
     func rejectInboxFile(
         action: InboxAction,
         fileURL: URL,
@@ -125,7 +125,16 @@ extension MacSyncEngine {
             // exact retry after deliberate local repair.
             return
         }
-        guard case .absent = await readTransaction(id: transactionId) else { return }
+        switch await readTransaction(id: transactionId) {
+        case .absent:
+            break
+        case .present(let record):
+            guard record.id == transactionId, record.direction == "ios_to_mac", record.state == "received",
+                  record.msgId == action.msgId, let actionDigest,
+                  record.actionDigest == actionDigest, record.action == action.action else { return }
+        case .unreadable:
+            return
+        }
         guard await writeRejectedResponseIfNeeded(
             action: action,
             transactionId: transactionId,
@@ -225,13 +234,53 @@ extension MacSyncEngine {
                 validatedID: ids.messageID
                ) {
                 let txId = ids.transactionID
-                guard let response = try? signedResponse([
+                guard await authenticateInboxFile(
+                    data: data, action: staleAction, fileURL: pendingURL, inboxDir: inboxDir
+                ) else { continue }
+                let actionDigest = Self.inboxActionDigest(envelope: data)
+                var retainedResponse: [String: String]?
+                var recoveredResponseFile = false
+                switch await readTransaction(id: txId) {
+                case .absent:
+                    break
+                case .unreadable:
+                    syncError = "Could not read the durable record for stale command \(staleAction.msgId); left pending."
+                    continue
+                case .present(let record):
+                    guard Self.inboxLedgerRow(record, matchesMsgId: staleAction.msgId, digest: actionDigest, action: staleAction.action) else {
+                        await quarantineUnauthenticatedInboxFile(
+                            data: data, fileURL: pendingURL, inboxDir: inboxDir, reason: "transaction identity collision"
+                        )
+                        continue
+                    }
+                    if Self.inboxActionDidExecute(record.state) {
+                        retainedResponse = record.response
+                        // A crash can land the response before the terminal
+                        // ledger write. Recover only a signed, matching reply.
+                        if retainedResponse == nil {
+                            let savedData = await Task.detached(priority: .utility) {
+                                Self.coordinatedRead(at: responseURL)
+                            }.value
+                            if let savedData,
+                               let saved = try? JSONDecoder().decode([String: String].self, from: savedData),
+                               saved["msgId"] == staleAction.msgId,
+                               saved["transactionId"] == txId,
+                               saved["action"] == staleAction.action,
+                               saved["status"] != nil,
+                               authenticateInboxResponse(saved) {
+                                retainedResponse = saved
+                                recoveredResponseFile = true
+                            }
+                        }
+                    }
+                }
+                guard let response = retainedResponse ?? (try? signedResponse([
                     "status": "error",
                     "message": "Mac could not confirm whether this command completed, so it was not retried automatically.",
                     "msgId": staleAction.msgId,
                     "transactionId": txId,
                     "action": staleAction.action,
-                ]) else {
+                ])) else {
                     syncError = "Pairing secret unavailable; stale command \(staleAction.msgId) remains pending."
                     continue
                 }
@@ -245,7 +294,6 @@ extension MacSyncEngine {
                 guard responseWritten else {
                     syncError = "Could not write iCloud response for stale command \(staleAction.msgId); left pending for retry."
                     NSLog("MacSyncEngine.processInboxFiles: %@", syncError ?? "")
-                    await writeTransaction(id: txId, action: staleAction.action, state: "response_write_failed", error: syncError)
                     continue
                 }
                 let msgId = staleAction.msgId
@@ -254,18 +302,25 @@ extension MacSyncEngine {
                     kvs.set(msgId, forKey: "inbox_response_\(msgId)")
                     return kvs.synchronize()
                 }
-                await writeTransaction(id: txId, action: staleAction.action, state: "unknown", error: response["message"], response: response)
+                if retainedResponse == nil || recoveredResponseFile {
+                    let status = (response["status"] ?? "").lowercased()
+                    let recoveredState = status == "error" || status == "failed" || response["ok"] == "false"
+                        ? "failed" : (status == "pending_approval" ? "pending_approval" : "completed")
+                    await writeTransaction(
+                        id: txId, action: staleAction.action, state: recoveredResponseFile ? recoveredState : "unknown", error: response["message"],
+                        response: response, msgId: staleAction.msgId, actionDigest: actionDigest
+                    )
+                }
                 recordProcessed(staleAction.msgId)
                 saveProcessedIds()
                 let archiveURL = inboxDir.appendingPathComponent("processed_\(pendingURL.lastPathComponent).done")
                 await Task.detached(priority: .utility) { [pendingURL, archiveURL] in
                     try? FileManager.default.moveItem(at: pendingURL, to: archiveURL)
                 }.value
-            } else {
-                let archiveURL = inboxDir.appendingPathComponent("rejected_\(pendingURL.lastPathComponent).done")
-                await Task.detached(priority: .utility) { [pendingURL, archiveURL] in
-                    try? FileManager.default.moveItem(at: pendingURL, to: archiveURL)
-                }.value
+            } else if let data {
+                await quarantineUnauthenticatedInboxFile(
+                    data: data, fileURL: pendingURL, inboxDir: inboxDir, reason: "malformed envelope or invalid message identity"
+                )
             }
         }
 
@@ -729,19 +784,37 @@ extension MacSyncEngine {
 
         let transactionId = ids.transactionID
         let actionDigest = Self.inboxActionDigest(envelope: data)
+        let transactionLookup = await readTransaction(id: transactionId)
+        let envelopeAge = Date().timeIntervalSince(message.timestamp)
+        let envelopeFreshnessError: String? = envelopeAge > 24 * 60 * 60
+            ? "message too old: \(Int(envelopeAge))s"
+            : (envelopeAge < -15 * 60 ? "timestamp is too far in the future: \(Int(-envelopeAge))s" : nil)
+        let freshnessError = inboxActionFreshnessError(action) ?? envelopeFreshnessError
+        let processed = processedMsgIds.contains(action.msgId)
+        let verifiedProcessedRecord: ICloudTransactionRecord?
+        if case .present(let record) = transactionLookup,
+           record.id == transactionId, record.direction == "ios_to_mac",
+           record.msgId == action.msgId, let actionDigest,
+           record.actionDigest == actionDigest, record.action == action.action,
+           Self.inboxActionDidExecute(record.state) {
+            verifiedProcessedRecord = record
+        } else {
+            verifiedProcessedRecord = nil
+        }
 
         // A prior attempt may have executed successfully but lost its CloudKit
         // response send. Re-send the durable signed response; never redispatch.
-        if processedMsgIds.contains(action.msgId) {
+        if processed, let record = verifiedProcessedRecord {
             let responseTask = Task<[String: String]?, Never>.detached(priority: .utility) {
                 guard case .data(let data) = Self.coordinatedReadOutcome(at: responseURL) else { return nil }
                 return try? JSONDecoder().decode([String: String].self, from: data)
             }
             var resolved = await responseTask.value
-            if resolved == nil,
-               case .present(let record) = await readTransaction(id: transactionId),
-               Self.inboxLedgerRow(record, matchesMsgId: action.msgId, digest: actionDigest, action: action.action),
-               let retained = record.response {
+            if let cached = resolved,
+               cached["msgId"] != action.msgId || cached["transactionId"] != transactionId || cached["action"] != action.action {
+                resolved = nil
+            }
+            if resolved == nil, let retained = record.response {
                 // 2026-09-06: the response file is missing or does not decode.
                 // The ledger kept a copy of the same signed response when the
                 // action completed, so it — not the file — is authoritative
@@ -772,9 +845,11 @@ extension MacSyncEngine {
         // is NEVER executed and NEVER served another action's result: it gets a
         // signed, honest outcome and nothing in the ledger is overwritten.
         var refusal: (code: String, message: String)?
-        switch await readTransaction(id: transactionId) {
+        switch transactionLookup {
         case .absent:
-            break
+            if processed {
+                refusal = ("unknown_outcome", "Mac no longer has a verified result for this command, so it was not run again.")
+            }
         case .unreadable:
             // 2026-09-06: absence and unreadability used to collapse into the
             // same nil, so a corrupt or unreadable ledger row read as "fresh
@@ -785,7 +860,8 @@ extension MacSyncEngine {
                 "Mac could not read the durable record for this command, so it was not run again."
             )
         case .present(let record):
-            guard Self.inboxLedgerRow(record, matchesMsgId: action.msgId, digest: actionDigest, action: action.action) else {
+            guard Self.inboxLedgerRow(record, matchesMsgId: action.msgId, digest: actionDigest, action: action.action),
+                  !processed || verifiedProcessedRecord != nil else {
                 // 2026-09-06: `transactionId` comes from the phone and only
                 // DEFAULTS to msgId, so two unrelated actions can collide on it.
                 // A colliding envelope is a new action, not a redelivery — it is
@@ -825,7 +901,7 @@ extension MacSyncEngine {
             }
         }
 
-        if !alreadyExecuted, inboxActionFreshnessError(action) == nil {
+        if !alreadyExecuted, freshnessError == nil {
             await writeTransaction(
                 id: transactionId,
                 action: action.action,
@@ -866,7 +942,7 @@ extension MacSyncEngine {
                     response: response
                 )
             }
-        } else if let validationError = inboxActionFreshnessError(action) {
+        } else if let validationError = freshnessError {
             inboundActionVerified = false
             if validationError.contains("pairing secret unavailable") {
                 syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
@@ -875,7 +951,7 @@ extension MacSyncEngine {
             guard let signed = try? signedResponse([
                 "status": "error",
                 "ok": "false",
-                "code": validationError.contains("signature") ? "signature_invalid" : "invalid_action",
+                "code": validationError.hasPrefix("message too old:") ? "expired_before_execution" : "invalid_action",
                 "message": validationError,
                 "msgId": action.msgId,
                 "transactionId": transactionId,

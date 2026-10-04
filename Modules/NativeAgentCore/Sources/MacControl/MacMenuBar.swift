@@ -134,7 +134,7 @@ public enum MacMenuBar {
 
         func descend(_ element: MacAXElementRef, titles: [String], indices: [Int]) {
             guard !done else { return }
-            guard inMenu < maxItems else {
+            guard titles.isEmpty || inMenu < maxItems else {
                 truncated = true
                 return
             }
@@ -142,7 +142,7 @@ public enum MacMenuBar {
             if children.count > maxChildrenPerMenu { truncated = true }
             for (offset, child) in children.prefix(maxChildrenPerMenu).enumerated() {
                 guard !done else { return }
-                guard inMenu < maxItems else {
+                guard titles.isEmpty || inMenu < maxItems else {
                     truncated = true
                     return
                 }
@@ -314,21 +314,27 @@ public enum MacMenuBar {
 
     /// The refusal, in words. Every branch names the state and the next move.
     public static func words(for resolution: Resolution, requested raw: String) -> String? {
+        func safe(_ title: String) -> String {
+            if case .string(let text) = MacScreenViewTextRedaction.redactedLegendString(
+                title, valueChars: maxTitleChars * maxPathDepth
+            ) { return text }
+            return "[redacted]"
+        }
         switch resolution {
         case .matched:
             return nil
         case .disabled(let item):
-            return "\"\(item.display)\" is in the menu but it is greyed out right now, "
+            return "\"\(safe(item.display))\" is in the menu but it is greyed out right now, "
                 + "so pressing it would do nothing. The app has it switched off in this state."
         case .ambiguous(let candidates):
-            return "\"\(raw)\" matches more than one menu path — "
-                + candidates.joined(separator: ", ") + ". Say which one."
+            return "\"\(safe(raw))\" matches more than one menu path — "
+                + candidates.map(safe).joined(separator: ", ") + ". Say which one."
         case .notFound(let nearest):
             guard !nearest.isEmpty else {
-                return "There is no \"\(raw)\" in this app's menu bar. Read the menu again and use a path it shows."
+                return "There is no \"\(safe(raw))\" in this app's menu bar. Read the menu again and use a path it shows."
             }
-            return "There is no \"\(raw)\" in this app's menu bar. What is there: "
-                + nearest.joined(separator: ", ") + ". Read the menu again and choose an exact path."
+            return "There is no \"\(safe(raw))\" in this app's menu bar. What is there: "
+                + nearest.map(safe).joined(separator: ", ") + ". Read the menu again and choose an exact path."
         }
     }
 

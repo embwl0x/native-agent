@@ -19,19 +19,11 @@ extension NativeClient {
 
     typealias ApprovalExecutionReconcileKind = ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind
     typealias ChatApprovalContinuation = ApprovalTransactionCoordinator.ChatApprovalContinuation
-    typealias ApprovalReceiptTools = ApprovalTransactionCoordinator.ApprovalReceiptTools
 
     static func memoryHygieneReceipt(
         _ report: MemoryHygieneReport
     ) -> (fields: [String: JSONValue], detail: String) {
         ApprovalTransactionCoordinator.memoryHygieneReceipt(ApprovalMemoryHygieneResult(id: report.id, status: report.status, reason: report.reason, consolidationRunId: report.consolidationRunId))
-    }
-
-    static func applyResolvedProceduralSkillProposal(
-        from rec: ApprovalRecord,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
-        await Self.approvalTransactions.applyResolvedProceduralSkillProposal(from: rec, dataRoot: dataRoot)
     }
 
     static func applyResolvedStudioCanonProposal(

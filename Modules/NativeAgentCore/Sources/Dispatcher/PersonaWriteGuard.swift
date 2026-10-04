@@ -30,14 +30,11 @@ import Foundation
 // explicit per-call `autonomy_override` (an explicit override is the operator
 // already speaking; the guard does not second-guess it).
 //
-// SCOPE / DORMANCY: the Swift `Dispatcher` module is still a DORMANT-PROXY for
-// execution (see Dispatcher.swift header) — the native unified-policy resolver
-// (`resolve_effective_policy`) is NOT yet ported. This file ports ONLY the guard
-// predicate, as a pure function with no side effects, so it is ready to slot
-// into the native resolver the moment that lands. It mutates nothing and is
-// not yet wired into the proxy run() path (where autonomy is decided by the
-// daemon's authoritative receipt). Its presence + tests close prereq #12's
-// "confirm Swift mirrors it before any persona-touching tool goes native".
+// NATIVE OWNERSHIP: this module owns the pure guard decision. Native chat
+// dispatch applies it after SecurityCenter policy resolution in
+// ChatOrchestrationClient+DispatchWrappers. AppToolExecutor+SkillRun consults
+// the same predicate when checking whether a skill's action needs approval.
+// The callers enforce approval; this guard has no side effects.
 //
 // PARITY NOTES (must stay byte-equivalent to the Python set above):
 //   * `persona_write` guards {soul, voice, agents, skill}  (4 kinds).
@@ -55,12 +52,11 @@ import Foundation
 //     "auto". Anything else (already "confirm"/"block"/etc.) passes through
 //     untouched — the ratchet never downgrades.
 
-/// Pure decision function: given the tool, the input `kind` argument, the
-/// already-resolved autonomy string ("auto"/"confirm"/"block"/...), and
+/// Pure decision function: given the tool, the input `kind` argument, a
+/// protected personality setting write, the resolved autonomy string, and
 /// whether the caller passed an explicit per-call autonomy override, decide
 /// whether the dynamic persona-write guard upgrades the autonomy to "confirm".
 ///
-/// Returns `true` only in the exact cases the Python dispatcher upgrades.
 /// Callers that get `true` MUST set the resolved autonomy to "confirm" and the
 /// autonomy source to `PersonaWriteGuard.autonomySource`.
 public enum PersonaWriteGuard {
@@ -100,12 +96,14 @@ public enum PersonaWriteGuard {
     public static func shouldUpgradeToConfirm(
         tool: String,
         kind: String?,
+        personaSettingWrite: Bool = false,
         resolvedAutonomy: String,
         hasExplicitAutonomyOverride: Bool
     ) -> Bool {
         // Mirror: `autonomy_override is None and resolved.autonomy == AUTO`.
         guard !hasExplicitAutonomyOverride else { return false }
         guard resolvedAutonomy == triggeringAutonomy else { return false }
+        if personaSettingWrite { return true }
 
         // W32 W06 (prereq #12 re-close) / W33 W06: canonicalize IDENTICALLY to
         // the Python dispatcher guard's `unicodedata.normalize("NFKC", kind)
@@ -153,12 +151,14 @@ public enum PersonaWriteGuard {
     public static func apply(
         tool: String,
         kind: String?,
+        personaSettingWrite: Bool = false,
         resolvedAutonomy: String,
         hasExplicitAutonomyOverride: Bool
     ) -> (autonomy: String, source: String?) {
         if shouldUpgradeToConfirm(
             tool: tool,
             kind: kind,
+            personaSettingWrite: personaSettingWrite,
             resolvedAutonomy: resolvedAutonomy,
             hasExplicitAutonomyOverride: hasExplicitAutonomyOverride
         ) {

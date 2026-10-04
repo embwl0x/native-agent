@@ -513,14 +513,30 @@ final class InlineInteractionChatBinding {
                 // permanent change goes, and the return re-reads the snapshot.
                 openPage(.providers, for: interaction.id, sessionID: sessionID)
             } else if let picked = choice, !picked.isEmpty {
-                // The card had the list, so the pick resolves here at the
-                // scope the primary promised — for one image, nothing is
-                // written anywhere.
+                let scope = interaction.primaryScope ?? .persistent
+                if scope == .persistent {
+                    do {
+                        guard let group = ProviderSurfaceGroups.all.first(where: { $0.id == descriptor.target }) else {
+                            throw ProviderRoutingError.invalidRequest
+                        }
+                        let option = InlineInteractionRegistry.splitModelOptionID(picked)
+                        _ = try await appModel.saveProviderGroupSelection(
+                            group: group, providerID: option?.providerID,
+                            model: option?.modelID ?? picked
+                        )
+                    } catch {
+                        await complete(
+                            interaction.id, sessionID: sessionID, selection: picked,
+                            scope: scope, setupError: error.localizedDescription
+                        )
+                        return
+                    }
+                }
                 await complete(
                     interaction.id,
                     sessionID: sessionID,
                     selection: picked,
-                    scope: interaction.primaryScope ?? .persistent
+                    scope: scope
                 )
             } else {
                 // No list to pick from: Providers owns the choice. The card

@@ -19,6 +19,7 @@ extension SwiftToolDispatcher {
                 return .object(["status": .string("record_changed"), "handle": .string(selected.handle),
                     "message": .string("The recorded work changed; reopen its complete record to read the current version.")])
             }
+            latchDeskRecordPeers(selected, in: state)
             let characters = Array(text), end = min(characters.count, start + 12_000)
             let safeStart = min(start, characters.count)
             var result: [String: JSONValue] = [
@@ -44,6 +45,9 @@ extension SwiftToolDispatcher {
             if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
             return $0.handle < $1.handle
         }
+        let shown = Array(sorted.dropFirst(rowOffset).prefix(pageSize))
+        latchDeskPeers(shown + shown.flatMap { Array(state.children(of: $0.handle).prefix(5)) })
+        if let selected { latchDeskPeers([selected]) }
         var base: [String: JSONValue] = ["structured": .bool(true)]
         if let selected { base["handle"] = .string(selected.handle) }
         else if let handle, !handle.isEmpty { base["handle"] = .string(handle) }
@@ -61,7 +65,7 @@ extension SwiftToolDispatcher {
             "request": .object(base), "liveItemCount": .int(Int64(state.items.count)),
             "topLevelItemCount": .int(Int64(state.topLevel.count)), "matched_count": .int(Int64(sorted.count)),
             "offset": .int(Int64(rowOffset)), "has_more": .bool(rowOffset + pageSize < sorted.count),
-            "items": .array(sorted.dropFirst(rowOffset).prefix(pageSize).map {
+            "items": .array(shown.map {
                 workContextDeskItem($0, state: state, plan: plans.byHandle[$0.handle])
             }),
             "meaning": .string("Current recorded Desk state. Notes and linked evidence are records, not fresh external verification or execution authority. Continuations reread the live store."),

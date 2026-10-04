@@ -41,6 +41,10 @@ public final class MacSyncEngine: ObservableObject {
     /// integrity fallback or adding a polling loop.
     var cognitionSnapshotObservationTask: Task<Void, Never>?
     var helpersSnapshotWatcher: FileChangeWatcher?
+    var workActivityObservationTask: Task<Void, Never>?
+    var workActivityPublicationTask: Task<Void, Never>?
+    var workActivities: [String: MobileWorkActivity] = [:]
+    var workActivityVersion: UInt64 = 0
     /// Existing chat completion notifications drive one bounded transcript
     /// projection pass. The short coalescer absorbs completion fan-out (for
     /// example a bridge delivery plus its local refresh) without polling or
@@ -55,12 +59,14 @@ public final class MacSyncEngine: ObservableObject {
     var chatSnapshotCoalescer = MacSyncChatSnapshotCoalescerState()
     /// One exact archive-retention crossing, recalculated after each prune.
     var pruneDeadlineTask: Task<Void, Never>?
+    var archiveRetentionRetryAfter: Date?
     var archiveRetentionWatcher: FileChangeWatcher?
     var schedulerSnapshotWatcher: FileChangeWatcher?
     var activeDocsURL: URL?
     var snapshotWriteInFlight = false
     var snapshotWriteQueued = false
     var snapshotWriteQueuedNeedsHeavy = false
+    var snapshotWriteQueuedNeedsMemories = false
     var snapshotWriteQueuedNeedsChatTranscripts = false
     var snapshotWriteQueuedNeedsStandardPass = false
     /// Invalidates any snapshot pass suspended across stop/restart. A late pass
@@ -194,11 +200,15 @@ public final class MacSyncEngine: ObservableObject {
         }
     }
 
+    public func activeChatRunID(for sessionID: String) -> String? {
+        activeChatTasks[sessionID]?.runID
+    }
+
     /// Cancel the session's in-flight chat task. `runIDs` are the runs the
     /// caller believes it is stopping; when they name a run that is NOT the one
     /// holding the session, nothing is cancelled and the caller is told so —
     /// the stopped turn is already over and the current one is somebody else's.
-    func cancelActiveChatTask(for sessionID: String, runIDs: [String] = []) -> MacSyncChatCancelOutcome {
+    public func cancelActiveChatTask(for sessionID: String, runIDs: [String] = []) -> MacSyncChatCancelOutcome {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .noActiveTask }
         guard let entry = activeChatTasks[trimmed] else {

@@ -1,5 +1,6 @@
 import SwiftUI
 import ApprovalInbox
+import NativeAgentShared
 import Observation
 import AppKit
 import CoreGraphics
@@ -301,6 +302,7 @@ final class ApprovalLoadState {
 
 // PATCH-2026-05-09: design-system-pass ApprovalsView — NativePanel cards, design tokens
 struct ApprovalsView: View {
+    var focusedID: String? = nil
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var approvalLoadState = ApprovalLoadState()
@@ -319,16 +321,20 @@ struct ApprovalsView: View {
     }
 
     private var pending: [ApprovalRecord] {
-        approvalLoadState.approvals.filter { $0.status.lowercased() == "pending" }
+        approvalLoadState.approvals.filter { $0.status.lowercased() == "pending" && (focusedID == nil || $0.id == focusedID) }
     }
 
     private var recent: [ApprovalRecord] {
-        approvalLoadState.approvals.filter { $0.status.lowercased() != "pending" }
+        approvalLoadState.approvals.filter { $0.status.lowercased() != "pending" && (focusedID == nil || $0.id == focusedID) }
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
+                if let focusedID, approvalLoadState.hasLoadedSnapshot,
+                   !approvalLoadState.approvals.contains(where: { $0.id == focusedID }) {
+                    Text("This decision is no longer available.").foregroundStyle(.secondary)
+                }
                 HStack {
                     GradientText(text: "Approvals", colors: [.orange, .red], font: NativeAgentFont.title)
                     Spacer()
@@ -529,9 +535,10 @@ private struct ApprovalRequestPanel: View {
                 HStack(alignment: .top) {
                     PulsingDot(color: .orange, size: 8)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(approval.title.isEmpty ? approval.action : approval.title)
+                        Text(approval.title.isEmpty ? ToolActivityPresentation.title(approval.action)
+                            : ToolActivityPresentation.approvalText(approval.title, tool: approval.action))
                             .font(NativeAgentFont.section)
-                        Text(approval.action)
+                        Text(ToolActivityPresentation.title(approval.action))
                             .font(NativeAgentFont.label)
                             .foregroundStyle(.secondary)
                     }
@@ -539,7 +546,7 @@ private struct ApprovalRequestPanel: View {
                     StatusBadge(text: riskBadge.label, status: riskBadge.status)
                 }
                 if !approval.reason.isEmpty {
-                    Text(approval.reason)
+                    Text(ToolActivityPresentation.approvalText(approval.reason, tool: approval.action))
                         .font(NativeAgentFont.body)
                         .foregroundStyle(.secondary)
                         .lineLimit(5)
@@ -593,7 +600,8 @@ private struct ApprovalHistoryRow: View {
             Image(systemName: icon.systemName)
                 .foregroundStyle(ApprovalHistoryRowPresentation.color(for: icon.tone))
             VStack(alignment: .leading, spacing: 2) {
-                Text(approval.title.isEmpty ? approval.action : approval.title)
+                Text(approval.title.isEmpty ? ToolActivityPresentation.title(approval.action)
+                    : ToolActivityPresentation.approvalText(approval.title, tool: approval.action))
                     .font(NativeAgentFont.label)
                     .lineLimit(1)
                 Text("\(approval.decision ?? approval.status) · \(UserDisplayFormatters.humanizeISOTimestamp(approval.resolvedAt ?? approval.createdAt))")

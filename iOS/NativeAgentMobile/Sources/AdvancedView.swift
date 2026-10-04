@@ -63,10 +63,12 @@ struct AdvancedView: View {
     var body: some View {
         NavigationStack {
             AlivePage(title: "More", line: "Rooms, settings and tools.", style: .root) {
-                if PairingSkipPresentation.showsRecoveryAffordance(isPaired: pairingStore.isPaired) {
+                if !pairingStore.isPaired || bridgeClient.bridgeStatus != .online {
                     AliveSection("Connection", surface: .none) {
-                        AliveCalmState(title: AliveConnection.unpaired,
-                                       line: "I live on your Mac. Pair this iPhone and I can reach you here.",
+                        AliveCalmState(title: AliveConnection.line(for: bridgeClient.bridgeStatus, paired: pairingStore.isPaired),
+                                       line: pairingStore.isPaired
+                                        ? "Open Settings to repair this iPhone’s connection, or pair with your Mac again."
+                                        : "I live on your Mac. Pair this iPhone and I can reach you here.",
                                        actionTitle: "Pair with Mac",
                                        actionHint: "Opens pairing so this iPhone can reconnect to the Mac.") {
                             showPairingRecovery = true
@@ -133,6 +135,7 @@ struct AdvancedView: View {
                 PairingView(onSkip: {
                     showPairingRecovery = false
                 }, onPaired: {
+                    bridgeClient.recordMacConfirmation()
                     showPairingRecovery = false
                 })
                 .environmentObject(pairingStore)
@@ -317,11 +320,11 @@ final class AdvancedStore: ObservableObject {
         health = engine.health
         switch outcome {
         case .refreshed:
-            healthLoadError = nil
+            healthLoadError = SnapshotHealthLog.damageSentence()
         case .partial:
-            healthLoadError = "Some Health snapshots are still downloading from iCloud."
+            healthLoadError = SnapshotHealthLog.damageSentence() ?? "Some Health snapshots are still downloading from iCloud."
         case .unavailable:
-            healthLoadError = "Health snapshot is still downloading from iCloud. Try again in a moment."
+            healthLoadError = SnapshotHealthLog.damageSentence() ?? "Health snapshot is still downloading from iCloud. Try again in a moment."
         case .superseded:
             healthLoadError = "Health refresh was superseded by a sync reconfiguration. Try again."
         }
@@ -336,19 +339,19 @@ final class AdvancedStore: ObservableObject {
         runs = engine.runs
         switch outcome {
         case .refreshed:
-            runsLoadError = nil
+            runsLoadError = SnapshotHealthLog.damageSentence(for: "runs.json")
         case .unavailable:
-            runsLoadError = "Runs snapshot is still downloading from iCloud. Try again in a moment."
+            runsLoadError = SnapshotHealthLog.damageSentence(for: "runs.json") ?? "Runs snapshot is still downloading from iCloud. Try again in a moment."
         case .superseded:
             runsLoadError = "Runs refresh was superseded by a sync reconfiguration. Try again."
         case .partial:
-            runsLoadError = "Some Runs data is still downloading from iCloud."
+            runsLoadError = SnapshotHealthLog.damageSentence(for: "runs.json") ?? "Some Runs data is still downloading from iCloud."
         }
     }
 
     func applySyncedRuns(_ next: [RunRecord]) {
         if next != runs { runs = next }
-        if !next.isEmpty { runsLoadError = nil }
+        if !next.isEmpty { runsLoadError = SnapshotHealthLog.damageSentence(for: "runs.json") }
     }
 }
 

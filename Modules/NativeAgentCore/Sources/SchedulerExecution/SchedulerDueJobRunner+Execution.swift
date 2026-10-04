@@ -36,10 +36,10 @@ extension SchedulerDueJobRunner {
             let objective = string(job.payload["objective"]) ?? "Make NativeAgent meaningfully better."
             let run = try await platform.startImprovement(objective: objective)
             let runStatus = (run.status ?? "pending").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let status = runStatus == "disabled" ? "skipped" : "completed"
+            let status = runStatus == "disabled" ? "skipped" : "warn"
             let detail = runStatus == "disabled"
                 ? "self-improvement disabled"
-                : "improvement run \(run.id) staged"
+                : "improvement run \(run.id) \(runStatus); no execution occurred"
             return JobResult(
                 status: status,
                 detail: detail,

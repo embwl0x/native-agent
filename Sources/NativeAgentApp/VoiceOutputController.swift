@@ -89,8 +89,6 @@ final class VoiceOutputController: NSObject {
     private(set) var speechGeneration: Int = 0
     private let openAISynthesis: OpenAISynthesis
     private let audioPlayerFactory: (Data) throws -> AVAudioPlayer
-    // Weak back-reference for app runtime settings, set by ChatView on init.
-    var nativeBaseURL: String = ""
 
     override convenience init() {
         self.init(openAISynthesis: Self.liveOpenAISynthesis)
@@ -205,16 +203,6 @@ final class VoiceOutputController: NSObject {
         audioPlayer = nil
         isSpeaking = false
         speechOwnerID = nil
-    }
-
-    func pause() {
-        synthesizer?.pauseSpeaking(at: .word)
-        audioPlayer?.pause()
-    }
-
-    func resume() {
-        synthesizer?.continueSpeaking()
-        audioPlayer?.play()
     }
 
     // MARK: Private
@@ -373,22 +361,25 @@ extension VoiceOutputController: AVSpeechSynthesizerDelegate {
 
 extension VoiceOutputController: AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        // Wave 35 W18: superseded players have their delegate detached in
-        // stop()/speakOpenAI before replacement, so only the CURRENT player ever
-        // reaches here — no identity comparison needed (and capturing the
-        // non-Sendable player into the @MainActor hop would be a Swift 6 race).
+        // Delegate detachment cannot retract a callback already queued.
+        let playerID = ObjectIdentifier(player)
         Task { @MainActor in
+            guard self.audioPlayer.map(ObjectIdentifier.init) == playerID else { return }
             self.audioPlayer = nil
             self.isSpeaking = false
         }
     }
 
     nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-        let message = error?.localizedDescription
+        let playerID = ObjectIdentifier(player)
+        let message = error?.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         Task { @MainActor in
+            guard self.audioPlayer.map(ObjectIdentifier.init) == playerID else { return }
             self.audioPlayer = nil
-            self.errorMessage = message
+            self.errorOwnerID = self.speechOwnerID
+            self.errorMessage = message.flatMap { $0.isEmpty ? nil : $0 } ?? "The audio couldn't be played."
             self.isSpeaking = false
+            self.speechOwnerID = nil
         }
     }
 }

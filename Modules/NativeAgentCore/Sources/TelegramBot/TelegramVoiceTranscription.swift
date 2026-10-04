@@ -1,6 +1,8 @@
 @preconcurrency import AVFoundation
 @preconcurrency import Speech
 import Foundation
+import Darwin
+import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
@@ -21,6 +23,7 @@ public struct TelegramVoiceTranscription: Sendable, Codable, Equatable {
 }
 
 public protocol TelegramVoiceTranscribing: Sendable {
+    var hasSpeechPermission: Bool { get }
     func transcribe(_ attachment: TelegramMediaAttachment) async throws -> TelegramVoiceTranscription
 }
 
@@ -64,6 +67,68 @@ private final class TelegramAVExportSessionBox: @unchecked Sendable {
     init(_ export: AVAssetExportSession) {
         self.export = export
     }
+}
+
+private final class TelegramFFmpegCapture: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "TelegramFFmpeg.stderr")
+    private let reader: FileHandle
+    private let source: DispatchSourceRead
+    private var bytes = Data()
+    private var ended = false
+
+    init(_ reader: FileHandle) throws {
+        self.reader = reader
+        let fd = reader.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg stderr could not be opened")
+        }
+        source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in self?.drain() }
+        source.setCancelHandler { try? reader.close() }
+        source.resume()
+    }
+
+    private func drain() {
+        guard !ended else { return }
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = Darwin.read(reader.fileDescriptor, &chunk, chunk.count)
+            if count > 0 {
+                let room = max(0, 64 * 1024 - bytes.count)
+                bytes.append(contentsOf: chunk.prefix(min(count, room)))
+            } else if count < 0, errno == EINTR {
+                continue
+            } else {
+                if count == 0 || (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    ended = true
+                    source.cancel()
+                }
+                break
+            }
+        }
+    }
+
+    func finish() -> Data {
+        queue.sync {
+            drain()
+            source.cancel()
+            return bytes
+        }
+    }
+}
+
+private final class TelegramFFmpegCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    let wake = DispatchSemaphore(value: 0)
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+        wake.signal()
+    }
+
+    var isCancelled: Bool { lock.withLock { cancelled } }
 }
 
 private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
@@ -282,44 +347,87 @@ enum TelegramVoiceAudioPreparer {
     }
 
     private static func transcodeWithFFmpeg(ffmpeg: URL, input: URL, output: URL) async throws {
-        try await Task.detached(priority: .utility) {
-            let process = Process()
-            process.executableURL = ffmpeg
-            process.arguments = [
-                "-hide_banner",
-                "-loglevel", "error",
-                "-y",
-                "-i", input.path,
-                "-vn",
-                "-acodec", "aac",
-                "-b:a", "96k",
-                output.path,
-            ]
-            let errorPipe = Pipe()
-            process.standardError = errorPipe
-            do {
-                try process.run()
-            } catch {
-                throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg failed to start: \(error.localizedDescription)")
+        try Task.checkCancellation()
+        let cancellation = TelegramFFmpegCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                Thread {
+                    do {
+                        try transcodeWithFFmpegBlocking(ffmpeg: ffmpeg, input: input, output: output, cancellation: cancellation)
+                        continuation.resume()
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }.start()
             }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30) {
-                if process.isRunning {
-                    process.terminate()
-                }
+        } onCancel: {
+            cancellation.cancel()
+        }
+        try Task.checkCancellation()
+    }
+
+    private static func transcodeWithFFmpegBlocking(
+        ffmpeg: URL, input: URL, output: URL, cancellation: TelegramFFmpegCancellation
+    ) throws {
+        if cancellation.isCancelled { throw CancellationError() }
+        let process = Process()
+        process.executableURL = ffmpeg
+        process.arguments = [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", input.path,
+            "-vn",
+            "-acodec", "aac",
+            "-b:a", "96k",
+            output.path,
+        ]
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        process.standardOutput = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        let capture = try TelegramFFmpegCapture(errorPipe.fileHandleForReading)
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            exited.signal()
+            cancellation.wake.signal()
+        }
+        do {
+            try process.run()
+            try? errorPipe.fileHandleForWriting.close()
+        } catch {
+            try? errorPipe.fileHandleForWriting.close()
+            _ = capture.finish()
+            throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg failed to start: \(error.localizedDescription)")
+        }
+        let pid = process.processIdentifier
+        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(pid)
+        let timedOut = cancellation.wake.wait(timeout: .now() + .seconds(30)) == .timedOut
+        if process.isRunning {
+            let tree = ProcessTreeReaper.snapshot(rootPID: pid)
+            ProcessTreeReaper.signal(tree, signal: SIGTERM)
+            let graceExpired = exited.wait(timeout: .now() + .milliseconds(200)) == .timedOut
+            let remaining = ProcessTreeReaper.snapshot(rootPID: pid, retaining: tree)
+            if graceExpired || ProcessTreeReaper.hasLiveDescendant(in: remaining) {
+                ProcessTreeReaper.quiesceAndKill(remaining)
             }
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                let message = String(data: errorData, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                throw TelegramVoiceTranscriptionError.conversionFailed(
-                    "ffmpeg exited \(process.terminationStatus)\(message.map { ": \($0)" } ?? "")"
-                )
-            }
-            guard FileManager.default.fileExists(atPath: output.path) else {
-                throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg did not write output audio")
-            }
-        }.value
+        }
+        process.waitUntilExit()
+        let errorData = capture.finish()
+        if cancellation.isCancelled { throw CancellationError() }
+        if timedOut {
+            throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg timed out")
+        }
+        guard process.terminationStatus == 0 else {
+            let message = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw TelegramVoiceTranscriptionError.conversionFailed(
+                "ffmpeg exited \(process.terminationStatus)\(message.map { ": \($0)" } ?? "")"
+            )
+        }
+        guard FileManager.default.fileExists(atPath: output.path) else {
+            throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg did not write output audio")
+        }
     }
 }
 
@@ -328,6 +436,7 @@ enum TelegramVoiceAudioPreparer {
 /// recognition because SFSpeechRecognizer consumes file URLs in system audio
 /// formats, not raw Telegram voice-note containers.
 public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
+    public var hasSpeechPermission: Bool { speechAuthorizationStatus() == .authorized }
     private let localeIdentifier: String
     private let preferOnDevice: Bool
     private let timeoutNanoseconds: UInt64

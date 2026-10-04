@@ -723,11 +723,11 @@ extension SwiftToolDispatcher {
     func impl_image_generate(input: [String: JSONValue], surface: String = "unknown") async -> JSONValue {
         let admitted = await fullMacYoloAdmitted(tool: "image_generate", surface: surface)
         return await ImageGenerationAdmission.$fullMacAdmitted.withValue(admitted) {
-            await impl_admitted_image_generate(input: input)
+            await impl_admitted_image_generate(input: input, surface: surface)
         }
     }
 
-    private func impl_admitted_image_generate(input: [String: JSONValue]) async -> JSONValue {
+    private func impl_admitted_image_generate(input: [String: JSONValue], surface: String) async -> JSONValue {
         let input = input.filter {
             if case .string(let text) = $0.value { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             return true
@@ -797,7 +797,7 @@ extension SwiftToolDispatcher {
                 for key in ["previous_response_id", "num_last_images_to_include", "mask", "input_fidelity", "output_compression"] where input[key] != nil && input[key] != .null {
                     throw ImageGenerationToolError.unsupportedControl("\(key) is not exposed by the Codex OAuth route. Continue edits by supplying the last artifact in referenced_image_paths.")
                 }
-                let references = try await imageGenerationReferences(input["referenced_image_paths"])
+                let references = try await imageGenerationReferences(input["referenced_image_paths"], surface: surface)
                 let request = try CodexImageGenerationRequest(
                     prompt: prompt,
                     size: jsonString(input["size"]),
@@ -899,25 +899,29 @@ extension SwiftToolDispatcher {
         return .object(object)
     }
 
-    func imageGenerationReferences(_ value: JSONValue?) async throws -> [CodexImageReference] {
+    func imageGenerationReferences(_ value: JSONValue?, surface: String) async throws -> [CodexImageReference] {
         guard let value, value != .null else { return [] }
         guard case .array(let paths) = value, paths.count <= 4 else {
             throw ImageGenerationToolError.unsupportedControl("referenced_image_paths must be an array of at most four local image paths.")
         }
         var references: [CodexImageReference] = []
         var bytes = 0
+        let fullMacReadAllowed = await fullMacToolAccess(surface: surface).fileOpsAllowed
         for path in paths {
-            guard case .string(let path) = path, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard case .string(let rawPath) = path, !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ImageGenerationToolError.unsupportedControl("Each referenced_image_paths entry must be a nonempty local path.")
             }
             // Existing generated attachments are the tool's own output surface.
             // Permit only its canonical subtree, with symlinks unable to escape it.
             let artifactRoot = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
                 .appendingPathComponent("generated_images", isDirectory: true)
-            let candidate = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            let path = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            let candidate = URL(fileURLWithPath: Self.normalizeFullMacPathArgument(path))
                 .standardizedFileURL.resolvingSymlinksInPath()
             let url: URL
             if (path.hasPrefix("/") || path.hasPrefix("~")), candidate.path.hasPrefix(artifactRoot.path + "/") {
+                url = candidate
+            } else if fullMacReadAllowed, path.hasPrefix("/") || path.hasPrefix("~") {
                 url = candidate
             } else {
                 url = try await resolveTrustedFilePath(path)
@@ -965,7 +969,7 @@ extension SwiftToolDispatcher {
                 "byteSize": .int(Int64(image.data.count)),
             ]
             if let revised = image.revisedPrompt, !revised.isEmpty {
-                row["revisedPrompt"] = .string(ChatSecretRedactor.redactText(String(revised.prefix(1_000))))
+                row["revisedPrompt"] = .string(String(ChatSecretRedactor.redactText(revised).prefix(1_000)))
             }
             imageRows.append(.object(row))
         }
@@ -976,7 +980,7 @@ extension SwiftToolDispatcher {
             "provider": .string("openai_api"),
             "model": .string(result.model),
             "createdAt": .string(createdAt),
-            "promptPreview": .string(ChatSecretRedactor.redactText(String(prompt.prefix(1_000)))),
+            "promptPreview": .string(String(ChatSecretRedactor.redactText(prompt).prefix(1_000))),
             "size": request.size.map { .string($0) } ?? .null,
             "quality": request.quality.map { .string($0) } ?? .null,
             "outputFormat": .string(request.outputFormat),
@@ -1037,7 +1041,7 @@ extension SwiftToolDispatcher {
             "provider": .string(provider),
             "model": .string(result.model),
             "createdAt": .string(createdAt),
-            "promptPreview": .string(ChatSecretRedactor.redactText(String(prompt.prefix(1_000)))),
+            "promptPreview": .string(String(ChatSecretRedactor.redactText(prompt).prefix(1_000))),
             "size": request.size.map { .string($0) } ?? .null,
             "quality": request.quality.map { .string($0) } ?? .null,
             "outputFormat": .string(request.outputFormat),
@@ -1112,10 +1116,10 @@ extension SwiftToolDispatcher {
             }
         }
         if !result.reply.isEmpty {
-            receipt["codexReply"] = .string(ChatSecretRedactor.redactText(String(result.reply.prefix(2_000))))
+            receipt["codexReply"] = .string(String(ChatSecretRedactor.redactText(result.reply).prefix(2_000)))
         }
         if !result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            receipt["codexStderrPreview"] = .string(ChatSecretRedactor.redactText(String(result.stderr.prefix(2_000))))
+            receipt["codexStderrPreview"] = .string(String(ChatSecretRedactor.redactText(result.stderr).prefix(2_000)))
         }
 
         let receiptPath = receiptsDir.appendingPathComponent("\(result.runId).json", isDirectory: false)

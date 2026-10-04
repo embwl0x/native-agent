@@ -8,16 +8,54 @@ extension ChatStore {
     // by taking the oldest pending placeholder) and updates it.
     func receiveICloudReply(_ msg: BridgeMessage) {
         guard msg.sender == "mac" else { return }  // only accept Mac replies
-        if let correlationID = msg.correlationID, resolvedICloudReplyIds.contains(correlationID) {
-            return
+        // The bridge records receipts as seen before dispatch. Settle offscreen
+        // exchanges before the session-switch guards can drop their only receipt.
+        if let correlationID = msg.correlationID,
+           let record = pendingExchanges[correlationID],
+           record.sessionID != Self.cleanSessionID(selectedSessionID) {
+            let kind = msg.metadata?["kind"]
+            if kind == nil || kind == "reply" || kind == "final" || kind == "error" || kind == "cancelled" {
+                var cached = loadCachedMessages(for: record.sessionID)
+                let text: String
+                if kind == "cancelled" {
+                    text = "(stopped)"
+                } else if kind == "error" {
+                    let detail = msg.metadata?["errorDetail"] ?? msg.text
+                    let explanation = detail.isEmpty ? msg.text : detail
+                    text = explanation.isEmpty ? "(I hit an error answering that message)" : String(explanation.prefix(600))
+                } else {
+                    text = msg.text
+                }
+                let reply = ChatMessage(
+                    id: record.placeholderID,
+                    role: .assistant,
+                    text: text,
+                    attachments: attachmentSummaries(from: msg.attachments),
+                    awaitingMacTranscript: true
+                )
+                if let index = cached.firstIndex(where: { $0.id == record.placeholderID }) {
+                    cached[index] = reply
+                } else {
+                    cached.append(reply)
+                }
+                let envelope = CachedTranscript(
+                    schemaVersion: 2,
+                    sessionID: record.sessionID,
+                    messages: cachedTranscriptRows(cached),
+                    appliedTranscriptGeneration: record.sessionID.flatMap { appliedTranscriptGenerations[$0] }
+                )
+                do {
+                    let data = try JSONEncoder().encode(envelope)
+                    defaults.set(data, forKey: transcriptStorageKey(for: record.sessionID))
+                } catch {
+                    errorBanner = error.localizedDescription
+                    return
+                }
+                cancelReplyWaits(for: correlationID)
+                markICloudReplyResolved(correlationID)
+                return
+            }
         }
-        // ...with one exception, checked first. A signed expiry has no
-        // backstop: the bridge durably records this message as seen before it
-        // dispatches, so an expiry the session guard below drops is never said
-        // again, and the durable record for that other session stays open —
-        // restoring later as an exchange that can never settle. Settle it
-        // against pendingExchanges by correlation here; that chat rebuilds its
-        // bubble ("wasn't started · Send now") from the record when selected.
         if msg.metadata?["kind"] == "rejection",
            let correlationID = msg.correlationID,
            let record = pendingExchanges[correlationID],
@@ -38,6 +76,9 @@ extension ChatStore {
                 closePendingExchange(correlationID)
             }
             markICloudReplyResolved(correlationID)
+            return
+        }
+        if let correlationID = msg.correlationID, resolvedICloudReplyIds.contains(correlationID) {
             return
         }
         // Session ownership is checked before dispatching ANY event kind. New
@@ -101,7 +142,8 @@ extension ChatStore {
                     placeholderText: explanation.isEmpty
                         ? "(I hit an error answering that message)"
                         : String(explanation.prefix(600)),
-                    banner: explanation
+                    banner: explanation,
+                    awaitingMacTranscript: true
                 )
             } else {
                 errorBanner = detail.isEmpty ? msg.text : detail
@@ -111,18 +153,16 @@ extension ChatStore {
         // F7 P0 #3: explicit cancelled kind. Resolve the placeholder, clear
         // the spinner, but don't surface an error banner.
         if msg.metadata?["kind"] == "cancelled" {
-            var matchedActivePlaceholder = false
             if let correlationID = msg.correlationID,
                let placeholderId = pendingICloudPlaceholders.removeValue(forKey: correlationID) {
-                matchedActivePlaceholder = true
                 cancelReplyWaits(for: correlationID)
                 streamingHintsByMessageId.removeValue(forKey: placeholderId)
                 markICloudReplyResolved(correlationID)
                 if messages.contains(where: { $0.id == placeholderId }) {
-                    finishPlaceholder(id: placeholderId, text: "(stopped)")
+                    finishPlaceholder(id: placeholderId, text: "(stopped)", awaitingMacTranscript: true)
                 }
+                releaseLoading(for: placeholderId)
             }
-            if matchedActivePlaceholder && pendingICloudPlaceholders.isEmpty { isLoading = false }
             return
         }
         // F7 P2: tool events are progress-style; route to the existing
@@ -168,9 +208,9 @@ extension ChatStore {
             markICloudReplyResolved(correlationID)
             if messages.contains(where: { $0.id == placeholderId }) {
                 // finishPlaceholder plays the soft "reply landed" haptic here.
-                finishPlaceholder(id: placeholderId, text: msg.text, attachments: replyAttachments)
+                finishPlaceholder(id: placeholderId, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true)
             } else {
-                messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments))
+                messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true))
                 Haptics.replyFinalized()
             }
             onReply?(msg.text)
@@ -179,13 +219,11 @@ extension ChatStore {
             // to the bottom and surface a toast so the late answer is noticed.
             requestScrollToBottom()
             iOSSystemToastCenter.shared.push(info: "Reply arrived")
-            if pendingICloudPlaceholders.isEmpty && timedOutPendingIds.isEmpty {
-                isLoading = false
-            }
+            releaseLoading(for: placeholderId)
             return
         }
         guard !pendingICloudPlaceholders.isEmpty else {
-            messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments))
+            messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true))
             onReply?(msg.text)
             isLoading = false
             return
@@ -195,7 +233,7 @@ extension ChatStore {
             if let placeholderId = pendingICloudPlaceholders[correlationID] {
                 match = (correlationID, placeholderId)
             } else {
-                messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments))
+                messages.append(ChatMessage(role: .assistant, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true))
                 onReply?(msg.text)
                 if pendingICloudPlaceholders.isEmpty {
                     isLoading = false
@@ -231,13 +269,10 @@ extension ChatStore {
             insertPendingUserIfNeeded(pendingId: pendingId, before: placeholderId)
             markICloudReplyResolved(pendingId)
             if messages.contains(where: { $0.id == placeholderId }) {
-                finishPlaceholder(id: placeholderId, text: msg.text, attachments: replyAttachments)
+                finishPlaceholder(id: placeholderId, text: msg.text, attachments: replyAttachments, awaitingMacTranscript: true)
                 onReply?(msg.text)
             }
-            // If this was the last pending placeholder, clear the loading spinner.
-            if pendingICloudPlaceholders.isEmpty {
-                isLoading = false
-            }
+            releaseLoading(for: placeholderId)
         }
     }
 
@@ -353,7 +388,7 @@ extension ChatStore {
             }
             // A tool firing is real progress — clear any stale "Typing"/waiting
             // hint so the flip-box, not the hint line, drives the UI.
-            noteEvidencedActivity(correlationID: correlationID, activity: clean)
+            noteEvidencedActivity(correlationID: correlationID, activity: ToolActivityPresentation.progress(clean))
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
         } else if kind != "tool_result" {
             // The Mac evidenced this activity; the waiting line ages from here
@@ -570,18 +605,18 @@ extension ChatStore {
     /// only thing that changes is the status word.
     private func fireTimeout(pendingId: String, placeholderId: UUID) {
         guard pendingICloudPlaceholders[pendingId] != nil else { return }
-        _ = placeholderId
         notePendingExchangeSilent(correlationID: pendingId)
         // Release the composer — the person can say something else while this
         // request keeps being watched — but keep the bubble waiting.
-        isLoading = false
+        releaseLoading(for: placeholderId)
     }
 
     private func failPendingReply(
         pendingId: String,
         placeholderId: UUID,
         placeholderText: String,
-        banner: String
+        banner: String,
+        awaitingMacTranscript: Bool = false
     ) {
         cancelReplyWaits(for: pendingId)
         pendingICloudPlaceholders.removeValue(forKey: pendingId)
@@ -592,14 +627,14 @@ extension ChatStore {
         // need to clear the text_delta seq tracker so the map stays bounded
         // and any straggler deltas for this correlation get dropped.
         maxDeltaSeqByCorrelation.removeValue(forKey: pendingId)
-        finishPlaceholder(id: placeholderId, text: placeholderText, success: false)
+        finishPlaceholder(id: placeholderId, text: placeholderText, success: false, awaitingMacTranscript: awaitingMacTranscript)
         errorBanner = banner
-        isLoading = false
+        releaseLoading(for: placeholderId)
     }
 
-    func markICloudReplyResolved(_ pendingId: String) {
+    func markICloudReplyResolved(_ pendingId: String, discardRetainedSend: Bool = true) {
         resolvedICloudReplyIds.insert(pendingId)
-        queuedSends.removeAll { $0.id.uuidString == pendingId }
+        if discardRetainedSend { queuedSends.removeAll { $0.id.uuidString == pendingId } }
         // PATCH-2026-05-30: this correlation's stream is over — drop its
         // text_delta seq tracker so the map stays bounded across long
         // sessions. Late deltas for it will be dropped on the dispatcher.
@@ -620,7 +655,8 @@ extension ChatStore {
         id placeholderId: UUID,
         text: String,
         attachments: [ChatAttachmentSummary] = [],
-        success: Bool = true
+        success: Bool = true,
+        awaitingMacTranscript: Bool = false
     ) {
         // Final text wins instantly — never make the user wait on the
         // typewriter to catch up to an already-complete reply.
@@ -631,6 +667,7 @@ extension ChatStore {
         updated.text = text
         updated.attachments = attachments
         updated.isStreaming = false
+        updated.awaitingMacTranscript = awaitingMacTranscript
         messages[idx] = updated
         // phase 6: soft confirmation tap once the reply lands — one per turn,
         // never per typewriter tick (this is the single finalize site). Only

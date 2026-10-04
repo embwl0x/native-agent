@@ -22,7 +22,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -42,86 +41,11 @@ import Connectors
 import Browser
 
 extension NativeClient {
-    // Swift-owned Codex device-auth subprocess lifecycle.
-    func getCodexDeviceLoginStatus() async throws -> CodexDeviceLogin {
-        try await Self.codexDeviceLoginManager.status(codexHome: Self.codexDeviceLoginHome())
-    }
-
-    func getLatestContextReceipt(sessionId: String) async throws -> ContextReceipt {
-        try await Self.getLatestContextReceipt(
-            sessionId: sessionId,
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-    }
-
-    static func getLatestContextReceipt(
-        sessionId: String,
-        dataRoot: URL
-    ) async throws -> ContextReceipt {
-        try await RuntimeReadProjection.getLatestContextReceipt(sessionId: sessionId, dataRoot: dataRoot)
-    }
-
-    func verifyCodex() async throws -> CodexCheckResponse {
-        try await Self.verifyCodex(dataRoot: PersistenceCore.defaultDataRoot())
-    }
-
-    static func verifyCodex(dataRoot: URL) async throws -> CodexCheckResponse {
-        try await ProviderReadProjection.verifyCodex(dataRoot: dataRoot)
-    }
-
-    func openCodexLoginInBrowser() async throws -> CodexDeviceLogin {
-        try await Self.codexDeviceLoginManager.start(codexHome: Self.codexDeviceLoginHome(), openBrowser: true)
-    }
-
-    @discardableResult
-    func cancelCodexDeviceLogin() async throws -> CodexDeviceLogin {
-        try await Self.codexDeviceLoginManager.cancel(codexHome: Self.codexDeviceLoginHome())
-    }
-
-    @discardableResult
-    func codexDeviceLoginClear() async throws -> CodexDeviceLogin {
-        try await Self.codexDeviceLoginManager.clear(codexHome: Self.codexDeviceLoginHome())
-    }
-
-    static func codexDeviceLoginHome() -> URL {
-        codexDeviceLoginHome(dataRoot: PersistenceCore.defaultDataRoot())
-    }
-
-    static func codexDeviceLoginHome(dataRoot: URL) -> URL {
-        dataRoot
-            .appendingPathComponent("codex_home", isDirectory: true)
-    }
-
     func getCompiledPersonality(surface: String) async throws -> CompiledPersonality {
-        // WAVE 35 W01 (§6.116 prereq #1): missing-doc default-value
-        // PERSISTENCE on the compiled-packet path. The daemon's
-        // `compiled_personality_packet`
-        // calls `personality_doc_contents(create_missing=True)`, which
-        // atomically WRITES the default body for any missing mutable fixed doc
-        // once SOUL.md exists — BEFORE reading the file back to build the
-        // packet. USER.md is skipped here because MemoryV2 owns it.
-        //
-        // The Swift `compiledPacket` read path (PersonaEngine+CompiledPacket.swift
-        // `readPersonaDocContents`) is pure: a missing doc reads as "",
-        // so its fingerprint diverges from the daemon's whenever SOUL.md
-        // exists but a sibling doc is absent (documented divergence at
-        // PersonaEngine+CompiledPacket.swift L115-124). Wave 34 W05 closed
-        // this same gap on the `/v1/personality/docs` path; this mirrors
-        // it on `/v1/personality/compiled`.
-        //
-        // Gate the WRITE on the dedicated `.personaEngineWrites` flag (NOT
-        // the read flag `.personaEngine`), exactly as W05 does: a read must
-        // never mutate disk while only the read flag is live. Scaffold
-        // first, then build the packet, so the fingerprint reflects the
-        // just-persisted default body — matching the daemon's
-        // write-then-read order. A scaffold IO failure PROPAGATES (not
-        // `try?`-swallowed): the daemon's `personality_doc_contents` calls
-        // `_atomic_write_text` with no try/except, so a failed write fails
-        // the compiled read; mirror that rather than silently returning an
-        // in-memory packet over an un-scaffolded disk (which would let the
-        // next daemon read scaffold UNLOCKED, the race this closes). When
-        // the write flag is OFF the scaffold never runs and the compiled
-        // read stays pure (production read-flag-only path unchanged).
+        // Scaffold missing fixed persona docs before compiling so the packet
+        // reflects persisted defaults. PersonaEngine requires SOUL.md first,
+        // skips USER.md (owned by MemoryV2), and locks each write. Scaffold
+        // failures propagate; there are no rollout flags around this read.
         do {
             let writer: any PersonaEngineWriting = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? makePersonaEngineWriter()
             try await writer.scaffoldMissingDocs()
@@ -129,34 +53,10 @@ extension NativeClient {
         return try await swiftCompiledPersonality(surface: surface)
     }
 
-    // Wave 3 fixup: Core now exposes `listPersonaDocSpecs()` returning the
-    // wire-shape DTO (id/title/filename/path/content/updatedAt), so the
-    // .personaEngine flag covers doc listing too. The NativeClient adapter
-    // (`swiftPersonalityDocs`) is a trivial field-for-field map from
-    // PersonaDocSpec to NativeAgentShared.PersonalityDoc.
     func getPersonalityDocs() async throws -> PersonalityDocsResponse {
-        // WAVE 34 W05: missing-doc default-value PERSISTENCE. The daemon's
-        // `personality_docs()` calls `personality_doc_contents(create_missing=True)`,
-        // which atomically WRITES the default body for any missing mutable fixed
-        // doc once SOUL.md exists. USER.md is skipped because MemoryV2 owns it.
-        // The Swift READ path only renders those defaults in-memory
-        // (updatedAt nil) and never persists — so a
-        // flipped write subsystem would leave the next DAEMON read to
-        // scaffold them UNLOCKED, reopening the split-writer race. Mirror
-        // the daemon's scaffold-on-read here, but gate the WRITE on the
-        // dedicated `.personaEngineWrites` flag so it stays DORMANT on the
-        // production read flag `.personaEngine` (a read must never mutate
-        // disk while only the read flag is live). Scaffold first, then list,
-        // so the returned `updatedAt` reflects the just-persisted file —
-        // matching the daemon's read-then-stat order. A scaffold IO failure
-        // PROPAGATES (not `try?`-swallowed): the daemon's
-        // `personality_doc_contents` calls `_atomic_write_text` with no
-        // try/except, so a failed write fails the `/v1/personality/docs`
-        // read — we mirror that exactly rather than silently returning
-        // in-memory defaults while leaving the disk un-scaffolded (which
-        // would let the next daemon read scaffold UNLOCKED, the very race
-        // this closes). When the write flag is OFF, the scaffold never runs
-        // and the read is pure (production read-flag-only path unchanged).
+        // Scaffold before listing so content and updatedAt describe persisted
+        // defaults. As with compiled reads, PersonaEngine gates on SOUL.md,
+        // skips USER.md, locks each write, and propagates scaffold failures.
         do {
             let writer: any PersonaEngineWriting = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? makePersonaEngineWriter()
             try await writer.scaffoldMissingDocs()
@@ -231,7 +131,7 @@ extension NativeClient {
             doctorStatus = Self.supportSnapshotOfflineRollup(report.checks)
         } else {
             let impl = makeDoctorChecks()
-            let statuses = try await impl.runAll(repair: false, checkLLM: false).map(\.status)
+            let statuses = try await impl.runAll(repair: false).map(\.status)
             doctorStatus = Self.supportSnapshotRollup(statuses)
         }
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -252,8 +152,8 @@ extension NativeClient {
     /// `runAll(...)` (the offline core pass) PLUS the app's live-coverage
     /// checks (`live.*`). The cold Support Snapshot uses `runAll` alone, so
     /// dropping exactly the `live.*` checks reproduces its rollup byte-for-byte
-    /// — NOTE the core `runAll` ignores its `checkLLM` flag (the `llm` check is
-    /// always part of the offline pass), so it must NOT be excluded here (B2.6d).
+    /// — the `llm` check is always part of the offline pass, so it must NOT
+    /// be excluded here (B2.6d).
     static func supportSnapshotOfflineRollup(_ checks: [CheckResult]) -> String {
         DoctorStatusProjection.supportSnapshotOfflineRollup(checks)
     }

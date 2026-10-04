@@ -150,6 +150,12 @@ extension MacFourVerbs {
             return Self.obstructedPointReply(screen: before.render)
         }
         let spokenSource = Self.spokenName(source, requestedAs: target)
+        if verb == .drag, source.secret {
+            return MacFourVerbsReply(
+                ok: false, text: "I can't drag from a password field. No input was sent.",
+                detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
+            )
+        }
 
         // fable51 item 32b — TWO ANCHORS. The source has just been resolved in
         // the frontmost window; when `to_app` names somebody else's window the
@@ -194,6 +200,15 @@ extension MacFourVerbs {
             case .ambiguous(let candidates):
                 return ambiguousPhysical(destination, candidates: candidates, screen: before.render)
             }
+            if endTarget.secret {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.destinationIsSecureWords(
+                        destination: Self.spokenName(endTarget, requestedAs: destination)
+                    ),
+                    detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
+                )
+            }
             guard let endFrame = Self.visiblePortion(of: endTarget.frame, within: before.visibleFrame) else {
                 return MacFourVerbsReply(
                     ok: false,
@@ -207,6 +222,14 @@ extension MacFourVerbs {
             guard let end = Self.safeAimPoint(for: endTarget, in: endFrame,
                 describedBy: exactDestinationAlias ? "" : destination) else {
                 return Self.obstructedPointReply(screen: before.render)
+            }
+            let secureFrames = before.targets.filter(\.secret).compactMap(\.frame)
+            guard MacRegionAim.pathIsClear(from: start, to: end, excluding: secureFrames) else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: before.appName ?? "this window"),
+                    detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
+                )
             }
             guard MacRegionAim.pathIsClear(from: start, to: end,
                 excluding: source.excludedFrames + endTarget.excludedFrames) else {
@@ -366,7 +389,7 @@ extension MacFourVerbs {
         //    `type` refuses at, and a drag that merely CROSSES one can
         //    spring-load it open on the way past. Both ends and the line
         //    between them, before anything is raised.
-        if MacCrossAppDrag.isSecureKind(endTarget.kind) {
+        if endTarget.secret {
             return MacFourVerbsReply(
                 ok: false,
                 text: MacCrossAppDrag.destinationIsSecureWords(
@@ -376,7 +399,7 @@ extension MacFourVerbs {
             )
         }
         let secureFrames = (before.targets + anchored.targets)
-            .filter { MacCrossAppDrag.isSecureKind($0.kind) }
+            .filter(\.secret)
             .compactMap(\.frame)
         guard MacRegionAim.pathIsClear(from: start, to: end, excluding: secureFrames) else {
             return MacFourVerbsReply(
@@ -419,6 +442,18 @@ extension MacFourVerbs {
         var dropTarget = endTarget
         var anchoredAfterRaise = anchored
         if raise.needed {
+            guard Self.foregroundRequested else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: "I need the screen because the drop needs \(destinationAppName) in front. Nothing was raised or dragged. "
+                        + "Only use front:true when the task explicitly asks to bring it forward.",
+                    detail: raiseDetail.merging([
+                        "error": .string("needs_front"), "status": .string("needs_front"),
+                        "needs_front_reason": .string(raise.reason),
+                        "raised": .bool(false), "user_front_changed": .bool(false),
+                    ]) { _, new in new }
+                )
+            }
             // gpt-5.5 review — WHAT COVERS THE SOURCE IS THE WINDOW, not the
             // union of the elements read inside it. A window whose title bar,
             // toolbar or blank body sits over `start` publishes no target there,
@@ -552,9 +587,9 @@ extension MacFourVerbs {
             // The secure boundary is re-drawn on the line that will actually be
             // travelled: a raise can bring a password field onto it.
             let rereadSecureFrames = (before.targets + reread.targets)
-                .filter { MacCrossAppDrag.isSecureKind($0.kind) }
+                .filter(\.secret)
                 .compactMap(\.frame)
-            if MacCrossAppDrag.isSecureKind(rereadTarget.kind) {
+            if rereadTarget.secret {
                 return MacFourVerbsReply(
                     ok: false,
                     text: MacCrossAppDrag.destinationIsSecureWords(

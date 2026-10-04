@@ -53,7 +53,8 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                       case .object(let existing) = value else { return true }
                 return jsonString(existing["token"]) != token
             }
-            var entry: [String: JSONValue] = [:]
+            var entry: [String: JSONValue]
+            if case .object(let existing)? = root[deviceId] { entry = existing } else { entry = [:] }
             entry["deviceId"] = .string(deviceId)
             entry["token"] = .string(token)
             entry["environment"] = .string(environment)
@@ -92,6 +93,59 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         return object
     }
 
+    static func storeWorkActivityRegistration(
+        deviceID: String, enabled: Bool, environment: String, bundleID: String,
+        startToken: String?, workID: String?, activityToken: String?,
+        observedWorkIDs: Set<String>?, dataRoot: URL
+    ) async throws {
+        let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
+        let lock = dataRoot.appendingPathComponent("notifications/push-token-registration")
+        let pairing = try PairingSecretManager.existingSecretBase64()
+        guard let pairing, !deviceID.isEmpty, !bundleID.isEmpty else {
+            throw CocoaError(.validationMissingMandatoryProperty)
+        }
+        let fingerprint = WorkActivityPushRegistration.fingerprint(pairing)
+        let persistence = SwiftNativePersistenceCore()
+        try await persistence.withFileLock(lock) {
+            var root = try readObjectStore(path)
+            var entry: [String: JSONValue]
+            if case .object(let existing)? = root[deviceID] { entry = existing } else { entry = [:] }
+            var registration = try WorkActivityPushRegistration.read(entry["workActivity"])
+                ?? WorkActivityPushRegistration(pairing: fingerprint, environment: environment, bundleID: bundleID)
+            if registration.pairing != fingerprint {
+                registration = WorkActivityPushRegistration(pairing: fingerprint, environment: environment, bundleID: bundleID)
+            }
+            registration.enabled = enabled
+            registration.environment = environment
+            registration.bundleID = bundleID
+            if !enabled {
+                registration.startToken = nil
+                registration.activityTokens.removeAll()
+                registration.lastContents.removeAll()
+                // Revoking opt-in does not establish whether an unknown start happened.
+                registration.startOutcomes = registration.startOutcomes?.filter { $0.value == .unknown || $0.value == .notObserved }
+                registration.startedIDs = Set(registration.startOutcomes?.keys.map { $0 } ?? [])
+            } else {
+                if let startToken { registration.startToken = startToken }
+                if let observedWorkIDs {
+                    for (id, outcome) in registration.startOutcomes ?? [:] where outcome == .unknown || outcome == .notObserved {
+                        // Absence on foreground is an observation, not proof of rejection.
+                        // Keep the reservation even when ActivityKit has no matching activity.
+                        registration.startOutcomes?[id] = observedWorkIDs.contains(id) ? .observed : .notObserved
+                    }
+                }
+                if let workID {
+                    if let activityToken { registration.activityTokens[workID] = activityToken }
+                    registration.startedIDs.insert(workID)
+                    if registration.startOutcomes?[workID] != nil { registration.startOutcomes?[workID] = .observed }
+                }
+            }
+            entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
+            root[deviceID] = .object(entry)
+            try await persistence.writeJSON(.object(root), to: path)
+        }
+    }
+
     private static func readArrayStore(_ path: URL) throws -> [JSONValue] {
         guard FileManager.default.fileExists(atPath: path.path) else { return [] }
         let value = try JSONValue.parse(Data(contentsOf: path))
@@ -116,6 +170,9 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
         if predictDelivery {
             await beginDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
+        }
+        if userInfo["source"] == "requested_result" {
+            return try await sendRequestedResult(title: notificationTitle, body: body, userInfo: userInfo, eventID: eventID)
         }
         var eventUserInfo = userInfo
         eventUserInfo["eventId"] = eventID
@@ -171,6 +228,30 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             ])
         }
         return receipt
+    }
+
+    /// One signed notification record owns the visible result. APNS wakes its
+    /// reader after publication, and retries reuse identical signed bytes.
+    private func sendRequestedResult(title: String, body: String, userInfo: [String: String],
+                                     eventID: String) async throws -> MobileNotificationDeliveryReceipt {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let createdAt = userInfo["resultCreatedAt"], let timestamp = formatter.date(from: createdAt) else {
+            throw NSError(domain: "RequestedResult", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "The result has no valid settlement timestamp."])
+        }
+        var eventInfo = userInfo
+        eventInfo["eventId"] = eventID
+        var metadata = ["kind": "notification", "title": title, "body": body, "directAlertDeviceIDs": "[]"]
+        for (key, value) in eventInfo { metadata["userInfo.\(key)"] = value }
+        let message = try await sync.bridge.sendChatMessage(
+            text: body, metadata: metadata, messageID: eventID, timestamp: timestamp
+        )
+        let wake = await sync.apns.sendNotification(title: title, body: body, userInfo: eventInfo)
+        // A wake is not visual acceptance. The receipt truth is the signed
+        // record queued for the phone's existing notification reader.
+        return MobileNotificationDeliveryReceipt(bridgeMessageID: message.id, bridgeError: nil,
+            apnsReceipts: [], apnsErrors: wake.errors, eventID: eventID)
     }
 
     public func beginDeliveryPrediction(eventID: String, source: String) async {

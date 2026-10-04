@@ -19,7 +19,12 @@ struct BotsShelfView: View {
         let visible: Bool
         let records: [UUID]
     }
+    private struct TranscriptWatchIdentity: Equatable {
+        let visible: Bool
+        let sessionID: String
+    }
     @State var activeIDs: Set<UUID> = []
+    @State var queuedIDs: Set<UUID> = []
     @State private var editing = false
     @State private var editedBot: BotDefinition?
     @State private var notice: String?
@@ -138,7 +143,7 @@ struct BotsShelfView: View {
     static let makeABotDraft = "Help me keep up with something regularly."
 
     private func state(_ record: BotsShelfRecord) -> BotState {
-        BotState(record: record, running: activeIDs.contains(record.id))
+        BotState(record: record, running: activeIDs.contains(record.id), queued: queuedIDs.contains(record.id))
     }
 
     /// One glass card per bot: the mark, the name, the brief, one caption.
@@ -246,7 +251,15 @@ struct BotsShelfView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     HStack(spacing: 8) {
-                        Button("Run once") { perform { _ = try BotRunQueue(dataRoot: root).enqueueRequest(bot: record.id); notice = "Run queued." } }
+                        Button("Run once") {
+                            Task {
+                                do {
+                                    _ = try await BotRunConversation.enqueueRequestedCheck(botID: record.id, dataRoot: root)
+                                    notice = "Run queued."
+                                    reload()
+                                } catch { notice = error.localizedDescription }
+                            }
+                        }
                         // Pause has nothing to stop on a manual bot with no event.
                         if record.definition.cadence != .manual || record.definition.eventTrigger != nil || record.definition.paused {
                             Button(record.definition.paused ? "Resume" : "Pause") {
@@ -296,19 +309,27 @@ struct BotsShelfView: View {
                 // is the one thing the tint never does. Publish the block as
                 // the punched-out band, exactly as the chat transcript does.
                 .moodTintProseGuard()
-                .task(id: isVisible && sessionOpen) {
+                .task(id: TranscriptWatchIdentity(visible: isVisible && sessionOpen, sessionID: record.definition.sessionID)) {
                     guard isVisible && sessionOpen else { return }
-                    messagesLoading = true
-                    messagesError = nil
-                    do {
-                        let loaded = try await appModel.engine.transcripts.loadMessages(sessionId: record.definition.sessionID, cached: true)
-                        guard !Task.isCancelled else { return }
-                        messages = loaded
-                    } catch {
-                        guard !Task.isCancelled else { return }
-                        messagesError = "Messages could not be loaded. Close and reopen this section to try again. \(error.localizedDescription)"
-                    }
-                    messagesLoading = false
+                    let sessionID = record.definition.sessionID
+                    let path = root.appendingPathComponent("chat/messages/\(sessionID).jsonl")
+                    let events = FileChangeEvents(paths: [path], emitInitial: true)
+                    await withTaskCancellationHandler {
+                        for await _ in events.stream {
+                            guard !Task.isCancelled else { break }
+                            messagesLoading = true
+                            messagesError = nil
+                            do {
+                                let loaded = try await appModel.engine.transcripts.loadMessages(sessionId: sessionID, cached: true)
+                                guard !Task.isCancelled else { break }
+                                messages = loaded
+                            } catch {
+                                guard !Task.isCancelled else { break }
+                                messagesError = "Messages could not be loaded. Close and reopen this section to try again. \(error.localizedDescription)"
+                            }
+                            messagesLoading = false
+                        }
+                    } onCancel: { events.cancel() }
                 }
             }
             .frame(maxWidth: 760, alignment: .leading).padding(.bottom, 20)
@@ -353,14 +374,15 @@ struct BotsShelfView: View {
         do {
             let loaded = try await Task.detached(priority: .userInitiated) {
                 (records: try Self.readRecords(root: root, unattended: allowed),
-                 active: try BotRunQueue(dataRoot: root).activeOrQueuedIDs())
+                 runs: try BotRunQueue(dataRoot: root).activeAndQueuedIDs())
             }.value
             // Most reloads in a burst find the same shelf. Publishing only what
             // actually changed keeps SwiftUI from re-laying out every card —
             // and keeps the file watcher above (keyed on the record ids) from
             // restarting for nothing.
             if records != loaded.records { records = loaded.records }
-            if activeIDs != loaded.active { activeIDs = loaded.active }
+            if activeIDs != loaded.runs.active { activeIDs = loaded.runs.active }
+            if queuedIDs != loaded.runs.queued { queuedIDs = loaded.runs.queued }
             shelfLoaded = true
             shelfError = nil
         } catch { shelfError = "Helpers could not be loaded. Reopen Bots to try again. \(error.localizedDescription)" }
@@ -641,10 +663,13 @@ struct BotState {
     let word: String
     let color: Color
     let running: Bool
+    let queued: Bool
 
-    init(record: BotsShelfRecord, running: Bool) {
+    init(record: BotsShelfRecord, running: Bool, queued: Bool) {
         self.running = running
+        self.queued = queued
         if running { word = "Running"; color = NativeAgentShell.calm; return }
+        if queued { word = "Queued"; color = NativeAgentShell.secondary; return }
         if record.definition.paused { word = "Paused"; color = NativeAgentShell.tertiary; return }
         guard let latest = record.sortedEntries.first else { word = "New"; color = NativeAgentShell.secondary; return }
         switch latest.runtimeStatus {
@@ -801,6 +826,8 @@ struct BotRow: View {
         var parts: [String] = []
         if state.running {
             parts.append("running now")
+        } else if state.queued {
+            parts.append("queued")
         } else if let latest = record.sortedEntries.first {
             let when = BotsShelfRecord.shortDate(latest.runAt)
             switch latest.runtimeStatus {

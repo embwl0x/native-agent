@@ -29,6 +29,7 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
     /// an appearance.
     public let aliases: [String]
     public let kind: String
+    public let secret: Bool
     public let frame: MacAXFrame
     /// Captured bounds, distinct from the private motion-led motor frame.
     public let observedFrame: MacAXFrame
@@ -50,6 +51,7 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
         label: MacScreenText?,
         aliases: [String] = [],
         kind: String,
+        secret: Bool = false,
         frame: MacAXFrame,
         observedFrame: MacAXFrame? = nil,
         excludedFrames: [MacAXFrame] = [],
@@ -66,6 +68,7 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
         self.label = label
         self.aliases = aliases
         self.kind = kind
+        self.secret = secret
         self.frame = frame
         self.observedFrame = observedFrame ?? frame
         self.excludedFrames = excludedFrames

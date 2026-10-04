@@ -42,7 +42,7 @@ snapshot or user takeover.
 | Action | Required payload | Result or behavior |
 |---|---|---|
 | `attach` | none | Negotiates protocol, extension version, host id, and capabilities. |
-| `lease.acquire` | `mode` (`create` or `claim`), optional `leaseDurationMs` | Creates an inactive tab or claims an exact existing tab. X/Twitter post creation automatically uses its own unfocused window with one active tab; optional create-only `renderingMode` selects `visible_work_window` or `grouped_background`. Never changes the user's selected tab. One X thread's real replies verified live; rendering remains observable, not universally guaranteed. Claim requires `tabId` plus exact expected URL/title. Default lease 60 seconds; bounded range 30–300 seconds. |
+| `lease.acquire` | `mode` (`create` or `claim`), optional `leaseDurationMs` | Creates an inactive tab or claims an exact existing tab. X/Twitter post creation stays inactive by default; explicit create-only `renderingMode` selects `visible_work_window` or `grouped_background`. Never changes the user's selected tab. One X thread's real replies verified live; rendering remains observable, not universally guaranteed. Claim requires `tabId` plus exact expected URL/title. Default lease 60 seconds; bounded range 30–300 seconds. |
 | `lease.renew` | `leaseId`, `expectedUserSequence`, optional `leaseDurationMs` | Extends an active lease from the current instant and emits `lease.renewed`. |
 | `lease.resume` | `leaseId`, `expectedUserSequence` | Reserved compatibility action. It returns `lease_resume_not_supported`: user yield is terminal, so the host must explicitly reacquire the exact tab. |
 | `lease.release` | `leaseId` | Releases a claimed tab; closes an agent-created tab unless `closeCreatedTab` is false. |

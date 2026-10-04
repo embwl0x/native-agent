@@ -442,7 +442,13 @@ public enum OrganismBodySchemaSampler {
         }
         if let notificationDeliveryBelief = read.notificationDeliveryBelief {
             body.notificationDeliveryBelief = notificationDeliveryBelief
-            if notificationDeliveryBelief.deviceReceived {
+            // Delivery freshness can describe a transport failure, not the device receipt.
+            if notificationDeliveryBelief.deviceReceived,
+               notificationDeliveryBelief.evidence.contains(where: {
+                   $0.evidenceClass == .deviceProcessReceipt
+                       && $0.receivedAt.timeIntervalSince(now) <= 5
+                       && now.timeIntervalSince($0.receivedAt) <= read.iPhoneStaleAfter
+               }) {
                 body.iPhoneReachable = true
             }
             if let healthy = notificationDeliveryBelief.compatibilityPathHealthy {

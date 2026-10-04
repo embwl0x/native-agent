@@ -62,8 +62,16 @@ extension RuntimeReadProjection {
             receiptsPath: receiptsPath,
             approvalsPath: approvalsPath
         )
-        if let envelope = try await client.notificationStatus() {
-            return try Self.decodeJSONValue(envelope, as: NotificationRuntimeStatus.self, context: "getNotificationStatus(swiftNative)")
+        do {
+            if let envelope = try await client.notificationStatus() {
+                return try Self.decodeJSONValue(envelope, as: NotificationRuntimeStatus.self, context: "getNotificationStatus(swiftNative)")
+            }
+        } catch {
+            return NotificationRuntimeStatus(
+                status: "unavailable", authorization: nil, pendingApprovals: nil,
+                receiptCount: nil, latestReceipt: nil,
+                createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
+            )
         }
         // A reader that cannot produce an envelope has not measured status.
         return NotificationRuntimeStatus(
@@ -107,8 +115,17 @@ extension RuntimeReadProjection {
             )
         }
         let client = makeBrowserClient(dataRoot: root)
-        if let envelope = try await client.browserStatus() {
-            return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
+        do {
+            if let envelope = try await client.browserStatus() {
+                return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
+            }
+        } catch {
+            return BrowserRuntimeStatus(
+                status: "unavailable", profilePath: nil, sourcePath: nil,
+                screenshotPath: nil, approvedDomains: nil, domainPolicy: nil,
+                activeRuns: nil, receiptCount: nil, latestReceipt: nil,
+                createdAt: ISO8601DateFormatter().string(from: Date())
+            )
         }
         // The read boundary could not establish browser status.
         return BrowserRuntimeStatus(
@@ -181,10 +198,9 @@ extension RuntimeReadProjection {
 
     public static func readLocalJSON<T: Decodable>(_ url: URL, fallbackJSON: String) throws -> T {
         let data: Data
-        if FileManager.default.fileExists(atPath: url.path),
-           let read = try? Data(contentsOf: url) {
-            data = read
-        } else {
+        do {
+            data = try Data(contentsOf: url)
+        } catch CocoaError.fileReadNoSuchFile {
             data = Data(fallbackJSON.utf8)
         }
         return try JSONDecoder.nativeAgent.decode(T.self, from: data)

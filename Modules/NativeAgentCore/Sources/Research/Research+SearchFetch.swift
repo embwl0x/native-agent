@@ -28,22 +28,24 @@ extension SwiftNativeResearchClient {
         guard let url = makeURL(base: base, path: "/search", query: parameters) else {
             throw ResearchClientError.malformedResponse("could not build SearXNG /search URL")
         }
-        let (status, body): (Int, Data)
+        let response: ResearchHTTPResponse
         do {
-            let (s, b, _) = try await http.get(url: url, timeout: 25)
-            (status, body) = (s, b)
+            response = try await http.getBounded(url: url, timeout: 25, maxBytes: 1_000_000)
         } catch {
             if Self.localServerIsDown(error, url: url) {
                 throw ResearchClientError.localServerNotRunning(url.absoluteString)
             }
             throw ResearchClientError.transport(String(describing: error))
         }
-        if !(200...299).contains(status) {
-            throw ResearchClientError.malformedResponse("SearXNG returned HTTP \(status)")
+        if !(200...299).contains(response.status) {
+            throw ResearchClientError.malformedResponse("SearXNG returned HTTP \(response.status)")
+        }
+        guard !response.truncated else {
+            throw ResearchClientError.malformedResponse("SearXNG response exceeds 1,000,000 bytes")
         }
         let parsed: JSONValue
         do {
-            parsed = try JSONValue.parse(body)
+            parsed = try JSONValue.parse(response.body)
         } catch {
             throw ResearchClientError.malformedResponse("SearXNG body is not JSON: \(error)")
         }
@@ -169,7 +171,11 @@ extension SwiftNativeResearchClient {
             "source_id": .string(sourceID),
             "contents": .string("JSON with retained extracted text (if any) and coverage from this bounded read. Content beyond the response byte bound is not retained."),
             "retention": .string("Limited local retention: newest \(Self.receiptRetentionLimit) mixed search/fetch receipts. May be pruned or removed; no fixed expiry is promised."),
-            "read_tool": .string("read_file"),
+            "read_tool": .string("app"),
+            "read_args": .object([
+                "action": .string("files.read"),
+                "args": .object(["path": .string(receiptPath.path)]),
+            ]),
             "access": .string("Normal file permissions apply. This locator does not grant access."),
         ])
         let record = ResearchFetchRecord(
@@ -212,12 +218,39 @@ extension SwiftNativeResearchClient {
             return (name, isEnd)
         }
 
+        func tagEnd(from start: Int) -> Int? {
+            var quote: Character?
+            for index in start..<n {
+                let char = chars[index]
+                if let current = quote {
+                    if char == current { quote = nil }
+                } else if char == "\"" || char == "'" {
+                    quote = char
+                } else if char == ">" {
+                    return index
+                }
+            }
+            return nil
+        }
+
         var dataBuf = ""
         while i < n {
             if chars[i] == "<" {
                 // Flush the pending text run before processing the tag.
                 if !dataBuf.isEmpty { appendData(dataBuf); dataBuf = "" }
-                guard let close = chars[i...].firstIndex(of: ">") else {
+                // Comments have no attribute quotes; skip them before tag scanning.
+                if chars[i...].starts(with: ["<", "!", "-", "-"]) {
+                    var end = i + 4
+                    while end + 2 < n {
+                        if chars[end] == "-", chars[end + 1] == "-", chars[end + 2] == ">" {
+                            break
+                        }
+                        end += 1
+                    }
+                    i = end + 2 < n ? end + 3 : n
+                    continue
+                }
+                guard let close = tagEnd(from: i + 1) else {
                     // Unterminated tag: treat the rest as data (Python is lenient).
                     dataBuf.append(contentsOf: chars[i...])
                     break
@@ -253,7 +286,7 @@ extension SwiftNativeResearchClient {
                             if matched {
                                 // Advance past the closing tag's `>` (Python is
                                 // lenient about attrs/whitespace before `>`).
-                                if let gt = chars[(j + needle.count - 1)...].firstIndex(of: ">") {
+                                if let gt = tagEnd(from: j + needle.count) {
                                     i = gt + 1
                                 } else {
                                     i = n
@@ -287,10 +320,8 @@ extension SwiftNativeResearchClient {
     /// left verbatim.
     static func decodeHTMLEntities(_ s: String) -> String {
         guard s.contains("&") else { return s }
-        // Common HTML5 named refs that show up in real page text. NOT the full
-        // ~2000-entry HTML5 table (gpt-5.5 review #3): unknown refs pass
-        // through verbatim, which is acceptable while .research is DORMANT and
-        // the daemon route is the production path.
+        // The shipped Swift extractor decodes common named HTML5 references,
+        // not the full HTML5 table. Unknown named references remain verbatim.
         let named: [String: String] = [
             "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'",
             "nbsp": "\u{00A0}", "copy": "\u{00A9}", "reg": "\u{00AE}", "trade": "\u{2122}",

@@ -26,7 +26,7 @@ import Synchronization
 
 // MARK: - MemoryStorageBridge — MemoryStorage actor → MemoryStorageProtocol
 
-public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol, MemoryRecordLookupStorage, MomentProposalCountingStorage, AtomicProposalStagingStorage, AtomicSupersedingAcceptanceStorage {
+public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol, MemoryRecordLookupStorage, MomentProposalCountingStorage, AtomicProposalStagingStorage, AtomicSupersedingAcceptanceStorage, AtomicSupersedingMemoryStorage, AtomicMemoryAdmissionStorage {
     private let storage: MemoryStorage
     /// The SQLite file this bridge fronts; `profile.json` lives beside it.
     public var path: URL { storage.path }
@@ -77,6 +77,34 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         embedding: [Float]?,
         embeddingEpoch: MemoryEmbeddingEpoch?
     ) async throws -> MemoryRecord {
+        try await insert(record: record, embedding: embedding, embeddingEpoch: embeddingEpoch, superseding: [])
+    }
+
+    public func insert(
+        record: MemoryRecord,
+        embedding: [Float]?,
+        embeddingEpoch: MemoryEmbeddingEpoch?,
+        superseding: [SupersedingAcceptance]
+    ) async throws -> MemoryRecord {
+        let stored = Self.toStoredMemory(record, embedding: embedding, embeddingEpoch: embeddingEpoch)
+        let inserted = try await storage.insertMemory(stored, superseding: superseding)
+        return Self.toMemoryRecord(inserted)
+    }
+
+    public func admit(
+        record: MemoryRecord, embedding: [Float]?, embeddingEpoch: MemoryEmbeddingEpoch?,
+        insertIfMissing: Bool, preserveID: Bool
+    ) async throws -> MemoryRecord? {
+        let stored = Self.toStoredMemory(record, embedding: embedding, embeddingEpoch: embeddingEpoch)
+        return try await storage.admitMemory(
+            stored, insertIfMissing: insertIfMissing, preserveID: preserveID
+        ).map(Self.toMemoryRecord)
+    }
+
+    static func toStoredMemory(
+        _ record: MemoryRecord, embedding: [Float]?, embeddingEpoch: MemoryEmbeddingEpoch?,
+        defaultPersonaID: String = MemoryV2Defaults.personaID
+    ) -> StoredMemory {
         // Fold the typed MemoryRecord fields that StoredMemory has no column
         // for into metadata_json so they round-trip (they were silently
         // amputated in transit — pin/tags/importance/kind all lost; audit
@@ -90,10 +118,10 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         }
         if meta["importance"] == nil, let imp = record.importance { meta["importance"] = .double(imp) }
         if meta["pinned"] == nil, let pin = record.pinned { meta["pinned"] = .bool(pin) }
-        let stored = StoredMemory(
+        return StoredMemory(
             id: record.id,
             content: record.text,
-            personaId: record.personaId ?? MemoryV2Defaults.personaID,
+            personaId: record.personaId ?? defaultPersonaID,
             source: record.sourceRunId,
             confidence: record.confidence ?? 1.0,
             createdAt: record.createdAt,
@@ -108,8 +136,6 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
             evidence: record.evidence,
             metadata: meta.isEmpty ? nil : .object(meta)
         )
-        let inserted = try await storage.insertMemory(stored)
-        return Self.toMemoryRecord(inserted)
     }
 
     public func updateMemory(id: String, patch: JSONValue, newEmbedding: [Float]?) async throws -> MemoryRecord {
@@ -132,6 +158,8 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
             if case .string(let s)? = obj["text"] { p.content = s }
             if case .string(let s)? = obj["content"] { p.content = s }
             if case .string(let s)? = obj["status"] { p.status = s }
+            // The agent's restore lifts a corrected row back to current.
+            if case .string(let s)? = obj["lifecycle"] { p.lifecycle = s }
             if case .double(let d)? = obj["confidence"] { p.confidence = d }
             if case .int(let i)? = obj["confidence"] { p.confidence = Double(i) }
             if case .string(let value)? = obj["validFrom"] { p.validFrom = value }
@@ -430,6 +458,10 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         try await storage.markProposalStatus(id: id, status: status, resolvedAt: MemoryStorage.nowISO8601())
     }
 
+    public func supersedeProposal(id: String, by successorId: String) async throws -> Bool {
+        try await storage.supersedeProposal(id: id, by: successorId)
+    }
+
     public func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> ProposalRecord {
         guard let updated = try await storage.updateProposalMetadata(id: id, metadata: metadata) else {
             throw MemoryV2Error.recordNotFound
@@ -575,7 +607,11 @@ extension SwiftNativeMemoryV2 {
         let underlying = await bridge.underlyingStorage()
         let sqlitePath = underlying.path
         let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
-        return try await indexer.rebuildMemoryDerivedGraphFromCanonicalStore()
+        return try await indexer.rebuildMemoryDerivedGraphFromCanonicalStore(
+            producing: MemoryPolicyGate.knowledgeGraphEnabled(
+                dataRoot: sqlitePath.deletingLastPathComponent().deletingLastPathComponent()
+            )
+        )
     }
 
     private static func canonicalRootIdentity(_ root: URL) -> String {
@@ -591,6 +627,19 @@ extension SwiftNativeMemoryV2 {
         let corrected = try await storage.markCorrected(id: id, by: newerId, reason: reason)
         await flushDerivedMemoryChanges()
         return corrected
+    }
+
+    /// Phase 5 B0: one record by exact id, unfiltered, for the authority
+    /// check in front of her association rejections. Not a recall path.
+    public func authorityRecord(id: String) async throws -> MemoryRecord? {
+        guard let bridge = storage as? MemoryStorageBridge else { throw MemoryV2Error.storageUnavailable }
+        return try await bridge.lookupMemoryRecord(id: id)
+    }
+
+    /// Uses disclosure-filtered user facts until a pinned core is chosen.
+    public func userPromptCore(surface: String) async throws -> [String]? {
+        guard let bridge = storage as? MemoryStorageBridge else { throw MemoryV2Error.storageUnavailable }
+        return try await bridge.underlyingStorage().userPromptCore(surface: surface)
     }
 
     /// Process-wide instance rooted at the default data root. Uses the same
@@ -656,10 +705,10 @@ extension SwiftNativeMemoryV2 {
                     if stored.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { return }
                     // Settings ▸ "Knowledge graph": off means no graph is
                     // PRODUCED. A delete still reaches the graph, and a write
-                    // while off retires the row's node, so a rewritten or
+                    // while off retires the memory-derived graph, so a rewritten or
                     // forgotten memory never lingers with old text (reviewer,
                     // 2026-09-05). Read fresh per mutation.
-                    let deleted = deleted || !MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
+                    let producing = MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
                     try? await kgIndexer.indexMemory(
                         KnowledgeGraphMemoryFact(
                             id: stored.id,
@@ -670,7 +719,8 @@ extension SwiftNativeMemoryV2 {
                             updatedAt: stored.updatedAt,
                             metadata: stored.projectionMetadata
                         ),
-                        deleted: deleted
+                        deleted: deleted,
+                        producing: producing
                     )
                 }
                 // Healthy launches only repair rows missed by a fire-and-forget
@@ -881,6 +931,7 @@ public extension ProposalRecord {
         self.init(
             id: p.id,
             content: p.content,
+            personaId: p.personaId,
             source: p.source,
             status: p.status,
             createdAt: p.stagedAt,
@@ -888,5 +939,19 @@ public extension ProposalRecord {
             rejectionReason: p.rejectionReason,
             metadata: p.metadata
         )
+    }
+}
+
+extension SwiftNativeMemoryV2 {
+    /// Her prompt core for her own background work and reflection: the same
+    /// core chat carries (read as chat sees it, since this is her own thinking,
+    /// not a door). A read failure degrades to the preamble only, as chat
+    /// does, and never fails the background job.
+    public static func userCoreForBackground(dataRoot: URL) async -> [String]? {
+        do {
+            return try await resolvedOwner(dataRoot: dataRoot).userPromptCore(surface: "chat")
+        } catch {
+            return []
+        }
     }
 }

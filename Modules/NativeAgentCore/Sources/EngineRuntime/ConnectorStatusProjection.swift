@@ -263,21 +263,20 @@ public enum ConnectorStatusProjection {
             row["runtimeUpdatedAt"] = .null
         }
         do {
-            if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
-               recovery.hasQuarantinedEvidence {
-                row["runtimeStatus"] = .string("recovery_quarantined")
-                row["runtimeDetail"] = .string("A damaged Slack delivery journal was moved aside (.stale-<ts>) and a fresh one started; intake is running again. Accepted-but-undelivered replies may only exist in that file — ask \(platform.agentSubject) to inspect it before any manual retry.")
-            } else if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
-                      recovery.pendingCount > 0 {
+            if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root) {
                 if recovery.isAtCapacity {
                     row["runtimeStatus"] = .string("intake_paused")
                     row["runtimeDetail"] = .string("\(recovery.pendingCount) pending replies; new message intake is paused. \(recovery.unknownCount) need recovery. Ask \(platform.agentSubject) to inspect Slack delivery recovery before any manual retry; nothing is automatically discarded or resent.")
                 } else if recovery.unknownCount > 0 {
                     row["runtimeStatus"] = .string("recovery_required")
                     row["runtimeDetail"] = .string("\(recovery.unknownCount) replies have an unknown outcome (\(recovery.pendingCount) pending). Ask \(platform.agentSubject) to inspect Slack delivery recovery before any manual retry; automatic resend is paused.")
-                } else {
+                } else if recovery.pendingCount > 0 {
                     let detail = connectorString(row["runtimeDetail"]) ?? ""
                     row["runtimeDetail"] = .string("\(detail) \(recovery.pendingCount) accepted replies are pending delivery.")
+                }
+                if recovery.hasQuarantinedEvidence {
+                    let detail = connectorString(row["runtimeDetail"]) ?? ""
+                    row["runtimeDetail"] = .string("\(detail) A damaged Slack delivery journal was moved aside (.stale-<ts>). Accepted replies that were not delivered may only exist in that file; ask \(platform.agentSubject) to inspect it before any manual retry.")
                 }
             }
         } catch {

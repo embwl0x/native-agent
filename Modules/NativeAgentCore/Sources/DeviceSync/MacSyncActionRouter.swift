@@ -375,44 +375,6 @@ struct MacSyncActionRouter {
                 _ = try await api.rejectPromotionPending(id: candidateId, reason: "Rejected via iOS")
                 return observed(["status": "ok"])
 
-            case "approveOrganismReflex":
-                let candidateId = payload["candidateId"] ?? payload["candidate_id"] ?? ""
-                guard !candidateId.isEmpty else {
-                    return observed(["status": "error", "message": "Missing candidateId"])
-                }
-                _ = await cognition.reviewOrganismReflexCandidate(
-                    id: candidateId,
-                    decision: .approve,
-                    note: "Approved from iOS",
-                    reviewedBy: "operator",
-                    source: "ios_signed_action"
-                )
-                return observed([
-                    "status": "ok",
-                    "ok": "true",
-                    "candidateId": candidateId,
-                    "decision": OrganismReflexReviewDecision.approve.rawValue,
-                ])
-
-            case "retireOrganismReflex":
-                let candidateId = payload["candidateId"] ?? payload["candidate_id"] ?? ""
-                guard !candidateId.isEmpty else {
-                    return observed(["status": "error", "message": "Missing candidateId"])
-                }
-                _ = await cognition.reviewOrganismReflexCandidate(
-                    id: candidateId,
-                    decision: .retire,
-                    note: "Retired from iOS",
-                    reviewedBy: "operator",
-                    source: "ios_signed_action"
-                )
-                return observed([
-                    "status": "ok",
-                    "ok": "true",
-                    "candidateId": candidateId,
-                    "decision": OrganismReflexReviewDecision.retire.rawValue,
-                ])
-
             case "approveApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
                 guard !approvalId.isEmpty else { return ["status": "error", "message": "Missing approvalId"] }
@@ -504,6 +466,36 @@ struct MacSyncActionRouter {
                     "message": "Inbox reply is not yet supported from iOS.",
                     "itemId": itemId,
                 ]
+
+            case "registerWorkActivity":
+                guard let deviceID = payload["deviceId"], !deviceID.isEmpty,
+                      let enabled = payload["enabled"], ["true", "false"].contains(enabled),
+                      let environment = payload["environment"], ["development", "production"].contains(environment),
+                      let bundleID = payload["bundleId"], !bundleID.isEmpty else {
+                    return ["status": "error", "message": "Invalid Live Activity registration"]
+                }
+                for key in ["startToken", "activityToken"] {
+                    if let token = payload[key], !token.isEmpty,
+                       (token.count > 512 || !token.allSatisfy(\.isHexDigit)) {
+                        return ["status": "error", "message": "Invalid Live Activity token"]
+                    }
+                }
+                let observedWorkIDs: Set<String>?
+                if let inventory = payload["observedWorkIds"] {
+                    let ids = try JSONDecoder().decode([String].self, from: Data(inventory.utf8))
+                    guard ids.count <= 64, ids.allSatisfy({ !$0.isEmpty && $0.count <= 512 }) else {
+                        return ["status": "error", "message": "Invalid Live Activity inventory"]
+                    }
+                    observedWorkIDs = Set(ids)
+                } else { observedWorkIDs = nil }
+                try await MacSyncMobileNotificationRelay.storeWorkActivityRegistration(
+                    deviceID: deviceID, enabled: enabled == "true", environment: environment, bundleID: bundleID,
+                    startToken: payload["startToken"], workID: payload["workId"],
+                    activityToken: payload["activityToken"].flatMap { $0.isEmpty ? nil : $0 },
+                    observedWorkIDs: observedWorkIDs, dataRoot: sync.dataRoot)
+                sync.engine.workActivityVersion &+= 1
+                sync.engine.requestWorkActivityPublication()
+                return ["status": "ok", "ok": "true"]
 
             case "registerPushToken":
                 let token = (payload["token"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -666,8 +658,14 @@ struct MacSyncActionRouter {
                 let providerId = payload["providerId"] ?? ""
                 guard !providerId.isEmpty else { return observed(["status": "error", "message": "Missing providerId"]) }
                 let result = try await api.testProvider(providerId)
-                let detail = result.detail ?? result.error ?? result.response ?? ""
-                return observed(["status": result.status, "detail": detail, "provider_id": providerId])
+                var response = ["status": result.status, "detail": result.detail ?? "", "provider_id": providerId]
+                if let error = result.error {
+                    response["error"] = error
+                    response["message"] = error
+                } else if let text = result.response {
+                    response["message"] = text
+                }
+                return observed(response)
 
             case "clear_provider":
                 let providerId = payload["providerId"] ?? ""

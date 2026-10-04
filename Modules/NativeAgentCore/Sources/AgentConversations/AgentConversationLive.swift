@@ -95,7 +95,7 @@ public actor AgentConversationLiveHub {
 
     /// Streamed reply text: `delta` appends, `replace` is the whole text so far.
     public func text(_ target: AgentConversationLiveTarget, delta: String? = nil, replace: String? = nil) {
-        guard !(replace ?? delta ?? "").isEmpty else { return }
+        guard replace != nil || !(delta ?? "").isEmpty else { return }
         edit(target, activity: true) { live in
             let whole = replace ?? (live.partial ?? "") + (delta ?? "")
             live.streams = true

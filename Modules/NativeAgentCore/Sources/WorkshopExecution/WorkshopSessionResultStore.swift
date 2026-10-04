@@ -85,6 +85,11 @@ public struct WorkshopSessionResultStore: Sendable {
             .appendingPathComponent("workshop/reservation_claims/\(safe).claim").path)
     }
 
+    public func hasResult(reservationId: String) -> Bool {
+        guard let path = path(reservationId: reservationId) else { return false }
+        return FileManager.default.fileExists(atPath: path.path)
+    }
+
     public func remove(reservationId: String) {
         guard let path = path(reservationId: reservationId) else { return }
         try? FileManager.default.removeItem(at: path)

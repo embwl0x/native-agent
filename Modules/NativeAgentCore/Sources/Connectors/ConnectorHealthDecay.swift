@@ -187,6 +187,11 @@ public enum ConnectorProofLedger {
                   !connector.isEmpty else { continue }
             // A dry run proves nothing about the live integration.
             if case .bool(true)? = row["dryRun"] { continue }
+            // Only Slack and GitHub status actions contact their providers.
+            if let action = string(row["actionId"])?.lowercased(),
+               action.hasSuffix(".status"), action != "slack.status", action != "github.status" {
+                continue
+            }
             guard let status = string(row["status"])?.lowercased(),
                   successStatuses.contains(status) else { continue }
             guard let created = string(row["createdAt"]),

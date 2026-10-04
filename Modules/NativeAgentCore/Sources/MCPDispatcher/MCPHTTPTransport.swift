@@ -68,9 +68,9 @@ private struct MCPBoundedHTTPBytes: AsyncSequence, Sendable {
 /// `initialize` and replayed on every subsequent request, plus the JSON-RPC
 /// id counter).
 ///
-/// Lifecycle: the first outward call runs the `initialize` handshake exactly
-/// once (capturing `Mcp-Session-Id` and emitting the `notifications/initialized`
-/// notification per spec), then the requested `tools/list` / `tools/call`.
+/// Lifecycle: outward calls share the `initialize` handshake (capturing
+/// `Mcp-Session-Id` and emitting `notifications/initialized`), renewing it
+/// when the server reports that the assigned session has expired.
 ///
 /// No silent fallbacks: every failure — non-2xx status, empty endpoint, timeout,
 /// malformed SSE, JSON-RPC error object — surfaces as a thrown error naming the
@@ -94,6 +94,7 @@ public actor MCPHTTPTransport {
     /// Installed synchronously before the first network await so concurrent
     /// first callers join the same handshake; cleared on failure for retry.
     private var initTask: Task<Void, Error>?
+    private var closed = false
 
     public init(
         serverId: String,
@@ -132,6 +133,7 @@ public actor MCPHTTPTransport {
     /// first await; concurrent callers join it. A failed handshake clears the
     /// slot so the next caller retries cleanly.
     public func initializeIfNeeded() async throws {
+        guard !closed else { throw MCPSubprocessError.streamClosed }
         if let inflight = initTask {
             return try await awaitInitialization(inflight)
         }
@@ -168,13 +170,22 @@ public actor MCPHTTPTransport {
                 "version": .string("1.0.0"),
             ]),
         ])
-        _ = try await sendRequest(method: "initialize", params: initParams, expectsResponse: true)
-        // notifications/initialized is a *notification*: no id, no response.
-        _ = try await sendRequest(
-            method: "notifications/initialized",
-            params: .object([:]),
-            expectsResponse: false
-        )
+        for attempt in 0..<2 {
+            sessionId = nil
+            _ = try await sendRequest(method: "initialize", params: initParams, expectsResponse: true)
+            let assignedSessionId = sessionId
+            do {
+                // Do not join our own initTask if this new session expires.
+                _ = try await sendRequest(
+                    method: "notifications/initialized",
+                    params: .object([:]),
+                    expectsResponse: false
+                )
+                return
+            } catch MCPSubprocessError.httpTransport(_, let status, _) where status == 404 && attempt == 0 && assignedSessionId != nil {
+                continue
+            }
+        }
     }
 
     /// `tools/list` — returns the raw `tools` array from the JSON-RPC result.
@@ -259,14 +270,59 @@ public actor MCPHTTPTransport {
         return result
     }
 
+    /// Retire local ownership and ask the server to end its assigned session.
+    func close() async {
+        guard !closed else { return }
+        closed = true
+        initTask?.cancel()
+        initTask = nil
+        let assignedSessionId = sessionId
+        sessionId = nil
+        defer { session.invalidateAndCancel() }
+        guard let assignedSessionId else { return }
+        let timeout = min(requestTimeout, 2)
+        let session = session
+        let endpoint = endpoint
+        let serverId = serverId
+        do {
+            try await Self.withTimeout(timeout, serverId: serverId, method: "session termination") {
+                var request = URLRequest(url: endpoint)
+                request.httpMethod = "DELETE"
+                request.timeoutInterval = timeout
+                request.setValue(assignedSessionId, forHTTPHeaderField: "Mcp-Session-Id")
+                let (rawBytes, response) = try await session.bytes(for: request, delegate: MCPHTTPRedirectPolicy())
+                defer { rawBytes.task.cancel() }
+                let bytes = MCPBoundedHTTPBytes(bytes: rawBytes, serverId: serverId, method: "session termination")
+                for try await _ in bytes {}
+                guard let http = response as? HTTPURLResponse else {
+                    throw MCPSubprocessError.httpTransport(serverId: serverId, status: nil,
+                                                          detail: "Session termination returned a non-HTTP response")
+                }
+                // 404 means already retired; MCP permits servers to refuse DELETE with 405.
+                guard (200..<300).contains(http.statusCode) || http.statusCode == 404 || http.statusCode == 405 else {
+                    throw MCPSubprocessError.httpTransport(serverId: serverId, status: http.statusCode,
+                                                          detail: "Session termination failed")
+                }
+            }
+        } catch {
+            let detail = TurnSecretRedactor.redactText(error.localizedDescription)
+            FileHandle.standardError.write(Data("MCPDispatcher: \(detail)\n".utf8))
+        }
+    }
+
     // MARK: Request core (actor-isolated; delegates network I/O to a
     // nonisolated static so the timeout race stays Sendable-clean)
 
     private func sendRequest(
         method: String,
         params: JSONValue,
-        expectsResponse: Bool
+        expectsResponse: Bool,
+        recoverExpiredSession: Bool = true
     ) async throws -> JSONValue? {
+        guard !closed else { throw MCPSubprocessError.streamClosed }
+        if method != "initialize" && method != "notifications/initialized" {
+            try await initializeIfNeeded()
+        }
         let id: Int64? = expectsResponse ? nextId() : nil
         // Snapshot actor state into locals so the @Sendable timeout closure
         // never captures the actor.
@@ -274,22 +330,41 @@ public actor MCPHTTPTransport {
         let ep = endpoint
         let sid = serverId
         let to = requestTimeout
-        let currentSessionId = sessionId
-        let outcome = try await Self.withTimeout(to, serverId: sid, method: method) {
-            try await Self.httpRPC(
-                session: sess,
-                endpoint: ep,
-                serverId: sid,
-                method: method,
-                params: params,
-                id: id,
-                sessionId: currentSessionId,
-                expectsResponse: expectsResponse,
-                timeout: to
+        let currentSessionId = method == "initialize" ? nil : sessionId
+        let outcome: (result: JSONValue?, sessionId: String?)
+        do {
+            outcome = try await Self.withTimeout(to, serverId: sid, method: method) {
+                try await Self.httpRPC(
+                    session: sess,
+                    endpoint: ep,
+                    serverId: sid,
+                    method: method,
+                    params: params,
+                    id: id,
+                    sessionId: currentSessionId,
+                    expectsResponse: expectsResponse,
+                    timeout: to
+                )
+            }
+        } catch {
+            guard case MCPSubprocessError.httpTransport(_, let status, _) = error,
+                  status == 404, currentSessionId != nil else { throw error }
+            guard !closed else { throw MCPSubprocessError.streamClosed }
+            // A late 404 for an old session must not retire its replacement.
+            if sessionId == currentSessionId {
+                sessionId = nil
+                if method != "notifications/initialized" { initTask = nil }
+            }
+            guard recoverExpiredSession, method != "notifications/initialized" else { throw error }
+            try await initializeIfNeeded()
+            return try await sendRequest(
+                method: method, params: params, expectsResponse: expectsResponse,
+                recoverExpiredSession: false
             )
         }
-        if let newSid = outcome.sessionId, !newSid.isEmpty {
-            sessionId = newSid
+        guard !closed else { throw MCPSubprocessError.streamClosed }
+        if method == "initialize" {
+            sessionId = outcome.sessionId.flatMap { $0.isEmpty ? nil : $0 }
         }
         return outcome.result
     }
@@ -337,7 +412,8 @@ public actor MCPHTTPTransport {
         }
         let newSid = http.value(forHTTPHeaderField: "Mcp-Session-Id")
         guard (200..<300).contains(http.statusCode) else {
-            for try await _ in bytes {}
+            // Expiry is established by the status; do not let its body delay recovery.
+            if http.statusCode != 404 { for try await _ in bytes {} }
             throw MCPSubprocessError.httpTransport(
                 serverId: serverId, status: http.statusCode,
                 detail: "HTTP \(http.statusCode) (method \(method))"

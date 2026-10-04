@@ -1,9 +1,12 @@
 import Foundation
+import ImageIO
 import os
+import UniformTypeIdentifiers
 import NativeAgentShared
 import NativeAgentCore
 import ChatOrchestration
 import PersistenceCore
+import ToolRegistry
 import Transcripts
 import ProviderRouting
 
@@ -50,13 +53,6 @@ private final class ICloudGeneratedAttachmentBox: @unchecked Sendable {
 }
 
 public struct ICloudIncomingTurnForwarder: Sendable {
-    private static let turnAdmission = TurnAdmission()
-
-    public static func runAdmittedTurn<T>(sessionID: String, isolation: isolated (any Actor)? = #isolation,
-                                         operation: () async throws -> T) async throws -> T {
-        try await turnAdmission.run(sessionID: sessionID, operation: operation)
-    }
-
     private let port: any ICloudIncomingTurnPort
 
     public init(port: any ICloudIncomingTurnPort) {
@@ -228,6 +224,61 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             resolvedSessionID = UUID().uuidString
         }
 
+        // Read before any suspension: a handoff after this point supersedes it.
+        let receivedAtHandoffGeneration = port.controlHandoffGeneration(sessionID: resolvedSessionID)
+        func supersededByControlHandoff() -> Bool {
+            port.holdsMessageAfterControlHandoff(sessionID: resolvedSessionID,
+                receivedAtGeneration: receivedAtHandoffGeneration, sentAt: msg.timestamp)
+        }
+
+        if UserMessageIntentSignals.isControlHandoff(msg.text) {
+            guard let trimmedSessionID, !trimmedSessionID.isEmpty, port.signatureVerified(msg) else {
+                return await writeErrorReply("Control handoff requires a signed message naming its chat session.", sessionID: nil)
+            }
+            do {
+                let reply = try await port.stopChatForControlHandoff(sessionID: resolvedSessionID, messageDate: msg.timestamp)
+                try await port.residentChatClient().recordControlHandoff(
+                    message: msg.text, reply: reply, sessionId: resolvedSessionID, surface: "ios"
+                )
+                _ = try await port.sendChatMessage(text: reply, sessionID: resolvedSessionID,
+                    correlationID: msg.id, metadata: [
+                        "transport": "icloud", "source": "mac",
+                        "replyTo": remoteMetadata["clientSurface"] ?? "iphone", "targetSourceKey": routeKey,
+                    ])
+                await port.sendICloudReplyPushNotification(text: reply, sessionID: resolvedSessionID,
+                    correlationID: msg.id, kind: "reply")
+                port.requestChatSnapshotPublication(includeTranscripts: true)
+                port.completed(sessionID: resolvedSessionID)
+                return true
+            } catch {
+                return await writeErrorReply("Control handoff could not be confirmed: \(Self.redactedRemoteErrorDetail(error.localizedDescription))",
+                    sessionID: resolvedSessionID, turnReachedTerminalState: true)
+            }
+        }
+
+        func consumeSupersededMessage() async -> Bool {
+            defer { port.completed(sessionID: resolvedSessionID) }
+            do {
+                _ = try await port.sendChatMessage(text: "(cancelled)", sessionID: resolvedSessionID,
+                    correlationID: msg.id, metadata: [
+                        "kind": "cancelled", "transport": "icloud", "source": "mac",
+                        "replyTo": remoteMetadata["clientSurface"] ?? "iphone", "targetSourceKey": routeKey,
+                    ])
+            } catch {
+                NSLog("[iCloudBridge] failed to write superseded reply for msg %@: %@", msg.id, "\(error)")
+            }
+            // A handoff is terminal for this input, even if reply publication fails.
+            return true
+        }
+
+        guard !supersededByControlHandoff() else {
+            return await consumeSupersededMessage()
+        }
+        await port.awaitPendingChatStop(sessionID: resolvedSessionID)
+        guard !supersededByControlHandoff() else {
+            return await consumeSupersededMessage()
+        }
+
         // A bot's session opened or pinned on iPhone is still that bot's
         // session: it runs on the bot's own checked tuple, never Chat's. The
         // same contract and the same gate the Mac send applies
@@ -282,6 +333,11 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         }
 
         await MainActor.run { port.received(in: resolvedSessionID) }
+        // User sent this from his phone, so it is the conversation he is in.
+        // Best-effort: a failed publish must never fail his message.
+        _ = try? await ConversationAnchor.publish(
+            sessionId: resolvedSessionID, source: "ios", conversationKind: .direct
+        )
 
         let coAttachments: [ChatOrchestration.MultimodalAttachment] = (msg.attachments ?? []).map { a in
             ChatOrchestration.MultimodalAttachment(
@@ -308,6 +364,12 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         // iOS "cancelChat" inbox action can `.cancel()` it (in addition to
         // the cancelled.flag the streaming chat path also polls).
         let generatedAttachmentBox = ICloudGeneratedAttachmentBox()
+        let replyMetadata = [
+            "transport": "icloud",
+            "source": "mac",
+            "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
+            "targetSourceKey": routeKey
+        ]
         let personError = OSAllocatedUnfairLock<String?>(initialState: nil)
         let replyRoute = ChatToolSessionContext.ReplyRoute(
             surface: "ios",
@@ -319,13 +381,19 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         // Bind cryptographic evidence inside the detached consumer; a surface
         // label or phone-supplied metadata can never supply this authority.
         let commandSignatureVerified = port.signatureVerified(msg)
+        // No suspension from this final boundary read through task registration.
+        guard !supersededByControlHandoff() else {
+            return await consumeSupersededMessage()
+        }
         let streamTask = Task.detached(priority: .userInitiated) { () -> (text: String, deltaSeq: Int, error: String?, toolEvents: Int) in
             do {
-            return try await Self.runAdmittedTurn(sessionID: resolvedSessionID) {
+            return try await TurnAdmission.shared.run(sessionID: resolvedSessionID) {
             await ChatToolSessionContext.$commandSignatureVerified.withValue(commandSignatureVerified) {
             var accumulated = ""
             var sawError: String? = nil
             var toolEventCounter = 0
+            // The phone reads an app call as the action it ran.
+            let shown = ShownToolNames()
             var deltaCoalescer = ICloudTextDeltaCoalescer()
 
             // U4 Wave D (gpt-5.5 review-2 BLOCKER): iCloud/iOS streaming is a
@@ -387,11 +455,15 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                             r.reply,
                             workingCommentaryCharacters: r.workingCommentaryCharacters
                         )
-                        generatedAttachmentBox.set(Self.bridgeAttachments(
+                        generatedAttachmentBox.set(try Self.bridgeAttachments(
                             from: ChatGeneratedImageArtifacts.attachments(
                                 from: r.toolDispatches,
                                 dataRoot: PersistenceCore.defaultDataRoot()
-                            )
+                            ),
+                            text: accumulated.trimmingCharacters(in: .whitespacesAndNewlines),
+                            sessionID: resolvedSessionID,
+                            correlationID: msg.id,
+                            metadata: replyMetadata
                         ))
                     case .replyTextSettled:
                         break
@@ -425,10 +497,11 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                             key: NativeAgentICloudBridgeConstants.KVSKey.chatNoticeLatest,
                             mirrorKey: NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest
                         )
-                    case .toolUse(let name, _):
+                    case .toolUse(let called, let input):
                         // F7 P2: forward a lightweight tool_use progress event so
                         // iOS can render that a tool is firing. Payload is the
                         // tool name only — full input/output stays Mac-local.
+                        let name = shown.use(called, input: input).name
                         toolEventCounter += 1
                         if let flush = deltaCoalescer.flush(nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) {
                             await sendICloudTextDelta(
@@ -456,7 +529,8 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                         if !delivered {
                             NSLog("[iCloudBridge] failed tool_use KVS event msg=%@: %@", msg.id, name)
                         }
-                    case .toolResult(let name, _):
+                    case .toolResult(let called, _):
+                        let name = shown.result(called)
                         toolEventCounter += 1
                         if let flush = deltaCoalescer.flush(nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) {
                             await sendICloudTextDelta(
@@ -639,24 +713,12 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 text: replyText,
                 sessionID: resolvedSessionID,
                 correlationID: msg.id,
-                metadata: [
-                    "transport": "icloud",
-                    "source": "mac",
-                    "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
-                    "targetSourceKey": routeKey
-                ],
+                metadata: replyMetadata,
                 attachments: outcomeAttachments
             )
-            await port.sendICloudReplyPushNotification(
-                // An image-only answer has no text to announce, and the request
-                // builder rejects an empty body — which used to mean no
-                // notification at all for exactly the reply worth walking back
-                // for. Announce the artifact instead.
-                text: replyText.isEmpty ? "Your image is ready" : replyText,
-                sessionID: resolvedSessionID,
-                correlationID: msg.id,
-                kind: "reply"
-            )
+            // Requested results carry their durable intent on the assistant
+            // row. Publication retries that one phone event independently;
+            // ordinary conversation does not create a notification.
             port.completed(sessionID: resolvedSessionID)
             NSLog("[iCloudBridge] forwarded iOS msg %@ → Swift chatStream (session=%@) → wrote reply (%d chars, %d deltas, %d attachments)",
                   msg.id, resolvedSessionID, replyText.count, outcome.deltaSeq, outcomeAttachments.count)
@@ -676,21 +738,77 @@ public struct ICloudIncomingTurnForwarder: Sendable {
     }
 
     nonisolated private static func bridgeAttachments(
-        from attachments: [ChatOrchestration.MultimodalAttachment]
-    ) -> [NativeAgentShared.MultimodalAttachment] {
-        attachments.compactMap { attachment in
-            guard let withData = ChatGeneratedImageArtifacts.imageDataAttachment(from: attachment) else {
-                return nil
-            }
-            return NativeAgentShared.MultimodalAttachment(
-                id: withData.id,
-                type: withData.type,
-                base64: withData.base64,
-                mime: withData.mime,
-                name: withData.name,
-                byteSize: withData.byteSize
+        from attachments: [ChatOrchestration.MultimodalAttachment],
+        text: String,
+        sessionID: String,
+        correlationID: String,
+        metadata: [String: String]
+    ) throws -> [NativeAgentShared.MultimodalAttachment] {
+        guard !attachments.isEmpty else { return [] }
+        var previews = attachments.map { attachment in
+            NativeAgentShared.MultimodalAttachment(
+                id: attachment.id, type: "image", base64: "", mime: "image/jpeg",
+                name: attachment.name.map { ($0 as NSString).deletingPathExtension + ".jpg" }
             )
         }
+        var envelope = BridgeMessage.make(
+            sender: "mac", text: text, sessionID: sessionID,
+            correlationID: correlationID, metadata: metadata, attachments: previews
+        )
+        // Measure the signed envelope, including all attachment names. Reserve
+        // duplicated CloudKit fields and growth in byteSize's decimal digits.
+        envelope.signature = String(repeating: "0", count: 64)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        let remaining = NAChatMessageCodec.maxCloudKitRecordValueBytes
+            - (try encoder.encode(envelope)).count - text.utf8.count - sessionID.utf8.count - 8192
+        // Base64 expands 4/3; JSON may also escape every slash. Share the
+        // remaining budget across every image rather than dropping later ones.
+        let imageBudget = max(0, remaining / attachments.count) * 3 / 8
+        guard imageBudget > 0 else {
+            throw DeviceSyncError.payloadTooLarge(
+                actualBytes: NAChatMessageCodec.maxCloudKitRecordValueBytes - remaining,
+                maximumBytes: NAChatMessageCodec.maxCloudKitRecordValueBytes
+            )
+        }
+        for (index, attachment) in attachments.enumerated() {
+            guard let path = attachment.path,
+                  let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            var dimension = 1400
+            while true {
+                guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: dimension
+                ] as CFDictionary) else { throw CocoaError(.fileReadCorruptFile) }
+                let data = NSMutableData()
+                guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+                CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
+                guard CGImageDestinationFinalize(destination) else { throw CocoaError(.fileWriteUnknown) }
+                if data.length <= imageBudget {
+                    previews[index].base64 = (data as Data).base64EncodedString()
+                    previews[index].byteSize = data.length
+                    break
+                }
+                guard dimension > 1 else {
+                    throw DeviceSyncError.payloadTooLarge(actualBytes: data.length, maximumBytes: imageBudget)
+                }
+                dimension = max(1, dimension * 3 / 4)
+            }
+        }
+        envelope = BridgeMessage.make(
+            id: envelope.id, sender: "mac", text: text, sessionID: sessionID,
+            correlationID: correlationID, metadata: metadata, attachments: previews,
+            timestamp: envelope.timestamp
+        )
+        envelope.signature = String(repeating: "0", count: 64)
+        _ = try NAChatMessageCodec.encode(envelope)
+        return previews
     }
 
     private func sendICloudTextDelta(
@@ -730,10 +848,9 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
         let nowISO = ISO8601DateFormatter().string(from: Date())
-        let short = String(sessionID.prefix(8))
         let entry: [String: JSONValue] = [
             "id": .string(sessionID),
-            "title": .string("iOS chat \(short)"),
+            "title": .string("New Chat"),
             "createdAt": .string(nowISO),
             "updatedAt": .string(nowISO),
             "source": .string("ios"),

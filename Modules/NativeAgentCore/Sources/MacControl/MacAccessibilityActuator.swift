@@ -53,7 +53,9 @@ final class MacDocumentScrollRestoration: MacDocumentScrollRestoring, @unchecked
         var candidate = source.element(container)
         for _ in 0..<32 {
             guard let node = candidate else { return nil }
+            _ = source.prepareForRead(node)
             if let bar = MacAXAttributeRead.copyElement(node, kAXVerticalScrollBarAttribute) {
+                let bar = source.prepareForRead(bar)
                 var settable = DarwinBoolean(false)
                 guard AXUIElementIsAttributeSettable(bar, kAXValueAttribute as CFString, &settable) == .success,
                       settable.boolValue,
@@ -74,6 +76,7 @@ final class MacDocumentScrollRestoration: MacDocumentScrollRestoring, @unchecked
               CFEqual(current, scrollbar) else { return false }
         // Avoid even a no-op write when the downward end probe never moved.
         if isRestored { return true }
+        guard MacDriverContext.binding?.allowsEmission == true else { return false }
         return AXUIElementSetAttributeValue(scrollbar, kAXValueAttribute as CFString, value) == .success
         #else
         return false
@@ -301,6 +304,10 @@ public enum MacKeySyntax {
                 return (code, .shift)
             }
         }
+        // A bare modifier ("shift" on its own, e.g. a screensaver nudge) is its own key.
+        let modifierKeys: [String: UInt16] = ["shift": 56, "cmd": 55, "command": 55, "opt": 58,
+                                              "option": 58, "alt": 58, "ctrl": 59, "control": 59]
+        if let code = modifierKeys[lower] { return (code, []) }
         throw MacKeySyntaxError.unknownKey(token, chord: chord)
     }
 
@@ -478,6 +485,58 @@ public extension MacEventSink {
     /// A sink with no per-process route says so; it never falls back to the
     /// global post, which would type into the key window.
     func post(key: MacKeyEvent, toPid pid: Int32) -> Bool { false }
+}
+
+/// The client's sink checks the inherited driver at every post. The binding
+/// retains only releases for inputs this act actually pressed.
+struct DriverCheckedMacEventSink: MacEventSink {
+    let base: any MacEventSink
+    var isAvailable: Bool { base.isAvailable }
+    var secureKeyboardEntryActive: Bool { base.secureKeyboardEntryActive }
+
+    func post(key event: MacKeyEvent) {
+        guard let binding = MacDriverContext.binding, binding.allowsEmission else { return }
+        base.post(key: event)
+        binding.notePostedEvent()
+        let key = "key:\(event.keyCode)"
+        if event.down {
+            binding.held(key, release: { [base] in
+                base.post(key: MacKeyEvent(keyCode: event.keyCode, down: false))
+            })
+        } else { binding.held(key, release: nil) }
+    }
+
+    func post(key event: MacKeyEvent, toPid pid: Int32) -> Bool {
+        guard let binding = MacDriverContext.binding, binding.allowsEmission,
+              base.post(key: event, toPid: pid) else { return false }
+        binding.notePostedEvent()
+        let key = "pid:\(pid):\(event.keyCode)"
+        if event.down {
+            binding.held(key, release: { [base] in
+                _ = base.post(key: MacKeyEvent(keyCode: event.keyCode, down: false), toPid: pid)
+            })
+        } else { binding.held(key, release: nil) }
+        return true
+    }
+
+    func post(mouse event: MacMouseEvent) {
+        guard let binding = MacDriverContext.binding, binding.allowsEmission else { return }
+        base.post(mouse: event)
+        binding.notePostedEvent()
+        let key = "mouse:\(event.button)"
+        if event.phase == .down {
+            binding.held(key, release: { [base] in
+                guard let point = SystemMacPointerPositionSource().currentPosition() else { return }
+                base.post(mouse: MacMouseEvent(phase: .up, button: event.button, x: point.x, y: point.y))
+            })
+        } else if event.phase == .up { binding.held(key, release: nil) }
+    }
+
+    func post(scroll event: MacScrollEvent) {
+        guard let binding = MacDriverContext.binding, binding.allowsEmission else { return }
+        base.post(scroll: event)
+        binding.notePostedEvent()
+    }
 }
 
 /// The live probe. Carbon's `IsSecureEventInputEnabled()` is the only public
@@ -937,7 +996,17 @@ public extension MacAXActSource {
 enum MacAXExecutionLane {
     static func sync<T>(_ body: () -> T) -> T {
         if Thread.isMainThread { return body() }
-        return DispatchQueue.main.sync(execute: body)
+        let binding = MacDriverContext.binding
+        let continuation = MacWorkContinuation.current
+        return withoutActuallyEscaping(body) { operation in
+            // GCD sync completes this nonescaping operation before returning.
+            nonisolated(unsafe) let synchronousOperation = operation
+            return DispatchQueue.main.sync {
+                MacDriverContext.$binding.withValue(binding) {
+                    MacWorkContinuation.$current.withValue(continuation, operation: synchronousOperation)
+                }
+            }
+        }
     }
 }
 
@@ -1134,6 +1203,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         // while Chrome kept the front.
         let raiseStatus: AXError? = MacAXExecutionLane.sync {
             guard let element = element(window.handle) else { return nil }
+            guard MacDriverContext.binding?.allowsEmission == true else { return nil }
             NativeAgentMotorEpoch.noteAgentMotorEvent()
             return AXUIElementPerformAction(element, kAXRaiseAction as CFString)
         }
@@ -1157,8 +1227,12 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         // then the one that works, and in both cases believe only the window
         // server's own answer.
         if isFrontAndFocused(app: app, window: window) { return .performed }
-        _ = MacAXExecutionLane.sync { app.activate() }
+        _ = MacAXExecutionLane.sync {
+            guard MacDriverContext.binding?.allowsEmission == true else { return false }
+            return app.activate()
+        }
         if awaitFrontAndFocused(app: app, window: window) { return .performed }
+        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
         activateViaAppleEvent(app)
         if awaitFrontAndFocused(app: app, window: window) { return .performed }
 
@@ -1274,6 +1348,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             .replacingOccurrences(of: "\"", with: "\\\"")
         guard let script = NSAppleScript(source: "tell application id \"\(escaped)\" to activate") else { return }
         var error: NSDictionary?
+        guard MacDriverContext.binding?.allowsEmission == true else { return }
         script.executeAndReturnError(&error)
         guard let error else { return }
         let code = (error[NSAppleScript.errorNumber] as? Int) ?? 0
@@ -1426,11 +1501,20 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         MacAXExecutionLane.sync { performOnExecutionLane(target, action: action) }
     }
 
+    /// Only a write the target accepted consumes a takeover continuation; an
+    /// AX error leaves its protection in place (the posted-event sink is the
+    /// one other consumer).
+    private func recordMutationStatus(_ status: AXError) -> AXError {
+        if status == .success { MacWorkContinuation.current?.actionStarted() }
+        return status
+    }
+
     private func performOnExecutionLane(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
         guard target.actions.contains(action) else { return .unsupported }
+        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
-        let status = AXUIElementPerformAction(element, action as CFString)
+        let status = recordMutationStatus(AXUIElementPerformAction(element, action as CFString))
         switch status {
         case .success: return .performed
         case .actionUnsupported: return .unsupported
@@ -1447,8 +1531,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         var settable: DarwinBoolean = false
         let probe = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
         guard probe == .success, settable.boolValue else { return .unsupported }
+        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
-        let status = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFTypeRef)
+        let status = recordMutationStatus(AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFTypeRef))
         switch status {
         case .success: return .performed
         case .attributeUnsupported, .actionUnsupported: return .unsupported
@@ -1575,8 +1660,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             guard probe == .success, settable.boolValue else { return .unsupported }
             var selection = CFRange(location: range.location, length: range.length)
             guard let value = AXValueCreate(.cfRange, &selection) else { return .failed }
+            guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
             NativeAgentMotorEpoch.noteAgentMotorEvent()
-            let status = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value)
+            let status = recordMutationStatus(AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value))
             switch status {
             case .success: return .performed
             case .attributeUnsupported, .actionUnsupported: return .unsupported
@@ -1591,8 +1677,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             var settable: DarwinBoolean = false
             let probe = AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable)
             guard probe == .success, settable.boolValue else { return .unsupported }
+            guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
             NativeAgentMotorEpoch.noteAgentMotorEvent()
-            let status = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
+            let status = recordMutationStatus(AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef))
             switch status {
             case .success: return .performed
             case .attributeUnsupported, .actionUnsupported: return .unsupported
@@ -1610,8 +1697,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         var settable: DarwinBoolean = false
         let probe = AXUIElementIsAttributeSettable(element, "AXSelected" as CFString, &settable)
         guard probe == .success, settable.boolValue else { return .unsupported }
+        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
-        let status = AXUIElementSetAttributeValue(element, "AXSelected" as CFString, true as CFTypeRef)
+        let status = recordMutationStatus(AXUIElementSetAttributeValue(element, "AXSelected" as CFString, true as CFTypeRef))
         return status == .success ? .performed : .failed
     }
 
@@ -1620,12 +1708,13 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         var settable: DarwinBoolean = false
         let probe = AXUIElementIsAttributeSettable(element, kAXFocusedAttribute as CFString, &settable)
         guard probe == .success, settable.boolValue else { return .unsupported }
+        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
-        let status = AXUIElementSetAttributeValue(
+        let status = recordMutationStatus(AXUIElementSetAttributeValue(
             element,
             kAXFocusedAttribute as CFString,
             kCFBooleanTrue
-        )
+        ))
         switch status {
         case .success: return .performed
         case .attributeUnsupported, .actionUnsupported: return .unsupported
@@ -1976,42 +2065,15 @@ public enum MacAccessibilityActuator {
 
 // MARK: - Approval capability (W2/W3-FIX 1+2, replaces the forgeable marker)
 
-/// A per-call, non-forgeable authorization to synthesize input.
+/// A body-bound, expiring, single-use authorization to synthesize input.
 ///
-/// WHY IT IS A TYPE AND NOT A JSON KEY. The first cut of this wave carried the
-/// approval as `body["__mac_injection_approved"] = true`. That is in-band with
-/// model-supplied arguments, so anything that could put a key in a dictionary —
-/// the model's own tool arguments, an HTTP body, a raw dispatcher call — could
-/// mint the authority itself. Stripping-then-stamping made forgery from the
-/// MODEL hard but left every in-process caller of the public API able to type
-/// the key. The boundary was a convention, not a boundary.
-///
-/// What replaces it:
-///   • `MacInjectionCapability` has a PRIVATE memberwise init. It cannot be
-///     constructed by writing a literal; the only constructor is `mint`.
-///   • It is not `Codable` and carries no wire form, so it cannot arrive from
-///     off-process. The HTTP / iOS bridge calls `dispatch`, which has no
-///     parameter that can carry one — remote injection is refused by SIGNATURE,
-///     not by a runtime check that could be forgotten.
-///   • It is BOUND: to one action, to a SHA-256 digest of the exact body, to an
-///     approval id, and to a short TTL. A capability minted for
-///     `keystroke "hello"` does not authorize `keystroke "rm -rf /"`, a
-///     different action, or the same call ten minutes later.
-///   • It is SINGLE USE: `MacInjectionCapabilityLedger` consumes the id on
-///     first successful authorization, so a captured capability cannot be
-///     replayed even inside its TTL.
-///   • `mint` has exactly ONE non-test call site in the repo — the
-///     post-approval branch of `AutonomyGatedDispatcher`. That is pinned by a
-///     source-conformance test (`macInjectionCapability_hasExactlyOneMintSite`)
-///     which fails the build's test suite if a second site appears.
-///
-/// The honest limit: Swift has no cross-module access level that lets
-/// ChatOrchestration call a function MacControlBridge cannot. `mint` is public.
-/// What the design buys is that minting is (a) a deliberate, greppable,
-/// test-pinned act rather than a dictionary key anyone can copy, and (b)
-/// useless unless you already hold the exact approved body — so the interesting
-/// attack (model or remote caller escalating its OWN request) is closed
-/// structurally.
+/// The private initializer and non-Codable representation prevent a JSON
+/// approval marker from becoming a capability. `mint` is public and does not
+/// verify human approval: callers supply an approval or automatic-decision id.
+/// `SwiftNativeMacControl.dispatch` automatically mints when none is supplied,
+/// including for bridge callers. An explicit approved replay supplies its own
+/// capability. Both paths validate the action, body digest, TTL and single-use
+/// nonce, then apply the same policy, Full Mac, category, TCC and driver gates.
 public struct MacInjectionCapability: Sendable, Equatable {
     /// Approval record id (or an equivalent resolved-decision id) this
     /// capability was minted from. Recorded in refusals for audit.
@@ -2048,12 +2110,8 @@ public struct MacInjectionCapability: Sendable, Equatable {
     /// dispatcher hop, far too short to bank.
     public static let defaultTTLSeconds: Double = 120
 
-    /// THE ONLY CONSTRUCTOR. Call sites are pinned to one by
-    /// `macInjectionCapability_hasExactlyOneMintSite`.
-    ///
-    /// - Parameter approvalID: the resolved approval record's id. Empty ⇒ nil;
-    ///   an authorization with no approval behind it is exactly what this whole
-    ///   mechanism exists to prevent.
+    /// Construct a capability without independently checking human approval.
+    /// - Parameter approvalID: an approval or automatic-decision id. Empty ⇒ nil.
     public static func mint(
         approvalID: String,
         action: String,

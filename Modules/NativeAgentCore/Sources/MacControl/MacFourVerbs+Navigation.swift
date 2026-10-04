@@ -11,20 +11,34 @@ extension MacFourVerbs {
     /// Get her THERE. A running app is raised through the existing focus organ,
     /// an installed one is launched, a path or a URL is opened. The reply is
     /// where she landed, as `screen()`.
-    public func go(_ name: String) async -> MacFourVerbsReply {
+    public func go(_ name: String, front: Bool = false) async -> MacFourVerbsReply {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return MacFourVerbsReply(ok: false, text: "Where to? Give me an app, a folder, a file or a link.")
+        }
+
+        guard front else {
+            let reason = "opening or switching to \(trimmed) brings an app to the front"
+            return MacFourVerbsReply(
+                ok: false,
+                text: "I need the screen because " + reason + ". Nothing was opened or brought forward. "
+                    + "Only use front:true when the task explicitly asks to bring it forward.",
+                detail: [
+                    "error": .string("needs_front"), "status": .string("needs_front"),
+                    "needs_front_reason": .string(reason), "user_front_changed": .bool(false),
+                ]
+            )
         }
 
         // AppKit cannot raise an app over loginwindow. In User's ordinary setup
         // that is the screensaver layer, and the existing wake organ is the
         // safe, bounded way through it. A four-verb caller should never have to
         // discover a fifth tool or translate `loginwindow` into that action.
-        // `sight` nudges only when it actually observes that layer and keeps all
-        // wake/injection gates below this surface.
+        // The look owner wakes only while that layer covers the screen and
+        // keeps all wake/injection gates below this surface.
         if case .blind(let readiness) = await sight(part: nil),
-           readiness.detail["error"] == .string("display_obstructed") {
+           readiness.detail["error"] == .string("display_obstructed")
+            || readiness.detail["error"] == .string("mac_locked") {
             return readiness
         }
 
@@ -123,21 +137,12 @@ extension MacFourVerbs {
             let landed = Self.destination(verificationDestination, matches: hit)
             var detail = Self.operationDetail(result).merging(hit.detail) { current, _ in current }
             detail["observed_destination"] = landed.map(JSONValue.bool) ?? .null
-            if landed == true {
-                if result.ok == false {
-                    detail["mechanism_operation_state"] = detail["operationState"] ?? .null
-                    detail["mechanism_verification"] = detail["verification"] ?? .null
-                    detail["operationState"] = .string(MacControlOperationState.completed.rawValue)
-                    detail["outcome_reconciled"] = .bool(true)
-                }
+            if landed == true, result.ok {
                 detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
                 detail["verification_evidence"] = .string("fresh_screen_destination_match")
                 return MacFourVerbsReply(
                     ok: true,
-                    text: (result.ok
-                        ? moved
-                        : "The activation report lagged, but the fresh screen shows I arrived at \(trimmed).")
-                        + " Now looking at " + hit.place + ".\n" + hit.render,
+                    text: moved + " Now looking at " + hit.place + ".\n" + hit.render,
                     detail: detail
                 )
             }
@@ -152,7 +157,8 @@ extension MacFourVerbs {
             }
             return MacFourVerbsReply(
                 ok: false,
-                text: "I didn't arrive at \(trimmed). The fresh screen is still " + hit.place + ".\n" + hit.render,
+                text: (result.ok ? "I didn't arrive at \(trimmed)." : "I couldn't complete the request to go to \(trimmed).")
+                    + " The fresh screen is " + hit.place + ".\n" + hit.render,
                 detail: detail
             )
         }
@@ -254,30 +260,13 @@ extension MacFourVerbs {
     /// the surface does not publish enough identity to decide (common for a URL
     /// whose page title does not resemble its host); it never means success.
     static func destination(_ requested: String, matches sighting: Sighting) -> Bool? {
-        if let url = webURL(requested) {
-            guard let host = url.host?.lowercased() else { return nil }
-            let hostWords = host
-                .replacingOccurrences(of: "www.", with: "")
-                .split(separator: ".")
-                .map(String.init)
-                .filter { $0.count > 2 && !["com", "org", "net", "io", "app"].contains($0) }
-            guard !hostWords.isEmpty else { return nil }
-            let visible = normalize(sighting.place + " " + sighting.render)
-            return hostWords.contains { visible.contains(normalize($0)) } ? true : nil
-        }
+        // Screen prose can mention a host or filename without being there.
+        // Neither establishes destination identity.
+        if webURL(requested) != nil || filePath(requested) != nil { return nil }
         // A pane id does not spell its window title ("Wi‑Fi"): Settings in
         // front is as far as the screen can prove.
         if settingsPaneURL(requested) != nil {
             return sighting.bundleIdentifier == "com.apple.systempreferences" ? nil : false
-        }
-        if let path = filePath(requested) {
-            let leaf = normalize(path.lastPathComponent)
-            guard !leaf.isEmpty else { return nil }
-            let stem = normalize(path.deletingPathExtension().lastPathComponent
-                .replacingOccurrences(of: "-", with: " ")
-                .replacingOccurrences(of: "_", with: " "))
-            let visible = normalize(sighting.place + " " + sighting.render)
-            return visible.contains(leaf) || (stem.count >= 3 && visible.contains(stem))
         }
         let wanted = normalize(requested)
         if let bundle = sighting.bundleIdentifier, bundle.lowercased() == requested.lowercased() { return true }

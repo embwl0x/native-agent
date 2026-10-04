@@ -101,7 +101,9 @@ public enum MemoryDueDateStamp {
         // ago" are all statements about the past, and a memory that contains
         // one is not a plan — even when it also names a weekday
         // ("we shipped it last Friday").
-        for marker in backwardMarkers where lower.contains(marker) {
+        for marker in backwardMarkers where lower.range(
+            of: "\\b" + NSRegularExpression.escapedPattern(for: marker) + "\\b",
+            options: .regularExpression) != nil {
             return nil
         }
 
@@ -110,7 +112,12 @@ public enum MemoryDueDateStamp {
         // there is no honest way to pick.
         guard days.count == 1, let day = days.first else { return nil }
 
-        let time = candidateTime(in: lower)
+        let time: (hour: Int, minute: Int)?
+        switch candidateTime(in: lower) {
+        case .absent: time = nil
+        case .clock(let hour, let minute): time = (hour, minute)
+        case .ambiguous: return nil
+        }
         guard let dueAt = combine(day: day.date, time: time, calendar: calendar) else { return nil }
         // Already gone, or beyond the week anyone can feel.
         guard dueAt > now, dueAt.timeIntervalSince(now) <= maximumHorizon else { return nil }
@@ -157,7 +164,10 @@ public enum MemoryDueDateStamp {
         for (index, name) in weekdayNames.enumerated() where containsWord(lower, name) {
             // Gregorian weekday is 1-based from Sunday; `weekdayNames` is
             // 0-based from Sunday, so the target is index + 1.
-            if let next = nextOccurrence(ofWeekday: index + 1, after: now, calendar: calendar) {
+            if let next = nextOccurrence(
+                ofWeekday: index + 1, after: now, calendar: calendar,
+                includeToday: !lower.contains("next \(name)")
+            ) {
                 out.append(DayMatch(date: next, form: .weekday(index)))
             }
         }
@@ -181,21 +191,15 @@ public enum MemoryDueDateStamp {
         return byDay.values.sorted { $0.date < $1.date }
     }
 
-    /// The next STRICTLY future occurrence of a weekday. "Friday" said on a
-    /// Friday means the one coming, not the one happening — a plan is never
-    /// about a moment that has already started.
-    ///
-    /// "next friday" is treated identically to "friday". English genuinely does
-    /// not agree on whether it means the coming Friday or the one after, and a
-    /// coin-flip on a date she will visibly anticipate is worse than the
-    /// nearer, more common reading.
+    /// Include today; the combined day and time must still be in the future.
     private static func nextOccurrence(
         ofWeekday weekday: Int,
         after now: Date,
-        calendar: Calendar
+        calendar: Calendar,
+        includeToday: Bool
     ) -> Date? {
         let startOfToday = calendar.startOfDay(for: now)
-        for offset in 1...7 {
+        for offset in (includeToday ? 0...6 : 1...7) {
             guard let candidate = calendar.date(byAdding: .day, value: offset, to: startOfToday) else {
                 continue
             }
@@ -240,7 +244,13 @@ public enum MemoryDueDateStamp {
     /// An hour/minute, only when the text CUES one. A bare number is never a
     /// time: "9 open tabs" is not nine o'clock, and inventing an hour is how a
     /// register starts lying about when.
-    private static func candidateTime(in lower: String) -> (hour: Int, minute: Int)? {
+    private enum TimeMatch {
+        case absent
+        case clock(hour: Int, minute: Int)
+        case ambiguous
+    }
+
+    private static func candidateTime(in lower: String) -> TimeMatch {
         let words = lower.split(whereSeparator: { $0 == " " }).map(String.init)
         var found: [(hour: Int, minute: Int)] = []
         for (index, word) in words.enumerated() {
@@ -252,8 +262,9 @@ public enum MemoryDueDateStamp {
         }
         // Two different times is the same ambiguity as two different days.
         let distinct = Set(found.map { $0.hour * 60 + $0.minute })
-        guard distinct.count == 1, let first = found.first else { return nil }
-        return first
+        guard distinct.count <= 1 else { return .ambiguous }
+        guard let first = found.first else { return .absent }
+        return .clock(hour: first.hour, minute: first.minute)
     }
 
     private static let timeCues: Set<String> = ["at", "around", "by", "before", "after", "til", "until"]
@@ -270,6 +281,7 @@ public enum MemoryDueDateStamp {
     /// "9:30" does.
     private static func parseClockWord(_ raw: String, cued: Bool, next: String) -> (hour: Int, minute: Int)? {
         var word = raw.trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!?"))
+        let next = next.trimmingCharacters(in: .punctuationCharacters)
         // A meridiem may be attached ("9pm") or the next word ("9 pm").
         var meridiem: String?
         for suffix in ["am", "pm"] where word.hasSuffix(suffix) && word.count > suffix.count {

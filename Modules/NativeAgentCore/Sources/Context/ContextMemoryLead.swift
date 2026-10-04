@@ -104,7 +104,7 @@ public enum ContextMemoryLead {
     /// persona docs and instructions are not episodes and take no age tag.
     public static func recordedAt(for draft: ContextAtomDraft) -> Date? {
         guard draft.kind == .memory else { return nil }
-        return draft.freshness.updatedAt
+        return draft.freshness.createdAt
     }
 
     /// Provenance parsed out of the atom's provenance entity, if it has one.

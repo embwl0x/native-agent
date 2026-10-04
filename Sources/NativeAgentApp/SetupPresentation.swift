@@ -23,7 +23,7 @@ enum MomentsLaneSetting {
     }
 }
 
-/// HOW MUCH THE AGENT MAY DO ALONE — the three postures Setup exposes, mapped
+/// HOW MUCH THE AGENT MAY DO ALONE — the four postures Setup exposes, mapped
 /// onto the Trust Center presets that already own the policy write.
 ///
 /// ── THE MAPPING ─────────────────────────────────────────────────────────────
@@ -32,12 +32,9 @@ enum MomentsLaneSetting {
 ///   trusted  → Builder   `TrustPolicyPreset.builder`  (access `workspace`, outside ask)
 ///   everything → Full Mac `TrustPolicyPreset.fullMac`
 ///
-/// Full Mac YOLO and Developer Mode are deliberately NOT reachable from here.
-/// They are a security-domain escalation with their own confirmation alert and
-/// stay in Advanced ▸ Trust. A policy already sitting at Full Mac is therefore
-/// not representable by these three segments: `resolve` returns nil for it and
-/// the Setup row renders a read-only line pointing at Trust rather than
-/// silently downgrading a grant the user made deliberately.
+/// Full Mac is the fourth segment and requires its own confirmation alert
+/// before Setup applies that preset. An existing Full Mac policy resolves to
+/// that segment. Developer Mode remains in Advanced ▸ Trust.
 enum SetupPosture: String, CaseIterable, Identifiable, Sendable {
     case ask
     case balanced
@@ -77,8 +74,7 @@ enum SetupPosture: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// The live posture, or nil when the saved policy is outside these three
-    /// (Full Mac). `accessMode` is the already-resolved mode string the Trust
+    /// The live posture, including Full Mac. `accessMode` is the resolved mode string the Trust
     /// surface computes from the same policy.
     static func resolve(accessMode: String, outsideWorkspaceDefault: String?) -> SetupPosture? {
         switch accessMode {

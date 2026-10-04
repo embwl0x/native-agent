@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
@@ -241,7 +242,8 @@ extension SwiftNativeMacControl {
                     "label": markedTarget.label.map {
                         MacScreenViewTextRedaction.redactedLegendString(
                             $0,
-                            valueChars: MacAXLimits.hardValueChars
+                            valueChars: MacAXLimits.hardValueChars,
+                            enclosing: markedTarget.enclosingCaption
                         )
                     } ?? .null,
                     "path": .array(markedTarget.path.map { .int(Int64($0)) }),
@@ -570,6 +572,30 @@ extension SwiftNativeMacControl {
             // Written/secure values use count+digest. Path-only calls lack the
             // caption context needed to safely expose even an unwritten value.
             let redactValue = (value?.isEmpty == false) || markedTarget == nil || markedTarget?.secret == true
+                || markedTarget?.valueRedaction != nil
+                || (markedTarget?.labelSource == "value" && markedTarget?.labelRedaction != nil)
+            func elementReceipt(_ target: MacAXActTarget, postState: Bool = false) -> JSONValue {
+                guard case .object(var object) = target.toJSON(redactingValue: redactValue || postState) else {
+                    return .null
+                }
+                if let title = target.title {
+                    if postState {
+                        object["title"] = MacInjectionResultRedaction.redactedSecret(title)
+                    } else if let redaction = markedTarget?.labelRedaction {
+                        object["title"] = title == markedTarget?.label
+                            ? redaction : MacInjectionResultRedaction.redactedSecret(title)
+                    }
+                }
+                if !postState, target.value == markedTarget?.value,
+                   let redaction = markedTarget?.valueRedaction {
+                    object["value"] = redaction
+                }
+                return MacScreenViewTextRedaction.redactedElementJSON(
+                    .object(object),
+                    under: markedTarget?.label,
+                    enclosing: markedTarget?.enclosingCaption ?? .none
+                )
+            }
             var output: [String: JSONValue] = [
                 "ok": .bool(result.ok),
                 "status": .string(result.ok ? "acted" : "failed"),
@@ -578,20 +604,13 @@ extension SwiftNativeMacControl {
                 "outcome": .string(result.outcome.rawValue),
                 "path": pathJSON,
                 // Receipt fields retain the legend's contextual redaction.
-                "element": MacScreenViewTextRedaction.redactedElementJSON(
-                    result.target.toJSON(redactingValue: redactValue),
-                    under: markedTarget?.label,
-                    enclosing: markedTarget?.enclosingCaption ?? .none
-                ),
+                "element": elementReceipt(result.target),
                 // The post-state read is offered so the caller can CHECK
                 // whether the state changed; it is not itself a claim that it
-                // did (see `verificationState`).
+                // did (see `verificationState`). Its text lacks a fresh full
+                // caption context, so only count+digest can leave this read.
                 "post_state": result.postState.map {
-                    MacScreenViewTextRedaction.redactedElementJSON(
-                        $0.toJSON(redactingValue: redactValue),
-                        under: markedTarget?.label,
-                        enclosing: markedTarget?.enclosingCaption ?? .none
-                    )
+                    elementReceipt($0, postState: true)
                 } ?? .null,
                 "verified": .bool(false),
                 "value_redacted": .bool(redactValue),

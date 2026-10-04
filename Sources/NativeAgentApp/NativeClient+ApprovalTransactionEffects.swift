@@ -27,10 +27,10 @@ struct NativeClientApprovalTransactionEffects: ApprovalTransactionEffects {
     }
 
     func disableSkill(name: String) async throws { try await client.disableSkill(name: name) }
-    func enableSkill(name: String) async throws { try await client.enableSkill(name: name) }
-
-    func reconcileSkillEvolutionRecall(memory: SwiftNativeMemoryV2, dataRoot: URL, personaRoot: URL) async throws {
-        try await NativeClient.reconcileSkillEvolutionRecall(memory: memory, dataRoot: dataRoot, personaRoot: personaRoot)
+    /// A self-improvement card (no digest) may be hers to approve under Full
+    /// Mac, so it never admits a script; User's script install card admits its digest.
+    func enableSkill(name: String, reviewedDigest: String?) async throws {
+        try await client.enableSkill(name: name, reviewedDigest: reviewedDigest, admitScript: reviewedDigest != nil)
     }
 
     func applyResolvedExternalSend(from record: ApprovalRecord) async -> Bool {
@@ -54,12 +54,18 @@ struct NativeClientApprovalTransactionEffects: ApprovalTransactionEffects {
                                                  denyExternalMcp: denyExternalMcp, enforceAppAutonomy: enforceAppAutonomy)
     }
 
-    func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String,
-                                  tools: any ToolDispatchClient) async throws {
+    func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String) async throws {
+        // The steer and file access the card carried, bound by the
+        // coordinator; Telegram runs the turn on its own queue, so they are
+        // carried in by hand. A card with no file access predates the record:
+        // the chat's current setting, never a wider one by default.
+        let steer = PeerDataTaint.current ?? PeerDataTaint()
+        let fileAccess = ChatToolSessionContext.fileAccess
+            ?? UserDefaults.standard.string(forKey: "chatFileAccess") ?? "read_only"
         let operation: @Sendable () async throws -> Void = {
-            try await ApprovalTransactionCoordinator.ApprovalReceiptTools.withTransientLoadout {
+            try await PeerDataTaint.$current.withValue(steer) {
                 try await self.runApprovalFollowUp(dataRoot: dataRoot, sessionID: sessionID,
-                    envelope: envelope, prompt: prompt, tools: tools)
+                    envelope: envelope, prompt: prompt, fileAccess: fileAccess)
             }
         }
         switch envelope.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -73,24 +79,30 @@ struct NativeClientApprovalTransactionEffects: ApprovalTransactionEffects {
             }
             try await TelegramTurnCoordinator.shared.runApprovalContinuation(
                 destination: TelegramDestination(chatId: chatID, threadId: threadID),
-                text: prompt, operation: operation)
-        case "chat", "app", "bot":
-            try await NativeAgentEngine.live.turns.runtime.runAdmittedTurn(sessionID: sessionID, operation: operation)
-        case "ios", "iphone", "phone", "mobile", "icloud":
-            try await ICloudIncomingTurnForwarder.runAdmittedTurn(sessionID: sessionID, operation: operation)
-        case "slack":
-            try await SlackSocketModeLoop.runAdmittedTurn(sessionID: sessionID, operation: operation)
+                text: prompt, operation: { try await TurnAdmission.shared.run(sessionID: sessionID, operation: operation) })
         default:
-            // Builder bridges and agent peers already admit ordinary turns here.
+            // Every door admits ordinary turns in this session here.
             try await TurnAdmission.shared.run(sessionID: sessionID, operation: operation)
         }
     }
 
+    /// Her normal tools on the card's own door (Wave 2 #8): Trust, the peer
+    /// floor and the steer bound around this turn judge every call in it.
     private func runApprovalFollowUp(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String,
-                                     tools: any ToolDispatchClient) async throws {
-        let client = NativeAgentEngine.live.chatClient(tools: tools)
+                                     fileAccess: String) async throws {
+        let door = ConversationSurfaceProfile(envelope.surface)
+        // A card from Claude's or Codex's own bridge lane is that agent's
+        // ask, whatever the card recorded (their lanes latch no steer of
+        // their own), so the follow-up is held to the peer floor for it.
+        if let lane = ["claude-bridge": "claude", "codex-bridge": "codex"][door.id] {
+            PeerDataTaint.current?.mark(peer: lane)
+        }
+        let profile: NativeAgentAppChatSurfaceProfile = door.isAgentBridge || ["claude-bridge", "codex-bridge"].contains(door.id)
+            ? .bridge : door.isIOSRemote ? .ios : NativeAgentAppChatSurfaceProfile(rawValue: door.id) ?? .mac
+        let client = NativeAgentEngine.live.chatClient(profile: profile,
+            approvalFiler: profile == .telegram ? TelegramApprovalFilerRef.shared.current() : nil)
         let options = NativeChatTurnOptions.current(surface: envelope.surface)
-        let response = try await TurnRequest(message: prompt, sessionID: sessionID, fileAccess: "read_only", persona: options.persona,
+        let response = try await TurnRequest(message: prompt, sessionID: sessionID, fileAccess: fileAccess, persona: options.persona,
                                   surface: envelope.surface, suppressUserAppend: true, envelope: envelope,
                                   verifiedSessionID: sessionID, verifiedChatID: .some(envelope.verifiedChatId),
                                   verifiedUserID: .some(envelope.verifiedUserId), replyRoute: envelope.replyRoute,

@@ -2,13 +2,16 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import StandingBots
 
 /// Per-request schema construction; descriptions and parameters stay lazy.
 package struct BuiltInToolSchemaFactory {
     let requestedNames: Set<String>?
+    let standingBotMinimumInterval: TimeInterval
 
-    package init(requestedNames: Set<String>?) {
+    package init(requestedNames: Set<String>?, standingBotMinimumInterval: TimeInterval = BotRunLimits.minimumInterval) {
         self.requestedNames = requestedNames
+        self.standingBotMinimumInterval = standingBotMinimumInterval
     }
 
     func requestedSchema(
@@ -142,7 +145,7 @@ package struct BuiltInToolSchemaFactory {
     }
     func stringOrLooseObjectSchema(_ desc: String? = nil) -> JSONValue {
         var props: [(String, JSONValue)] = [
-            ("anyOf", .array([strSchema(), looseObjectSchema()])),
+            ("anyOf", .array([strSchema(), looseObjectSchema(), obj([("type", .string("null"))])])),
         ]
         if let desc { props.append(("description", .string(desc))) }
         return obj(props)

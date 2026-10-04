@@ -6,44 +6,11 @@ import MemoryV2
 
 
 extension NativeClient {
-    struct ManifestSkillValue: Decodable {
-        let state: String
-        let version: String
-        let type: String
-        let installedAt: String?
-        let path: String
-    }
-    struct ManifestRegistryFile: Decodable {
-        let skills: [String: ManifestSkillValue]
-    }
-
-    /// Read the manifest skill registry from the local filesystem.
+    /// Skills owns the legacy/data-root manifest merge and checked read.
     func readSkillRegistry() async throws -> [SkillRegistryEntry] {
-        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let registryURL = dataRoot.appendingPathComponent("skills/manifest_registry.json")
-        // The native merge treats malformed JSON as its default empty value.
-        // Validate existing authority bytes first so the Skills banner can
-        // distinguish unreadable storage from a genuine empty catalog.
-        if FileManager.default.fileExists(atPath: registryURL.path) {
-            let data = try Data(contentsOf: registryURL)
-            _ = try JSONDecoder.nativeAgent.decode(ManifestRegistryFile.self, from: data)
-        }
-        let impl = makeSkillsClient(root: dataRoot)
-        if let rows = try? await impl.listManifestSkills(),
-           let data = try? JSONValue.array(rows).serializedData(pretty: false),
-           let entries = try? JSONDecoder.nativeAgent.decode([SkillRegistryEntry].self, from: data) {
-            return entries
-        }
-        // Read the saved registry directly if the native list projection is unavailable.
-        guard FileManager.default.fileExists(atPath: registryURL.path) else {
-            return []
-        }
-        let data = try Data(contentsOf: registryURL)
-        let wrapper = try JSONDecoder.nativeAgent.decode(ManifestRegistryFile.self, from: data)
-        return wrapper.skills.map { name, val in
-            SkillRegistryEntry(name: name, state: val.state, version: val.version,
-                               type: val.type, installedAt: val.installedAt, path: val.path)
-        }
+        let rows = try await makeSkillsClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot()).listManifestSkills()
+        return try JSONDecoder.nativeAgent.decode([SkillRegistryEntry].self,
+            from: JSONValue.array(rows).serializedData(pretty: false))
     }
 
     /// Read a skill's manifest.json from its directory (v1 fallback).
@@ -73,42 +40,29 @@ extension NativeClient {
     }
 
     func skillDirectory(for entry: SkillRegistryEntry) throws -> URL {
-        let fm = FileManager.default
-        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let fallback = dataRoot.appendingPathComponent("skills/\(entry.name)")
-        let rawPath = entry.path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawPath.isEmpty else { return fallback }
-
-        let candidate = URL(fileURLWithPath: rawPath).standardizedFileURL
-        let allowedRoots = [
-            dataRoot.appendingPathComponent("skills").standardizedFileURL,
-            fm.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/NativeAgent/skills")
-                .standardizedFileURL,
-        ]
-        let candidatePath = candidate.path
-        let allowed = allowedRoots.contains { root in
-            candidatePath == root.path || candidatePath.hasPrefix(root.path + "/")
-        }
-        if allowed, fm.fileExists(atPath: candidate.appendingPathComponent("manifest.json").path) {
-            return candidate
-        }
-        return fallback
+        SwiftNativeSkillsClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot()).manifestDirectory(for: [
+            "name": .string(entry.name), "path": .string(entry.path),
+        ])
     }
 
-    func enableSkill(name: String) async throws {
+    /// User's Install admits a script skill's exact digest as his: the one
+    /// he reviewed (`reviewedDigest`), refused if the script changed since.
+    /// An approved card's (`admitScript: false`) turns on only what needs no admission.
+    func enableSkill(name: String, reviewedDigest: String? = nil, admitScript: Bool = true) async throws {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         try await Self.enableSkill(
             name: name, dataRoot: root, memory: nil,
-            personaRoot: dataRootOverride == nil ? PersonaRootResolver.resolve() : root.appendingPathComponent("persona")
+            personaRoot: dataRootOverride == nil ? PersonaRootResolver.resolve() : root.appendingPathComponent("persona"),
+            reviewedDigest: reviewedDigest, admitScript: admitScript
         )
     }
 
     static func enableSkill(
-        name: String, dataRoot: URL, memory: SwiftNativeMemoryV2?, personaRoot: URL
+        name: String, dataRoot: URL, memory: SwiftNativeMemoryV2?, personaRoot: URL,
+        reviewedDigest: String? = nil, admitScript: Bool = true
     ) async throws {
-        let impl = makeSkillsClient(root: dataRoot)
-        let result = try await impl.enableSkill(name: name)
+        let result = try await SwiftNativeSkillsClient(root: dataRoot).enableSkill(
+            name: name, admittedBy: admitScript ? "user" : nil, reviewedDigest: reviewedDigest)
         // The runtime branch returns an active canonical skill record. The
         // manifest-only branch merely changes registration state; it does not
         // install a body or establish recall readiness, and needs no memory
@@ -124,7 +78,10 @@ extension NativeClient {
     func disableSkill(name: String) async throws {
         let impl = makeSkillsClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         _ = try await impl.disableSkill(name: name)
-        return
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        try await Self.reconcileSkillEvolutionRecall(
+            memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root,
+            personaRoot: dataRootOverride == nil ? PersonaRootResolver.resolve() : root.appendingPathComponent("persona"))
     }
 
 }

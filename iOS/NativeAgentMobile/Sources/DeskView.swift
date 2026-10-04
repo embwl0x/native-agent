@@ -117,15 +117,12 @@ struct MobileDeskView: View {
     @State private var hasAttemptedDeskLoad = false
     @State private var deskLoadError: String?
     @State private var historyLimit = 40
+    @State private var notifiedHandle: String?
 
     private static let syncingLine = "The board is still coming over from your Mac. It usually takes a moment."
 
     private var rows: [MobileDeskItem] {
         MobileDeskSample.rows(MobileDesignSamples.rows(sync.deskItems))
-    }
-
-    private var waitingOnYou: [MobileDeskItem] {
-        rows.filter { MobileDeskSectionPresentation.section(for: $0) == .waitingOnYou }
     }
 
     private var active: [MobileDeskItem] {
@@ -139,7 +136,15 @@ struct MobileDeskView: View {
     /// A sample run is judged as a paired phone.
     private var isPaired: Bool { MobileDeskSample.mode != nil || pairingStore.isPaired }
 
+    private var movementDeadlines: [Date] {
+        [Date()] + rows.flatMap { item in
+            [item.executionEvidence?.lastMovementAt, item.status == "now" ? item.updatedAt : nil]
+                .compactMap { DeskActivityState.movementDate($0)?.addingTimeInterval(DeskActivityState.movementWindow) }
+        }.filter { $0 > Date() }.sorted()
+    }
+
     var body: some View {
+        TimelineView(.explicit(movementDeadlines)) { _ in
         // The line describes the page; the Mac's status lives in the chat
         // header. Desk's own delivery clock drives the freshness note: a
         // Memory read is not a Desk delivery.
@@ -149,10 +154,11 @@ struct MobileDeskView: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Add Desk item")
         } content: {
+            MobileWorkOverviewView()
             if rows.isEmpty {
                 emptyBoard
             } else {
-                board
+                DisclosureGroup("Desk items and history") { board }
             }
         }
         .defaultScrollAnchor(MobileDeskSample.mode == "end" ? .bottom : nil)
@@ -163,12 +169,26 @@ struct MobileDeskView: View {
         .refreshable { await refreshDesk() }
         .task {
             openSampleRoute()
+            notifiedHandle = MobileDeskItemNotificationIntent.consume() ?? notifiedHandle
             await refreshDesk()
+            openNotifiedItem()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .nativeagentOpenActivity)) { _ in
+            guard let handle = MobileDeskItemNotificationIntent.consume() else { return }
+            notifiedHandle = handle
+            Task {
+                await refreshDesk()
+                openNotifiedItem()
+            }
         }
         .onChange(of: sync.deskItems) { _, items in
             guard !items.isEmpty else { return }
             hasAttemptedDeskLoad = true
             deskLoadError = nil
+            if let item = items.first(where: { $0.handle == selectedItem?.handle }) {
+                selectedItem = item
+            }
+            openNotifiedItem()
         }
         .sheet(item: $selectedItem) { item in
             MobileDeskItemDetail(item: item, errorMessage: $errorMessage)
@@ -188,6 +208,7 @@ struct MobileDeskView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+        }
     }
 
     private func refreshDesk() async {
@@ -206,33 +227,15 @@ struct MobileDeskView: View {
 
     /// "Working on four things. Two need you." Said only once there is a board.
     private var headerLine: String? {
-        guard !rows.isEmpty else { return nil }
-        let moving = active.count
-        let waiting = waitingOnYou.count
-        let doing = moving == 0
-            ? "Nothing in motion right now."
-            : "Working on \(AliveWords.spelled(moving, capitalized: false)) \(moving == 1 ? "thing" : "things")."
-        if waiting > 0 {
-            return doing + " \(AliveWords.spelled(waiting)) \(waiting == 1 ? "needs" : "need") you."
-        }
-        return moving == 0 ? doing : doing + " Nothing needs you."
+        sync.workOverview?.headline
     }
 
     // MARK: The board
 
     @ViewBuilder
     private var board: some View {
-        if !waitingOnYou.isEmpty {
-            AliveSection("Waiting on you", surface: .waiting) {
-                ForEach(Array(waitingOnYou.enumerated()), id: \.element.id) { index, item in
-                    if index > 0 { AliveDivider() }
-                    waitingRow(item)
-                }
-            }
-        }
-
         if !active.isEmpty {
-            AliveSection("What I'm working on", surface: .none) {
+            AliveSection("On the board", surface: .none) {
                 ForEach(active) { item in workCard(item) }
             }
         }
@@ -265,46 +268,12 @@ struct MobileDeskView: View {
         }
     }
 
-    private func waitingRow(_ item: MobileDeskItem) -> some View {
-        Button { selectedItem = item } label: {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                AliveWaitingDot()
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(item.title)
-                        .font(.headline)
-                        .foregroundStyle(AlivePalette.text)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if let line = Self.waitingLine(item) {
-                        Text(line)
-                            .font(.subheadline)
-                            .foregroundStyle(AlivePalette.secondary)
-                            .lineLimit(2)
-                            .multilineTextAlignment(.leading)
-                    }
-                }
-                Spacer(minLength: 8)
-                AliveChevron()
-            }
-            .aliveRow()
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private static func waitingLine(_ item: MobileDeskItem) -> String? {
-        for text in [item.blockedReason, item.waitingOn, item.summary] {
-            if let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty { return text }
-        }
-        return nil
-    }
-
     private func workCard(_ item: MobileDeskItem) -> some View {
         Button { selectedItem = item } label: {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
                     DeskStatusMark(status: item.status)
-                    Text(DeskStatusWords.word(for: item.status))
+                    Text(item.activity(at: Date()).label)
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(AlivePalette.text)
                     Spacer(minLength: 8)
@@ -448,10 +417,18 @@ struct MobileDeskView: View {
     /// `-deskSample detail|new|tasks|taskdetail|tasknew` opens that screen over the sample board.
     private func openSampleRoute() {
         switch MobileDeskSample.mode {
-        case "detail": selectedItem = waitingOnYou.first ?? rows.first
+        case "detail": selectedItem = rows.first
         case "tasks", "taskdetail", "tasknew": showingTasks = true
         case "new": showingNewItem = true
         default: break
+        }
+    }
+
+    private func openNotifiedItem() {
+        guard let handle = notifiedHandle else { return }
+        if let item = sync.deskItems.first(where: { $0.handle == handle }) {
+            selectedItem = item
+            notifiedHandle = nil
         }
     }
 }
@@ -462,20 +439,20 @@ struct MobileDeskView: View {
 /// terminal Mac status in Active until the iOS app shipped again.
 enum MobileDeskSectionPresentation {
     enum Section: Equatable {
-        case waitingOnYou
         case active
         case history
     }
 
     static func section(for item: MobileDeskItem) -> Section {
-        section(requiresOwnerInput: item.requiresOwnerInput, closedAt: item.closedAt)
+        section(closedAt: item.closedAt)
     }
 
-    static func section(requiresOwnerInput: Bool, closedAt: String?) -> Section {
+    /// What waits on him is the overview's Needs you above the board.
+    static func section(closedAt: String?) -> Section {
         if let closedAt, !closedAt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return .history
         }
-        return requiresOwnerInput ? .waitingOnYou : .active
+        return .active
     }
 }
 
@@ -502,7 +479,7 @@ enum MobileDeskNotePresentation {
     }
 }
 
-private struct MobileDeskItemDetail: View {
+struct MobileDeskItemDetail: View {
     let item: MobileDeskItem
     @Binding var errorMessage: String?
     @Environment(\.dismiss) private var dismiss
@@ -529,7 +506,7 @@ private struct MobileDeskItemDetail: View {
 
     var body: some View {
         NavigationStack {
-            AlivePage(title: item.title, line: item.requiresOwnerInput && item.closedAt == nil ? "Waiting on you" : DeskStatusWords.word(for: item.status), style: .pushed) {
+            AlivePage(title: item.title, line: item.requiresOwnerInput && item.closedAt == nil ? "Waiting on you" : (item.closedAt != nil ? DeskStatusWords.word(for: item.status) : item.activity(at: Date()).label), style: .pushed) {
 
                 if let summary = displayedSummary, !summary.isEmpty {
                     AliveCard {
@@ -602,6 +579,12 @@ private struct MobileDeskItemDetail: View {
                                 Text(pending.statusLine)
                                     .font(.footnote)
                                     .foregroundStyle(AlivePalette.secondary)
+                                if let error = pending.lastError {
+                                    Text(error)
+                                        .font(.footnote)
+                                        .foregroundStyle(AlivePalette.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
                             .aliveRow()
                         }

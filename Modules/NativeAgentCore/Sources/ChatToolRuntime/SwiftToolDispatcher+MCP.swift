@@ -154,6 +154,19 @@ extension SwiftToolDispatcher {
             }
         }
         if hasOwnWords(outer) || hasOwnWords(payload) { return result }
+        if serverId == "searxng-local", toolName == "fetch",
+           payload["reason"] == .string("unsupported_content_type") {
+            var isPDF = false
+            if case .object(let coverage)? = payload["coverage"],
+               case .string(let contentType)? = coverage["content_type"] {
+                isPDF = contentType.split(separator: ";").first?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "application/pdf"
+            }
+            outer["message"] = .string(isPDF
+                ? "That URL is a PDF (unsupported content type); fetch reads HTML and text only."
+                : "That URL has an unsupported content type; fetch reads HTML and text only.")
+            return .object(outer)
+        }
         func hasReadableText(_ value: JSONValue?) -> Bool {
             switch value {
             case .string(let words):

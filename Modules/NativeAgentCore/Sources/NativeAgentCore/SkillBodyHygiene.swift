@@ -14,12 +14,9 @@ public enum SkillBodyHygiene {
     }
 
     private static let bannedPatterns: [(label: String, pattern: String)] = [
-        ("python", #"\bpython\b"#),
-        ("daemon", #"\bdaemons?\b"#),
         ("native_agentd", #"native_agentd"#),
-        ("old local port", #"127\.0\.0\.1:8765|:8765\b|\b8766\b"#),
+        ("old local port", #"(?:127\.0\.0\.1|localhost|\[::1\]):876[56]\b"#),
         ("old tool proposal route", #"/v1/tools/propose"#),
-        ("python cache artifact", #"\.pyc\b|\.pyo\b|__pycache__"#),
         ("old introspection tool names", #"daemon_introspect|daemon_status|daemon_logs"#),
     ]
 

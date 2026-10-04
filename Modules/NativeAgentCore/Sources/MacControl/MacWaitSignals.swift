@@ -15,12 +15,12 @@
 // installed on.
 //
 // WHAT CHANGED, AND WHAT DID NOT:
-//   • `wait` renders ONCE at the start (its baseline), and then once per change
-//     EPISODE — not on a timer. A burst of twelve notifications is one wake.
+//   • `wait` renders to identify the app, then reconciles the baseline after
+//     subscribing. Later it renders once per change EPISODE, with another
+//     reconciliation after an app switch. A burst of notifications is one wake.
 //   • Silence is the settle. When the observer is installed and nothing fires
 //     for `settleQuietSeconds`, the screen has stopped changing; the render
-//     already in hand is the answer, so a settle now costs ONE capture instead
-//     of two.
+//     already in hand is the answer once the subscription has been reconciled.
 //   • The coarse fallback re-render is the SAFETY NET, and it is honest about
 //     what it is for: when no observer could be installed at all, silence
 //     proves nothing, so `wait` degrades to a slow poll (every

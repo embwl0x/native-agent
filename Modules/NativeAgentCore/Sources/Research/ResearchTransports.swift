@@ -123,60 +123,88 @@ public final class SystemDockerPSExecutor: DockerPSExecutor {
 
     private func run(arguments: [String]) async -> String? {
         // Locate `docker` on PATH (matches Python's shutil.which).
-        guard let dockerPath = Self.whichDocker() else { return nil }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: dockerPath)
-        process.arguments = arguments
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
+        guard let dockerPath = Self.whichDocker(),
+              let result = await runResearchSubprocess(executable: dockerPath, arguments: arguments, timeout: 8),
+              result.status == 0 else { return nil }
+        return String(data: result.stdout, encoding: .utf8)
+    }
 
-        // Drain stdout/stderr CONTINUOUSLY while docker runs. The old shape
-        // (waitUntilExit BEFORE readDataToEndOfFile) deadlocked any docker
-        // output larger than the ~64KB pipe buffer: docker blocked in
-        // write(2), never exited, the 8s SIGTERM fired, and the call
-        // misreported nil. Same pattern as ToolExecution+RunSandbox
-        // (audit 2026-06-09; applied here 2026-06-10).
-        let stdoutBuf = ResearchPipeCaptureBuffer()
-        let stderrBuf = ResearchPipeCaptureBuffer()
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty { handle.readabilityHandler = nil } else { stdoutBuf.append(chunk) }
+    private static func whichDocker() -> String? {
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin"
+        for dir in path.split(separator: ":") {
+            let candidate = String(dir) + "/docker"
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
         }
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty { handle.readabilityHandler = nil } else { stderrBuf.append(chunk) }
-        }
+        return nil
+    }
+}
 
-        do {
-            try process.run()
-        } catch {
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-            return nil
-        }
-        // 8s deadline matches Python's `timeout=8`.
-        //
-        // HANG-PROOFING (2026-08-25): the previous shape parked this
-        // continuation on `DispatchQueue.global().async { waitUntilExit() }`
-        // with a separate 8s Task that only ever called `terminate()`. Under
-        // full-suite subprocess churn the shared GCD pool starves — the queued
-        // block never STARTS, so the continuation is never resumed even though
-        // the child exited long ago (release-gauntlet wedge: 75+ min at 0% CPU
-        // with no child process). Same landmine ToolExecution+RunSandbox
-        // documents; same cure: a dedicated reap Thread that polls under the
-        // deadline, escalates SIGTERM → grace → SIGKILL, and resumes the
-        // continuation UNCONDITIONALLY. Worst case is bounded (~10s), never a
-        // hang, with zero dependence on GCD scheduling.
-        let pidRef = process
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+/// Run a subprocess under a deadline with stdin closed; nil when it cannot
+/// start. Shared by the docker probes (8s) and Codex web search (60s).
+func runResearchSubprocess(
+    executable: String, arguments: [String], environment: [String: String]? = nil,
+    cwd: URL? = nil, timeout: TimeInterval
+) async -> (status: Int32, stdout: Data, stderr: Data, timedOut: Bool)? {
+    guard !Task.isCancelled else { return nil }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    if let environment { process.environment = environment }
+    if let cwd { process.currentDirectoryURL = cwd }
+    process.standardInput = FileHandle.nullDevice
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+
+    // Drain stdout/stderr CONTINUOUSLY while the child runs. The old shape
+    // (waitUntilExit BEFORE readDataToEndOfFile) deadlocked any docker
+    // output larger than the ~64KB pipe buffer: docker blocked in
+    // write(2), never exited, the 8s SIGTERM fired, and the call
+    // misreported nil. Same pattern as ToolExecution+RunSandbox
+    // (audit 2026-06-09; applied here 2026-06-10).
+    let stdoutBuf = ResearchPipeCaptureBuffer()
+    let stderrBuf = ResearchPipeCaptureBuffer()
+    stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+        let chunk = handle.availableData
+        if chunk.isEmpty { handle.readabilityHandler = nil } else { stdoutBuf.append(chunk) }
+    }
+    stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+        let chunk = handle.availableData
+        if chunk.isEmpty { handle.readabilityHandler = nil } else { stderrBuf.append(chunk) }
+    }
+
+    do {
+        try process.run()
+    } catch {
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        return nil
+    }
+    // HANG-PROOFING (2026-08-25): the previous shape parked this
+    // continuation on `DispatchQueue.global().async { waitUntilExit() }`
+    // with a separate 8s Task that only ever called `terminate()`. Under
+    // full-suite subprocess churn the shared GCD pool starves — the queued
+    // block never STARTS, so the continuation is never resumed even though
+    // the child exited long ago (release-gauntlet wedge: 75+ min at 0% CPU
+    // with no child process). Same landmine ToolExecution+RunSandbox
+    // documents; same cure: a dedicated reap Thread that polls under the
+    // deadline, escalates SIGTERM → grace → SIGKILL, and resumes the
+    // continuation UNCONDITIONALLY. Worst case is bounded (deadline + 2s),
+    // never a hang, with zero dependence on GCD scheduling.
+    let pidRef = process
+    let cancellation = ResearchSubprocessCancellation()
+    let timedOut = await withTaskCancellationHandler {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let reaper = Thread {
-                let deadline = Date().addingTimeInterval(8)
-                while pidRef.isRunning && Date() < deadline {
+                let deadline = Date().addingTimeInterval(timeout)
+                while pidRef.isRunning && Date() < deadline && !cancellation.isCancelled {
                     Thread.sleep(forTimeInterval: 0.02)
                 }
-                if pidRef.isRunning {
+                let late = pidRef.isRunning
+                if late {
                     pidRef.terminate() // SIGTERM
                     let grace = Date().addingTimeInterval(2)
                     while pidRef.isRunning && Date() < grace {
@@ -191,34 +219,36 @@ public final class SystemDockerPSExecutor: DockerPSExecutor {
                         pidRef.waitUntilExit()
                     }
                 }
-                cont.resume()
+                cont.resume(returning: late && !cancellation.isCancelled)
             }
             reaper.qualityOfService = .userInitiated
             reaper.start()
         }
-
-        // Final drain: nil the handlers, then grab whatever is still buffered
-        // WITHOUT blocking — a grandchild holding an inherited write end would
-        // make an EOF-waiting read (readDataToEndOfFile) hang forever.
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        stdoutBuf.appendNonBlockingDrain(from: stdoutPipe.fileHandleForReading)
-        stderrBuf.appendNonBlockingDrain(from: stderrPipe.fileHandleForReading)
-
-        if process.terminationStatus != 0 { return nil }
-        return String(data: stdoutBuf.data, encoding: .utf8)
+    } onCancel: {
+        cancellation.cancel()
     }
 
-    private static func whichDocker() -> String? {
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin"
-        for dir in path.split(separator: ":") {
-            let candidate = String(dir) + "/docker"
-            if FileManager.default.isExecutableFile(atPath: candidate) {
-                return candidate
-            }
-        }
-        return nil
-    }
+    // Final drain: nil the handlers, then grab whatever is still buffered
+    // WITHOUT blocking — a grandchild holding an inherited write end would
+    // make an EOF-waiting read (readDataToEndOfFile) hang forever.
+    stdoutPipe.fileHandleForReading.readabilityHandler = nil
+    stderrPipe.fileHandleForReading.readabilityHandler = nil
+    stdoutBuf.appendNonBlockingDrain(from: stdoutPipe.fileHandleForReading)
+    stderrBuf.appendNonBlockingDrain(from: stderrPipe.fileHandleForReading)
+    guard !Task.isCancelled else { return nil }
+    return (process.terminationStatus, stdoutBuf.data, stderrBuf.data, timedOut)
+}
+
+/// The existing reap thread handles cancellation with the same bounded
+/// SIGTERM/SIGKILL sequence as a deadline. Registration also catches a task
+/// cancelled between process launch and installation of the handler.
+private final class ResearchSubprocessCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool { lock.withLock { cancelled } }
+
+    func cancel() { lock.withLock { cancelled = true } }
 }
 
 /// Thread-safe capture buffer for subprocess pipes — appended from

@@ -56,7 +56,30 @@ extension CognitiveSubstrate {
         kind == .userMessageReceived || kind == .userCorrection
     }
 
-    struct AffectAppraisal: Sendable {
+    public struct AffectAppraisal: Sendable, Codable {
+        public init() {}
+        enum CodingKeys: String, CodingKey {
+            case valence, warmth, tension, pressure, arousal, affection, warmthBoost
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            func delta(_ key: CodingKeys, low: Double = -0.65, high: Double = 0.65) throws -> Double {
+                let value = try values.decode(Double.self, forKey: key)
+                guard value.isFinite, (low...high).contains(value) else {
+                    throw DecodingError.dataCorruptedError(forKey: key, in: values, debugDescription: "affect delta out of bounds")
+                }
+                return value
+            }
+            valence = try delta(.valence)
+            warmth = try delta(.warmth)
+            tension = try delta(.tension)
+            pressure = try delta(.pressure)
+            arousal = try delta(.arousal)
+            affection = try values.decode(Bool.self, forKey: .affection)
+            warmthBoost = try delta(.warmthBoost, low: 0, high: 0.18)
+            if valence < 0 { affection = false }
+        }
         var valence = 0.0   // → node valence (emotionTag)
         var warmth = 0.0    // → socialWarmth (can go negative: dismissal cools her)
         var tension = 0.0   // → uncertainty
@@ -66,6 +89,7 @@ extension CognitiveSubstrate {
         // emoji) — content the pierce lexicon can't see as a "win" but that
         // must never stamp as a deep wound under negative residue.
         var affection = false
+        var warmthBoost = 0.0
         /// Item 8 (2026-09-02): how far the affection FLOOR reaches, as a
         /// multiple of the user's. 1.0 for User and for every path that predates
         /// relational sources; `RelationalSource.appraisalWeight` for anyone

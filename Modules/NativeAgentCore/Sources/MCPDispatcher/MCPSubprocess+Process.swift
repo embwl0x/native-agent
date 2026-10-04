@@ -5,6 +5,7 @@ import PersistenceCore
 import Research
 import KnowledgeGraph
 import CapabilityFoundry
+import Privacy
 
 // MARK: - Persistent stdin writer
 
@@ -195,8 +196,8 @@ private final class _MCPStdinWriter: @unchecked Sendable {
         while let request = nextRequest() {
             let outcome = write(request)
             let timeoutIsTerminal: Bool
-            if case .timedOut = outcome {
-                timeoutIsTerminal = request.policy.shouldStopWriterOnTimeout()
+            if case .timedOut(let partialFrame) = outcome {
+                timeoutIsTerminal = partialFrame || request.policy.shouldStopWriterOnTimeout()
             } else {
                 timeoutIsTerminal = false
             }
@@ -253,7 +254,7 @@ private final class _MCPStdinWriter: @unchecked Sendable {
             while offset < bytes.count {
                 if isStopped() { return .failed(ECANCELED) }
                 if DispatchTime.now().uptimeNanoseconds >= request.deadlineNanos {
-                    return .timedOut(writerStopped: false)
+                    return .timedOut(writerStopped: offset > 0)
                 }
 
                 let written = Darwin.write(
@@ -271,6 +272,7 @@ private final class _MCPStdinWriter: @unchecked Sendable {
                     return .failed(errno)
                 }
                 if let outcome = waitUntilWritable(deadlineNanos: request.deadlineNanos) {
+                    if case .timedOut = outcome { return .timedOut(writerStopped: offset > 0) }
                     return outcome
                 }
             }
@@ -394,7 +396,9 @@ final class _MCPStderrTail: @unchecked Sendable {
         let didTruncate = truncated
         lock.unlock()
         guard !data.isEmpty else { return "" }
-        let text = String(decoding: data, as: UTF8.self)
+        let text = TurnSecretRedactor.redactText(
+            NativeAgentSecretRedactor.redactText(String(decoding: data, as: UTF8.self))
+        )
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return "" }
         return didTruncate ? "…\(text)" : text
@@ -458,11 +462,9 @@ public actor MCPSubprocess {
     /// Outstanding request waiters keyed by JSON-RPC id.
     private var waiters: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
     /// Request ids whose waiter was cancelled while their OWN request frame may
-    /// still be queued on stdin. A wedge-timeout on such a write must be treated
-    /// as fire-and-forget (drop, no terminate) — the request is already abandoned
-    /// client-side, and killing the whole subprocess over it would take down a
-    /// server that may just be busy (W3d delta review, 2026-07-01). Entries are
-    /// consumed at the write's resolution (success, failure, or wedge).
+    /// still be queued on stdin. A wedge-timeout may drop such a frame only
+    /// before any bytes were emitted; a partial frame terminates the transport.
+    /// Entries are consumed at the write's resolution (success, failure, or wedge).
     private var cancelledRequestWrites: Set<Int64> = []
     /// Per-request native-writer policies let cancellation downgrade the
     /// request frame before its deadline. This preserves the no-terminate
@@ -526,8 +528,7 @@ public actor MCPSubprocess {
     ) throws -> MCPSubprocess {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw MCPSubprocessError.missingCommand }
-        // Minimal POSIX-ish argv split. The daemon uses `shlex.split` — we
-        // mirror "quoted segments stay together, backslash escapes one char".
+        // Split quoted command arguments without invoking a shell.
         let argv = MCPSubprocess.shlexSplit(trimmed)
         guard let first = argv.first else { throw MCPSubprocessError.missingCommand }
         return MCPSubprocess(
@@ -546,12 +547,18 @@ public actor MCPSubprocess {
         return p.processIdentifier
     }
 
-    public var isRunning: Bool { process?.isRunning ?? false }
+    public var isRunning: Bool {
+        get async {
+            if let stopTask { await stopTask.value }
+            return process?.isRunning ?? false
+        }
+    }
 
     /// Spawn the child + perform the `initialize` + `notifications/initialized`
     /// handshake the daemon performs.
     public func start() async throws {
         if let stopTask { await stopTask.value }
+        try Task.checkCancellation()
         if process?.isRunning == true { return }
         let proc = Process()
         // Resolve absolute command via /usr/bin/env so PATH lookup works.
@@ -563,11 +570,8 @@ public actor MCPSubprocess {
             proc.arguments = argv
         }
         if let cwd = cwd { proc.currentDirectoryURL = cwd }
-        if let env = env {
-            // Merge over the inherited env so PATH stays present.
-            var merged = ProcessInfo.processInfo.environment
-            for (k, v) in env { merged[k] = v }
-            proc.environment = merged
+        proc.environment = AgentHostCommandLines.scrubbedEnvironment().merging(env ?? [:]) {
+            _, configured in configured
         }
         let stdin = Pipe()
         let stdout = Pipe()
@@ -806,11 +810,11 @@ public actor MCPSubprocess {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
                     ProcessTreeReaper.quiesceAndKill(tree)
+                    Thread {
+                        proc.waitUntilExit()
+                        continuation.resume()
+                    }.start()
                 }
-                Thread {
-                    proc.waitUntilExit()
-                    continuation.resume()
-                }.start()
             }
         }
         stopTask = shutdown
@@ -835,29 +839,16 @@ public actor MCPSubprocess {
         stopTask = nil
     }
 
-    /// Bug 1 fix (2026-05-31): drain-task entry point when the frame
-    /// reader rejects a malformed frame. We force-terminate the
-    /// child + route through the normal unexpected-termination handler
-    /// so the pool evicts + arms backoff (same path a crash takes). We
-    /// deliberately do NOT call `stop()` here: stop() sets
-    /// `didRequestStop = true`, which would tell `_processDidTerminate`
-    /// to swallow the termination callback, defeating the eviction.
-    fileprivate func _terminateForMalformedFrame(notice: String) {
-        guard let proc = process, proc.isRunning else { return }
-        // SIGTERM the child. The termination handler bridge will fire
-        // → `_processDidTerminate` → which (since `didRequestStop` stays
-        // false) forwards to the pool's onUnexpectedTermination handler.
-        // The pool eviction path runs there.
-        proc.terminate()
-        // Surface a precise lastError on the crash record by also
-        // routing a synthetic termination through the handler. We do
-        // BOTH (synthetic + real) because the real terminationHandler
-        // might not fire promptly enough; the pool's recordCrash path is
-        // idempotent-per-generation (see Bug 5 fix), so double-fire
-        // results in exactly one crash record.
-        if let handler = terminationHandler {
-            handler(-1, "malformed frame: \(notice)")
-        }
+    /// Finish tree shutdown before notifying the pool that ownership ended.
+    fileprivate func _terminateForMalformedFrame(notice: String) async {
+        await terminateForProtocolFailure(reason: "malformed frame: \(notice)")
+    }
+
+    private func terminateForProtocolFailure(reason: String) async {
+        guard process != nil || stopTask != nil else { return }
+        let handler = terminationHandler
+        await stop()
+        handler?(-1, reason)
     }
 
     /// Invoked from the Process terminationHandler bridge. We swallow the
@@ -977,7 +968,7 @@ public actor MCPSubprocess {
             // A malformed frame means the server is broken or logging to
             // stdout. Fail callers and evict it so the pool can respawn clean.
             failAllWaiters(error: MCPSubprocessError.malformedResponse(notice))
-            _terminateForMalformedFrame(notice: notice)
+            await _terminateForMalformedFrame(notice: notice)
             return false
         }
         for frame in frames {
@@ -1064,8 +1055,10 @@ public actor MCPSubprocess {
         guard let cont = waiters.removeValue(forKey: id) else { return }
         // Mark BEFORE resuming: if this request's own frame is the one wedging
         // stdin, its write-timeout must not terminate the subprocess.
-        cancelledRequestWrites.insert(id)
-        requestWritePolicies[id]?.allowWriterToContinueAfterTimeout()
+        if let policy = requestWritePolicies[id] {
+            cancelledRequestWrites.insert(id)
+            policy.allowWriterToContinueAfterTimeout()
+        }
         cont.resume(throwing: CancellationError())
         // MCP `notifications/cancelled` — params carry the id of the request
         // being cancelled + a human reason. No existing cancelled-notification
@@ -1168,10 +1161,8 @@ public actor MCPSubprocess {
         case .failed:
             throw MCPSubprocessError.streamClosed
         case .timedOut(let writerStopped):
-            // A CANCELLED request's own queued frame downgrades to
-            // fire-and-forget: the caller already abandoned it, so a wedge
-            // here must not kill a subprocess that may just be busy
-            // (W3d delta review, 2026-07-01).
+            // Cancellation permits a nonterminal drop only before any frame
+            // bytes were written. The native writer makes that decision.
             if let rpcId {
                 cancelledRequestWrites.remove(rpcId)
                 requestWritePolicies.removeValue(forKey: rpcId)
@@ -1185,25 +1176,16 @@ public actor MCPSubprocess {
                 stdinWriter = nil
                 try? stdinHandle?.close()
                 stdinHandle = nil
-                _terminateForWedgedStdin(notice: "stdin write (\(label)) stalled > \(deadline)s")
+                await _terminateForWedgedStdin(notice: "stdin write (\(label)) stalled > \(deadline)s")
             }
-            // Fire-and-forget/cancelled path: the expired frame is dropped, but
-            // the writer and child remain available for later frames. The caller
-            // has already abandoned this request and swallows the throw.
+            // An untouched abandoned frame can be dropped with the writer and
+            // child still available for later frames.
             throw MCPSubprocessError.timeout(method: "stdin write: \(label)", seconds: deadline)
         }
     }
 
-    /// U5 W-E fix: stdin-wedge twin of `_terminateForMalformedFrame` — a
-    /// child that stops draining stdin is as broken as one writing garbage
-    /// to stdout. Deliberately NOT `stop()` (which would set
-    /// `didRequestStop` and swallow the pool's eviction callback).
-    private func _terminateForWedgedStdin(notice: String) {
-        guard let proc = process, proc.isRunning else { return }
-        proc.terminate()
-        if let handler = terminationHandler {
-            handler(-1, "stdin wedged: \(notice)")
-        }
+    private func _terminateForWedgedStdin(notice: String) async {
+        await terminateForProtocolFailure(reason: "stdin wedged: \(notice)")
     }
 
     private func handleIncomingFrame(_ frame: JSONValue) async {
@@ -1231,7 +1213,7 @@ public actor MCPSubprocess {
                jsonValueAsInt64(value).flatMap({ Int(exactly: $0) }) == nil {
                 let notice = "Invalid JSON-RPC error code"
                 failAllWaiters(error: MCPSubprocessError.malformedResponse(notice))
-                _terminateForMalformedFrame(notice: notice)
+                await _terminateForMalformedFrame(notice: notice)
                 return
             }
             guard let cont = waiters.removeValue(forKey: rpcId) else { return }
@@ -1249,7 +1231,7 @@ public actor MCPSubprocess {
         } else if idValue != .null {
             let notice = "Invalid JSON-RPC response id"
             failAllWaiters(error: MCPSubprocessError.malformedResponse(notice))
-            _terminateForMalformedFrame(notice: notice)
+            await _terminateForMalformedFrame(notice: notice)
         }
     }
 
@@ -1361,30 +1343,53 @@ public actor MCPSubprocess {
         }
     }
 
-    // Minimal shlex-style split: respects single/double quotes and backslash
-    // escapes. The daemon uses Python's shlex; this is the 90% subset that
-    // covers every MCP server entry in `data/mcp/servers.json` today.
+    // Shell-style quoting only; no expansion or command substitution.
     nonisolated static func shlexSplit(_ input: String) -> [String] {
         var out: [String] = []
         var current = ""
         var quote: Character? = nil
-        var iter = input.makeIterator()
-        while let ch = iter.next() {
+        var argumentStarted = false
+        let characters = Array(input)
+        var index = 0
+        while index < characters.count {
+            let ch = characters[index]
+            index += 1
             if let q = quote {
                 if ch == q { quote = nil; continue }
-                if ch == "\\", let nxt = iter.next() { current.append(nxt); continue }
+                if q == "\"", ch == "\\", index < characters.count {
+                    let next = characters[index]
+                    if ["$", "`", "\"", "\\", "\n"].contains(next) {
+                        index += 1
+                        if next != "\n" { current.append(next) }
+                        continue
+                    }
+                }
                 current.append(ch)
                 continue
             }
-            if ch == "'" || ch == "\"" { quote = ch; continue }
-            if ch == "\\", let nxt = iter.next() { current.append(nxt); continue }
+            if ch == "'" || ch == "\"" {
+                quote = ch
+                argumentStarted = true
+                continue
+            }
+            if ch == "\\", index < characters.count {
+                let next = characters[index]
+                index += 1
+                if next != "\n" {
+                    current.append(next)
+                    argumentStarted = true
+                }
+                continue
+            }
             if ch.isWhitespace {
-                if !current.isEmpty { out.append(current); current = "" }
+                if argumentStarted { out.append(current); current = "" }
+                argumentStarted = false
                 continue
             }
             current.append(ch)
+            argumentStarted = true
         }
-        if !current.isEmpty { out.append(current) }
+        if argumentStarted { out.append(current) }
         return out
     }
 }

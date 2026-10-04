@@ -50,9 +50,11 @@ public struct MobileAgentRow: Codable, Identifiable, Sendable, Equatable {
     public var via: String
     public var lastExchange: String
     public var status: String
-    public init(id: String, name: String, via: String, lastExchange: String, status: String) {
+    public var sendRestriction: String?
+    public init(id: String, name: String, via: String, lastExchange: String, status: String, sendRestriction: String? = nil) {
         self.id = id; self.name = name; self.via = via
         self.lastExchange = lastExchange; self.status = status
+        self.sendRestriction = sendRestriction
     }
 }
 

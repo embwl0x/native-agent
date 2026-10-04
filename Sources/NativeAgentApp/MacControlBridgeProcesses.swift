@@ -184,17 +184,20 @@ final class MacControlBridgeProcesses: MacControlBridgeProcessPort, @unchecked S
         }
         let outBox = DataBox()
         let errBox = DataBox()
+        let stopDraining = TimeoutFlag()
         let drainGroup = DispatchGroup()
         drainGroup.enter()
         DispatchQueue.global().async {
-            let capped = self.readCapped(stdoutPipe.fileHandleForReading, maxBytes: self.execOutputLimitBytes)
+            let capped = self.readCapped(stdoutPipe.fileHandleForReading, maxBytes: self.execOutputLimitBytes,
+                                        shouldStop: { stopDraining.fired })
             outBox.value = capped.data
             outBox.truncated = capped.truncated
             drainGroup.leave()
         }
         drainGroup.enter()
         DispatchQueue.global().async {
-            let capped = self.readCapped(stderrPipe.fileHandleForReading, maxBytes: self.execOutputLimitBytes)
+            let capped = self.readCapped(stderrPipe.fileHandleForReading, maxBytes: self.execOutputLimitBytes,
+                                        shouldStop: { stopDraining.fired })
             errBox.value = capped.data
             errBox.truncated = capped.truncated
             drainGroup.leave()
@@ -219,9 +222,17 @@ final class MacControlBridgeProcesses: MacControlBridgeProcessPort, @unchecked S
         }
 
         proc.waitUntilExit()
-        drainGroup.wait()
-        // The child is gone, so a blocked write has taken EPIPE by now. Bounded
-        // anyway: a stuck writer must never outlive the request it belongs to.
+        if drainGroup.wait(timeout: .now() + 2) == .timedOut {
+            timeoutFlag.fire()
+            // Descendants can keep the pipes open after their parent exits.
+            let pid = proc.processIdentifier
+            killpg(pid, SIGTERM)
+            _ = drainGroup.wait(timeout: .now() + 2)
+            killpg(pid, SIGKILL)
+            stopDraining.fire()
+            drainGroup.wait()
+        }
+        // A descendant can also retain stdin. Keep its writer wait bounded.
         _ = stdinGroup.wait(timeout: .now() + 5)
         let outData = outBox.value
         let errData = errBox.value
@@ -232,16 +243,31 @@ final class MacControlBridgeProcesses: MacControlBridgeProcessPort, @unchecked S
         ))
     }
 
-    private func readCapped(_ handle: FileHandle, maxBytes: Int) -> (data: Data, truncated: Bool) {
+    private func readCapped(_ handle: FileHandle, maxBytes: Int,
+                            shouldStop: () -> Bool) -> (data: Data, truncated: Bool) {
+        defer { try? handle.close() }
         var collected = Data()
         var truncated = false
+        var buffer = [UInt8](repeating: 0, count: 65_536)
         while true {
-            guard let chunk = try? handle.read(upToCount: 65_536), !chunk.isEmpty else { break }
+            if shouldStop() { truncated = true; break }
+            var descriptor = pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&descriptor, 1, 100)
+            if ready == 0 { continue }
+            if ready < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(handle.fileDescriptor, bytes.baseAddress, bytes.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else { break }
             let remaining = max(0, maxBytes - collected.count)
             if remaining > 0 {
-                collected.append(chunk.prefix(remaining))
+                collected.append(contentsOf: buffer.prefix(min(count, remaining)))
             }
-            if chunk.count > remaining {
+            if count > remaining {
                 truncated = true
             }
         }

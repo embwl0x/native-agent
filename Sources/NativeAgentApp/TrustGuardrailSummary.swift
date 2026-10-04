@@ -213,7 +213,7 @@ enum TrustGuardrailSummary {
     }
 
     private static func macControlRow(policy: TrustPolicy) -> TrustGuardrailRow {
-        let mac = policy.macControlPolicy
+        let mac = effectiveMacControlPolicy(policy)
         guard let mac, mac.enabled else {
             return TrustGuardrailRow(
                 id: "mac_control",
@@ -247,6 +247,14 @@ enum TrustGuardrailSummary {
             systemImage: "macbook",
             tone: loud ? .danger : .caution
         )
+    }
+
+    /// Full Mac admits every category without the lower-mode approval stops.
+    /// This display projection never changes the saved restricted-mode settings.
+    static func effectiveMacControlPolicy(_ policy: TrustPolicy) -> TrustMacControlPolicy? {
+        fullMacActive(policy)
+            ? TrustAccessModeCapabilityCatalog.macControlPolicy(for: "full", developerMode: true)
+            : policy.macControlPolicy
     }
 
     /// Human names for every granted Mac Control category, in the order the
@@ -328,7 +336,7 @@ enum TrustGuardrailSummary {
             return TrustGuardrailRow(
                 id: "external_send", title: "Sending things to other people",
                 value: "Sends without asking",
-                detail: "Under Full Mac I can send through your connected accounts without an additional app approval. Requests from other assistants still need your permission.",
+                detail: "Under Full Mac I can send through your connected accounts without an additional app approval. Agents you enabled in Trust inherit your authority. Other agents do not, and their requests can require approval.",
                 // As loud as file reach: this is the one that reaches other
                 // people, so it never wears a quieter word than the files row.
                 systemImage: "paperplane.fill", tone: .danger
@@ -366,13 +374,24 @@ struct TrustGuardrailSummaryPanel: View {
     /// The access mode the page's own picker is showing.
     let accessMode: String
 
+    private var policyReadFailed: Bool {
+        appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "trust policy"
+        } == true
+    }
+
     private var rows: [TrustGuardrailRow] {
         TrustGuardrailSummary.rows(policy: appModel.engine.trust.policy, accessMode: accessMode)
     }
 
     var body: some View {
-        NativePanel(title: "What I can do right now", systemImage: "eye") {
-            if rows.isEmpty {
+        NativePanel(title: policyReadFailed ? "Permissions unavailable" : "What I can do right now", systemImage: "eye") {
+            if policyReadFailed {
+                Text("Your saved permissions could not be checked. Reload Trust to try again.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if rows.isEmpty {
                 HStack(spacing: NativeAgentSpacing.sm) {
                     ProgressView().controlSize(.small)
                     Text("Reading your current settings…")

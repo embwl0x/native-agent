@@ -1,5 +1,8 @@
 import Foundation
+import NativeAgentCore
+import os
 import PersistenceCore
+import Transcripts
 
 /// App-owned routing bookmarks, not another transcript or authority store.
 /// The last receipt is a bounded cache; the adapter remains the evidence owner.
@@ -203,4 +206,158 @@ public struct AgentConversationExchange: Codable, Sendable {
         self.firstActivityAt = firstActivityAt
     }
 
+}
+
+/// One contact's conversation with her lives in one chat session the contact
+/// owns (User 10-01, "one brain, many doors"): what she sends it, what it says
+/// to her, and the turns either one starts. Every view of the contact reads it.
+public enum ContactThread {
+    /// Every session a contact owns starts with this: its id, hashed.
+    public static func prefix(owner: String) -> String { ChatSessionRetention.contactSessionPrefix(owner: owner) }
+
+    /// The contact's own conversation (a peer's id, or a built-in lane's
+    /// name); for a peer, the one its MCP door opens.
+    public static func session(owner: String) -> String { prefix(owner: owner) + "mcp-" + owner }
+
+    /// One thing said: hers (`mine`; the person's when `byPerson`) or the contact's.
+    public struct Line: Sendable, Equatable {
+        public let id: String
+        public let mine: Bool
+        public let text: String
+        public let at: Date
+        public let byPerson: Bool
+        public var door: String? = nil
+        public var fetched = false
+    }
+
+    /// The sessions the contact owns that are still kept (not archived).
+    public static func sessions(dataRoot: URL, owner: String) -> [String] {
+        let start = prefix(owner: owner)
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dataRoot.appendingPathComponent("chat/messages").path)) ?? []
+        return names.filter { $0.hasPrefix(start) && $0.hasSuffix(".jsonl") }.map { String($0.dropLast(6)) }
+    }
+
+    /// Presentation-only union for Simple and home rows. Route readers use lines.
+    /// Everything said between her and the contact, oldest first, from its
+    /// sessions: the live logs and the copies each compaction kept, once each
+    /// by message id (`tailBytes`: only the newest bytes of each live log).
+    /// The contact's lines are the turns it sent and its saved replies; hers
+    /// are her sends (each carries its send id) and her answers to turns it
+    /// started. Her turn on one of its replies is her own: it went nowhere.
+    public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil) -> [Line] {
+        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let owners = identity.owners(owner)
+        var seen: Set<String> = []
+        return owners.flatMap { door -> [Line] in
+            lines(dataRoot: dataRoot, owner: door, tailBytes: tailBytes).map { line in
+                var line = line
+                if owners.count > 1 { line.door = identity.doors[identity.aliases["peer:" + door] == nil ? door : "peer:" + door] }
+                return line
+            }
+        }.sorted { $0.at < $1.at }.filter { seen.insert($0.id).inserted }
+    }
+
+    /// Exact route history; directory counts must not include another door.
+    public static func lines(dataRoot: URL, owner: String, tailBytes: Int? = nil) -> [Line] {
+        let chat = dataRoot.appendingPathComponent("chat", isDirectory: true)
+        let fetched = ContactReplyReads.read(dataRoot)
+        let dates = ISO8601DateFormatter()
+        dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var seen: Set<String> = [], started: Set<String> = [], found: [Line] = []
+        for session in sessions(dataRoot: dataRoot, owner: owner) {
+            let folder = chat.appendingPathComponent("sessions/\(session)", isDirectory: true)
+            let backups = tailBytes != nil ? [] : ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+                .filter { $0.hasPrefix("messages.compact.") && $0.hasSuffix(".jsonl") }.sorted()
+                .map { folder.appendingPathComponent($0) }
+            for file in backups + [chat.appendingPathComponent("messages/\(session).jsonl")] {
+                guard let text = read(file, tailBytes: tailBytes) else { continue }
+                for row in text.split(separator: "\n") {
+                    guard let object = try? JSONSerialization.jsonObject(with: Data(row.utf8)) as? [String: Any],
+                          let role = object["role"] as? String, let id = object["id"] as? String, !seen.contains(id),
+                          let content = object["content"] as? String else { continue }
+                    let metadata = object["metadata"] as? [String: Any]
+                    let origin = metadata?["origin"] as? [String: Any]
+                    let envelope = metadata?["envelope"] as? [String: Any]
+                    let run = object["runId"] as? String
+                    var said = content
+                    if role == "user" {
+                        // A peer's turns come over the agent bridge; a built-in lane's carry its name.
+                        guard envelope?["surface"] as? String == "agent-bridge" || origin?["agent"] as? String == owner else { continue }
+                        // A reply handed to her, or a pull of Dot's room: her answer stays hers.
+                        let handed = (origin?["replyTo"] as? String)?.hasPrefix("agent-conversation:") == true
+                            || (envelope?["correlationId"] as? String)?.hasPrefix("dot-room:") == true
+                        if !handed, let run { started.insert(run) }
+                        said = bridgedText(content)
+                        // The note under Dot's turn is for her, not his words.
+                        if let note = said.range(of: "(Dot sees your answer only if", options: .backwards) {
+                            said = said[..<note.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                    } else if role != "assistant" || !(metadata?["dotClientUserMessageID"] is String || run.map(started.contains) == true) {
+                        continue
+                    }
+                    seen.insert(id)
+                    guard !said.isEmpty else { continue }
+                    let at = (object["createdAt"] as? String).flatMap { dates.date(from: $0) } ?? .distantPast
+                    found.append(Line(id: id, mine: role == "assistant", text: said, at: at,
+                                      byPerson: metadata?["byPerson"] as? Bool == true,
+                                      fetched: role == "assistant" && fetched.contains { $0.session == session && $0.run == run }))
+                }
+            }
+        }
+        return found.sorted { $0.at < $1.at }
+    }
+
+    /// A bridged turn without the bracketed notes the bridge puts on top (and
+    /// the bare contact-metadata line replies carried before 09-25).
+    public static func bridgedText(_ content: String) -> String {
+        let text = BridgeRoutingPrefix.stripping(content)
+        var rows = text.split(separator: "\n", omittingEmptySubsequences: false)[...]
+        while let first = rows.first?.trimmingCharacters(in: .whitespaces),
+              first.isEmpty || (first.hasPrefix("[") && first.hasSuffix("]")) || (first.hasPrefix("{\"agent\"") && first.hasSuffix("}")) {
+            rows = rows.dropFirst()
+        }
+        return rows.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func read(_ file: URL, tailBytes: Int?) -> String? {
+        guard let tailBytes else { return try? String(contentsOf: file, encoding: .utf8) }
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0)
+        guard var data = try? handle.readToEnd() else { return nil }
+        // The first line of a cut window is partial.
+        if size > UInt64(tailBytes), let end = data.firstIndex(of: 0x0A) { data = data[data.index(after: end)...] }
+        return String(data: data, encoding: .utf8)
+    }
+
+    public enum Entry: Sendable {
+        /// A message to the contact: hers, or the person's from its thread.
+        case send(owner: String, text: String, sendID: String, byPerson: Bool)
+        /// The contact's answer to a send, when no turn of hers carries it there.
+        case reply(owner: String, name: String, text: String, replyID: String, at: Date)
+
+        var owner: String {
+            switch self {
+            case .send(let owner, _, _, _), .reply(let owner, _, _, _, _): owner
+            }
+        }
+    }
+
+    public typealias Writer = @Sendable (URL, Entry) async throws -> Void
+    private static let writer = OSAllocatedUnfairLock<Writer?>(initialState: nil)
+
+    /// The engine root, which owns the chat client that appends to a session.
+    public static func installWriter(_ write: @escaping Writer) { writer.withLock { $0 = write } }
+
+    /// Appends the entry to the contact's session. The thread's own record
+    /// keeps the send either way; a failed append is logged, never retried.
+    public static func write(_ entry: Entry, dataRoot: URL) async {
+        guard let write = writer.withLock({ $0 }) else {
+            NSLog("ContactThread: no writer installed; a message with \(entry.owner) was not saved to its session")
+            return
+        }
+        do { try await write(dataRoot, entry) }
+        catch { NSLog("ContactThread: a message with \(entry.owner) was not saved to its session: \(error)") }
+    }
 }

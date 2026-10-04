@@ -68,7 +68,8 @@ final class CognitiveAttentionResidentProjection: @unchecked Sendable {
             residentWorkIntent: snapshot.pursuit != nil,
             predictedToolGroups: snapshot.predictedToolGroups,
             memoryActivation: base?.memoryActivation ?? [:],
-            workingMemoryRecordIDs: base?.workingMemoryRecordIDs ?? []
+            workingMemoryRecordIDs: base?.workingMemoryRecordIDs ?? [],
+            suppressedMemory: base?.suppressedMemory ?? [:]
         )
         return signals.isEmpty ? nil : signals
     }

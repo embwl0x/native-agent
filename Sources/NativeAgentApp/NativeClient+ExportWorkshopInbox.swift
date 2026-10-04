@@ -22,7 +22,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -46,7 +45,7 @@ extension NativeClient {
     /// controls are imported from their producer contract so a new heartbeat
     /// button cannot be accepted or omitted independently here.
     static let explicitlyHandledInboxActionIDs: Set<String> = Set([
-        "read", "act", "approve", "reject",
+        "read", "archive", "dismiss", "act", "approve", "reject",
     ]).union(HeartbeatCardAction.ids)
 
     func createProductionExport() async throws -> ProductionExport {
@@ -69,11 +68,26 @@ extension NativeClient {
         try Self.writeCodableJSON(try await getPrivacyMap(), to: stageDir.appendingPathComponent("privacy_map.json"))
 
         let dataDir = stageDir.appendingPathComponent("data", isDirectory: true)
-        let copied = try Self.copySelectedDataPaths(
+        var copied = try Self.copySelectedDataPaths(
             root: root,
             destinationRoot: dataDir,
-            relativePaths: Self.productionExportRelativePaths
+            relativePaths: Self.productionExportRelativePaths.filter { $0 != "memory" }
         )
+        let memoryDir = root.appendingPathComponent("memory", isDirectory: true)
+        if fm.fileExists(atPath: memoryDir.path) {
+            let destination = dataDir.appendingPathComponent("memory", isDirectory: true)
+            try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+            let databaseNames: Set<String> = ["memory.sqlite", "memory.sqlite-wal", "memory.sqlite-shm", "memory.sqlite-journal"]
+            for source in try fm.contentsOfDirectory(at: memoryDir, includingPropertiesForKeys: nil)
+                where !databaseNames.contains(source.lastPathComponent) {
+                _ = try Self.copyExistingItem(from: source, to: destination.appendingPathComponent(source.lastPathComponent))
+            }
+            if fm.fileExists(atPath: memoryDir.appendingPathComponent("memory.sqlite").path) {
+                try await MemoryStorage.createConsistentBackup(
+                    dataRoot: root, destinationDatabaseURL: destination.appendingPathComponent("memory.sqlite"))
+            }
+            copied.append("memory")
+        }
         var scope = Self.scopeNames(for: copied)
         if !scope.contains("diagnostics") { scope.insert("diagnostics", at: 0) }
 
@@ -205,7 +219,11 @@ extension NativeClient {
     }
 
     // PATCH-2026-05-07: proactive-inbox-1 Inbox action helper (avoids Sendable Any issue at call site)
-    func inboxAction(_ id: String, action: String) async throws {
+    /// `quiet` is the agent's call (the inbox tool): the same writes, but it
+    /// never navigates User's window or touches his composer.
+    func inboxAction(
+        _ id: String, action: String, metadata: [String: JSONValue] = [:], quiet: Bool = false
+    ) async throws {
         // Keep the action writer on the same resolved root as the inbox reader.
         // Isolated/recovered app surfaces inject `dataRootOverride`; falling
         // back to the process default here made a visible card's button write
@@ -219,7 +237,7 @@ extension NativeClient {
         let normalizedAction = action == "deny" ? "reject" : action
         if id.hasPrefix("interaction:"), !["read", "archive", "dismiss"].contains(normalizedAction) {
             try await InteractionCardDelivery.act(id: id, action: normalizedAction,
-                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(), quiet: quiet)
             return
         }
         if normalizedAction == "reply" {
@@ -230,7 +248,12 @@ extension NativeClient {
             )
         }
         let nativeActions = Self.explicitlyHandledInboxActionIDs
-        let endpointAction = nativeActions.contains(normalizedAction) ? normalizedAction : "act"
+        guard nativeActions.contains(normalizedAction) else {
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
+                NSLocalizedDescriptionKey: "Unknown inbox action: \(normalizedAction)"
+            ])
+        }
+        let endpointAction = normalizedAction
 
         // Wave 32 W16 (2026-06-01): consume the SwiftNative NotificationInbox for
         // status-write actions — read / archive / dismiss. archive/dismiss fire
@@ -238,7 +261,7 @@ extension NativeClient {
         // the inbox file lock. Other actions are handled below or fail closed.
         if endpointAction == "read" || endpointAction == "archive" || endpointAction == "dismiss" {
             if await Self.updateVisibleNotificationInboxStatus(
-                id: id, action: endpointAction, inboxPath: visibleInboxPath) {
+                id: id, action: endpointAction, inboxPath: visibleInboxPath, metadata: metadata) {
                 return
             }
             // A5.2 (2026-07-24): the legacy silo fallback (makeNotificationInbox
@@ -278,7 +301,11 @@ extension NativeClient {
             return
         }
         if endpointAction == HeartbeatCardAction.openApprovals.rawValue {
-            await Self.openApprovalsFromInboxAction(id: id)
+            if quiet {
+                _ = await Self.updateVisibleNotificationInboxStatus(id: id, action: "read", inboxPath: visibleInboxPath)
+            } else {
+                await Self.openApprovalsFromInboxAction(id: id)
+            }
             return
         }
         if endpointAction == HeartbeatCardAction.repair.rawValue {
@@ -330,8 +357,13 @@ extension NativeClient {
             }
             switch resolution {
             case .openApprovals:
-                await Self.openApprovalsFromInboxAction(id: id)
+                if quiet {
+                    _ = await Self.updateVisibleNotificationInboxStatus(id: id, action: "read", inboxPath: visibleInboxPath)
+                } else {
+                    await Self.openApprovalsFromInboxAction(id: id)
+                }
             case .openDeskExecution:
+                if quiet { break }
                 // No execution-detail deep link exists yet (DeskItem carries
                 // no execution id), so land on the Desk surface via the same
                 // coordinator route the command palette uses.
@@ -339,6 +371,7 @@ extension NativeClient {
                     NotificationCenter.default.post(name: .openCommandRouteRequest, object: "desk")
                 }
             case .chatDraft(let draft):
+                if quiet { break }
                 // ContentView's .openChatDraftRequest receiver switches to
                 // Chat and injects via AppModel.injectChatDraft — the S.6
                 // suggestion-chip idiom skillBuildRequest already uses.
@@ -351,15 +384,23 @@ extension NativeClient {
                 // navigating first would show User the session a beat before the
                 // row exists in it.
                 //
-                // FAIL-OPEN, LOUDLY: if the seam refuses (rate limit, duplicate)
+                // An unresolved duplicate throws without opening the composer.
+                // Otherwise, if the seam refuses (rate limit)
                 // or the write throws, fall back to the old composer draft so
                 // Act still does something and User still lands in chat with the
                 // reference — but say which one happened in the log rather than
                 // pretending she spoke.
-                let spoke = await Self.postSpokenInboxMessage(message: message, itemId: id)
+                let spokenSession = try await Self.postSpokenInboxMessage(message: message, itemId: id)
+                if quiet {
+                    guard spokenSession != nil else {
+                        throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey:
+                            "Inbox act for \(id): the chat message didn't post (rate limit or write failure) — retry later."])
+                    }
+                    break
+                }
                 await MainActor.run {
-                    if spoke {
-                        NotificationCenter.default.post(name: .openSpokenChatRequest, object: nil)
+                    if let spokenSession {
+                        NotificationCenter.default.post(name: .openSpokenChatRequest, object: spokenSession)
                     } else {
                         NotificationCenter.default.post(
                             name: .openChatDraftRequest,
@@ -525,9 +566,9 @@ extension NativeClient {
     }
 
     /// L5 G6/G7 — post her card as her message, into the session User is about
-    /// to land in. Returns whether a row actually reached the transcript; the
-    /// caller falls back to the composer draft on false, so Act is never a
-    /// dead button.
+    /// to land in. Returns the original destination on a duplicate; the
+    /// caller falls back to the composer draft on nil. An unresolved duplicate
+    /// throws instead, keeping the already claimed message suppressed.
     ///
     /// SESSION CHOICE: the session the UI will show. `AppModel` mirrors its
     /// active session into UserDefaults on every selection, which is the only
@@ -536,14 +577,14 @@ extension NativeClient {
     /// blank (no chat opened yet on a fresh install), there is no session to
     /// speak into and we take the draft fallback rather than minting a stray
     /// one User never opened.
-    static func postSpokenInboxMessage(message: String, itemId: String) async -> Bool {
+    static func postSpokenInboxMessage(message: String, itemId: String) async throws -> String? {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
+        guard !trimmed.isEmpty else { return nil }
         let sessionId = (UserDefaults.standard.string(forKey: "activeChatSessionId") ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sessionId.isEmpty else {
             NSLog("[NativeClient] inbox act chat_spoken: no active chat session — falling back to draft")
-            return false
+            return nil
         }
         let client = NativeAgentEngine.live.chatClient(profile: .background)
         do {
@@ -561,22 +602,24 @@ extension NativeClient {
                 initiative: .userRequested
             )
             switch outcome {
-            case .posted:
-                return true
-            case .duplicate:
+            case .posted(let destination, _):
+                return destination
+            case .duplicate(let destination):
                 // Already in the transcript — navigating to it IS the right
                 // outcome, and posting again would be the storm this seam
                 // exists to prevent.
-                return true
+                return destination
             case .rateLimited(let seconds):
                 // Unreachable on the `.userRequested` route (see the seam's
                 // header); handled rather than assumed away.
                 NSLog("[NativeClient] inbox act chat_spoken: rate limited (%ds) — falling back to draft", seconds)
-                return false
+                return nil
             }
+        } catch let error as ProactiveSpeechError {
+            throw error
         } catch {
             NSLog("[NativeClient] inbox act chat_spoken failed: \(error) — falling back to draft")
-            return false
+            return nil
         }
     }
 
@@ -629,14 +672,15 @@ extension NativeClient {
         id: String,
         action: String,
         inboxPath: URL = visibleNotificationInboxPath(),
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
+        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
+        metadata: [String: JSONValue] = [:]
     ) async -> Bool {
         let status: String
         let readAt: String?
         switch action {
         case "read":
             status = "read"
-            readAt = NotificationInboxStore.nowISO()
+            readAt = NotificationInboxClock.nowISO()
         case "archive":
             status = "archived"
             readAt = nil
@@ -650,7 +694,7 @@ extension NativeClient {
         do {
             _ = persistence // retained for source-compatible test injection
             return try await LiveNotificationInbox(path: inboxPath).updateStatus(
-                id: id, status: status, readAt: readAt
+                id: id, status: status, readAt: readAt, metadata: metadata
             )
         } catch {
             NSLog("[inbox] updateVisibleNotificationInboxStatus(\(action)) failed for \(id): \(String(describing: error))")

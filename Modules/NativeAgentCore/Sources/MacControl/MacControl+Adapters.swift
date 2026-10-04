@@ -185,33 +185,36 @@ public final class SystemAppleScriptAdapter: AppleScriptAdapter {
     public init() {}
     public func run(script: String) async throws -> String {
         #if canImport(AppKit)
-        // NSAppleScript.executeAndReturnError is main-thread-only — hop through
-        // @MainActor the same way SystemAppControlAdapter.focusAppOnMain does.
-        return try await Self.runOnMain(script: script)
+        let result = try await SystemProcessAdapter().run(
+            executable: "/usr/bin/osascript",
+            arguments: ["-"],
+            currentDirectory: nil,
+            environment: nil,
+            standardInput: Data(script.utf8),
+            timeoutSeconds: 30
+        )
+        guard !result.timedOut else {
+            throw MacControlError.applescriptFailed("AppleScript timed out after 30 seconds")
+        }
+        guard !result.stdoutTruncated, !result.stderrTruncated else {
+            throw MacControlError.applescriptFailed("AppleScript output exceeded the capture limit; the result is incomplete")
+        }
+        guard result.exitCode == 0 else {
+            throw MacControlError.applescriptFailed(result.stderr.trimmingCharacters(in: .newlines))
+        }
+        var output = result.stdout
+        if output.hasSuffix("\n") { output.removeLast() }
+        return output
         #else
         throw MacControlError.applescriptFailed("AppKit unavailable on this platform")
         #endif
     }
 
-    #if canImport(AppKit)
-    @MainActor
-    private static func runOnMain(script: String) throws -> String {
-        guard let scr = NSAppleScript(source: script) else {
-            throw MacControlError.applescriptFailed("NSAppleScript init failed")
-        }
-        var errInfo: NSDictionary? = nil
-        let descriptor = scr.executeAndReturnError(&errInfo)
-        if let errInfo {
-            let message = (errInfo[NSAppleScript.errorMessage] as? String)
-                ?? "applescript error"
-            throw MacControlError.applescriptFailed(message)
-        }
-        return descriptor.stringValue ?? ""
-    }
-    #endif
 }
 
 public final class SystemProcessAdapter: ProcessAdapter {
+    public static let defaultOutputByteLimit = 1_048_576
+
     private let timeoutSnapshotInstalledObserver:
         (@Sendable (ProcessTreeSnapshot) -> Void)?
 
@@ -231,24 +234,20 @@ public final class SystemProcessAdapter: ProcessAdapter {
     }
     private final class _Buffer: @unchecked Sendable {
         private let lock = NSLock()
-        private let byteLimit: Int?
+        private let byteLimit: Int
         private var data = Data()
         private var droppedBytes = 0
 
         init(byteLimit: Int?) {
-            self.byteLimit = byteLimit.map { max(0, $0) }
+            self.byteLimit = max(0, byteLimit ?? SystemProcessAdapter.defaultOutputByteLimit)
         }
 
         func append(_ chunk: Data) {
             guard !chunk.isEmpty else { return }
             lock.lock()
-            if let byteLimit {
-                let room = max(0, byteLimit - data.count)
-                if room > 0 { data.append(chunk.prefix(room)) }
-                droppedBytes += max(0, chunk.count - room)
-            } else {
-                data.append(chunk)
-            }
+            let room = max(0, byteLimit - data.count)
+            if room > 0 { data.append(chunk.prefix(room)) }
+            droppedBytes += max(0, chunk.count - room)
             lock.unlock()
         }
 
@@ -298,6 +297,64 @@ public final class SystemProcessAdapter: ProcessAdapter {
         }
     }
 
+    /// Nonblocking readers keep EOF inside the subprocess deadline. A child
+    /// exiting does not imply EOF when descendants still own pipe writers.
+    private final class _PipeDrain: @unchecked Sendable {
+        private let handle: FileHandle
+        private let buffer: _Buffer
+        private let queue = DispatchQueue(label: "NativeAgent.process.pipe")
+        private let source: DispatchSourceRead
+        private let completion = _ProcessCompletion()
+
+        init(handle: FileHandle, buffer: _Buffer) throws {
+            self.handle = handle
+            self.buffer = buffer
+            let fd = handle.fileDescriptor
+            let flags = fcntl(fd, F_GETFL)
+            guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+                throw MacControlError.ioFailure("Could not configure subprocess pipe")
+            }
+            source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+            source.setEventHandler { [self] in drain() }
+            source.setCancelHandler { [self] in
+                try? handle.close()
+                completion.finish()
+                source.setEventHandler(handler: nil)
+                source.setCancelHandler(handler: nil)
+            }
+            source.resume()
+        }
+
+        private func drain() {
+            var bytes = [UInt8](repeating: 0, count: 65_536)
+            // Bound each callback so a continuous writer cannot prevent stop.
+            for _ in 0..<64 {
+                let count = read(handle.fileDescriptor, &bytes, bytes.count)
+                if count > 0 {
+                    buffer.append(Data(bytes.prefix(count)))
+                } else if count == 0 {
+                    source.cancel()
+                    return
+                } else if errno != EINTR {
+                    if errno != EAGAIN { source.cancel() }
+                    return
+                }
+            }
+        }
+
+        func stop() {
+            queue.async { [self] in
+                guard !source.isCancelled else { return }
+                drain()
+                source.cancel()
+            }
+        }
+
+        func wait() async {
+            await withCheckedContinuation { completion.wait($0) }
+        }
+    }
+
     /// Owns process-tree termination for timeout and parent Task cancellation.
     /// Timeout gets a cooperative SIGTERM -> SIGKILL window; explicit user
     /// cancellation SIGKILLs immediately so descendants cannot continue side
@@ -305,6 +362,7 @@ public final class SystemProcessAdapter: ProcessAdapter {
     private final class _ProcessTermination: @unchecked Sendable {
         private let lock = NSLock()
         private let process: Process
+        private let initialTree: ProcessTreeSnapshot
         private let onSettled: @Sendable () -> Void
         private let timeoutSnapshotInstalledObserver:
             (@Sendable (ProcessTreeSnapshot) -> Void)?
@@ -318,11 +376,13 @@ public final class SystemProcessAdapter: ProcessAdapter {
 
         init(
             process: Process,
+            initialTree: ProcessTreeSnapshot,
             onSettled: @escaping @Sendable () -> Void,
             timeoutSnapshotInstalledObserver:
                 (@Sendable (ProcessTreeSnapshot) -> Void)?
         ) {
             self.process = process
+            self.initialTree = initialTree
             self.onSettled = onSettled
             self.timeoutSnapshotInstalledObserver = timeoutSnapshotInstalledObserver
         }
@@ -366,9 +426,8 @@ public final class SystemProcessAdapter: ProcessAdapter {
             requested = true
             timeoutRequested = timedOut
             let pid = process.processIdentifier
-            let running = process.isRunning
             lock.unlock()
-            guard running, pid > 0 else {
+            guard pid > 0 else {
                 finish()
                 return
             }
@@ -376,7 +435,7 @@ public final class SystemProcessAdapter: ProcessAdapter {
             // Snapshot descendants before signaling the shell. Once the root
             // exits, a surviving grandchild may be reparented and disappear
             // from a later parent-only traversal.
-            let terminationTree = ProcessTreeReaper.snapshot(rootPID: pid)
+            let terminationTree = Self.captureTree(rootPID: pid, retaining: initialTree)
             lock.lock()
             activeTerminationTree = terminationTree
             let cancellationAlreadyEscalated = cancelEscalationRequested
@@ -454,6 +513,48 @@ public final class SystemProcessAdapter: ProcessAdapter {
             }
             worker.qualityOfService = .userInitiated
             worker.start()
+        }
+
+        static func captureTree(rootPID: Int32, retaining prior: ProcessTreeSnapshot? = nil) -> ProcessTreeSnapshot {
+            let tree = ProcessTreeReaper.snapshot(rootPID: rootPID, retaining: prior)
+            #if canImport(Darwin)
+            // A shell may have exited and reparented its pipe-owning children.
+            // Capture group members at launch even if the root has already
+            // exited. Later scans retain those identities and reject a reused
+            // root PID; signals never rely on a naked process-group id.
+            guard rootPID > 0 else { return tree }
+            if let prior {
+                if let liveRoot = ProcessTreeReaper.snapshot(rootPID: rootPID).rootIdentity,
+                   liveRoot != prior.rootIdentity { return tree }
+                guard prior.rootIdentity != nil || !prior.descendants.isEmpty else { return tree }
+            }
+            let earliest = prior?.rootIdentity ?? tree.rootIdentity ?? prior?.descendants.min {
+                ($0.startSeconds, $0.startMicroseconds) < ($1.startSeconds, $1.startMicroseconds)
+            }
+            let bytes = proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(rootPID), nil, 0)
+            guard bytes > 0 else { return tree }
+            var pids = [Int32](repeating: 0, count: Int(bytes) / MemoryLayout<Int32>.stride + 16)
+            let used = proc_listpids(UInt32(PROC_PGRP_ONLY), UInt32(rootPID), &pids,
+                                    Int32(pids.count * MemoryLayout<Int32>.stride))
+            var identities = tree.descendants
+            for pid in pids.prefix(max(0, Int(used)) / MemoryLayout<Int32>.stride) where pid > 0 && pid != rootPID {
+                var info = proc_bsdinfo()
+                let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+                guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
+                      info.pbi_pgid == UInt32(rootPID)
+                else { continue }
+                if let earliest,
+                   (info.pbi_start_tvsec, info.pbi_start_tvusec) < (earliest.startSeconds, earliest.startMicroseconds) {
+                    continue
+                }
+                let identity = ProcessTreeIdentity(pid: pid, startSeconds: info.pbi_start_tvsec,
+                                                   startMicroseconds: info.pbi_start_tvusec)
+                if !identities.contains(identity) { identities.append(identity) }
+            }
+            return ProcessTreeSnapshot(rootPID: tree.rootPID, rootIdentity: tree.rootIdentity, descendants: identities)
+            #else
+            return tree
+            #endif
         }
 
         private func cancellationEscalationWasRequested() -> Bool {
@@ -573,17 +674,13 @@ public final class SystemProcessAdapter: ProcessAdapter {
 
         let outBuf = _Buffer(byteLimit: outputByteLimit)
         let errBuf = _Buffer(byteLimit: outputByteLimit)
-        // Drain pipes concurrently with waitUntilExit so subprocesses
-        // producing > 64KB of output don't deadlock on a full pipe buffer.
-        outPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty { return }
-            outBuf.append(chunk)
-        }
-        errPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty { return }
-            errBuf.append(chunk)
+        let outDrain = try _PipeDrain(handle: outPipe.fileHandleForReading, buffer: outBuf)
+        let errDrain: _PipeDrain
+        do {
+            errDrain = try _PipeDrain(handle: errPipe.fileHandleForReading, buffer: errBuf)
+        } catch {
+            outDrain.stop()
+            throw error
         }
 
         let completion = _ProcessCompletion()
@@ -592,10 +689,11 @@ public final class SystemProcessAdapter: ProcessAdapter {
             try proc.run()
         } catch {
             proc.terminationHandler = nil
-            outPipe.fileHandleForReading.readabilityHandler = nil
-            errPipe.fileHandleForReading.readabilityHandler = nil
+            outDrain.stop()
+            errDrain.stop()
             throw MacControlError.ioFailure("Process.run() failed: \(error)")
         }
+        let initialTree = _ProcessTermination.captureTree(rootPID: proc.processIdentifier)
         if let inputPipe, let standardInput {
             // A helper may accept a payload larger than the pipe buffer. Feed
             // it off-thread so the event-driven termination path remains able
@@ -611,7 +709,12 @@ public final class SystemProcessAdapter: ProcessAdapter {
         ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(proc.processIdentifier)
         let termination = _ProcessTermination(
             process: proc,
-            onSettled: { completion.finish() },
+            initialTree: initialTree,
+            onSettled: {
+                outDrain.stop()
+                errDrain.stop()
+                completion.finish()
+            },
             timeoutSnapshotInstalledObserver: timeoutSnapshotInstalledObserver
         )
         let deadline = _ProcessDeadline()
@@ -622,23 +725,14 @@ public final class SystemProcessAdapter: ProcessAdapter {
             await withCheckedContinuation { continuation in
                 completion.wait(continuation)
             }
-        } onCancel: {
+            await outDrain.wait()
+            await errDrain.wait()
+            await termination.waitIfRequested()
             deadline.cancel()
+        } onCancel: {
             termination.request(timedOut: false)
         }
-        // Timeout/cancellation settles the captured process tree before the
-        // adapter reports completion; direct-shell exit alone is insufficient.
-        await termination.waitIfRequested()
-        deadline.cancel()
         proc.terminationHandler = nil
-
-        // Tear down readers, then drain anything still sitting in the pipe.
-        outPipe.fileHandleForReading.readabilityHandler = nil
-        errPipe.fileHandleForReading.readabilityHandler = nil
-        let tailOut = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let tailErr = errPipe.fileHandleForReading.readDataToEndOfFile()
-        outBuf.append(tailOut)
-        errBuf.append(tailErr)
         let outData = outBuf.snapshot()
         let errData = errBuf.snapshot()
         if Task.isCancelled {
@@ -646,8 +740,8 @@ public final class SystemProcessAdapter: ProcessAdapter {
         }
         return ProcessRunResult(
             exitCode: proc.terminationStatus,
-            stdout: String(data: outData, encoding: .utf8) ?? "",
-            stderr: String(data: errData, encoding: .utf8) ?? "",
+            stdout: String(decoding: outData, as: UTF8.self),
+            stderr: String(decoding: errData, as: UTF8.self),
             timedOut: termination.didTimeOut,
             stdoutTruncated: outBuf.truncated,
             stderrTruncated: errBuf.truncated
@@ -725,7 +819,10 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
     @MainActor
     private static func focusAppOnMain(named query: String) async throws -> AppControlRunResult {
         try Task.checkCancellation()
-        if let running = runningApp(matching: query) {
+        if let running = try runningApp(matching: query) {
+            guard MacDriverContext.binding?.allowsEmission == true else {
+                throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
+            }
             let activationRequestAccepted = running.activate(options: [.activateAllWindows])
             var fallbackAttempted = false
             var fallbackSucceeded = false
@@ -781,6 +878,9 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
         }
         let launched = try await openApplication(at: url)
         try Task.checkCancellation()
+        guard MacDriverContext.binding?.allowsEmission == true else {
+            throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
+        }
         let activationRequestAccepted = launched.activate(options: [.activateAllWindows])
         let activated = try await waitUntilFrontmost(pid: launched.processIdentifier)
         let failureReason = activated ? nil : activationFailureReason(
@@ -862,7 +962,20 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
             throw MacControlError.appControlFailed("app_not_running_or_not_found: \(query)")
         }
         let first = running[0]
-        let terminated = running.map { $0.terminate() }.contains(true)
+        let identities = Set(running.map {
+            $0.bundleURL?.standardizedFileURL.path ?? $0.bundleIdentifier ?? "pid:\($0.processIdentifier)"
+        })
+        guard identities.count == 1 else {
+            throw MacControlError.appControlFailed("app_query_ambiguous: use an exact app name or bundle identifier")
+        }
+        var terminated = false
+        for app in running {
+            try Task.checkCancellation()
+            guard MacDriverContext.binding?.allowsEmission == true else {
+                throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
+            }
+            if app.terminate() { terminated = true }
+        }
         return runResult(
             requested: query,
             app: first,
@@ -874,7 +987,10 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
 
     @MainActor
     private static func openApplication(at url: URL) async throws -> NSRunningApplication {
-        try await withCheckedThrowingContinuation { continuation in
+        guard MacDriverContext.binding?.allowsEmission == true else {
+            throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
+        }
+        return try await withCheckedThrowingContinuation { continuation in
             let config = NSWorkspace.OpenConfiguration()
             config.activates = true
             NSWorkspace.shared.openApplication(at: url, configuration: config) { app, error in
@@ -890,8 +1006,15 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
     }
 
     @MainActor
-    private static func runningApp(matching query: String) -> NSRunningApplication? {
-        runningApplications(matching: query).first
+    private static func runningApp(matching query: String) throws -> NSRunningApplication? {
+        let running = runningApplications(matching: query)
+        let identities = Set(running.map {
+            $0.bundleURL?.standardizedFileURL.path ?? $0.bundleIdentifier ?? "pid:\($0.processIdentifier)"
+        })
+        guard identities.count <= 1 else {
+            throw MacControlError.appControlFailed("app_query_ambiguous: use an exact app name or bundle identifier")
+        }
+        return running.first
     }
 
     @MainActor
@@ -930,6 +1053,7 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
             URL(fileURLWithPath: "/Applications", isDirectory: true),
             URL(fileURLWithPath: "/System/Applications", isDirectory: true),
             URL(fileURLWithPath: "/Applications/Utilities", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications/Utilities", isDirectory: true),
             fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
         ]
         for dir in candidateDirs {
@@ -994,7 +1118,8 @@ public struct SystemOpenTargetAdapter: OpenTargetAdapter {
     #if canImport(AppKit)
     @MainActor
     private static func requestOpenOnMain(_ url: URL) -> Bool {
-        NSWorkspace.shared.open(url)
+        guard MacDriverContext.binding?.allowsEmission == true else { return false }
+        return NSWorkspace.shared.open(url)
     }
     #endif
 }

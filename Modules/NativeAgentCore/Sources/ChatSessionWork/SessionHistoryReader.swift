@@ -192,7 +192,8 @@ public actor SessionHistoryReader {
         forSessionId id: String,
         limit: Int? = nil,
         excludingRunId: String? = nil,
-        strictEvidence: Bool = false
+        strictEvidence: Bool = false,
+        maximumBytes: Int? = nil
     ) async throws -> SessionHistoryReadResult {
         guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
             return SessionHistoryReadResult(
@@ -227,7 +228,8 @@ public actor SessionHistoryReader {
         if let limit, limit > 0, !strictEvidence {
             let result = Self.tailLinesResult(
                 from: path,
-                minimumLineCount: max(64, limit * 3)
+                minimumLineCount: max(64, limit * 3),
+                maximumBytes: maximumBytes
             )
             lines = result.lines
             sourceBytes = result.sourceBytes
@@ -292,6 +294,75 @@ public actor SessionHistoryReader {
                 truncated: truncated
             )
         )
+    }
+
+    /// Check provenance across the whole donor, retaining only a bounded tail.
+    /// A stale index cannot certify rows outside the prompt's sampled window.
+    /// Unreadable, damaged, or changing evidence throws; participant mismatch
+    /// or oversized rows disable handoff. The row limit is independent of the
+    /// retained tail budget and admits 40,000-character Unicode recollections.
+    package nonisolated static func continuityMessages(
+        forSessionId id: String,
+        dataRoot: URL,
+        limit: Int,
+        maximumBytes: Int,
+        matching: @Sendable (ChatMessage) -> Bool
+    ) throws -> [ChatMessage]? {
+        guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id),
+              limit > 0, maximumBytes > 0 else { throw CocoaError(.fileReadInvalidFileName) }
+        let path = dataRoot.appendingPathComponent("chat/messages/\(safeId).jsonl")
+        let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+        let handle = try FileHandle(forReadingFrom: path)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        try handle.seek(toOffset: 0)
+        let maximumRowBytes = 1024 * 1024
+        var remaining = size
+        var pending = Data()
+        var tail: [(message: ChatMessage, bytes: Int)] = []
+        var tailBytes = 0
+
+        func admit(_ line: Data) throws -> Bool {
+            guard line.count <= maximumRowBytes else { return false }
+            guard let text = String(data: line, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding)
+            }
+            let decoded = Self.decodeMessages(from: [text], excludingRunId: nil)
+            guard decoded.malformedRowCount == 0, decoded.invalidShapeRowCount == 0 else {
+                throw CocoaError(.coderReadCorrupt)
+            }
+            for message in decoded.messages {
+                guard matching(message) else { return false }
+                tail.append((message, line.count))
+                tailBytes += line.count
+                while tail.count > limit || tailBytes > maximumBytes {
+                    tailBytes -= tail.removeFirst().bytes
+                }
+            }
+            return true
+        }
+
+        while remaining > 0 {
+            try Task.checkCancellation()
+            guard let chunk = try handle.read(upToCount: Int(min(remaining, 64 * 1024))),
+                  !chunk.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+            remaining -= UInt64(chunk.count)
+            pending.append(chunk)
+            while let newline = pending.firstIndex(of: 0x0A) {
+                guard try admit(Data(pending[..<newline])) else { return nil }
+                pending.removeSubrange(...newline)
+            }
+            guard pending.count <= maximumRowBytes else { return nil }
+        }
+        if !pending.isEmpty, try !admit(pending) { return nil }
+        let settled = try FileManager.default.attributesOfItem(atPath: path.path)
+        for key in [FileAttributeKey.size, .modificationDate, .systemFileNumber] {
+            guard let before = attributes[key] as? NSObject,
+                  let after = settled[key] as? NSObject, before == after else {
+                throw CocoaError(.fileReadUnknown)
+            }
+        }
+        return tail.map(\.message)
     }
 
     /// Read the first few messages plus a bounded tail. This lets the prompt

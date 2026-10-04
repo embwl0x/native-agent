@@ -47,11 +47,17 @@ public enum WorkshopStorageMigrator {
 
         func prepare(dataRoot: URL) async throws -> WorkshopStorageMigrationReport {
             let root = dataRoot.standardizedFileURL
-            let task = tasks[root] ?? Task.detached(priority: .utility) {
+            if let task = tasks[root] { return try await task.value }
+            let task = Task.detached(priority: .utility) {
                 try migrateIfNeeded(dataRoot: root)
             }
             tasks[root] = task
-            return try await task.value
+            do {
+                return try await task.value
+            } catch {
+                tasks[root] = nil
+                throw error
+            }
         }
     }
 

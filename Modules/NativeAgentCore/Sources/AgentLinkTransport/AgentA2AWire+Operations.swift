@@ -27,7 +27,7 @@ extension AgentA2AWire {
             path = "/tasks"; verb = "GET"
         case "SubscribeToTask":
             guard interface.streaming else { throw WireError.unsupported("streaming was not offered") }
-            path = try "/tasks/" + identifier("id") + ":subscribe"; verb = "POST"
+            path = try "/tasks/" + identifier("id") + ":subscribe"; verb = "GET"
         case "CreateTaskPushNotificationConfig", "GetTaskPushNotificationConfig", "ListTaskPushNotificationConfigs", "DeleteTaskPushNotificationConfig":
             let collection = try "/tasks/" + identifier("taskId") + "/pushNotificationConfigs"
             if method == "CreateTaskPushNotificationConfig" {
@@ -41,9 +41,11 @@ extension AgentA2AWire {
             }
         default: throw WireError.unsupported("operation \(method)")
         }
+        let expectedTaskID: String? = if method == "SubscribeToTask", case .string(let id)? = params["id"] { id } else { nil }
         if interface.binding == "GRPC" {
             return Request(url: interface.endpoint, httpMethod: "POST", headers: [:],
-                           body: .object(params), requestID: nil, grpcMethod: method)
+                           body: .object(params), requestID: nil, grpcMethod: method,
+                           streamInterface: interface, expectedTaskID: expectedTaskID)
         }
         let rpc = interface.binding == "JSONRPC"
         let headers = ["Content-Type": rpc ? "application/json" : "application/a2a+json",
@@ -51,13 +53,15 @@ extension AgentA2AWire {
                        "A2A-Version": interface.version]
         if rpc {
             return Request(url: interface.endpoint, httpMethod: "POST", headers: headers,
-                           body: .object(["jsonrpc": .string("2.0"), "id": .string(requestID), "method": .string(method), "params": .object(params)]), requestID: requestID)
+                           body: .object(["jsonrpc": .string("2.0"), "id": .string(requestID), "method": .string(method), "params": .object(params)]), requestID: requestID,
+                           streamInterface: interface, expectedTaskID: expectedTaskID)
         }
         guard var url = URLComponents(url: interface.endpoint, resolvingAgainstBaseURL: false) else { throw WireError.invalid("endpoint") }
-        let base = url.percentEncodedPath.hasSuffix("/") ? String(url.percentEncodedPath.dropLast()) : url.percentEncodedPath
+        let base = try httpPathBase(url, tenant: params["tenant"])
         url.percentEncodedPath = base + path
+        params.removeValue(forKey: "tenant")
         if verb != "POST" {
-            let pathKeys: Set<String> = method.contains("PushNotificationConfig") ? ["taskId", "id"] : []
+            let pathKeys: Set<String> = method.contains("PushNotificationConfig") ? ["taskId", "id"] : (method == "SubscribeToTask" ? ["id"] : [])
             url.queryItems = try (url.queryItems ?? []) + params.keys.sorted().filter { !pathKeys.contains($0) }.map { key in
                 let text: String
                 switch params[key]! {
@@ -70,7 +74,8 @@ extension AgentA2AWire {
             }
         }
         guard let endpoint = url.url else { throw WireError.invalid("request URL") }
-        return Request(url: endpoint, httpMethod: verb, headers: headers, body: verb == "POST" ? .object(params) : nil, requestID: nil)
+        return Request(url: endpoint, httpMethod: verb, headers: headers, body: verb == "POST" ? .object(params) : nil, requestID: nil,
+                       streamInterface: interface, expectedTaskID: expectedTaskID)
     }
 
     public static func operationResult(_ value: JSONValue, interface: Interface, requestID: String?) throws -> JSONValue {

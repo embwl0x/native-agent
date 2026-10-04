@@ -43,13 +43,6 @@ extension NativeClient {
         return SystemRebuildResult(ok: r.ok, message: r.message, error: r.error)
     }
 
-    func gitPush() async throws -> GitPushResult {
-        let result = try await SystemGitActions.gitPush { arguments, repoRoot, timeout in
-            try await Self.runGit(arguments, repoRoot: repoRoot, timeout: timeout)
-        }
-        return GitPushResult(ok: result.ok, branch: result.branch, output: result.output, error: result.error)
-    }
-
     static func runGit(
         _ arguments: [String],
         repoRoot: URL,
@@ -90,12 +83,6 @@ extension NativeClient {
         SystemGitActions.processDetail(result)
     }
 
-    func gitStashRecover(label: String) async throws -> GitStashRecoverResult {
-        // WAVE 15 (2026-06-01): Swift-only — daemon route retired.
-        let impl = makeGitStashRecoverClient()
-        let r = try await impl.gitStashRecover(label: label)
-        return GitStashRecoverResult(ok: r.ok, stashRef: r.stashRef, output: r.output, error: r.error)
-    }
 }
 
 extension NativeClient: DoctorActionPort {

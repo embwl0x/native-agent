@@ -180,6 +180,11 @@ struct SchedulerView: View {
                                 Text(job.kind)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if let once = job.onceScheduleDescription {
+                                    Text(once)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             Spacer(minLength: 8)
                             // Item 36: this used to be a plain Text reading

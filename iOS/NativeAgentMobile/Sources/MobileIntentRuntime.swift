@@ -42,6 +42,9 @@ enum MobileIntentRuntime {
     }
 
     static var phoneConversationID: String {
+        // Siri continues the conversation User is in, whichever door he last
+        // spoke at — not whatever the chat screen last adopted.
+        if let anchor = iCloudSyncEngine.shared.chatAnchor?.cleanSessionId { return anchor }
         if let existing = ChatStore.shared.mainSessionID { return existing }
         let published = iCloudSyncEngine.shared.sessions.first {
             (NativeAgentICloudBridgeConstants.isMobileSourceKey($0.sourceKey)
@@ -81,7 +84,7 @@ enum MobileIntentRuntime {
         }
         // A notification preceding the reply must have its normal consumer on
         // cold launch, otherwise the ordered CloudKit drain cannot reach it.
-        let notifications = bridge.observeNotifications { NativeAgentBridgeNotificationScheduler.schedule($0) }
+        let notifications = bridge.observeNotifications { await NativeAgentBridgeNotificationScheduler.schedule($0) }
         defer {
             bridge.removeIncomingObserver(observer)
             bridge.removeNotificationObserver(notifications)
@@ -128,7 +131,7 @@ enum MobileIntentRuntime {
     private static func withDeliveryConsumers<T>(_ operation: () async throws -> T) async rethrows -> T {
         let bridge = iCloudBridge.shared
         let messages = bridge.observeIncomingMessages { receiveRetainedChatMessage($0) }
-        let notifications = bridge.observeNotifications { NativeAgentBridgeNotificationScheduler.schedule($0) }
+        let notifications = bridge.observeNotifications { await NativeAgentBridgeNotificationScheduler.schedule($0) }
         defer {
             bridge.removeIncomingObserver(messages)
             bridge.removeNotificationObserver(notifications)

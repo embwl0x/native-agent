@@ -280,7 +280,7 @@ public actor HistoryWindowCursorStore {
         var remaining = used
         var remainingRows = rowCount
         var cut = 0
-        // Drop COMPLETE user/assistant pairs, oldest first. A half-dropped pair
+        // Drop COMPLETE turns, oldest first. A half-dropped turn
         // leaves an answer with no question — worse context than either whole.
         while cut < live.count,
               Double(remaining) > target || Double(remainingRows) > rowTarget {
@@ -319,17 +319,18 @@ public actor HistoryWindowCursorStore {
         return candidate
     }
 
-    /// End index (exclusive) of the user/assistant pair beginning at `start`:
-    /// the run of rows up to and including the first assistant-side row that
-    /// follows at least one user-side row.
+    /// End index (exclusive) of the turn beginning at `start`, including every
+    /// tool receipt and assistant response before the next user row.
     private nonisolated static func pairEnd(in rows: [HistoryWindowRow], from start: Int) -> Int {
         var index = start
         var sawUser = false
         while index < rows.count {
             let row = rows[index]
+            if row.role == "user" {
+                if sawUser { return index }
+                sawUser = true
+            }
             index += 1
-            if row.role == "user" { sawUser = true; continue }
-            if sawUser, row.role == "assistant" || row.role == "tool" { return index }
         }
         return rows.count
     }

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 private final class FileLockSidecarEnumerationFailure: @unchecked Sendable {
     private let lock = NSLock()
@@ -169,11 +170,11 @@ public enum FileLockSidecarLifecycle {
                 await candidateBeforeAcquire(sidecar)
             }
             do {
-                let didReap = try await persistence.withFileLock(guarded) { () -> Bool in
+                let didReap = try await persistence.withFileLock(guarded, waitingAtMost: 0) { () -> Bool in
                     // We now hold this candidate's flock. Recheck every
                     // destructive predicate after contention: a writer may
                     // have created the guarded target or replaced the sidecar
-                    // while this sweep waited.
+                    // before this sweep acquired the lock.
                     guard !FileManager.default.fileExists(atPath: guarded.path),
                           let state = sidecarState(at: sidecar, cutoff: cutoff),
                           state.isAged else {
@@ -188,6 +189,8 @@ public enum FileLockSidecarLifecycle {
                 } else {
                     report.skippedAfterContention += 1
                 }
+            } catch let error as NSError where error.domain == "FileLock" && error.code == Int(ETIMEDOUT) {
+                report.deferred += 1
             } catch {
                 // Do not let one permissions or IO problem starve other stale
                 // sidecars; the mounted runner reports this as degraded.

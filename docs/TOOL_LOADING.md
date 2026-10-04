@@ -1,111 +1,122 @@
 # Tool loading: the contract
 
-This is the agreed behaviour for which tool schemas ride on a chat request. It is
-short on purpose. A change to any line below is a design change and needs User's
-word, not a side effect of a cache fix (2026-09-11: an append-only floor for
-prompt-cache stability silently overrode rule 2; User caught it a day later).
+NativeAgent is Agent's only tool: one always-on `app` schema. Pages, action
+arguments and results travel through that tool. This is a design contract;
+changing it requires User's authorization.
 
-Agent Experience selection clarification (2026-09-14, User-authorized): category,
-`name` and `names` are additive, including app/core mixed selections. Unknown
-names report unavailable/partial, never loaded. A sessionless call is an
-availability preview with empty `loaded`; it does not establish a session
-contract. Explicit promotion markers apply only to persisted active tools;
-turn-only availability must not create an empty session file.
+## One tool, every action
 
-Native workspace (2026-09-21, User-requested): `workspace` replaces the compact
-`work_context` reader in the always-on set. Picking up work and following its
-offered actions needs no catalog step; Swift carries targets and navigation.
-The underlying work/artifact/source readers remain lazy. Every selected
-read/send enters the ordinary gates under its actual name and arguments.
-This replacement adds no always-on names or background reads.
-The current count includes `agent_contacts` and `agent_message` from the
-previous natural agent-conversation work.
+`SwiftToolDispatcher.alwaysOnCoreNames` contains only `app`. Ordinary chat
+requests offer it alone. The schema is defined in
+`AppToolExecutor+ToolSchemas.swift`; `AppActionRegistry.swift` owns the
+`AppActions` registry behind it.
 
-1. **Always on (33 names).** `SwiftToolDispatcher.alwaysOnCoreNames`. These are
-   the only native tools in every request. The fixed floor is emitted in
-   alphabetical order, independent of tool use, session load order and set
-   iteration order. The names are `act`, `agent_connect`, `agent_contacts`,
-   `agent_introspect`, `agent_message`, `agent_read`, `codex_message`,
-   `commit_memory`, `context_expand`, `claude_message`, `delegation_status`,
-   `desk_read`, `go`, `inner_state`, `list_dir`, `list_skills`,
-   `mac_calendar_list_upcoming`, `mail_list_recent`, `read_file`, `read_skill`,
-   `recall_memory`, `recent_trace_summary`, `screen`, `search_chat_history`,
-   `shelf_entry`, `time_now`, `tool_catalog`, `tool_load`, `tool_result_page`,
-   `tool_unload`, `wait`, `workspace`, `write_file`.
-   User 2026-09-29: widened to them measured working set so the tool array stays byte-stable and prompt caching holds on every provider.
-   Four are the Mac verbs (`screen`, `act`, `go`, `wait`), whose
-   schemas are emitted only while Full Mac accessibility is active
-   (`BuiltInToolSchemaFactory+MacSchemas.swift`, `SwiftToolDispatcher+Sandbox.swift`),
-   so an install without it rides twenty-nine.
-   The six requested `browser.chrome_*` schemas remain lazy: the app-owned
-   catalog currently admits contributed schemas by session-active names, not
-   by the core always-on set.
-   MCP exception: while an MCP server is mounted, its tool schemas ride the
-   session contract automatically, without a `tool_load` or a preload
-   (`ChatSessionActiveTools.swift`,
-   `ChatOrchestrationClient+StructuredChat.swift`).
-2. **Everything else is lazy.** Calling a known catalog tool loads it and runs
-   it in the same call, through the ordinary security gates. `tool_catalog`
-   and `tool_load` remain optional discovery/schema fallbacks. A tool also joins by `tool_load`,
-   a confident route preload for this turn, or a turn-start promotion; it
-   **keeps its offered slot across idle turns**. Turn-only predictions also
-   enter persisted load order. Usage still comes from real dispatch; a
-   prediction never counts as a call.
-   App-owned tools are lazy like every other name: their descriptors reach
-   Core's one catalog through the engine's port (`AppToolExecutor`), and Core's
-   own gate covers them before their executor runs. The set is the notify pair
-   (Core's schemas, run by the app), the browser/Chrome group, `doctor_status` /
-   `telegram_status`, `reflex_review`, and — since 0.4.14 — the quiet
-   self-administration tools: `app_page_read`, `app_page_screenshot`,
-   `app_settings_list`, `app_setting_set`, `interaction_act`, `chat_reply`
-   (category `app`). None of them is always-on.
-   `app_page_screenshot` renders offscreen, where a material has no backdrop to
-   sample, so the composer shell and card surfaces substitute a solid slate fill
-   for their live glass — a capture reads like the settled window, not through it.
-3. **Loads persist.** An explicit `tool_load` keeps its existing protection
-   from prediction-driven eviction. Idle turns do not remove it.
-   `tool_unload` (by name or `all`) drops its schema at once.
-4. **The offer floor** (`offerFloor`) exists so the array is byte-stable *within
-   a conversation burst* on stable-array providers (ChatGPT OAuth). It is
-   append-only during a burst, capped at 40 with LRU eviction of unprotected
-   entries at the turn boundary, or explicit unload. There is no time-based rule: the
-   30-minute rebuild trial of 2026-09-12 was withdrawn the same day (User:
-   "what does a timestamp have to do with the turn count"). Ordinary turns
-   preserve the floor followed by the persisted append order.
-5. **Retired is not removed.** Every unloaded tool stays in `tool_catalog` and
-   loadable. Removing a tool from the catalog is a separate, owner-level call.
-6. **Receipts.** `tools.contract` per turn carries the real wire count, floor
-   and appended counts and bytes, and whether the turn followed a rebuild.
-   `turn.terminal` records `discoveryToolDispatchCount`, with separate
-   `toolCatalogDispatchCount` (including `list_tools`) and `toolLoadDispatchCount`.
-   Cancelled, unexecuted slots do not count as discovery calls.
-7. **Installed schema upgrades (2026-09-15, User-authorized).** At the accepted turn boundary,
-   `ActiveToolsStore.commitTurnStartContract` refreshes changed descriptors for
-   code-owned tools already pinned in the session. The app dispatcher supplies
-   its own names through `ActiveToolsStoreProviding.codeOwnedToolNames` alongside
-   the core registry. A changed declaration receives one generation bump;
-   unchanged schemas cause none. The captured contract stays immutable during
-   the turn, dynamic/MCP descriptors remain pinned, and missing/readiness-gated
-   tools keep their previous descriptors without gaining dispatch authority.
-   An upgrade never requires Agent to unload and reload a native tool manually.
+| Call | Meaning |
+|---|---|
+| `app {}` | Home first—where they left off—then the page index and action IDs. |
+| `app {"page":"home"}` | Their work, arrivals, conversations and places. |
+| `app {"item":"<name or ref>","args":{…}}` | Open or act on a name returned by home or one of its rooms. Home arguments are `text` and `fields`. |
+| `app {"page":"home","find":"<words>"}` | Search their work and conversations. |
+| `app {"page":"<page>","item":"<optional item>"}` | Read a page or one of that page's items. Page reads return a version and available actions. |
+| `app {"find":"<words>"}` | Discover matching pages, actions and skills. |
+| `app {"action":"<id>","args":{…}}` | Run one registered action. |
+| `app {"script":"<JavaScript>"}` | Compose permitted app calls in JavaScriptCore. |
 
-The tool list itself is code, not this page: `SwiftToolDispatcher.alwaysOnCoreNames`
-is the set in rule 1, and `SwiftToolDispatcher.builtInToolNames` is the
-catalog everything else is loaded from. A new tool joins the latter and nothing
-else — most recently `studio_journal_amend` and `dream_diary_read` (0.4.14),
-both lazy: the first like the rest of the studio lane, the second because
-reading a night back out of the dream diary is a deliberate pull and has no
-business costing prompt bytes on every turn. `second_opinion` (0.4.15) is lazy
-for the same reason, and refuses outright when no key is on file — a tool that
-exists only sometimes has no claim on every turn's prompt.
+Home names belong under `item`; registry action IDs belong under `action`.
+A home item can change state or send a message immediately. Read its room to
+understand it first: home items do not support `preview` or
+`expected_version`.
 
-The pre-turn helper lane does NOT touch this contract. It reads a tool family
-per turn and the log records which family it would have loaded ahead, but the
-promotion is in shadow: no name from that lane reaches
-`commitTurnStartContract`, and the advisory `optionalPromotions:` parameter that
-carried it has been deleted along with its admission step. The record showed no
-demonstrated benefit and schemas the model never calls are not free. See
-`docs/JEV.md` for the readings the lane still takes.
+For actions, `preview:true` describes the call without executing it.
+`expected_version` can guard against a page changing after it was read.
+Unknown keys, invalid arguments and stale versions refuse with a remedy.
 
-Owner: ChatSessionActiveTools.swift (`beginTurn`, `commitTurnStartContract`,
-`markUsed`), ChatOrchestrationClient+StructuredChat.swift (`traceFinalToolContract`).
+## No loading lifecycle
+
+There is no model-facing catalog/load/unload flow, turn-start schema preload
+or per-session active-tools store. An installed schema update is available on
+the next turn.
+
+Legacy model-facing tool names run nothing. `ToolNameAliases` returns an
+equivalent `app` call where one exists, or directs the caller to `app`.
+The former `workspace` interface is home; a catalog query becomes `find`.
+
+Internal executors and saved Trust keys still exist where actions need them.
+A folded action re-enters the gated dispatcher under its underlying tool name;
+home likewise re-enters its internal executor. Saved blocks and domain gates
+continue to apply. Internal names are not additional tools offered to Agent.
+
+Workshop, studio-wander, swarm and bridge execution paths can have their own
+declared tool lists. Their internal dispatch contracts do not enlarge the
+ordinary chat request. The Tools UI reads the manifest rather than calling a
+discovery tool.
+
+## Extending their reach
+
+- Built-in capabilities are registered app actions, not additional request
+  schemas.
+- Mounted MCP tools appear as `mcp.<server>.<tool>`, generated from the live
+  server list. The built-in search/fetch actions appear as `web.search` and
+  `web.fetch`.
+- Self-authored tools follow `tool.propose` → `tool.approve` →
+  `authored.<id>`. A proposal supplies Swift code and input/expected cases,
+  with optional permissions and input schema. Only active registry entries
+  become authored actions; approval follows the current Trust policy.
+- Skills remain guidance: discovery can return a `skill.read` call for a
+  relevant body.
+
+`web.search` tries Codex web search first for general queries. Code-shaped
+queries try SearXNG first. Unfiltered searches try the other route if the first
+fails or returns no results; the result identifies the route and any fallback
+reason. Explicit time ranges and non-general categories use only SearXNG.
+Cancellation stops the search.
+
+## Scripts
+
+`AppScriptRunner` creates a fresh JavaScriptCore context with
+`app.<action>(args)`, `app.read`, `app.find` and `app.log`. It exposes no
+direct filesystem, network, process or timer API. Every nested app call
+re-enters the same gate chain.
+
+The registry's `scriptable` flag decides which actions may run. Home may be
+read, but home items cannot be opened from a script. Sends, shell commands,
+Mac control and MCP calls are examples of actions that must be separate app
+calls. Secret arguments must also be passed through a single action.
+
+The runner bounds source size, reads, actions, call duration and total time.
+Its receipt retains completed effects if a later step fails; a script is not
+an atomic transaction or a rollback mechanism.
+
+## Authority and receipts
+
+Under Full Mac, Agent can also perform actions otherwise marked User's.
+Explicit blocks, checked policy, actual macOS grants and connector
+authentication still apply. macOS privacy permission resets always require
+the owner's approval. Peer-steered turns additionally ask User for deletes and
+irreversible acts, sends in their name, persona writes and protected approvals.
+`SecurityCenter` and `PeerTurnEffectPolicy` own those decisions.
+Authenticated turns from agents enabled in Trust → Connected agents carry
+User's authority and skip extra peer approvals; ordinary Trust and domain checks
+still apply.
+
+`tools.contract` records the actual wire schema count and bytes.
+`turn.terminal` includes `discoveryToolDispatchCount` for executed
+`app {find}` discovery calls. Action receipts distinguish refusal, waiting,
+failure and observed effects; a response alone is not proof of an external
+outcome.
+
+## Source owners
+
+All paths below are under `Modules/NativeAgentCore/Sources/`.
+
+| Owner | Contract |
+|---|---|
+| `AppToolRuntime/AppActionRegistry.swift` | Actions, arguments, ownership and scriptability. |
+| `AppToolRuntime/AppToolExecutor+AppDoor.swift` | Home, pages, discovery, previews and action dispatch. |
+| `AppToolRuntime/AppScriptRunner.swift` | JavaScript execution and bounds. |
+| `ToolRegistry/ToolNameAliases.swift` | Action translations and underlying dispatch identity. |
+| `ChatToolRuntime/SwiftToolDispatcher+ToolCatalog.swift` | The single always-on name. |
+| `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift` | Request filtering and tool-contract traces. |
+| `Research/Research+CodexSearch.swift` | Search routing and fallback. |
+
+See [Anatomy of a Turn](ANATOMY_OF_A_TURN.md) for the surrounding lifecycle.

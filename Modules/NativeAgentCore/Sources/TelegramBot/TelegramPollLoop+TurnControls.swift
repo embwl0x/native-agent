@@ -75,11 +75,13 @@ extension TelegramPollLoop {
 
     func requestLiveTurnStop(
         destination: TelegramDestination,
-        turnId: UUID? = nil
+        turnId: UUID? = nil,
+        pauseQueuedTurns: Bool = false
     ) async -> TelegramTurnCoordinator.StopOutcome {
         await turnCoordinator.requestStop(
             destination: destination,
             turnId: turnId,
+            pauseQueuedTurns: pauseQueuedTurns,
             confirmationTimeoutNanoseconds: turnStopConfirmationNanoseconds,
             sleeper: turnCardSleeper
         )

@@ -2,9 +2,44 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 // Project already-decided delivery outcomes into the existing inbox under its lock.
-function createCodexWakeInboxProjection({ BRIDGE_DIR, inboxLockDir, withDirLock, nowISO }) {
+function createCodexWakeInboxProjection({ BRIDGE_DIR, inboxLockDir, withDirLock, nowISO, writeJSONAtomic, writeTextAtomic }) {
+function historyPath(inboxPath, messageId) {
+  const key = crypto.createHash("sha256").update(messageId).digest("hex");
+  return path.join(path.dirname(inboxPath), "codex-inbox-history", `${key}.json`);
+}
+
+// Archive consumed briefs and terminal delivery failures with their exact retry
+// identity outside the hot inbox; pending briefs and reply jobs are never discarded.
+function compactInbox(lines, inboxPath) {
+  const completed = [];
+  const identities = new Set();
+  for (const [index, line] of lines.entries()) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { throw new Error("codex inbox cannot be compacted; original bytes preserved"); }
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error("codex inbox cannot be compacted; original bytes preserved");
+    }
+    const id = messageIdForPayload(row);
+    if (!id || identities.has(id) || (row.id && row.messageId && row.id !== row.messageId)) {
+      throw new Error("codex inbox retry identity conflicts; original bytes preserved");
+    }
+    identities.add(id);
+    if ((row.read === true && typeof row.consumedAt === "string" && row.consumedAt)
+        || (row.deliveryStatus === "dead_letter"
+            && typeof row.deliveryTerminalAt === "string" && row.deliveryTerminalAt)) {
+      completed.push({ index, id, row });
+    }
+  }
+  const removing = completed.slice(0, Math.max(0, completed.length - 256));
+  for (const entry of removing) writeJSONAtomic(historyPath(inboxPath, entry.id), entry.row);
+  const indices = new Set(removing.map((entry) => entry.index));
+  return lines.filter((_line, index) => !indices.has(index));
+}
+
 function inboxPathForPayload(payload) {
   if (payload && typeof payload.inboxPath === "string" && payload.inboxPath) return payload.inboxPath;
   return path.join(BRIDGE_DIR, "codex-inbox.jsonl");
@@ -69,10 +104,21 @@ async function rewriteInboxEntries(entries, rewriteRow, successStatus) {
           seen.add(match);
           return JSON.stringify(rewriteRow(row, targets.get(match), match));
         });
-        const tmp = `${inboxPath}.${process.pid}.${Date.now()}.tmp`;
-        fs.writeFileSync(tmp, next.join("\n"), { mode: 0o600 });
-        fs.renameSync(tmp, inboxPath);
-        try { fs.chmodSync(inboxPath, 0o600); } catch {}
+        for (const [id, entry] of targets) {
+          if (seen.has(id)) continue;
+          const archivedPath = historyPath(inboxPath, id);
+          let row;
+          try { row = JSON.parse(fs.readFileSync(archivedPath, "utf8")); }
+          catch (error) { if (error.code === "ENOENT") continue; throw error; }
+          if (!row || typeof row !== "object" || Array.isArray(row)
+              || (row.id && row.messageId && row.id !== row.messageId)
+              || !rowMessageIds(row).includes(id)) {
+            throw new Error("codex inbox retry identity conflicts; original bytes preserved");
+          }
+          writeJSONAtomic(archivedPath, rewriteRow(row, entry, id));
+          seen.add(id);
+        }
+        writeTextAtomic(inboxPath, compactInbox(next, inboxPath).join("\n"));
         return {
           status: "ok",
           inboxPath,

@@ -10,9 +10,7 @@ public func makeRouterPlanClient() -> any RouterPlanClient {
 }
 
 public func makeSystemRebuildClient() -> any SystemRebuildClient {
-    return SwiftNativeSystemRebuildClient()
-}
-
-public func makeGitStashRecoverClient() -> any GitStashRecoverClient {
-    return SwiftNativeGitStashRecoverClient()
+    // The in-process Swift runtime is unconditional; current Trust policy
+    // owns the autonomy switch and the per-action rebuild authorization.
+    return SwiftNativeSystemRebuildClient(daemonAutonomy: true)
 }

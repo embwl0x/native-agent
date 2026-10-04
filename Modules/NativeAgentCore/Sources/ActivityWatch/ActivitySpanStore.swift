@@ -1,14 +1,14 @@
 import Foundation
 import GRDB
 
-/// Single-writer SQLite store for v0 activity spans.
+/// Single-writer SQLite store for activity spans.
 ///
 /// Construction style mirrors `ContextSQLiteStore` (subdirectory + GRDB
 /// `Configuration` + `DatabaseMigrator`). Own DB file, mode 0600, inside
-/// `<dataRoot>/activity/activity_probe.sqlite`.
+/// `<dataRoot>/activity_watch/activity_spans.sqlite`.
 ///
 /// ONE table. There is no `activity_event` table (cut in the cold pass — it had
-/// zero readers) and no title column of any kind.
+/// zero readers). The `title_redacted` column holds redacted window titles.
 public actor ActivitySpanStore {
     /// W10 default retention. v0 shipped 7 d because it was a throwaway probe;
     /// v1's ceiling is 30 d (build plan W3) and it is configurable through
@@ -427,9 +427,15 @@ public actor ActivitySpanStore {
     /// test found 28,872 bytes still in `-wal`.)
     public func checkpointAndVacuum() throws {
         try dbQueue.writeWithoutTransaction { db in
-            try? db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+            func checkpoint() throws {
+                guard let row = try Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)"),
+                      (row[0] as Int) == 0, (row[1] as Int) == (row[2] as Int) else {
+                    throw DatabaseError(resultCode: .SQLITE_BUSY, message: "Activity privacy deletion could not finish clearing the WAL.")
+                }
+            }
+            try checkpoint()
             try db.execute(sql: "VACUUM")
-            try? db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+            try checkpoint()
         }
     }
 

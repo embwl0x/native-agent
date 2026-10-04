@@ -121,8 +121,8 @@ public struct DreamEntryProvenance: Sendable, Equatable {
         let dates = Set(matches(of: dateRegex, in: livedLine)).sorted()
         var refs: [String] = []
         if let sourcesLine {
-            let body = String(sourcesLine.dropFirst(sourcesPrefix.count))
-                .replacingOccurrences(of: "_", with: "")
+            var body = String(sourcesLine.dropFirst(sourcesPrefix.count))
+            if body.hasSuffix("_") { body.removeLast() }
             refs = body.components(separatedBy: " · ")
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }

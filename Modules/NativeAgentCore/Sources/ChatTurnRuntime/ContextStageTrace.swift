@@ -32,6 +32,7 @@ enum ContextHistoryStageName: String, CaseIterable, Sendable {
     case recallQuery = "history.recall_query"
     case contextBase = "context.base"
     case digest = "history.digest"
+    case prepare = "history.prepare"
     case render = "history.render"
     case contextClockRuntime = "context.clock_runtime"
 }
@@ -344,7 +345,8 @@ struct ContextStageTrace: Sendable {
         memoryRecallOutcome = outcome
     }
 
-    func emit(kind: String, surface: String) {
+    @discardableResult
+    func emit(kind: String, surface: String) -> Int64 {
         var stageObject: [String: JSONValue] = [:]
         for timing in timings {
             stageObject[timing.name] = .int(timing.elapsedMs)
@@ -364,6 +366,7 @@ struct ContextStageTrace: Sendable {
         let totalMs = Int64((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
         var payload: [String: JSONValue] = [
             "totalMs": .int(totalMs),
+            "preparationMs": .int(totalMs),
             "stageMs": .object(stageObject),
             "counts": .object(countObject),
             "flags": .object(flagObject),
@@ -383,6 +386,7 @@ struct ContextStageTrace: Sendable {
             surface: surface,
             payload: .object(payload)
         )
+        return totalMs
     }
 
     static func emitStage(

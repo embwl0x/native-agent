@@ -22,7 +22,7 @@ public enum LocalToolImage {
     /// `match` (2026-09-24), a generate call with n=4, a before/after pair —
     /// the same eight `boundConversation` keeps.
     public static let maximumImagesPerResult = 8
-    /// Long edge of a produced-image thumbnail. Half `readAuthorizedFile`'s
+    /// Long edge of a produced-image thumbnail. Half the verified reader's
     /// 2048: a produced image is shown so the model can CHECK it (did it come
     /// out, is it the right shape, is the text right), and 1024 JPEG is a
     /// tenth of the bytes of 2048 PNG.
@@ -38,7 +38,8 @@ public enum LocalToolImage {
     public static let pixelCapableTools: Set<String> = [
         "read_file",
         "screen",
-        "app_page_screenshot",
+        // The app door's page.screenshot.
+        "app",
         "image_generate",
         "browser.screenshot",
         // Both carry a `capture_screenshot` flag through the same capture.
@@ -64,7 +65,6 @@ public enum LocalToolImage {
     /// A tool that just WROTE `url` offers it to the model for this same turn.
     /// No file gate is consulted and none is needed: the caller produced this
     /// file itself, inside its own data root, in the turn that is returning it
-    /// — unlike `readAuthorizedFile`, where the path came from the model.
     public static func showProducedImage(at url: URL, name: String? = nil) -> ProducedImage {
         func skipped(_ reason: String) -> ProducedImage {
             ProducedImage(shown: false, note: reason, width: nil, height: nil)
@@ -198,7 +198,7 @@ public enum LocalToolImage {
         _ data: Data, name: String, width: Int, height: Int, mediaType: String = "image/png"
     ) -> JSONValue {
         func failure(_ reason: String) -> JSONValue {
-            .object(["status": .string("failed"), "error": .string(reason)])
+            .object(["ok": .bool(false), "status": .string("failed"), "error": .string(reason)])
         }
         guard !data.isEmpty, data.count <= maximumBytes else {
             return failure("Image must be nonempty and at most 8 MiB.")
@@ -220,60 +220,4 @@ public enum LocalToolImage {
         ])
     }
 
-    /// Caller MUST have resolved and authorized this exact URL through its
-    /// ordinary file gate. nil preserves the existing text-file reader.
-    public static func readAuthorizedFile(_ url: URL) -> JSONValue? {
-        guard ["png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "tif", "tiff", "bmp"]
-            .contains(url.pathExtension.lowercased()) else { return nil }
-        func failure(_ reason: String) -> JSONValue {
-            .object(["status": .string("failed"), "error": .string(reason)])
-        }
-        guard let sink else {
-            return failure("Image pixels require a model tool turn; this direct text-only call cannot display an image.")
-        }
-        do {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-            guard values.isRegularFile == true, let size = values.fileSize,
-                  size > 0, size <= maximumBytes else {
-                return failure("Image must be a nonempty regular file of at most 8 MiB.")
-            }
-            let handle = try FileHandle(forReadingFrom: url)
-            defer { try? handle.close() }
-            let data = try handle.read(upToCount: maximumBytes + 1) ?? Data()
-            guard !data.isEmpty, data.count <= maximumBytes,
-                  let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
-                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-                  let width = properties[kCGImagePropertyPixelWidth] as? Int,
-                  let height = properties[kCGImagePropertyPixelHeight] as? Int,
-                  width > 0, height > 0, Double(width) * Double(height) <= 40_000_000,
-                  let pixels = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                    kCGImageSourceCreateThumbnailFromImageAlways: true,
-                    kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: 2048,
-                  ] as CFDictionary) else {
-                return failure("Image is unreadable, unsupported, or exceeds the 40-megapixel limit.")
-            }
-            let encoded = NSMutableData()
-            guard let destination = CGImageDestinationCreateWithData(encoded, UTType.png.identifier as CFString, 1, nil) else {
-                return failure("Could not encode image pixels.")
-            }
-            CGImageDestinationAddImage(destination, pixels, nil)
-            guard CGImageDestinationFinalize(destination), encoded.length <= maximumBytes else {
-                return failure("Encoded image exceeds the 8 MiB delivery limit.")
-            }
-            guard !Task.isCancelled, sink.accept(.image(mediaType: "image/png",
-                base64: (encoded as Data).base64EncodedString(), name: url.lastPathComponent, byteSize: encoded.length)) else {
-                return failure("Image delivery was cancelled or this tool call already supplied an image.")
-            }
-            return .object([
-                "status": .string("ok"), "image_pixels": .bool(true),
-                "name": .string(url.lastPathComponent),
-                "width": .int(Int64(pixels.width)), "height": .int(Int64(pixels.height)),
-                "source_width": .int(Int64(width)), "source_height": .int(Int64(height)),
-                "note": .string("Actual image follows this tool result. First frame, oriented and bounded to 2048 pixels; not OCR or a text description."),
-            ])
-        } catch {
-            return failure("Could not read image: \(error.localizedDescription)")
-        }
-    }
 }

@@ -472,7 +472,7 @@ extension MacAppleScriptBridge {
             return (parts[0].trimmingCharacters(in: .whitespacesAndNewlines), parts[1], parts[2])
         }
         var exact = rows.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
-        if let artist, exact.count > 1 { exact = exact.filter { $0.artist.caseInsensitiveCompare(artist) == .orderedSame } }
+        if let artist { exact = exact.filter { $0.artist.caseInsensitiveCompare(artist) == .orderedSame } }
         if exact.count == 1 { return (exact[0].id, nil) }
         let shown = (exact.isEmpty ? rows : exact).prefix(6).map { "\"\($0.name)\" by \($0.artist)" }.joined(separator: ", ")
         let fix = exact.isEmpty

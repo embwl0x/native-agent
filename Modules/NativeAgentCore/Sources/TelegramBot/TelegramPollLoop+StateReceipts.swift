@@ -5,6 +5,72 @@ import NativeAgentCore
 import PersistenceCore
 
 extension TelegramPollLoop {
+    static func botStorageIdentity(_ token: String) -> String {
+        let id = String(token.prefix { $0 != ":" })
+        // Invalid credentials never become a path component.
+        return id.allSatisfy({ $0.isASCII && $0.isNumber }) && !id.isEmpty
+            ? id : "invalid"
+    }
+
+    func prepareBotIngressStorage() async throws {
+        guard let id = Int64(botIdentity), id > 0, token.contains(":") else {
+            throw TelegramOffsetCursorError.malformed
+        }
+        let store = SwiftNativePersistenceCore()
+        // The saved bot ID survives token rotation and does not depend on a
+        // private chat ever needing the optional username cache.
+        try await store.withFileLock(legacyOffsetURL) {
+            guard !FileManager.default.fileExists(atPath: offsetURL.path) else { return }
+            let legacyInbox = TelegramUpdateInbox(offsetURL: legacyOffsetURL)
+            guard FileManager.default.fileExists(atPath: legacyOffsetURL.path)
+                    || FileManager.default.fileExists(atPath: legacyInbox.directory.path) else { return }
+            let state = try await store.readJSON(telegramDir.appendingPathComponent("state.json"), ifMissing: .object([:]))
+            guard case .object(let root) = state else {
+                throw TelegramBotError.underlying("Legacy Telegram inbox ownership unavailable: state.json must be an object; polling paused.")
+            }
+            let savedIdentity: String?
+            // Only the previous poller's state can attribute legacy work.
+            // Current credentials say nothing about who received that inbox.
+            if case .object(let menu)? = root["commandMenu"], let identity = _tgJSONString(menu["botIdentity"]) {
+                savedIdentity = identity
+            } else {
+                savedIdentity = nil
+            }
+            // A matching old cache can still attribute storage for callers
+            // without saved configuration. Never bypass a conflicting saved ID.
+            let ownsLegacy = savedIdentity.map { $0 == String(id) }
+                ?? (_tgJSONString(root["botUsernameTokenFingerprint"]) == Self.botTokenFingerprint(token))
+            guard ownsLegacy else {
+                throw TelegramBotError.underlying("Legacy Telegram inbox ownership unresolved for this bot; cursor and inbox preserved, polling paused. Restore historical bot identity evidence before retrying.")
+            }
+            let inbox = TelegramUpdateInbox(offsetURL: offsetURL)
+            try await store.withFileLock(legacyInbox.directory.appendingPathComponent("claims_index.json")) {
+                if FileManager.default.fileExists(atPath: legacyInbox.directory.path) {
+                    let manager = FileManager.default
+                    if manager.fileExists(atPath: inbox.directory.path) {
+                        guard manager.contentsEqual(atPath: legacyInbox.directory.path, andPath: inbox.directory.path) else {
+                            throw TelegramBotError.underlying("Legacy Telegram inbox migration is incomplete; cursor and both inboxes preserved, polling paused.")
+                        }
+                        _ = try await inbox.snapshots()
+                    } else {
+                        let staged = TelegramUpdateInbox(offsetURL: offsetURL.deletingLastPathComponent()
+                            .appendingPathComponent(".migration-\(UUID().uuidString)"))
+                        try manager.createDirectory(at: inbox.directory.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        defer { try? manager.removeItem(at: staged.directory) }
+                        try manager.copyItem(at: legacyInbox.directory, to: staged.directory)
+                        _ = try await staged.snapshots()
+                        guard manager.contentsEqual(atPath: legacyInbox.directory.path, andPath: staged.directory.path) else {
+                            throw TelegramBotError.underlying("Legacy Telegram inbox copy could not be verified; polling paused.")
+                        }
+                        try manager.moveItem(at: staged.directory, to: inbox.directory)
+                    }
+                }
+                let offset = try TelegramOffsetCursor(fileURL: legacyOffsetURL).load()
+                _ = try await TelegramOffsetCursor(fileURL: offsetURL).advance(to: offset)
+            }
+        }
+    }
+
     static func inferDataRoot(from offsetURL: URL) -> URL {
         let parent = offsetURL.deletingLastPathComponent()
         if parent.lastPathComponent == "telegram" {
@@ -20,9 +86,15 @@ extension TelegramPollLoop {
     func writeStatePatch(_ patch: [String: JSONValue]) async {
         let store = SwiftNativePersistenceCore()
         let path = telegramDir.appendingPathComponent("state.json")
-        let current: JSONValue
         do {
-            current = try await store.readJSON(path, ifMissing: .object([:]))
+            try await store.withFileLock(path) {
+                let current = try await store.readJSON(path, ifMissing: .object([:]))
+                guard case .object(var obj) = current else {
+                    throw TelegramUpdateInboxError.malformedClaim("state.json")
+                }
+                for (key, value) in patch { obj[key] = value }
+                try await store.writeJSON(.object(obj), to: path)
+            }
         } catch {
             // Never write over a state file that did not read back. Logged
             // here, not through recordError, which writes state.json too.
@@ -37,16 +109,6 @@ extension TelegramPollLoop {
             )
             return
         }
-        var obj: [String: JSONValue]
-        if case .object(let currentObj) = current {
-            obj = currentObj
-        } else {
-            obj = [:]
-        }
-        for (key, value) in patch {
-            obj[key] = value
-        }
-        try? await store.writeJSON(.object(obj), to: path)
     }
 
     /// A short, non-reversible fingerprint of the bot token. The token itself
@@ -66,10 +128,8 @@ extension TelegramPollLoop {
     static let botUsernameCacheSeconds: TimeInterval = 24 * 60 * 60
 
     /// 2026-09-06: this bot's own @username, cached in telegram/state.json.
-    /// Only a slash command that NAMES a bot asks for it, so a failed getMe
-    /// costs one round trip per such command and never a per-tick one. Nil
-    /// means the identity is unknown; the caller then keeps the old permissive
-    /// behaviour rather than dropping the owner's own command.
+    /// Named slash commands and group mention checks use this identity. A
+    /// failed lookup leaves mention-required group messages unaddressed.
     ///
     /// 2026-09-06: the cache is keyed to the token's fingerprint and expires.
     /// Cached forever and untied to the token, a swapped token (or a rename)
@@ -125,6 +185,7 @@ extension TelegramPollLoop {
            case .object(let menu)? = root["commandMenu"],
            _tgJSONInt(menu["commandCount"]) == TelegramCommandRegistry.commands.count,
            _tgJSONString(menu["registryVersion"]) == TelegramCommandRegistry.version,
+           _tgJSONString(menu["botIdentity"]) == botIdentity,
            _tgJSONString(menu["syncedAt"]) != nil {
             return
         }
@@ -137,6 +198,7 @@ extension TelegramPollLoop {
             await commandMenuBackoff.recordSuccess()
             await writeStatePatch([
                 "commandMenu": .object([
+                    "botIdentity": .string(botIdentity),
                     "commandCount": .int(Int64(status.commandCount)),
                     "registryVersion": .string(status.registryVersion),
                     "syncedAt": .string(status.syncedAt),
@@ -148,6 +210,7 @@ extension TelegramPollLoop {
             let retryDelay = await commandMenuBackoff.recordFailure()
             await writeStatePatch([
                 "commandMenu": .object([
+                    "botIdentity": .string(botIdentity),
                     "commandCount": .int(Int64(TelegramCommandRegistry.commands.count)),
                     "registryVersion": .string(TelegramCommandRegistry.version),
                     "synced": .bool(false),

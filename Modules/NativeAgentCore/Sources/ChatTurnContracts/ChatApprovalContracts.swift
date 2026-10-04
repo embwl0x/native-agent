@@ -54,6 +54,12 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
         } else {
             fields["detail"] = .string(sentence(location: location))
         }
+        // Wave 2 #8: the step she means to take once the card is decided
+        // rides MY QUEUE, and the follow-up hands it back to her.
+        if self == .approvalFiled, case .string(let id)? = fields["approvalId"] {
+            fields["then"] = .string("app {action:\"queue.add\", args:{text:\"…\", when:\"after_card \(id)\"}} "
+                + "keeps the step you will take once it is decided")
+        }
         return .object(fields)
     }
 

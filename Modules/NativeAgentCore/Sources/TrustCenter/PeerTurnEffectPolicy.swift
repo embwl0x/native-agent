@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import ToolRegistry
 
 /// Peer sessions receive the ordinary full Agent context and tool policy.
 /// The extra peer approval rule protects destructive/unknown execution without
@@ -16,17 +17,47 @@ public enum PeerTurnEffectPolicy {
         externalToolIsEffect: ((String) -> Bool)? = nil,
         input: [String: JSONValue] = [:],
         workspaceRoot: URL? = nil,
-        relativeBases: [URL] = []
+        relativeBases: [URL] = [],
+        fullMac: Bool = false
     ) -> Bool {
         let name = normalized(tool)
         // These dispatchers own their connection, route and executable checks.
         // A host-backed message may carry a shell capability for its transport;
         // that does not make its text an arbitrary local shell command.
-        // 2026-09-22: claude/codex/omp_message are NOT exempt — each wakes a
-        // coding agent with local authority, so a peer's ask gets the card.
+        // claude/codex/omp_message are not exempt; they carry no shell or
+        // process capability, so they card only on the floors below.
         if ["agent_message", "agent_read", "bot_ask"].contains(name) { return false }
         let destructive: Set<String> = ["destructive", "filesystem_delete", "system_permission_reset"]
         if !destructive.isDisjoint(with: capabilities) { return true }
+        if isPersonaSettingWrite(tool: name, input: input) { return true }
+        // Agent 10-02: under Full Mac what she does on a peer's word is her
+        // call, and he sees each as a decided row. Three acts stay the
+        // person's: a delete or irreversible loss (the set above, and the
+        // app's own), a send or post in his name, and a write to her persona
+        // (by its tools or by a path under persona/). Messaging a peer back is
+        // a routine peer step, not a send in his name.
+        if fullMac {
+            // Folded actions re-enter under their tool's name and keep that
+            // call's approval/replay. The outer app call only passes them on.
+            let action = string(input["action"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            let passesThrough = name == "app" && ToolNameAliases.isFoldedAction(action)
+            let appAction = AppActionPolicy.action(tool: name, input: input)
+            // A preview does nothing, so it never cards. An id the table doesn't
+            // know can never run (the door refuses it as unknown_action); only
+            // before the table is installed does a missing entry card.
+            if name == "app", input["preview"] == .bool(true) { return false }
+            if name == "app", !passesThrough, !action.isEmpty, appAction == nil, !AppActionPolicy.isRegistered { return true }
+            if !passesThrough, appAction?.isHis == true || appAction?.irreversible == true { return true }
+            // A delete to trash is reversible, but still belongs on the delete floor.
+            if name == "app", action == "skill.delete" { return true }
+            if capabilities.contains("external_send"), !capabilities.contains("notification"),
+               !capabilities.contains("approval_stage"),
+               !["claude_message", "codex_message", "omp_message"].contains(name) { return true }
+            if name == "github_mutate" { return true }
+            if ["persona_write", "persona_append_section"].contains(name) { return true }
+            let writes: Set<String> = ["filesystem_write", "shell", "process_spawn"]
+            return !writes.isDisjoint(with: capabilities) && mentionsPersonaPath(.object(input))
+        }
         // Match the executor's sandbox parsing. Omitted or invalid values
         // execute as workspace-write and must keep the peer approval card.
         if name == "invoke_codex", case .string(let sandbox)? = input["sandbox"],
@@ -42,6 +73,18 @@ public enum PeerTurnEffectPolicy {
         }
         if name.hasPrefix("mcp__") { return externalToolIsEffect?(name) ?? true }
         return externalToolIsEffect?(tool) ?? false
+    }
+
+    /// Any string in the call naming a path under `persona/` (a target, a
+    /// shell command, a patch header).
+    static func mentionsPersonaPath(_ value: JSONValue) -> Bool {
+        switch value {
+        case .string(let text):
+            return text.range(of: #"(^|[^A-Za-z0-9_])persona/"#, options: [.regularExpression, .caseInsensitive]) != nil
+        case .array(let items): return items.contains(where: mentionsPersonaPath)
+        case .object(let fields): return fields.values.contains(where: mentionsPersonaPath)
+        default: return false
+        }
     }
 
     /// Every target path, resolved the way the file tools will: a relative
@@ -98,9 +141,9 @@ public enum PeerTurnEffectPolicy {
     static let effectTools: Set<String> = [
         // Her mind and the person's configuration.
         "persona_write", "persona_append_section", "save_skill",
-        "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
+        "forget_memory", "rebuild_knowledge_graph",
         "hold_view", "release_view",
-        "studio_canon_resolve", "bot_ask", "answer_card",
+        "studio_canon_resolve", "bot_ask",
         "mac_calendar_modify_event",
         // Desk STATE transitions whose names carry no effect verb.
         "desk_blocked_on", "desk_breakdown",
@@ -113,8 +156,8 @@ public enum PeerTurnEffectPolicy {
         "swift_build", "swift_test", "act", "go", "mac_wake",
         // Outward sends and other agents.
         "agent_message", "claude_message", "codex_message", "omp_message",
-        "invoke_claude", "invoke_codex", "agent_swarm",
-        "mail_reply", "mail_archive", "github_mutate",
+        "invoke_codex", "agent_swarm",
+        "mail_reply", "mail_archive", "mail_triage_batch", "github_mutate",
         // Defaults `persist: true` and REPLACES the durable tracking config,
         // so the name's "discover" reads like a probe and is not one.
         "github_discover_tracking", "github_project_digest",
@@ -233,6 +276,45 @@ public enum PeerTurnEffectPolicy {
         let name = who.isEmpty ? "another agent" : who
         return "\(name) asked for this on the agent bridge, not you. "
             + "\(tool) may perform a destructive action, so it waits for you."
+    }
+
+    /// The Full Mac floor's card: whose turn it was, and the line of theirs
+    /// that led here (Agent, 10-02).
+    public static func floorReason(tool: String, input: [String: JSONValue] = [:], capabilities: Set<String> = [],
+                                   requester: String, quote: String) -> String {
+        let who = requester.trimmingCharacters(in: .whitespacesAndNewlines)
+        let said = quote.isEmpty ? "" : " It said: \"\(quote)\"."
+        // Name the act itself: through the app door that is the action, not "app".
+        var shown = tool
+        if tool == "app", case .string(let action)? = input["action"] { shown = action }
+        let kind: String
+        if ["chat.send"].contains(shown) || tool == "github_mutate" || capabilities.contains("external_send") {
+            kind = "a send in your name"
+        } else if shown.hasSuffix(".approve") || shown == "mind.approve_view" {
+            kind = "an approval"
+        } else if ["persona_write", "persona_append_section"].contains(tool) || isPersonaSettingWrite(tool: tool, input: input) {
+            kind = "a persona write"
+        } else {
+            kind = "a delete or something that can't be undone"
+        }
+        return "This turn was steered by \(who.isEmpty ? "another agent" : who), not you.\(said) "
+            + "\(shown) is \(kind), so it waits for you."
+    }
+
+    /// The setting registry accepts both IDs and labels.
+    public static func isPersonaSettingWrite(tool: String, input: [String: JSONValue]) -> Bool {
+        let name = normalized(tool)
+        let args: [String: JSONValue]
+        if name == "app" {
+            guard input["preview"] != .bool(true),
+                  normalized(string(input["action"]) ?? "") == "setting_set",
+                  case .object(let given)? = input["args"] else { return false }
+            args = given
+        } else if name == "app_setting_set" {
+            args = input
+        } else { return false }
+        let setting = string(args["setting"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return ["personality.boundaries", "boundaries", "personality.forbidden_patterns", "forbidden patterns"].contains(setting)
     }
 
     /// Agent's ruling, 2026-09-15: her OWN memory notes stay allowed on a peer

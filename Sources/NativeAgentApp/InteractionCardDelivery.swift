@@ -4,6 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import NotificationInbox
+import ApprovalTransactions
 import AttentionRouting
 import Privacy
 
@@ -100,7 +101,10 @@ enum InteractionCardDelivery {
                 let choices: [JSONValue] = card.kind == .choose ? card.options.enumerated().map { index, option in
                     .object(["id": .string("interaction_choice_\(index)"), "label": .string(option.label)])
                 } : []
-                let inserted = try await inbox.appendUnique(.object([
+                // Her resident wake's card files now; its push and banner wait
+                // for the person's quiet hours to end (AttentionRouter.releaseHeld).
+                let held = AttentionRouter.holdsResidentWake(session: sessionID, dataRoot: dataRoot)
+                var row: [String: JSONValue] = [
                     "id": .string(id), "source": .string(source),
                     "created_at": .string(ISO8601DateFormatter().string(from: card.createdAt)),
                     "severity": .string("actionable"), "status": .string("unread"),
@@ -110,9 +114,18 @@ enum InteractionCardDelivery {
                         .object(["id": .string("act"), "label": .string("Open on Mac")]),
                         .object(["id": .string("reject"), "label": .string("Not now")]),
                     ]),
-                ]), id: id)
+                ]
+                if held, notify { row["held_delivery"] = .array([.string("phone"), .string("mac")]) }
+                let inserted = try await inbox.appendUnique(.object(row), id: id)
                 changed = inserted || changed
-                guard inserted, notify else { continue }
+                // User, 10-03: raised outside his conversation, it is mirrored
+                // there once; the claim on this note makes every refresh a safe retry.
+                if case .posted = await ApprovalChatCards.postInteraction(
+                    card, sessionID: sessionID, dataRoot: dataRoot,
+                    telegram: TelegramApprovalFilerRef.shared.current(), quiet: held || !notify) {
+                    changed = true
+                }
+                guard inserted, notify, !held else { continue }
                 do {
                     try await AttentionRouter.shared.route(
                         eventId: id, importance: .ownerWaiting, title: title, body: body,
@@ -144,22 +157,37 @@ enum InteractionCardDelivery {
     /// The same signed inbox-action transport the phone already uses. Opening
     /// a Mac-owned permission/OAuth control never pretends to grant access.
     @MainActor
-    static func act(id: String, action: String, dataRoot: URL) async throws {
+    static func act(id: String, action: String, dataRoot: URL, quiet: Bool = false) async throws {
         let pointer = try await pointer(id: id, dataRoot: dataRoot)
         if action.hasPrefix("interaction_choice_"),
            let index = Int(action.dropFirst("interaction_choice_".count)),
            let card = await InlineInteractionResolver.interaction(id: pointer.interactionID,
                 sessionID: pointer.sessionID, dataRoot: dataRoot),
            card.kind == .choose, card.options.indices.contains(index) {
+            // `quiet` is the agent's inbox.act; the phone's signed tap is User's.
             _ = try await InlineInteractionResolver.complete(id: card.id, sessionID: pointer.sessionID,
-                selection: card.options[index].id, expectedRevision: card.revision, dataRoot: dataRoot)
+                selection: card.options[index].id, expectedRevision: card.revision, byAgent: quiet, dataRoot: dataRoot)
         } else if action == "reject" || action == "deny" {
             _ = try await InlineInteractionResolver.decline(id: pointer.interactionID,
-                sessionID: pointer.sessionID, dataRoot: dataRoot)
+                sessionID: pointer.sessionID, resume: !quiet, dataRoot: dataRoot)
         } else if action == "act" {
-            guard QuietSelfAdmin.shared.appModel != nil else {
+            guard let appModel = QuietSelfAdmin.shared.appModel else {
                 throw NSError(domain: "InteractionCard", code: 2, userInfo: [
                     NSLocalizedDescriptionKey: "Open NativeAgent on your Mac to finish this request."
+                ])
+            }
+            await appModel.refreshChatSessionIndex()
+            guard let session = appModel.engine.transcripts.sessions.first(where: { $0.id == pointer.sessionID }),
+                  await InlineInteractionResolver.interaction(id: pointer.interactionID,
+                    sessionID: pointer.sessionID, dataRoot: dataRoot) != nil else {
+                throw NSError(domain: "InteractionCard", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
+                ])
+            }
+            await appModel.selectChatSession(session)
+            guard appModel.activeChatSessionId == pointer.sessionID else {
+                throw NSError(domain: "InteractionCard", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
                 ])
             }
             _ = NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
@@ -174,7 +202,14 @@ enum InteractionCardDelivery {
 /// Reuse the chat card and its existing controls without copying its state to
 /// User's conversation or changing the session that a tap resumes.
 struct InteractionInboxCard: View {
-    let item: InboxItemRecord
+    /// The card's inbox note id, or the original card itself (a chat mirror).
+    let noteID: String
+    var pinned: InteractionCardDelivery.Pointer? = nil
+    init(item: InboxItemRecord) { noteID = item.id }
+    init(mirrorOf pointer: InteractionCardDelivery.Pointer) {
+        noteID = "interaction:\(pointer.interactionID)"
+        pinned = pointer
+    }
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.chatPageIsVisible) private var chatPageIsVisible
@@ -218,10 +253,13 @@ struct InteractionInboxCard: View {
                 .environment(appModel)
             }
         }
-        .task(id: item.id) {
+        .task(id: noteID) {
             do {
                 let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-                let origin = try await InteractionCardDelivery.pointer(id: item.id, dataRoot: root)
+                let origin: InteractionCardDelivery.Pointer
+                if let pinned { origin = pinned } else {
+                    origin = try await InteractionCardDelivery.pointer(id: noteID, dataRoot: root)
+                }
                 pointer = origin
                 await binding.refresh(sessionID: origin.sessionID)
             } catch { loadError = error.localizedDescription }

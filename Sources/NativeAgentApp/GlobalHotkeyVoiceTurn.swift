@@ -24,6 +24,7 @@ final class GlobalHotkeyVoiceTurn {
     /// Returns a visible reason when the audio engine cannot actually begin.
     private let beginCapture: () -> String?
     private let stopCapture: () async -> String
+    private let discardCapture: () -> Void
     private let captureFailureMessage: () -> String?
     private let submitTurn: (String) async -> AppModel.ChatTurnAcceptance
     private let reportUnavailable: (String) -> Void
@@ -32,6 +33,7 @@ final class GlobalHotkeyVoiceTurn {
     private var awaitingPermission = false
     private var captureActive = false
     private var captureFinishing = false
+    private var generation: UInt64 = 0
 
     init(
         requestPermission: @escaping () async -> Bool,
@@ -39,6 +41,7 @@ final class GlobalHotkeyVoiceTurn {
         isVoiceHoldCurrent: @escaping () -> Bool,
         beginCapture: @escaping () -> String?,
         stopCapture: @escaping () async -> String,
+        discardCapture: @escaping () -> Void,
         captureFailureMessage: @escaping () -> String?,
         submitTurn: @escaping (String) async -> AppModel.ChatTurnAcceptance,
         reportUnavailable: @escaping (String) -> Void,
@@ -49,6 +52,7 @@ final class GlobalHotkeyVoiceTurn {
         self.isVoiceHoldCurrent = isVoiceHoldCurrent
         self.beginCapture = beginCapture
         self.stopCapture = stopCapture
+        self.discardCapture = discardCapture
         self.captureFailureMessage = captureFailureMessage
         self.submitTurn = submitTurn
         self.reportUnavailable = reportUnavailable
@@ -57,6 +61,7 @@ final class GlobalHotkeyVoiceTurn {
 
     /// Called only after the press state has crossed the hold threshold.
     func beginVoiceTurn() async -> Outcome {
+        guard isVoiceHoldCurrent() else { return .releasedBeforeCapture }
         // `stopListening` waits for the recognizer's final result. A fresh
         // hold during that flush cannot reuse the previous audio engine as a
         // second capture.
@@ -65,18 +70,17 @@ final class GlobalHotkeyVoiceTurn {
         }
 
         awaitingPermission = true
+        let generation = self.generation
         defer { awaitingPermission = false }
 
-        guard await requestPermission() else {
+        let permitted = await requestPermission()
+        guard generation == self.generation, isVoiceHoldCurrent() else {
+            return .releasedBeforeCapture
+        }
+        guard permitted else {
             let message = permissionFailureMessage() ?? "Microphone or speech recognition permission was not granted."
             reportUnavailable(message)
             return .permissionRefused(message)
-        }
-
-        // A user may release while the TCC prompt is visible. Do not begin a
-        // late recording that has no matching key-up event to finish it.
-        guard isVoiceHoldCurrent() else {
-            return .releasedBeforeCapture
         }
 
         if let message = beginCapture() {
@@ -94,9 +98,11 @@ final class GlobalHotkeyVoiceTurn {
         guard captureActive else { return .noActiveCapture }
         captureActive = false
         captureFinishing = true
+        let generation = self.generation
         defer { captureFinishing = false }
 
         let capturedTranscript = await stopCapture()
+        guard generation == self.generation else { return .noActiveCapture }
         let transcript = capturedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !transcript.isEmpty else {
             if let message = captureFailureMessage(), !message.isEmpty {
@@ -112,5 +118,11 @@ final class GlobalHotkeyVoiceTurn {
             return .submissionRejected(message)
         }
         return .submitted(acceptance)
+    }
+
+    func cancelVoiceTurn() {
+        generation &+= 1
+        if captureActive || captureFinishing { discardCapture() }
+        captureActive = false
     }
 }

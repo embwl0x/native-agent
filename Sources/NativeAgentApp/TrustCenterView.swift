@@ -952,28 +952,6 @@ private extension View {
     }
 }
 
-private enum TrustPalette {
-    // Resolve in SwiftUI. The shell overlays its warm lamp after page content;
-    // keep dark surfaces deep enough for the final composited text contrast.
-    struct AdaptiveColor: ShapeStyle {
-        let light: Color
-        let dark: Color
-
-        func resolve(in environment: EnvironmentValues) -> Color {
-            environment.colorScheme == .dark ? dark : light
-        }
-    }
-
-    static let secondary = AdaptiveColor(
-        light: Color(.sRGB, red: 0.28, green: 0.30, blue: 0.34),
-        dark: Color(.sRGB, red: 0.80, green: 0.82, blue: 0.85)
-    )
-    /// The same glass every other card in the room wears.
-    static let card = TodayPalette.cardFill
-    static let border = TodayPalette.cardStroke
-}
-
-
 // MARK: - Connected agents
 
 /// The person's per-peer elevation grant — the ONLY thing that lets an inbound
@@ -1009,7 +987,7 @@ struct AgentPeerTrustView: View {
                                 Text(peer.name)
                                     .font(.system(size: 14, weight: .medium))
                                     .foregroundStyle(NativeAgentShell.text)
-                                Text("\(Self.via(peer.transport)) · \(peer.credentialKey == nil ? "no credential, so it can't be turned on" : "has its own credential")")
+                                Text("\(Self.via(peer)) · \(peer.credentialKey == nil ? "no credential, so it can't be turned on" : "has its own credential")")
                                     .font(.system(size: 12))
                                     .foregroundStyle(NativeAgentShell.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -1034,11 +1012,30 @@ struct AgentPeerTrustView: View {
         }
         .accessibilityElement(children: .contain)
         .onAppear(perform: reload)
+        .task {
+            if peers.contains(where: ChatGPTDotIPCTransport.owns) {
+                _ = await SwiftToolDispatcher(dataRoot: NativeAgentPaths.dataRoot, allowProcessGlobalTools: false).chatGPTDotReadiness()
+                reload()
+            }
+        }
+        .task {
+            let events = FileChangeEvents(paths: [store.fileURL], emitInitial: true)
+            await withTaskCancellationHandler {
+                for await _ in events.stream {
+                    if Task.isCancelled { break }
+                    reload()
+                }
+            } onCancel: { events.cancel() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ChatGPTDotIPCTransport.didChange)) { _ in reload() }
     }
 
     /// How a peer reaches me, in words a person uses (the Simple view's words).
-    private static func via(_ transport: AgentPeerTransport) -> String {
-        switch transport {
+    private static func via(_ peer: AgentPeerContact) -> String {
+        if AgentPeerStore.hostRowID(peer.endpoint).flatMap({ AgentHostDirectory.row(named: $0)?.format }) == .shellEnvironment {
+            return ChatGPTDotIPCTransport.detail
+        }
+        return switch peer.transport {
         case .a2a: "Over the network (A2A)"
         case .nativeAgent: "Another NativeAgent"
         case .desktop: "Desktop app on this Mac"

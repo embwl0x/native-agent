@@ -138,10 +138,17 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             return nil
         }
         let captureFinishedNs = DispatchTime.now().uptimeNanoseconds
-        guard result.ok, case .object(let output) = result.output else { return nil }
+        guard result.ok, case .object(var output) = result.output else { return nil }
 
         let viewId = string(output["view"])
         let marks = array(output["marks"])
+        if output["image"] != nil, output["image"] != .null {
+            // One masked capture feeds the preview, OCR and model attachment.
+            output["image"] = maskedCapture(output: output, marks: marks).map(JSONValue.string)
+            if output["image"] == nil {
+                output["image_unavailable_reason"] = .string("The capture could not be safely masked.")
+            }
+        }
         let app = object(output["app"])
         let appName = string(app["name"])
         let bundleIdentifier = string(app["bundle_id"])
@@ -272,8 +279,6 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             ).compile(
                 image: crop.image,
                 using: VisionKitTextRecognizer(),
-                appName: appName,
-                windowTitle: title,
                 excludedRegions: excludedRegions
             )
             let sceneKey = [bundleIdentifier, appName, title]
@@ -306,7 +311,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                     // of it. Carry exact exclusions to the fresh point chooser;
                     // never exempt its motor point from obstruction checks.
                     return MacFourVerbsSupplementalTarget(label: target.label, aliases: target.aliases,
-                        kind: target.kind, frame: target.frame, observedFrame: target.observedFrame,
+                        kind: target.kind, secret: target.secret, frame: target.frame, observedFrame: target.observedFrame,
                         excludedFrames: obstructions.map(\.frame), provenance: target.provenance,
                         viewId: target.viewId, mark: target.mark, ordinal: target.ordinal,
                         regionOnly: true, physicalOnly: target.physicalOnly,
@@ -550,6 +555,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             targets.append(MacFourVerbsSupplementalTarget(
                 label: label,
                 kind: kind,
+                secret: bool(mark["secret_field"]) == true,
                 frame: frame,
                 provenance: .ax,
                 viewId: viewId,
@@ -576,6 +582,27 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             values: values,
             targets: targets
         )
+    }
+
+    private func maskedCapture(output: [String: JSONValue], marks: [JSONValue]) -> String? {
+        let imageOrigin = object(output["image_origin"])
+        let imageLogical = object(output["image_logical_size"])
+        let origin = object(output["origin"])
+        let logical = object(output["logical_size"])
+        guard let encoded = string(output["image"]), let data = Data(base64Encoded: encoded),
+              let image = VisionImageDecoder.decode(data),
+              let x = number(imageOrigin["x"] ?? origin["x"]), let y = number(imageOrigin["y"] ?? origin["y"]),
+              let w = number(imageLogical["w"] ?? logical["w"]), let h = number(imageLogical["h"] ?? logical["h"]),
+              w > 0, h > 0 else { return nil }
+        guard !MacScreenPreviewFrame.secretRects(marks: marks,
+            imagePixelSize: (w: image.width, h: image.height), origin: (x: x, y: y), logicalSize: (w: w, h: h)).isEmpty else { return encoded }
+        guard let masked = MacScreenPreviewFrame.previewImage(from: image, marks: marks,
+                  origin: (x: x, y: y), logicalSize: (w: w, h: h), maximumWidth: image.width) else { return nil }
+        let png = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(png, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, masked, nil)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return (png as Data).base64EncodedString()
     }
 
     /// Hands the card the frame this observation already holds, masked and

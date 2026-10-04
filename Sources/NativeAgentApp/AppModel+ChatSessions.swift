@@ -25,7 +25,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -60,9 +59,16 @@ import DeviceSync
 enum MacChatSelectionIntent {
     private(set) static var userChoseThisLaunch = false
 
+    /// The anchor Simple last followed or was taken off by a choice. Simple
+    /// moves only when the anchor moves past this.
+    static var lastSeenAnchorSessionId: String?
+
     /// Called wherever the human's own intent selects a session — picking one
     /// in the sidebar, or creating a new one.
-    static func noteUserChoice() { userChoseThisLaunch = true }
+    static func noteUserChoice() {
+        userChoseThisLaunch = true
+        lastSeenAnchorSessionId = ConversationAnchor.currentSessionId()
+    }
 
     /// Test seam. Production never calls this; a launch has exactly one start.
     static func resetForTesting() { userChoseThisLaunch = false }
@@ -235,7 +241,7 @@ extension AppModel {
         case .desk, .workshop, .work, .command, .bots:
             // Nothing is read here, so nothing is said about freshness below.
             performedRead = false
-            // DeskView, SchedulerView, and ResearchView own their bounded reads.
+            // DeskPageView, SchedulerView, and ResearchView own their bounded reads.
             // `.command` and `.workshop` are retired aliases → Desk
             // 2026-07-23); its old command-summary fetch went with the view.
             break
@@ -452,7 +458,7 @@ extension AppModel {
             nextGenPhases = phaseRows ?? fresh("nextgen phases", summaryRow?.phases) ?? nextGenPhases
             nextGenReceipts = fresh("nextgen receipts", receiptRows) ?? nextGenReceipts
         case .autoImprovement:
-            await loadAllSelfImprovement()
+            failedEndpoints.append(contentsOf: await loadAllSelfImprovement())
             async let nextImprovementSummary = try? api.getImprovementSummary()
             async let nextImprovements = try? api.getImprovements()
             async let nextJobs = try? desk.listJobs()
@@ -615,7 +621,9 @@ extension AppModel {
                         mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
                     }
                 }
-                mcpResourceReadState = .loading
+                if selectedMCPServerId == pendingId {
+                    mcpResourceReadState = .loading
+                }
                 let fetchedResources: [MCPResourceRecord]?
                 do {
                     fetchedResources = try await api.getMCPResources(serverId: pendingId).resources
@@ -757,13 +765,6 @@ extension AppModel {
         fetched ?? previous
     }
 
-    /// True when the panel's last refresh had at least one endpoint fail, so
-    /// some of what it is rendering was fetched at an earlier time.
-    @MainActor
-    func isPanelStale(_ item: SidebarItem) -> Bool {
-        panelRefreshStatus[item]?.isStale ?? false
-    }
-
     /// One user-facing sentence naming what could not be reached and how old
     /// the displayed data is, or nil when the last refresh was clean.
     @MainActor
@@ -835,7 +836,7 @@ extension AppModel {
         ) {
             sidebarActivityRefreshStatus = nextStatus
         }
-        if #available(macOS 27, *) { await publishWidgetStatus() }
+        await publishWorkStatus()
         return receipt
     }
 
@@ -1018,6 +1019,24 @@ extension AppModel {
         }
     }
 
+    /// Simple has no conversation list, so it follows the conversation User is
+    /// in: when the anchor MOVES (he sent from another door) the window moves
+    /// with it. A chat he opened here stays until the anchor moves again.
+    @MainActor
+    func followMovedAnchorInSimple() async {
+        guard SimpleViewMode.isShowing,
+              let anchorId = ConversationAnchor.currentSessionId(),
+              anchorId != MacChatSelectionIntent.lastSeenAnchorSessionId else { return }
+        MacChatSelectionIntent.lastSeenAnchorSessionId = anchorId
+        guard anchorId != activeChatSessionId else { return }
+        if !engine.transcripts.sessions.contains(where: { $0.id == anchorId }) {
+            do { engine.transcripts.sessions = try await engine.transcripts.list() } catch { return }
+        }
+        guard let session = engine.transcripts.sessions.first(where: { $0.id == anchorId && $0.archived != true })
+        else { return }
+        await selectChatSession(session)
+    }
+
     @MainActor
     private func performLoadChatState(api: NativeClient) async {
         let activeAtStart = activeChatSessionId
@@ -1070,14 +1089,13 @@ extension AppModel {
                 await self.readCanonicalChatTurnTerminalProof(identity: identity)
             }
             pruneChatDrafts()
-            // 2026-07-21 audit fix: prune per-session message/receipt caches
+            // 2026-07-21 audit fix: prune per-session message caches
             // for sessions the list no longer reports — mirrors the stale-draft
             // prune above, same low-frequency hook.
             pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             let targetSessionId = activeChatSessionId
             let lifecycleAtLoadStart = engine.turns.lifecycle(for: targetSessionId)
             let messages = try await engine.transcripts.loadMessages(sessionId: targetSessionId, cached: true)
-            let receipt = try? await api.getLatestContextReceipt(sessionId: targetSessionId)
             guard activeChatSessionId == targetSessionId else { return }
             guard !engine.turns.streamingSessions.contains(targetSessionId),
                   engine.turns.lifecycle(for: targetSessionId) == lifecycleAtLoadStart,
@@ -1089,7 +1107,6 @@ extension AppModel {
                 return
             }
             applyLoadedChatMessages(messages, for: targetSessionId)
-            latestContextReceipt = receipt
             markChatSidebarLoadSucceeded()
         } catch {
             chatStateLoadFailed = true
@@ -1097,28 +1114,9 @@ extension AppModel {
         }
     }
 
-    /// H4 (2026-07-09): the post-turn refresh. `.chatTurnCompleted` used to run
-    /// the whole of `performLoadChatState` — a health busy-wait (up to 8 ×
-    /// 350ms) plus getTrustPolicy + getChatSessions + getChatMessages +
-    /// getLatestContextReceipt — on the tail of every single turn. Three of
-    /// those four fetches are redundant: `_sendChatBody` already refreshes
-    /// `chatSessions` and the receipt before it posts the notification, and the
-    /// trust policy cannot change as a result of a chat turn. Only the message
-    /// list genuinely needs re-reading from disk, to swap the optimistic
-    /// bubble ids for the persisted rows.
-    ///
-    /// The receipt fetch stays because remote turns (iCloud/iOS forwarding)
-    /// post `.chatTurnCompleted` without going through `_sendChatBody`, so
-    /// nothing else refreshes it on that path.
-    ///
-    /// No health probe, no session-list fetch, no trust-policy fetch, and no
-    /// session-creation branch: this path never *creates* state, it only
-    /// re-reads the active session's messages.
-    /// `messagesAlreadyRefreshed` (gpt-5.5 review, 2026-07-09): a LOCAL turn's
-    /// `_sendChatBody` lands its own disk snapshot just before posting, so its
-    /// notification says so and this path skips the second whole-transcript
-    /// read. The receipt fetch always runs — nothing else sets it on either
-    /// path — and remote turns (flag absent) keep the full refresh.
+    /// Re-read the active transcript after a turn to replace optimistic rows
+    /// with persisted ones. Local turns already land their disk snapshot and
+    /// set `messagesAlreadyRefreshed`; remote turns keep the full refresh.
     @MainActor
     func refreshChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool = false) async {
         guard !sessionId.isEmpty, activeChatSessionId == sessionId else { return }
@@ -1134,8 +1132,7 @@ extension AppModel {
                 return
             }
         }
-        let receipt = try? await client.getLatestContextReceipt(sessionId: sessionId)
-        // The active session can change while those awaits are in flight.
+        // The active session can change while the load is in flight.
         guard activeChatSessionId == sessionId,
               !engine.turns.streamingSessions.contains(sessionId),
               engine.turns.lifecycle(for: sessionId) == lifecycleAtLoadStart else { return }
@@ -1147,9 +1144,6 @@ extension AppModel {
             // already in memory, so nothing is lost by skipping the swap.
             guard !engine.turns.streamingSessions.contains(sessionId) else { return }
             applyLoadedChatMessages(messages, for: sessionId)
-        }
-        if let receipt {
-            setLatestContextReceipt(receipt, for: sessionId)
         }
     }
 
@@ -1179,7 +1173,6 @@ extension AppModel {
                 return
             }
         }
-        let receipt = try? await client.getLatestContextReceipt(sessionId: sessionId)
         guard DetachedChatWindowController.shared.isDetached(sessionId),
               engine.turns.lifecycle(for: sessionId) == lifecycleAtLoadStart,
               !engine.turns.streamingSessions.contains(sessionId)
@@ -1187,17 +1180,9 @@ extension AppModel {
         if let messages {
             applyLoadedChatMessages(messages, for: sessionId)
         }
-        if let receipt {
-            setLatestContextReceipt(receipt, for: sessionId)
-        }
         detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
             previous: detachedChatRefreshStatus[sessionId],
             failedEndpoints: [],
-            at: Date()
-        )
-        detachedChatContextReceiptRefreshStatus[sessionId] = Self.nextRefreshStatus(
-            previous: detachedChatContextReceiptRefreshStatus[sessionId],
-            failedEndpoints: receipt == nil ? ["context receipt"] : [],
             at: Date()
         )
     }
@@ -1250,15 +1235,14 @@ extension AppModel {
 
     struct ChatSessionLoadSnapshot {
         let messages: [ChatMessage]
-        let receipt: ContextReceipt?
     }
 
     @MainActor
     func selectChatSession(_ session: ChatSession) async {
-        await selectChatSession(session, persistSelection: true) { [client, transcripts = engine.transcripts] requestedId in
-            let messages = try await transcripts.loadMessages(sessionId: requestedId, cached: true)
-            let receipt = try? await client.getLatestContextReceipt(sessionId: requestedId)
-            return ChatSessionLoadSnapshot(messages: messages, receipt: receipt)
+        await selectChatSession(session, persistSelection: true) { [transcripts = engine.transcripts, agents = engine.agents] requestedId in
+            let pulledDot = await agents.refreshDotSession(requestedId)
+            let messages = try await transcripts.loadMessages(sessionId: requestedId, cached: !pulledDot)
+            return ChatSessionLoadSnapshot(messages: messages)
         }
     }
 
@@ -1290,7 +1274,6 @@ extension AppModel {
             if !isStreamingThisSession || inMemoryEmpty {
                 applyLoadedChatMessages(snapshot.messages, for: requestedId)
             }
-            setLatestContextReceipt(snapshot.receipt, for: requestedId)
         }
 
         // Publish the identity only after the requested transcript slot is
@@ -1316,6 +1299,9 @@ extension AppModel {
                 let liveText = engine.turns.streamingTexts[requestedId] ?? ""
                 var liveBubble = ChatMessage(sessionId: requestedId, role: "assistant", content: liveText)
                 liveBubble.id = bubbleId
+                var liveMetadata = ChatMessageMetadata()
+                liveMetadata.turnTraceId = engine.turns.activeTurnIDsBySession[requestedId]
+                liveBubble.metadata = liveMetadata
                 appendChatMessage(liveBubble, to: requestedId)
             }
         }
@@ -1330,13 +1316,12 @@ extension AppModel {
             // Seed before publishing the session: the next await lets its
             // composer start a turn, which must retain ownership of these rows.
             engine.transcripts.setMessages([], for: session.id)
-            setLatestContextReceipt(nil, for: session.id)
             activeChatSessionId = session.id
             persistActiveChatSessionID(activeChatSessionId)
             engine.transcripts.sessions = try await engine.transcripts.list()
             migrateEmptySessionChatState(to: activeChatSessionId)
             pruneChatDrafts()
-            // 2026-07-21 audit fix: prune per-session message/receipt caches
+            // 2026-07-21 audit fix: prune per-session message caches
             // for sessions the list no longer reports — mirrors the stale-draft
             // prune above, same low-frequency hook.
             pruneStaleSessionChatState(knownSessionIds: Set(engine.transcripts.sessions.map(\.id)))

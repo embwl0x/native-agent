@@ -261,6 +261,15 @@ function createProcessStartIdentityReader() {
 // Callbacks preserve the worker's delivery classification and timeout ordering.
 function postBridgeRequest(transport, requestOptions, token, body, onResponse, onTimeout, onError, options = {}) {
   return new Promise((resolve) => {
+    let settled = false;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const fail = (error) => {
+      if (!settled) onError(error, settle);
+    };
     const req = transport.request({
       ...requestOptions,
       method: "POST",
@@ -273,17 +282,21 @@ function postBridgeRequest(transport, requestOptions, token, body, onResponse, o
     }, (res) => {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
+      res.on("error", fail);
       res.on("end", () => {
+        if (settled) return;
         const raw = Buffer.concat(chunks).toString("utf8");
         let parsed = null;
         try { parsed = JSON.parse(raw); } catch {}
         const httpOK = res.statusCode >= 200 && res.statusCode < 300;
         const replyStatus = parsed && parsed.status ? parsed.status : null;
-        onResponse({ res, raw, parsed, httpOK, replyStatus }, resolve);
+        onResponse({ res, raw, parsed, httpOK, replyStatus }, settle);
       });
     });
-    req.on("timeout", () => onTimeout(req, resolve));
-    req.on("error", (error) => onError(error, resolve));
+    req.on("timeout", () => {
+      if (!settled) onTimeout(req, settle);
+    });
+    req.on("error", fail);
     if (options.endWithBody) {
       req.end(body);
     } else {
@@ -293,35 +306,32 @@ function postBridgeRequest(transport, requestOptions, token, body, onResponse, o
   });
 }
 
-// Claude reconciles ambiguous delivery against its session store. Codex keeps
-// its explicit reply fields and existing failed/retry classification. Both
-// require a clean 2xx {status:"ok"}; transport success alone is not delivery.
-function postWakeCompletion(transport, requestOptions, token, body, sessionId, sessionStoreConfirmation = false) {
+// Codex keeps its explicit reply fields and existing failed/retry
+// classification. Calls backed by a completion lifecycle retain transport
+// uncertainty for same-ID reconciliation. Transport success alone is not delivery.
+function postWakeCompletion(transport, requestOptions, token, body, sessionId, completionLifecycle = false) {
   return postBridgeRequest(transport, requestOptions, token, body,
     ({ res, raw, parsed, httpOK, replyStatus }, resolve) => {
-      const ok = httpOK && replyStatus === "ok";
-      const prefix = sessionStoreConfirmation ? "bridge" : "nativeagent";
+      const ok = httpOK && (replyStatus === "ok" || (replyStatus === "completion_already_settled"
+        && parsed.completionDelivery && parsed.completionDelivery.status === "completed"));
+      const uncertain = completionLifecycle && ["outcome_unknown", "completion_in_progress", "delivery_in_progress", "in_progress"].includes(
+        parsed && parsed.completionDelivery ? parsed.completionDelivery.status : replyStatus
+      );
       resolve({
-        status: ok ? "delivered" : (sessionStoreConfirmation ? "unknown" : "failed"),
-        reason: ok ? null : (httpOK ? `${prefix}_reply_${replyStatus || "missing_status"}` : `http_${res.statusCode}`),
-        ...(sessionStoreConfirmation ? {
-          // Legacy turn-completion acknowledgments still prove delivery.
-          ackMode: ok ? (parsed && parsed.ack === "enqueued" ? "enqueued" : "turn_completion") : null,
-        } : {}),
+        status: ok ? "delivered" : (uncertain ? "unknown" : "failed"),
+        reason: ok ? null : (httpOK ? `nativeagent_reply_${replyStatus || "missing_status"}` : `http_${res.statusCode}`),
         delivery: "nativeagent_bridge_message",
         httpStatus: res.statusCode,
         sessionId: sessionId || null,
-        ...(sessionStoreConfirmation ? {} : {
-          replyStatus,
-          nativeAgentSessionId: parsed && parsed.sessionId ? parsed.sessionId : null,
-          nativeAgentReplyPreview: parsed && typeof parsed.reply === "string" ? unicodePrefix(parsed.reply, 1000) : null,
-          completionDelivery: parsed && parsed.completionDelivery ? parsed.completionDelivery : null,
-        }),
-        rawPreview: sessionStoreConfirmation ? raw.slice(0, 500) : unicodePrefix(raw, 1000),
+        replyStatus,
+        nativeAgentSessionId: parsed && parsed.sessionId ? parsed.sessionId : null,
+        nativeAgentReplyPreview: parsed && typeof parsed.reply === "string" ? unicodePrefix(parsed.reply, 1000) : null,
+        completionDelivery: parsed && parsed.completionDelivery ? parsed.completionDelivery : null,
+        rawPreview: unicodePrefix(raw, 1000),
       });
     }, (req, resolve) => {
-      if (sessionStoreConfirmation) {
-        // Settle uncertainty before destroy can emit an error. Codex instead
+      if (completionLifecycle) {
+        // Settle uncertainty before destroy can emit an error. Legacy Codex
         // keeps its existing error-handler resolution after destruction.
         resolve({
           status: "unknown",
@@ -335,7 +345,7 @@ function postWakeCompletion(transport, requestOptions, token, body, sessionId, s
       const code = error && error.code;
       const provablyUnsent = code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN";
       resolve({
-        status: sessionStoreConfirmation && !provablyUnsent ? "unknown" : "failed",
+        status: completionLifecycle && !provablyUnsent ? "unknown" : "failed",
         reason: (error && error.message) || "bridge_message_failed",
         delivery: "nativeagent_bridge_message",
         sessionId: sessionId || null,
@@ -361,7 +371,8 @@ function createWakeLivePoster({ url, tokenPath, messageIds, intervalMs = 400 }) 
   } catch { return noop; }
   if (!token || !["http:", "https:"].includes(target.protocol)) return noop;
   const transport = target.protocol === "https:" ? require("https") : require("http");
-  let chain = Promise.resolve();
+  const queue = [];
+  let draining = null;
   let pendingText = null;
   let timer = null;
   let lastActivity = 0;
@@ -376,10 +387,22 @@ function createWakeLivePoster({ url, tokenPath, messageIds, intervalMs = 400 }) 
     req.on("error", resolve);
     req.end(body);
   });
-  // One ordered queue: a later partial never lands before an earlier one.
+  const drain = async () => {
+    while (queue.length) {
+      const { event, fields } = queue.shift();
+      for (const id of ids) await post({ message_id: id, event, ...fields }).catch(() => {});
+    }
+    draining = null;
+  };
+  // Keep notes in order and only the newest unsent text snapshot.
   const send = (event, fields = {}) => {
-    for (const id of ids) chain = chain.then(() => post({ message_id: id, event, ...fields })).catch(() => {});
-    return chain;
+    if (event === "partial") {
+      const previous = queue.findIndex((item) => item.event === "partial");
+      if (previous >= 0) queue.splice(previous, 1);
+    }
+    queue.push({ event, fields });
+    if (!draining) draining = drain();
+    return draining;
   };
   const flushText = () => {
     if (timer) { clearTimeout(timer); timer = null; }

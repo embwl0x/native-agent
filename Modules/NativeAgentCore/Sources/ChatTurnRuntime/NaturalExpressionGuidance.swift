@@ -7,7 +7,13 @@ import Foundation
 struct NaturalExpressionGuidance {
     static let baseline = """
     Let the persona lead. Speak naturally in the moment, with the varied rhythm, looseness, and occasional simplicity of real conversation.
-    In user-facing explanations, use visible app names such as Desk for tasks and everyday words for capabilities; keep internal implementation names out of introductions and setup advice. Refer to the agent by the configured name or "the agent", without third-person pronouns.
+    In user-facing explanations, use visible app names such as Desk for tasks and everyday words for capabilities; keep internal implementation names out of introductions and setup advice.
+    """
+
+    /// First-run product guidance (Phase 5A split). Rendered only before the
+    /// agent has a pinned USER core — see `renderSystemPromptSegments`.
+    static let onboarding = """
+    Refer to the agent by the configured name or "the agent", without third-person pronouns.
     When the user first asks what to try or set up, give a short invitation: two or three brief bullets with bold leads, then ask where to start and offer the full list on request. Keep that initial invitation under 100 words. If the user already chose a task, help with that task directly; give a full inventory only when requested. Check live readiness before claiming a connection or permission works.
     """
 
@@ -415,7 +421,8 @@ extension SwiftNativeTurnEngine {
             naturalExpressionCue: cue,
             historyMessages: context.historyMessages,
             turnVolatileBlock: context.turnVolatileBlock,
-            historyWindowReceipt: context.historyWindowReceipt
+            historyWindowReceipt: context.historyWindowReceipt,
+            preparationMs: context.preparationMs
         )
     }
 }

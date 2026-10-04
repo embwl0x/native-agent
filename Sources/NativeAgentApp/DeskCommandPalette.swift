@@ -10,7 +10,7 @@ import PersistenceCore
 // with different pools beats one palette whose results User has to disambiguate.
 //
 // Lightweight by contract: a sheet, a TextField, a filtered list. No third-party
-// deps, no new mutation path — Enter hands a verb + a handle back to DeskView,
+// deps, no new mutation path — Enter hands a verb + a handle back to the primary Desk,
 // which fires the same `DeskQuickAction` the buttons fire.
 
 /// Resolves the one row the palette can name in its mutation banner and hand
@@ -200,7 +200,7 @@ struct DeskCommandPaletteView: View {
                         .contentShape(Rectangle())
                         .onTapGesture {
                             highlighted = index
-                            commit()
+                            commit(row: row)
                         }
                 }
                 .listStyle(.plain)
@@ -249,10 +249,10 @@ struct DeskCommandPaletteView: View {
         .background(.regularMaterial)
     }
 
-    private func commit() {
+    private func commit(row: DeskPaletteRow? = nil) {
         guard let submission = DeskPalettePresentation.submission(
             parsed: parsed,
-            target: target
+            target: row ?? target
         ) else { return }
         isPresented = false
         switch submission {

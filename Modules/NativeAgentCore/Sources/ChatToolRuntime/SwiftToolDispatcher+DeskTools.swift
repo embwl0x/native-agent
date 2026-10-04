@@ -22,6 +22,23 @@ import Desk
 
 extension SwiftToolDispatcher {
 
+    static func latchDeskPeers(_ items: [DeskItem]) {
+        for item in items where item.project == MyQueue.project {
+            guard let step = item.refs.reversed().lazy.compactMap({ ref -> DeskStep? in
+                if case .step(let step) = ref.kind { return step }; return nil
+            }).first else { continue }
+            step.peers.forEach { PeerDataTaint.markConsumed(peer: $0) }
+            step.elevated.forEach { PeerDataTaint.markElevated(peer: $0) }
+        }
+    }
+
+    static func latchDeskRecordPeers(_ item: DeskItem, in state: DeskState) {
+        let handles = Set([item.handle] + item.blockedOn + (item.parent.map { [$0] } ?? []))
+        latchDeskPeers(state.items.filter {
+            handles.contains($0.handle) || $0.parent == item.handle || $0.blockedOn.contains(item.handle)
+        })
+    }
+
     private func deskStore() -> SwiftNativeDeskStore {
         SwiftNativeDeskStore(dataRoot: dataRoot)
     }
@@ -93,6 +110,26 @@ extension SwiftToolDispatcher {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// The Desk tools that change one item by `handle`: working it holds it
+    /// for this conversation (skills-as-code PR 4).
+    static let deskItemTools: Set<String> = [
+        "desk_set_status", "desk_update_item", "desk_note", "desk_add_ref", "desk_set_cadence", "desk_set_notify",
+        "desk_close", "desk_archive", "desk_blocked_on", "desk_defer", "desk_work_log",
+    ]
+
+    /// Takes the item for this conversation, or the refusal when another
+    /// conversation or a stopped skill run holds it. A hold that does not
+    /// read or write lets the call through, as before holds.
+    func deskHeld(_ input: [String: JSONValue], session: String) async -> JSONValue? {
+        guard let raw = optionalString(input, "handle"),
+              let by = (try? await deskStore().hold(Self.deskAlias(raw), session: session)) ?? nil else { return nil }
+        return .object([
+            "status": .string("refused"), "reason": .string("held_by"), "held_by": .string(by), "effects": .string("none"),
+            "detail": .string("\(raw) is held by \(by), which is working it; nothing changed. "
+                + "Leave it to that one, or pick it up there."),
+        ])
+    }
+
     /// Resolve a mutation's `handle` param to a stable handle. Accepts EITHER a
     /// stable handle (desk_…) OR the visible desk NUMBER the user sees in the
     /// projection ("1", "2.1") — so User/Agent can drive an item by its number,
@@ -157,6 +194,9 @@ extension SwiftToolDispatcher {
     func impl_desk_read(input: [String: JSONValue]) async throws -> JSONValue {
         let store = deskStore()
         let state = try await store.liveState()
+        // The board is the owner's work: her MY QUEUE is on her home, and a
+        // handle or query still reaches it.
+        let board = DeskState(items: state.items.filter { $0.project != MyQueue.project }, generatedTs: state.generatedTs)
         let handle = optionalString(input, "handle")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let query = optionalString(input, "query")?
@@ -170,7 +210,7 @@ extension SwiftToolDispatcher {
         // 2026-09-22: triage view. The board shows 25 rows with no dates, so
         // staleness was unjudgeable; list every open top-level item, oldest first.
         if optionalString(input, "sort") == "stale", handle?.isEmpty != false, query?.isEmpty != false {
-            let open = state.topLevel.filter { !$0.status.isTerminal }.sorted {
+            let open = board.topLevel.filter { !$0.status.isTerminal }.sorted {
                 $0.updatedAt != $1.updatedAt ? $0.updatedAt < $1.updatedAt : $0.handle < $1.handle
             }
             return .object([
@@ -203,7 +243,6 @@ extension SwiftToolDispatcher {
         } else {
             rawMatches = []
         }
-
         if input["structured"] == .bool(true) {
             return Self.workspaceDesk(state: state, input: input, handle: handle, query: query, matches: rawMatches)
         }
@@ -226,8 +265,9 @@ extension SwiftToolDispatcher {
                 generatedTs: state.generatedTs
             )
         } else {
-            renderState = state
+            renderState = board
         }
+        Self.latchDeskPeers(renderState.items)
         var text = DeskProjection.render(renderState)
         if isFiltered, matches.isEmpty {
             text += "\nno live Desk items matched"
@@ -235,14 +275,14 @@ extension SwiftToolDispatcher {
         // Never a silent cut: say what's hidden and how to reach it.
         if isFiltered, rawMatches.count > matchCap {
             text += "\nshowing \(matchCap) of \(rawMatches.count) matches — narrow the query"
-        } else if !isFiltered, case let shown = DeskProjection.cappedTopLevel(state), shown.count < state.topLevel.count {
+        } else if !isFiltered, case let shown = DeskProjection.cappedTopLevel(board), shown.count < board.topLevel.count {
             let shownHandles = Set(shown.map(\.handle))
             let quietBefore = DeskClock.nowISO(Date().addingTimeInterval(-20 * 86_400))
-            let quiet = state.topLevel.filter {
+            let quiet = board.topLevel.filter {
                 !$0.status.isTerminal && !shownHandles.contains($0.handle)
-                    && DeskProjection.lastActive($0, in: state) < quietBefore
+                    && DeskProjection.lastActive($0, in: board) < quietBefore
             }.count
-            text += "\nshowing \(shown.count) of \(state.topLevel.count) top-level, most recently active first"
+            text += "\nshowing \(shown.count) of \(board.topLevel.count) top-level, most recently active first"
                 + (quiet > 0 ? " · \(quiet) quiet 20d+" : "")
                 + " — sort:\"stale\" to see them; or query / handle"
         }
@@ -256,6 +296,7 @@ extension SwiftToolDispatcher {
         // A query that finds exactly one item opens it too: no second read.
         if handle?.isEmpty == false || matches.count == 1 {
             for match in matches {
+                Self.latchDeskRecordPeers(match, in: state)
                 text += "\n\n" + DeskProjection.renderRecord(match, in: state)
             }
         }
@@ -277,8 +318,8 @@ extension SwiftToolDispatcher {
             }
         }
         let defaultProjectionIsBounded = !isFiltered && (
-            state.topLevel.count > DeskProjection.topLevelCap
-                || state.topLevel.filter { $0.status.isTerminal }.count > DeskProjection.doneCap
+            board.topLevel.count > DeskProjection.topLevelCap
+                || board.topLevel.filter { $0.status.isTerminal }.count > DeskProjection.doneCap
         )
         return .object([
             "status": .string("ok"),
@@ -289,6 +330,7 @@ extension SwiftToolDispatcher {
             "projectionIsBounded": .bool(defaultProjectionIsBounded),
             "matchCount": .int(Int64(rawMatches.count)),
             "matchesTruncated": .bool(rawMatches.count > matchCap),
+            "continuation": matches.count == 1 ? (matches.first?.continuation?.summaryJSON() ?? .null) : .null,
         ])
     }
 
@@ -414,8 +456,8 @@ extension SwiftToolDispatcher {
 
     // MARK: - desk_work_log
 
-    /// desk_work_log — append a work receipt note to a pursuit (Agent logging
-    /// progress from chat). Refuses a non-pursuit target. Reservation-backed work
+    /// desk_work_log — append a work receipt, reusing desk_note for ordinary
+    /// items. Reservation-backed work
     /// completion is Wave B's internal path (completeWorkSession), NOT a tool.
     func impl_desk_work_log(input: [String: JSONValue]) async throws -> JSONValue {
         let handle = try await resolveDeskHandle(input)
@@ -428,10 +470,7 @@ extension SwiftToolDispatcher {
             _ = try await store.appendWorkReceipt(handle, receipt: receipt)
             return await deskConfirm(store, handle: handle, prefix: "work logged")
         } catch DeskError.notAPursuit {
-            return .object([
-                "status": .string("refused"),
-                "reason": .string("desk_work_log is for self-pursuits (origin=agent, kind=project). For an ordinary Desk item, use desk_note with the same handle and put the receipt in text."),
-            ])
+            return try await impl_desk_note(input: ["handle": .string(handle), "text": .string(receipt)])
         } catch let e as DeskError {
             return .object([
                 "status": .string("refused"),
@@ -480,6 +519,11 @@ extension SwiftToolDispatcher {
         }
         let store = deskStore()
         // Closing an item with open parts: say the one call that does it.
+        if input["remaining_work"] != .null, let remaining = try deskMetadataString(input, "remaining_work") {
+            guard !status.isTerminal, !remaining.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let journal = DeskContinuationScope.current else { throw DeskContinuationError.unavailable }
+            try await journal.attach(handle: handle, remainingWork: remaining)
+        }
         if status.isTerminal {
             let state = try await store.liveState()
             let open = SwiftNativeDeskStore.descendants(of: handle, in: state).filter { !$0.status.isTerminal }
@@ -624,7 +668,15 @@ extension SwiftToolDispatcher {
             if let expectedUpdatedAt, !expectedUpdatedAt.isEmpty, root?.updatedAt != expectedUpdatedAt {
                 return refusedChanged
             }
-            for kid in SwiftNativeDeskStore.descendants(of: handle, in: state).reversed() where !kid.status.isTerminal {
+            let descendants = SwiftNativeDeskStore.descendants(of: handle, in: state).reversed().filter { !$0.status.isTerminal }
+            let session = Self.extractSessionId(from: input)
+            if !session.isEmpty, let by = try await store.hold([handle] + descendants.map(\.handle), session: session) {
+                return .object([
+                    "status": .string("refused"), "reason": .string("held_by"), "held_by": .string(by), "effects": .string("none"),
+                    "detail": .string("An item in this subtree is held by \(by), which is working it; nothing was closed. Leave it to that one, or pick it up there."),
+                ])
+            }
+            for kid in descendants {
                 do {
                     // A child keeps its own summary; only a bare one gets a pointer.
                     let own = kid.summary?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -875,8 +927,7 @@ extension SwiftToolDispatcher {
         // what already exists on the desk.
         var createdHandles: [String] = []
         var planLines: [String] = []
-        // Steps already open under a reused campaign keep their handle and
-        // wiring; batch positions still map to them.
+        // Reused steps keep their handles; finish their requested setup too.
         var reusedSteps: Set<Int> = []
         let openSteps = reusedParent
             ? try await store.liveState().children(of: parentHandle).filter { !$0.status.isTerminal } : []
@@ -909,7 +960,7 @@ extension SwiftToolDispatcher {
                 return await partial("creating child \(idx + 1) '\(spec.title)': \(error.localizedDescription)")
             }
         }
-        for (idx, spec) in specs.enumerated() where !reusedSteps.contains(idx) {
+        for (idx, spec) in specs.enumerated() {
             let tokens = spec.blockedOnCSV.split(separator: ",")
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
             if !tokens.isEmpty {

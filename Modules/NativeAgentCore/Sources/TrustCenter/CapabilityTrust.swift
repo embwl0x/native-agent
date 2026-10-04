@@ -404,14 +404,16 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
     private let catalogSourcesActor: SwiftNativeCatalogSources
     private let trustRootsActor: SwiftNativeCapabilityTrustRoots
     /// The MCP owner's server listing, handed in: TrustCenter imports no executor.
-    private let mcpServers: @Sendable () async -> [[String: JSONValue]]
+    private let mcpServers: @Sendable () async throws -> [[String: JSONValue]]
+    private let connectorActionStatuses: @Sendable () async throws -> [String: String]
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         personaRoot: URL? = nil,
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         clock: @escaping @Sendable () -> Date = { Date() },
-        mcpServers: @escaping @Sendable () async -> [[String: JSONValue]]
+        connectorActionStatuses: @escaping @Sendable () async throws -> [String: String],
+        mcpServers: @escaping @Sendable () async throws -> [[String: JSONValue]]
     ) {
         self.dataRoot = dataRoot
         self.personaRoot = personaRoot
@@ -424,6 +426,7 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
             dataRoot: dataRoot, persistence: persistence, clock: clock
         )
         self.mcpServers = mcpServers
+        self.connectorActionStatuses = connectorActionStatuses
     }
 
     /// Byte-for-byte port of the retired daemon capability_trust_network().
@@ -434,6 +437,7 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
             personaRoot: personaRoot,
             nowISO: nowISO,
             persistence: persistence,
+            connectorActionStatuses: connectorActionStatuses,
             mcpServers: mcpServers
         )
         let sliced = Array(allRecords.prefix(200))
@@ -487,6 +491,7 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
             personaRoot: personaRoot,
             nowISO: nowISO,
             persistence: persistence,
+            connectorActionStatuses: connectorActionStatuses,
             mcpServers: mcpServers
         )
         let match = records.first { rec in
@@ -551,7 +556,11 @@ private func decodeCatalogSource(_ dict: [String: JSONValue]) -> CapabilityCatal
 /// the Python side. The Python-backed impl stays available as the rollback
 /// when `capabilityTrust` is absent from `NATIVE_AGENT_SWIFT_SUBSYSTEMS`.
 public func makeCapabilityTrust(
-    mcpServers: @escaping @Sendable () async -> [[String: JSONValue]]
+    dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    connectorActionStatuses: @escaping @Sendable () async throws -> [String: String],
+    mcpServers: @escaping @Sendable () async throws -> [[String: JSONValue]]
 ) -> any CapabilityTrustProtocol {
-    return SwiftNativeCapabilityTrust(mcpServers: mcpServers)
+    return SwiftNativeCapabilityTrust(
+        dataRoot: dataRoot, connectorActionStatuses: connectorActionStatuses, mcpServers: mcpServers
+    )
 }

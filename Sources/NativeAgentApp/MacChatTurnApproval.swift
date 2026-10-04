@@ -134,7 +134,10 @@ enum MacChatTurnApprovalProjection {
             approvalId: chosen.candidate.row.id,
             toolName: displayAction(chosen.candidate.row),
             reason: nonEmpty(chosen.candidate.row.reason).map {
-                ApprovalActionText.reason($0, tool: chosen.candidate.row.action)
+                ToolActivityPresentation.approvalText(
+                    ApprovalActionText.reason($0, tool: chosen.candidate.row.action),
+                    tool: chosen.candidate.row.action
+                )
             },
             inputSummary: inputSummary(chosen.candidate.row),
             requester: NativeAgentChatApprovalFiler.requester(
@@ -154,13 +157,6 @@ enum MacChatTurnApprovalProjection {
         "to", "recipient", "recipients", "chat_id", "channel",
         "command", "cmd", "script", "url", "endpoint",
         "query", "pattern", "name", "title", "text", "message", "body",
-    ]
-
-    /// Keys whose VALUE is never shown. A preview is for deciding, not for
-    /// spilling a credential onto a card that sits in scrollback.
-    private static let secretKeyMarkers = [
-        "token", "secret", "password", "passwd", "api_key", "apikey",
-        "authorization", "auth", "credential", "private_key", "cookie",
     ]
 
     /// One short line describing the input, from the inbox row's own preview.
@@ -211,9 +207,9 @@ enum MacChatTurnApprovalProjection {
         return input
     }
 
+    /// Keys whose VALUE is never shown: one list with the phone and Telegram copies.
     private static func isSecretKey(_ key: String) -> Bool {
-        let lowered = key.lowercased()
-        return secretKeyMarkers.contains { lowered.contains($0) }
+        NativeAppSecretRedactor.isSecretArgName(key)
     }
 
     private static func scalarText(_ value: Any) -> String? {
@@ -296,7 +292,7 @@ enum MacChatTurnApprovalProjection {
     }
 
     private static func displayAction(_ row: ApprovalRecord) -> String {
-        nonEmpty(row.action) ?? nonEmpty(row.title) ?? "this action"
+        nonEmpty(row.action).map(ToolActivityPresentation.title) ?? nonEmpty(row.title) ?? "this action"
     }
 
     private static func nonEmpty(_ raw: String?) -> String? {

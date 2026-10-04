@@ -74,40 +74,62 @@ enum ChatComposerSupport {
         canAttach: @escaping @MainActor () -> Bool = { true },
         showToast: @escaping @MainActor (String) -> Void
     ) {
-        let ext = url.pathExtension.lowercased()
-        guard let attachmentInfo = resolveType(ext) else {
-            showToast("Unsupported file type: \(ext.isEmpty ? "(no extension)" : ext)")
-            return
-        }
-        if let attrs = try? url.resourceValues(forKeys: [.fileSizeKey]),
-           let size = attrs.fileSize, size > 10_000_000 {
-            showToast("File too large (limit: 10 MB): \(url.lastPathComponent)")
-            return
+        let kind: (type: String, mime: String)
+        switch attachmentKind(url, resolveType: resolveType) {
+        case .success(let resolved): kind = resolved
+        case .failure(let refusal): showToast(refusal.message); return
         }
         let destination = sessionId()
         Task {
-            let data = await Task.detached(priority: .utility) { () -> Data? in
-                try? readAttachmentFile(url)
-            }.value
-            guard let data else {
-                showToast("Couldn't read file: \(url.lastPathComponent)")
-                return
+            switch await readAttachment(url, kind: kind) {
+            case .failure(let refusal):
+                showToast(refusal.message)
+            case .success(let att):
+                guard canAttach() else { return }
+                appModel.chatPendingAttachments[destination, default: []].append(att)
+                showToast("Attached \(url.lastPathComponent)")
             }
-            guard data.count <= 10_000_000 else {
-                showToast("File too large (limit: 10 MB): \(url.lastPathComponent)")
-                return
-            }
-            guard canAttach() else { return }
-            let att = MultimodalAttachment(
-                type: attachmentInfo.type,
-                base64: data.base64EncodedString(),
-                mime: attachmentInfo.mime,
-                name: url.lastPathComponent,
-                byteSize: data.count
-            )
-            appModel.chatPendingAttachments[destination, default: []].append(att)
-            showToast("Attached \(url.lastPathComponent)")
         }
+    }
+
+    struct AttachmentRefusal: Error { let message: String }
+
+    /// Type and size, decided before any read. Shared with the agent's own
+    /// composer verbs so a file she attaches meets the same rules.
+    static func attachmentKind(
+        _ url: URL, resolveType: (String) -> (type: String, mime: String)?
+    ) -> Result<(type: String, mime: String), AttachmentRefusal> {
+        let ext = url.pathExtension.lowercased()
+        guard let attachmentInfo = resolveType(ext) else {
+            return .failure(.init(message: "Unsupported file type: \(ext.isEmpty ? "(no extension)" : ext)"))
+        }
+        if let attrs = try? url.resourceValues(forKeys: [.fileSizeKey]),
+           let size = attrs.fileSize, size > 10_000_000 {
+            return .failure(.init(message: "File too large (limit: 10 MB): \(url.lastPathComponent)"))
+        }
+        return .success(attachmentInfo)
+    }
+
+    /// The bounded read, off the main actor.
+    static func readAttachment(
+        _ url: URL, kind: (type: String, mime: String)
+    ) async -> Result<MultimodalAttachment, AttachmentRefusal> {
+        let data = await Task.detached(priority: .utility) { () -> Data? in
+            try? readAttachmentFile(url)
+        }.value
+        guard let data else {
+            return .failure(.init(message: "Couldn't read file: \(url.lastPathComponent)"))
+        }
+        guard data.count <= 10_000_000 else {
+            return .failure(.init(message: "File too large (limit: 10 MB): \(url.lastPathComponent)"))
+        }
+        return .success(MultimodalAttachment(
+            type: kind.type,
+            base64: data.base64EncodedString(),
+            mime: kind.mime,
+            name: url.lastPathComponent,
+            byteSize: data.count
+        ))
     }
 }
 

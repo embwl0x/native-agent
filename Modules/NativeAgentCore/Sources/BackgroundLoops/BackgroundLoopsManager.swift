@@ -377,6 +377,9 @@ private struct ManagedLoopRunner: LoopRunner {
     private func tickOutcome(
         ifDue isDue: (@Sendable () async -> Bool)?
     ) async -> LoopTickOutcome {
+        guard let accounting = LoopTickAccounting.current else {
+            return .failed(error: "Background work could not start because result tracking is unavailable.")
+        }
         guard let token = await gate.acquireOrJoin(startedAt: clock()) else {
             return .skipped(reason: LoopTickOutcome.coalescedSkipReason)
         }
@@ -402,8 +405,7 @@ private struct ManagedLoopRunner: LoopRunner {
                 // This return is nevertheless the first authoritative proof
                 // that the old effecting body is gone, so only now may a new
                 // execution acquire the registration.
-                await gate.finish(at: nil, token: token)
-                await onFinished()
+                await finishAfterRecording(at: nil, token: token, accounting: accounting)
             }
         }
         let result = await withTaskCancellationHandler {
@@ -424,8 +426,7 @@ private struct ManagedLoopRunner: LoopRunner {
             if !outcome.isHealthNeutralSkip {
                 PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: loopId)
             }
-            await gate.finish(at: clock(), token: token)
-            await onFinished()
+            await finishAfterRecording(at: clock(), token: token, accounting: accounting)
             return outcome
         case .cancelled:
             // The caller receives a bounded failure, but the gate deliberately
@@ -434,6 +435,16 @@ private struct ManagedLoopRunner: LoopRunner {
             // this quarantined execution.
             return .failed(error: "cancelled before tick completed")
         }
+    }
+
+    private func finishAfterRecording(
+        at date: Date?, token: UInt64, accounting: LoopTickAccounting
+    ) async {
+        let release: @Sendable () async -> Void = {
+            await gate.finish(at: date, token: token)
+            await onFinished()
+        }
+        await accounting.releaseAfterRecording(release)
     }
 }
 
@@ -690,6 +701,21 @@ public actor BackgroundLoopsManager {
         loopId: String,
         runner: any LoopRunner,
         automaticLifecycle: UInt64? = nil
+    ) async -> LoopTickOutcome {
+        let accounting = LoopTickAccounting()
+        let outcome = await LoopTickAccounting.$current.withValue(accounting) {
+            await executeAndRecordOutcome(
+                loopId: loopId, runner: runner, automaticLifecycle: automaticLifecycle
+            )
+        }
+        await accounting.didRecord()
+        return outcome
+    }
+
+    private func executeAndRecordOutcome(
+        loopId: String,
+        runner: any LoopRunner,
+        automaticLifecycle: UInt64?
     ) async -> LoopTickOutcome {
         do {
             let outcome = try await tickWithTimeoutOutcome(

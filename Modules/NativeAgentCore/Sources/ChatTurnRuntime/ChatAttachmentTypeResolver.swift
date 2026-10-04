@@ -17,8 +17,6 @@ public enum ChatAttachmentTypeResolver {
             return ("image", "image/gif")
         case "pdf":
             return ("file", "application/pdf")
-        case "docx":
-            return ("file", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         case "txt", "md":
             return ("file", "text/plain")
         default:

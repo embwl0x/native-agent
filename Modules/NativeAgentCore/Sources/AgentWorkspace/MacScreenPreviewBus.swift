@@ -207,12 +207,13 @@ public enum MacScreenPreviewFrame {
         from image: CGImage,
         marks: [JSONValue],
         origin: (x: Double, y: Double),
-        logicalSize: (w: Double, h: Double)
+        logicalSize: (w: Double, h: Double),
+        maximumWidth: Int = maxWidth
     ) -> CGImage? {
         guard image.width > 0, image.height > 0,
               logicalSize.w > 0, logicalSize.h > 0 else { return nil }
 
-        let scale = min(1, Double(maxWidth) / Double(image.width))
+        let scale = min(1, Double(maximumWidth) / Double(image.width))
         let targetW = max(1, Int((Double(image.width) * scale).rounded()))
         let targetH = max(1, Int((Double(image.height) * scale).rounded()))
 

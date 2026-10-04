@@ -169,7 +169,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                         let value = Self.trimmed(row["provenance"])
                         return value.isEmpty ? nil : value
                     }(),
-                    journalEntryIDs: Self.studioEntryIDs(row["studio_entry_ids"])
+                    journalEntryIDs: Array(Self.studioEntryIDs(row["studio_entry_ids"]).prefix(24))
                 ))
             }
             return result

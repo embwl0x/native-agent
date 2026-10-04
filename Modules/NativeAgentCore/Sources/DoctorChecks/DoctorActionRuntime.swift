@@ -97,7 +97,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             return true
         }
         defer { if ownsRepair { doctorRepairInFlight.withLock { $0 = false } } }
-        var checks = try await impl.runAll(repair: false, checkLLM: true)
+        var checks = try await impl.runAll(repair: false)
         checks += await liveDoctorCoverageReadings(probeSearch: true, includeCognition: true)
         var liveRepairs: [String: DoctorExecutableRepair] = [:]
         for check in checks where check.id.hasPrefix("live.") && DoctorSafeRepairPolicy.isAdverse(check.status)

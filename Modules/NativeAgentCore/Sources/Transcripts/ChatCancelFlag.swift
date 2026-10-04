@@ -22,9 +22,11 @@ public enum ChatCancelFlag {
     /// Registers `runId` as in flight on the session; pair with `finish`.
     public static func accept(dataRoot: URL, sessionId: String, runId: String) -> URL {
         let file = path(dataRoot: dataRoot, sessionId: sessionId)
+        let key = file.standardizedFileURL.path
         registry.withLock { runs in
-            runs.inFlight[file.standardizedFileURL.path, default: []].append(runId)
-            runs.latest[file.standardizedFileURL.path] = runId
+            runs.completed.removeAll { $0 == key }
+            runs.inFlight[key, default: []].append(runId)
+            runs.latest[key] = runId
         }
         guard var parts = URLComponents(url: file, resolvingAgainstBaseURL: false) else { return file }
         parts.fragment = runId
@@ -38,6 +40,12 @@ public enum ChatCancelFlag {
             guard var ids = runs.inFlight[key], let i = ids.firstIndex(of: runId) else { return }
             ids.remove(at: i)
             runs.inFlight[key] = ids.isEmpty ? nil : ids
+            if ids.isEmpty {
+                runs.completed.append(key)
+                if runs.completed.count > 256 {
+                    runs.latest.removeValue(forKey: runs.completed.removeFirst())
+                }
+            }
         }
     }
 
@@ -70,6 +78,8 @@ public enum ChatCancelFlag {
     private struct Runs {
         var inFlight: [String: [String]] = [:]
         var latest: [String: String] = [:]
+        // Keep up to 256 completed sessions for Stop; in-flight sessions stay retained.
+        var completed: [String] = []
     }
     private static let registry = Locked()
     private final class Locked: @unchecked Sendable {

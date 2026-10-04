@@ -11,6 +11,8 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case archiveRefusedNonTerminalChild(handle: String, childHandle: String)
     case archiveRefusedStanding(handle: String)
     case archiveRefusedNonTerminalSelf(handle: String, status: DeskStatus)
+    case archiveRefusedUnresolvedContinuation(handle: String)
+    case queueCreationRequiresQueuePath
     // Pursuit invariants (H2 / M7).
     case pursuitCapReached(openCount: Int)
     case pursuitFieldMissing(reason: String)
@@ -31,6 +33,7 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case blockedOnSelf(handle: String)
     case blockedOnCycle(handle: String, handles: [String])
     case deferUntilUnparseable(handle: String, value: String)
+    case notifyTriggerUnsupported(String)
     case liveActivityMetadataEmpty(field: String)
     case laneOfUnknown(handle: String, laneOf: String)
     case laneOfSelf(handle: String)
@@ -63,6 +66,10 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: cannot archive standing item \(h) (MVP)"
         case let .archiveRefusedNonTerminalSelf(handle, status):
             return "desk: cannot archive \(handle) — item is not terminal (status \(status.rawValue)); close it first"
+        case .archiveRefusedUnresolvedContinuation(let handle):
+            return "desk: cannot archive \(handle) — its continuation has unfinished steps; verify them through their domains first"
+        case .queueCreationRequiresQueuePath:
+            return "desk: use queue.add to add a step to my queue so its readiness and origin are preserved"
         case .pursuitCapReached(let openCount):
             return "desk: cap reached — \(openCount) open self-pursuits already (max 2); close or abandon one before opening or reopening another"
         case .pursuitFieldMissing(let reason):
@@ -94,6 +101,8 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: that edge would close a blocked-on cycle through \(handles.joined(separator: " → ")) — \(handle) would wait on itself"
         case let .deferUntilUnparseable(handle, value):
             return "desk: cannot defer \(handle) until '\(value)' — expected a yyyy-MM-dd day or a full ISO timestamp"
+        case .notifyTriggerUnsupported(let trigger):
+            return "desk: unsupported notification trigger '\(trigger)'; use state_change, blocked, done, or explicit (alone for a one-time announcement)"
         case .liveActivityMetadataEmpty(let field):
             return "desk: \(field) must be non-empty when supplied"
         case let .laneOfUnknown(handle, laneOf):
@@ -249,7 +258,13 @@ struct DeskCompactionBase: Sendable {
 func deskBaseRoundTripIsFaithful(decoded state: DeskState, onDisk: JSONValue) -> Bool {
     let encoded = state.toJSON()
     guard let restable = DeskState.fromJSON(encoded), restable.toJSON() == encoded else { return false }
-    return deskJSONShapeMatches(encoded, onDisk)
+    guard case .object(var original) = onDisk,
+          case .object(let encodedObject) = encoded else { return false }
+    if original["version"] == .int(1), original["workSlotsByDay"] == nil {
+        original["workSlotsByDay"] = encodedObject["workSlotsByDay"]
+        original["version"] = .int(2)
+    }
+    return deskJSONShapeMatches(encoded, .object(original))
 }
 
 /// Recursive shape equality: same object key sets, same array counts, same

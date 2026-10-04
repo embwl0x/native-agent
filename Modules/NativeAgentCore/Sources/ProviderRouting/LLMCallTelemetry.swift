@@ -87,53 +87,6 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
     public let stablePrefixFingerprintSHA256: String
     public let toolsFingerprintSHA256: String
     public let historyHeadFingerprintSHA256: String
-    /// Mid-conversation tool-change receipts (Anthropic structured lanes).
-    /// nil on every lane that does not run the tool-change plan, so those rows
-    /// decode exactly as before.
-    public let toolChanges: ToolChangeReceipts?
-
-    /// Sizes and one digest. `arrayFingerprintSHA256` hashes the `tools` ARRAY
-    /// alone — the thing that must not move turn to turn — never the offered
-    /// set, which is supposed to move.
-    public struct ToolChangeReceipts: Sendable, Equatable {
-        public let arrayFingerprintSHA256: String
-        public let offeredCount: Int
-        public let additionCount: Int
-        public let removalCount: Int
-        public let droppedUnknownCount: Int
-        /// The session declaration's re-pin counter. The array is pinned per
-        /// session, so this is the ONLY legitimate reason the array
-        /// fingerprint moved between two turns of one session.
-        public let declarationGeneration: Int
-
-        public init(
-            arrayFingerprintSHA256: String,
-            offeredCount: Int,
-            additionCount: Int,
-            removalCount: Int,
-            droppedUnknownCount: Int,
-            declarationGeneration: Int = 0
-        ) {
-            self.arrayFingerprintSHA256 = arrayFingerprintSHA256
-            self.offeredCount = offeredCount
-            self.additionCount = additionCount
-            self.removalCount = removalCount
-            self.droppedUnknownCount = droppedUnknownCount
-            self.declarationGeneration = declarationGeneration
-        }
-
-        public var payload: [String: JSONValue] {
-            [
-                "tools.arrayFingerprintSHA256": .string(arrayFingerprintSHA256),
-                "tools.offeredCount": .int(Int64(offeredCount)),
-                "tools.additionCount": .int(Int64(additionCount)),
-                "tools.removalCount": .int(Int64(removalCount)),
-                "tools.droppedUnknownCount": .int(Int64(droppedUnknownCount)),
-                "tools.declarationGeneration": .int(Int64(declarationGeneration)),
-            ]
-        }
-    }
-
     public init(
         shapeVersion: String,
         prefixFingerprintSHA256: String,
@@ -145,7 +98,6 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         windowSlid: Bool,
         messageCount: Int = 0,
         messageDigests: [String] = [],
-        toolChanges: ToolChangeReceipts? = nil,
         prefixMessageDigests: [String] = [],
         stablePrefixFingerprintSHA256: String = "",
         toolsFingerprintSHA256: String = "",
@@ -162,7 +114,6 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         self.windowSlid = windowSlid
         self.messageCount = messageCount
         self.messageDigests = messageDigests
-        self.toolChanges = toolChanges
         self.prefixMessageDigests = prefixMessageDigests
         self.headPreviews = headPreviews
         self.stablePrefixFingerprintSHA256 = stablePrefixFingerprintSHA256
@@ -193,9 +144,6 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         }
         if !historyHeadFingerprintSHA256.isEmpty {
             out["component.historyHeadSHA256"] = .string(historyHeadFingerprintSHA256)
-        }
-        if let toolChanges {
-            for (key, value) in toolChanges.payload { out[key] = value }
         }
         return out
     }
@@ -556,6 +504,18 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         private let persistence = SwiftNativePersistenceCore()
 
         func write(_ pending: SessionUsageReceiptWrite) async {
+            do {
+                try await persistence.withFileLock(pending.path) {
+                    await self.writeLocked(pending)
+                }
+            } catch {
+                FileHandle.standardError.write(
+                    Data("LLMCallTraceRecorder: session usage receipt lock failed: \(error)\n".utf8)
+                )
+            }
+        }
+
+        private func writeLocked(_ pending: SessionUsageReceiptWrite) async {
             let existing: JSONValue
             do {
                 existing = try await persistence.readJSON(pending.path, ifMissing: .object([:]))

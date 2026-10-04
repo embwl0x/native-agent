@@ -37,18 +37,9 @@ extension AnthropicOAuthDirectAdapter {
 
     // MARK: - cache_control body helpers (U1 step 3 + 2b/3b, 2026-06-10)
     //
-    // Anthropic prompt caching is a PREFIX match over system → messages
-    // (this route sends no tools array). System breakpoints (max 4 in all):
-    //   (a) the claudeCodeIdentity system block
-    //   (b) the END of the STABLE system mass:
-    //       - with a stable/dynamic split bound via
-    //         LLMCallContext.systemSegments (U1 2b/3b), the breakpoint sits
-    //         on the stable block (persona+pins) and the dynamic block
-    //         (recall+history) follows with NO breakpoint — so the per-turn
-    //         churn stops invalidating the persona prefix and stops paying
-    //         the 1.25x write premium uncached every turn;
-    //       - without segments, the caller-supplied sys string is ONE block
-    //         with the breakpoint (byte-identical to the pre-2b/3b shape).
+    // Anthropic prompt caching matches the system → messages prefix. A valid
+    // segment split puts one system breakpoint at the stable end, covering the
+    // identity too. Plain helper prompts retain their combined-system blocks.
     // Blocks below the model's minimum cacheable prefix silently don't
     // cache (no error) — verified via usage.cache_read_input_tokens.
 
@@ -119,8 +110,8 @@ extension AnthropicOAuthDirectAdapter {
     /// next turn is built on. Anchored on the current USER message, not on
     /// the system message and not on the current boundary: anchoring on
     /// either would let a within-turn round stamp THIS turn's own assistant
-    /// tool_use with the cross-turn 1h TTL. Unlike the v1 `count - 3`
-    /// arithmetic it stays correct however many messages the turn appended.
+    /// tool_use with the cross-turn 1h TTL. It stays correct however many
+    /// messages the turn appended.
     static func previousTurnBoundaryIndex(_ messages: [LLMMessage]) -> Int? {
         guard let userIndex = currentTurnUserIndex(messages) else { return nil }
         return messages[..<userIndex].lastIndex { $0.role == .assistant }
@@ -137,10 +128,9 @@ extension AnthropicOAuthDirectAdapter {
     /// the rule permits.
     ///
     /// Returns nil (plain 5m ephemeral, no `ttl` key on the wire) unless the
-    /// request is a v2 prefix turn carrying at least two completed turns.
+    /// request has a valid segmented prefix.
     static func requestLongTTL(
-        usesPrefixShape: Bool,
-        messages: [LLMMessage]
+        usesPrefixShape: Bool
     ) -> String? {
         // User 2026-09-29: the stable prefix lives an hour from the first turn,
         // so a reply after a pause still reads it from cache.
@@ -150,8 +140,7 @@ extension AnthropicOAuthDirectAdapter {
 
     /// Mark the current append-only request boundary and, when a previous
     /// boundary index is supplied, the preceding one. Both indices are
-    /// explicit: v1 passes `count - 3` / `count - 1`; v2 passes
-    /// `previousTurnBoundaryIndex` / `currentBoundaryIndex`. TTLs are
+    /// explicit, using the seeded turn boundary where available. TTLs are
     /// explicit too — the previous boundary is the CROSS-TURN read (1h), the
     /// current boundary is re-read within this turn's own loop (5m — `nil`,
     /// i.e. no `ttl` key on the wire, byte-identical to the legacy marker).
@@ -233,8 +222,7 @@ extension AnthropicOAuthDirectAdapter {
     /// string (pre-U1 shape was already [identity][sys]), so it carries no
     /// join contract with the blocks that follow it.
     ///
-    /// V2 PREFIX SHAPE (`ConversationPrefixShape.v2Prefix`, production default,
-    /// engaged only when the segments are present and reassemble):
+    /// Segmented prefix shape (only when segments are present and reassemble):
     ///   [identity — NO cache_control] [stable] [stableSuffix?] [dynamic?]
     /// The identity block is a strict PREFIX of the stable mass, so a
     /// breakpoint at the end of the stable mass already caches it; its own
@@ -299,29 +287,11 @@ extension AnthropicOAuthDirectAdapter {
             }
             return blocks
         }
-        if let seg = segments,
-           !seg.stable.isEmpty, !seg.dynamic.isEmpty, seg.stableSuffix.isEmpty,
-           seg.reassembles(into: sys)
-        {
-            // Stable block carries the "\n\n" separator as its suffix so
-            // stable-block-text + dynamic-block-text == `sys` byte-for-byte.
-            blocks.append([
-                "type": "text",
-                "text": seg.stable + "\n\n",
-                "cache_control": ephemeralCacheControl,
-            ])
-            // Dynamic tail: NO breakpoint — recall+history churn per turn.
-            blocks.append([
-                "type": "text",
-                "text": seg.dynamic,
-            ])
-        } else {
-            blocks.append([
-                "type": "text",
-                "text": sys,
-                "cache_control": ephemeralCacheControl,
-            ])
-        }
+        blocks.append([
+            "type": "text",
+            "text": sys,
+            "cache_control": ephemeralCacheControl,
+        ])
         return blocks
     }
 
@@ -361,32 +331,13 @@ extension AnthropicOAuthDirectAdapter {
         }
     }
 
-    /// Which prefix shape this REQUEST actually emits.
-    ///
-    /// READS THE BOUND TASK-LOCAL ONLY — never `ConversationPrefixShape
-    /// .effective`. The shape is decided ONCE per turn, at the history
-    /// builder's seeding boundary, and bound around the whole call: a turn
-    /// that seeded no replayed history seeds the v1 shape and binds
-    /// `.v1Legacy`, and the adapter must then emit the v1 bytes exactly.
-    /// If the adapter re-derived the shape from `.effective` it would answer
-    /// `.v2Prefix` on that turn — dropping the identity breakpoint and adding
-    /// a current-message breakpoint to a request the builder shaped as v1.
-    /// Unbound (every non-chat caller: dream, REM, executions, tests) →
-    /// `.v1Legacy`, i.e. byte-identical to the pre-v2 wire.
-    ///
-    /// v2 additionally needs segments that
-    /// make it representable: a non-empty stable segment that reassembles
-    /// byte-for-byte into the combined `system` string. Same safety guard as
-    /// v1 — a stale or caller-mutated binding falls back to the legacy arm
-    /// rather than changing model-visible content — but it tolerates an EMPTY
-    /// `dynamic` (the cross-turn shape legitimately has none once history has
-    /// moved into the message array).
+    /// Segmentation is safe only when it preserves the exact system string.
+    /// Plain helper prompts keep their combined-system encoding.
     static func usesV2PrefixShape(
         _ system: String?,
         segments: SystemPromptSegments?
     ) -> Bool {
-        guard ConversationPrefixShape.override == .v2Prefix,
-              let sys = system,
+        guard let sys = system,
               !sys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let seg = segments,
               !seg.stable.isEmpty,
@@ -462,7 +413,7 @@ extension AnthropicOAuthDirectAdapter {
             (usesPrefixShape || MessagesCacheHint.withinTurnReuse)
             && trailingEligible
         let longTTL = Self.requestLongTTL(
-            usesPrefixShape: usesPrefixShape, messages: messages
+            usesPrefixShape: usesPrefixShape
         )
         let systemBlocks = Self.makeSystemBlocks(system, longTTL: longTTL)
 
@@ -521,15 +472,6 @@ extension AnthropicOAuthDirectAdapter {
             anthropicMessages.append(entry)
         }
         if useConversationCache {
-            // v2: the previous boundary is the last assistant message before
-            // the volatile system message (funded by the identity block's
-            // freed slot) and reads at the request's long TTL. v1: the historical
-            // `count - 3` arithmetic, plain 5m, byte-identical.
-            // The CURRENT marker index is the same rule on both arms: the
-            // newest NON-system message. On v1 that is `count - 1` (v1 never
-            // carries a mid-conversation system message), so the legacy body
-            // stays byte-identical; the rule simply also holds the
-            // never-mark-a-system-message invariant if one ever appears.
             let currentIndex = boundaryIndex
             let previousBoundaryIndex: Int?
             let previousBoundaryTTL: String?
@@ -543,7 +485,8 @@ extension AnthropicOAuthDirectAdapter {
                 // Budget: stable-end + previous + current = 3.
                 // Nothing else can ship a marker on v2, so this is closed.
             } else {
-                // The text lane has one free fourth slot.
+                // Unsegmented within-turn helper calls retain their existing
+                // preceding-round marker; they have no seeded turn boundary.
                 let retain = MessagesCacheHint.withinTurnReuse
                 previousBoundaryIndex =
                     (retain && anthropicMessages.count >= 3)

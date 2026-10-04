@@ -262,7 +262,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private var cancellationDrainInFlight = false
     private var pairingHandler: (@Sendable (Data) async -> Bool)?
     private var statusWrites: [String: Task<Void, Error>] = [:]
-    private var statusHandlers: [String: @Sendable (String) async -> Bool] = [:]
+    private var statusHandlers: [String: @Sendable (String, Date?) async -> Bool] = [:]
     private var lastPullDate: Date?
     private var lastPullCursorPersistenceAt: Date?
     // CK-3c: transport-level drain serialization (guarded by `lock`). Concurrent
@@ -687,7 +687,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return dispatched
     }
 
-    /// Mac-only admission; the bridge authenticates and requires an exact run.
+    /// Mac-only admission; the bridge authenticates run-scoped Stops and handoffs.
     /// Ordinary chat delivery and its terminal receipt retain their original owner.
     public func setCancellationAdmission(_ admission: @escaping @Sendable (BridgeMessage) async -> Bool) {
         lock.lock(); defer { lock.unlock() }
@@ -1208,6 +1208,12 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// its place in the drain and is redelivered — the same claim/commit split
     /// the pairing lane has always used.
     public func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async {
+        await observeStatus(key: key, onApply: { value, _ in
+            await onApply(value)
+        })
+    }
+
+    public func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async {
         guard configured else {
             NSLog("[ck-device] observeStatus: CloudKit entitlement absent — not subscribing (notConfigured).")
             return
@@ -1281,7 +1287,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             // snapshot generation the phone then failed to store was marked seen
             // and never redelivered.
             guard statusIsNewer(key: key, hit.modDate) else { continue }
-            guard await handler(hit.value) else { continue }
+            guard await handler(hit.value, hit.modDate) else { continue }
             commitStatusDate(key: key, hit.modDate)
             dispatched += 1
             NADeviceSyncRecoveryBudget.didApplyData?()
@@ -1753,7 +1759,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         lock.lock(); pairingHandler = h; lock.unlock()
     }
 
-    private func setStatusHandler(key: String, _ h: @escaping @Sendable (String) async -> Bool) {
+    private func setStatusHandler(key: String, _ h: @escaping @Sendable (String, Date?) async -> Bool) {
         lock.lock(); statusHandlers[key] = h; lock.unlock()
     }
 
@@ -1764,7 +1770,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     /// Snapshot copy of the status handlers so we never hold the lock across the
     /// awaits in drainStatus (matches the never-lock-across-await rule).
-    private func loadStatusHandlers() -> [String: @Sendable (String) async -> Bool] {
+    private func loadStatusHandlers() -> [String: @Sendable (String, Date?) async -> Bool] {
         lock.lock(); defer { lock.unlock() }
         return statusHandlers
     }

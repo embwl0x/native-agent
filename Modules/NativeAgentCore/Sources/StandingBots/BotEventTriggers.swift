@@ -77,12 +77,15 @@ public struct BotIncomingEvent: Sendable, Equatable {
     public let target: String
     public let summary: String
     public let detail: String
+    public let provenance: BotEventProvenance
 
-    public init(source: BotEventSource, target: String, summary: String, detail: String) {
+    public init(source: BotEventSource, target: String, summary: String, detail: String,
+                verifiedUserID: String? = nil) {
         self.source = source
         self.target = target
         self.summary = summary
         self.detail = detail
+        self.provenance = BotEventProvenance(source: source, verifiedChatID: target, verifiedUserID: verifiedUserID)
     }
 }
 
@@ -184,7 +187,8 @@ public struct BotEventRouter: Sendable {
             }
             let context = Self.context(event)
             do {
-                let receipt = try queue.enqueue(bot: bot.id, context: context, origin: .event)
+                let receipt = try queue.enqueue(bot: bot.id, context: context, origin: .event,
+                                                provenance: event.provenance)
                 try? store.record(BotEventRecord(source: event.source, target: event.target,
                     summary: event.summary, outcome: receipt.accepted ? .queued : .notRun,
                     detail: receipt.accepted ? nil : receipt.reason), bot: bot.id)

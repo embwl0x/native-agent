@@ -1,5 +1,7 @@
 import Foundation
+import ProviderRouting
 import ApprovalInbox
+import Desk
 import MemoryV2
 import NativeAgentShared
 import NotificationInbox
@@ -48,6 +50,9 @@ public protocol DeviceSyncHost: Sendable {
     func agentThreadAction(action: String, payload: [String: String]) async throws -> [String: String]
     // Snapshot reads.
     func getWorkshopExecutions() async throws -> DeviceSyncSnapshotRows
+    /// One Desk read per pass: the overview and the board it was built from
+    /// (nil items when the Desk itself could not be read).
+    func workOverview() async -> (overview: WorkOverview, deskItems: [DeskItem]?)
     func getChatSessions() async throws -> [NativeAgentShared.ChatSession]
     func getChatMessages(sessionId: String) async throws -> [any DeviceSyncTranscriptMessage & Sendable]
     func getHealth() async throws -> RuntimeHealth
@@ -59,7 +64,7 @@ public protocol DeviceSyncHost: Sendable {
     func getConnectors() async throws -> DeviceSyncSnapshotRows
     func mobileToolCatalog() async throws -> [MobileToolCatalogRecord]
     func providers() async throws -> DeviceSyncSnapshotRows
-    func providerCatalogProviders() async throws -> [NAProviderCatalogProvider]
+    func providerCatalogSnapshot() async throws -> (providers: [NAProviderCatalogProvider], routing: ProviderRoutingSnapshot)
     func trustSnapshotData() async throws -> Data
     func telegramSnapshot() async throws -> MobileTelegramSnapshot
     func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot
@@ -98,7 +103,6 @@ public protocol DeviceSyncHost: Sendable {
     func configureSurfaceSelection(surface: String, providerID: String, model: String, reasoningEffort: String, serviceTier: String?) async throws
     /// The Mac's own pinned chats, in order, and their one mutation seam.
     @MainActor func pinnedChatSessionIDs() -> [String]
-    @MainActor func currentChatAnchor() -> ConversationAnchorPin?
     @MainActor func savePinnedChatSessionIDs(_ ids: [String]) throws
     /// A phone's `mac_control` action, through the app's Mac control route.
     func remoteMacControl(payload: [String: String]) async throws -> [String: String]
@@ -106,4 +110,6 @@ public protocol DeviceSyncHost: Sendable {
     /// The needs-User knock, through the attention router. Throws when it
     /// reached no channel, so the edge is retried.
     func knockNeedsUser(title: String, body: String, userInfo: [String: String]) async throws
+    /// Retry persisted result delivery independently of turn execution.
+    func retryRequestedResults() async
 }

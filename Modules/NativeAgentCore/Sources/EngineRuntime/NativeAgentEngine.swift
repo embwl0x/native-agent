@@ -31,7 +31,6 @@ import WorkshopExecution
 /// TrustCenter, and the per-turn gated dispatcher.
 public final class NativeAgentEngine: Sendable {
     public let dataRoot: URL
-    public let activeToolsStore: ActiveToolsStore
     public let ports: NativeAgentEnginePorts
     public let hasBody: Bool
     /// The resident mind: cognitive events and capsule, provider lifecycle,
@@ -84,19 +83,18 @@ public final class NativeAgentEngine: Sendable {
 
     public init(
         dataRoot: URL,
-        activeToolsStore: ActiveToolsStore? = nil,
         ports: NativeAgentEnginePorts,
         hasBody: Bool = true
     ) {
         self.dataRoot = dataRoot
-        self.activeToolsStore = activeToolsStore ?? ActiveToolsStore(dataRoot: dataRoot)
         self.ports = ports
         self.hasBody = hasBody
+        PeerTrust.install(dataRoot: dataRoot)
         self.memory = MemoryFacade(dataRoot: dataRoot)
         self.approvals = ApprovalsFacade(dataRoot: dataRoot)
         self.inbox = InboxFacade(dataRoot: dataRoot)
         self.chrome = ChromeControlRuntime()
-        self.trust = TrustFacade(dataRoot: dataRoot)
+        self.trust = TrustFacade(dataRoot: dataRoot, connectorActionStatuses: ports.connectorActionStatuses)
         self.providers = ProvidersFacade(dataRoot: dataRoot)
         self.telegram = TelegramFacade(dataRoot: dataRoot)
         self.tools = ToolsFacade(dataRoot: dataRoot, ports: ports)
@@ -154,7 +152,6 @@ public final class NativeAgentEngine: Sendable {
         includeEvolutionBridge: Bool = true,
         denyExternalMcp: Bool = false,
         enforceAppAutonomy: Bool = true,
-        enforceLazyToolLoading: Bool? = nil,
         swarmApprovalFiler: (any ApprovalFiler)? = nil,
         innerTools: (any ToolDispatchClient)? = nil
     ) -> any ToolDispatchClient {
@@ -173,9 +170,7 @@ public final class NativeAgentEngine: Sendable {
         // interception, SecurityCenter, or the bridge chain's wrapper order.
         let inner: any ToolDispatchClient = innerTools ?? SwiftToolDispatcher(
             dataRoot: dataRoot,
-            activeToolsStore: activeToolsStore,
             allowProcessGlobalTools: hasBody,
-            enforceLazyToolLoading: enforceLazyToolLoading,
             providerLifecycleObserver: cognition,
             swarmApprovalFiler: swarmApprovalFiler,
             // The 5 Phase-1 Mac integration chat tools reach their app-side
@@ -197,7 +192,6 @@ public final class NativeAgentEngine: Sendable {
             let contextFlow = self.contextFlow
             appTools = AppChatToolDispatcher(
                 inner: inner,
-                activeToolsStore: activeToolsStore,
                 securityCenter: securityCenter,
                 enforceAutonomySecurity: enforceAppAutonomy,
                 appTools: appToolExecutor,
@@ -260,7 +254,6 @@ public final class NativeAgentEngine: Sendable {
         } else {
             appTools = AppChatToolDispatcher(
                 inner: inner,
-                activeToolsStore: activeToolsStore,
                 securityCenter: securityCenter,
                 enforceAutonomySecurity: enforceAppAutonomy,
                 includeAppOwnedTools: false,
@@ -282,7 +275,8 @@ public final class NativeAgentEngine: Sendable {
     }
 
     /// The raw bridge tool RPC: the same app tool chain chat uses, inside the
-    /// bridge's conservative read-only/autonomy envelope.
+    /// bridge's conservative read-only/autonomy envelope, with ordinary
+    /// nonblocking approval filing when the caller supplies a filer.
     /// `ClaudeBridgeDenyDispatcher` intentionally stays outermost: external MCP
     /// names are rejected before they can probe TrustCenter or the inner catalog.
     public func bridgeToolDispatchClient(
@@ -315,7 +309,8 @@ public final class NativeAgentEngine: Sendable {
         { [self] bot, message in
             let client = chatClient(
                 tools: toolDispatchClient(denyExternalMcp: false),
-                approvalFiler: NativeAgentChatApprovalFiler(dataRoot: dataRoot))
+                approvalFiler: NativeAgentChatApprovalFiler(dataRoot: dataRoot),
+                continuationCapabilityProfile: .mac)
             return try await StandingBotContinuity.session(client: client, dataRoot: dataRoot)(bot, message)
         }
     }
@@ -330,7 +325,8 @@ public final class NativeAgentEngine: Sendable {
         tools: any ToolDispatchClient,
         approvalFiler: (any ApprovalFiler)? = nil,
         toolLoopMaxIterations: Int? = nil,
-        turnWallClockSeconds: TimeInterval? = nil
+        turnWallClockSeconds: TimeInterval? = nil,
+        continuationCapabilityProfile: NativeAgentAppChatSurfaceProfile? = nil
     ) -> SwiftNativeChatOrchestrationClient {
         let contextFlow = hasBody ? self.contextFlow : nil
         return makeChatOrchestrationClient(
@@ -338,13 +334,14 @@ public final class NativeAgentEngine: Sendable {
             dataRoot: dataRoot,
             toolLoopMaxIterations: toolLoopMaxIterations,
             turnWallClockSeconds: turnWallClockSeconds,
+            continuationCapabilityProfile: continuationCapabilityProfile?.rawValue,
             approvalFiler: approvalFiler,
             cognitiveObserver: cognition,
             cognitiveContextProvider: cognition,
             providerLifecycleObserver: cognition,
             contextFlow: contextFlow,
-            memoryAtomTranslator: contextFlow.map { _ in { @Sendable recordID in
-                NativeContextFlowRuntime.memoryRecordAtomID(forRecordID: recordID)
+            memoryAtomTranslator: contextFlow.map { runtime in { @Sendable recordID in
+                runtime.memoryRecordAtomID(forRecordID: recordID)
             } }
         )
     }
@@ -379,7 +376,8 @@ public final class NativeAgentEngine: Sendable {
             tools: tools,
             approvalFiler: resolvedApprovalFiler,
             toolLoopMaxIterations: profile.toolLoopMaxIterations,
-            turnWallClockSeconds: profile.turnWallClockSeconds
+            turnWallClockSeconds: profile.turnWallClockSeconds,
+            continuationCapabilityProfile: profile
         )
     }
 }
@@ -403,5 +401,8 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
     }
     func bridgeToolDispatchClient(fileAccess: String, verifiedSessionId: String?) -> any ToolDispatchClient {
         engine.bridgeToolDispatchClient(fileAccess: fileAccess, verifiedSessionId: verifiedSessionId)
+    }
+    func deliverReach(reply: String, itemID: String, turnID: String) async {
+        await engine.cognition?.deliverReach(reply: reply, itemID: itemID, turnID: turnID, chat: bridgeChatClient())
     }
 }

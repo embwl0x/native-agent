@@ -3,7 +3,9 @@ import ApprovalInbox
 import ChatOrchestration
 import MacControl
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
+import Privacy
 import TurnTrace
 import TelegramBot
 import TrustCenter
@@ -35,16 +37,29 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     private let promptSender: PromptSender
     private let approvalResolver: ApprovalResolver
 
+    /// A plain message with its own keyboard (a mirrored inline card).
+    public typealias CardSender = @Sendable (
+        _ token: String, _ destination: TelegramDestination, _ text: String, _ replyMarkup: JSONValue
+    ) async throws -> Void
+    private let cardSender: CardSender
+
     public init(
         dataRoot: URL,
         token: String,
         promptSender: @escaping PromptSender,
-        approvalResolver: @escaping ApprovalResolver
+        approvalResolver: @escaping ApprovalResolver,
+        cardSender: @escaping CardSender = TelegramPollLoop.defaultSendMessageWithReplyMarkup
     ) {
         self.dataRoot = dataRoot
         self.token = token
         self.promptSender = promptSender
         self.approvalResolver = approvalResolver
+        self.cardSender = cardSender
+    }
+
+    /// Send a mirrored inline card to User's DM (`ApprovalChatCards`).
+    public func sendChatCard(text: String, chatId: Int, markup: JSONValue) async throws {
+        try await cardSender(token, TelegramDestination(chatId: chatId, threadId: nil), text, markup)
     }
 
     public func fileApprovalRequest(
@@ -104,6 +119,9 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         if toolName == "agent_message", AgentConversationApproval.exactProtocol {
             request["agentExactProtocol"] = .bool(true)
         }
+        // Wave 2 #8: who steered this turn rides the card to its follow-up.
+        request["peer"] = PeerDataTaint.carriedRecord(peerBridge: false, peerID: userId)
+        request["fileAccess"] = ChatToolSessionContext.fileAccess.map(JSONValue.string) ?? .null
         let metadata: JSONValue = .object(request)
         // Reserve the complete request before the first suspension, including
         // inbox creation. Every duplicate awaits the same delivery or failure.
@@ -162,6 +180,9 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
             && left["surface"] == right["surface"]
             && left["input"] == right["input"]
             && left["agentExactProtocol"] == right["agentExactProtocol"]
+            && left["peer"] == right["peer"]
+            // A card filed with other hands is another request (an old card has none).
+            && left["fileAccess"] == right["fileAccess"]
             && leftTelegram["chatId"] == rightTelegram["chatId"]
             && leftTelegram["threadId"] == rightTelegram["threadId"]
             && leftTelegram["sessionId"] == rightTelegram["sessionId"]
@@ -253,8 +274,34 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         chatId: Int,
         fromUserId: Int?
     ) async throws -> TelegramApprovalResolution {
+        try await resolveTelegramApproval(id: id, decision: decision, choice: nil, chatId: chatId, fromUserId: fromUserId)
+    }
+
+    public func resolveTelegramApproval(
+        id: String,
+        decision: TelegramApprovalDecision,
+        choice: Int?,
+        chatId: Int,
+        fromUserId: Int?
+    ) async throws -> TelegramApprovalResolution {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let pending = try await inbox.get(id)
+        let pending: ApprovalRecord
+        do {
+            pending = try await inbox.get(id)
+        } catch ApprovalInboxError.notFound {
+            // Not an approval: a mirrored inline card's button, answered on its original.
+            guard let answer = try await ApprovalChatCards.answerInteractionFromTelegram(
+                id: id, choice: choice, decline: decision == .denied,
+                chatId: chatId, fromUserId: fromUserId, dataRoot: dataRoot) else {
+                throw ApprovalInboxError.notFound(id)
+            }
+            return TelegramApprovalResolution(acknowledgement: answer)
+        }
+        // A late tap on a card answered elsewhere (Mac, phone, Inbox) is a
+        // harmless no-op that says so — once the chat is proven to be its own.
+        if pending.status != "pending", Self.boundChat(pending) == String(chatId) {
+            return TelegramApprovalResolution(acknowledgement: "Already answered — nothing changed.")
+        }
         try validateTelegramDecision(record: pending, chatId: chatId)
         guard let fromUserId else {
             throw TelegramApprovalError.missingUserIdentity
@@ -277,6 +324,12 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
             .telegram(chatID: String(chatId), userID: String(fromUserId))
         )
 
+        // The card User's DM got for an approval raised elsewhere: the shared
+        // resolver runs whatever follows; this chat only hears the decision.
+        if Self.telegramChatId(pending.payload) == nil {
+            return TelegramApprovalResolution(acknowledgement: decision == .approved
+                ? "Approved \(pending.action)." : "Denied \(pending.action) — nothing was done.")
+        }
         let resolved = (try? await inbox.get(id)) ?? pending
         // 2026-09-06: the session the interrupted turn ran in, off the record
         // itself. Delivering the continuation against the chat's CURRENT
@@ -387,10 +440,25 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         guard record.remoteResolvable, !record.localOnly else {
             throw TelegramApprovalError.notRemoteResolvable
         }
-        guard let storedChatId = Self.telegramChatId(record.payload),
-              storedChatId == String(chatId) else {
+        guard Self.boundChat(record) == String(chatId) else {
             throw TelegramApprovalError.chatMismatch
         }
+    }
+
+    /// The Telegram chat an approval answers to: the one its turn ran in, or
+    /// the DM its chat card was posted into (`ApprovalChatCards`).
+    private static func boundChat(_ record: ApprovalRecord) -> String? {
+        if let stored = telegramChatId(record.payload) { return stored }
+        guard case .object(let card)? = record.chatCard, case .string(let chat)? = card["telegramChatId"] else { return nil }
+        return chat
+    }
+
+    /// Post the Approve/Deny prompt for an approval raised outside this chat
+    /// into User's DM. Once per approval in this process.
+    public func promptChatCard(_ approval: ApprovalRecord, chatId: Int, payload: JSONValue) async throws {
+        guard !promptedApprovalIDs.contains(approval.id) else { return }
+        try await promptSender(token, chatId, approval, approval.action, payload)
+        promptedApprovalIDs.insert(approval.id)
     }
 
     /// 2026-09-06: the chat session recorded on the approval, in the same two
@@ -458,7 +526,8 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     }
 
     private static func preview(_ value: JSONValue) -> String {
-        let raw = (try? value.serialize(pretty: false)) ?? String(describing: value)
+        let redacted = NativeAppSecretRedactor.redactArguments(value).mapStrings(TurnSecretRedactor.redactText)
+        let raw = (try? redacted.serialize(pretty: false)) ?? String(describing: redacted)
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count > 1400 else { return trimmed }
         return String(trimmed.prefix(1400)) + "..."
@@ -469,10 +538,13 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         toolName: String,
         payload: JSONValue
     ) -> String {
-        """
-        Approval required: \(toolName)
+        // A card raised elsewhere keeps its own heading: who asked, or what for.
+        let heading = approval.title.isEmpty || approval.title == "Approve \(toolName)"
+            ? "Approval required: \(ToolActivityPresentation.title(toolName))" : approval.title
+        return """
+        \(TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(heading)))
         ID: \(approval.id)
-        Reason: \(approval.reason)
+        Reason: \(TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(ToolActivityPresentation.approvalText(approval.reason, tool: toolName))))
 
         \(Self.preview(payload))
 
@@ -488,6 +560,13 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         payload: JSONValue,
         send: @Sendable (String, TelegramDestination, String, JSONValue) async throws -> Void
     ) async throws {
+        // A script install is decided where the whole script shows.
+        if approval.action == SwiftNativeApprovalInbox.skillScriptInstallAction {
+            try await send(token, TelegramDestination(chatId: chatId, threadId: nil),
+                           "\(TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(approval.title))) Review and approve it on the Mac or phone, where the whole script shows.",
+                           .object(["inline_keyboard": .array([])]))
+            return
+        }
         let text = approvalPromptText(approval: approval, toolName: toolName, payload: payload)
         let replyMarkup: JSONValue = .object([
             "inline_keyboard": .array([

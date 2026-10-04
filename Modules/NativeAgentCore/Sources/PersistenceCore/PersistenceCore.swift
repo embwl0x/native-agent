@@ -643,6 +643,11 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // DURABLE happens below, BEFORE we return — never in a defer.
         handedOff = true
         try flushAndClose(fd: fd, path: path, durable: durable, syscalls: syscalls)
+        if durable {
+            // Also persist the entry if this append created the file, including
+            // a retry after an earlier append failed to sync the directory.
+            try syncDirectory(path.deletingLastPathComponent())
+        }
     }
 
     /// The three syscalls the durability tail depends on, behind a seam so a
@@ -837,6 +842,12 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // barrier a power loss may forget the new directory entry even though
         // the file contents reached storage. Callers receive an error on an
         // uncertain commit and can re-read the canonical path before retrying.
+        try syncDirectory(dir, fullFlush: fullFlush)
+        atomicWriteDurabilityObserver?(.parentDirectorySynced)
+    }
+
+    /// Persist directory-entry changes before a transaction advances.
+    public static func syncDirectory(_ dir: URL, fullFlush: Bool = true) throws {
         let directoryFD = open(dir.path, O_RDONLY)
         if directoryFD < 0 {
             throw PersistenceCoreError.ioFailure(
@@ -851,7 +862,6 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
                 "fsync(parent directory) failed: \(String(cString: strerror(errno)))"
             )
         }
-        atomicWriteDurabilityObserver?(.parentDirectorySynced)
     }
 }
 

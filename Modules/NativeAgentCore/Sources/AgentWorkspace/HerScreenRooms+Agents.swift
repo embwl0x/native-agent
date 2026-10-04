@@ -71,8 +71,8 @@ extension HerScreen {
             let started = (job.startedAt ?? job.claimedAt ?? job.createdAt).flatMap(date)
             return (job.stalled ? "✗ stalled" : "⟳ running") + (started.map { " " + age(now.timeIntervalSince($0)) } ?? "")
         }
-        let failed = job.executionError != nil || ["failed", "error", "interrupted"].contains((job.runStatus ?? job.status ?? "").lowercased())
-        return (failed ? "✗ failed " : "✓ done ") + age(now.timeIntervalSince(done))
+        let failed = job.executionError != nil || ["failed", "error", "interrupted", "failed_hung", "stalled", "spawn_failed", "timed_out", "timeout", "cancelled", "canceled"].contains((job.runStatus ?? job.status ?? "").lowercased())
+        return (job.stalled ? "✗ stalled " : failed ? "✗ failed " : "✓ done ") + age(now.timeIntervalSince(done))
             + (job.deliveryOutcome == "lost" ? " · reply lost" : job.deliveryOutcome == "unknown" ? " · delivery unconfirmed" : "")
     }
 
@@ -84,12 +84,13 @@ extension HerScreen {
     /// its state. `job.N` opens one; the lane's own room holds the talk.
     static func delegationsRoom(dataRoot: URL, now: Date = Date()) -> String {
         let list = jobs(now: now)
-        // Numbered in the order shown, newest first (the desk walk read 13-15 then 1-9).
-        let numbers = Dictionary(list.enumerated().map { ($0.element.id, $0.offset + 1) }, uniquingKeysWith: { a, _ in a })
-        withNames(dataRoot) { book in book.numbers["job"] = numbers; book.next["job"] = list.count + 1 }
-        let lines: [String] = list.map { job in
-                let n = numbers[job.id] ?? 0
+        let lines: [String] = withNames(dataRoot) { book in
+            list.map { job in
+                let n = book.number("job", id: job.id) {
+                    Set(DelegationStatusProjector().recentJobs(now: now, limit: DelegationStatusProjector.maxLimit).map(\.id))
+                }
                 return pad("job.\(n)", 8) + pad(job.agent, 9) + clip(jobTitle(job), 44) + " · " + jobState(job, now: now)
+            }
         }
         let open = list.filter { $0.completedAt == nil }.count, stalled = list.filter(\.stalled).count
         return screen(["DELEGATIONS", "\(open) open"] + (stalled > 0 ? ["\(stalled) stalled"] : []) + ["\(list.count) newest"],
@@ -124,6 +125,7 @@ extension HerScreen {
             ?? DelegationStatusProjector().recentJobs(now: now, limit: DelegationStatusProjector.maxLimit).first(where: { $0.id == id }) else { return nil }
         let asked = nonEmpty(job.requestTextHead).map { plainLines($0).prefix(3).map { clip($0, 100) } } ?? [clip(jobTitle(job), 100)]
         let replyText = nonEmpty(job.agentReplyText) ?? nonEmpty(job.agentReplyTextHead) ?? nonEmpty(job.completionTextHead)
+        if replyText != nil { AgentWorkspacePorts.current.tools.markConsumed(peer: job.agent) }
         var reply = replyText.map { plainLines($0).prefix(5).map { clip($0, 100) } } ?? [job.completedAt == nil ? "not back yet" : "no reply text retained"]
         if replyText == nil, deliveredLive(job) {
             reply = ["Waiting in \(job.agent.capitalized)'s inbox until its next turn; no one is answering yet."]
@@ -133,7 +135,7 @@ extension HerScreen {
                 reply.append("answer: chat.\(n) " + clip(chat.title, 60) + " · " + age(now.timeIntervalSince(chat.at)))
             }
         }
-        if job.agentReplyTruncated { reply.append("(reply cut; the full text: agent_read agent \(job.agent))") }
+        if job.agentReplyTruncated { reply.append("(reply cut; the full text: app agent.read agent \(job.agent))") }
         var about: [String] = []
         if let error = nonEmpty(job.executionError) { about.append("error: " + clip(error, 100)) }
         if let handle = job.deskHandle, let desk = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState(),

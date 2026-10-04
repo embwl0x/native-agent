@@ -10,7 +10,7 @@ extension SwiftNativeChatOrchestrationClient {
     /// Executes a one-shot tool-capable turn without creating chat session state.
     /// The caller owns the tool scope; execution synthesis supplies its restricted
     /// read-only dispatcher. All configured schemas are request-scoped through
-    /// `turnActiveTools`, so no `ActiveToolsStore` row or transcript is needed.
+    /// `turnActiveTools`, so no transcript is needed.
     public func runEphemeralToolTurn(
         message: String,
         model: String = "",
@@ -38,7 +38,7 @@ extension SwiftNativeChatOrchestrationClient {
         // 2026-09-06: the Trust ▸ Multimodal gates apply on every lane that can
         // carry an attachment, not just the chat ones — otherwise "Allow vision
         // API calls" off is defeated by an execution turn.
-        let attachmentInput = Self.turnAttachmentInput(
+        let attachmentInput = try Self.turnAttachmentInput(
             message: message, attachments: attachments, dataRoot: dataRoot)
         let imageBlocks = attachmentInput.imageBlocks
         let baseContext = try await engine.buildTurnContext(
@@ -69,7 +69,8 @@ extension SwiftNativeChatOrchestrationClient {
             toolSchemas: baseContext.toolSchemas,
             systemSegments: baseContext.systemSegments,
             imageBlocks: baseContext.imageBlocks,
-            fluidContextTurn: baseContext.fluidContextTurn
+            fluidContextTurn: baseContext.fluidContextTurn,
+            preparationMs: baseContext.preparationMs
         )
         // Ephemeral/execution turns are still turns of the same resident mind.
         // Freeze and commit the existing cognitive projection once, then feed
@@ -85,9 +86,10 @@ extension SwiftNativeChatOrchestrationClient {
         let cognitiveProjection = await prepareCognitiveTurnProjection(
             surface: surface,
             userMessage: message,
-            sessionId: projectionSessionId
+            sessionId: projectionSessionId,
+            runId: runId
         )
-        let (contextWithCognition, pendingProjectionCommit) = await contextByAppendingCognitiveCapsule(
+        let (contextWithCognition, pendingProjectionCommit) = await Self.contextByAppendingCognitiveCapsule(
             to: context,
             surface: surface,
             userMessage: message,
@@ -132,7 +134,8 @@ extension SwiftNativeChatOrchestrationClient {
                     tools: gated,
                     preBuiltContext: projectedContext,
                     rendersProse: false,
-                    providerAdmission: providerAdmission
+                    providerAdmission: providerAdmission,
+                    fileAccess: fileAccess
                 )
             }
             }
@@ -152,7 +155,8 @@ extension SwiftNativeChatOrchestrationClient {
             pendingProjectionCommit,
             surface: surface,
             userMessage: message,
-            sessionId: projectionSessionId
+            sessionId: projectionSessionId,
+            turnId: runId
         )
         if requireCompleted, result.completionState != .completed {
             throw EphemeralToolTurnIncomplete(

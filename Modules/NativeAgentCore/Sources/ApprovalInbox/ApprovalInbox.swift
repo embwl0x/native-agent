@@ -44,6 +44,10 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var executedAction: JSONValue?
     public var detail: String?
     public var chatContinuation: JSONValue? = nil
+    /// User, 10-03: the one inline card this approval posted into his
+    /// conversation (`ApprovalChatCards`): `{sessionId, telegramChatId?, at}`.
+    /// Display binding only; set once, so a request never posts two cards.
+    public var chatCard: JSONValue? = nil
 
     public init(
         id: String,
@@ -83,6 +87,36 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         self.localOnly = localOnly
         self.executedAction = executedAction
         self.detail = detail
+    }
+}
+
+extension ApprovalRecord {
+    /// The conversation that asked, for a chat tool approval: the filer
+    /// (`NativeAgentChatApprovalFiler`) records it as `payload.origin.sessionId`.
+    /// Only chat approvals carry a chat origin — every other kind is nil rather
+    /// than borrowing a lookalike field.
+    public var chatOriginSessionId: String? {
+        guard case .object(let fields) = payload,
+              case .string(let kind)? = fields["kind"],
+              // ACP questions belong to a live protocol request, not a tool
+              // replay. They share chat presentation only, never execution.
+              kind == "chat_tool_approval" || kind == "agent_acp_live_approval",
+              case .object(let origin)? = fields["origin"],
+              case .string(let sessionId)? = origin["sessionId"] else { return nil }
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// The conversation this approval's chat card was posted into, if any.
+    public var chatCardSessionId: String? {
+        guard case .object(let card)? = chatCard, case .string(let id)? = card["sessionId"],
+              !id.isEmpty else { return nil }
+        return id
+    }
+
+    public var chatCardDelivered: Bool {
+        guard case .object(let card)? = chatCard else { return false }
+        return card["delivered"] == .bool(true)
     }
 }
 
@@ -149,6 +183,7 @@ extension ApprovalRecord {
         }
         self.detail = optStr("detail")
         self.chatContinuation = obj["chatContinuation"]
+        self.chatCard = obj["chatCard"]
     }
 
     /// Serialize nullable decision fields as explicit `null`, not absent.
@@ -187,6 +222,7 @@ extension ApprovalRecord {
             obj["detail"] = .string(d)
         }
         if let chatContinuation { obj["chatContinuation"] = chatContinuation }
+        if let chatCard { obj["chatCard"] = chatCard }
         return .object(obj)
     }
 }
@@ -366,11 +402,6 @@ public protocol ApprovalInboxProtocol: Sendable {
         executedAction: JSONValue,
         detail: String
     ) async throws -> ApprovalRecord
-
-    /// Drop terminal records older than `cutoff`. Returns the count
-    /// removed. Pending records are NEVER archived.
-    @discardableResult
-    func archive(olderThan cutoff: Date) async throws -> Int
 }
 
 public extension ApprovalInboxProtocol {
@@ -443,6 +474,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         "memory.repair",
         "memory.kind_backfill",
         "memory.consolidation.swap",
+        // User's own Install of a skill script, bound to its exact digest.
+        SwiftNativeApprovalInbox.skillScriptInstallAction,
     ]
 
     /// - root: the canonical data root. The approvals
@@ -472,6 +505,12 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     public nonisolated func pendingUnlocked() throws -> [ApprovalRecord] {
         let path = root.appendingPathComponent("workflows/approvals/requests.json")
         return try Self.loadApprovalRowsChecked(at: path).compactMap(ApprovalRecord.init(json:)).filter { $0.status == "pending" }
+    }
+
+    public nonisolated func resolvedUnlocked() throws -> [ApprovalRecord] {
+        let path = root.appendingPathComponent("workflows/approvals/requests.json")
+        return try Self.loadApprovalRowsChecked(at: path).compactMap(ApprovalRecord.init(json:))
+            .filter { $0.status == "resolved" }
     }
 
     public func list(filter: ApprovalFilter) async throws -> [ApprovalRecord] {
@@ -623,6 +662,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// match-or-create path builds a row through EXACTLY this logic instead of
     /// a second copy of it. Pure: no file IO, no lock.
     private static func makeApprovalRecord(body: JSONValue, now: Date) throws -> ApprovalRecord {
+        // Every approval row is made here: a skill's step never files one.
+        if SkillRunContext.handsBack { throw SkillRunContext.HandBack("an approval") }
         let bodyObj: [String: JSONValue]
         if case .object(let obj) = body {
             bodyObj = obj
@@ -647,8 +688,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         } else {
             rawPayloadPreview = (try? payload.serialize(pretty: false)) ?? ""
         }
-        let payloadPreview = String(rawPayloadPreview.prefix(4000))
         let action = codepointPrefix(pyStr(bodyObj["action"], fallback: "unknown"), 120)
+        // A script install card shows the whole script it admits, never part of it.
+        let previewLimit = action == Self.skillScriptInstallAction ? Self.skillScriptPreviewLimit : 4000
+        guard action != Self.skillScriptInstallAction || rawPayloadPreview.count <= previewLimit else {
+            throw ApprovalInboxError.malformedResponse("the script is too long to show whole on the card")
+        }
+        let payloadPreview = String(rawPayloadPreview.prefix(previewLimit))
         // Remote resolution is authority: hard-local actions ignore caller
         // overrides. Otherwise honor only a literal JSON Boolean; missing or
         // malformed flags default to false unless the action is remote-safe.
@@ -850,6 +896,39 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         return (0...600).contains(now.timeIntervalSince(date))
     }
 
+    /// Retain the destination before delivery, then mark it delivered only
+    /// after its idempotent transcript write. An unfinished claim resumes at
+    /// the same destination; an old claim without delivery evidence does too.
+    public func claimChatCard(
+        _ id: String, card: JSONValue,
+        deliver: @escaping @Sendable (ApprovalRecord) async throws -> Void
+    ) async throws -> ApprovalRecord? {
+        try await runSerialized { [persistence, approvalsPath] in
+            try await persistence.withFileLock(approvalsPath) {
+                var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
+                guard let index = items.firstIndex(where: {
+                    guard case .object(let object) = $0 else { return false }
+                    return object["id"] == .string(id)
+                }), case .object(var object) = items[index],
+                    object["status"] == .string("pending") else { return nil }
+                if object["chatCard"] == nil {
+                    object["chatCard"] = card
+                    items[index] = .object(object)
+                    try await persistence.writeJSON(.array(items), to: approvalsPath)
+                }
+                guard case .object(var savedCard)? = object["chatCard"],
+                      savedCard["delivered"] != .bool(true),
+                      let claimed = ApprovalRecord(json: .object(object)) else { return nil }
+                try await deliver(claimed)
+                savedCard["delivered"] = .bool(true)
+                object["chatCard"] = .object(savedCard)
+                items[index] = .object(object)
+                try await persistence.writeJSON(.array(items), to: approvalsPath)
+                return ApprovalRecord(json: .object(object))
+            }
+        }
+    }
+
     private func updateChatContinuation(
         _ id: String,
         update: @escaping @Sendable (ApprovalRecord, inout [String: JSONValue]) -> Bool
@@ -879,47 +958,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
     }
 
-    @discardableResult
-    public func archive(olderThan cutoff: Date) async throws -> Int {
-      return try await persistence.withFileLock(approvalsPath) { [persistence, approvalsPath] in
-        let items = try Self.loadApprovalRowsChecked(at: approvalsPath)
-        let cutoffISO = Self.isoTimestamp(cutoff)
-        let terminal: Set<String> = ["resolved", "denied", "canceled", "orphaned"]
-        var kept: [JSONValue] = []
-        var dropped = 0
-        for item in items {
-            guard case .object(let obj) = item else {
-                kept.append(item)
-                continue
-            }
-            let status: String = {
-                if case .string(let s) = obj["status"] ?? .null { return s }
-                return ""
-            }()
-            if !terminal.contains(status) {
-                kept.append(item)
-                continue
-            }
-            let ts: String = {
-                if case .string(let s) = obj["resolvedAt"] ?? .null { return s }
-                if case .string(let s) = obj["createdAt"] ?? .null { return s }
-                return ""
-            }()
-            // ISO-8601 lexicographic compare works for same-offset zulu/+00:00
-            // timestamps. The daemon emits +00:00; cutoff is also +00:00.
-            if !ts.isEmpty && ts < cutoffISO {
-                dropped += 1
-            } else {
-                kept.append(item)
-            }
-        }
-        if dropped > 0 {
-            try await persistence.writeJSON(.array(kept), to: approvalsPath)
-        }
-        return dropped
-      }
-    }
-
     // MARK: - Helpers
 
     /// The most rows `requests.json` keeps. Terminal rows above it are the
@@ -940,7 +978,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         _ items: [JSONValue],
         now: Date
     ) -> [JSONValue] {
-        // ISO-8601 lexicographic compare, as `archive` does: every writer here
+        // ISO-8601 lexicographic compare: every writer here
         // emits the same fractional `+00:00` shape.
         let cutoff = isoTimestamp(now.addingTimeInterval(-pendingApprovalTimeout))
         return items.map { item in
@@ -1189,6 +1227,11 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 id: id, reason: "Telegram transport identity is incomplete"
             )
         }
+        // The card posted into User's own Telegram DM (`ApprovalChatCards`):
+        // a private chat's id IS its one user's id, so the binding is the
+        // chat and that person both.
+        if case .object(let card)? = row["chatCard"],
+           card["telegramChatId"] == .string(chatID), chatID == userID { return }
         guard case .object(let payload) = record.payload,
               case .object(let telegram)? = payload["telegram"],
               telegram["chatId"] == .string(chatID),

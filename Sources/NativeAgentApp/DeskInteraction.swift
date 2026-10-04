@@ -1,49 +1,7 @@
 import Foundation
-import SwiftUI
 import PersistenceCore
 import Desk
 import GitHubConnector
-
-// MARK: - DeskInteraction — the pure half of the desk's interaction tier
-//
-// Sweep R4 W5 (desk interaction tier). DeskView shipped read-only: 7 buttons,
-// no selection, no keyboard, no search. The desk already beats Linear on DATA
-// (dependency edges, auto-unblock, drift kinds, EWMA cadence); Linear's moat is
-// keyboard-first MUTATION. This file is the part of that tier that is not a
-// view: row ordering, selection movement, reveal keys, fuzzy match and the
-// palette's command grammar.
-//
-// Everything here is pure and Sendable so it can be tested without SwiftUI —
-// the same contract `DeskAttentionStrip` keeps in DeskView.swift.
-//
-// ONE DEFINITION RULE: the section partition and the family grouping live HERE
-// and DeskView calls them, rather than each surface keeping its own copy. A
-// selection order derived from a second copy of the partition would drift from
-// what is actually on screen, and "arrow-down selects a row you can't see" is
-// exactly the bug that makes a keyboard surface feel broken.
-
-// MARK: - Selection chrome
-
-extension View {
-    /// The selected row's mark. Deliberately a THIN accent ring rather than a
-    /// filled row: the desk's rows already carry a status pill, a kind line and
-    /// sequencing pills, and a solid selection fill fought all three for the
-    /// eye. Nothing renders when `isSelected` is false, so glance mode is
-    /// byte-identical to the pre-W5 surface.
-    @ViewBuilder
-    func selectionHighlight(_ isSelected: Bool) -> some View {
-        if isSelected {
-            self.overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(Color.accentColor.opacity(0.85), lineWidth: 2)
-            )
-        } else {
-            self
-        }
-    }
-}
-
-// MARK: - Section partition + family grouping (shared with DeskView's render)
 
 enum DeskBoardLayout {
 
@@ -67,10 +25,6 @@ enum DeskBoardLayout {
         item.origin == .agent && item.kind == .project
     }
 
-    static func pursuits(_ active: [DeskItem]) -> [DeskItem] {
-        active.filter(isPursuitLaneItem)
-    }
-
     static func watches(_ active: [DeskItem]) -> [DeskItem] {
         // Stalest first (desk-triage-makeover W2) — sorted HERE so rendering,
         // arrow-key selection order, and reveal keys all share one definition
@@ -88,147 +42,6 @@ enum DeskBoardLayout {
             }
     }
 
-    static func board(_ active: [DeskItem]) -> [DeskItem] {
-        active.filter { !isPursuitLaneItem($0) && !isWatchShaped($0) }
-    }
-
-    static func boardNonGh(_ board: [DeskItem]) -> [DeskItem] {
-        board.filter { $0.kind != .gh }
-    }
-
-    static func ghByProject(_ board: [DeskItem]) -> [(project: String, items: [DeskItem])] {
-        Dictionary(grouping: board.filter { $0.kind == .gh }, by: \.project)
-            .map { (project: $0.key, items: $0.value) }
-            .sorted { $0.project < $1.project }
-    }
-
-    // MARK: grouping
-
-    /// One top-level family: the root row (when its parent lives in this
-    /// section) plus its dot-nested children. A family whose root lives
-    /// elsewhere (e.g. already done) collapses under a synthetic header that
-    /// borrows the parent's title from the full item list.
-    struct Group: Equatable, Sendable {
-        let key: String
-        let root: DeskItem?
-        let parentTitle: String?
-        let children: [DeskItem]
-    }
-
-    /// `allItems` is the FULL list (not the section slice) so an orphan family
-    /// can name its absent parent.
-    static func groups(_ list: [DeskItem], allItems: [DeskItem]) -> [Group] {
-        var order: [String] = []
-        var roots: [String: DeskItem] = [:]
-        var children: [String: [DeskItem]] = [:]
-        for item in list {
-            let key = item.alias.split(separator: ".").first.map(String.init) ?? item.alias
-            if roots[key] == nil && children[key] == nil { order.append(key) }
-            if item.alias.contains(".") || roots[key] != nil {
-                // Dot-nested items are children; so is any duplicate depth-0
-                // alias (should never happen, but a dict overwrite would hide
-                // an item entirely — nothing on this board may vanish).
-                children[key, default: []].append(item)
-            } else {
-                roots[key] = item
-            }
-        }
-        return order.map { key in
-            Group(
-                key: key,
-                root: roots[key],
-                parentTitle: roots[key] == nil
-                    ? allItems.first(where: { $0.alias == key })?.title
-                    : nil,
-                children: children[key] ?? []
-            )
-        }
-    }
-
-    /// The toggle key DeskView stores in `expandedRoots` for one family.
-    static func toggleKey(section: String, group: Group) -> String {
-        "\(section):\(group.key)"
-    }
-
-    /// The handles a family renders RIGHT NOW, given the expansion set. Mirrors
-    /// `DeskView.groupView` case for case:
-    ///   • root present      → the root row, plus children only when expanded
-    ///   • orphan family >1  → children only when expanded (header is chrome)
-    ///   • lone orphan child → rendered flat, always visible
-    static func visibleHandles(
-        in group: Group, section: String, expandedRoots: Set<String>
-    ) -> [String] {
-        let expanded = expandedRoots.contains(toggleKey(section: section, group: group))
-        if let root = group.root {
-            return [root.handle] + (expanded ? group.children.map(\.handle) : [])
-        }
-        if group.children.count > 1 {
-            return expanded ? group.children.map(\.handle) : []
-        }
-        return group.children.map(\.handle)
-    }
-
-    // MARK: selection order
-
-    /// Every handle that can currently take the selection, in EXACTLY the order
-    /// it renders — pursuits, then watches, then the board, then the GitHub
-    /// project roll-ups.
-    ///
-    /// Deliberately excludes "Recently finished": close/defer/note on a
-    /// terminal item is meaningless, and letting arrow-down walk into history
-    /// would put the caret somewhere no action applies. Glance mode for that
-    /// section is unchanged.
-    ///
-    /// Collapsed rows are excluded because they are NOT ON SCREEN. Selecting a
-    /// row a `scrollTo` cannot reach is the failure this ordering exists to
-    /// prevent; `revealKeys(for:)` is the counterpart for jumping TO a
-    /// collapsed row on purpose (a blocker pill, a palette match).
-    static func selectableHandles(items: [DeskItem], expandedRoots: Set<String>) -> [String] {
-        let active = activeItems(items)
-        var out: [String] = []
-        out.append(contentsOf: pursuits(active).map(\.handle))
-        for group in groups(watches(active), allItems: items) {
-            out.append(contentsOf: visibleHandles(
-                in: group, section: "watch", expandedRoots: expandedRoots))
-        }
-        let boardItems = board(active)
-        for group in groups(boardNonGh(boardItems), allItems: items) {
-            out.append(contentsOf: visibleHandles(
-                in: group, section: "board", expandedRoots: expandedRoots))
-        }
-        for entry in ghByProject(boardItems) where expandedRoots.contains("gh:\(entry.project)") {
-            out.append(contentsOf: entry.items.map(\.handle))
-        }
-        return out
-    }
-
-    /// Toggle keys that must be OPEN for `handle` to render. Empty when the row
-    /// is already reachable (a pursuit, a family root, a lone orphan child).
-    static func revealKeys(for handle: String, items: [DeskItem]) -> [String] {
-        let active = activeItems(items)
-        guard let item = active.first(where: { $0.handle == handle }) else { return [] }
-        if isPursuitLaneItem(item) { return [] }
-        if isWatchShaped(item) {
-            return keys(containing: item,
-                        in: groups(watches(active), allItems: items),
-                        section: "watch")
-        }
-        if item.kind == .gh { return ["gh:\(item.project)"] }
-        return keys(containing: item,
-                    in: groups(boardNonGh(board(active)), allItems: items),
-                    section: "board")
-    }
-
-    private static func keys(
-        containing item: DeskItem, in groups: [Group], section: String
-    ) -> [String] {
-        for group in groups where group.children.contains(where: { $0.handle == item.handle }) {
-            // A lone orphan child renders flat — nothing to open.
-            if group.root == nil && group.children.count <= 1 { return [] }
-            return [toggleKey(section: section, group: group)]
-        }
-        return []
-    }
 }
 
 // MARK: - Selection movement
@@ -251,13 +64,6 @@ enum DeskSelection {
         return order[next]
     }
 
-    /// A selection whose row is gone (closed, collapsed, filtered out by a
-    /// reload) must not linger: a stale caret makes `c` fire on something User
-    /// can no longer see.
-    static func reconcile(_ current: String?, order: [String]) -> String? {
-        guard let current, order.contains(current) else { return nil }
-        return current
-    }
 }
 
 // MARK: - Palette rows + fuzzy match
@@ -583,6 +389,8 @@ enum DeskRefAffordance {
             return .copy(text: id, label: kind.map { "\($0) \(id.prefix(8))" } ?? "trace \(id.prefix(8))")
         case let .note(text):
             return .copy(text: text, label: text)
+        case let .step(step):
+            return .copy(text: step.words, label: "queued " + step.when)
         }
     }
 }

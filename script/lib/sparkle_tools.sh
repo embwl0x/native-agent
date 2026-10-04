@@ -21,6 +21,7 @@ sparkle_tool_path() {
   root="$(cd "$root" && pwd)"
 
   local candidates=(
+    "$root/DerivedData/ReleaseBundle/SourcePackages/artifacts/sparkle/Sparkle/bin/$tool"
     "$root/.build/artifacts/sparkle/Sparkle/bin/$tool"
     "$root/.build/checkouts/Sparkle/bin/$tool"
     "$root/.build/checkouts/Sparkle/$tool"
@@ -40,6 +41,7 @@ sparkle_tool_path() {
   local found
   found="$(
     find "$root/.build/artifacts" "$root/.build/checkouts" \
+      "$root/DerivedData/ReleaseBundle/SourcePackages/artifacts" \
       -name "$tool" -type f 2>/dev/null \
       | grep -v 'old_dsa_scripts' \
       | head -1 || true

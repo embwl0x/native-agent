@@ -531,7 +531,9 @@ extension SwiftToolDispatcher {
         //    comes from the ENTRY — sign and size from the judgment she wrote,
         //    zero for an abstention — and it is derived on the cognition side,
         //    which owns the appraisal. This lane only says that an entry landed.
-        await StudioJournalCognitiveBus.publish(entry)
+        if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
+            await StudioJournalCognitiveBus.publish(entry)
+        }
         return report
     }
 

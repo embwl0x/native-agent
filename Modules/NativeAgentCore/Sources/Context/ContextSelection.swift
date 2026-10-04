@@ -215,8 +215,37 @@ public struct ContextSelector: Sendable {
         let admittedCandidates = boundedCandidates.filter {
             !flooredMemoryIDs.contains($0.draft.id)
         }
+        // PERSONAL LANE (Phase 5 C3). What happened between them is not ranked
+        // against ops rulings: personal atoms leave the ordinary competition
+        // and ONE is picked on its own, or none (none is normal). It ranks on
+        // LIFT: how much closer this turn is than that memory sits to
+        // everything else she knows (its baseline). Raw cosine let a memory
+        // that mentions Claude answer every turn that does. Nothing else
+        // (friction, importance, recency) can lift one over a better fit. It
+        // takes one memory row below, never an extra one.
+        let personalLane = configuration.personalRecallFloor > 0
+        let personalPick: ContextStoredAtom? = {
+            guard personalLane, queryIsComparable, let fingerprint = need.queryEmbeddingModelFingerprint else { return nil }
+            let personal = admittedCandidates.filter {
+                $0.draft.contentRole == .personal && $0.draft.injectionPolicy != .onDemand
+                    && $0.draft.embedding?.modelFingerprint == fingerprint
+            }
+            guard !personal.isEmpty else { return nil }
+            let baselines = Self.personalBaselines(generation.atoms, fingerprint: fingerprint)
+            func lift(_ atom: ContextStoredAtom) -> Double {
+                (baseScores[atom.draft.id]?.semanticCosine ?? 0) - (baselines[atom.draft.id] ?? 1)
+            }
+            return personal.filter { lift($0) >= configuration.personalRecallFloor }.max { lhs, rhs in
+                let left = lift(lhs), right = lift(rhs)
+                if left != right { return left < right }
+                return lhs.draft.id > rhs.draft.id
+            }
+        }()
         var units = makeSelectionUnits(
-            candidates: admittedCandidates.filter { $0.draft.injectionPolicy != .onDemand },
+            candidates: admittedCandidates.filter {
+                $0.draft.injectionPolicy != .onDemand
+                    && !(personalLane && $0.draft.contentRole == .personal)
+            },
             groups: groups,
             atomByID: atomByID,
             candidateIDs: Set(admittedCandidates.map(\.draft.id)),
@@ -229,6 +258,30 @@ public struct ContextSelector: Sendable {
         let reservedPlan = reservedRolePlan(in: units, scores: baseScores)
         let reservedSlots = reservedPlan.slots
         var reservedRoleCounts: [ContextAtomKind: Int] = [:]
+        // The personal pick's row is taken BEFORE the ordinary lane runs, so
+        // the ops lane fills one fewer row; it is appended after it.
+        var personalItem: ContextPacketItem?
+        if let atom = personalPick, configuration.maximumDynamicAtoms > 0 {
+            let unit = SelectionUnit(stableKey: "atom:\(atom.draft.id.rawValue)", conflictID: nil, atoms: [atom])
+            if quotaAllows(
+                unit,
+                sourceCounts: sourceCounts,
+                kindCounts: kindCounts,
+                reservedSlots: reservedSlots,
+                reservedRoleCounts: reservedRoleCounts,
+                memoryAtomRowLimit: effectiveMemoryRowLimit
+            ), let item = plannedItems(
+                for: unit,
+                generationID: generation.generation.id,
+                remainingCharacters: need.characterBudget - usedCharacters
+            )?.first {
+                personalItem = item
+                selectedDynamicCount += 1
+                usedCharacters += item.characterCount
+                sourceCounts[item.pointer.sourceID, default: 0] += 1
+                kindCounts[item.pointer.kind, default: 0] += 1
+            }
+        }
         // Corrections admitted this turn that the message is NOT about, and
         // the ones the cap turned away. Exempt corrections (this message is
         // about them) never consume the cap and never appear in the drop
@@ -399,34 +452,26 @@ public struct ContextSelector: Sendable {
             }
         }
 
+        if let personalItem {
+            selectedItems.append(personalItem)
+            selectedIDs.insert(personalItem.pointer.atomID)
+            selectionOrdinals[personalItem.pointer.atomID] = selectedItems.count
+        }
+
         let onDemandPointers = boundedCandidates
             .filter { $0.draft.injectionPolicy == .onDemand }
             .sorted { rankedBefore($0, $1, scores: scores) }
             .prefix(configuration.maximumPointers)
             .map { ContextAtomPointer(atom: $0, generationID: generation.generation.id) }
-        // TRUNCATION POINTERS (NORTHSTAR clause 6). When the caller's renderer
-        // cuts a long atom down to a lead, the rest of that atom must stay
-        // REACHABLE — otherwise the lead is not "fingertips", it is loss. The
-        // selector is the only place that knows which items were selected, so
-        // it publishes one expandable pointer per item the renderer will
-        // truncate. `ContextExpander` admits exactly these (same threshold,
-        // same NeedSignal) despite their non-`.onDemand` injection policy.
-        //
-        // THE NEW BOUND: the on-demand lane keeps `configuration
-        // .maximumPointers` unchanged; this lane adds AT MOST one pointer per
-        // selected item, and `selectedItems` is itself bounded by the mandatory
-        // set plus `configuration.maximumDynamicAtoms`. So
-        //   expandablePointers.count
-        //     <= maximumPointers + mandatoryAtomIDs.count + maximumDynamicAtoms
-        // and it is still a bounded packet, not a search bypass.
+        // Summaries and renderer-truncated bodies retain a route to the full
+        // atom. This adds at most one pointer per bounded selected item.
         var pointers = onDemandPointers
-        if need.packetAtomExpandThresholdChars > 0 {
-            var published = Set(pointers.map(\.atomID))
-            for item in selectedItems
-            where item.text.count > need.packetAtomExpandThresholdChars {
-                guard published.insert(item.pointer.atomID).inserted else { continue }
-                pointers.append(item.pointer)
-            }
+        var published = Set(pointers.map(\.atomID))
+        for item in selectedItems where item.representation == .deterministicSummary
+            || (need.packetAtomExpandThresholdChars > 0
+                && item.text.count > need.packetAtomExpandThresholdChars) {
+            guard published.insert(item.pointer.atomID).inserted else { continue }
+            pointers.append(item.pointer)
         }
 
         let conflicts = groups.map { group in
@@ -1167,5 +1212,41 @@ enum ContextLexicalTokenizer {
             let token = String($0)
             return routingStopWords.contains(token) ? nil : RecallLexicalNormalization.term(token)
         })
+    }
+}
+
+extension ContextSelector {
+    /// Phase 5 C3: each personal atom's baseline, its mean cosine to the
+    /// ordinary memory atoms of this generation (a mean of cosines is one dot
+    /// with the mean of the unit vectors, so this is one pass, not N×M).
+    public static func personalBaselines(
+        _ atoms: [ContextStoredAtom],
+        fingerprint: String
+    ) -> [ContextAtomID: Double] {
+        func unit(_ values: [Float]) -> [Double]? {
+            let norm = values.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
+            guard norm > 0, norm.isFinite else { return nil }
+            return values.map { Double($0) / norm }
+        }
+        var sum: [Double] = []
+        var count = 0
+        for atom in atoms where atom.draft.kind == .memory && atom.draft.contentRole != .personal {
+            guard let embedding = atom.draft.embedding, embedding.modelFingerprint == fingerprint,
+                  let vector = unit(embedding.values) else { continue }
+            if sum.isEmpty { sum = [Double](repeating: 0, count: vector.count) }
+            guard vector.count == sum.count else { continue }
+            for index in vector.indices { sum[index] += vector[index] }
+            count += 1
+        }
+        guard count > 0 else { return [:] }
+        var baselines: [ContextAtomID: Double] = [:]
+        for atom in atoms where atom.draft.contentRole == .personal {
+            guard let embedding = atom.draft.embedding, embedding.modelFingerprint == fingerprint,
+                  let vector = unit(embedding.values), vector.count == sum.count else { continue }
+            var dot = 0.0
+            for index in vector.indices { dot += vector[index] * sum[index] }
+            baselines[atom.draft.id] = dot / Double(count)
+        }
+        return baselines
     }
 }

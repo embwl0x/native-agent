@@ -1,16 +1,8 @@
 // DeskBoardRead.swift
 // ONE read of the Desk's stores, for every page that renders the Desk.
 //
-// Both Desk surfaces — the classic `DeskView` and the newer `DeskPageView` —
-// render the same board from the same stores. Until this file existed they each
-// carried their own copy of that read, and the second copy was documented as
-// "the classic Desk's load(), minus the parts only the classic Desk renders".
-// A copy is a divergence waiting to happen: a store swapped, a lane reordered
-// or a failure re-classified on one page would have left the other page quietly
-// showing something else.
-//
-// So the read lives once, in `NativeAgentEngine.desk.loadBoard` (EngineDesk.swift),
-// and both pages call it:
+// The primary Desk calls `NativeAgentEngine.desk.loadBoard` (EngineDesk.swift).
+// Canonical reads and their failure classification live here, outside the UI.
 //
 //   desk items    SwiftNativeDeskStore.liveState()  → rows, or a reason
 //   executions    SwiftNativeWorkshopRunner.listAll(), classified against the
@@ -41,6 +33,7 @@ import PersistenceCore
 import Desk
 import GitHubConnector
 import WorkshopExecution
+import NativeAgentShared
 
 /// One read of every Desk store, taken off the main actor.
 public struct DeskBoardRead: Sendable {
@@ -51,6 +44,7 @@ public struct DeskBoardRead: Sendable {
     public var deskError: String?
     public var executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord> = .rows([])
     public var github: DeskLaneState<GitHubCommandItem> = .rows([])
+    public var overview: WorkOverview?
 
     /// ONE DeskSequencing.compute() per load — never per row. The derivation
     /// walks the whole blocked-on graph plus every parent chain, so calling it

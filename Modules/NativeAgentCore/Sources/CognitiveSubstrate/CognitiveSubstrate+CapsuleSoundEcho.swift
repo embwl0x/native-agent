@@ -327,6 +327,8 @@ extension CognitiveSubstrate {
         ignoringCadence: Bool = false,
         mode: FeltMode? = nil,
         roomValence: Double? = nil,
+        currentSessionId: String? = nil,
+        trustedPeerIds: Set<String>? = nil,
         fieldNodes frozenFieldNodes: [CognitiveNode]? = nil,
         fixedAffect: CognitiveAffectState? = nil,
         fixedMood: CognitiveMoodReading? = nil,
@@ -343,7 +345,16 @@ extension CognitiveSubstrate {
         // Her OWN live conversation turns only — never User's words as her voice,
         // never tool/system summaries (the feltDaySummary injection-safety rule).
         let herTurns = fieldNodes.filter { node in
-            node.turnKind == .live
+            // Owner conversations remain her own sources. Peer replies may
+            // echo only in that conversation or after an explicit Trust grant.
+            let sameSession = Self.cleanedSessionId(currentSessionId).map {
+                $0 == Self.cleanedSessionId(metadataString(node.metadata["sessionId"]))
+            } ?? false
+            let peer = Self.peerIdentity(metadata: node.metadata)
+            let sourceAllowed = sameSession || (peer.map {
+                trustedPeerIds?.contains($0) ?? dependencies.peerTrusted($0)
+            } ?? true)
+            return sourceAllowed && node.turnKind == .live
                 && node.kind == .conversationFocus
                 && node.subjectReference.type == "chat.assistant_turn"
                 && now.timeIntervalSince(node.createdAt) >= 0
@@ -364,7 +375,7 @@ extension CognitiveSubstrate {
         // closer; one that recurs in ≥`verbalRutMinimumReplies` of them is
         // named in one concrete line. Silent otherwise. Any word — nothing
         // here knows which words are pet names. Local, over nodes in RAM.
-        // ACROSS EVERY SESSION AND SURFACE (2026-09-25): she is one mind, and a
+        // Across owner sessions and trusted peer sources: she is one mind, and a
         // habit spread over many short sessions ("babe" in 4 of 15 one-turn
         // sessions) is invisible to a per-session window. The line names the
         // form, never who it was said to. Capped by COUNT, not days.

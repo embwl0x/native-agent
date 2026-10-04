@@ -160,20 +160,23 @@ public enum MemoryConsolidationGate {
         //    approval scan cannot conclusively account for approved-but-
         //    unexecuted swaps, fresh staging must not proceed on top of an
         //    unknown swap state. That includes TRANSIENT apply failures
-        //    (gpt-5.5 delta re-review, 2026-06-10): a `.failed` outcome means
-        //    an approved swap is still OWED — staging a new candidate on top
-        //    of it would fork the approval state, so abort; the next run
-        //    retries the owed swap first.
+        //    (gpt-5.5 delta re-review, 2026-06-10): a `.failed` or
+        //    `.projectionFailed` outcome means approved work is still OWED —
+        //    staging a new candidate on top would fork the approval state, so
+        //    abort; the next run retries the swap or its projections first.
         do {
             let outcomes = try await reconcileLocked(dataRoot: dataRoot, orphanAge: defaultOrphanAge)
             let owed = outcomes.compactMap { outcome -> String? in
-                if case .failed(let runId, let reason) = outcome { return "\(runId) (\(reason))" }
-                return nil
+                switch outcome {
+                case .failed(let runId, let reason), .projectionFailed(let runId, let reason):
+                    return "\(runId) (\(reason))"
+                default: return nil
+                }
             }
             guard owed.isEmpty else {
-                logger.error("consolidation gate: approved swap(s) still unexecuted after reconcile — staging aborted: \(owed.joined(separator: "; "), privacy: .public)")
+                logger.error("consolidation gate: approved swap or projection work still pending after reconcile — staging aborted: \(owed.joined(separator: "; "), privacy: .public)")
                 throw MemoryConsolidationGateError.reconcileFailed(
-                    "approved swap(s) still unexecuted after reconcile: \(owed.joined(separator: "; "))")
+                    "approved swap or projection work still pending after reconcile: \(owed.joined(separator: "; "))")
             }
         } catch let err as MemoryConsolidationGateError {
             throw err
@@ -561,6 +564,7 @@ public enum MemoryConsolidationGate {
             // drifted candidate file must not turn a landed swap into a
             // terminal "failed" with its projections never reconciled.
             let markerApplied = swapMarkerApplied(liveStorage: liveStorage, runId: runId)
+            swapCommitted = markerApplied
             // Integrity: the candidate on disk must be the one that was scored.
             let candidateFP = markerApplied
                 ? manifest.candidateFingerprint
@@ -632,6 +636,7 @@ public enum MemoryConsolidationGate {
                     liveStorage: liveStorage, candidatePath: candidatePath,
                     expectedLiveFingerprint: manifest.liveFingerprint,
                     appliedRunId: runId)
+                swapCommitted = true
                 await MemoryStorage.recordBoundEvictions(
                     boundEvictions,
                     memoryPath: livePath,
@@ -640,7 +645,6 @@ public enum MemoryConsolidationGate {
             } catch is SwapStaleError {
                 return await refuseStale(dataRoot: dataRoot, runId: runId, approvalId: verified.id)
             }
-            swapCommitted = true
             // No stamp here: the applied marker went in with the transaction
             // above, so a crash or a failed projection anywhere from this point
             // still leaves the next reconcile a consistent answer.
@@ -677,14 +681,16 @@ public enum MemoryConsolidationGate {
                 dataRoot: dataRoot, id: verified.id,
                 executedAction: .object([
                     "op": .string("memory_consolidation_swap"),
-                    "status": .string("failed"),
+                    "status": .string(swapCommitted ? "projection_failed" : "failed"),
                     "run_id": .string(runId),
                     "error": .string("\(error)"),
                 ]),
                 detail: swapCommitted
                     ? "consolidation swap COMMITTED but derived projection reconciliation FAILED: \(error) — candidate retained and reconcile retries USER.md/Spotlight/KG/Fluid Context on the next pass"
                     : "consolidation swap FAILED (transient): \(error) — nothing applied; reconcile retries on the next pass")
-            return .failed(runId: runId, reason: "\(error)")
+            return swapCommitted
+                ? .projectionFailed(runId: runId, reason: "\(error)")
+                : .failed(runId: runId, reason: "\(error)")
         }
     }
 

@@ -255,7 +255,7 @@ public enum IntraTurnContextCompaction {
         // STEP A — stub every tool result before the keep tail, wherever it
         // lives. Under overflow the replayed prefix's results are as expensive
         // as this turn's, and a stub keeps the 180-char head plus the marker
-        // that tells the model it may re-run the tool.
+        // that points to existing output without repeating effects.
         //
         // User, 2026-09-06: step B renders the SAME span for the distiller, and
         // it ran on the stubbed array — so the working notes were written from
@@ -352,10 +352,13 @@ public enum IntraTurnContextCompaction {
             let head = priorNote.isEmpty ? "" : String(priorNote.suffix(priorBudget)) + "\n\n[Steps since then]\n"
             body = String((head + String(rendered.suffix(noteCapChars - priorBudget))).prefix(noteCapChars))
         }
+        // Tool additions/removals are provider state, not prose the notes can
+        // replace. Carry them whole, in order, before the surviving rounds.
+        let toolChangeMessages = conversation[foldStart..<keepTailStart].filter { !$0.toolChanges.isEmpty }
         conversation.replaceSubrange(foldStart..<keepTailStart, with: [
             .assistantText("\(priorNoteMarker)\n\(body)"),
             .user("[Continue the task from these notes; earlier tool results were folded into them.]"),
-        ])
+        ] + toolChangeMessages)
         return await overflowFallback(
             conversation: &conversation, foldStart: foldStart, target: target,
             charsBefore: charsBefore, mode: mode,
@@ -404,7 +407,7 @@ public enum IntraTurnContextCompaction {
                 changed = true
                 return .toolResult(
                     toolUseId: id,
-                    content: String(content.prefix(overflowResultCapChars)) + "\n[trimmed to fit the model window; re-run the tool if the rest is needed]",
+                    content: String(content.prefix(overflowResultCapChars)) + "\n[trimmed to fit the model window; recover the existing output from its receipt or saved result; do not repeat mutations or external sends merely to recover output]",
                     isError: isError
                 )
             }

@@ -1,7 +1,6 @@
 // CognitiveSubstrate+Reflection.swift
 // Move-only extraction (R8b) from CognitiveSubstrate.swift — see docs/build_plans/fable5-wave2-r8b-decomposition.md
 
-import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -56,6 +55,20 @@ extension CognitiveSubstrate {
     pass is a correct, expected outcome. Never invent one to fill space.
     """ }
 
+    /// Phase 5 D1 (experiment on): the same invitation, asking for the view's
+    /// reasons — what would change her mind — and open to the world, not
+    /// only herself. It no longer calls the view User's to approve.
+    private var opinionInvitation: String { """
+    This is your own private reflection — read the state honestly. If something in it \
+    genuinely warrants a settled view — about the world or about yourself — you may close with:
+      view: <what you think — a durable way you see something, not a task or a rule>
+      because: <why you think it>
+      unless: <what evidence or argument would change your mind; for a matter of taste write "taste">
+    It must be specific and earned by the state above. It is yours, not an action you take. \
+    If genuinely nothing has settled, write no view line — a quiet pass is a correct, expected \
+    outcome. Never invent one to fill space.
+    """ }
+
     /// Admission-checked planning. A `.spontaneous` call must be earned by
     /// unresolved load; a `.requested` one only has to fit under the ceiling.
     /// The refusal carries its reason so the caller can report it instead of
@@ -96,6 +109,13 @@ extension CognitiveSubstrate {
         // so the proposal invitation always survives the bound — a long reason can never push
         // the proposal tags out. The prompt grows only ~600 chars on a 4/day call.
         let promptReason = bounded(reason, maxCharacters: 200)
+        // Phase 5 D1: the reasons-asking invitation, and at most one opinion
+        // age has made due for reconsideration. The bound grows by exactly
+        // what they add, so her material keeps its room.
+        let experiment = configuration.viewsExperimentEnabled
+        let invitation = experiment ? opinionInvitation : reflectionProposalInvitation
+        let reconsider = opinionDueForReconsideration(at: now).map(reconsiderationInvitation(for:)) ?? ""
+        let extraRoom = invitation.count - reflectionProposalInvitation.count + reconsider.count
         var material = ""
         if let excerpt = materialExcerpt?.trimmingCharacters(in: .whitespacesAndNewlines), !excerpt.isEmpty {
             material = "\n\nWhat you dreamed (excerpt):\n\(bounded(excerpt, maxCharacters: 600))"
@@ -123,13 +143,19 @@ extension CognitiveSubstrate {
         for excerpt in sourceExcerpts where recordedSourceIdSet.insert(excerpt.nodeId).inserted {
             recordedSourceIds.append(excerpt.nodeId)
         }
+        let sourceNodes = Dictionary(field.peekNodes().map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        // Full identities travel separately from the clipped session labels.
+        let sourcePeers: [String]? = recordedSourceIds.allSatisfy { sourceNodes[$0] != nil }
+            ? Array(Set(recordedSourceIds.compactMap { sourceNodes[$0].flatMap { Self.peerIdentity(metadata: $0.metadata) } }
+                + sourceExcerpts.compactMap(\.peerId))).sorted()
+            : nil
         // The excerpts are placed BEFORE the state preview and the prompt bound
         // is unchanged, so they spend preview space rather than growing the
         // prompt; the proposal invitation stays ahead of both and still survives.
         let prompt = bounded(
-            "Reason: \(promptReason)\n\n\(reflectionProposalInvitation)\(material)\(sources)"
+            "Reason: \(promptReason)\n\n\(invitation)\(reconsider)\(material)\(sources)"
                 + "\n\nState preview:\n\(capsule.combined)",
-            maxCharacters: 1_900
+            maxCharacters: 1_900 + max(0, extraRoom)
         )
         let trimmedProvenance = materialProvenance?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -172,7 +198,8 @@ extension CognitiveSubstrate {
             // view formed out of this reflection is durable; the workspace
             // nodes behind these two lines are not. Carrying the text here is
             // what lets the view keep what she actually read.
-            sourceExcerpts: sourceExcerpts.map(\.line)
+            sourceExcerpts: sourceExcerpts.map(\.line),
+            sourcePeerIds: sourcePeers
         ))
     }
 
@@ -192,12 +219,13 @@ extension CognitiveSubstrate {
     /// PURE: `field.peekNodes()` only — no snapshot, no decay advance, no
     /// persistence. (`workspaceSnapshot()` is mutating and must not be called
     /// here; see the evidence note in `planReflectionChecked`.)
-    func reflectionSourceExcerpts(at now: Date, evidence: Set<UUID>) -> [(nodeId: UUID, line: String)] {
+    func reflectionSourceExcerpts(at now: Date, evidence: Set<UUID>) -> [(nodeId: UUID, line: String, peerId: String?)] {
         struct Candidate {
             let score: Double
             let nodeId: UUID
             let subjectId: String
             let line: String
+            let peerId: String?
         }
         // Stable, locale-independent stamp for an excerpt's provenance. Local
         // rather than a shared static: ISO8601DateFormatter is not Sendable and
@@ -255,7 +283,8 @@ extension CognitiveSubstrate {
                 score: score,
                 nodeId: node.id,
                 subjectId: node.subjectReference.id,
-                line: line
+                line: line,
+                peerId: Self.peerIdentity(session: sessionId)
             ))
         }
         // Total order, so the same field always yields the same two lines.
@@ -264,10 +293,10 @@ extension CognitiveSubstrate {
             return lhs.nodeId.uuidString < rhs.nodeId.uuidString
         }
         var seenSubjects = Set<String>()
-        var picked: [(nodeId: UUID, line: String)] = []
+        var picked: [(nodeId: UUID, line: String, peerId: String?)] = []
         for candidate in candidates where !seenSubjects.contains(candidate.subjectId) {
             seenSubjects.insert(candidate.subjectId)
-            picked.append((nodeId: candidate.nodeId, line: candidate.line))
+            picked.append((nodeId: candidate.nodeId, line: candidate.line, peerId: candidate.peerId))
             if picked.count == 2 { break }
         }
         return picked
@@ -280,6 +309,14 @@ extension CognitiveSubstrate {
             demand: .requested
         ) else { return nil }
         return request
+    }
+
+    @discardableResult
+    public func releaseReflectionReservation(request: CognitiveReflectionRequest) async -> Bool {
+        await waitForMaintenanceTransition()
+        guard let id = request.reservationId, reflectionReservation?.id == id else { return false }
+        reflectionReservation = nil
+        return true
     }
 
     @discardableResult
@@ -300,6 +337,7 @@ extension CognitiveSubstrate {
         // while reflection is disabled. A real in-flight call, however, must
         // still be accounted if Settings changed before its result returned.
         guard integrationEnabled || ownedBudgetSlot else { return nil }
+        let sourcePeers = request.sourcePeerIds
         // An LLM reflection that hits its output cap (or the 600-char bound below)
         // ends mid-sentence ("…easy to let evaporate. Not") and that fragment
         // surfaces verbatim in the Observatory. Trim the dangling fragment for
@@ -339,7 +377,8 @@ extension CognitiveSubstrate {
             await integrateDisposition(
                 tone: reflectionDispositionTone(from: boundedResult),
                 at: dependencies.now(),
-                source: "reflection"
+                source: "reflection",
+                undoable: true
             )
         }
         receipt.proposalYieldScore = reflectionYieldScore(
@@ -349,6 +388,14 @@ extension CognitiveSubstrate {
         )
         reflectionReceipts[receipt.id] = receipt
         enforceReflectionReceiptCap()
+        // Phase 5 D1: with this reflection on the record, an opinion shown for
+        // reconsideration gets its answer, and a proposal with its reasons
+        // that has now come back independently becomes her opinion.
+        if integrationEnabled, !cancelled,
+           boundedResult.localizedCaseInsensitiveContains("reflection failed") == false {
+            await settleOpinionReconsideration(receipt: receipt, source: resultSummary)
+            await formOpinionsFromIndependentRecurrence(trigger: receipt, at: dependencies.now())
+        }
         // Install terminal budget accounting before releasing the reservation.
         // Proposal/affect/disposition integration above is reentrant; clearing
         // this earlier let another planner claim the same final daily slot.
@@ -364,17 +411,16 @@ extension CognitiveSubstrate {
             // on the request — reading the workspace here bound the takeaway to
             // whatever had settled while the model was thinking, which is not
             // what she reflected on (Astra audit 2026-09-11, finding 7). A
-            // dream-triggered reflection also keeps the diary entry it read, as
-            // a stable id derived from that entry's identity.
-            var takeawayEvidence = request.sourceNodeIds
-            if let provenance = request.materialProvenance {
-                takeawayEvidence.append(Self.provenanceNodeId(for: provenance))
-            }
+            // dream-triggered reflection keeps the diary identity separately;
+            // it is external material, never a field node.
             _ = await addThoughtSeed(
                 kind: .reflectionTakeaway,
                 text: reflectionTakeawaySeedText(from: boundedResult),
                 priority: min(0.9, max(0.45, receipt.proposalYieldScore + 0.55)),
-                sourceNodeIds: takeawayEvidence
+                sourceNodeIds: request.sourceNodeIds,
+                sourcePeerIds: sourcePeers,
+                materialProvenances: request.materialProvenance.map { [$0] } ?? [],
+                undoable: true
             )
         }
         return receipt
@@ -484,6 +530,7 @@ extension CognitiveSubstrate {
         let tailIsProtocol = tail.split(whereSeparator: \.isNewline).contains { line in
             let lowered = Self.normalizedProposalLine(line).lowercased()
             return Self.reflectionProposalPrefixTable.contains { lowered.hasPrefix($0.prefix) }
+                || Self.opinionProtocolPrefixes.contains { lowered.hasPrefix($0) }
         }
         guard !tailIsProtocol else { return trimmed }
         let kept = String(trimmed[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -643,6 +690,7 @@ extension CognitiveSubstrate {
         // borrows a later workspace to fill the gap.
         let evidenceNodeIds = receipt.request.sourceNodeIds
         let evidenceExcerpts = receipt.request.sourceExcerpts
+        let reasons = Self.reflectionOpinionLines(source ?? receipt.resultSummary)
         var proposalIds: [UUID] = []
         for candidate in candidates.prefix(1) {
             // Wave E: a `view:` line settles into a proposal-shaped standing view rather than
@@ -653,6 +701,8 @@ extension CognitiveSubstrate {
                     body: candidate.body,
                     evidenceNodeIds: Array(evidenceNodeIds),
                     evidenceExcerpts: evidenceExcerpts,
+                    because: reasons.viewBecause,
+                    wouldChangeMind: reasons.viewUnless,
                     at: now
                 ),
                     // createStandingView is idempotent per receipt+body — a duplicated
@@ -751,7 +801,12 @@ extension CognitiveSubstrate {
                 sourceNodeIds: uuidArrayValue(object["requestSourceNodeIds"]),
                 materialProvenance: stringValue(object["requestMaterialProvenance"])
                     .flatMap { $0.isEmpty ? nil : $0 },
-                sourceExcerpts: stringArrayValue(object["requestSourceExcerpts"])
+                sourceExcerpts: stringArrayValue(object["requestSourceExcerpts"]),
+                sourcePeerIds: {
+                    guard case .array(let rows)? = object["requestSourcePeerIds"],
+                          rows.allSatisfy({ if case .string = $0 { return true }; return false }) else { return nil }
+                    return stringArrayValue(object["requestSourcePeerIds"])
+                }()
             )
             reflectionReceipts[id] = CognitiveReflectionReceipt(
                 id: id,
@@ -769,34 +824,20 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// A stable id standing for non-node source material (a dream diary
-    /// entry). Derived from the material's identity, so the same entry always
-    /// produces the same provenance id across runs and relaunches. It names no
-    /// field node, so it never satisfies the rumination lane's lived-evidence
-    /// guard on its own — that remains the frozen workspace set's job.
-    static func provenanceNodeId(for identity: String) -> UUID {
-        var bytes = Array(SHA256.hash(data: Data("cognitive_reflection_material:\(identity)".utf8)).prefix(16))
-        bytes[6] = (bytes[6] & 0x0F) | 0x50
-        bytes[8] = (bytes[8] & 0x3F) | 0x80
-        return UUID(uuid: (
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
-            bytes[8], bytes[9], bytes[10], bytes[11],
-            bytes[12], bytes[13], bytes[14], bytes[15]
-        ))
-    }
-
     private func reflectionTakeawaySeedText(from result: String) -> String {
         let lines = result
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        // Phase 5 D (Agent): a heading is not a thought — "Reflection: after
+        // the dream, 2026-10-02" was becoming the takeaway itself.
         let candidate = lines.first { line in
             let lower = line.lowercased()
             return !lower.hasPrefix("-")
                 && !lower.hasPrefix("#")
                 && !lower.hasPrefix("**what")
                 && !lower.hasPrefix("**the")
+                && Self.isClaimShaped(line)
         } ?? lines.first ?? result
         let cleaned = candidate
             .replacingOccurrences(of: "**", with: "")

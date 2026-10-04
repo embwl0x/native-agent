@@ -52,8 +52,6 @@ public struct TurnPlan: Equatable, Sendable {
     public let risk: String
     public let requiresApprovalHint: Bool
     public let matchedCapabilityIds: [String]
-    public let preloadPrediction: ToolPreloadHeuristics.Prediction?
-    public let residentCapabilityGuidance: String?
     public let policySnapshot: TurnPolicySnapshot
     public let receiptHints: [String]
     public let createdAt: String
@@ -67,8 +65,6 @@ public struct TurnPlan: Equatable, Sendable {
         risk: String,
         requiresApprovalHint: Bool,
         matchedCapabilityIds: [String],
-        preloadPrediction: ToolPreloadHeuristics.Prediction?,
-        residentCapabilityGuidance: String? = nil,
         policySnapshot: TurnPolicySnapshot,
         receiptHints: [String],
         createdAt: String
@@ -81,61 +77,9 @@ public struct TurnPlan: Equatable, Sendable {
         self.risk = risk
         self.requiresApprovalHint = requiresApprovalHint
         self.matchedCapabilityIds = matchedCapabilityIds
-        self.preloadPrediction = preloadPrediction
-        self.residentCapabilityGuidance = residentCapabilityGuidance
         self.policySnapshot = policySnapshot
         self.receiptHints = receiptHints
         self.createdAt = createdAt
-    }
-
-    public var preloadGroupNames: [String] {
-        preloadPrediction?.groupNames ?? []
-    }
-
-    var shouldInjectContextHint: Bool {
-        goalType != "chat" ||
-            contextMode != "minimal" ||
-            requiresApprovalHint ||
-            !preloadGroupNames.isEmpty ||
-            !matchedCapabilityIds.isEmpty ||
-            residentCapabilityGuidance != nil
-    }
-
-    var contextHint: String? {
-        guard shouldInjectContextHint else { return nil }
-        var parts = [
-            "goal=\(goalType)",
-            "context=\(contextMode)",
-            "risk=\(risk)",
-        ]
-        if requiresApprovalHint {
-            parts.append("approval_hint=true")
-        }
-        let groups = preloadGroupNames.prefix(3)
-        if !groups.isEmpty {
-            parts.append("preload=\(groups.joined(separator: ","))")
-        }
-        let caps = matchedCapabilityIds.prefix(3)
-        if !caps.isEmpty {
-            parts.append("capabilities=\(caps.joined(separator: ","))")
-        }
-        var guidance = "Keep tool and context use focused; leave receipts for meaningful actions."
-        if let residentCapabilityGuidance {
-            guidance += " \(residentCapabilityGuidance)"
-        }
-        if preloadGroupNames.contains("github") {
-            guidance += " Best-fit capability: the connected GitHub API tools are ready for structured evidence. For a repository link, begin with github_get_repository, then use github_read_repository_content or github_list_commits when the question needs deeper source or history."
-        }
-        if goalType == "file_work" {
-            guidance += " For file_work, when the user names a file, doc, readme, or handoff, first locate and read that artifact with file/search tools (grep, list_dir, file_excerpt, read_file) before using repo/git tools as secondary evidence. For long docs or handoffs, prefer targeted file_excerpt or grep first and read the full file only when the answer needs it. For the NativeAgent handoff, prefer the repo-relative path docs/HANDOFF_CURRENT.md. Do not answer requested files, docs, or handoffs from memory, chat history, recent traces, or runtime introspection alone; use agent_introspect only when the user asks about live run status."
-        }
-        if goalType == "research" {
-            guidance += " For research, if a direct page is empty, blocked, shows a bot/challenge/login wall, or a social shortlink does not expose the requested source, try an official source, approved-domain page, or search result in the same turn before giving the final answer; state source quality and do not ask to continue while safe read-only source options remain."
-        }
-        if goalType == "schedule" {
-            guidance += " For calendar reads about today, tomorrow, or a specific date, call mac_calendar_list_upcoming with day=today, day=tomorrow, or day=YYYY-MM-DD instead of a broad hours window."
-        }
-        return "Turn route: \(parts.joined(separator: "; ")). \(guidance)"
     }
 
     func tracePayload(runId: String?, surface: String) -> JSONValue {
@@ -148,8 +92,6 @@ public struct TurnPlan: Equatable, Sendable {
             "requiresApprovalHint": .bool(requiresApprovalHint),
             "messageChars": .int(Int64(messageCharCount)),
             "matchedCapabilityIds": .array(matchedCapabilityIds.map { .string($0) }),
-            "preloadGroups": .array(preloadGroupNames.map { .string($0) }),
-            "preloadCandidateToolCount": .int(Int64(preloadPrediction?.candidateTools.count ?? 0)),
             "receiptHints": .array(receiptHints.prefix(6).map { .string($0) }),
             "surface": .string(surface),
             "permissionLevel": .string(policySnapshot.permissionLevel),
@@ -206,7 +148,6 @@ public actor TurnPlanner {
             requiresApprovalHint: route.requiresApproval,
             dataRoot: dataRoot
         )
-        let residentGroups = Self.residentCapabilityGroups(for: message)
         return TurnPlan(
             id: route.id,
             messageCharCount: message.count,
@@ -216,43 +157,10 @@ public actor TurnPlanner {
             risk: route.risk,
             requiresApprovalHint: route.requiresApproval,
             matchedCapabilityIds: Self.meaningfulCapabilityIds(from: route.matchedCapabilities),
-            preloadPrediction: ToolPreloadHeuristics.predict(
-                userMessage: message,
-                surface: surface,
-                residentGroupHints: route.toolReadinessGroups + residentGroups,
-                dataRoot: dataRoot
-            ),
-            residentCapabilityGuidance: Self.residentCapabilityGuidance(for: message),
             policySnapshot: policySnapshot,
             receiptHints: route.nextActions,
             createdAt: route.createdAt
         )
-    }
-
-    /// Deterministic readiness for a narrow capability whose agent names are
-    /// too common to use as unconditional lexical preload triggers.
-    nonisolated static func residentCapabilityGroups(for message: String) -> [String] {
-        delegationIntent(in: message) ? ["delegation"] : []
-    }
-
-    /// Small positive cue paired with deterministic readiness. This keeps
-    /// bridge progress checks on the canonical projection rather than asking
-    /// the model to discover private job files through shell commands.
-    nonisolated static func residentCapabilityGuidance(for message: String) -> String? {
-        guard delegationIntent(in: message) else { return nil }
-        return "Best-fit capability: delegation_status reads current bridge work and outcomes; claude_message, codex_message, and omp_message send or continue work on the matching topic."
-    }
-
-    nonisolated private static func delegationIntent(in message: String) -> Bool {
-        let lower = message.lowercased()
-        let names = ["claude", "codex", "claude", "omp"]
-        guard names.contains(where: lower.contains) else { return false }
-        let bridgeIntent = [
-            "how is", "how's", "hows", "status", "progress", "running",
-            "working", "finished", "done", "timeout", "timed out", "job",
-            "send", "tell", "ask", "message", "reply", "continue", "resume",
-        ].contains(where: lower.contains)
-        return bridgeIntent
     }
 
     nonisolated static func meaningfulCapabilityIds(from capabilities: [JSONValue]) -> [String] {
@@ -445,50 +353,25 @@ public actor TurnPlanner {
         return false
     }
 
-    /// PARSE SITE 3 of 5, DELETED (one-thread-many-surfaces plan §1.2). The
-    /// `telegram:<chatId>` session-string parse that stood beside the verified
-    /// id is gone: a storage key is not identity. The transport binds the
-    /// verified chat id (and, on the envelope, the verified user id) or this
-    /// returns false — fail closed, no inference.
-    ///
-    /// `sessionId` is retained in the signature because callers pass it and
-    /// removing the parameter would hide, rather than record, what was deleted.
+    /// Match the transport's admission rule using verified identities only:
+    /// chat ID in the chat allowlist OR user ID in the user allowlist.
     private nonisolated static func telegramChatAllowed(sessionId: String, dataRoot: URL) -> Bool {
         _ = sessionId
-        // CHAT identity only. `telegramAllowedIds` merges the chat and user
-        // allowlists into one set, so admitting a user id here would let a
-        // sender match a CHAT entry — a widening, and exactly the silent kind
-        // (plan §8 R1). The set of candidates is deliberately no larger than it
-        // was before the parse was deleted, minus the parse.
-        let candidates = [
-            ChatToolSessionContext.envelope?.verifiedChatId,
-            ChatToolSessionContext.verifiedChatId,
-        ]
-        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-        .filter { !$0.isEmpty }
-        guard !candidates.isEmpty else { return false }
-        let allowed = telegramAllowedIds(dataRoot: dataRoot)
-        guard !allowed.isEmpty else { return false }
-        return candidates.contains { allowed.contains($0) }
-    }
-
-    private nonisolated static func telegramAllowedIds(dataRoot: URL) -> Set<String> {
         let path = dataRoot
             .appendingPathComponent("telegram", isDirectory: true)
             .appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: path),
               let json = try? JSONValue.parse(data),
               case .object(let obj) = json else {
-            return []
+            return false
         }
-        var ids = Set<String>()
-        for key in ["allowed_chat_ids", "allowedChatIds", "allowed_user_ids", "allowedUserIds"] {
-            for value in stringArray(obj[key]) {
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { ids.insert(trimmed) }
-            }
+        func allowed(_ id: String?, key: String) -> Bool {
+            guard let id, let candidate = Int64(id) else { return false }
+            return stringArray(obj[key]).contains { Int64($0) == candidate }
         }
-        return ids
+        let envelope = TurnEnvelope.current(surface: "telegram")
+        return allowed(envelope.verifiedChatId, key: "allowed_chat_ids")
+            || allowed(envelope.verifiedUserId, key: "allowed_user_ids")
     }
 
     private nonisolated static func turnPolicyActor(surface: String, sessionId: String) -> String {
@@ -614,7 +497,6 @@ extension SwiftNativeTurnEngine {
         turnPlan: TurnPlan?
     ) -> TurnContext {
         var additions: [String] = []
-        if let hint = turnPlan?.contextHint { additions.append(hint) }
         // W7/P13 — the cue family splits by what it regulates. Serve/rut/register
         // stay chat-gated (they are about matching a social register). Stance
         // routes through EVERY goal type: narrating your own performance is the
@@ -653,7 +535,8 @@ extension SwiftNativeTurnEngine {
             naturalExpressionCue: nil,
             historyMessages: context.historyMessages,
             turnVolatileBlock: context.turnVolatileBlock,
-            historyWindowReceipt: context.historyWindowReceipt
+            historyWindowReceipt: context.historyWindowReceipt,
+            preparationMs: context.preparationMs
         )
     }
 }

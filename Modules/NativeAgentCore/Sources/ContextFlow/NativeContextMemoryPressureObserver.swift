@@ -64,7 +64,7 @@ final class DispatchContextMemoryPressureObserver:
     private let lock = NSLock()
     private let sourceFactory: any NativeContextMemoryPressureDispatchSourceFactory
     private var source: (any NativeContextMemoryPressureDispatchSource)?
-    private var pendingHandlers: [Task<Void, Never>] = []
+    private var pendingHandlers: [UUID: Task<Void, Never>] = [:]
 
     init(
         sourceFactory: any NativeContextMemoryPressureDispatchSourceFactory
@@ -97,8 +97,14 @@ final class DispatchContextMemoryPressureObserver:
                 hasCritical: source.data.contains(.critical),
                 hasWarning: source.data.contains(.warning)
             )
-            let task = Task { await handler(pressure) }
-            self.lock.withLock { self.pendingHandlers.append(task) }
+            self.lock.withLock {
+                guard self.source === source else { return }
+                let id = UUID()
+                self.pendingHandlers[id] = Task {
+                    await handler(pressure)
+                    self.lock.withLock { self.pendingHandlers[id] = nil }
+                }
+            }
         }
         self.source = source
         lock.unlock()
@@ -114,7 +120,7 @@ final class DispatchContextMemoryPressureObserver:
                 self.source = nil
                 self.pendingHandlers.removeAll()
             }
-            return (self.source, self.pendingHandlers)
+            return (self.source, Array(self.pendingHandlers.values))
         }
         state.source?.cancel()
         for task in state.handlers { await task.value }

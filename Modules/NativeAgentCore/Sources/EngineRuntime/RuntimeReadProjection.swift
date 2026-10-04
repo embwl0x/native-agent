@@ -166,44 +166,6 @@ public enum RuntimeReadProjection {
         )
     }
 
-    public static func getLatestContextReceipt(
-        sessionId: String,
-        dataRoot: URL
-    ) async throws -> ContextReceipt {
-        // Swift-native cutover port P2: was GET /v1/context/latest. Tail-scan
-        // `<dataRoot>/context/receipts.jsonl` (append-only, newest-last),
-        // return the newest entry whose sessionId matches; if no sessionId
-        // filter hits, fall back to the absolute newest. Missing file or
-        // empty → synthesized empty receipt (ContextReceipt's custom
-        // init(from:) decodeIfPresent's every key, so `{}` is valid).
-        let url = dataRoot
-            .appendingPathComponent("context", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
-        guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else {
-            return try JSONDecoder.nativeAgent.decode(ContextReceipt.self, from: Data("{}".utf8))
-        }
-        let decoder = JSONDecoder.nativeAgent
-        var newestForSession: ContextReceipt? = nil
-        var newestAny: ContextReceipt? = nil
-        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            guard let lineData = trimmed.data(using: .utf8) else { continue }
-            guard let row = try? decoder.decode(ContextReceipt.self, from: lineData) else { continue }
-            newestAny = row
-            if row.sessionId == sessionId { newestForSession = row }
-        }
-        let trimmedSessionId = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedSessionId.isEmpty {
-            if let receipt = newestForSession { return receipt }
-            return try decoder.decode(ContextReceipt.self, from: Data("{}".utf8))
-        }
-        if let receipt = newestAny { return receipt }
-        return try decoder.decode(ContextReceipt.self, from: Data("{}".utf8))
-    }
-
     public static func getPersonalOS<Failure: Error>(dataRoot: URL, unreadableFeed: (String) -> Failure) async throws -> PersonalOSSummary {
         /// HONEST MINIMAL: NativeAgent ships a single active persona today
         /// (persona/profile.json), so the PersonalOS summary surfaces exactly

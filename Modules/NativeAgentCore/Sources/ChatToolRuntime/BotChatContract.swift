@@ -49,7 +49,12 @@ public struct BotChatContract: Sendable, Equatable {
         // definition edited in between produced a contract for one version gated
         // against another — and a second read that simply failed handed back the
         // first, ungated.
-        guard let bot = definition(for: sessionId, dataRoot: dataRoot) else { return nil }
+        guard sessionId.hasPrefix("bot-"),
+              UUID(uuidString: String(sessionId.dropFirst(4))) != nil else { return nil }
+        guard let bot = definition(for: sessionId, dataRoot: dataRoot) else {
+            return BotChatContract(name: "Bot", model: nil, reasoningEffort: nil, choice: nil,
+                                   modelChoiceProblem: "This bot's definition is unavailable or deleted. Restore it before continuing this conversation.")
+        }
         return await contract(for: bot, dataRoot: dataRoot)
     }
 

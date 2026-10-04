@@ -18,16 +18,11 @@ public func listMCPServersAsDicts(
     dataRoot: URL,
     dispatcher: SwiftNativeMCPDispatcher? = nil,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> [[String: JSONValue]] {
+) async throws -> [[String: JSONValue]] {
     let disp = dispatcher ?? SwiftNativeMCPDispatcher(
         root: dataRoot, persistence: persistence
     )
-    let servers: [MCPServer]
-    do {
-        servers = try await disp.listServers()
-    } catch {
-        return []
-    }
+    let servers = try await disp.listServers()
     return servers.compactMap {
         if case .object(let dict) = $0.toJSON() { return dict }
         return nil

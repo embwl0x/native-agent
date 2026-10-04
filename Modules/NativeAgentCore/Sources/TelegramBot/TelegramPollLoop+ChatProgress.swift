@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 
@@ -222,35 +223,8 @@ extension TelegramPollLoop {
                     return "Loading skill: \(skill)"
                 }
                 return "Loading skill"
-            case "list_skills":
-                return "Checking skills"
-            case "tool_load":
-                if let tool = progressInputString(input, keys: ["name", "tool", "id"]) {
-                    return "Loading tool: \(tool)"
-                }
-                return "Loading tool"
-            case "tool_catalog", "list_tools":
-                return "Checking tools"
-            case "git_log":
-                return "Checking recent commits"
-            case "git_status":
-                return "Checking repo status"
-            case "git_diff":
-                return "Checking repo diff"
-            case "repo_dirty_summary":
-                return "Checking repo state"
-            case "read_file", "file_excerpt":
-                return "Reading file"
-            case "list_dir":
-                return "Listing folder"
-            case "recall_memory", "recall_search":
-                return "Searching memory"
-            case "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message", "agent_swarm":
-                return "Starting background work"
-            case "search_kg":
-                return "Searching knowledge graph"
             default:
-                return "Using tool: \(name)"
+                return ToolActivityPresentation.progress(name)
             }
         }
     }

@@ -219,6 +219,11 @@ public struct AgentDiscoveryCandidate: Sendable, Equatable, Identifiable {
             // Seeing an installed host does not prove a usable connection.
             fields["can_start_turn"] = .bool(false)
             fields["can_answer_back"] = .bool(false)
+            if row.format == .shellEnvironment {
+                fields["description"] = .string(row.description)
+                fields["outbound_route"] = .string("none")
+                fields["setup"] = .string("agent_connect with name \"\(row.displayName)\" creates a private environment file and returns the local commands to give Dot. Dot can message NativeAgent, and NativeAgent can message Dot in its current ChatGPT conversation after checking the running app and conversation.")
+            }
             if row.route == .desktopChat {
                 fields["setup"] = .string("agent_connect with name \"\(row.displayName)\" sets this one up. Messages go to a chat of its own in the app, and the answer comes back in the same call.")
             }

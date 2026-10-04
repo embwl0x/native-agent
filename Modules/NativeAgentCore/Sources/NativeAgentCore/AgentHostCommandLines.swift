@@ -42,6 +42,9 @@ public struct AgentHostCommandLine: Sendable, Equatable {
     /// The CLI prints one JSON event per line while it answers; the
     /// adapter reads those as live progress. nil: its output is read at exit.
     public let stream: Stream?
+    /// Which documented permission flags carry NativeAgent's launch decision
+    /// (`DrivenAgentLaunchPermission`). nil: this CLI is not given one.
+    public let permissionFlags: PermissionFlags?
     /// The wall-clock limit for one run.
     public let timeoutSeconds: Int
     /// The documentation these flags were checked against.
@@ -51,7 +54,7 @@ public struct AgentHostCommandLine: Sendable, Equatable {
 
     public init(executable: String, arguments: [String], continuation: [String] = [],
                 replyFileName: String? = nil, capturesThreadID: Bool = false, jsonResultReply: Bool = false,
-                automaticMCPProbe: Bool = true, stream: Stream? = nil,
+                automaticMCPProbe: Bool = true, stream: Stream? = nil, permissionFlags: PermissionFlags? = nil,
                 timeoutSeconds: Int, documentation: String) {
         self.executable = executable
         self.arguments = arguments
@@ -61,6 +64,7 @@ public struct AgentHostCommandLine: Sendable, Equatable {
         self.jsonResultReply = jsonResultReply
         self.automaticMCPProbe = automaticMCPProbe
         self.stream = stream
+        self.permissionFlags = permissionFlags
         self.timeoutSeconds = timeoutSeconds
         self.documentation = documentation
     }
@@ -92,11 +96,6 @@ public struct AgentHostCommandLine: Sendable, Equatable {
     }
 
     public func resultReply(stdout: String) -> String? {
-        if stream == .claudeCode {
-            // The one closing `result` event carries what plain `-p` prints.
-            let results = Self.events(stdout).filter { $0["type"] as? String == "result" }
-            return results.count == 1 ? results[0]["result"] as? String : nil
-        }
         guard jsonResultReply, let object = resultObject(stdout),
               object["status"] as? String == "SUCCESS" else { return nil }
         return object["response"] as? String
@@ -107,7 +106,6 @@ public struct AgentHostCommandLine: Sendable, Equatable {
     public func isResultLine(_ line: String) -> Bool {
         guard let event = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return false }
         switch stream {
-        case .claudeCode: return event["type"] as? String == "result"
         case .antigravity: return event["event"] as? String == "result"
         case .codex: return event["type"] as? String == "thread.started"
         case nil: return false
@@ -136,11 +134,14 @@ public struct AgentHostCommandLine: Sendable, Equatable {
 
     /// Stream shapes, by protocol rather than by agent.
     public enum Stream: String, Sendable, Equatable {
-        /// `claude --output-format stream-json --include-partial-messages`.
-        case claudeCode
         /// `agy --output-format stream-json`: step_update text_delta, then one result.
         case antigravity
         /// `codex exec --json`: whole items as they complete.
+        case codex
+    }
+
+    public enum PermissionFlags: String, Sendable, Equatable {
+        /// `codex -c sandbox_mode=… -c approval_policy=…`.
         case codex
     }
 
@@ -155,15 +156,6 @@ public struct AgentHostCommandLine: Sendable, Equatable {
     public func streamEvent(line: String) -> StreamEvent? {
         guard let stream, let event = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return nil }
         switch stream {
-        case .claudeCode:
-            // Only this conversation's own text; a subagent's carries its parent tool id.
-            guard event["type"] as? String == "stream_event",
-                  event["parent_tool_use_id"] == nil || event["parent_tool_use_id"] is NSNull,
-                  let inner = event["event"] as? [String: Any] else { return .activity }
-            if let delta = inner["delta"] as? [String: Any], delta["type"] as? String == "text_delta",
-               let text = delta["text"] as? String { return .text(text, whole: false) }
-            if let block = inner["content_block"] as? [String: Any], block["type"] as? String == "tool_use",
-               let name = block["name"] as? String { return .note(name) }
         case .antigravity:
             if event["event"] as? String == "step_update",
                let step = event["step_update"] as? [String: Any], step["step_type"] as? String == "agent_response",
@@ -214,20 +206,8 @@ public enum AgentHostCommandLines {
                            "--print=" + AgentHostCommandLine.messagePlaceholder],
             capturesThreadID: true, jsonResultReply: true, automaticMCPProbe: false, stream: .antigravity, timeoutSeconds: 300,
             documentation: "https://www.antigravity.google/docs/cli/headless/"),
-        // Verified on this Mac: `claude -p --session-id <uuid> -- "<text>"`
-        // printed the reply on stdout, `claude -p --resume <uuid>` answered
-        // from the same conversation, and a message beginning with `--` stayed
-        // the prompt rather than becoming a flag.
-        "claude-code": AgentHostCommandLine(
-            executable: "claude",
-            arguments: ["-p", "--session-id", AgentHostCommandLine.sessionPlaceholder,
-                        "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-                        "--", AgentHostCommandLine.messagePlaceholder],
-            continuation: ["-p", "--resume", AgentHostCommandLine.sessionPlaceholder,
-                           "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-                           "--", AgentHostCommandLine.messagePlaceholder],
-            stream: .claudeCode, timeoutSeconds: 300,
-            documentation: "https://code.claude.com/docs/en/cli-reference"),
+        // No claude-code row (10-02): Claude Code is Claude, and a message to
+        // her goes to her inbox, never a headless `claude -p`.
         // JSONL thread.started carries the CLI-minted identity. Resume uses
         // that exact UUID, never --last or a guessed private rollout path.
         "codex": AgentHostCommandLine(
@@ -238,7 +218,7 @@ public enum AgentHostCommandLines {
                            "-o", AgentHostCommandLine.replyFilePlaceholder,
                            "--", AgentHostCommandLine.sessionPlaceholder, AgentHostCommandLine.messagePlaceholder],
             replyFileName: "reply.txt",
-            capturesThreadID: true, stream: .codex,
+            capturesThreadID: true, stream: .codex, permissionFlags: .codex,
             timeoutSeconds: 300,
             documentation: "https://learn.chatgpt.com/docs/non-interactive-mode"),
     ]

@@ -161,65 +161,6 @@ enum DoctorSupportSnapshotPresentation {
     }
 }
 
-enum DoctorOAuthLoginButtonPresentation {
-    static let buttonTitle = "Open device sign-in (fallback)"
-    static let openingTitle = "Opening device sign-in…"
-    static let panelTitle = "Device sign-in (fallback)"
-
-    enum Tone: Equatable {
-        case progress
-        case success
-        case failure
-    }
-
-    struct Notice: Equatable {
-        let detail: String
-        let tone: Tone
-    }
-
-    static func notice(for outcome: CodexOAuthLoginLaunchOutcome) -> Notice {
-        switch outcome {
-        case .failed(let detail):
-            return Notice(
-                detail: "Could not start Device sign-in: \(nonempty(detail, fallback: "no error detail was returned"))",
-                tone: .failure
-            )
-        case .started(let login):
-            if login.running != true {
-                return Notice(
-                    detail: "Device sign-in ended before it produced a usable device code. \(nonempty(login.detail, fallback: "Check the Device sign-in (fallback) panel for details."))",
-                    tone: .failure
-                )
-            }
-            if login.url != nil, login.code != nil {
-                return Notice(
-                    detail: login.openedBrowser == true
-                        ? "Device sign-in is ready; its browser page was opened. Enter the code shown below."
-                        : "Device sign-in is ready. Open the link shown below and enter the code.",
-                    tone: .success
-                )
-            }
-            if login.url != nil {
-                return Notice(
-                    detail: login.openedBrowser == true
-                        ? "Device sign-in opened its browser page and is waiting for the device code."
-                        : "Device sign-in is waiting for the device code. Open the link shown below.",
-                    tone: .progress
-                )
-            }
-            return Notice(
-                detail: "Device sign-in process started; waiting for device-login instructions.",
-                tone: .progress
-            )
-        }
-    }
-
-    private static func nonempty(_ value: String?, fallback: String) -> String {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? fallback : trimmed
-    }
-}
-
 /// The Doctor core marks only app-owned, conservative repairs with this
 /// instruction. Other repair text is a human next step (for example provider
 /// authentication) and must never make the local repair button runnable.
@@ -426,34 +367,6 @@ struct DoctorView: View {
             // 2026-07-03 dead-weight audit flagged the duplication.
 
             healthSummaryPanel
-
-            if let login = appModel.codexDeviceLogin {
-                NativePanel(title: DoctorOAuthLoginButtonPresentation.panelTitle, systemImage: "key.fill", tint: .blue) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Open \(login.url ?? "https://auth.openai.com/codex/device")")
-                            .font(NativeAgentFont.body)
-                        Text("Code: \(login.code ?? "pending")")
-                            .font(.system(.title3, design: .monospaced, weight: .semibold))
-                        // UI-2: the CODEX_HOME path is a developer detail. It
-                        // still ships, collapsed, so support requests can read
-                        // it without it being the second thing a user sees.
-                        DisclosureGroup("Technical details") {
-                            Text("CODEX_HOME: \(login.codexHome ?? "")")
-                                .font(NativeAgentFont.mono)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .font(NativeAgentFont.label)
-                        // Cancel + clear through the same Swift device-login
-                        // subprocess owner used by the Setup view.
-                        Button("Cancel", systemImage: "xmark.circle") {
-                            Task { await appModel.cancelCodexDeviceLogin() }
-                        }
-                        .padding(.top, 4)
-                    }
-                    .textSelection(.enabled)
-                }
-            }
 
             // Background-loop health (2026-07-16): github_tracking failed every
             // tick for 4 days with zero surfacing. Rule + receipt parsing live

@@ -39,27 +39,30 @@ public final class ToolsFacade {
         try await SwiftNativeMCPDispatcher(root: dataRoot).listSessions()
     }
 
-    /// The trust-aware full catalog, through the same dispatcher composition
+    /// The trust-aware tool manifest, through the same dispatcher composition
     /// ordinary app chat uses, Mac Integration included.
-    public nonisolated func loadCatalog() async throws -> ChatToolCatalogSnapshot {
+    public nonisolated func loadManifest(detail: String? = nil) async throws -> JSONValue {
+        let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
         let inner = SwiftToolDispatcher(
             dataRoot: dataRoot,
             macIntegrationBridge: ports.macIntegration,
-            appTools: ports.appTools(SwiftNativeSecurityCenter(), true),
+            appTools: ports.appTools(securityCenter, true),
             agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         )
-        let dispatcher = AppChatToolDispatcher(inner: inner, organismPostureProvider: ports.catalogPosture,
+        let dispatcher = AppChatToolDispatcher(inner: inner, securityCenter: securityCenter,
+            organismPostureProvider: ports.catalogPosture,
             interactions: ports.interactions, platform: ports.chatPlatform)
-        let envelope = try await dispatcher.dispatch(
-            tool: "tool_catalog",
-            input: ["detail": .string("full")],
-            surface: "chat"
-        )
+        return try await dispatcher.toolManifest(detail: detail)
+    }
+
+    /// The full manifest, typed for the Tools page.
+    public nonisolated func loadCatalog() async throws -> ChatToolCatalogSnapshot {
+        let envelope = try await loadManifest(detail: "full")
         guard let snapshot = ChatToolCatalogSnapshot(envelope: envelope) else {
             throw NSError(
                 domain: "NativeAgent.ChatToolCatalog",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Tool catalog returned an invalid envelope."]
+                userInfo: [NSLocalizedDescriptionKey: "Tool manifest returned an invalid envelope."]
             )
         }
         return snapshot

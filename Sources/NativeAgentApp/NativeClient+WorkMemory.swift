@@ -108,23 +108,15 @@ extension NativeClient {
     }
 
     func getImprovements() async throws -> [ImprovementRun] {
-        // WAVE 37 W04 (§6.159): COMMIT-MARKER verified-fresh local read. The
-        // legacy list_improvements() flow ran a write-on-read reconcile, and
-        // runs.json is mutated by reconcile/finalize/heartbeat writers; a naive
-        // local read could serve a `running`/non-transient row from a window
-        // where a writer was mid-update. The verified read runs a seq->runs->seq
-        // sandwich against the commit marker (improvements/runs.commit) and
-        // returns nil if a writer raced the read (seq moved) or no marker is
-        // provable yet; with no verified-fresh native data, the Swift-only UI
-        // returns an empty list rather than stale state. Mac-only (iOS has no
-        // local runs.json).
+        // Only verified reads may replace the UI's last loaded runs.
         let actor = NativeClient._trainingPromotionActor()
-        if let runs = try? await actor.listImprovementsVerified(),
-           runs.allSatisfy({ $0.objective != nil && $0.status != nil && $0.phase != nil && $0.createdAt != nil }) {
-            return runs
+        guard let runs = try await actor.listImprovementsVerified(),
+              runs.allSatisfy({ $0.objective != nil && $0.status != nil && $0.phase != nil && $0.createdAt != nil }) else {
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -503, userInfo: [
+                NSLocalizedDescriptionKey: "Improvement runs are unavailable because the read could not be verified."
+            ])
         }
-        // No verified-fresh native data in the Swift-only runtime; return empty.
-        return []
+        return runs
     }
 
     func getImprovementSummary() async throws -> ImprovementSummary {
@@ -164,7 +156,7 @@ extension NativeClient {
         config.telegram = await TelegramFacade(dataRoot: dataRoot).configuration()
 
         config.codexAuth = try? await ProvidersFacade(dataRoot: PersistenceCore.defaultDataRoot()).codexAuthStatus()
-        config.modelRouting = Self.readModelRoutingConfig(dataRoot: dataRoot)
+        config.modelRouting = try await Self.readModelRoutingConfig(dataRoot: dataRoot)
         return config
     }
 

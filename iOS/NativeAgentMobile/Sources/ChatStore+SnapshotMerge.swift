@@ -3,7 +3,14 @@ import UIKit
 import NativeAgentShared
 
 extension ChatStore {
-    private func pendingUserMessage(for pendingId: String) -> ChatMessage? {
+    private func publishedAttachmentsMatch(_ left: [ChatAttachmentSummary], _ right: [ChatAttachmentSummary]) -> Bool {
+        left.count == right.count && zip(left, right).allSatisfy {
+            $0.id == $1.id && $0.name == $1.name && $0.type == $1.type
+                && $0.mime == $1.mime && $0.byteSize == $1.byteSize
+        }
+    }
+
+    func pendingUserMessage(for pendingId: String) -> ChatMessage? {
         guard let args = pendingSendArgs[pendingId],
               let appendedUserId = args.appendedUserId else {
             return nil
@@ -39,11 +46,18 @@ extension ChatStore {
     }
 
     private func optimisticMessagesToPreserve(
-        macMessages: [ChatMessage],
-        replyArrived: Bool
+        macMessages: [ChatMessage]
     ) -> [ChatMessage] {
         var preserved: [ChatMessage] = []
-        for pendingId in pendingSendArgs.keys.sorted() {
+        func position(_ pendingId: String) -> Int {
+            let messageId = pendingSendArgs[pendingId]?.appendedUserId ?? pendingICloudPlaceholders[pendingId]
+            return messages.firstIndex(where: { $0.id == messageId }) ?? messages.endIndex
+        }
+        let pendingIds = Set(pendingSendArgs.keys).union(pendingICloudPlaceholders.keys).sorted {
+            let left = position($0), right = position($1)
+            return left == right ? $0 < $1 : left < right
+        }
+        for pendingId in pendingIds {
             // Occurrence-aware containment: with repeated identical user texts,
             // a stale snapshot holding only an EARLIER occurrence must not
             // suppress the pending one (it would vanish while in flight).
@@ -52,8 +66,7 @@ extension ChatStore {
                indexOfUserOccurrence(user, in: macMessages) == nil {
                 preserved.append(user)
             }
-            if !replyArrived,
-               let placeholderId = pendingICloudPlaceholders[pendingId],
+            if let placeholderId = pendingICloudPlaceholders[pendingId],
                let placeholder = messages.first(where: { $0.id == placeholderId }),
                !macMessages.contains(where: { $0.id == placeholder.id }) {
                 preserved.append(placeholder)
@@ -63,7 +76,7 @@ extension ChatStore {
         if preserved.isEmpty, isLoading {
             let tail = messages.suffix(2)
             preserved = tail.filter { candidate in
-                if candidate.isStreaming { return !replyArrived }
+                if candidate.isStreaming { return true }
                 if candidate.role == .user {
                     return self.indexOfUserOccurrence(candidate, in: macMessages) == nil
                 }
@@ -124,8 +137,8 @@ extension ChatStore {
     private func snapshotMessageMatches(_ snapshot: ChatMessage, local: ChatMessage) -> Bool {
         if snapshot.id == local.id { return true }
         guard snapshot.role == local.role else { return false }
-        if local.role == .user, !local.attachments.isEmpty {
-            guard snapshot.attachments == local.attachments else { return false }
+        if local.role == .user {
+            guard publishedAttachmentsMatch(snapshot.attachments, local.attachments) else { return false }
             // Attachment-only sends may carry empty text — attachments equality
             // IS the match then (snapshotTextMatches rejects empty text).
             if local.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -135,11 +148,26 @@ extension ChatStore {
         return snapshotTextMatches(snapshot, local: local)
     }
 
+    /// Keep local detail when the ordered merge replaces a matched message's id.
+    /// Snapshot attachments retain authority; only bytes for the same id carry over.
+    private func preservingLocalDetails(_ local: ChatMessage, in snapshot: ChatMessage) -> ChatMessage {
+        var matched = snapshot
+        // A matching Mac row completes the receipt's publication handoff.
+        matched.awaitingMacTranscript = false
+        if matched.text.hasSuffix(Self.snapshotTruncationMarker) {
+            matched.text = local.text
+        }
+        for index in matched.attachments.indices where matched.attachments[index].base64 == nil {
+            let id = matched.attachments[index].id
+            matched.attachments[index].base64 = local.attachments.first(where: { $0.id == id })?.base64
+        }
+        return matched
+    }
+
     // Internal (not private) so ChatStoreMergeTests can pin the stale-snapshot
     // guard semantics directly.
     func mergedMacMessagesPreservingPending(
-        _ macMessages: [ChatMessage],
-        replyArrived: Bool
+        _ macMessages: [ChatMessage]
     ) -> [ChatMessage] {
         // 2026-09-06: reply SELECTION already refuses a regenerated-away row,
         // but the merge did not: the anchor walk appends every unmatched
@@ -178,17 +206,14 @@ extension ChatStore {
                     merged.append(flushed)
                     unconsumedFlushedIds.insert(flushed.id)
                 }
-                var matched = macMessages[j]
-                if matched.text.hasSuffix(Self.snapshotTruncationMarker) {
-                    matched.text = local.text
-                }
-                merged.append(matched)
+                merged.append(preservingLocalDetails(local, in: macMessages[j]))
                 cursor = macMessages.index(after: j)
-            } else if retainedIDs.contains(local.id) || (localArrivalDates[local.id] ?? .distantPast) >= preserveFloor {
-                if let twinId = merged.first(where: {
+            } else if local.awaitingMacTranscript || retainedIDs.contains(local.id) || (localArrivalDates[local.id] ?? .distantPast) >= preserveFloor {
+                if let twinIndex = merged.firstIndex(where: {
                     unconsumedFlushedIds.contains($0.id) && snapshotMessageMatches($0, local: local)
-                })?.id {
-                    unconsumedFlushedIds.remove(twinId)        // local is that row's twin
+                }) {
+                    unconsumedFlushedIds.remove(merged[twinIndex].id) // local is that row's twin
+                    merged[twinIndex] = preservingLocalDetails(local, in: merged[twinIndex])
                 } else if !merged.contains(where: { $0.id == local.id }) {
                     merged.append(local)
                 }
@@ -198,20 +223,13 @@ extension ChatStore {
         }
         merged.append(contentsOf: macMessages[cursor...])
 
-        for candidate in optimisticMessagesToPreserve(macMessages: macMessages, replyArrived: replyArrived) {
+        for candidate in optimisticMessagesToPreserve(macMessages: macMessages) {
             if merged.contains(where: { $0.id == candidate.id }) { continue }
             if candidate.role == .user,
                indexOfUserOccurrence(candidate, in: merged) != nil {
                 continue
             }
-            if candidate.role == .user,
-               replyArrived,
-               let reply = newestMacAssistantReply(merged),
-               let replyIndex = merged.firstIndex(where: { $0.id == reply.id }) {
-                merged.insert(candidate, at: replyIndex)
-            } else {
-                merged.append(candidate)
-            }
+            merged.append(candidate)
         }
         return carryForwardToolEvents(into: merged)
     }
@@ -257,16 +275,8 @@ extension ChatStore {
             guard macMessage.text.trimmingCharacters(in: .whitespacesAndNewlines) == candidateText else {
                 return false
             }
-            if !candidate.attachments.isEmpty {
-                return macMessage.attachments == candidate.attachments
-            }
-            return true
+            return publishedAttachmentsMatch(macMessage.attachments, candidate.attachments)
         }
-    }
-
-    func macAssistantReplyArrived(_ macMessages: [ChatMessage]) -> Bool {
-        guard isLoading, !pendingICloudPlaceholders.isEmpty else { return false }
-        return newestMacAssistantReply(macMessages) != nil
     }
 
     /// Occurrence-aware anchor for a locally-appended user message inside a
@@ -298,10 +308,7 @@ extension ChatStore {
             guard m.role == .user else { return false }
             if m.id == candidate.id { return true }
             guard occurrenceClassText(m) == candidateClass else { return false }
-            if candidateClass.isEmpty || !candidate.attachments.isEmpty {
-                return m.attachments == candidate.attachments
-            }
-            return true
+            return publishedAttachmentsMatch(m.attachments, candidate.attachments)
         }
         // Head-anchored occurrence rank. Known tradeoff: an aged identical local
         // row outside the snapshot's suffix(80) window inflates N, so a fresh
@@ -324,7 +331,7 @@ extension ChatStore {
         return nil
     }
 
-    func newestMacAssistantReply(_ macMessages: [ChatMessage]) -> ChatMessage? {
+    private func macAssistantReply(for pendingId: String, in macMessages: [ChatMessage]) -> ChatMessage? {
         // Positional containment gate: a reply to the pending send can only sit
         // AFTER the pending user message in the snapshot (the Mac transcript is
         // append-ordered). A stale snapshot either lacks the pending user
@@ -341,16 +348,20 @@ extension ChatStore {
         // replaced. Exclude those ids from every candidate lane below.
         let localAssistantIDs = Set(messages.filter { $0.role == .assistant && !$0.isStreaming }.map(\.id))
             .union(regeneratedAwayAssistantIDs)
-        if let pendingId = pendingICloudPlaceholders.keys.first,
-           let pendingUser = pendingUserMessage(for: pendingId) {
+        if let pendingUser = pendingUserMessage(for: pendingId) {
             guard let userIndex = indexOfUserOccurrence(pendingUser, in: macMessages) else {
                 return nil
             }
-            let tail = macMessages[macMessages.index(after: userIndex)...]
+            let start = macMessages.index(after: userIndex)
+            let end = macMessages[start...].firstIndex(where: { $0.role == .user }) ?? macMessages.endIndex
+            let tail = macMessages[start..<end]
             return tail.last(where: { $0.role == .assistant && !localAssistantIDs.contains($0.id) })
         }
-        // No pending-user info (e.g. appendUser:false regenerate/retry sends):
-        // pre-existing last-assistant heuristic, unchanged scope.
+        // Regeneration has no appended user. Only a sole, retained request
+        // can own the last user interval without an explicit anchor.
+        guard !regeneratedAwayAssistantIDs.isEmpty,
+              pendingSendArgs[pendingId] != nil,
+              pendingICloudPlaceholders.count == 1 else { return nil }
         if let lastUserIndex = macMessages.lastIndex(where: { $0.role == .user }) {
             let tail = macMessages[macMessages.index(after: lastUserIndex)...]
             if let reply = tail.last(where: { $0.role == .assistant && !localAssistantIDs.contains($0.id) }) {
@@ -361,41 +372,30 @@ extension ChatStore {
     }
 
     func resolvePendingReplyFromMac(_ macMessages: [ChatMessage]) -> Bool {
-        guard let pendingId = pendingICloudPlaceholders.keys.first,
-              let reply = newestMacAssistantReply(macMessages) else {
-            return false
+        let matches = pendingICloudPlaceholders.keys.sorted().compactMap { pendingId -> (String, UUID, ChatMessage, [ToolEvent])? in
+            guard let placeholderId = pendingICloudPlaceholders[pendingId],
+                  let reply = macAssistantReply(for: pendingId, in: macMessages) else { return nil }
+            let events = messages.first(where: { $0.id == placeholderId })?.toolEvents ?? []
+            return (pendingId, placeholderId, reply, events)
         }
-        let placeholderId = pendingICloudPlaceholders[pendingId]
-        // Capture the placeholder's tool events BEFORE the merge replaces it with
-        // the Mac-id reply, so the collapsed box carries over to the new id.
-        let carriedEvents = placeholderId
-            .flatMap { id in messages.first(where: { $0.id == id })?.toolEvents } ?? []
-        let merged = mergedMacMessagesPreservingPending(macMessages, replyArrived: true)
-        if merged.map(\.id) != messages.map(\.id) {
-            messages = merged
-        }
-        markICloudReplyResolved(pendingId)
-        pendingICloudPlaceholders.removeValue(forKey: pendingId)
-        pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
-        pendingPolls.removeValue(forKey: pendingId)?.cancel()
-        if let placeholderId {
+        guard !matches.isEmpty else { return false }
+        // Retire only matched exchanges before merging. Every other bubble
+        // remains owned by its pending record, even if this snapshot has replies.
+        for (pendingId, placeholderId, _, _) in matches {
+            markICloudReplyResolved(pendingId)
+            pendingICloudPlaceholders.removeValue(forKey: pendingId)
+            cancelReplyWaits(for: pendingId)
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
+            cancelTypewriter(placeholderId)
+            messages.removeAll { $0.id == placeholderId }
+        }
+        messages = mergedMacMessagesPreservingPending(macMessages)
+        for (_, placeholderId, reply, events) in matches {
+            stampToolEvents(events, onMessageWithId: reply.id)
+            releaseLoading(for: placeholderId)
+            onReply?(reply.text)
         }
         isPollingFallback = false
-        if let placeholderId, messages.contains(where: { $0.id == placeholderId }) {
-            finishPlaceholder(id: placeholderId, text: reply.text)
-            stampToolEvents(carriedEvents, onMessageWithId: placeholderId)
-        } else if !messages.contains(where: { $0.id == reply.id }) {
-            var finalReply = reply
-            if finalReply.toolEvents.isEmpty { finalReply.toolEvents = carriedEvents }
-            messages.append(finalReply)
-        } else {
-            stampToolEvents(carriedEvents, onMessageWithId: reply.id)
-        }
-        if pendingICloudPlaceholders.isEmpty {
-            isLoading = false
-        }
-        onReply?(reply.text)
         persistMessages()
         return true
     }

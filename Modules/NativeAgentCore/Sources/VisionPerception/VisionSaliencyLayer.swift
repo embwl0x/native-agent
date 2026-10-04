@@ -120,7 +120,7 @@ public enum VisionSaliencyLayer {
             ))
             added += 1
         }
-        return ranked.sorted(by: VisionColorRegionLayer.readingOrder)
+        return VisionColorRegionLayer.readingOrder(ranked)
     }
 }
 

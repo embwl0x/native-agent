@@ -65,7 +65,17 @@ extension BackgroundLoopsAssembly {
                 let engine = usesLiveAppBody ? NativeAgentEngine.live : NativeAgentEngine(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot), hasBody: false)
                 return engine.chatClient(tools: tools)
             },
-            gatedTools: gatedTools, notify: workshopInboxNotification
+            gatedTools: gatedTools,
+            approvedTools: { replay in
+                makeGatedToolDispatchClient(
+                    tools: SwiftToolDispatcher(
+                        dataRoot: dataRoot, allowProcessGlobalTools: usesLiveAppBody,
+                        providerLifecycleObserver: cognition,
+                        macIntegrationBridge: usesLiveAppBody ? MacIntegrationBridgeImpl() : nil,
+                        agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)),
+                    fileAccess: "auto", dataRoot: dataRoot, approvedReplay: replay)
+            },
+            notify: workshopInboxNotification
         )
     }
 

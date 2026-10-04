@@ -40,11 +40,13 @@ public enum DeskOpBody: Sendable, Equatable {
     case settleWorkSession(reservationId: String, receipt: String, disposition: DeskWorkDisposition, artifactRefs: [String])
     case reserveWorkAttempt(attemptId: String, lane: DeskWorkAttempt.Lane, day: String, slot: String)
     case completeWorkAttempt(attemptId: String, receipt: String)
+    case handOffWorkReceipt(reservationId: String)
     case workLog(receipt: String)   // desk_work_log — a plain work receipt note
     // Sequencing seam. Both REPLACE (never merge) so the op is the whole truth
     // of the field at that point in the feed.
     case setBlockedOn(handles: [String])   // replaces the WHOLE blocker set
     case setDeferUntil(until: String?)     // nil / "" CLEARS the parked date
+    case setContinuation(record: DeskContinuation)
 
     public var token: String {
         switch self {
@@ -66,9 +68,11 @@ public enum DeskOpBody: Sendable, Equatable {
         case .settleWorkSession: return "complete_work_session"
         case .reserveWorkAttempt: return "reserve_work_attempt"
         case .completeWorkAttempt: return "complete_work_attempt"
+        case .handOffWorkReceipt: return "hand_off_work_receipt"
         case .workLog: return "work_log"
         case .setBlockedOn: return "set_blocked_on"
         case .setDeferUntil: return "set_defer_until"
+        case .setContinuation: return "set_continuation"
         }
     }
 }
@@ -169,6 +173,8 @@ public struct DeskOp: Sendable, Equatable {
         case let .completeWorkAttempt(attemptId, receipt):
             obj["attemptId"] = .string(attemptId)
             obj["receipt"] = .string(receipt)
+        case let .handOffWorkReceipt(reservationId):
+            obj["reservationId"] = .string(reservationId)
         case let .workLog(receipt):
             obj["receipt"] = .string(receipt)
         case let .setBlockedOn(handles):
@@ -180,6 +186,8 @@ public struct DeskOp: Sendable, Equatable {
         case let .setDeferUntil(until):
             // Same reason: "" IS the clear and must survive the round-trip.
             obj["until"] = .string(until ?? "")
+        case let .setContinuation(record):
+            obj["continuation"] = record.toJSON()
         }
         return .object(obj)
     }
@@ -191,6 +199,10 @@ public struct DeskOp: Sendable, Equatable {
               let token = jsonString(obj, "op"),
               let handle = jsonString(obj, "handle") else { return nil }
         let body: DeskOpBody
+        if token == "set_continuation" {
+            guard let value = obj["continuation"], let record = DeskContinuation.fromJSON(value) else { return nil }
+            return DeskOp(opId: opId, ts: ts, handle: handle, body: .setContinuation(record: record))
+        }
         switch token {
         case "create_item":
             guard let alias = jsonString(obj, "alias"),
@@ -292,6 +304,9 @@ public struct DeskOp: Sendable, Equatable {
         case "work_log":
             guard let receipt = jsonString(obj, "receipt") else { return nil }
             body = .workLog(receipt: receipt)
+        case "hand_off_work_receipt":
+            guard let reservationId = jsonString(obj, "reservationId") else { return nil }
+            body = .handOffWorkReceipt(reservationId: reservationId)
         case "set_blocked_on":
             // Absent / wrong-typed → [] , which is the CLEAR. The op is a
             // whole-set replace, so there is nothing to preserve on a partial read.

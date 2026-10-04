@@ -36,7 +36,7 @@ public enum EvolutionProposalStatus: String, Sendable, Codable, CaseIterable {
     /// transition exits — their remove path is `sweep(olderThanDays:)`, which
     /// closes the state-lifecycle loop.
     public static let legalTransitions: [EvolutionProposalStatus: Set<EvolutionProposalStatus>] = [
-        .needsDiff: [.proposed, .denied],
+        .needsDiff: [.denied],
         .proposed: [.building, .denied],
         .building: [.candidateGreen, .candidateFailed],
         .candidateGreen: [.staged, .denied],
@@ -226,34 +226,6 @@ public actor EvolutionProposalStore {
         return proposal
     }
 
-    /// Attach a diff to a `needs_diff` proposal → `proposed`. CAS'd.
-    @discardableResult
-    public func attachDiff(
-        id: String,
-        diffText: String,
-        expectedHead: String? = nil
-    ) async throws -> EvolutionProposal {
-        let trimmed = diffText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw EvolutionEngineError.underlying("attachDiff: empty diff refused")
-        }
-        let stamp = EvolutionSupport.isoTimestamp(now())
-        let (proposal, _) = try await mutateOne(id: id) { p -> Bool in
-            guard p.status == .needsDiff else {
-                throw EvolutionEngineError.illegalTransition(
-                    id: id, from: p.status.rawValue, to: EvolutionProposalStatus.proposed.rawValue)
-            }
-            p.diffText = diffText
-            p.diffSHA256 = EvolutionSupport.sha256Hex(diffText)
-            if let expectedHead { p.expectedHead = expectedHead }
-            p.status = .proposed
-            p.updatedAt = stamp
-            p.receipts.append(EvolutionReceipt(at: stamp, kind: "diff_attached", detail: "sha256=\(p.diffSHA256 ?? "")"))
-            return true
-        }
-        return proposal
-    }
-
     /// CAS transition under flock. `require` adds an explicit precondition on
     /// the current status beyond the legal-edge table; pass nil to rely on the
     /// table alone. Illegal edge or failed precondition → `applied: false`
@@ -312,7 +284,8 @@ public actor EvolutionProposalStore {
     /// records are never swept. Returns count removed.
     ///
     /// `needs_diff` IS SWEPT FIRST, by expiry rather than deletion. Nothing in
-    /// the app can attach a diff or withdraw such a row, so the live store held
+    /// the app attaches a diff to such a row (a diff is filed as a new
+    /// proposal), so the live store held
     /// 38 of them with the oldest from 2026-06-16 — a queue with no drain and no
     /// exit. A row that has waited out the whole retention window is denied with
     /// an exact reason, which is a legal edge (`needsDiff -> denied`) and a

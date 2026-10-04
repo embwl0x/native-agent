@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ProviderRouting
 
 // MARK: - Prompt prefix health (Runtime)
 //
@@ -37,8 +38,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
     private let root: URL
     private let now: @Sendable () -> Date
-    /// Injectable so a test never reads (or needs) the real user default.
-    private let killSwitchRaw: @Sendable () -> String?
     /// The build whose behavior this row is allowed to grade.
     private let identity: NativeAgentBuildIdentity
     private let cache: DoctorScanCache
@@ -70,16 +69,12 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     public init(
         root: URL = defaultDataRoot(),
         now: @escaping @Sendable () -> Date = { Date() },
-        killSwitchRaw: (@Sendable () -> String?)? = nil,
         identity: NativeAgentBuildIdentity = .current,
         cacheTTL: TimeInterval = 60
     ) {
         self.root = root
         self.now = now
         self.identity = identity
-        self.killSwitchRaw = killSwitchRaw ?? {
-            UserDefaults.standard.string(forKey: ConversationPrefixShape.defaultsKey)
-        }
         self.cache = DoctorScanCache(ttl: cacheTTL)
     }
 
@@ -169,16 +164,22 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     ignoredSurfaces += 1
                     return
                 }
-                if let input = row.payload["inputTokens"]?.intValue,
+                let provider = row.payload["provider"]?.stringValue ?? "unknown"
+                let usage = LLMUsage(
+                    inputTokens: row.payload["inputTokens"]?.intValue,
+                    cacheReadInputTokens: row.payload["cacheReadInputTokens"]?.intValue,
+                    cacheCreationInputTokens: row.payload["cacheCreationInputTokens"]?.intValue
+                )
+                if let input = usage.logicalInputTokens(provider: provider),
                    input < minimumCacheInputTokens {
                     ignoredSmallCalls += 1
                     return
                 }
                 let shape = row.payload["shapeVersion"]?.stringValue
                 switch shape {
-                case ConversationPrefixShape.v2Prefix.rawValue:
+                case "v2Prefix":
                     v2CallCount += 1
-                case ConversationPrefixShape.v1Legacy.rawValue:
+                case "v1Legacy":
                     v1CallCount += 1
                     return
                 default:
@@ -188,7 +189,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     return
                 }
 
-                let provider = row.payload["provider"]?.stringValue ?? "unknown"
                 guard !row.turnId.isEmpty else { return }
                 let observation = TurnObservation(
                     sessionId: row.sessionId ?? "unknown",
@@ -261,11 +261,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     + " trace day(s) read and \(summary.matchedRows) row(s) in window, but not"
                     + " one eligible chat call used the current prompt format. Nothing about prefix reuse"
                     + " can be measured. \(shapeLine)\(coverageDetail)",
-                repair: v1CallCount > 0
-                    ? "The v2 prefix shape appears to be rolled back. Clear the"
-                        + " \(ConversationPrefixShape.defaultsKey) user default to return to"
-                        + " the production default."
-                    : nil
+                repair: nil
             )
         }
 
@@ -501,7 +497,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             )
             repair = "The v2 prefix is not being reused. Check that the identity block is still"
                 + " a strict prefix of the stable block and that only one cache breakpoint sits"
-                + " at the end of the stable mass (ConversationPrefixShape.v2Prefix)."
+                + " at the end of the stable mass (v2Prefix)."
         } else if !anthropicBelowFloor.isEmpty, v2FirstCalls.count >= minimumHitRateTurns {
             status = "warn"
             parts.append(
@@ -531,23 +527,10 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         return named + (overflow > 0 ? ", +\(overflow) more" : "")
     }
 
-    /// (d) The kill switch, said out loud, so a silent rollback is visible in
-    /// the row instead of only in a user default nobody inspects.
+    /// Historical trace formats remain identifiable after the switch retires.
     private func shapeMixLine(v2: Int, v1: Int, unshaped: Int) -> String {
-        let raw = killSwitchRaw()
-        let parsed = ConversationPrefixShape.parse(raw)
-        let switchState: String
-        switch (raw, parsed) {
-        case (let raw?, let parsed?) where !raw.isEmpty:
-            switchState = "\(ConversationPrefixShape.defaultsKey)=\(parsed.rawValue) (set by hand)"
-        case (let raw?, nil) where !raw.isEmpty:
-            switchState = "\(ConversationPrefixShape.defaultsKey)=\"\(raw)\" (UNPARSEABLE — the"
-                + " runtime ignores it and uses the v2Prefix default)"
-        default:
-            switchState = "\(ConversationPrefixShape.defaultsKey) unset → v2Prefix default"
-        }
         return "shape mix over the window: v2Prefix=\(v2) call(s), v1Legacy=\(v1),"
-            + " no shapeVersion field=\(unshaped); \(switchState)"
+            + " no shapeVersion field=\(unshaped)"
     }
 
     /// (c) volatile block size distribution. Percentiles, not a mean — one

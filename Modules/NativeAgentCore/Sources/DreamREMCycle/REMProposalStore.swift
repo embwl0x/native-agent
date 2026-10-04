@@ -41,6 +41,8 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
     /// reads this: a thing dwelt on is offered deliberately, under its own
     /// name, and is never presented as a pattern.
     public var support: REMSupportKind?
+    /// Phase 5 C1: the circumstance behind the lesson (`REMProposal.whatChanged`).
+    public var whatChanged: String?
 
     public init(
         id: String,
@@ -53,8 +55,10 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
         approvalId: String? = nil,
         supportingPassages: [REMSupportingPassage]? = nil,
         livedDates: [String]? = nil,
-        support: REMSupportKind? = nil
+        support: REMSupportKind? = nil,
+        whatChanged: String? = nil
     ) {
+        self.whatChanged = whatChanged
         self.id = id
         self.targetDoc = targetDoc
         self.proposalText = proposalText
@@ -84,7 +88,8 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
             status: status,
             supportingPassages: proposal.supportingPassages,
             livedDates: proposal.livedDates,
-            support: proposal.support
+            support: proposal.support,
+            whatChanged: proposal.whatChanged
         )
     }
 
@@ -99,7 +104,8 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
             createdAt: createdAt,
             supportingPassages: supportingPassages,
             livedDates: livedDates,
-            support: support
+            support: support,
+            whatChanged: whatChanged
         )
     }
 }
@@ -383,6 +389,8 @@ public struct REMProposalStore: Sendable {
     ) async throws -> AppendReceipt {
         guard !proposals.isEmpty else { return AppendReceipt(appended: 0) }
         return try await lockCore.withFileLock(proposalsURL) {
+            // Compaction can throw; finish it before committing new proposals.
+            try await self.compactIfNeededLocked()
             // Dedupe against base AND feed: an id folded to base is a settled
             // decision, and re-appending it as pending would shadow it
             // (gpt-5.5 fix round, HIGH). Corrupt base (nil) degrades to
@@ -419,7 +427,6 @@ public struct REMProposalStore: Sendable {
             if let line = receipt.droppedLogLine {
                 FileHandle.standardError.write(Data((line + "\n").utf8))
             }
-            try await self.compactIfNeededLocked()
             return receipt
         }
     }

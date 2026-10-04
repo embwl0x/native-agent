@@ -1,3 +1,4 @@
+import ChatToolParsing
 import Foundation
 import CryptoKit
 import NativeAgentCore
@@ -41,7 +42,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
     let history: SessionHistoryReader
     let persistence: any PersistenceCoreProtocol
     let dataRoot: URL
-    let activeToolsStore: ActiveToolsStore
     let turnTraceBus: TurnTraceBus
     let trust: SwiftNativeTrustCenter
     let approvalFiler: (any ApprovalFiler)?
@@ -49,6 +49,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
     let historyLimit: Int
     let toolLoopMaxIterationsOverride: Int?
     let turnWallClockSecondsOverride: TimeInterval?
+    let continuationCapabilityProfile: String?
     let promoter: (any MemoryPromoting)?
     let cognitiveObserver: (any CognitiveEventObserving)?
     let cognitiveContextProvider: (any CognitiveContextProviding)?
@@ -60,10 +61,9 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         engine: SwiftNativeTurnEngine,
         tools: any ToolDispatchClient,
         llm: any LLMClient,
-        history: SessionHistoryReader = SessionHistoryReader(),
+        history: SessionHistoryReader? = nil,
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        activeToolsStore: ActiveToolsStore? = nil,
         turnTraceBus: TurnTraceBus? = nil,
         trust: SwiftNativeTrustCenter? = nil,
         approvalFiler: (any ApprovalFiler)? = nil,
@@ -71,6 +71,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         historyLimit: Int = 400,
         toolLoopMaxIterations: Int? = nil,
         turnWallClockSeconds: TimeInterval? = nil,
+        continuationCapabilityProfile: String? = nil,
         promoter: (any MemoryPromoting)? = nil,
         cognitiveObserver: (any CognitiveEventObserving)? = nil,
         cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
@@ -78,23 +79,19 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         autocompactionConfig: ChatSessionAutocompactionConfig = .productionDefault(),
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
-        // The tool-call guard lets a read recur in one reply but never an
-        // action: parallel-safe tools are reads, and a bare `workspace` call
-        // is her home screen.
-        RunawayOutputDetector.registerReadOnlyCalls { name, bare in
-            ParallelToolDispatch.isParallelSafe(internalToolName: name) || (name == "workspace" && bare)
+        // Reuse the executable parser; malformed or unknown calls remain actions.
+        RunawayOutputDetector.registerReadOnlyCalls { block in
+            let calls = ToolCallParser.parse(block, parseInvoke: true)
+            guard calls.count == 1, let call = calls.first, call.undeclaredKeys.isEmpty else { return false }
+            if call.name == "app" { return RunawayOutputDetector.isAppReadOnly(call.input) }
+            return ParallelToolDispatch.isParallelSafe(internalToolName: call.name)
         }
         self.engine = engine
         self.tools = tools
         self.llm = llm
-        self.history = history
+        self.history = history ?? SessionHistoryReader(dataRoot: dataRoot)
         self.persistence = persistence
         self.dataRoot = dataRoot
-        // The engine and client participate in one tool loop. Default to the
-        // engine's exact store rather than independently deriving another
-        // actor from dataRoot; direct test/custom constructions therefore
-        // cannot split same-turn load and cleanup state across two owners.
-        self.activeToolsStore = activeToolsStore ?? engine.activeToolsStore
         self.turnTraceBus = turnTraceBus ?? engine.turnTraceBus
         // Resolve trust against the SAME dataRoot the client is bound to.
         // Default params can't reference other params in Swift, so this is an
@@ -107,6 +104,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         self.historyLimit = historyLimit
         self.toolLoopMaxIterationsOverride = toolLoopMaxIterations
         self.turnWallClockSecondsOverride = turnWallClockSeconds
+        self.continuationCapabilityProfile = continuationCapabilityProfile
         self.promoter = promoter
         self.cognitiveObserver = cognitiveObserver
         let runtime = cognitiveObserver as? (any CognitiveRuntimeProviding)
@@ -249,15 +247,8 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
             requestedModel: model,
             requestedReasoningEffort: reasoningEffort
         )
-        // v2Prefix: the adapters read ONLY the task-local override (never
-        // `.effective`), so EVERY outer turn entry has to resolve it once and
-        // bind it. This is the non-streaming entry — the streaming facade wraps
-        // its own; an entry that forgot would silently ship v1 wire layout for a
-        // v2-shaped body.
-        let prefixShape = ConversationPrefixShape.effective
         let prefixTelemetrySink = ConversationPrefixTelemetrySink()
         return try await ConversationPrefixTelemetry.$sink.withValue(prefixTelemetrySink) {
-        try await ConversationPrefixShape.$override.withValue(prefixShape) {
         try await LLMCallContext.$admittedModel.withValue(admission.modelId) {
         try await LLMCallContext.$providerId.withValue(admission.providerId) {
         try await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
@@ -285,7 +276,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
             let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
             response.requestedModel = requested.isEmpty ? nil : requested
             return response
-        }
         }
         }
         }

@@ -23,7 +23,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -45,7 +44,7 @@ import DeviceSync
 
 @MainActor
 @Observable
-final class AppModel {
+final class AppModel: Sendable {
     /// Global toast/status surface. Views overlay SystemToastBar(center:) and
     /// any code path can call appModel.systemToasts.push(...).
     let systemToasts = SystemToastCenter()
@@ -106,16 +105,6 @@ final class AppModel {
     // (Telegram, SearXNG, native runtime setting) actually save when toggled.
     private(set) var nativeBaseURL: String = NativeBaseURLDefaults.read() {
         didSet { NativeBaseURLDefaults.write(nativeBaseURL) }
-    }
-
-    /// Commit the compatibility URL only after validation. NativeAgent's
-    /// in-process Swift runtime remains the runtime owner; this does not
-    /// establish a fallback daemon connection.
-    @discardableResult
-    func configureNativeBaseURL(_ value: String) throws -> String {
-        let normalized = try NativeBaseURLDefaults.normalized(value)
-        nativeBaseURL = normalized
-        return normalized
     }
 
     var searxngBaseURL: String = UserDefaults.standard.string(forKey: "searxngBaseURL") ?? "" {
@@ -179,56 +168,52 @@ final class AppModel {
         didSet { UserDefaults.standard.set(telegramReasoningEffort, forKey: "telegramReasoningEffort") }
     }
 
-    /// 2026-06-05 picker-sync: read providers/surfaces.json and sync local
-    /// chat/telegram bar picker state to whatever it says. Called on app init
-    /// so the chat-bar UserDefaults cache can't drift from disk truth.
+    /// The bars cache the same checked selection every other door reads.
     @MainActor
     func refreshSurfacePickerCache() async {
-        let path = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("providers", isDirectory: true)
-            .appendingPathComponent("surfaces.json")
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return }
-        func entryFor(_ surface: String) -> (model: String?, effort: String?, serviceTier: String?) {
-            if let inner = obj[surface] as? [String: Any] {
-                return (
-                    inner["model"] as? String,
-                    inner["reasoningEffort"] as? String ?? inner["reasoning_effort"] as? String,
-                    inner["serviceTier"] as? String ?? inner["service_tier"] as? String
-                )
+        let saveGeneration = chatBrainSaveGeneration
+        let chatWasSaving = isSavingChatBrain
+        do {
+            let snapshot = try await engine.providers.routing.checkedRoutingSnapshot()
+            applySurfacePickerSnapshot(snapshot, applyChat: !chatWasSaving
+                && !isSavingChatBrain && saveGeneration == chatBrainSaveGeneration)
+        } catch {
+            if !chatWasSaving && !isSavingChatBrain && saveGeneration == chatBrainSaveGeneration {
+                chatModel = ""
+                chatReasoningEffort = ""
+                chatFastMode = false
+                chatBrainCanonicalSelection = nil
             }
-            if let flat = obj[surface] as? String, !flat.isEmpty {
-                return (flat, nil, nil)
-            }
-            return (nil, nil, nil)
+            telegramModel = ""
+            telegramReasoningEffort = ""
+            statusText = error.localizedDescription
         }
-        let chat = entryFor("chat")
-        if let m = chat.model, !m.isEmpty, m != chatModel { chatModel = m }
-        if let e = chat.effort, !e.isEmpty, e != chatReasoningEffort { chatReasoningEffort = e }
-        if let tier = chat.serviceTier {
-            chatFastMode = tier == "priority"
-        }
-        if let model = chat.model, !model.isEmpty {
+    }
+
+    func applySurfacePickerSnapshot(_ snapshot: ProviderRoutingSnapshot, applyChat: Bool = true) {
+        if applyChat, let chat = snapshot.preferences["chat"] {
+            chatModel = chat.model
+            chatReasoningEffort = chat.reasoningEffort
+            chatFastMode = chat.serviceTier == "priority"
+            chatProvider = snapshot.activeProviders["chat"] ?? ""
             chatBrainCanonicalSelection = ChatBrainSelection(
-                model: model,
-                reasoningEffort: chat.effort ?? chatReasoningEffort,
-                fastMode: chat.serviceTier.map { $0 == "priority" } ?? chatFastMode
+                model: chat.model, reasoningEffort: chat.reasoningEffort, fastMode: chatFastMode
             )
         }
-        let tg = entryFor("telegram")
-        if let m = tg.model, !m.isEmpty, m != telegramModel { telegramModel = m }
-        if let e = tg.effort, !e.isEmpty, e != telegramReasoningEffort { telegramReasoningEffort = e }
+        if let telegram = snapshot.preferences["telegram"] {
+            telegramModel = telegram.model
+            telegramReasoningEffort = telegram.reasoningEffort
+        }
     }
 
     var telegramTokenConfigured = false
     /// Last checked form values, used only to preserve unsaved UI edits.
     var telegramSettingsDraftBaseline: TelegramSettingsDraftSnapshot?
     var telegramSettingsReadID: UUID?
-    /// Memories waiting for review, as Today last counted them; the rail's dot
-    /// on Today reads this and the pending approvals, the same two the page's
-    /// waiting card reads, so the two can never disagree.
-    var todayWaitingMemories = 0
+    /// The one "needs you" count (WorkOverviewRead's Needs you): Today's header
+    /// and rail dot, the Simple card and the widget read it. Nil while part of
+    /// the overview could not be read.
+    var ownerWaitingCount: Int?
     var telegramEnabled = false
     var isSavingTelegram = false
     /// The Telegram settings surface owns this receipt. `statusText` remains
@@ -253,23 +238,15 @@ final class AppModel {
         didSet {
             guard activeChatSessionId != oldValue else { return }
             persistActiveChatSessionID(activeChatSessionId.isEmpty ? nil : activeChatSessionId)
-            UserDefaults.standard.set(ISO8601DateFormatter().string(from: Date()), forKey: "activeChatSessionUpdatedAt")
             MacChatUnreadSessions.shared.markRead(activeChatSessionId)
             NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: true)
         }
     }
-    var latestContextReceiptBySession: [String: ContextReceipt] = [:]
-
     /// The active session's loaded transcript (`engine.transcripts`).
     var chatMessages: [ChatMessage] {
         get { engine.transcripts.messages(for: activeChatSessionId) }
         set { engine.transcripts.setMessages(newValue, for: activeChatSessionId) }
     }
-    var latestContextReceipt: ContextReceipt? {
-        get { latestContextReceiptBySession[activeChatSessionId] }
-        set { latestContextReceiptBySession[activeChatSessionId] = newValue }
-    }
-
     // M12 (2026-07-09): `refreshForSidebarItem` is a wall of
     // `try? await api.getX() ?? existingValue`. When the backend is dead every
     // one of those falls back to the previous value and the panel renders
@@ -290,19 +267,6 @@ final class AppModel {
         return hasContent ? .content : .empty
     }
 
-    static func detachedContextReceiptWarning(
-        history: CompactReadPresentationState,
-        receiptStatus: PanelRefreshStatus?
-    ) -> String? {
-        guard receiptStatus?.isStale == true else { return nil }
-        switch history {
-        case .empty, .content:
-            return "Context receipt unavailable; conversation history is still current."
-        case .loading, .unavailable, .stale:
-            return "Context details are also unavailable."
-        }
-    }
-
     /// Last refresh outcome per sidebar panel. Written only by
     /// `refreshForSidebarItem`; read by views via `panelStaleNotice(for:)`.
     var panelRefreshStatus: [SidebarItem: PanelRefreshStatus] = [:]
@@ -311,7 +275,6 @@ final class AppModel {
     /// badge poll cannot erase a stale full-panel warning (or vice versa).
     var sidebarActivityRefreshStatus: PanelRefreshStatus?
     var detachedChatRefreshStatus: [String: PanelRefreshStatus] = [:]
-    var detachedChatContextReceiptRefreshStatus: [String: PanelRefreshStatus] = [:]
 
     /// Set by `performLoadChatState` when the chat message/session fetch threw.
     /// Folded into the `.chat` panel's failed-endpoint list.
@@ -354,6 +317,9 @@ final class AppModel {
     /// over an override. The memory pages observe `engine.memory`.
     @ObservationIgnored let engine: NativeAgentEngine
     @ObservationIgnored var widgetContainerUnavailableLogged = false
+    /// One overview read at a time; edges during a read ask for one more.
+    @ObservationIgnored var workStatusInFlight = false
+    @ObservationIgnored var workStatusDirty = false
     var personality: PersonalityProfile? {
         didSet {
             if oldValue?.name != personality?.name {
@@ -438,7 +404,6 @@ final class AppModel {
     var latestNextGenReceipt: NextGenReceipt?
     var isRunningNextGenAction = false
     var personalityGrowth: PersonalityGrowthSummary?
-    var nativePower: NativePowerSummary?
     var nativeActions: [NativeActionRecord] = []
     var nativeActionReceipts: [NativeActionReceipt] = []
     var notificationStatus: NotificationRuntimeStatus?
@@ -483,7 +448,6 @@ final class AppModel {
     var trainingArtifacts: [TrainingArtifact] = []
     var improvements: [ImprovementRun] = []
     var improvementSummary: ImprovementSummary?
-    var codexDeviceLogin: CodexDeviceLogin?
     var isSavingChatBrain = false
     /// One captured chat-brain tuple. Picker fields are optimistic UI caches;
     /// this value is updated only from a checked canonical read or a successful
@@ -792,12 +756,16 @@ final class AppModel {
         // Render-cost audit F13: these hooks keep `pendingActivityCount`
         // derived from EVERY mutation path, not just the badge refresh — see
         // the invariant note on `recomputePendingActivityCount()`.
-        engine.approvals.recordsDidChange = { [weak self] in self?.recomputePendingActivityCount() }
-        engine.inbox.itemsDidChange = { [weak self] in self?.recomputePendingActivityCount() }
+        engine.approvals.recordsDidChange = { [weak self] in
+            self?.recomputePendingActivityCount()
+            Task { [weak self] in await self?.publishWorkStatus() }
+        }
+        engine.inbox.itemsDidChange = { [weak self] in
+            self?.recomputePendingActivityCount()
+            Task { [weak self] in await self?.publishWorkStatus() }
+        }
         engine.turns.activityDidChange = { [weak self] in
-            if #available(macOS 27, *) {
-                Task { [weak self] in await self?.publishWidgetStatus() }
-            }
+            Task { [weak self] in await self?.publishWorkStatus() }
         }
         // Every policy read or write re-syncs the chat's access mode.
         engine.trust.policyDidChange = { [weak self] in
@@ -814,6 +782,14 @@ final class AppModel {
         }
         guard startBackgroundTasks else { return }
         Task { @MainActor in await self.refreshSurfacePickerCache() }
+        // Every Desk write in this process re-reads the overview, so a new
+        // owner wait counts and pushes whether or not phone sync is on.
+        Task { [weak self] in
+            for await change in StoreChangeBus.shared.changes() where change.store == .desk {
+                guard let self else { return }
+                await publishWorkStatus()
+            }
+        }
         pollScheduler.bind(to: self)
     }
 

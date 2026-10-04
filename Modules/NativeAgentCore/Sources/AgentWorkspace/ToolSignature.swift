@@ -69,6 +69,18 @@ public enum ToolSignature {
         return name + "(" + parts.joined(separator: ", ") + ")"
     }
 
+    /// The same arguments in the `app` door's form (`AppAction.args`): the
+    /// name, `?` when it may be left out or null, then `:shape` unless a string.
+    public static func doorArgs(_ parametersJSON: Data) -> [String] {
+        guard let (props, required) = properties(parametersJSON) else { return [] }
+        return ordered(props, required).map { key in
+            let property = props[key] ?? [:]
+            let nullable = (property["type"] as? [String])?.contains("null") == true
+            let form = shape(property)
+            return key + (required.contains(key) && !nullable ? "" : "?") + (form == "str" ? "" : ":" + form)
+        }
+    }
+
     /// One short line per argument, same order: "steps: up to 12 acts in ONE call…".
     /// Argument names, required and optional, auto-filled ones left out.
     public static func argumentNames(_ parametersJSON: Data) -> (required: [String], optional: [String]) {

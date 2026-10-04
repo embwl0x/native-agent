@@ -407,17 +407,10 @@ extension SwiftNativeChatOrchestrationClient {
         suppressUserAppend: Bool,
         continuation: AsyncThrowingStream<TurnStreamEvent, Error>.Continuation
     ) async {
-        // v2Prefix (2026-09-01): resolve the conversation-prefix shape ONCE per
-        // turn and bind it for the whole turn — same discipline as the pinned
-        // turn clock. A shape that could change between the context build and
-        // the message seeding, or between two tool-loop iterations, would emit
-        // a half-v1/half-v2 request; binding it here makes that unreachable.
-        let prefixShape = ConversationPrefixShape.effective
         // Bound EMPTY here; the lane fills it once the seeded prefix exists, so
         // every `llm.call` row this turn emits carries the same receipts.
         let prefixTelemetrySink = ConversationPrefixTelemetrySink()
         await ConversationPrefixTelemetry.$sink.withValue(prefixTelemetrySink) {
-        await ConversationPrefixShape.$override.withValue(prefixShape) {
         do {
             // App/iOS streaming must use the same structured tool loop as
             // chat()/Telegram while still yielding provider text deltas.
@@ -459,7 +452,6 @@ extension SwiftNativeChatOrchestrationClient {
             return
         }
         continuation.finish()
-        } // ConversationPrefixShape.$override.withValue
         } // ConversationPrefixTelemetry.$sink.withValue
     }
 }

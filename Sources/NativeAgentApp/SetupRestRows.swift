@@ -175,12 +175,11 @@ struct SetupRestRows: View {
     // MARK: Updates
 
     private var updatesRow: some View {
-        // The same two independent facts the Form row resolved: whether this
-        // build has a published feed at all, and whether Sparkle can start
-        // another manual check right now.
+        // Keep the automatic preference separate from manual-check readiness.
         let state = SoftwareUpdateRowPresentation.resolve(
             availableVersion: updateController.status.availableVersion,
             updatesAreAvailable: updateController.updatesAreAvailable,
+            automaticChecksEnabled: updateController.automaticChecksEnabled,
             canCheckForUpdates: updateController.canCheckForUpdates,
             unavailableDetail: updateController.settingsDetail
         )

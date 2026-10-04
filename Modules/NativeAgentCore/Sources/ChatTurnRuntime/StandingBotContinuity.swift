@@ -1,12 +1,16 @@
 import Foundation
+import ChatTurnContracts
 import StandingBots
 import ProviderRouting
 
 /// Adapter only: all history, recall, compaction, tools and approvals belong to
 /// the ordinary chat client. No bot-owned conversational state is maintained.
 public enum StandingBotContinuity {
+    @TaskLocal public static var currentBot: BotDefinition?
+
     public static func session(client: SwiftNativeChatOrchestrationClient, dataRoot: URL) -> BotRunnerSession {
         { bot, message in
+            try await $currentBot.withValue(bot) {
             try await TurnAdmission.shared.run(sessionID: bot.sessionID) {
             // A bot runs on the tuple it was made with, never the agent's route
             // (2026-09-13 review): building NO choice here is exactly what sent
@@ -43,21 +47,46 @@ public enum StandingBotContinuity {
             // writes. Carried, not inferred from `surface`: a person steering
             // into a bot session arrives on the same surface, and what she
             // hears from a person stays appraisable.
-            let response = try await client.chat(message: message, sessionId: bot.sessionID,
-                choice: choice, tokenLimit: bot.budget.tokens, surface: "bot",
-                mechanicalRow: .botReceipt)
-            return BotTurnReply(reply: response.output,
-                artifacts: (response.attachments ?? []).map { attachment in
-                    var artifact = BotArtifact(name: attachment.name ?? "Artifact", path: attachment.path ?? "")
-                    artifact.type = attachment.type; artifact.mime = attachment.mime
-                    artifact.base64 = attachment.base64.isEmpty ? nil : attachment.base64
-                    artifact.byteSize = attachment.byteSize
-                    return artifact
-                }, status: BotRunStatus(rawValue: response.runtimeStatus ?? "completed") ?? .failed,
-                detail: response.statusDetail, model: response.model,
-                approvalID: response.pendingApprovalID)
+            let response: ChatResponse
+            if let event = BotRunQueue.eventProvenance {
+                let source = event.source?.rawValue ?? "remote"
+                response = try await PeerDataTaint.withScope {
+                    PeerDataTaint.markConsumed(
+                        peer: event.verifiedUserID.map { source + ":" + $0 } ?? "an event with no recorded sender",
+                        line: BotRunQueue.eventContext ?? "")
+                    let envelope = TurnEnvelope(
+                        surface: source,
+                        verifiedChatId: event.verifiedChatID,
+                        verifiedUserId: event.verifiedUserID,
+                        declaredRemote: true)
+                    return try await ChatToolSessionContext.$envelope.withValue(envelope) {
+                        try await client.chat(message: message, sessionId: bot.sessionID,
+                            choice: choice, tokenLimit: bot.budget.tokens, surface: "bot",
+                            mechanicalRow: .botReceipt)
+                    }
+                }
+            } else {
+                response = try await client.chat(message: message, sessionId: bot.sessionID,
+                    choice: choice, tokenLimit: bot.budget.tokens, surface: "bot",
+                    mechanicalRow: .botReceipt)
+            }
+            return reply(response)
+            }
             }
         }
+    }
+
+    public static func reply(_ response: ChatResponse) -> BotTurnReply {
+        BotTurnReply(reply: response.output,
+            artifacts: (response.attachments ?? []).map { attachment in
+                var artifact = BotArtifact(name: attachment.name ?? "Artifact", path: attachment.path ?? "")
+                artifact.type = attachment.type; artifact.mime = attachment.mime
+                artifact.base64 = attachment.base64.isEmpty ? nil : attachment.base64
+                artifact.byteSize = attachment.byteSize
+                return artifact
+            }, status: BotRunStatus(rawValue: response.runtimeStatus ?? "completed") ?? .failed,
+            detail: response.statusDetail, model: response.model,
+            approvalID: response.pendingApprovalID)
     }
 }
 

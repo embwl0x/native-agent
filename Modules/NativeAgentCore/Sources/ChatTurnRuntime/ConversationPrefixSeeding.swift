@@ -8,70 +8,11 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
-// MARK: - Mid-conversation tool changes (Anthropic structured lanes)
-
-/// The turn-invariant `tools` array plus this turn's OFFERED delta, for the
-/// Anthropic beta `mid-conversation-tool-changes-2026-07-01`.
-///
-/// WHY: `tools` sits FIRST in Anthropic's hashed prefix (tools → system →
-/// messages), so a session load or an idle drop that edits the array
-/// invalidates the cache for the WHOLE conversation. The fix is to declare the
-/// session's full pinned catalog once, mark every non-floor tool
-/// `defer_loading: true`, and express what is actually offered THIS turn as
-/// `tool_addition` / `tool_removal` blocks in a `role: "system"` message that
-/// sits behind the cache breakpoint.
-///
-/// NO LEDGER. History is rebuilt from the transcript every turn, so the turn's
-/// message re-declares the FULL delta relative to the array's own defaults
-/// (floor offered, everything else deferred) rather than a diff against what
-/// some earlier turn declared.
-///
-/// `array` names are INTERNAL tool names; the loop maps them through
-/// `ProviderToolNameMap` before they reach the wire.
-struct StructuredToolChangePlan: Sendable, Equatable {
-    /// The session's FULL pinned catalog, canonical order, byte-stable across
-    /// turns. Non-floor entries carry `deferLoading`.
-    let array: [LLMToolSchema]
-    /// Everything offered to the model at turn start (floor + resident +
-    /// pinned MCP + session loads + promotions, minus drops).
-    let offered: [String]
-    /// Offered − array defaults: the `tool_addition` set.
-    let additions: [String]
-    /// Array defaults (the always-on floor) withdrawn by policy this turn:
-    /// the `tool_removal` set. A deferred tool is withdrawn by simply not
-    /// being added, so it never needs a removal block.
-    let removals: [String]
-    /// RECEIPT: offered names that are not declared in `array`. Referencing
-    /// one is a 400, so they are dropped from the addition list and never
-    /// sent — recorded here so the drop is observable instead of silent.
-    let droppedUnknown: [String]
-    /// The session declaration's re-pin counter. The array can only move when
-    /// this moves, so the turn trace carries it next to the array fingerprint
-    /// and a cache miss is attributable instead of mysterious.
-    let declarationGeneration: Int
-
-    var arrayNames: Set<String> { Set(array.map(\.name)) }
-}
-
-/// Per-turn binding for the plan above, bound by the STRUCTURED chat turn-start
-/// sites around the engine call and read at the tool loop's seeding site.
-///
-/// Unbound (every text-compat turn, every non-Anthropic provider, every model
-/// whose catalog row does not claim the capability, every non-chat caller) →
-/// the loop keeps today's churning-tools-array behavior exactly.
-enum StructuredToolChangeContext {
-    @TaskLocal static var plan: StructuredToolChangePlan?
-}
-
 // MARK: - ConversationPrefixSeeding (v2Prefix message assembly)
 
 /// Assembles the provider message array for one turn:
 ///
-///   historyMessages ‖ [volatile block] ‖ [current user message]
-///
-/// On `.v1Legacy` this is a no-op that returns the exact single-user-message
-/// array every lane built before — the rollback arm is byte-identical by
-/// construction, not by a parallel code path that has to be kept in sync.
+///   historyMessages ‖ [current user message] ‖ [volatile block]
 ///
 /// DELIVERY LADDER for the volatile block. The block has to sit AFTER the
 /// cached transcript prefix, and how it can be expressed depends on what the
@@ -97,7 +38,7 @@ enum ConversationPrefixSeeding {
         case system
         /// Leading text block of the current user message.
         case userLeadingBlock
-        /// Nothing to deliver (empty volatile block, or `.v1Legacy`).
+        /// Nothing to deliver (empty volatile block).
         case none
     }
 
@@ -126,9 +67,8 @@ enum ConversationPrefixSeeding {
     }
 
     struct Seed {
-        /// The context to hand the provider. On v2 its `systemSegments.dynamic`
-        /// is EMPTY (the bytes moved into `turnVolatileBlock`); on v1 it is the
-        /// caller's context, untouched.
+        /// The context to hand the provider. Its `systemSegments.dynamic`
+        /// is empty because the bytes moved into `turnVolatileBlock`.
         let context: TurnContext
         let messages: [LLMMessage]
         let delivery: VolatileDelivery
@@ -142,12 +82,6 @@ enum ConversationPrefixSeeding {
         /// reuse. The current user message is per-turn by definition and is
         /// deliberately excluded.
         let currentUserIndex: Int
-        /// The shape this seed ACTUALLY produced — not the shape that was
-        /// asked for. A `.v2Prefix` request with no replayed history falls back
-        /// to the v1 message array, and the adapters read the task-local shape
-        /// to choose their wire layout, so the caller must re-bind THIS value
-        /// for the rest of the turn or the body and the layout disagree.
-        let shape: ConversationPrefixShape
         /// TEXT-COMPAT lane only: the session-loaded tool catalog run was
         /// delivered in the volatile block instead of the cached prefix, so the
         /// prefix's tool contribution is the FLOOR alone (see `telemetry`).
@@ -163,52 +97,10 @@ enum ConversationPrefixSeeding {
     /// there the provider's own `tools` array is the contract and the
     /// equivalent fix is Anthropic's mid-conversation `tool_addition` content
     /// blocks (follow-up, not this change).
-    /// The mid-conversation tool-change message for one turn, or nil when
-    /// there is nothing to declare. `additions`/`removals` are PROVIDER names,
-    /// already validated against the request's `tools` array by the caller.
-    static func toolChangeMessage(
-        additions: [String],
-        removals: [String]
-    ) -> LLMMessage? {
-        let changes = additions.map(LLMToolChange.addition)
-            + removals.map(LLMToolChange.removal)
-        return changes.isEmpty ? nil : .toolChanges(changes)
-    }
-
-    /// `toolChanges` is the mid-conversation `tool_addition`/`tool_removal`
-    /// message (structured Anthropic lanes only). It goes AFTER the current
-    /// user message and BEFORE the turn-scoped volatile block: a turn-scoped
-    /// message is text-only and 400s if it carries a tool-change block, and
-    /// consecutive system messages are judged as one group, so the pair still
-    /// satisfies "follows a user turn, ends the array". nil (every other
-    /// caller) is byte-identical to the pre-2026-09-02 shape.
     static func seed(
         _ ctx: TurnContext,
-        shape: ConversationPrefixShape,
-        textToolCatalogAppendix: String? = nil,
-        toolChanges: LLMMessage? = nil
+        textToolCatalogAppendix: String? = nil
     ) -> Seed {
-        // v2 engages from session turn 1 (User 09-29, prompt cache): the tools and
-        // stable system prompt are identical across turns and sessions, so turn 1
-        // both reads them from cache and leaves them for turn 2 to read. On the
-        // v1 shape turn 1's system carried the volatile block and turn 2 missed.
-        guard shape == .v2Prefix else {
-            // The tool-change message is NOT a v2 feature: on a plan turn the
-            // array declares most tools deferred, so dropping the additions
-            // here would leave the model holding the floor alone. It still
-            // ends the array, directly after the one user message — legal.
-            return Seed(
-                context: ctx,
-                messages: [currentUserMessage(ctx)] + (toolChanges.map { [$0] } ?? []),
-                delivery: .none,
-                volatileIndex: nil,
-                currentUserIndex: 0,
-                shape: .v1Legacy,
-                // The v1 arm never relocates anything: on that shape the
-                // catalog run stays in `stableSuffix` where the layout put it.
-                textToolCatalogRidesVolatileBlock: false
-            )
-        }
         let split = ctx.splittingVolatileBlock(appending: textToolCatalogAppendix ?? "")
         let volatile = split.turnVolatileBlock ?? ""
         var messages = split.historyMessages
@@ -252,10 +144,6 @@ enum ConversationPrefixSeeding {
             messages.append(current)
         }
 
-        // Tool changes first, turn-scoped volatile block last: the volatile
-        // block is the one that must END the array to render.
-        if let toolChanges { messages.append(toolChanges) }
-
         var volatileIndex: Int?
         switch delivery {
         case .systemClearAt:
@@ -276,7 +164,6 @@ enum ConversationPrefixSeeding {
             delivery: delivery,
             volatileIndex: volatileIndex,
             currentUserIndex: currentUserIndex,
-            shape: .v2Prefix,
             textToolCatalogRidesVolatileBlock: textToolCatalogAppendix != nil
         )
     }
@@ -293,9 +180,7 @@ enum ConversationPrefixSeeding {
     ///
     /// Rule: walk back over any trailing system run, then merge into the user
     /// message in front of it, or insert a new one at that position. With no
-    /// trailing system run this is byte-identical to the previous
-    /// merge-into-trailing-user-else-append behavior, so `.v1Legacy` is
-    /// unchanged.
+    /// trailing system run this merges into a trailing user message or appends.
     static func appendUserText(_ text: String, to conversation: inout [LLMMessage]) {
         var insertAt = conversation.count
         while insertAt > 0, conversation[insertAt - 1].role == .system { insertAt -= 1 }
@@ -432,9 +317,7 @@ enum ConversationPrefixSeeding {
     /// placeholder that quietly disagrees with it.
     static func telemetry(
         _ seed: Seed,
-        shape: ConversationPrefixShape,
-        toolSchemaFingerprint: String,
-        toolChangePlan: StructuredToolChangePlan? = nil
+        toolSchemaFingerprint: String
     ) -> ConversationPrefixTelemetrySnapshot {
         // "What the next turn can reuse": history through the previous
         // assistant. The CURRENT user message is per-turn content and is
@@ -455,7 +338,7 @@ enum ConversationPrefixSeeding {
             )
             : toolSchemaFingerprint
         return ConversationPrefixTelemetrySnapshot(
-            shapeVersion: shape.rawValue,
+            shapeVersion: "v2Prefix",
             prefixFingerprintSHA256: prefixFingerprint(
                 stable: segments?.stable ?? seed.context.systemPrompt ?? "",
                 stableSuffix: segments?.stableSuffix ?? "",
@@ -475,17 +358,6 @@ enum ConversationPrefixSeeding {
             windowSlid: seed.context.historyWindowReceipt?.slid ?? false,
             messageCount: seed.messages.count,
             messageDigests: seed.messages.prefix(messageDigestCount).map(messageDigest),
-            toolChanges: toolChangePlan.map {
-                .init(
-                    arrayFingerprintSHA256: SwiftNativeTurnEngine
-                        .toolSchemaFingerprint($0.array),
-                    offeredCount: $0.offered.count,
-                    additionCount: $0.additions.count,
-                    removalCount: $0.removals.count,
-                    droppedUnknownCount: $0.droppedUnknown.count,
-                    declarationGeneration: $0.declarationGeneration
-                )
-            },
             prefixMessageDigests: before.map(messageDigest),
             // REQUEST-COMPONENT FINGERPRINTS (A3 2026-09-11). The whole-prefix
             // hash moves every turn by construction, which left the 2026-09-11

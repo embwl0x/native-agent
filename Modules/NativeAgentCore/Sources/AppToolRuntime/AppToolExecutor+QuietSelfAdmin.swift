@@ -1,4 +1,5 @@
 import AppToolRuntime
+import ChatOrchestration
 import Dispatcher
 import Foundation
 import NativeAgentCore
@@ -6,29 +7,29 @@ import PersistenceCore
 import ProviderRouting
 import TrustCenter
 
-/// The six quiet self-administration tools.
+/// The `app` door's posture, page read and setting set.
 ///
 /// Core owns admission, catalog reads and receipts. The mounted window,
 /// page rendering and visible controls remain behind the presentation ports.
 extension AppToolExecutor {
     /// Consume the self-window handoff inside the original tool call, through
-    /// the same app handlers (and posture checks) as direct self-administration.
+    /// the `app` door's own read or action (and its posture checks), as a
+    /// direct `app` call runs them (`runSelfAppRoute`).
     public static func performMacSelfAppRoute(
         _ result: JSONValue,
-        run: (String, [String: JSONValue]) async -> JSONValue
+        run: ([String: JSONValue]) async -> JSONValue
     ) async -> JSONValue {
         guard case .object(let payload) = result,
               case .object(let detail) = payload["detail"],
               detail["status"] == .string("in_process_route"),
               detail["execute_in_process"] == .bool(true),
               case .object(let next) = detail["next_action"],
-              case .string(let tool) = next["tool"],
-              ["interaction_act", "app_page_read"].contains(tool),
+              next["tool"] == .string("app"),
               case .object(let input) = next["input"] else { return result }
-        let outcome = await run(tool, input)
+        let outcome = await run(input)
         // Page inspection is supplementary after a verified app focus. Its
         // availability must not turn completed navigation into a retry.
-        if tool == "app_page_read", payload["ok"] == .bool(true) {
+        if input["action"] == nil, payload["ok"] == .bool(true) {
             var response = payload
             response["in_process_observation"] = outcome
             var observationDetail = detail
@@ -41,11 +42,6 @@ extension AppToolExecutor {
         response["ok"] = .bool(response["status"] == .string("ok"))
         return .object(response)
     }
-
-    public static let quietSelfAdminToolNames: Set<String> = [
-        "app_page_read", "app_page_screenshot", "app_settings_list",
-        "app_setting_set", "interaction_act",
-    ]
 
     // MARK: - Posture
 
@@ -66,7 +62,7 @@ extension AppToolExecutor {
     /// secrets; those are fenced by `ownerOnly` and `fullMacOnly`, for what
     /// they ARE rather than for the mode the session is in.
     public struct QuietPosture: Sendable {
-        let name: String
+        public let name: String
         let changesAllowed: Bool
     }
 
@@ -140,12 +136,28 @@ extension AppToolExecutor {
             == fullMacModeName
     }
 
-    private static func unreadablePostureFailure(extra: [String: JSONValue] = [:]) -> JSONValue {
+    static func unreadablePostureFailure(extra: [String: JSONValue] = [:]) -> JSONValue {
         failure(
             "trust_mode_unreadable",
             "The saved Trust policy does not say which mode this Mac is in, so nothing is changed. "
             + "The person can set the mode in Trust.",
             extra: extra
+        )
+    }
+
+    /// The posture gate setting.set stands behind, for the app's other
+    /// writes (Doctor repair, upkeep). Nil when changes are allowed.
+    static func quietChangesRefusal() async -> JSONValue? {
+        guard let posture = await freshQuietPosture() else { return unreadablePostureFailure() }
+        return posture.changesAllowed ? nil : readOnlyFailure(posture)
+    }
+
+    static func readOnlyFailure(_ posture: QuietPosture) -> JSONValue {
+        failure(
+            "trust_mode_read_only",
+            "\(posture.name) is the posture that changes nothing at all, and only the person lifts it. "
+            + "Ask them to choose Work mode or above in Trust.",
+            extra: ["trust_mode": .string(posture.name)]
         )
     }
 
@@ -155,7 +167,8 @@ extension AppToolExecutor {
             "reason": .string(reason),
             "detail": .string(detail),
         ]
-        for (key, value) in extra { body[key] = value }
+        // The code, status and detail stand: extra never overwrites them.
+        body.merge(extra) { own, _ in own }
         return .object(body)
     }
 
@@ -174,26 +187,57 @@ extension AppToolExecutor {
         )
     }
 
-    // MARK: - Entry
-
-    public func runQuietSelfAdminTool(tool: String, input: [String: JSONValue], surface: String) async -> JSONValue {
-        switch tool {
-        case "app_page_read": return await runAppPageRead(input: input)
-        case "app_page_screenshot": return await presentation.pageScreenshot(input: input)
-        case "app_settings_list": return await runAppSettingsList(input: input)
-        case "app_setting_set": return await runAppSettingSet(input: input, surface: surface)
-        case "interaction_act": return await runInteractionAct(input: input, surface: surface)
-        default:
-            return Self.failure("unknown_tool", "No such quiet tool.", extra: ["tool": .string(tool)])
-        }
-    }
-
     private static func text(_ value: JSONValue?) -> String {
         guard case .string(let raw)? = value else { return "" }
         return raw.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - app_page_read
+    // MARK: - Chat
+
+    /// User, 10-02: no rule is only for when he is at the Mac, and under Full
+    /// Mac all of it is hers. Below Full Mac, a turn User started himself from
+    /// any door (no out-of-band origin, no agent lane; Mac chat, his paired
+    /// phone, or Telegram or Slack from a sender allowlisted by user id) may
+    /// move his screen, speak, and touch a conversation he is in. Any other
+    /// turn leaves all of that alone.
+    static func reachesUser(surface: String, fullMac: Bool, dataRoot: URL) async -> Bool {
+        if fullMac { return true }
+        let envelope = TurnEnvelope.current(surface: surface)
+        let door = envelope.surface.lowercased()
+        var user = ChatPersistenceContext.originProvenance == nil && envelope.agent == nil
+            && ["chat", "app", "mac", "ios", "telegram", "slack"].contains(door)
+        if user, ["telegram", "slack"].contains(door) {
+            user = await SwiftNativeSecurityCenter(dataRoot: dataRoot).remoteSenderIsAllowlisted(.currentTurn(
+                verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface))
+        }
+        return user
+    }
+
+    /// One chat action (`runFolded`): Safe has already refused it. The
+    /// posture is read again for the receipt; the conversation-level fences
+    /// (User's screen, User is in it, her own conversation) are the app's.
+    @MainActor
+    func runChatSessionAction(
+        verb: String, input: [String: JSONValue], surface: String, host: any QuietToolHost
+    ) async -> JSONValue {
+        guard let posture = await Self.freshQuietPosture(
+            dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        ) else { return Self.unreadablePostureFailure() }
+        guard posture.changesAllowed else { return Self.readOnlyFailure(posture) }
+        let reachesUser = await Self.reachesUser(surface: surface, fullMac: posture.name == Self.fullMacModeName,
+                                               dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        let answer = await host.runChatSession(verb: verb, input: input, reachesUser: reachesUser)
+        guard case .object(var body) = answer else {
+            return Self.failure("chat_session_failed", "The app gave no answer for that verb.")
+        }
+        body["verb"] = .string(verb)
+        body["trust_mode"] = .string(posture.name)
+        body["surface"] = .string(surface)
+        body["decided_by"] = .string("agent")
+        return .object(body)
+    }
+
+    // MARK: - Page read
 
     public static func pageReadResult(page: String, fields: [String: JSONValue]) -> JSONValue {
         .object(fields.merging([
@@ -202,15 +246,17 @@ extension AppToolExecutor {
             "page_shown_by_this_call": .bool(false),
             "summary": .string("Read \(page) in the background; it was not opened or shown. " + (SimpleViewMode.isShowing
                 ? SimpleViewMode.noPagesNote
-                : "To show it, use interaction_act(target: composer, verb: set_page, value: \(page)).")),
+                : "To show it, use app {action:\"page.show\", args:{page:\"\(page)\"}}.")),
         ]) { _, receipt in receipt })
     }
 
+    /// The `app` door's page read: each setting row also carries its type,
+    /// choices and note, so the read is all `setting.set` needs.
     @MainActor
-    private func runAppPageRead(input: [String: JSONValue]) async -> JSONValue {
+    func runAppPageRead(input: [String: JSONValue]) async -> JSONValue {
         let requested = Self.text(input["page"])
         if requested.lowercased() == "context" { return await presentation.contextReceiptRead(input: input) }
-        if requested.lowercased() == "agent" { return await presentation.agentViewRead(input: input) }
+        if requested.lowercased() == "agent_view" { return await presentation.agentViewRead(input: input) }
         let current = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "current"
         guard let page = current ? presentation.currentPage : presentation.page(named: requested) else {
             if current {
@@ -236,6 +282,9 @@ extension AppToolExecutor {
                 row["full_mac_only"] = .bool(true)
                 if !fullMac { row["refusal"] = .string(QuietSettings.belowFullMacRefusal) }
             }
+            if case .object(let listed) = await setting.catalogRow(fullMac: fullMac, host: { self.quietHost() }) {
+                for key in ["type", "choices", "note"] { row[key] = listed[key] }
+            }
             settingRows.append(.object(row))
         }
 
@@ -245,9 +294,7 @@ extension AppToolExecutor {
             "about": .string(page.summary),
             "settings": .array(settingRows),
             // What the page SAYS, built from the records the page draws from.
-            // The accessibility tree below is kept for the rows that carry
-            // words, but it is not what a page read is read from any more:
-            // offscreen SwiftUI publishes almost nothing to it.
+            // Elements outline the same projection without mounting SwiftUI.
             "content": .array(read.content),
             "elements": .array(read.rows),
             "elements_truncated": .bool(read.truncated),
@@ -256,110 +303,84 @@ extension AppToolExecutor {
             "note": .string(
                 "The page was read in the background, not opened or shown. " + (SimpleViewMode.isShowing
                     ? SimpleViewMode.noPagesNote
-                    : "To show it, use interaction_act(target: composer, verb: set_page, value: \(page.id)).")
+                    : "To show it, use app {action:\"page.show\", args:{page:\"\(page.id)\"}}.")
                 + " `content` is the page in words, built from the "
-                + "same records the page renders; `elements` is its accessibility tree. Nothing came "
+                + "same records the page renders; `elements` is a text outline of that content, not rendered controls. Nothing came "
                 + "forward, moved, or made a sound, and the window on screen was not touched."),
         ])
     }
 
-    // MARK: - app_settings_list
+    // MARK: - Setting set
 
-    @MainActor
-    private func runAppSettingsList(input: [String: JSONValue]) async -> JSONValue {
-        let requested = Self.text(input["page"])
-        let settings: [QuietSetting]
-        var scope = "all"
-        if requested.isEmpty {
-            settings = QuietSettings.all(host: quietHost())
-        } else {
-            guard let page = presentation.page(named: requested) else {
-                return Self.unknownPageFailure(requested, pages: presentation.pages.map(\.id))
-            }
-            scope = page.id
-            settings = QuietSettings.settings(forPage: page.id, host: quietHost())
-        }
-        let posture = await Self.freshQuietPosture()
-        let fullMac = posture?.name == Self.fullMacModeName
-        var catalogRows: [JSONValue] = []
-        for setting in settings {
-            catalogRows.append(await setting.catalogRow(fullMac: fullMac, host: { self.quietHost() }))
-        }
-        var body: [String: JSONValue] = [
-            "status": .string("ok"),
-            "page": .string(scope),
-            "count": .int(Int64(settings.count)),
-            "settings": .array(catalogRows),
-            "pages": .array(presentation.pages.map { .object([
-                "page": .string($0.id),
-                "title": .string($0.title),
-                "about": .string($0.summary),
-            ]) }),
-        ]
-        if let posture {
-            body["trust_mode"] = .string(posture.name)
-            body["changes_allowed"] = .bool(posture.changesAllowed)
-        }
-        return .object(body)
+    /// A set every check before the row's own rule has let through.
+    private struct GatedSetting {
+        let setting: QuietSetting
+        let host: any QuietToolHost
+        let posture: QuietPosture
+        let value: JSONValue
+        let write: @MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void
     }
 
-    // MARK: - app_setting_set
-
+    /// The setting, the posture and its rows' fences (owner-only, Safe,
+    /// Full-Mac-only), and that there is a value to write.
     @MainActor
-    private func runAppSettingSet(input: [String: JSONValue], surface: String) async -> JSONValue {
+    private func settingGate(input: [String: JSONValue]) async -> Result<GatedSetting, GateRefusal> {
+        func refuse(_ answer: JSONValue) -> Result<GatedSetting, GateRefusal> { .failure(GateRefusal(answer: answer)) }
         let requestedPage = Self.text(input["page"])
         let requestedSetting = Self.text(input["setting"])
         guard !requestedSetting.isEmpty else {
-            return Self.failure("missing_setting", "Name the setting. app_settings_list has the names.")
+            return refuse(Self.failure("missing_setting", "Name the setting. Its page read (app {page}) has the names."))
         }
-        guard let appModel = quietHost() else { return Self.unattachedFailure() }
+        guard let appModel = quietHost() else { return refuse(Self.unattachedFailure()) }
 
         guard let setting = QuietSettings.setting(id: requestedSetting, host: quietHost()) else {
             let known = requestedPage.isEmpty
                 ? QuietSettings.all(host: quietHost())
                 : QuietSettings.settings(forPage: presentation.page(named: requestedPage)?.id ?? "", host: quietHost())
-            return Self.failure(
+            return refuse(Self.failure(
                 "unknown_setting",
-                "No setting is called that. Call app_settings_list first rather than guessing a name.",
+                "No setting is called that. Read its page first for the names (app {page}) rather than guessing one.",
                 extra: [
                     "requested": .string(requestedSetting),
                     "known": .array(known.map { .string($0.id) }),
                 ]
-            )
+            ))
         }
         if !requestedPage.isEmpty,
            let page = presentation.page(named: requestedPage), page.id != setting.page {
-            return Self.failure(
+            return refuse(Self.failure(
                 "wrong_page",
                 "That setting lives on a different page.",
                 extra: ["setting": .string(setting.id), "page": .string(setting.page)]
-            )
+            ))
         }
 
         // The person's own posture. Refused for what it IS, not for the mode
         // the session is in — this one does not open up under Full Mac.
         if setting.ownerOnly {
-            return Self.failure(
+            return refuse(Self.failure(
                 "owner_only",
                 QuietSettings.ownerOnlyRefusal,
                 extra: [
                     "setting": .string(setting.id),
                     "page": .string(setting.page),
                     "label": .string(setting.label),
-                    "value": await setting.read(appModel),
+                    "requested_value": input["value"] ?? .null,
+                    "current_value": await setting.read(appModel),
                 ]
-            )
+            ))
         }
 
         guard let posture = await Self.freshQuietPosture() else {
-            return Self.unreadablePostureFailure(extra: [
+            return refuse(Self.unreadablePostureFailure(extra: [
                 "setting": .string(setting.id),
                 "page": .string(setting.page),
-                "value": await setting.read(appModel),
-            ])
+                "requested_value": input["value"] ?? .null,
+                "current_value": await setting.read(appModel),
+            ]))
         }
         guard posture.changesAllowed else {
-            return Self.failure(
+            return refuse(Self.failure(
                 "trust_mode_read_only",
                 "\(posture.name) is the posture that changes nothing at all — it is the person's "
                 + "standing choice to be read from and not written to, and only they lift it.",
@@ -367,59 +388,116 @@ extension AppToolExecutor {
                     "trust_mode": .string(posture.name),
                     "setting": .string(setting.id),
                     "page": .string(setting.page),
-                    "value": await setting.read(appModel),
+                    "requested_value": input["value"] ?? .null,
+                    "current_value": await setting.read(appModel),
                 ]
-            )
+            ))
         }
         // Full Mac is wide open, and only there may the agent move the Trust
         // fence — down, never up. Below it these read and refuse, saying the
         // one thing that never changes: turning Full Mac ON is the person's.
         if setting.fullMacOnly, posture.name != Self.fullMacModeName {
-            return Self.failure(
+            return refuse(Self.failure(
                 "trust_posture_needs_full_mac",
                 QuietSettings.belowFullMacRefusal,
                 extra: [
                     "trust_mode": .string(posture.name),
                     "setting": .string(setting.id),
                     "page": .string(setting.page),
-                    "value": await setting.read(appModel),
+                    "requested_value": input["value"] ?? .null,
+                    "current_value": await setting.read(appModel),
                 ]
-            )
+            ))
         }
         guard let write = setting.write else {
-            return Self.failure(
+            return refuse(Self.failure(
                 "not_writable",
                 "That one is shown, not set.",
                 extra: ["setting": .string(setting.id), "page": .string(setting.page)]
-            )
+            ))
         }
         guard let requestedValue = input["value"], requestedValue != .null else {
-            return Self.failure(
+            return refuse(Self.failure(
                 "missing_value", "Pass the new value.",
                 extra: ["setting": .string(setting.id), "type": .string(setting.kind.rawValue)]
-            )
+            ))
         }
+        return .success(GatedSetting(setting: setting, host: appModel, posture: posture, value: requestedValue, write: write))
+    }
+
+    /// Every check that refuses a set before anything is written, the row's
+    /// own value rule (`QuietSetting.check`: lower-only, narrow-only) last.
+    /// Reads only, so the door's preview asks it and refuses what the set
+    /// would; the set meets the same row rule again inside its write.
+    @MainActor
+    func settingRefusal(input: [String: JSONValue]) async -> JSONValue? {
+        switch await settingGate(input: input) {
+        case .failure(let refusal): return refusal.answer
+        case .success(let gated):
+            guard let refused = await QuietSettings.$fullMac.withValue(gated.posture.name == Self.fullMacModeName, operation: {
+                await gated.setting.check?(gated.host, gated.value)
+            }) else { return nil }
+            return await Self.settingWriteFailure(refused, gated.setting, gated.value, host: gated.host)
+        }
+    }
+
+    /// A write the row refused or that failed, with what was asked and what
+    /// it reads now. A value that would raise Trust is User's: `users_call`.
+    @MainActor
+    private static func settingWriteFailure(
+        _ error: Error, _ setting: QuietSetting, _ requestedValue: JSONValue, host: any QuietToolHost,
+        detail: [String: JSONValue] = [:]
+    ) async -> JSONValue {
+        var extra: [String: JSONValue] = [
+            "setting": .string(setting.id),
+            "page": .string(setting.page),
+            "requested_value": requestedValue,
+            "current_value": await setting.read(host),
+        ]
+        for (key, value) in detail { extra[key] = value }
+        let code = if case QuietSettingError.users = error { "users_call" } else { "write_refused" }
+        return failure(code, error.localizedDescription, extra: extra)
+    }
+
+    @MainActor
+    func runAppSettingSet(input: [String: JSONValue], surface: String) async -> JSONValue {
+        let gated: GatedSetting
+        switch await settingGate(input: input) {
+        case .failure(let refusal): return refusal.answer
+        case .success(let ready): gated = ready
+        }
+        let (setting, appModel, posture, requestedValue, write) = (gated.setting, gated.host, gated.posture, gated.value, gated.write)
 
         // The receipt's "before" is read from the page's own state, immediately
         // before the write, so it is what the person would have seen.
         let before = await setting.read(appModel)
-        QuietWriteDetail.begin()
+        // A raise: the row's own rule refuses it below Full Mac. Under Full
+        // Mac it is hers, and User sees it as a decided row.
+        var raise = false
+        if posture.name == Self.fullMacModeName, case QuietSettingError.users? = await setting.check?(appModel, requestedValue) {
+            raise = true
+        }
+        let writeDetail = QuietWriteDetail()
         do {
-            try await write(appModel, requestedValue)
+            try await QuietWriteDetail.$current.withValue(writeDetail) {
+                try await QuietSettings.$fullMac.withValue(posture.name == Self.fullMacModeName) {
+                    try await write(appModel, requestedValue)
+                }
+            }
         } catch {
             // A write that touches several surfaces says which ones it had
             // already changed before it failed and rolled them back, so the
             // receipt cannot quietly under-report its own reach.
-            var extra: [String: JSONValue] = [
-                "setting": .string(setting.id),
-                "page": .string(setting.page),
-                "value": before,
-            ]
-            for (key, value) in QuietWriteDetail.take() { extra[key] = value }
-            return Self.failure("write_refused", error.localizedDescription, extra: extra)
+            let touched = writeDetail.take()
+            return await Self.settingWriteFailure(error, setting, requestedValue, host: appModel, detail: touched)
         }
-        let detail = QuietWriteDetail.take()
+        let detail = writeDetail.take()
         let after = await setting.read(appModel)
+        if raise {
+            HarnessDecidedRow.post(requester: "Full Mac", tool: "setting.set \(setting.id)",
+                                   sessionID: Self.inputString(input["__session_id"]),
+                                   dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        }
 
         // This IS the receipt. A tool result is what appendToolMessage writes
         // into the transcript, so page/setting/old/new land in the same trail

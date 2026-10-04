@@ -1098,7 +1098,7 @@ private struct DoneStep: View {
                     .font(NativeAgentFont.title)
                     .foregroundStyle(.secondary)
             } else {
-                Text("One more step: connect an AI provider in the Providers tab in the sidebar, then say hello in Chat.")
+                Text("One more step: choose Open Providers in Chat to connect an AI provider, then say hello.")
                     .font(NativeAgentFont.title)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)

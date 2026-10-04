@@ -115,6 +115,22 @@ extension SwiftToolDispatcher {
         let normalizedSessionFilter = ["session_id", "sessionId"]
             .compactMap { jsonString(input[$0])?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
+        let turnID = jsonString(input["turn_id"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var fields: [String] = []
+        if let requested = input["fields"], requested != .null {
+            guard let turnID, !turnID.isEmpty,
+                  case .array(let values) = requested, !values.isEmpty, values.count <= 16,
+                  values.allSatisfy({ value in
+                      guard case .string(let key) = value else { return false }
+                      return !key.isEmpty && key.count <= 80
+                  }) else {
+                throw AutonomyGateError.toolDenied(reason: "fields requires turn_id and 1–16 payload keys of at most 80 characters.")
+            }
+            fields = values.compactMap { jsonString($0) }
+        }
+        // Shared across all returned events, in serialized UTF-8 bytes.
+        var remainingPayloadBytes = 8 * 1024
 
         let snapshot: TurnTraceRecentReader.Snapshot
         do {
@@ -142,6 +158,7 @@ extension SwiftToolDispatcher {
 
         var summaries: [JSONValue] = []
         for event in snapshot.events.sorted(by: { $0.ts > $1.ts }) {
+            if let turnID, !turnID.isEmpty, event.turnId != turnID { continue }
             if let normalizedSessionFilter,
                event.sessionId != normalizedSessionFilter,
                !sessionTurnIDs.contains(event.turnId) {
@@ -169,7 +186,7 @@ extension SwiftToolDispatcher {
             let payloadKeys = Array(payload.keys.sorted().prefix(30))
             let row = event.jsonRow
             guard case .object(let object) = row else { continue }
-            summaries.append(.object([
+            var summary: [String: JSONValue] = [
                 "id": .null,
                 "turn_id": .string(event.turnId),
                 "kind": .string(kind),
@@ -180,7 +197,29 @@ extension SwiftToolDispatcher {
                 "surface": event.surface.map(JSONValue.string) ?? .null,
                 "payload_keys": .array(payloadKeys.map { .string($0) }),
                 "receipt": .null,
-            ]))
+            ]
+            if !fields.isEmpty, remainingPayloadBytes > 2 {
+                var selected: [String: JSONValue] = [:]
+                var truncated = false
+                for key in fields {
+                    guard let value = payload[key] else { continue }
+                    var candidate = selected
+                    candidate[key] = value
+                    let redacted = TurnTraceRedactor.redactValue(.object(candidate))
+                    if try redacted.serializedData(pretty: false).count <= remainingPayloadBytes,
+                       case .object(let safe) = redacted {
+                        selected = safe
+                    } else {
+                        truncated = true
+                    }
+                }
+                let values = JSONValue.object(selected)
+                remainingPayloadBytes = max(0, remainingPayloadBytes - (try values.serializedData(pretty: false).count))
+                // Once the shared budget is spent, later events carry no payload at all.
+                summary["payload"] = values
+                summary["payload_truncated"] = .bool(truncated)
+            }
+            summaries.append(.object(summary))
             if summaries.count >= limit { break }
         }
 

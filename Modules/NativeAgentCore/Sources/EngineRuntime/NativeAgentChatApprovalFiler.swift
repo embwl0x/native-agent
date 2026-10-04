@@ -11,7 +11,7 @@ import PersistenceCore
 /// The inbox remains the authority and `NativeClient+ApprovalExecutors` remains
 /// the sole post-resolution executor. This filer only preserves the initiating
 /// conversation identity and returns immediately so Mac, detached, Slack, iOS,
-/// and bridge-message turns never block while waiting for a person.
+/// and bridge turns never block while waiting for a person.
 public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
     private let dataRoot: URL
 
@@ -66,6 +66,11 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         if toolName == "agent_message", AgentConversationApproval.exactProtocol {
             request["agentExactProtocol"] = .bool(true)
         }
+        // Wave 2 #8: the follow-up after User decides runs with her normal
+        // tools, under this turn's steer, so the card keeps who steered it.
+        request["peer"] = PeerDataTaint.carriedRecord(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                                                      peerID: envelope.verifiedUserId)
+        request["fileAccess"] = ChatToolSessionContext.fileAccess.map(JSONValue.string) ?? .null
         let requestPayload: JSONValue = .object(request)
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         // User, 2026-09-06: the SAME request, still pending, gets the SAME id.
@@ -112,6 +117,11 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
     /// Connected agents; a peer the directory does not know stays nameless
     /// rather than being described by its id.
     public static func peerRequesterName(surface: String, peerID: String?, dataRoot: URL) -> String? {
+        switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "codex-bridge": return "Codex"
+        case "claude-bridge": return "Claude"
+        default: break
+        }
         guard PeerTurnEffectPolicy.isPeerBridge(surface: surface),
               let peerID, !peerID.isEmpty,
               let peer = try? AgentPeerStore(dataRoot: dataRoot).list()
@@ -151,6 +161,9 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             && left["input"] == right["input"]
             && left["agentExactProtocol"] == right["agentExactProtocol"]
             && left["origin"] == right["origin"]
+            && left["peer"] == right["peer"]
+            // A card filed with other hands is another request (an old card has none).
+            && left["fileAccess"] == right["fileAccess"]
     }
 
     public func awaitResolution(id: String) async throws -> ApprovalDecision {

@@ -22,7 +22,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -119,14 +118,9 @@ extension NativeClient {
         // context whenever a file flag was ON — flipping the non-file actions'
         // persona root from `defaultPersonaRoot()` (`<repo>/persona`) to the
         // `<dataRoot>/memory` legacy fallback (they derive persona root from
-        // `_na_data_root` only in test mode), a behavior change. Now ACTION-NAME-
-        // scoped via `DispatchContext.fileSandboxContextForTool`: ONLY a `read_file`
-        // / `file_excerpt` dispatch whose own flag is ON engages the sandbox
-        // context; every other action keeps the normal chat context.
-        // Swift-native cutover: removed a stale `let ctx = DispatchContext.fileSandboxContextForTool(...)`
-        // block here — it predated the wave-42 W02 tightened-sandbox path below and
-        // was left in by a partial merge, producing `invalid redeclaration of 'ctx'`.
-        // The gated path below is the canonical one.
+        // `_na_data_root` only in test mode), a behavior change. The canonical
+        // path below scopes the sandbox context to read_file/file_excerpt;
+        // every other action keeps the normal chat context.
         // Scope: built ONLY for the file-system flips. The already-LIVE persona_read /
         // workspace_list / time_now / persona_list_skills flips resolve their own
         // roots (persona/workspace) independently of `repoRoot`/`file_access` and
@@ -241,12 +235,6 @@ extension NativeClient {
             serverId: serverId, toolName: toolName, risk: risk,
             dispatcher: mcpDispatcherForClientRoot(),
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-    }
-
-    func swiftRevokeMCPConsent(serverId: String, toolName: String) async throws -> MCPConsentRecord {
-        try await MCPUIActions.revokeConsent(
-            serverId: serverId, toolName: toolName, dispatcher: mcpDispatcherForClientRoot()
         )
     }
 

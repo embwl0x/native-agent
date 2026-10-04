@@ -186,6 +186,7 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
         do {
             let data = try Data(contentsOf: nodesPath)
             return try JSONDecoder().decode([TrustedRemoteEffectNode].self, from: data)
+                .map { try validate($0) }
         } catch {
             throw TrustedRemoteEffectError.corruptStore
         }
@@ -206,7 +207,7 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
         }
         let host = node.host.trimmingCharacters(in: .whitespacesAndNewlines)
         let user = node.user.trimmingCharacters(in: .whitespacesAndNewlines)
-        let forbidden = CharacterSet(charactersIn: " \t\r\n@:/[]")
+        let forbidden = CharacterSet(charactersIn: " \t\r\n@:/[]").union(.controlCharacters)
         guard !host.isEmpty, host.utf8.count <= 253, host.rangeOfCharacter(from: forbidden) == nil else {
             throw TrustedRemoteEffectError.invalidNode("host")
         }
@@ -215,18 +216,19 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
         }
         guard (1...65_535).contains(node.port) else { throw TrustedRemoteEffectError.invalidNode("port") }
         guard ["ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"].contains(node.hostKeyAlgorithm),
+              node.hostKey.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
               let key = Data(base64Encoded: node.hostKey), key.count >= 32 else {
             throw TrustedRemoteEffectError.invalidNode("host key")
         }
         let executables = Array(Set(node.allowedExecutables.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }))
-            .filter {
+            .sorted()
+        guard !executables.isEmpty, executables.count <= 32,
+              executables.allSatisfy({
                 $0.hasPrefix("/")
                     && $0.utf8.count <= 1_024
                     && !$0.contains("\0")
                     && !$0.contains(where: { $0.isWhitespace })
-            }
-            .sorted()
-        guard !executables.isEmpty, executables.count <= 32 else { throw TrustedRemoteEffectError.invalidNode("allowlisted executables") }
+              }) else { throw TrustedRemoteEffectError.invalidNode("allowlisted executables") }
         var copy = node
         copy.host = host
         copy.user = user
@@ -265,7 +267,9 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
         command: String,
         timeoutSeconds: Int
     ) async throws -> ProcessResult {
-        try await Task.detached(priority: .userInitiated) {
+        try Task.checkCancellation()
+        let task = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
             let temp = FileManager.default.temporaryDirectory
                 .appendingPathComponent(InstallPaths.current.name("nativeagent-known-hosts-\(UUID().uuidString)"))
             let hostToken = node.port == 22 ? node.host : "[\(node.host)]:\(node.port)"
@@ -280,6 +284,9 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
                 "-o", "BatchMode=yes",
                 "-o", "IdentitiesOnly=no",
                 "-o", "StrictHostKeyChecking=yes",
+                "-o", "ControlPath=none",
+                "-o", "VerifyHostKeyDNS=no",
+                "-o", "KnownHostsCommand=none",
                 "-o", "UserKnownHostsFile=\(temp.path)",
                 "-o", "GlobalKnownHostsFile=/dev/null",
                 "-o", "ConnectTimeout=\(min(timeoutSeconds, 30))",
@@ -291,6 +298,7 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
             ]
             process.standardOutput = out
             process.standardError = err
+            try Task.checkCancellation()
             do { try process.run() } catch { throw TrustedRemoteEffectError.transport(error.localizedDescription) }
             async let stdoutData = Task.detached(priority: .utility) {
                 Self.drain(out.fileHandleForReading, retaining: 32_768)
@@ -300,23 +308,34 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
             }.value
             let clock = ContinuousClock()
             let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
-            while process.isRunning && clock.now < deadline {
+            while process.isRunning && clock.now < deadline && !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(50))
             }
             var timedOut = false
             if process.isRunning {
-                timedOut = true
-                process.terminate()
-                let grace = clock.now.advanced(by: .seconds(2))
-                while process.isRunning && clock.now < grace { try? await Task.sleep(for: .milliseconds(50)) }
-                if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+                timedOut = !Task.isCancelled
+                // Cleanup must retain its grace period even when the caller cancelled.
+                await Task.detached(priority: .utility) {
+                    process.terminate()
+                    let grace = clock.now.advanced(by: .seconds(2))
+                    while process.isRunning && clock.now < grace { try? await Task.sleep(for: .milliseconds(50)) }
+                    if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+                }.value
             }
             process.waitUntilExit()
             let data = await (stdoutData, stderrData)
+            try Task.checkCancellation()
             let stdout = String(decoding: data.0, as: UTF8.self)
             var stderr = String(decoding: data.1, as: UTF8.self)
             if timedOut { stderr += stderr.isEmpty ? "Timed out." : "\nTimed out." }
             return ProcessResult(status: process.terminationStatus, stdout: stdout, stderr: stderr)
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            let result = try await task.value
+            try Task.checkCancellation()
+            return result
+        } onCancel: {
+            task.cancel()
+        }
     }
 }

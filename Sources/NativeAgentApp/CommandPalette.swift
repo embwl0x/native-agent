@@ -89,6 +89,7 @@ enum CommandPalettePresentation {
         }.map(\.0)
     }
 
+    @MainActor
     static func itemPool(
         sessions: [ChatSession],
         saved: [PaletteItem] = []
@@ -107,12 +108,12 @@ enum CommandPalettePresentation {
             )
         }
         let chats = visibleSessions(sessions).map { session in
-            let title = session.displayTitle.isEmpty ? "Untitled chat" : session.displayTitle
-            let preview = session.lastMessagePreview?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = ChatShellConversationRow.title(for: session)
+            let preview = ChatShellConversationRow.preview(for: session)
             return PaletteItem(
                 id: "chat.\(session.id)",
                 title: title,
-                subtitle: (preview?.isEmpty == false) ? preview : "Chat session",
+                subtitle: preview.isEmpty ? "Chat session" : preview,
                 systemImage: "bubble.left.and.bubble.right",
                 kind: .chatSession(session.id)
             )

@@ -49,7 +49,6 @@ enum OperationalSettingsControlPresentation {
     static func fluidContextLabel(_ mode: ContextFlowMode) -> String {
         switch mode {
         case .active: "Active"
-        case .shadow: "Observe Only"
         case .off: "Off"
         }
     }
@@ -131,8 +130,8 @@ enum SlimSettingsStatusLinePresentation {
     }
 }
 
-/// The updater has two independent facts: whether this build has a published
-/// feed at all, and whether Sparkle can start another manual check right now.
+/// Feed availability, automatic-check preference and manual-check readiness
+/// are independent facts.
 /// Keep them separate so a release build that is mid-check never looks like a
 /// locally built copy, and a development build never looks checkable.
 enum SoftwareUpdateRowPresentation {
@@ -147,6 +146,7 @@ enum SoftwareUpdateRowPresentation {
     static func resolve(
         availableVersion: String?,
         updatesAreAvailable: Bool,
+        automaticChecksEnabled: Bool,
         canCheckForUpdates: Bool,
         unavailableDetail: String
     ) -> State {
@@ -171,17 +171,20 @@ enum SoftwareUpdateRowPresentation {
         guard canCheckForUpdates else {
             return State(
                 title: "An update check is already in progress",
-                detail: "Wait for the current signed-feed check to finish before starting another one.",
+                detail: (automaticChecksEnabled ? "Automatic checks are on. " : "Automatic checks are off. ")
+                    + "Wait for the current signed-feed check to finish before starting another one.",
                 status: "info",
                 systemImage: "arrow.triangle.2.circlepath",
                 actionEnabled: false
             )
         }
         return State(
-            title: "Automatic updates are ready",
-            detail: "NativeAgent checks the signed release feed automatically. You can also check now.",
-            status: "ok",
-            systemImage: "checkmark.circle",
+            title: automaticChecksEnabled ? "Automatic update checks are on" : "Automatic update checks are off",
+            detail: automaticChecksEnabled
+                ? "NativeAgent checks the signed release feed automatically. You can also check now."
+                : "You can check the signed release feed manually.",
+            status: automaticChecksEnabled ? "ok" : "info",
+            systemImage: automaticChecksEnabled ? "checkmark.circle" : "info.circle",
             actionEnabled: true
         )
     }

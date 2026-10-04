@@ -95,8 +95,8 @@ public struct NeedSignal: Codable, Equatable, Sendable {
     public let mandatoryCharacterBudget: Int
     /// Body length above which the CALLER's packet renderer replaces an atom's
     /// full text with a lead + `context_expand` pointer. The selector uses it
-    /// only to publish a matching expandable pointer, and `ContextExpander`
-    /// uses it to admit that pointer. `0` = the caller renders atoms whole.
+    /// to publish a matching expandable pointer. Summarized representations
+    /// remain expandable independently. `0` = the caller renders bodies whole.
     public let packetAtomExpandThresholdChars: Int
     /// Upper bound on `.memory`-kind atoms in one packet. `nil` leaves the
     /// selector's own per-kind quota in charge (pre-existing behavior).
@@ -1008,6 +1008,17 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// lane. Applied as `min(cap, shortMessageMemoryRowCap)`. `0` disables the
     /// cap on its own, and `memorySemanticFloor == 0` disables it too.
     public let shortMessageMemoryRowCap: Int
+    /// Phase 5 C3: `.personal` atoms leave the ordinary competition and get
+    /// their own lane — the ONE with the highest lift (cosine minus the
+    /// memory's own baseline, `ContextSelector.personalBaselines`) at or above
+    /// this floor, or none. It takes one of the memory rows, never an extra
+    /// one. `0` turns the lane off: personal atoms compete like any memory.
+    ///
+    /// 0.20 is from the replay (204 of User's turns, 09-24…10-03, bge-large):
+    /// one personal memory on 11% of turns, 15 distinct (the old lane put 1-3
+    /// on 47%). Raw cosine at any floor kept answering every turn that
+    /// mentioned Claude with the same memory.
+    public let personalRecallFloor: Double
     public let weights: ContextScoreWeights
 
     /// Content-token count at or below which a message counts as short.
@@ -1029,8 +1040,10 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         minimumRelevance: Double = 0.05,
         memorySemanticFloor: Double = 0.30,
         shortMessageMemoryRowCap: Int = 6,
+        personalRecallFloor: Double = 0.20,
         weights: ContextScoreWeights = ContextScoreWeights()
     ) {
+        self.personalRecallFloor = max(0, personalRecallFloor)
         self.maximumCandidates = max(1, maximumCandidates)
         self.maximumDynamicAtoms = max(0, maximumDynamicAtoms)
         self.maximumPointers = max(0, maximumPointers)

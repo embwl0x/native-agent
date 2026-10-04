@@ -323,7 +323,7 @@ extension ProcedureArtifactStore {
               reviewerDecision.proposalDigest == proposal.bindingDigest else {
             throw ProcedureExactActivationError.invalidDecision
         }
-        let artifact = try await load(proposal.artifactID)
+        let artifact = try await loadForInvocation(proposal.artifactID)
         guard artifact.domain == "workshop_execution",
               artifact.procedureShapeIdentity == proposal.procedureShapeIdentity,
               artifact.authorityClass == "low_risk",
@@ -421,7 +421,7 @@ extension ProcedureArtifactStore {
               manifest.proposal.bindingDigest == pointer.proposalDigest else {
             throw ProcedureExactActivationError.activationBindingMismatch
         }
-        let artifact = try await load(pointer.artifactID)
+        let artifact = try await loadForInvocation(pointer.artifactID)
         guard artifact.procedureShapeIdentity == manifest.proposal.procedureShapeIdentity,
               artifact.domain == "workshop_execution",
               artifact.authorityClass == "low_risk",
@@ -520,7 +520,7 @@ extension ProcedureArtifactStore {
             .appendingPathComponent("\(procedureID).json")
     }
 
-    private nonisolated static func checkedRegularFile(
+    nonisolated static func checkedRegularFile(
         _ url: URL,
         maximumBytes: Int
     ) -> Data? {

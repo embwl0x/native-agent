@@ -196,13 +196,13 @@ public struct ChatCompactionDistiller: Sendable {
         surface: String,
         runId: String?
     ) async {
-        let summaryCap = Self.maxSummaryChars(model: turnModel, providerID: providerID)
         // 1. Recover the replaced content from the pre-compaction backup.
         let backupURL = URL(fileURLWithPath: backupPath)
         let backupRows: [JSONValue]
         do {
             backupRows = try await persistence.readJSONL(backupURL)
         } catch {
+            await settlePendingSummary(sessionId: sessionId, summaryRowId: summaryRowId)
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: turnModel,
                 charsIn: 0, charsOut: 0, runId: runId, status: "skipped"
@@ -211,6 +211,7 @@ public struct ChatCompactionDistiller: Sendable {
         }
         let replaced = Array(backupRows.prefix(max(0, messagesReplaced)))
         guard !replaced.isEmpty else {
+            await settlePendingSummary(sessionId: sessionId, summaryRowId: summaryRowId)
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: turnModel,
                 charsIn: 0, charsOut: 0, runId: runId, status: "skipped"
@@ -218,107 +219,20 @@ public struct ChatCompactionDistiller: Sendable {
             return
         }
 
-        // 2. Resolve the model through the Providers GROUP that owns
-        //    `compaction` — Memory and mind (User, 2026-09-13: every activity
-        //    resolves through its group). No per-surface pin and no fallback to
-        //    the originating turn's model: both could hand this call a model the
-        //    group's connected route cannot serve, which is how a legacy
-        //    compaction pin kept executing after upgrade while the Providers
-        //    page showed Memory and mind following Chat. Nothing resolved means
-        //    nothing is set up; the mechanical summary stands.
-        //    The budget below is a function of THAT model's window, so it has
-        //    to be known before the prompt is planned.
-        guard let resolved = await summaryModelResolver(Self.distillSurface),
-              !resolved.trimmingCharacters(in: .whitespaces).isEmpty else {
-            await emitDistillTrace(
-                sessionId: sessionId, surface: surface, model: turnModel,
-                charsIn: 0, charsOut: 0, runId: runId, status: "skipped"
-            )
+        guard let recollection = await prepareRecollection(
+            rows: replaced, sessionId: sessionId, turnModel: turnModel,
+            providerID: providerID, surface: surface, runId: runId,
+            summaryRowId: summaryRowId
+        ) else {
+            await settlePendingSummary(sessionId: sessionId, summaryRowId: summaryRowId)
             return
         }
-        let model = resolved
-
-        // 3. Plan the passes: the prior recollection pinned at the head, the
-        //    raw turns chunked oldest-first into the model's own budget.
-        let plan = Self.buildPlan(
-            from: replaced,
-            budget: Self.promptBudgetChars(forModel: model, dataRoot: dataRoot),
-            summaryCap: summaryCap
-        )
-
-        // 4. One LLM call per chunk, oldest-first, each inside a bounded
-        //    timeout. Every pass but the last produces an INTERIM note that
-        //    the next pass carries as its pinned memory, so a transcript wider
-        //    than one prompt is chained rather than omitted; the last pass's
-        //    output is the recollection. Any throw/timeout is fail-safe: the
-        //    mechanical summary stays.
-        var carried = plan.pinned
-        var promptCharsPerPass: [Int] = []
-        var raw = ""
-        for (index, chunk) in plan.chunks.enumerated() {
-            let prompt = Self.composePrompt(pinned: carried, body: chunk)
-            let output: String
-            do {
-                guard try await destinationExists(sessionId: sessionId, summaryRowId: summaryRowId) else {
-                    await emitDistillTrace(
-                        sessionId: sessionId, surface: surface, model: model,
-                        charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
-                        runId: runId, status: "row_missing",
-                        promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
-                    )
-                    return
-                }
-                promptCharsPerPass.append(prompt.count)
-                output = try await callLLM(model: model, prompt: prompt)
-            } catch {
-                await emitDistillTrace(
-                    sessionId: sessionId, surface: surface, model: model,
-                    charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
-                    runId: runId, status: "failed",
-                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
-                )
-                return
-            }
-            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
-                await emitDistillTrace(
-                    sessionId: sessionId, surface: surface, model: model,
-                    charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
-                    runId: runId, status: "failed",
-                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
-                )
-                return
-            }
-            if index == plan.chunks.count - 1 {
-                raw = trimmed
-            } else {
-                // The interim note enters the next pass as its pinned memory,
-                // so it obeys the same cap a stored recollection does.
-                carried = String(trimmed.prefix(summaryCap))
-            }
-        }
+        let model = recollection.model
+        let distilled = recollection.text
+        let promptCharsPerPass = recollection.promptCharsPerPass
         let promptChars = promptCharsPerPass.reduce(0, +)
-
-        // 5. Trim + hard-cap; refuse to overwrite with nothing.
-        let distilled = String(
-            raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(summaryCap)
-        )
-        guard !distilled.isEmpty else {
-            await emitDistillTrace(
-                sessionId: sessionId, surface: surface, model: model,
-                charsIn: promptChars, charsOut: 0, runId: runId, status: "failed",
-                promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
-            )
-            return
-        }
-
-        // 5b. First-person post-check. Never rejects — a recollection in the
-        //     wrong voice still beats the mechanical summary — but the receipt
-        //     says so, which is how "she reads her morning as a briefing about
-        //     someone else" becomes a number instead of a feeling.
-        let thirdPersonLines = (agentName ?? Self.configuredAgentName(dataRoot: dataRoot))
-            .map { Self.thirdPersonSubjectCount(distilled, agentName: $0) } ?? 0
-        let thirdPerson = thirdPersonLines > Self.thirdPersonFlagThreshold
+        let rowsOmitted = recollection.rowsOmitted
+        let thirdPerson = recollection.thirdPerson
 
         // 6. Swap the distilled text into the summary row in place, under lock.
         //    Line-surgical: only the matched line is re-serialized; every other
@@ -373,14 +287,16 @@ public struct ChatCompactionDistiller: Sendable {
                 }
                 // Rejoining the untouched segments reproduces the original
                 // bytes exactly — blank lines and final-newline state included.
-                try Self.writeRaw(segments.joined(separator: "\n"), to: messagesPath)
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                    Data(segments.joined(separator: "\n").utf8), to: messagesPath)
                 return "ok"
             }
         } catch {
+            await settlePendingSummary(sessionId: sessionId, summaryRowId: summaryRowId)
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: model,
                 charsIn: promptChars, charsOut: distilled.count, runId: runId, status: "failed",
-                promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                promptCharsPerPass: promptCharsPerPass, rowsOmitted: rowsOmitted
             )
             return
         }
@@ -392,19 +308,9 @@ public struct ChatCompactionDistiller: Sendable {
         // wrote, and every later publish of the same session looked no newer
         // than the copy it already had.
         if status == "ok" {
-            await bumpSessionTranscriptGeneration(sessionId: sessionId)
-            // 2026-09-06: the bump alone reaches nobody. Publication is edge
-            // driven — a turn completing is what asks for a transcript
-            // snapshot — and this swap happens long after that edge, on a
-            // detached task. Without an edge of its own the distilled
-            // recollection sat on the Mac until some unrelated turn published,
-            // and the phone kept showing the mechanical summary.
-            await MainActor.run {
-                NotificationCenter.default.post(
-                    name: .nativeAgentChatTranscriptDidChange,
-                    object: sessionId
-                )
-            }
+            await Self.publishTranscriptChange(
+                sessionId: sessionId, dataRoot: dataRoot, persistence: persistence
+            )
         }
 
         await emitDistillTrace(
@@ -413,7 +319,169 @@ public struct ChatCompactionDistiller: Sendable {
             charsOut: status == "ok" ? distilled.count : 0,
             runId: runId, status: status,
             thirdPerson: status == "ok" ? thirdPerson : false,
-            promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+            promptCharsPerPass: promptCharsPerPass, rowsOmitted: rowsOmitted
+        )
+    }
+
+    private func settlePendingSummary(sessionId: String, summaryRowId: String) async {
+        let path = messagesPath(sessionId: sessionId)
+        do {
+            let changed = try await persistence.withFileLock(path) {
+                guard FileManager.default.fileExists(atPath: path.path) else { return false }
+                let raw = try String(contentsOf: path, encoding: .utf8)
+                var segments = raw.components(separatedBy: "\n")
+                for index in segments.indices {
+                    guard let parsed = try? JSONValue.parse(Data(segments[index].utf8)),
+                          case .object(var row) = parsed,
+                          row["id"] == .string(summaryRowId),
+                          case .object(var metadata)? = row["metadata"],
+                          metadata["kind"] == .string("compaction_summary"),
+                          metadata["distill"] == .string("pending") else { continue }
+                    metadata["distill"] = .string("mechanical")
+                    row["metadata"] = .object(metadata)
+                    segments[index] = try JSONValue.object(row).serialize(pretty: false)
+                    try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                        Data(segments.joined(separator: "\n").utf8), to: path)
+                    return true
+                }
+                return false
+            }
+            if changed {
+                await Self.publishTranscriptChange(
+                    sessionId: sessionId, dataRoot: dataRoot, persistence: persistence
+                )
+            }
+        } catch {
+            FileHandle.standardError.write(Data(
+                "ChatCompactionDistiller: pending summary could not be settled for session \(sessionId): \(error)\n".utf8
+            ))
+        }
+    }
+
+    private struct PreparedRecollection: Sendable {
+        let text: String
+        let model: String
+        let promptCharsPerPass: [Int]
+        let rowsOmitted: Int
+        let thirdPerson: Bool
+    }
+
+    private func prepareRecollection(
+        rows: [JSONValue],
+        sessionId: String,
+        turnModel: String,
+        providerID: String?,
+        surface: String,
+        runId: String?,
+        summaryRowId: String
+    ) async -> PreparedRecollection? {
+        let summaryCap = Self.maxSummaryChars(model: turnModel, providerID: providerID)
+        // 2. Resolve the model through the Providers GROUP that owns
+        //    `compaction` — Memory and mind (User, 2026-09-13: every activity
+        //    resolves through its group). No per-surface pin and no fallback to
+        //    the originating turn's model: both could hand this call a model the
+        //    group's connected route cannot serve, which is how a legacy
+        //    compaction pin kept executing after upgrade while the Providers
+        //    page showed Memory and mind following Chat. Nothing resolved means
+        //    nothing is set up; the mechanical summary stands.
+        //    The budget below is a function of THAT model's window, so it has
+        //    to be known before the prompt is planned.
+        guard let resolved = await summaryModelResolver(Self.distillSurface),
+              !resolved.trimmingCharacters(in: .whitespaces).isEmpty else {
+            await emitDistillTrace(
+                sessionId: sessionId, surface: surface, model: turnModel,
+                charsIn: 0, charsOut: 0, runId: runId, status: "skipped"
+            )
+            return nil
+        }
+        let model = resolved
+
+        // 3. Plan the passes: the prior recollection pinned at the head, the
+        //    raw turns chunked oldest-first into the model's own budget.
+        let plan = Self.buildPlan(
+            from: rows,
+            budget: Self.promptBudgetChars(forModel: model, dataRoot: dataRoot),
+            summaryCap: summaryCap
+        )
+
+        // 4. One LLM call per chunk, oldest-first, each inside a bounded
+        //    timeout. Every pass but the last produces an INTERIM note that
+        //    the next pass carries as its pinned memory, so a transcript wider
+        //    than one prompt is chained rather than omitted; the last pass's
+        //    output is the recollection. Any throw/timeout is fail-safe: the
+        //    mechanical summary stays.
+        var carried = plan.pinned
+        var promptCharsPerPass: [Int] = []
+        var raw = ""
+        for (index, chunk) in plan.chunks.enumerated() {
+            let prompt = Self.composePrompt(pinned: carried, body: chunk)
+            let output: String
+            do {
+                try Task.checkCancellation()
+                guard try await destinationExists(sessionId: sessionId, summaryRowId: summaryRowId) else {
+                    await emitDistillTrace(
+                        sessionId: sessionId, surface: surface, model: model,
+                        charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
+                        runId: runId, status: "row_missing",
+                        promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                    )
+                    return nil
+                }
+                promptCharsPerPass.append(prompt.count)
+                output = try await callLLM(model: model, prompt: prompt)
+            } catch {
+                await emitDistillTrace(
+                    sessionId: sessionId, surface: surface, model: model,
+                    charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
+                    runId: runId, status: "failed",
+                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                )
+                return nil
+            }
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                await emitDistillTrace(
+                    sessionId: sessionId, surface: surface, model: model,
+                    charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
+                    runId: runId, status: "failed",
+                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                )
+                return nil
+            }
+            if index == plan.chunks.count - 1 {
+                raw = trimmed
+            } else {
+                // The interim note enters the next pass as its pinned memory,
+                // so it obeys the same cap a stored recollection does.
+                carried = String(trimmed.prefix(summaryCap))
+            }
+        }
+        let promptChars = promptCharsPerPass.reduce(0, +)
+
+        // 5. Trim + hard-cap; refuse to overwrite with nothing.
+        let distilled = String(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(summaryCap)
+        )
+        guard !distilled.isEmpty else {
+            await emitDistillTrace(
+                sessionId: sessionId, surface: surface, model: model,
+                charsIn: promptChars, charsOut: 0, runId: runId, status: "failed",
+                promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+            )
+            return nil
+        }
+
+        // 5b. First-person post-check. Never rejects — a recollection in the
+        //     wrong voice still beats the mechanical summary — but the receipt
+        //     says so, which is how "she reads her morning as a briefing about
+        //     someone else" becomes a number instead of a feeling.
+        let thirdPersonLines = (agentName ?? Self.configuredAgentName(dataRoot: dataRoot))
+            .map { Self.thirdPersonSubjectCount(distilled, agentName: $0) } ?? 0
+        let thirdPerson = thirdPersonLines > Self.thirdPersonFlagThreshold
+
+        return PreparedRecollection(
+            text: distilled, model: model, promptCharsPerPass: promptCharsPerPass,
+            rowsOmitted: plan.omitted, thirdPerson: thirdPerson
         )
     }
 
@@ -639,22 +707,17 @@ public struct ChatCompactionDistiller: Sendable {
         return PromptPlan(pinned: pinned, chunks: [body], omitted: omitted)
     }
 
-    // Atomic write of the already-joined transcript text. The caller preserves
-    // original line structure (blank lines, final-newline state) by rejoining
-    // the untouched components verbatim.
-    private static func writeRaw(_ text: String, to path: URL) throws {
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try Data(text.utf8).write(to: path, options: .atomic)
-    }
-
     /// 2026-09-06: advance the session's transcript version after the in-place
     /// rewrite, without touching any other index field. Mirrors the transcript
     /// writers' own bump. Best effort: the version is remote-display ordering,
     /// never grounds to undo a distillation that is already on disk.
-    private func bumpSessionTranscriptGeneration(sessionId: String) async {
+    /// Publish the change edge too: background rewrites have no turn completion
+    /// to request a fresh phone snapshot.
+    static func publishTranscriptChange(
+        sessionId: String,
+        dataRoot: URL,
+        persistence: SwiftNativePersistenceCore
+    ) async {
         let sessionsPath = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
@@ -669,7 +732,12 @@ public struct ChatCompactionDistiller: Sendable {
                 try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
             }
         } catch {
-            NSLog("ChatCompactionDistiller: transcript generation bump failed: \(error)")
+            NSLog("Chat transcript generation bump failed: \(error)")
+        }
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: .nativeAgentChatTranscriptDidChange, object: sessionId
+            )
         }
     }
 

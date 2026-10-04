@@ -174,9 +174,7 @@ public struct TelegramBotCommand: Sendable, Codable, Equatable {
 public enum TelegramSlashCommandHandler: String, Sendable, Codable, Equatable {
     case status
     case new
-    case reset
     case session
-    case clear
     case compact
     case stop
     case retry
@@ -261,7 +259,9 @@ public enum TelegramCommandRegistry {
     /// ("use opus", "think harder"), which lands on the same writers.
     public static let definitions: [TelegramSlashCommandDefinition] = [
         .init(name: "stop", aliases: ["cancel"], summary: "Stop the current task", handler: .stop),
-        .init(name: "new", aliases: ["start"], summary: "Start a fresh conversation", handler: .new),
+        // `/reset` and `/clear` used to wipe the session file the Mac and
+        // phone share; they now start a fresh conversation like `/new`.
+        .init(name: "new", aliases: ["start", "reset", "clear"], summary: "Start a fresh conversation", handler: .new),
         .init(name: "retry", aliases: ["again"], summary: "Try your last message again", handler: .retry),
         .init(name: "approve", aliases: ["approved", "allow"], summary: "Approve a pending request", args: "<id>", handler: .approve),
         .init(name: "deny", aliases: ["denied", "reject", "rejected"], summary: "Deny a pending request", args: "<id>", handler: .deny),
@@ -282,8 +282,6 @@ public enum TelegramCommandRegistry {
         .init(name: "scratch", summary: "Write session scratchpad data", args: "<key> <value>", handler: .scratch, showInMenu: false),
         .init(name: "tools", summary: "Show tool/progress controls", handler: .tools, showInMenu: false),
         .init(name: "session", summary: "Show or change Telegram session state", args: "status|new|reset", handler: .session, showInMenu: false),
-        .init(name: "reset", summary: "Clear the active Telegram session", handler: .reset, showInMenu: false),
-        .init(name: "clear", summary: "Clear current session messages", handler: .clear, showInMenu: false),
         .init(name: "compact", summary: "Compact current session context", handler: .compact, showInMenu: false),
         .init(name: "restart", summary: "Restart NativeAgent app (owner only)", args: "[reason]", handler: .restart, showInMenu: false),
     ]
@@ -547,7 +545,11 @@ public extension TelegramSpokenPreference {
                 }
             }
         }
-        if let first = exact.first { return first }
+        if !exact.isEmpty {
+            let current = exact.filter { telegramProviderIdsMatch($0.providerId, menu.currentProvider) }
+            let pool = current.isEmpty ? exact : current
+            return pool.count == 1 ? pool[0] : nil
+        }
         // A partial match only counts when it is UNAMBIGUOUS. "opus" naming
         // the one Opus in the menu is a switch; "claude" naming three of them
         // is not, and picking the first would silently reroute User to a model
@@ -1053,7 +1055,7 @@ extension SwiftNativeTelegramBot {
                         model: selection.modelId
                     )
                     let providerSuffix = selection.providerId.map { " @ \($0)" } ?? ""
-                    return "Telegram model set to \(selection.modelId)\(providerSuffix). Providers tab will reflect this under Telegram."
+                    return "Chat model set to \(selection.modelId)\(providerSuffix). Providers → Chat now uses this model for Mac, iPhone, Telegram, and Slack."
                 } catch {
                     return "Failed to set Telegram model: \(error.localizedDescription)"
                 }

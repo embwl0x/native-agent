@@ -1,132 +1,112 @@
 # NativeAgent Approval Action Schema
 
-_Added R10-N6. Last updated: 2026-05-08._
-
-This document describes the JSON schema for approval action envelopes exchanged
-between the iOS app and the Mac Swift runtime via iCloud Drive.
-
----
+Signed iOS action envelopes reach the in-process Swift runtime through iCloud
+Drive or the CloudKit device transport. `MacSyncEngine` owns transport
+validation and transaction recovery; `MacSyncActionRouter` dispatches actions.
 
 ## Inbox action envelope (iOS → Mac)
 
-Written by iOS to `iCloud Drive/<container>/inbox/<msgId>.json`.
+The Drive lane writes `inbox/<msgId>.json` under the configured iCloud container.
+The current sender produces:
 
 ```json
 {
-  "msgId":     "<UUID>",
-  "clientId":  "ios",
-  "action":    "<action-name>",
-  "payload":   { "<key>": "<value>" },
-  "createdAt": "<ISO-8601-timestamp>",
-  "signature": "<hmac-sha256-hex>"
+  "msgId": "<UUID>",
+  "clientId": "<device-public-key SHA-256 hex>",
+  "action": "approveApproval",
+  "payload": { "approvalId": "<approval-id>" },
+  "createdAt": "<ISO-8601 timestamp>",
+  "protocolVersion": 2,
+  "transactionId": "<UUID>",
+  "devicePublicKey": "<base64 Ed25519 public key>",
+  "deviceSignature": "<base64 Ed25519 signature>",
+  "signature": "<HMAC-SHA256 hex>"
 }
 ```
 
 ### Required fields
 
-| Field       | Type              | Description |
-|-------------|-------------------|-------------|
-| `msgId`     | string (UUID)     | Unique per-message ID. Used for deduplication (rolling 5000-entry window persisted in `processed_ids.json`). |
-| `clientId`  | string            | Always `"ios"` from the iOS app. |
-| `action`    | string            | Identifies the operation (see below). |
-| `payload`   | object (string→string) | Action-specific parameters (all values are strings). |
-| `createdAt` | string (ISO-8601) | Client-side timestamp. Mac rejects messages older than 5 minutes. |
-| `signature` | string (hex)      | HMAC-SHA256 over the canonical body (see Signing below). |
-
----
+| Field | Contract |
+| --- | --- |
+| `msgId` | Canonical UUID spelling; message and response identity. |
+| `clientId` | Current iOS sends the SHA-256 fingerprint of its device public key. |
+| `action` | Router action name. |
+| `payload` | String-to-string object; structured values are encoded as strings. |
+| `createdAt` | ISO-8601 timestamp. New execution requires a time within ±5 minutes. |
+| `protocolVersion`, `transactionId` | Optional in the decoder; current iOS sends version 2 and a separate UUID. An absent transaction ID defaults to `msgId`. |
+| `devicePublicKey`, `deviceSignature` | Base64 values binding this phone to its signed action. Approval actions require a verified, paired phone. |
+| `signature` | Required HMAC over the envelope, including device-signature fields. |
 
 ## Action names
 
-Common values for the `action` field:
+| Action | Payload / purpose |
+| --- | --- |
+| `approveApproval`, `rejectApproval`, `cancelApproval` | `approvalId` (or `id`): resolve a durable approval. |
+| `approveStep`, `rejectStep` | `missionId` or `executionId`, plus a real `stepId`: decide a Workshop step. |
+| `approveMemoryProposal`, `rejectMemoryProposal` | `proposalId`: decide a staged memory proposal. |
+| `approvePromotion`, `rejectPromotion` | `candidateId`: decide a promotion. |
+| `submitWorkshopTask`, `submitMission` | `title`, `objective`: submit Workshop work. |
+| `set_trust_policy` | Validated trust change through the Mac policy owner. |
+| `mac_control` | Remote Mac control through its policy/dispatch owner. |
 
-| Action                   | Description |
-|--------------------------|-------------|
-| `submitMission`          | Submit a new Workshop execution objective. |
-| `approveStep`            | Approve a pending improvement/approval step. |
-| `rejectStep`             | Reject a pending step. |
-| `approveMemoryProposal`  | Accept a staged memory proposal. |
-| `rejectMemoryProposal`   | Reject a staged memory proposal. |
-| `approvePromotion`       | Accept a promotion candidate. |
-| `rejectPromotion`        | Reject a promotion candidate. |
-| `saveTrustPolicy`        | Write an updated trust policy JSON through the Swift app policy path. |
-| `mac_control`            | Invoke a Mac-side remote-control method (shell, AppleScript, Shortcut, notify, etc.). |
-
----
+These are iOS wire actions, not Agent's tool names. Agent uses the single
+`app` tool and its action registry.
 
 ## Resolution and execution
 
-Approval records are durable app-owned files, not daemon memory. Resolvers must
-fail closed when an approval id is stale, missing, mismatched, or already
-terminal.
+The Drive lane authenticates before consulting the transaction ledger.
+Unsigned or invalidly signed files are quarantined without reserving message,
+response or transaction identities. A matching completed transaction returns
+retained evidence without executing again, even after the freshness window.
+Conflicting identities and unreadable ledger records fail closed.
 
-The execution path is derived from the signed iCloud action plus the durable
-approval/action record. The Swift resolver validates the action, re-checks
-policy, executes the focused handler, and writes a response/receipt back through
-the iCloud response channel.
+Approval actions also pass `PairedPhoneStore` device authorization. A pending
+phone does not gain approval authority until paired on the Mac. Resolution
+carries signed-iOS provenance into the canonical approval owner.
 
-| Action family | Swift owner |
-|---|---|
-| iOS inbox action routing | `Sources/NativeAgentApp/MacSyncActionRouter.swift` |
-| Generic approval resolve/reconcile | `Sources/NativeAgentApp/NativeClient+ApprovalExecutors.swift` |
-| Memory approval resolve/reconcile | `Sources/NativeAgentApp/NativeClient+MemoryApprovalExecutors.swift` |
-| Self-evolution approval apply/verify/reconcile | `Sources/NativeAgentApp/NativeClient+SelfEvolutionApproval.swift` |
-| Remote Mac control policy/dispatch | `Sources/NativeAgentApp/MacSyncRemoteMacControl.swift` |
+Current owners under `Modules/NativeAgentCore/Sources/`:
 
----
+| Responsibility | Source |
+| --- | --- |
+| Envelope identity validation | `DeviceSync/MacSyncInboxAction.swift` |
+| Transport, ledger and response handling | `DeviceSync/MacSyncEngine+Inbox.swift` |
+| HMAC and freshness | `DeviceSync/MacSyncEngine+Security.swift` |
+| Action dispatch | `DeviceSync/MacSyncActionRouter.swift` |
+| Phone authorization | `DeviceSync/PairedPhoneStore.swift` |
+| Durable approvals and execution | `ApprovalInbox/`, `ApprovalTransactions/` |
+| Remote Mac control | `DeviceSync/MacSyncRemoteMacControl.swift` |
 
 ## Approval receipts
 
-When the Mac resolves an approval or remote action, it records a compact receipt
-covering the requested action, policy/risk reason, decision, executor result,
-and any follow-up verification. iOS receives the user-facing result through
-`responses/<msgId>.json` plus the `inbox_response_<msgId>` KVS ping.
-
----
+Drive responses use `responses/<msgId>.json` and the
+`inbox_response_<msgId>` KVS signal. Response bodies are string-to-string
+objects, signed with the pairing secret. iOS verifies responses before using
+them. An approval decision and the action's execution result are separate
+evidence.
 
 ## `signature_required` upgrade response
 
-When the Mac receives an inbox action **without** a `signature` field (old iOS
-clients), it writes a structured error response to
-`iCloud Drive/<container>/responses/<msgId>.json` and pings the iOS KVS key
-`inbox_response_<msgId>`.
-
-All fields are strings (`[String: String]`) so iOS's `JSONDecoder` can parse it
-without a custom schema:
-
-```json
-{
-  "msgId":     "<original-msgId>",
-  "ok":        "false",
-  "error":     "iOS app needs upgrade to enable HMAC signing. Update via App Store / TestFlight.",
-  "code":      "signature_required",
-  "createdAt": "<ISO-8601-timestamp>"
-}
-```
-
-**iOS recovery (R10-C3):** on receiving `code == "signature_required"`, the iOS
-app re-signs the original action body with the current HMAC key and resubmits
-once. If the resubmission is also rejected the user sees an error alert via the
-existing `syncError` path. At most one retry is attempted to prevent loops.
-
-Reference: `Sources/NativeAgentApp/MacSyncEngine.swift` ~line 123,
-`iOS/NativeAgentMobile/Sources/iCloudSyncEngine.swift`.
-
----
+The iOS recovery path recognizes verified `signature_required` and
+`signature_invalid` responses. It makes at most one replacement request with
+fresh identities and signing. Encrypted secret payloads are not copied into a
+replacement identity. An uncertain response does not authorize a fresh send.
 
 ## HMAC signing input format
 
-The signing input is the canonical JSON serialization of the action envelope
-**excluding** the `signature` field itself, with object keys sorted
-(`JSONSerialization.data(withJSONObject:options:[.sortedKeys])`).
+Serialize the envelope with `JSONSerialization` and `.sortedKeys`, excluding
+only `signature`, then compute HMAC-SHA256 with the shared pairing secret.
+The Mac accepts 64 hexadecimal characters and compares normalized lowercase
+values.
 
-Verification on the Mac side mirrors this: the Mac reconstructs the same
-canonical JSON from the parsed body (minus `signature`), computes
-HMAC-SHA256 with the shared pairing secret, and compares the result to the
-`signature` field in lowercase hex.
+The device signature is separate: Ed25519 over sorted JSON excluding both
+`signature` and `deviceSignature`. Its verification contract is
+`Modules/NativeAgentShared/Sources/NativeAgentShared/DeviceApprovalSignature.swift`.
+The outer HMAC covers the device signature too.
 
-The shared secret is 32 bytes of random data generated on the Mac and
-published through the configured private iCloud pairing transport. Manual
-correction on iOS must match the Mac's published key; there is no QR step.
-It is stored in the iOS
-Keychain (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`) and on the Mac at
-`~/Library/Application Support/NativeAgent/remote/pairing_secret` (0600).
+`PairingSecretManager` owns the Mac's regular, 0600, 32-byte
+`icloud_pairing_secret.bin` under `PersistenceCore.defaultDataRoot()`.
+Pairing material is published through the configured private iCloud pairing
+transport. On iOS, `PairingStore` stores the shared secret in Keychain with
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
+The iOS sender is
+`iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift`.

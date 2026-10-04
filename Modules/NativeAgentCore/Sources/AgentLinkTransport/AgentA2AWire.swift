@@ -32,10 +32,14 @@ public enum AgentA2AWire {
         public let body: JSONValue?
         public let requestID: String?
         public var grpcMethod: String? = nil
+        package var streamInterface: Interface? = nil
+        package var expectedTaskID: String? = nil
         package init(url: URL, httpMethod: String, headers: [String: String], body: JSONValue?,
-                     requestID: String?, grpcMethod: String? = nil) {
+                     requestID: String?, grpcMethod: String? = nil,
+                     streamInterface: Interface? = nil, expectedTaskID: String? = nil) {
             self.url = url; self.httpMethod = httpMethod; self.headers = headers
             self.body = body; self.requestID = requestID; self.grpcMethod = grpcMethod
+            self.streamInterface = streamInterface; self.expectedTaskID = expectedTaskID
         }
         public var isStreaming: Bool {
             headers["Accept"] == "text/event-stream" || grpcMethod == "SendStreamingMessage" || grpcMethod == "SubscribeToTask"
@@ -182,9 +186,11 @@ public enum AgentA2AWire {
     }
 
     private static func request(interface: Interface, method: String, params: [String: JSONValue], requestID: String, taskID: String?) throws -> Request {
+        let expectedTaskID: String? = if case .object(let message)? = params["message"], case .string(let id)? = message["taskId"] { id } else { taskID }
         if interface.binding == "GRPC" {
             return Request(url: interface.endpoint, httpMethod: "POST", headers: [:],
-                           body: .object(params), requestID: nil, grpcMethod: method)
+                           body: .object(params), requestID: nil, grpcMethod: method,
+                           streamInterface: interface, expectedTaskID: expectedTaskID)
         }
         let rpc = interface.binding == "JSONRPC"
         let streaming = ["message/stream", "SendStreamingMessage"].contains(method)
@@ -195,19 +201,31 @@ public enum AgentA2AWire {
             _ = try requiredString(.string(requestID), "request ID")
             return Request(url: interface.endpoint, httpMethod: "POST", headers: headers,
                            body: .object(["jsonrpc": .string("2.0"), "id": .string(requestID),
-                                          "method": .string(method), "params": .object(params)]), requestID: requestID)
+                                          "method": .string(method), "params": .object(params)]), requestID: requestID,
+                           streamInterface: interface, expectedTaskID: expectedTaskID)
         }
         guard var components = URLComponents(url: interface.endpoint, resolvingAgainstBaseURL: false) else { throw WireError.invalid("endpoint URL") }
-        let base = components.percentEncodedPath.hasSuffix("/") ? String(components.percentEncodedPath.dropLast()) : components.percentEncodedPath
+        let base = try httpPathBase(components, tenant: params["tenant"])
         if let taskID {
             let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_~"))
             guard let encoded = taskID.addingPercentEncoding(withAllowedCharacters: safe), taskID != ".", taskID != ".." else { throw WireError.invalid("task path identifier") }
             components.percentEncodedPath = base + "/tasks/" + encoded + (cancelling ? ":cancel" : "")
-            if !cancelling, let tenant = interface.tenant { components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "tenant", value: tenant)] }
         } else { components.percentEncodedPath = base + (streaming ? "/message:stream" : "/message:send") }
         guard let url = components.url else { throw WireError.invalid("request URL") }
+        var body = params
+        body.removeValue(forKey: "tenant")
         return Request(url: url, httpMethod: taskID == nil || cancelling ? "POST" : "GET", headers: headers,
-                       body: taskID == nil || cancelling ? .object(params) : nil, requestID: nil)
+                       body: taskID == nil || cancelling ? .object(body) : nil, requestID: nil,
+                       streamInterface: interface, expectedTaskID: expectedTaskID)
+    }
+
+    static func httpPathBase(_ components: URLComponents, tenant: JSONValue?) throws -> String {
+        let base = components.percentEncodedPath.hasSuffix("/") ? String(components.percentEncodedPath.dropLast()) : components.percentEncodedPath
+        guard let tenant else { return base }
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_~"))
+        guard case .string(let tenant) = tenant, !tenant.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, tenant != ".", tenant != "..",
+              let encoded = tenant.addingPercentEncoding(withAllowedCharacters: safe) else { throw WireError.invalid("tenant path identifier") }
+        return base + "/" + encoded
     }
 
     public static func normalizeResponse(_ value: JSONValue, interface: Interface,

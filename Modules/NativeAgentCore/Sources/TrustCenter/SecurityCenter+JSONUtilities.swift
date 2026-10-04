@@ -96,6 +96,15 @@ extension SwiftNativeSecurityCenter {
         return out
     }
 
+    /// `read_file`'s fence, for a file that reaches the model another way (a
+    /// chat attachment the agent names): it must sit in a Trust workspace root.
+    public static func isInsideTrustedWorkspace(
+        _ file: URL, policy: [String: JSONValue], dataRoot: URL
+    ) -> Bool {
+        trustedWorkspaceRoots(policy: policy, filePolicy: object(policy["filePolicy"]), dataRoot: dataRoot)
+            .contains { isSelfOrAncestor(root: $0, of: file) }
+    }
+
     static func isSelfOrAncestor(root: URL, of candidate: URL) -> Bool {
         let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
         let candidatePath = candidate.standardizedFileURL.resolvingSymlinksInPath().path

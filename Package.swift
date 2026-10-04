@@ -95,10 +95,6 @@ let package = Package(
                 .product(name: "NotificationInbox", package: "NativeAgentCore"),
                 // Research owns SearXNG autodetect and search in process.
                 .product(name: "Research", package: "NativeAgentCore"),
-                // CommandPalette product (cluster C8 sibling) — its NativeClient
-                // import was added by the parallel cluster C8 worker without
-                // wiring the product dep here.
-                .product(name: "CommandPalette", package: "NativeAgentCore"),
                 // SystemOps owns router planning, rebuild, stash recovery, and
                 // crash-report surfaces.
                 .product(name: "SystemOps", package: "NativeAgentCore"),
@@ -202,10 +198,11 @@ let package = Package(
             resources: [
                 .copy("../../docs/data-bounds.md"),
                 // Public app-only installs do not have a source checkout. The
-                // async Codex / Claude Code bridges still need their durable
+                // async Codex / OMP bridges still need their durable
                 // wakeup workers, so ship the exact helpers as app resources
                 // instead of resolving only <repo>/script at runtime.
                 .copy("../../script/codex_thread_wakeup.js"),
+                .copy("../../script/chatgpt_dot_ipc.js"),
                 .copy("../../script/codex_wake_daemon_probe.js"),
                 .copy("../../script/codex_wake_execution_policy.js"),
                 .copy("../../script/codex_wake_prompt.js"),
@@ -221,7 +218,6 @@ let package = Package(
                 .copy("../../script/wake_reply_delivery.js"),
                 .copy("../../script/wake_recovery.js"),
                 .copy("../../script/codex_turn_result.js"),
-                .copy("../../script/claude_thread_wakeup.js"),
                 .copy("../../script/omp_thread_wakeup.js")
             ]
         )

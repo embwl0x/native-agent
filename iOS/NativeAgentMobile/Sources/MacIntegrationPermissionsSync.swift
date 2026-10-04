@@ -1,181 +1,64 @@
-// PATCH-2026-07-15: mac-integration-tab-ios — read-only iCloud projection of
-// the Mac side's <dataRoot>/security/mac_integration_permissions.json store.
-//
-// The Mac's MacIntegrationPermissionStore is the source of truth on disk. This
-// class reads its KVS projection and holds optimistic UI state while signed
-// actions are in flight. It never writes authority through KVS.
-//
-// Shape on the wire (matches the on-disk shape exactly):
-//   {
-//     "calendar":   {"read": true,  "write": false},
-//     "reminders":  {"read": true,  "write": false},
-//     "notify_mac": {"write": true},
-//     "spotlight":  {"read": true},
-//     ...
-//   }
-//
-// An axis the integration doesn't support is omitted (matches the Mac store's
-// clamping rule). Reads coalesce stored values on top of defaults via
-// `defaultValue(id:mode:)` so an unset key still answers the hot-path gate.
+// Read-only CloudKit snapshot of the Mac's canonical permission store.
+// Signed actions carry permission changes back to the Mac.
 
 import Foundation
-import CoreFoundation
 import SwiftUI
 
 @MainActor
 final class MacIntegrationPermissionsSync: ObservableObject {
     static let shared = MacIntegrationPermissionsSync()
 
-    /// KVS key shared with the Mac side. Do NOT rename without a coordinated
-    /// migration on the Mac side — the user's settings would silently revert to
-    /// defaults on first launch after the rename.
-    static let kvsKey = "nativeagent.mac_integration_permissions"
+    private struct Snapshot: Decodable, Sendable {
+        let permissions: [String: [String: Bool]]?
 
-    private let kvs = NSUbiquitousKeyValueStore.default
-    private let projectionLoader: () -> [String: Any]?
+        init(from decoder: Decoder) throws {
+            permissions = try? [String: [String: Bool]](from: decoder)
+        }
+    }
 
-    /// `id -> ["read": Bool, "write": Bool]`. Only axes the integration supports
-    /// are stored; axis lookups fall back to `defaultValue(id:mode:)` via
-    /// `get(id:mode:)`.
     @Published private(set) var permissions: [String: [String: Bool]] = [:]
 
-    /// What the phone can actually say about the Mac's permission matrix.
-    ///
-    /// Sweep 2026-09-01 item 36: `load()` used to treat "the Mac has never
-    /// published a projection" and "the Mac published a matrix" as the same
-    /// state — both left `projectionError` nil, and the view then rendered the
-    /// eleven hardcoded `defaultValue(id:mode:)` rows as if the Mac had
-    /// confirmed them. An unpaired or never-synced phone showed a complete,
-    /// plausible, entirely invented policy. The three cases are now distinct
-    /// and the view must say which one it is looking at.
     enum ProjectionState: Equatable {
-        /// No projection has ever arrived. Nothing here is authority.
         case awaitingMac
-        /// A well-formed projection from the Mac.
         case published
-        /// A projection arrived but cannot be read; reads fail closed.
         case malformed(String)
     }
 
     @Published private(set) var projectionState: ProjectionState = .awaitingMac
 
-    /// Existing malformed KVS state is unavailable, never silently presented
-    /// as the Mac's defaults. The view renders this instead of a plausible
-    /// toggle matrix until the Mac republishes a complete projection.
     var projectionError: String? {
         if case let .malformed(message) = projectionState { return message }
         return nil
     }
 
-    /// True only when a readable matrix actually came from the Mac. The view
-    /// gates every live toggle on this; anything else is a labelled placeholder.
     var hasMacProjection: Bool { projectionState == .published }
 
-    init(
-        projectionLoader: @escaping () -> [String: Any]? = {
-            NSUbiquitousKeyValueStore.default.dictionary(forKey: MacIntegrationPermissionsSync.kvsKey)
-        },
-        observesExternalChanges: Bool = true
-    ) {
-        self.projectionLoader = projectionLoader
-        load()
-        if observesExternalChanges {
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(externalChange(_:)),
-                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-                object: kvs
-            )
-            kvs.synchronize()
-        }
-    }
+    private var refreshGeneration = 0
 
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-    }
-
-    // MARK: - Persistence
-
-    /// Pull the current KVS dictionary into `permissions`. A malformed entry
-    /// is surfaced and makes permission reads fail closed, rather than being
-    /// silently replaced with believable defaults.
-    private func load() {
-        guard let raw = projectionLoader() else {
-            // Key absent from KVS: the Mac has never published. Say so — do
-            // not fall through to the default matrix and let the view render
-            // eleven confident toggles nobody on the Mac ever agreed to.
+    func refreshProjection() async {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        let engine = iCloudSyncEngine.shared
+        let lifecycle = engine.lifecycleGeneration
+        let filename = "mac_integration_permissions.json"
+        let snapshot: Snapshot? = await engine.loadSnapshotObjectAsync(named: filename)
+        guard generation == refreshGeneration, lifecycle == engine.lifecycleGeneration else { return }
+        guard let snapshot else {
             permissions = [:]
-            projectionState = .awaitingMac
+            let exists = engine.snapshotDir.map {
+                FileManager.default.fileExists(atPath: $0.appendingPathComponent(filename).path)
+            } ?? false
+            projectionState = exists ? .malformed("Mac permission sync is unavailable. Refresh after the Mac publishes its permissions.") : .awaitingMac
             return
         }
-        var out: [String: [String: Bool]] = [:]
-        var malformedIDs: [String] = []
-        out.reserveCapacity(raw.count)
-        for (id, value) in raw {
-            guard let entry = value as? [String: Any] else {
-                malformedIDs.append(id)
-                continue
-            }
-            var pair: [String: Bool] = [:]
-            var rowIsMalformed = false
-            if let rawRead = entry["read"] {
-                if let read = Self.strictBool(rawRead) {
-                    pair["read"] = read
-                } else {
-                    rowIsMalformed = true
-                }
-            }
-            if let rawWrite = entry["write"] {
-                if let write = Self.strictBool(rawWrite) {
-                    pair["write"] = write
-                } else {
-                    rowIsMalformed = true
-                }
-            }
-            if !pair.isEmpty {
-                out[id] = pair
-            }
-            if pair.isEmpty || rowIsMalformed {
-                malformedIDs.append(id)
-            }
+        guard let rows = snapshot.permissions, !rows.isEmpty,
+              rows.values.allSatisfy({ !$0.isEmpty && $0.keys.allSatisfy { $0 == "read" || $0 == "write" } }) else {
+            permissions = [:]
+            projectionState = .malformed("Mac permission sync is unavailable. Refresh after the Mac publishes its permissions.")
+            return
         }
-        permissions = out
-        let malformedCount = malformedIDs.count
-        projectionState = malformedCount == 0
-            ? .published
-            : .malformed(
-                "Mac permission sync is unavailable: \(malformedCount) malformed \(malformedCount == 1 ? "row" : "rows") in projection (\(malformedIDs.sorted().joined(separator: ", ")))."
-            )
-    }
-
-    /// `NSUbiquitousKeyValueStore` carries property-list scalars as bridged
-    /// Foundation values. A numeric `1` can bridge through `as? Bool`, but it
-    /// is not the Mac's documented Boolean wire value and must not make an OFF
-    /// permission silently read as ON.
-    private static func strictBool(_ value: Any) -> Bool? {
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) == CFBooleanGetTypeID() else {
-            return nil
-        }
-        return number.boolValue
-    }
-
-    /// Fired when the Mac side (or another paired iPhone) updates KVS while
-    /// the app is open. Re-reads on the main actor so SwiftUI views observing
-    /// `permissions` re-render.
-    @objc private func externalChange(_ note: Notification) {
-        Task { @MainActor in
-            self.load()
-        }
-    }
-
-    /// Reconcile the current KVS projection on explicit screen entry or
-    /// pull-to-refresh. External-change notifications remain the live-update
-    /// path; this prevents a screen opened after a missed notification from
-    /// presenting process-start defaults as a fresh Mac policy.
-    func refreshProjection() {
-        kvs.synchronize()
-        load()
+        permissions = rows
+        projectionState = .published
     }
 
     // MARK: - Gate

@@ -42,9 +42,6 @@ extension SwiftToolDispatcher {
         let admitted = await fullMacYoloAdmitted(tool: tool, surface: surface)
         let allowed = await macIntegrationPermissionStore.allows(integration, mode: mode, fullMacAdmitted: admitted)
         guard allowed else {
-            guard !CraftToolContext.requiresCurrentAuthority else {
-                throw CraftFailure("Craft stopped because current integration authority is missing. No sub-action approval was filed.")
-            }
             // The permission is not granted. That is not a refusal to be
             // relayed as prose with a "fix" hint — it is the person's
             // decision, not yet made, and it gets asked where the work is.

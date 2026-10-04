@@ -1,5 +1,6 @@
 import Foundation
 import Contacts
+import MacIntegration
 import PersistenceCore
 
 /// App-side adapter for the Contacts.framework backend behind the
@@ -217,6 +218,7 @@ public enum MacContactsAdapter {
             saveRequest.add(mutable, toContainerWithIdentifier: nil)
         }
         try store.execute(saveRequest)
+        invalidateNameCache()
 
         var result: [String: JSONValue] = [
             "status": .string("completed"),
@@ -270,6 +272,7 @@ public enum MacContactsAdapter {
             let req = CNSaveRequest()
             req.delete(mutable)
             try store.execute(req)
+            invalidateNameCache()
             return .object([
                 "status": .string("completed"),
                 "action": .string("deleted"),
@@ -286,6 +289,11 @@ public enum MacContactsAdapter {
     private static let nameCache = NSLock()
     nonisolated(unsafe) private static var namesByHandle: (built: Date, map: [String: String])?
 
+    private static func invalidateNameCache() {
+        nameCache.lock(); defer { nameCache.unlock() }
+        namesByHandle = nil
+    }
+
     /// A phone's last ten digits or a lowercased email: how a Messages handle
     /// and a card's number meet whatever their formatting.
     private static func handleKey(_ raw: String) -> String {
@@ -296,11 +304,14 @@ public enum MacContactsAdapter {
 
     /// Handle → contact name, from one pass over Contacts kept ten minutes.
     /// Only when Contacts access is already granted: this never asks.
-    static func contactNames() -> [String: String] {
+    private static func contactNames() -> [String: String] {
         nameCache.lock(); defer { nameCache.unlock() }
-        if let cached = namesByHandle, Date().timeIntervalSince(cached.built) < 600 { return cached.map }
         let status = CNContactStore.authorizationStatus(for: .contacts)
-        guard status == .authorized || status.rawValue == 4 else { return [:] }
+        guard status == .authorized || status.rawValue == 4 else {
+            namesByHandle = nil
+            return [:]
+        }
+        if let cached = namesByHandle, Date().timeIntervalSince(cached.built) < 600 { return cached.map }
         var map: [String: String] = [:]
         let keys = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactOrganizationNameKey,
                     CNContactPhoneNumbersKey, CNContactEmailAddressesKey] as [CNKeyDescriptor]
@@ -317,7 +328,10 @@ public enum MacContactsAdapter {
 
     /// A Messages read with people named: participants' `name` becomes the
     /// card's name, and each message gets `sender_name`. Handles are untouched.
-    static func naming(_ result: [String: JSONValue]) -> [String: JSONValue] {
+    static func naming(_ result: [String: JSONValue]) async -> [String: JSONValue] {
+        guard await MacIntegrationPermissionStore.shared.allows(MacIntegrationID.contacts, mode: .read) else {
+            return result
+        }
         let names = contactNames()
         guard !names.isEmpty else { return result }
         func name(_ handle: JSONValue?) -> String? {
@@ -389,6 +403,8 @@ public enum MacContactsAdapter {
         case .authorized:
             return true
         case .notDetermined:
+            // A skill never asks macOS for access (`SkillRunContext`); its step hands back.
+            guard !SkillRunContext.handsBack else { return false }
             return (try? await store.requestAccess(for: .contacts)) ?? false
         case .denied, .restricted:
             return false
@@ -398,7 +414,8 @@ public enum MacContactsAdapter {
     }
 
     private static func permissionDeniedEnvelope() -> JSONValue {
-        .object([
+        if SkillRunContext.handsBack { return SkillRunContext.handBack("macOS Contacts permission") }
+        return .object([
             "status": .string("denied"),
             "reason": .string("os_permission_denied"),
             "integration": .string("contacts"),

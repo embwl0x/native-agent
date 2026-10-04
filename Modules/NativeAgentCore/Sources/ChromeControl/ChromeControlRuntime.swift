@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentChromeRelayCore
 import PersistenceCore
 import TrustCenter
+import MacControl
 
 // No origin is a transport-level caller, never permission for a Chrome effect.
 public enum ChromeControlInvocationContext {
@@ -131,11 +132,14 @@ public enum ChromeControlEffect: String, Sendable, CaseIterable {
              .setChecked, .doubleClick, .drag, .scroll, .release: true
         }
     }
+
+    var requiresDriver: Bool { mayChangeExternalState && self != .release }
 }
 
 private final class ChromeSocketHandle: @unchecked Sendable {
     private let lock = NSLock()
     private var descriptor: Int32
+    private var shutDown = false
     /// 2026-09-06: frame writes run on a serial queue and can still be queued
     /// when the socket closes. They used to hold a FileHandle over THIS
     /// descriptor, so once it was closed and the number reused, a queued frame
@@ -153,13 +157,13 @@ private final class ChromeSocketHandle: @unchecked Sendable {
     var isOpen: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return descriptor >= 0
+        return descriptor >= 0 && !shutDown
     }
 
     func fileHandle() -> FileHandle? {
         lock.lock()
         defer { lock.unlock() }
-        guard descriptor >= 0 else { return nil }
+        guard descriptor >= 0, !shutDown else { return nil }
         return FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
     }
 
@@ -171,15 +175,21 @@ private final class ChromeSocketHandle: @unchecked Sendable {
         return FileHandle(fileDescriptor: writeDescriptor, closeOnDealloc: false)
     }
 
-    func close() {
+    func shutdown() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard descriptor >= 0, !shutDown else { return }
+        shutDown = true
+        _ = Darwin.shutdown(descriptor, SHUT_RDWR)
+    }
+
+    /// The reader owns this descriptor until its last queued read returns.
+    func closeReadSide() {
         lock.lock()
         let fd = descriptor
         descriptor = -1
         lock.unlock()
-        if fd >= 0 {
-            _ = Darwin.shutdown(fd, SHUT_RDWR)
-            Darwin.close(fd)
-        }
+        if fd >= 0 { Darwin.close(fd) }
     }
 
     /// Called only from the write queue, after the last queued frame.
@@ -232,7 +242,9 @@ actor ChromeControlChannel {
     private struct Pending {
         let expectedAction: ChromeControlEffect
         let leaseID: String?
-        let continuation: CheckedContinuation<JSONValue, Error>
+        let targetReceipt: [String: JSONValue]
+        let driver: MacDriverBinding?
+        var continuation: CheckedContinuation<JSONValue, Error>?
         let timeout: Task<Void, Never>
         let dispatch: ChromeRequestDispatch
 
@@ -259,6 +271,8 @@ actor ChromeControlChannel {
     )
     private let requestTimeout: Duration
     private var readTask: Task<Void, Never>?
+    private var driverTask: Task<Void, Never>?
+    private var leaseDriver: MacDriverBinding?
     private var pending: [String: Pending] = [:]
     private var activeLeaseIDs: Set<String> = []
     private struct LeaseActivityWindow {
@@ -283,12 +297,21 @@ actor ChromeControlChannel {
     }
 
     func start() {
-        guard readTask == nil, let handle = socket.fileHandle() else { return }
+        guard !closed, readTask == nil, let handle = socket.fileHandle() else { return }
+        driverTask = Task { [weak self] in
+            let changes = await MacAttentionSessionStore.shared.driverChanges()
+            for await _ in changes {
+                guard !Task.isCancelled else { return }
+                await self?.yieldInvalidDriver()
+            }
+        }
         let framer = self.framer
+        let socket = self.socket
         let readQueue = DispatchQueue(label: "com.nativeagent.chromecontrol.read", qos: .userInitiated)
         readTask = Task.detached(priority: .userInitiated) { [weak self] in
+            defer { socket.closeReadSide() }
             do {
-                while let data = try await offPool(readQueue, {
+                while !Task.isCancelled, let data = try await offPool(readQueue, {
                     Result { try framer.readMessage(from: handle) }
                 }).get() {
                     try framer.validateJSONObject(data)
@@ -302,6 +325,11 @@ actor ChromeControlChannel {
     }
 
     func request(action: ChromeControlEffect, payload: [String: JSONValue]) async throws -> JSONValue {
+        if action.requiresDriver, MacDriverContext.binding?.allowsEmission != true {
+            return Self.driverTakeoverResult(action: action, payload: payload, dispatched: false)
+        }
+        yieldInvalidDriver()
+        if action.requiresDriver { leaseDriver = MacDriverContext.binding }
         guard !closed, socket.isOpen else {
             throw ChromeControlRuntimeError.disconnected
         }
@@ -333,11 +361,13 @@ actor ChromeControlChannel {
                 pending[id] = Pending(
                     expectedAction: action,
                     leaseID: { if case .string(let id)? = payload["leaseId"] { id } else { nil } }(),
+                    targetReceipt: payload.filter { ["leaseId", "snapshotId", "nodeId", "targetNodeId", "url", "tabId"].contains($0.key) },
+                    driver: action.requiresDriver ? MacDriverContext.binding : nil,
                     continuation: continuation,
                     timeout: timeout,
                     dispatch: dispatch
                 )
-                enqueueWrite(data, dispatch: dispatch) { [weak self] error in
+                enqueueWrite(data, dispatch: dispatch, driver: action.requiresDriver ? MacDriverContext.binding : nil) { [weak self] error in
                     Task { await self?.failWrite(id: id, error: error) }
                 }
             }
@@ -362,7 +392,48 @@ actor ChromeControlChannel {
         closeSocket(drainingWrites: releaseLeases)
         readTask?.cancel()
         readTask = nil
+        driverTask?.cancel()
+        driverTask = nil
         failPending(error)
+    }
+
+    private func yieldInvalidDriver() {
+        guard leaseDriver?.takenOver == true else { return }
+        yieldToDriver()
+        leaseDriver = nil
+    }
+
+    private func yieldToDriver() {
+        for leaseID in activeLeaseIDs.sorted() { sendLeaseRelease(leaseID) }
+        activeLeaseIDs.removeAll()
+        leaseActivityWindows.removeAll()
+        for (id, var row) in pending where row.driver?.takenOver == true && row.continuation != nil {
+            pending[id] = nil
+            let dispatched = row.dispatch.cancel()
+            row.continuation?.resume(returning: Self.driverTakeoverResult(
+                action: row.expectedAction,
+                payload: row.targetReceipt,
+                dispatched: dispatched
+            ))
+            // An acquire may still return a new lease after this handback.
+            // Keep its existing pending row only to release that late lease.
+            if dispatched, row.expectedAction == .acquire {
+                row.continuation = nil
+                pending[id] = row
+            } else { row.timeout.cancel() }
+        }
+    }
+
+    private static func driverTakeoverResult(
+        action: ChromeControlEffect, payload: [String: JSONValue], dispatched: Bool
+    ) -> JSONValue {
+        .object(["result": .object(payload.merging([
+            "status": .string("yielded_to_user"),
+            "action": .string(action.rawValue),
+            "leaseId": payload["leaseId"] ?? .null,
+            "outcome": .string(dispatched && action.mayChangeExternalState ? "outcome_unknown" : "not_performed"),
+            "message": .string(MacAttentionSessionStore.driverRefusal),
+        ]) { _, new in new })])
     }
 
     func activeLeaseCount() -> Int { activeLeaseIDs.count }
@@ -433,7 +504,28 @@ actor ChromeControlChannel {
         }
         pending.removeValue(forKey: id)
         row.timeout.cancel()
+        if !ok, row.driver?.takenOver == true {
+            row.continuation?.resume(returning: Self.driverTakeoverResult(
+                action: row.expectedAction, payload: row.targetReceipt, dispatched: true))
+            yieldInvalidDriver()
+            return
+        }
         if ok {
+            if row.continuation == nil, row.expectedAction == .acquire,
+               case .object(let result)? = object["result"], case .string(let leaseID)? = result["leaseId"] {
+                sendLeaseRelease(leaseID)
+                return
+            }
+            if row.driver?.takenOver == true {
+                if row.expectedAction == .acquire, case .object(let result)? = object["result"],
+                   case .string(let leaseID)? = result["leaseId"] { sendLeaseRelease(leaseID) }
+                var receipt = row.targetReceipt
+                if case .object(let result)? = object["result"] { receipt.merge(result) { _, new in new } }
+                row.continuation?.resume(returning: Self.driverTakeoverResult(
+                    action: row.expectedAction, payload: receipt, dispatched: true))
+                yieldInvalidDriver()
+                return
+            }
             if (row.expectedAction == .acquire || row.expectedAction == .renew),
                case .object(let result)? = object["result"],
                case .string(let leaseID)? = result["leaseId"] {
@@ -447,7 +539,7 @@ actor ChromeControlChannel {
                 activeLeaseIDs.remove(leaseID)
                 leaseActivityWindows.removeValue(forKey: leaseID)
             }
-            row.continuation.resume(returning: value)
+            row.continuation?.resume(returning: value)
         } else {
             let code: String
             let message: String
@@ -463,7 +555,7 @@ actor ChromeControlChannel {
                 code = "extension_rejected"
                 message = "Chrome control action failed."
             }
-            row.continuation.resume(throwing: ChromeControlRuntimeError.extensionRejected(
+            row.continuation?.resume(throwing: ChromeControlRuntimeError.extensionRejected(
                 code: code,
                 message: message
             ))
@@ -483,6 +575,7 @@ actor ChromeControlChannel {
             activeLeaseIDs.insert(leaseID)
             endedLeases.removeValue(forKey: leaseID)
             endedLeaseOrder.removeAll { $0 == leaseID }
+            if !MacAttentionSessionStore.shared.currentDriverAllowed { yieldToDriver() }
         } else if event == "lease.yielded" || event == "lease.released" {
             activeLeaseIDs.remove(leaseID)
             leaseActivityWindows.removeValue(forKey: leaseID)
@@ -491,6 +584,10 @@ actor ChromeControlChannel {
             // one that names it.
             let reason: String
             if case .string(let detail)? = payload["reason"] { reason = detail } else { reason = "" }
+            if event == "lease.yielded", reason.hasPrefix("user_") || reason.hasPrefix("tab_activated") {
+                MacAttentionSessionStore.shared.takeUserControl()
+                yieldToDriver()
+            }
             noteLeaseEnded(leaseID, event: event, reason: reason)
             failPending(forLease: leaseID, error: ChromeControlRuntimeError.leaseEnded(
                 leaseID: leaseID, event: event, reason: reason
@@ -530,13 +627,13 @@ actor ChromeControlChannel {
             if let result = Self.tabTakeoverResult(
                 error: error, action: row.expectedAction, dispatched: row.dispatch.cancel()
             ) {
-                row.continuation.resume(returning: result)
+                row.continuation?.resume(returning: result)
                 continue
             }
             // A yield does not undo what the page already did, so an effect
             // still reports its outcome as unknown — but now with the cause
             // named instead of a bare timeout.
-            row.continuation.resume(throwing: row.unconfirmedFailure(error))
+            row.continuation?.resume(throwing: row.unconfirmedFailure(error))
         }
     }
 
@@ -566,11 +663,16 @@ actor ChromeControlChannel {
     private nonisolated func enqueueWrite(
         _ data: Data,
         dispatch: ChromeRequestDispatch? = nil,
+        driver: MacDriverBinding? = nil,
         onFailure: @escaping @Sendable (Error) -> Void
     ) {
         let framer = self.framer
         let socket = self.socket
         writeQueue.async {
+            if let driver, !driver.allowsEmission {
+                onFailure(ChromeControlRuntimeError.conversationContext(MacAttentionSessionStore.driverRefusal))
+                return
+            }
             // The descriptor is taken here, on the queue, not when the write
             // was enqueued: after teardown there is none, and the frame is
             // dropped instead of written to a reused descriptor number.
@@ -592,14 +694,15 @@ actor ChromeControlChannel {
     /// mostly lost. Shutdown now waits for the queue to drain first. The wait
     /// is bounded: a Chrome that has stopped draining its end must not park
     /// this actor forever — the write queue exists to prevent exactly that.
-    private nonisolated func closeSocket(drainingWrites: Bool) {
+    private func closeSocket(drainingWrites: Bool) {
         if drainingWrites {
             let drained = DispatchSemaphore(value: 0)
             writeQueue.async { drained.signal() }
             _ = drained.wait(timeout: .now() + 5)
         }
         let socket = self.socket
-        socket.close()
+        socket.shutdown()
+        if readTask == nil { socket.closeReadSide() }
         writeQueue.async { socket.closeWriteSide() }
     }
 
@@ -609,13 +712,13 @@ actor ChromeControlChannel {
         // FileHandle may report a write failure after a frame prefix or payload
         // reached the relay. For an effect, transport failure is therefore not
         // proof that Chrome did nothing and must not invite a blind retry.
-        row.continuation.resume(throwing: row.unconfirmedFailure(error))
+        row.continuation?.resume(throwing: row.unconfirmedFailure(error))
     }
 
     private func timeoutRequest(_ id: String) {
         guard let row = pending.removeValue(forKey: id) else { return }
         row.timeout.cancel()
-        row.continuation.resume(throwing: row.unconfirmedFailure(ChromeControlRuntimeError.requestTimedOut))
+        row.continuation?.resume(throwing: row.unconfirmedFailure(ChromeControlRuntimeError.requestTimedOut))
     }
 
     private func cancelRequest(_ id: String) {
@@ -629,7 +732,7 @@ actor ChromeControlChannel {
         }
         // Task cancellation remains cancellation, not proof that a dispatched
         // browser effect was rolled back or safe to repeat.
-        row.continuation.resume(throwing: CancellationError())
+        row.continuation?.resume(throwing: CancellationError())
     }
 
     private func sendLeaseRelease(_ leaseID: String) {
@@ -660,6 +763,8 @@ actor ChromeControlChannel {
         closeSocket(drainingWrites: false)
         readTask?.cancel()
         readTask = nil
+        driverTask?.cancel()
+        driverTask = nil
         failPending(error)
         onDisconnect()
     }
@@ -669,7 +774,7 @@ actor ChromeControlChannel {
         pending.removeAll()
         for row in rows {
             row.timeout.cancel()
-            row.continuation.resume(throwing: row.unconfirmedFailure(error))
+            row.continuation?.resume(throwing: row.unconfirmedFailure(error))
         }
     }
 }
@@ -1032,9 +1137,8 @@ public actor ChromeControlRuntime {
     }
 
     /// Leases Chrome opened in the visible work window, and background leases
-    /// whose page is now an X/Twitter post. The extension picks the visible
-    /// window only from the URL given at creation, so a background tab that
-    /// navigates or is redirected to a post must not act on it (Sol, 09-23).
+    /// whose page is now an X/Twitter post. Visible work windows require an
+    /// explicit rendering mode; background post actions remain refused.
     private var visibleLeases: Set<String> = []
     private var postOnBackgroundLeases: Set<String> = []
 
@@ -1072,7 +1176,7 @@ public actor ChromeControlRuntime {
         return !lease.isEmpty && postOnBackgroundLeases.contains(lease)
     }
 
-    /// The extension's `isXPostURL` (lease-manager.js), in Swift.
+    /// Exact X/Twitter post identity for the background action guard.
     public static func isXPostURL(_ raw: String) -> Bool {
         guard let url = URLComponents(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
               url.user == nil, url.password == nil, url.port == nil,
@@ -1106,12 +1210,11 @@ public actor ChromeControlRuntime {
         if let channel { known.formUnion(await channel.activeLeases()) }
         let resolved = try ChromeConversationTab.resolve(
             effect: effect, payload: payload, current: conversationTabs[session], knownLeases: known)
-        let generation = installationGeneration
         do {
-            let response = try await perform(effect, payload: resolved)
-            if generation == installationGeneration, case .object(let envelope) = response,
+            let (response, respondingChannel) = try await performOnChannel(effect, payload: resolved)
+            if channel === respondingChannel, case .object(let envelope) = response,
                case .object(let result)? = envelope["result"] {
-                if effect == .release || result["status"] == .string("yielded") {
+                if effect == .release || result["status"] == .string("yielded") || result["status"] == .string("yielded_to_user") {
                     if conversationTabs[session]?.leaseID == resolved["leaseId"] {
                         conversationTabs.removeValue(forKey: session)
                     }
@@ -1137,6 +1240,20 @@ public actor ChromeControlRuntime {
     }
 
     func perform(_ effect: ChromeControlEffect, payload: [String: JSONValue]) async throws -> JSONValue {
+        try await performOnChannel(effect, payload: payload).response
+    }
+
+    private func performOnChannel(
+        _ effect: ChromeControlEffect, payload: [String: JSONValue]
+    ) async throws -> (response: JSONValue, channel: ChromeControlChannel) {
+        if MacDriverContext.binding == nil {
+            let binding = await MacAttentionSessionStore.shared.bindDriver()
+            return try await withTaskCancellationHandler {
+                try await MacDriverContext.$binding.withValue(binding) {
+                    try await performOnChannel(effect, payload: payload)
+                }
+            } onCancel: { binding.cancel() }
+        }
         if effect.requiresEffectTimeAuthorization {
             guard await authority() else {
                 throw ChromeControlRuntimeError.disabled
@@ -1145,19 +1262,20 @@ public actor ChromeControlRuntime {
         let previous = channel
         do {
             guard let previous else { throw ChromeControlRuntimeError.disconnected }
-            if let renewal = await previous.activityRenewalPayload(for: effect, payload: payload) {
+            if MacDriverContext.binding?.allowsEmission == true,
+               let renewal = await previous.activityRenewalPayload(for: effect, payload: payload) {
                 // Re-enter the authority boundary for renewal, then check it
                 // again before the original action after the suspension.
-                let response = try await perform(.renew, payload: renewal)
-                if case .object(let envelope) = response,
+                let renewalResponse = try await performOnChannel(.renew, payload: renewal)
+                if case .object(let envelope) = renewalResponse.response,
                    case .object(let result)? = envelope["result"],
-                   case .string("yielded")? = result["status"] { return response }
+                   case .string("yielded")? = result["status"] { return renewalResponse }
                 try Task.checkCancellation()
                 guard await authority() else {
                     throw ChromeControlRuntimeError.disabled
                 }
             }
-            return try await previous.request(action: effect, payload: payload)
+            return (try await previous.request(action: effect, payload: payload), previous)
         } catch ChromeControlRuntimeError.disconnected {
             // Chrome owns host launch. Make its destination ready, then await
             // the extension's existing reconnect alarm and authenticated hello.
@@ -1176,7 +1294,7 @@ public actor ChromeControlRuntime {
             guard await authority() else {
                 throw ChromeControlRuntimeError.disabled
             }
-            return try await next.request(action: effect, payload: payload)
+            return (try await next.request(action: effect, payload: payload), next)
         }
     }
 
@@ -1325,7 +1443,11 @@ public actor ChromeControlRuntime {
         let installation = installationGeneration
         conversationTabs.removeAll()
         conversationTabOrder.removeAll()
-        if let channel { await channel.shutdown(releaseLeases: true) }
+        // Retire the old channel before shutdown suspends, so its late replies
+        // cannot restore bookmarks while the replacement is being installed.
+        let previous = channel
+        channel = nil
+        if let previous { await previous.shutdown(releaseLeases: true) }
         // Shutdown suspends: a stop or a newer accepted connection retires
         // this installation before it can publish a channel.
         guard generation == listenerGeneration,

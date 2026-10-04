@@ -1,14 +1,35 @@
 import ActivityKit
+import CryptoKit
 import NativeAgentShared
 import SwiftUI
 
-/// Local sends alone authorize a Live Activity. Signed sync supplies its state;
-/// no APNs activity token or push-to-start registration is requested.
 @MainActor
 final class PhoneTurnActivity: ObservableObject {
     static let shared = PhoneTurnActivity()
     @Published private(set) var workingIDs: Set<String> = []
     @Published private(set) var errorMessage: String?
+    @Published var isEnabled = UserDefaults.standard.bool(forKey: "NativeAgentMobile.workActivityEnabled")
+    var work: [String: MobileWorkActivity] = [:]
+    var pushConfigured = false
+    var workUpdates: [String: (token: UUID, task: Task<Void, Never>)] = [:]
+    var workPairing: String?
+    var workExpirations: [String: Task<Void, Never>] = [:]
+    var tokenObservers: [String: Task<Void, Never>] = [:]
+    var activityObserver: Task<Void, Never>?
+    var startTokenObserver: Task<Void, Never>?
+    var registrationTask: Task<Void, Never>?
+    var disableRegistrationInFlight = false
+    var disableRegistrationPending = (UserDefaults.standard.object(forKey: "NativeAgentMobile.workActivityDisablePending") as? Bool)
+        ?? !UserDefaults.standard.bool(forKey: "NativeAgentMobile.workActivityEnabled") {
+        didSet { UserDefaults.standard.set(disableRegistrationPending, forKey: "NativeAgentMobile.workActivityDisablePending") }
+    }
+    var failedWorkStarts: Set<String> = []
+    var activityPairing: String? { AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) }
+    var activityPushPairing: String? {
+        guard let secret = iCloudBridge.shared.pairingSecretForPhoneRequests else { return nil }
+        return SHA256.hash(data: Data(secret.base64EncodedString().utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+    func activityError(_ message: String?) { errorMessage = message }
     private struct Turn: Codable {
         let id: String
         let startedAt: Date
@@ -21,9 +42,7 @@ final class PhoneTurnActivity: ObservableObject {
     }
     private let key = "NativeAgentMobile.localLiveTurns"
     private var turns: [String: Turn] = [:]
-    private var updates: [String: Task<Void, Never>] = [:]
     private var expirations: [String: Task<Void, Never>] = [:]
-    private var failedStarts: Set<String> = []
     private let staleInterval: TimeInterval = 15 * 60
 
     private init() {
@@ -47,7 +66,7 @@ final class PhoneTurnActivity: ObservableObject {
     }
 
     func resume() {
-        failedStarts.removeAll()
+        resumeWorkActivities()
         let pairing = AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests)
         for turn in Array(turns.values) {
             if turn.pairing != pairing { finish(turn.id, status: "Activity ended") }
@@ -56,15 +75,10 @@ final class PhoneTurnActivity: ObservableObject {
             else if turn.status != nil {
                 if !turn.replying, let at = turn.updatedAt, at > Date().addingTimeInterval(-120) { workingIDs.insert(turn.id) }
                 else { workingIDs.remove(turn.id) }
-                enqueue(turn.id) { self.start(turn.id) }
             }
             expireWhenStale(turn.id)
         }
-        let orphans = Set(Activity<PhoneTurnAttributes>.activities.filter {
-            turns[$0.attributes.correlationID] == nil && updates[$0.attributes.correlationID] == nil
-                && $0.activityState != .ended && $0.activityState != .dismissed
-        }.map(\.id))
-        if !orphans.isEmpty { Task { await Self.endOrphans(orphans) } }
+        trimExpiredTurns()
     }
 
     func receive(_ message: BridgeMessage) {
@@ -84,15 +98,9 @@ final class PhoneTurnActivity: ObservableObject {
             if turn.replying { workingIDs.remove(id) } else { workingIDs.insert(id) }
             save()
             expireWhenStale(id)
-            let status = turn.status ?? "Working…"
-            enqueue(id) {
-                self.start(id)
-                await Self.update(id, status: status, at: message.timestamp)
-            }
         case "final", "cancelled", "error", "rejection":
             let status = kind == "final" ? "Reply ready" : kind == "cancelled" ? "Stopped" : "Open NativeAgent for details"
-            let needsStart = turn.expired == true || (!turn.requested && turn.status != nil)
-            finish(id, status: status, restoring: needsStart ? message.timestamp : nil)
+            finish(id, status: status)
         default: break
         }
     }
@@ -110,83 +118,34 @@ final class PhoneTurnActivity: ObservableObject {
     }
 
     private func expire(_ id: String) {
+        expirations.removeValue(forKey: id)?.cancel()
         guard var turn = turns[id], turn.expired != true else { return }
         turn.expired = true
         turn.requested = false
         turns[id] = turn
         workingIDs.remove(id)
-        failedStarts.remove(id)
+        trimExpiredTurns()
         save()
-        enqueue(id) { await Self.end(id, status: "Activity ended") }
     }
 
-    private func enqueue(_ id: String, operation: @escaping @MainActor () async -> Void) {
-        let previous = updates[id]
-        updates[id] = Task { await previous?.value; await operation() }
-    }
-
-    private func start(_ id: String, restoring turn: Turn? = nil) {
-        guard var current = turn ?? turns[id], current.expired != true, !current.requested, !failedStarts.contains(id),
-              let status = current.status, let updatedAt = current.updatedAt,
-              updatedAt > Date().addingTimeInterval(-120), UIApplication.shared.applicationState == .active,
-              ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-        if Activity<PhoneTurnAttributes>.activities.contains(where: {
-            $0.attributes.correlationID == id && $0.activityState != .ended && $0.activityState != .dismissed
-        }) {
-            if turn == nil { current.requested = true; turns[id] = current; save() }
-            return
+    private func trimExpiredTurns() {
+        let expired = turns.values.filter { $0.expired == true }
+            .sorted { ($0.updatedAt ?? $0.startedAt) > ($1.updatedAt ?? $1.startedAt) }
+        guard expired.count > 64 else { return }
+        for turn in expired.dropFirst(64) {
+            turns.removeValue(forKey: turn.id)
+            expirations.removeValue(forKey: turn.id)?.cancel()
         }
-        do {
-            _ = try Activity.request(attributes: PhoneTurnAttributes(correlationID: id,
-                agentName: iCloudSyncEngine.shared.agentDisplayName, startedAt: current.startedAt),
-                content: ActivityContent(state: .init(status: status, updatedAt: updatedAt),
-                    staleDate: updatedAt.addingTimeInterval(120)), pushType: nil)
-            if turn == nil { current.requested = true; turns[id] = current; save() }
-            errorMessage = nil
-        } catch {
-            failedStarts.insert(id)
-            errorMessage = "Live Activity could not start: \(error.localizedDescription)"
-        }
+        save()
     }
 
-    func finish(_ id: String, status: String = "Turn ended", restoring at: Date? = nil) {
+    func finish(_ id: String, status: String = "Turn ended") {
         expirations.removeValue(forKey: id)?.cancel()
         workingIDs.remove(id)
-        failedStarts.remove(id)
-        guard var turn = turns.removeValue(forKey: id) else { return }
-        if let at {
-            turn.expired = nil
-            turn.requested = false
-            turn.status = status
-            turn.updatedAt = at
-        }
+        guard turns.removeValue(forKey: id) != nil else { return }
         save()
-        enqueue(id) {
-            if at != nil { self.start(id, restoring: turn) }
-            await Self.end(id, status: status)
-            self.updates.removeValue(forKey: id)
-        }
     }
 
     func silence(_ id: String) { workingIDs.remove(id) }
 
-    // ActivityKit's activity handles are not Sendable. Create and use them on
-    // the same nonisolated executor, passing only value data from the UI owner.
-    @concurrent nonisolated private static func update(_ id: String, status: String, at: Date) async {
-        for activity in Activity<PhoneTurnAttributes>.activities where activity.attributes.correlationID == id {
-            await activity.update(ActivityContent(state: .init(status: status, updatedAt: at), staleDate: at.addingTimeInterval(120)))
-        }
-    }
-    @concurrent nonisolated private static func end(_ id: String, status: String) async {
-        for activity in Activity<PhoneTurnAttributes>.activities where activity.attributes.correlationID == id {
-            await activity.end(ActivityContent(state: .init(status: status, updatedAt: Date()), staleDate: nil),
-                dismissalPolicy: .after(Date().addingTimeInterval(30)))
-        }
-    }
-    @concurrent nonisolated private static func endOrphans(_ ids: Set<String>) async {
-        for activity in Activity<PhoneTurnAttributes>.activities where ids.contains(activity.id)
-            && activity.activityState != .ended && activity.activityState != .dismissed {
-            await activity.end(nil, dismissalPolicy: .immediate)
-        }
-    }
 }

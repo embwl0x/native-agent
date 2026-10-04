@@ -19,7 +19,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -129,6 +128,10 @@ extension NativeClient {
         }
 
         if id == "kimi-code" {
+            let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedProviderSnapshot()
+            guard let provider = snapshot.providers.first(where: { $0.id == id }) else {
+                throw ProviderRoutingError.providerNotFound
+            }
             // Real reachability probe: the subscription API has no free GET
             // /models, so spend one token on a minimal Messages call. Proves
             // key validity + endpoint reachability, and its 200 also confirms
@@ -140,10 +143,19 @@ extension NativeClient {
             req.setValue("application/json", forHTTPHeaderField: "content-type")
             req.timeoutInterval = 20
             // A connectivity probe still needs A model to ask with: take the
-            // FIRST row of this provider's own catalog (2026-09-13) rather than
-            // naming one in code, so the probe follows the catalog.
-            let probeModel = FirstPartyModelCatalog
-                .models(forProviderID: "kimi-code").first?.id ?? ""
+            // selected model from the checked snapshot, or the first catalog
+            // row when this account is not selected on any surface.
+            let selectedSurface = MODEL_SURFACES.first { snapshot.routing.activeProviders[$0] == id }
+            let selectedModel = selectedSurface.flatMap { snapshot.routing.preferences[$0]?.model }
+            let offeredModels: [String]
+            if case .array(let models)? = provider.modelCatalog {
+                offeredModels = models.compactMap {
+                    guard case .object(let row) = $0, case .string(let model)? = row["id"] else { return nil }
+                    return model
+                }
+            } else { offeredModels = [] }
+            guard let probeModel = selectedModel.flatMap({ offeredModels.contains($0) ? $0 : nil })
+                ?? offeredModels.first else { throw ProviderRoutingError.unavailable }
             req.httpBody = try? JSONSerialization.data(withJSONObject: [
                 "model": probeModel,
                 "max_tokens": 1,
@@ -318,7 +330,7 @@ extension NativeClient {
             now: now,
             cachePath: Self.doctorCachePath(),
             liveChecks: liveChecks,
-            runCoreChecks: { try await makeDoctorChecks().runAll(repair: false, checkLLM: true) }
+            runCoreChecks: { try await makeDoctorChecks().runAll(repair: false) }
         )
     }
 
@@ -622,13 +634,13 @@ enum EmbeddingPlainCopy {
         case .byMeaning:
             return "Memory search finds results by meaning."
         case .turnedOff:
-            return "Memory search by meaning is turned off. Searches match words instead."
+            return "Memory search by meaning is turned off."
         case .testVectors:
             return "Memory search is running on test data, so results will not match meaning."
         case .modelMissing:
-            return "Memory search by meaning is off because a required model is not installed. Searches match words instead."
+            return "Memory search is unavailable because a required model is not installed."
         case .modelFailed:
-            return "Memory search by meaning is off because the search model could not load. Searches match words instead."
+            return "Memory search is unavailable because the search model could not load."
         }
     }
 

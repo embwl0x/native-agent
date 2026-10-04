@@ -426,6 +426,8 @@ public enum MacActClosedLoop {
         /// caller did not ask, and the old silence-tolerating rule stands.
         appWindowCount: Int? = nil
     ) -> KeyWindowRefusal? {
+        let frameWindowTitle = receiptText(frameWindowTitle)
+        let focusedWindowTitle = receiptText(focusedWindowTitle)
         guard let frontmostPid else {
             return KeyWindowRefusal(
                 reason: "frontmost_unknown",
@@ -749,16 +751,20 @@ public enum MacActClosedLoop {
     ) async -> EffectWait {
         let deadline = startedAt.addingTimeInterval(Double(waitMs) / 1000.0)
         var first = collector.first()
-        while first == nil, clock() < deadline {
-            try? await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
+        while !Task.isCancelled, first == nil, clock() < deadline {
+            do {
+                try await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
+            } catch { break }
             first = collector.first()
         }
         if !until.isEmpty, first != nil {
             // Something fired, but not necessarily the thing this verb means.
             // Keep watching for the verb's own signal until the deadline.
-            while clock() < deadline,
+            while !Task.isCancelled, clock() < deadline,
                   !collector.snapshot().contains(where: { until.contains($0.kind) }) {
-                try? await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(pollMs) * 1_000_000)
+                } catch { break }
             }
         }
         guard let first else {
@@ -770,7 +776,7 @@ public enum MacActClosedLoop {
                 dropped: collector.droppedCount()
             )
         }
-        if quietMs > 0 {
+        if !Task.isCancelled, quietMs > 0 {
             try? await Task.sleep(nanoseconds: UInt64(quietMs) * 1_000_000)
         }
         let all = collector.snapshot()
@@ -1029,7 +1035,8 @@ public enum MacActClosedLoop {
         public let readoutsRemoved: [ReadoutRow]
         /// Were the two compiles allowed to see the same window? False when one
         /// side's walk truncated or the two ran under different caps — the
-        /// added/removed affordance CENSUS is a set difference and means nothing
+        /// added/removed affordance and readout CENSUS is a set difference and
+        /// means nothing
         /// across mismatched bounds. Said out loud rather than dropped silently.
         public let diffComparable: Bool
         public let diffIncomparableReason: String?
@@ -1107,8 +1114,8 @@ public enum MacActClosedLoop {
         /// `windowChanged` is exactly `!changeReasons.isEmpty`, so a true with
         /// no reasons is unrepresentable.
         ///
-        /// The added/removed CENSUS is omitted when the two compiles were not
-        /// comparable. The other channels stay: they are keyed by IDENTITY
+        /// Both affordance and readout added/removed counts are omitted when the
+        /// two compiles were not comparable. The other channels stay: they are keyed by IDENTITY
         /// (a handle's before/after, the focus, the modal, the title, a
         /// readout's key) rather than by set membership, so a cap that hides
         /// rows cannot fabricate one of them.
@@ -1117,6 +1124,8 @@ public enum MacActClosedLoop {
             if diffComparable {
                 if addedTotal > 0 { out.append("affordances_added") }
                 if removedTotal > 0 { out.append("affordances_removed") }
+                if readoutsAddedTotal > 0 { out.append("readouts_added") }
+                if readoutsRemovedTotal > 0 { out.append("readouts_removed") }
             }
             if changedTotal > 0 { out.append("affordances_changed") }
             if focusChanged { out.append("focus_changed") }
@@ -1124,8 +1133,6 @@ public enum MacActClosedLoop {
             if modalDisappeared { out.append("modal_disappeared") }
             if windowTitleChanged { out.append("window_title_changed") }
             if readoutsChangedTotal > 0 { out.append("readouts_changed") }
-            if readoutsAddedTotal > 0 { out.append("readouts_added") }
-            if readoutsRemovedTotal > 0 { out.append("readouts_removed") }
             return out
         }
 
@@ -1321,6 +1328,8 @@ public enum MacActClosedLoop {
         /// The label/content identity of the element the verb NAMED, for
         /// destination matching. Nil ⇒ intent unchecked, structural floor only.
         intendedTarget: String? = nil,
+        intendedTargetJSON: JSONValue? = nil,
+        windowTitleJSON: JSONValue? = nil,
         /// `type` only: the text the caller asked to land, the acted element's
         /// value BEFORE the act, and what it reads AFTER. Never echoed into
         /// any payload.
@@ -1417,8 +1426,8 @@ public enum MacActClosedLoop {
                 status: "acted_unobserved",
                 reason: "navigation_intent_unmatched",
                 note: "\(verb.rawValue) produced a real structural change — the window is now "
-                    + "titled \"\(diff.windowTitleAfter ?? "?")\" — but that is not the "
-                    + "destination this act named (\"\(intendedTarget ?? "?")\"). Something "
+                    + "titled \"\(receiptText(diff.windowTitleAfter, redacted: windowTitleJSON) ?? "?")\" — but that is not the "
+                    + "destination this act named (\"\(receiptText(intendedTarget, redacted: intendedTargetJSON) ?? "?")\"). Something "
                     + "moved; it was not necessarily what you asked for. mac_look to see where "
                     + "you actually are before acting again"
             )
@@ -1427,6 +1436,15 @@ public enum MacActClosedLoop {
     }
 
     // MARK: - Open-target resolution (Agent acceptance round 4, finding 1a)
+
+    private static func receiptText(_ raw: String?, redacted: JSONValue? = nil) -> String? {
+        guard let raw else { return nil }
+        let value = redacted ?? MacScreenViewTextRedaction.redactedLegendString(
+            raw, valueChars: MacAXLimits.hardValueChars
+        )
+        if case .string(let text) = value { return text }
+        return "[redacted]"
+    }
 
     /// Roles that are a legitimate CLICK target when the handle itself will not
     /// open. A Finder list ROW is the thing that opens.

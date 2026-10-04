@@ -218,13 +218,19 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         to next: MacControlOperationState,
         verification: MotorVerificationState? = nil,
         expectedNextEvidence: String? = nil,
-        outcomeCode: String? = nil
+        outcomeCode: String? = nil,
+        acknowledgePreStartCancellation: Bool = false
     ) async throws -> MacControlOperationRecord {
         try await mutate { snapshot in
             guard let index = snapshot.operations.firstIndex(where: { $0.operationId == operationId }) else {
                 throw MacControlOperationStoreError.operationNotFound
             }
             let current = snapshot.operations[index]
+            if acknowledgePreStartCancellation, current.state == .cancelAcknowledged,
+               current.startedAt == nil { return current }
+            let cancelledBeforeStart = acknowledgePreStartCancellation
+                && current.state == .cancelRequested && current.startedAt == nil
+            let next = cancelledBeforeStart ? MacControlOperationState.cancelAcknowledged : next
             if current.state == next {
                 return current
             }
@@ -237,9 +243,15 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
             if next == .started { updated.startedAt = timestamp }
             if next == .cancelRequested { updated.cancelRequestedAt = timestamp }
             if next.isTerminal { updated.terminalAt = timestamp }
-            if let verification { updated.verification = verification }
-            updated.expectedNextEvidence = expectedNextEvidence.map { Self.clip($0, limit: 256) }
-            updated.outcomeCode = outcomeCode.map { Self.clip($0, limit: 128) }
+            if cancelledBeforeStart {
+                updated.verification = .notRequired
+                updated.expectedNextEvidence = nil
+                updated.outcomeCode = "cancelled_before_start"
+            } else {
+                if let verification { updated.verification = verification }
+                updated.expectedNextEvidence = expectedNextEvidence.map { Self.clip($0, limit: 256) }
+                updated.outcomeCode = outcomeCode.map { Self.clip($0, limit: 128) }
+            }
             snapshot.operations[index] = updated
             Self.bound(&snapshot.operations)
             return updated
@@ -253,12 +265,14 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
 
     /// On restart no process can still be owned by the prior app instance.
     /// Mark interrupted rows terminal rather than silently replaying them.
+    /// Whole-store recovery is for app startup; a rebound bridge scopes its action.
     @discardableResult
-    public func recoverInterruptedOperations() async throws -> Int {
+    public func recoverInterruptedOperations(action: String? = nil) async throws -> Int {
         try await mutate { snapshot in
             var recovered = 0
             let timestamp = now()
             for index in snapshot.operations.indices where !snapshot.operations[index].state.isTerminal {
+                if let action, snapshot.operations[index].action != action { continue }
                 let priorState = snapshot.operations[index].state
                 // `accepted` is durably recorded before execution begins, so
                 // an interruption there proves no effect started. Once the

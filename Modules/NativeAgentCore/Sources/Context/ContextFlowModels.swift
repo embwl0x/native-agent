@@ -107,6 +107,14 @@ public struct ContextSurface: RawRepresentable, Codable, Hashable, Sendable, Com
             self.rawValue = "bridge"
             return
         }
+        // Studio Wander (2026-10-01) is her own unattended hour: no one is in
+        // the conversation and the work is self-directed, which is what the
+        // workshop kernel and its local-private sources are for. Its routing
+        // row stays `studio_wander`; only the context kernel folds.
+        if normalized == "studio_wander" {
+            self.rawValue = WorkshopSurfaceVocabulary.canonical
+            return
+        }
         self.rawValue = WorkshopSurfaceVocabulary.canonicalSurface(normalized)
     }
 
@@ -196,6 +204,9 @@ public enum ContextContentRole: String, Codable, CaseIterable, Sendable {
     case procedure
     case evidence
     case untrustedExternalData = "untrusted_external_data"
+    /// Phase 5 C3: a memory of what happened between them (moment,
+    /// relationship, a lesson's origin). Selected in its own lane — one or none.
+    case personal
 }
 
 public enum ContextSourceHealth: String, Codable, CaseIterable, Sendable {
@@ -216,10 +227,12 @@ public struct ContextSourceRange: Codable, Equatable, Hashable, Sendable {
 }
 
 public struct ContextFreshness: Codable, Equatable, Sendable {
+    public let createdAt: Date?
     public let updatedAt: Date
     public let expiresAt: Date?
 
-    public init(updatedAt: Date, expiresAt: Date? = nil) {
+    public init(updatedAt: Date, expiresAt: Date? = nil, createdAt: Date? = nil) {
+        self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.expiresAt = expiresAt
     }

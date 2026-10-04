@@ -307,17 +307,23 @@ enum BridgeCore {
     /// to a small error body rather than dropping the response entirely
     /// (ClaudeBridge's safety, now shared — MacControlBridge previously just
     /// cancelled the socket on that impossible path).
-    static func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any]) {
+    static func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any], onSent: (@Sendable () -> Void)? = nil) {
         let data: Data
+        let serialized: Bool
         if JSONSerialization.isValidJSONObject(obj),
            let d = try? JSONSerialization.data(withJSONObject: obj) {
             data = d
+            serialized = true
         } else {
             data = Data("{\"error\":\"serialization_failed\"}".utf8)
+            serialized = false
         }
         let header = "HTTP/1.1 \(status) \(statusText(for: status))\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
         var resp = Data(header.utf8)
         resp.append(data)
-        conn.send(content: resp, completion: .contentProcessed { _ in conn.cancel() })
+        conn.send(content: resp, completion: .contentProcessed { error in
+            if error == nil, serialized { onSent?() }
+            conn.cancel()
+        })
     }
 }

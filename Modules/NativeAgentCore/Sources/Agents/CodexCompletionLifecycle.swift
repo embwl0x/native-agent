@@ -22,7 +22,7 @@ public struct CodexCompletionLifecycle: Sendable {
     }
 
     enum ArtifactDecision: Sendable, Equatable {
-        case send
+        case send(attemptID: String)
         case alreadyAccepted
         case rejected
         case inProgress
@@ -74,6 +74,7 @@ public struct CodexCompletionLifecycle: Sendable {
         var retrySafe: Bool
         var phase: ArtifactPhase
         var ownerInstanceId: String
+        var attemptID: String? = nil
         var detail: String?
         var updatedAt: String
     }
@@ -112,8 +113,7 @@ public struct CodexCompletionLifecycle: Sendable {
 
     public static let processOwnerInstanceId = UUID().uuidString
     static let retainedTerminalResponses = 256
-    /// Avoid a full directory/decode scan for every settlement while keeping
-    /// response-bearing terminal state tightly bounded inside the marker hour.
+    /// Scan only after this many newly retained terminal responses.
     static let terminalResponseCompactionSlack = 32
 
     let receiptURL: URL
@@ -131,12 +131,12 @@ public struct CodexCompletionLifecycle: Sendable {
     }
 
     private var compactionMarkerURL: URL {
-        stateDirectory.appendingPathComponent(".response-compaction-v2.json")
+        stateDirectory.appendingPathComponent(".response-compaction-v3.json")
     }
 
     public init(
         receiptURL: URL,
-        ownerInstanceId: String = UUID().uuidString,
+        ownerInstanceId: String = CodexCompletionLifecycle.processOwnerInstanceId,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
     ) {
@@ -331,6 +331,7 @@ public struct CodexCompletionLifecycle: Sendable {
         retrySafe: Bool
     ) async throws -> ArtifactDecision {
         let path = stateURL(deliveryId)
+        let attemptID = UUID().uuidString
         return try await persistence.withFileLock(path) {
             guard var state = try await loadState(path) else { throw LifecycleError.responseMissing }
             try Self.requireDigest(state, requestDigest)
@@ -358,11 +359,14 @@ public struct CodexCompletionLifecycle: Sendable {
                         try await write(state, to: path)
                         return .outcomeUnknown
                     }
-                case .reserved, .preDispatchFailed:
+                case .reserved:
+                    if artifact.ownerInstanceId == ownerInstanceId { return .inProgress }
+                case .preDispatchFailed:
                     break
                 }
                 artifact.phase = .reserved
                 artifact.ownerInstanceId = ownerInstanceId
+                artifact.attemptID = attemptID
                 artifact.detail = nil
                 artifact.updatedAt = Self.nowISO()
                 state.artifacts[artifactId] = artifact
@@ -373,26 +377,29 @@ public struct CodexCompletionLifecycle: Sendable {
                     retrySafe: retrySafe,
                     phase: .reserved,
                     ownerInstanceId: ownerInstanceId,
+                    attemptID: attemptID,
                     detail: nil,
                     updatedAt: Self.nowISO()
                 )
             }
             state.updatedAt = Self.nowISO()
             try await write(state, to: path)
-            return .send
+            return .send(attemptID: attemptID)
         }
     }
 
     func markArtifactDispatchStarted(
         deliveryId: String,
         requestDigest: String,
-        artifactId: String
+        artifactId: String,
+        attemptID: String
     ) async throws {
         try await transitionArtifact(
             deliveryId: deliveryId,
             requestDigest: requestDigest,
             artifactId: artifactId,
-            allowed: [.reserved, .preDispatchFailed],
+            attemptID: attemptID,
+            allowed: [.reserved],
             to: .dispatchStarted,
             detail: nil
         )
@@ -401,12 +408,14 @@ public struct CodexCompletionLifecycle: Sendable {
     func markArtifactAccepted(
         deliveryId: String,
         requestDigest: String,
-        artifactId: String
+        artifactId: String,
+        attemptID: String
     ) async throws {
         try await transitionArtifact(
             deliveryId: deliveryId,
             requestDigest: requestDigest,
             artifactId: artifactId,
+            attemptID: attemptID,
             allowed: [.dispatchStarted],
             to: .accepted,
             detail: nil
@@ -417,12 +426,14 @@ public struct CodexCompletionLifecycle: Sendable {
         deliveryId: String,
         requestDigest: String,
         artifactId: String,
+        attemptID: String,
         detail: String
     ) async throws {
         try await transitionArtifact(
             deliveryId: deliveryId,
             requestDigest: requestDigest,
             artifactId: artifactId,
+            attemptID: attemptID,
             allowed: [.dispatchStarted],
             to: .rejected,
             detail: detail
@@ -433,12 +444,14 @@ public struct CodexCompletionLifecycle: Sendable {
         deliveryId: String,
         requestDigest: String,
         artifactId: String,
+        attemptID: String,
         detail: String
     ) async throws {
         try await transitionArtifact(
             deliveryId: deliveryId,
             requestDigest: requestDigest,
             artifactId: artifactId,
+            attemptID: attemptID,
             allowed: [.reserved, .preDispatchFailed],
             to: .preDispatchFailed,
             detail: detail
@@ -449,12 +462,14 @@ public struct CodexCompletionLifecycle: Sendable {
         deliveryId: String,
         requestDigest: String,
         artifactId: String,
+        attemptID: String,
         detail: String
     ) async throws {
         try await transitionArtifact(
             deliveryId: deliveryId,
             requestDigest: requestDigest,
             artifactId: artifactId,
+            attemptID: attemptID,
             allowed: [.dispatchStarted],
             to: .outcomeUnknown,
             detail: detail
@@ -467,22 +482,37 @@ public struct CodexCompletionLifecycle: Sendable {
         requestDigest: String
     ) async throws {
         let path = stateURL(deliveryId)
-        try await persistence.withFileLock(path) {
-            guard var state = try await loadState(path) else { throw LifecycleError.responseMissing }
-            try Self.requireDigest(state, requestDigest)
-            state.phase = .settled
-            state.delivery = delivery
-            state.ownerInstanceId = ownerInstanceId
-            state.updatedAt = Self.nowISO()
-            try await write(state, to: path)
+        try await persistence.withFileLock(compactionMarkerURL) {
+            var retained = 0
+            let initialized = FileManager.default.fileExists(atPath: compactionMarkerURL.path)
+            if initialized {
+                retained = try JSONDecoder().decode(Int.self, from: Data(contentsOf: compactionMarkerURL))
+            }
+            let newlyRetained = try await persistence.withFileLock(path) {
+                guard var state = try await loadState(path) else { throw LifecycleError.responseMissing }
+                try Self.requireDigest(state, requestDigest)
+                let newlyRetained = state.phase != .settled && state.response != nil
+                state.phase = .settled
+                state.delivery = delivery
+                state.ownerInstanceId = ownerInstanceId
+                state.updatedAt = Self.nowISO()
+                try await write(state, to: path)
+                return newlyRetained
+            }
+            if newlyRetained { retained += 1 }
+            if !initialized || retained >= Self.terminalResponseCompactionSlack {
+                try await compactOldTerminalResponses()
+                retained = 0
+            }
+            try await persistence.writeJSON(.int(Int64(retained)), to: compactionMarkerURL)
         }
-        try await compactOldTerminalResponsesIfNeeded()
     }
 
     private func transitionArtifact(
         deliveryId: String,
         requestDigest: String,
         artifactId: String,
+        attemptID: String,
         allowed: Set<ArtifactPhase>,
         to phase: ArtifactPhase,
         detail: String?
@@ -494,9 +524,11 @@ public struct CodexCompletionLifecycle: Sendable {
             guard var artifact = state.artifacts[artifactId] else {
                 throw LifecycleError.artifactMissing
             }
-            if artifact.phase == phase { return }
-            guard allowed.contains(artifact.phase),
-                  artifact.ownerInstanceId == ownerInstanceId else {
+            guard artifact.ownerInstanceId == ownerInstanceId, artifact.attemptID == attemptID else {
+                throw LifecycleError.invalidArtifactTransition
+            }
+            if artifact.phase == phase, phase != .dispatchStarted { return }
+            guard allowed.contains(artifact.phase) else {
                 throw LifecycleError.invalidArtifactTransition
             }
             artifact.phase = phase
@@ -664,22 +696,14 @@ public struct CodexCompletionLifecycle: Sendable {
         ).filter { $0.pathExtension == "json" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    private func compactOldTerminalResponsesIfNeeded() async throws {
-        if let attributes = try? FileManager.default.attributesOfItem(
-            atPath: compactionMarkerURL.path
-        ), let modified = attributes[.modificationDate] as? Date,
-           Date().timeIntervalSince(modified) < 60 * 60 {
-            let stateCount = try stateURLs().count
-            if stateCount <= Self.retainedTerminalResponses + Self.terminalResponseCompactionSlack {
-                return
-            }
-        }
+    private func compactOldTerminalResponses() async throws {
         var terminal: [(URL, State)] = []
         for url in try stateURLs() {
             if Self.isCorruptTombstone(url) { continue }
             do {
                 guard let state = try await loadState(url),
                       state.phase == .settled,
+                      state.delivery?.status == "completed",
                       state.response != nil else { continue }
                 terminal.append((url, state))
             } catch LifecycleError.corruptReceipt {
@@ -695,19 +719,13 @@ public struct CodexCompletionLifecycle: Sendable {
                 try await persistence.withFileLock(url) {
                     guard var current = try await loadState(url),
                           current.phase == .settled,
+                          current.delivery?.status == "completed",
                           current.updatedAt == old.updatedAt else { return }
                     current.response = nil
                     try await write(current, to: url)
                 }
             }
         }
-        try await persistence.writeJSON(.object([
-            "schema": .string("codex-completion-response-compaction.v2"),
-            "completedAt": .string(Self.nowISO()),
-            "retainedResponseCount": .int(Int64(min(
-                terminal.count, Self.retainedTerminalResponses
-            ))),
-        ]), to: compactionMarkerURL)
     }
 
     private nonisolated static func logLifecycleIsolationFailure(_ error: Error, url: URL) {

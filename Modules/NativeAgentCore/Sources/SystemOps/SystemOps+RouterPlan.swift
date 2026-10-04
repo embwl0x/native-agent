@@ -50,9 +50,6 @@ public struct SwiftNativeRouterPlanClient: RouterPlanClient {
             "handoff", "readme", "docs", "doc", "document", "documents",
             "documentation",
         ])
-        let explicitResearchReadiness = tokens.contains("research") ||
-            lower.contains("search the web") ||
-            lower.contains("search online")
 
         // FIX 2 / B1.2: connector-target detection. A github (or other
         // connector) -shaped request was falling through to `chat`/`minimal`,
@@ -230,24 +227,6 @@ public struct SwiftNativeRouterPlanClient: RouterPlanClient {
             hasMatch: hasMatch,
             requiresApproval: requiresApproval
         )
-        // Route-owned readiness is deliberately narrower than goalType. A
-        // generic mention of Swift or code may be conversational, while a
-        // repo-state request already proved it needs repository inspection.
-        // Readiness exposes schemas only; every call still crosses the normal
-        // TrustCenter, approval, and effect-time gates.
-        let toolReadinessGroups: [String]
-        if repoStateRequest {
-            toolReadinessGroups = ["builder"]
-        } else if goalType == "file_work" {
-            toolReadinessGroups = ["files"]
-        } else if webAddressRequest {
-            toolReadinessGroups = ["browser"]
-        } else if goalType == "research", explicitResearchReadiness {
-            toolReadinessGroups = ["research"]
-        } else {
-            toolReadinessGroups = []
-        }
-
         return RoutePlanResult(
             id: idFactory(),
             message: trimmed,
@@ -257,7 +236,6 @@ public struct SwiftNativeRouterPlanClient: RouterPlanClient {
             risk: risk,
             requiresApproval: requiresApproval,
             matchedCapabilities: matched,
-            toolReadinessGroups: toolReadinessGroups,
             nextActions: nextActions,
             createdAt: createdAt
         )

@@ -142,7 +142,7 @@ public actor SwiftNativeSecurityCenter {
                 id: "origin_trust",
                 title: "Origin Trust",
                 status: trustedOrigins > 0 ? "ready" : "limited",
-                detail: trustedOrigins > 0 ? "\(trustedOrigins) \(trustedOrigins == 1 ? "device" : "devices") you have approved can send requests." : "Requests from other devices need extra proof before anything risky runs.",
+                detail: trustedOrigins > 0 ? "\(trustedOrigins) approved remote trust \(trustedOrigins == 1 ? "entry" : "entries") across Telegram, Slack, and paired phones. Each request still needs origin verification." : "No approved remote trust entries. Remote requests need origin verification before risky actions run.",
                 enabled: Self.bool(security["originTrustEnabled"], default: true)
             ),
             SecurityStatusFlag(
@@ -166,11 +166,8 @@ public actor SwiftNativeSecurityCenter {
                 detail: developerMode
                     ? "Developer Mode is on, so I am allowed to take destructive actions on this Mac."
                     : (fullMac
-                        ? "Full Mac is on: broad file and app access is "
-                          + "allowed until you turn it off. The most "
-                          + "destructive Mac-control actions — shell, moving "
-                          + "files to the Trash, system control — still "
-                          + "require Developer Mode."
+                        ? "Full Mac allows file and app access, shell commands, moving files to the Trash, "
+                          + "and system control until you turn it off. Trust origin checks and macOS permissions still apply."
                         : "Destructive actions on this Mac are blocked."),
                 enabled: Self.bool(security["dangerGatesEnabled"], default: true)
             ),
@@ -282,7 +279,7 @@ public actor SwiftNativeSecurityCenter {
         // from their own authority domains.
         let originAssessment = try await assessOrigin(origin, policy: policy)
         let fullMacYoloAuthority = Self.fullMacYoloAuthority(
-            tool: canonicalTool,
+            tool: tool,
             surface: origin.surface,
             originAssessment: originAssessment,
             snapshot: snapshot
@@ -302,6 +299,7 @@ public actor SwiftNativeSecurityCenter {
         // surfaces ever join the allowlist.
         let autonomyLevel = resolveAutonomyLevel(
             tool: canonicalTool,
+            input: input,
             policy: policy,
             userOverrides: snapshot.userConfiguredAutonomyOverrides,
             origin: origin,
@@ -385,13 +383,12 @@ public actor SwiftNativeSecurityCenter {
             reasons.append(.init(.cause, "tool is explicitly blocked by the user"))
         }
 
-        // Permission-authority mutation is an unconditional hard boundary.
-        // Full Mac keeps ordinary shell/build work autonomous, but neither
-        // YOLO nor a saved per-tool `auto` override may reset TCC and
-        // remove microphone, speech, camera, Accessibility, or other grants.
-        // This runs even for callers that resolve autonomy in the outer chat
-        // gate (`enforceAutonomy == false`), so every dispatch surface sees
-        // the same effect-time decision.
+        // Resetting macOS permissions always asks: a saved per-tool `auto`
+        // override does not answer it, even under Full Mac. User must approve
+        // the reset explicitly. This runs even for callers
+        // that resolve autonomy in the outer chat gate
+        // (`enforceAutonomy == false`), so every dispatch surface sees the
+        // same effect-time decision.
         if decision != .block,
            profile.capabilities.contains("system_permission_reset") {
             decision = Self.maxDecision(decision, .ask)
@@ -419,7 +416,7 @@ public actor SwiftNativeSecurityCenter {
         let peerBridgeOrigin = PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface)
         let peerBridgeEffect = peerBridgeOrigin && PeerTurnEffectPolicy.requiresPeerApproval(
             tool, capabilities: Array(profile.capabilities), input: input,
-            workspaceRoot: NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot))
+            workspaceRoot: NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot), fullMac: fullMac)
         // A read on the peer bridge skips these gates entirely; an effect
         // downgrades to `.ask` so it reaches the approval card.
         func originGateDecision() -> SecurityToolDecision? {
@@ -455,7 +452,7 @@ public actor SwiftNativeSecurityCenter {
         // allowlist/pairing — the same trust root that lets the local Mac surface run
         // high-risk tools. For such origins the signed-command requirement is redundant,
         // so waive it and let trusted remote surfaces behave like the Mac (e.g.
-        // invoke_claude works in Telegram, not just Mac chat). Gate 1 above still
+        // invoke_codex works in Telegram, not just Mac chat). Gate 1 above still
         // hard-blocks any UNTRUSTED remote origin, so this never elevates a stranger.
         // the user can restore strict signing by setting trustedRemoteHighRiskAllowed=false.
         let trustedRemoteWaiver = originAssessment.trusted
@@ -592,23 +589,16 @@ public actor SwiftNativeSecurityCenter {
             reasons.append(.init(.note, "Security policy allows app notifications."))
         }
 
-        // An admitted Full Mac YOLO grant is the operator's answer to every
+        // An admitted Full Mac YOLO grant is the operator's answer to ordinary
         // per-call ask/confirm policy. Flatten asks here, after every security
         // rule has had a chance to produce a hard `.block`, so direct/raw
         // SecurityCenter clients and composed chat clients see the same
-        // zero-prompt result. This never upgrades a block.
-        //
-        // Resetting macOS permission authority is a hard boundary, not a
-        // prompt in disguise: during YOLO it remains blocked rather than
-        // returning an approval request that contradicts the selected mode.
-        if decision == .ask, fullMacYoloAuthority.admitted {
-            if profile.capabilities.contains("system_permission_reset") {
-                decision = .block
-                reasons.append(.init(.cause, "Full Mac cannot reset macOS permissions."))
-            } else {
-                decision = .allow
-                reasons.append(.init(.note, "Full Mac allows this action without asking again."))
-            }
+        // decision. This never upgrades a block. Resetting macOS permissions
+        // still requires User's explicit approval, even under Full Mac.
+        if decision == .ask, fullMacYoloAuthority.admitted,
+           !profile.capabilities.contains("system_permission_reset") {
+            decision = .allow
+            reasons.append(.init(.note, "Full Mac allows this action without asking again."))
         }
 
         let now = Self.isoTimestamp(evaluatedAt)
@@ -706,7 +696,9 @@ public actor SwiftNativeSecurityCenter {
             untrustedInputKeys: Array(
                 Set(Self.promptInjectionKeys(in: .object(input)))
             ).sorted(),
-            redactedInputPreview: Self.redactValue(.object(input)),
+            redactedInputPreview: Self.redactValue(
+                .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
+            ),
             auditReceiptsEnabled: true
         )
     }
@@ -885,6 +877,7 @@ public actor SwiftNativeSecurityCenter {
 
     private func resolveAutonomyLevel(
         tool: String,
+        input: [String: JSONValue],
         policy: [String: JSONValue],
         userOverrides: [String: JSONValue],
         origin: SecurityOriginContext,
@@ -902,13 +895,15 @@ public actor SwiftNativeSecurityCenter {
         }
         let overrides = Self.object(policy["toolAutonomy"])
         let defaultLevel = overrides["default"] ?? .string("send_approval")
-        return trustCenter.autonomyForTool(
-            tool,
-            policy: [
-                "autonomyOverrides": .object(overrides),
-                "autonomyDefault": defaultLevel,
-            ]
-        )
+        let bundle: [String: JSONValue] = [
+            "autonomyOverrides": .object(overrides),
+            "autonomyDefault": defaultLevel,
+        ]
+        let level = trustCenter.autonomyForTool(tool, policy: bundle)
+        // An app door action that runs its old tool's code in process keeps
+        // the level saved on that tool: the stricter of the two stands.
+        guard tool == "app", let old = Self.appActionOldTool(input) else { return level }
+        return SwiftNativeTrustCenter.moreRestrictiveAutonomy(level, trustCenter.autonomyForTool(old, policy: bundle))
     }
 
     func assessOrigin(
@@ -1042,7 +1037,12 @@ public actor SwiftNativeSecurityCenter {
     }
 
     private func trustedOriginCount() async throws -> Int {
-        try await telegramSecurityAllowlist().count
+        let telegram = try await telegramSecurityAllowlist()
+        let slack = try await slackSecurityAllowlist()
+        let phones = try PairedPhoneAuthority.pairedCountChecked(
+            at: dataRoot.appendingPathComponent("paired_phones.json")
+        )
+        return telegram.count + slack.chatIds.count + slack.userIds.count + phones
     }
 
     private func slackSecurityAllowlist() async throws -> TelegramSecurityAllowlist {
@@ -1070,6 +1070,18 @@ public actor SwiftNativeSecurityCenter {
             userIds.formUnion(Self.stringSet(obj["allowedUserIds"]))
         }
         return TelegramSecurityAllowlist(chatIds: chatIds, userIds: userIds, surfaceLabel: "slack")
+    }
+
+    /// The turn's verified SENDER is one the person allowlisted by user id
+    /// on Telegram or Slack: the allowlists `assessOrigin` trusts, without its
+    /// allowed-chat match, which admits anyone in that chat. A private
+    /// Telegram chat's id is its sender's. Anything unreadable is not him.
+    public func remoteSenderIsAllowlisted(_ origin: SecurityOriginContext) async -> Bool {
+        let surface = ConversationSurfaceProfile(origin.surface).id
+        guard let allowed = try? await (surface == "telegram" ? telegramSecurityAllowlist()
+            : surface == "slack" ? slackSecurityAllowlist() : nil) else { return false }
+        if let user = origin.userId { return allowed.userIds.contains(user) }
+        return surface == "telegram" && origin.chatId.map(allowed.userIds.contains) == true
     }
 
     private func telegramSecurityAllowlist() async throws -> TelegramSecurityAllowlist {

@@ -38,18 +38,14 @@ public enum TurnTraceRetention {
     /// Days of trace history to keep, counting the current day.
     public static let defaultKeepDays = 14
 
-    /// Remove `turn_traces/<date>.jsonl` (and its `.lock` sidecar) for every day
-    /// strictly older than `keepDays` days before `now`.
-    ///
-    /// The lock sidecar for an expired day can never be held: a flock is only
-    /// taken while appending, and appends only ever target the CURRENT day's
-    /// file. Removing the `.jsonl` without its `.lock` is what left the orphans.
+    /// Remove expired day files under the same locks reconciliation holds.
+    /// FileLockSidecarLifecycle owns reclamation of orphaned lock sidecars.
     @discardableResult
     public static func enforce(
         dataRoot: URL = defaultDataRoot(),
         now: Date = Date(),
         keepDays: Int = defaultKeepDays
-    ) throws -> TurnTraceRetentionReport {
+    ) async throws -> TurnTraceRetentionReport {
         let dir = dataRoot.appendingPathComponent("turn_traces", isDirectory: true)
         guard FileManager.default.fileExists(atPath: dir.path) else {
             return TurnTraceRetentionReport()
@@ -79,31 +75,16 @@ public enum TurnTraceRetention {
                 report.keptDays += 1
                 continue
             }
-            let entryAuditPath = relativePath(entry, from: dataRoot)
-            let lock = entry.appendingPathExtension("lock")
-            let lockExists = FileManager.default.fileExists(atPath: lock.path)
-            let lockAuditPath = lockExists ? relativePath(lock, from: dataRoot) : nil
-            try FileManager.default.removeItem(at: entry)
-            report.removedDays += 1
-            report.removedArtifactPaths.append(entryAuditPath)
-            if lockExists {
-                try FileManager.default.removeItem(at: lock)
-                report.removedLocks += 1
-                if let lockAuditPath { report.removedArtifactPaths.append(lockAuditPath) }
+            let removedPath = try await SwiftNativePersistenceCore().withFileLock(entry) {
+                guard FileManager.default.fileExists(atPath: entry.path) else { return nil as String? }
+                let auditPath = relativePath(entry, from: dataRoot)
+                try FileManager.default.removeItem(at: entry)
+                return auditPath
             }
-        }
-
-        // Second pass: a `.lock` for an expired day whose `.jsonl` is already
-        // gone (a previous partial sweep, or a lock taken for a file that was
-        // never written). Same date gate — a lock for a live day is never touched.
-        for entry in entries where entry.lastPathComponent.hasSuffix(".jsonl.lock") {
-            let day = entry.lastPathComponent.replacingOccurrences(of: ".jsonl.lock", with: "")
-            guard let dayDate = dayFormatter.date(from: day), dayDate < cutoff else { continue }
-            guard FileManager.default.fileExists(atPath: entry.path) else { continue }
-            let auditPath = relativePath(entry, from: dataRoot)
-            try FileManager.default.removeItem(at: entry)
-            report.removedLocks += 1
-            report.removedArtifactPaths.append(auditPath)
+            if let removedPath {
+                report.removedDays += 1
+                report.removedArtifactPaths.append(removedPath)
+            }
         }
         return report
     }

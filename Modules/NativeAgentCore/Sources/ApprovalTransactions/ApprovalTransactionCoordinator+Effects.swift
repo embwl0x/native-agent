@@ -15,13 +15,14 @@ public protocol ApprovalTransactionEffects: Sendable {
     var telegramIncludesEvolutionBridge: Bool { get }
     func runMemoryHygiene() async throws -> ApprovalMemoryHygieneResult
     func disableSkill(name: String) async throws
-    func enableSkill(name: String) async throws
-    func reconcileSkillEvolutionRecall(memory: SwiftNativeMemoryV2, dataRoot: URL, personaRoot: URL) async throws
+    /// `reviewedDigest` nil turns on only what needs no admission; a digest
+    /// admits exactly that script as User's, as the Skills page's Install does.
+    func enableSkill(name: String, reviewedDigest: String?) async throws
     func applyResolvedExternalSend(from record: ApprovalRecord) async -> Bool
     func selfEvolutionDependencies() -> SelfEvolutionApprovalExecutor.SelfEvolutionDeps
     func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue], approvedReplayApprovalID: String, dataRoot: URL) async throws -> ApprovalConnectorActionResult
     func toolDispatchClient(includeEvolutionBridge: Bool, denyExternalMcp: Bool, enforceAppAutonomy: Bool) -> any ToolDispatchClient
-    func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String, tools: any ToolDispatchClient) async throws
+    func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String) async throws
     func chatTurnCompleted(sessionID: String?) async
     func observeBrowserMotorAction(runID: String, dataRoot: URL) async
     func executeApprovedBrowserRun(from record: ApprovalRecord) async throws

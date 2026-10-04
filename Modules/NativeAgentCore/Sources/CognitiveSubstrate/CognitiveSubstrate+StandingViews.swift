@@ -26,15 +26,21 @@ public struct StandingViewTransition: Sendable {
     /// release the held view it displaced. The caller says what actually
     /// happened instead of claiming the whole change never reached the store.
     public var persistenceFailureIsPartial: Bool
+    /// Phase 5 B0: the view was not in the state this verb moves from — another
+    /// conversation (or User) changed it first. Nothing was written; `view` is
+    /// the current value, so the caller re-reads instead of claiming success.
+    public var conflict: Bool
 
     public init(
         view: CognitiveStandingView?,
         persistenceFailure: String? = nil,
-        persistenceFailureIsPartial: Bool = false
+        persistenceFailureIsPartial: Bool = false,
+        conflict: Bool = false
     ) {
         self.view = view
         self.persistenceFailure = persistenceFailure
         self.persistenceFailureIsPartial = persistenceFailureIsPartial
+        self.conflict = conflict
     }
 }
 
@@ -60,6 +66,18 @@ extension CognitiveStandingView {
             "createdAt": .double(createdAt.timeIntervalSince1970),
             "updatedAt": .double(updatedAt.timeIntervalSince1970),
             "lineageId": .string(lineageId),
+            // Phase 5 D. Absent on older rows; they restore empty.
+            "occurrences": .array(occurrences.map { .string($0) }),
+            "because": .string(because),
+            "wouldChangeMind": .string(wouldChangeMind),
+            "revisions": .array(revisions.map {
+                .object([
+                    "priorStance": .string($0.priorStance),
+                    "priorBecause": .string($0.priorBecause),
+                    "evidence": .string($0.evidence),
+                    "at": .double($0.at.timeIntervalSince1970),
+                ])
+            }),
         ])
     }
 }
@@ -89,9 +107,23 @@ extension CognitiveSubstrate {
     /// ≤12 proposed) far inside the bounded restore window, so proposal churn can never
     /// crowd an active view out of restore (gpt-5.5 delta review, 2026-07-02).
     static let maximumProposedStandingViews = 12
-    /// A proposed view left unresolved longer than this retires on the maintenance sweep
-    /// (no zombie proposals).
-    static let standingViewProposalMaxAge: TimeInterval = 14 * 24 * 60 * 60
+    static let maximumRetiredStandingViews = 12
+
+    func pruneRetiredStandingViews() {
+        let retired = standingViews.values.filter { $0.status == .retired }
+            .sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+        for view in retired.dropFirst(Self.maximumRetiredStandingViews) {
+            standingViews.removeValue(forKey: view.id)
+        }
+    }
+    // Phase 5 D (Agent, binding, 2026-10-03): AGE ALONE NEVER RETIRES A VIEW.
+    // A 14-day sweep used to retire unresolved proposals as "stale"; it took
+    // "Making every part defensible does not make the whole worth building",
+    // which she still holds. The proposal shelf stays bounded by its cap
+    // (capacity, recorded as such); age only ever asks for reconsideration.
     /// At most this many HELD views — the tier she adopts herself. Its own cap,
     /// not a share of the active one: a view the user signed must never be
     /// crowded out by one she adopted, and the two sets are LRU'd separately.
@@ -111,6 +143,8 @@ extension CognitiveSubstrate {
         body: String,
         evidenceNodeIds: [UUID],
         evidenceExcerpts: [String] = [],
+        because: String = "",
+        wouldChangeMind: String = "",
         at now: Date
     ) async -> CognitiveStandingView? {
         let trimmedBody = bounded(body.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 300)
@@ -129,8 +163,12 @@ extension CognitiveSubstrate {
         //     back at what it revises. A contradiction is never swallowed as
         //     more evidence FOR the view it argues against.
         let normalized = Self.normalizedStandingViewBody(trimmedBody)
+        // Phase 5 D (Sol): an untrusted peer's words reaching her reflection
+        // make this a view she read, not one she reached — it records nothing
+        // toward recurrence.
+        let tainted = reflectionIsTainted(receipt.request)
         let comparable = standingViews.values
-            .filter { $0.status == .proposed || $0.status == .held || $0.status == .active }
+            .filter { $0.status == .proposed || $0.status == .held || $0.status == .active || $0.status == .opinion }
             .sorted { $0.createdAt < $1.createdAt }
         if let twin = comparable.first(where: { Self.normalizedStandingViewBody($0.body) == normalized }) {
             return await revisitStandingView(
@@ -138,10 +176,31 @@ extension CognitiveSubstrate {
                 receipt: receipt,
                 evidenceNodeIds: evidenceNodeIds,
                 evidenceExcerpts: evidenceExcerpts,
+                because: because,
+                wouldChangeMind: wouldChangeMind,
+                tainted: tainted,
                 at: now)
         }
         let contradicted = comparable.first {
             Self.standingViewBodiesContradict($0.body, trimmedBody)
+        }
+        // Phase 5 D1: people recur by paraphrase. The same conclusion in other
+        // words (local embedder) deepens the view it restates, like a twin —
+        // never one it contradicts.
+        // Lexical overlap first; the warm embedder only if that finds nothing.
+        var paraphrased: CognitiveStandingView?
+        if contradicted == nil, configuration.viewsExperimentEnabled {
+            // A negated restatement is never a paraphrase: same polarity only.
+            let samePolarity = comparable.filter {
+                Self.negationParity($0.body) == Self.negationParity(trimmedBody)
+            }
+            paraphrased = lexicalTwin(of: trimmedBody, among: samePolarity)
+            if paraphrased == nil { paraphrased = await paraphraseTwin(of: trimmedBody, among: samePolarity) }
+        }
+        if let twin = paraphrased {
+            return await revisitStandingView(
+                twin, receipt: receipt, evidenceNodeIds: evidenceNodeIds, evidenceExcerpts: evidenceExcerpts,
+                because: because, wouldChangeMind: wouldChangeMind, tainted: tainted, at: now)
         }
         let mood = derivedMood(at: now)
         let view = CognitiveStandingView(
@@ -155,7 +214,10 @@ extension CognitiveSubstrate {
             revisesViewId: contradicted?.id,
             createdAt: now,
             updatedAt: now,
-            lineageId: bounded("reflection:\(receipt.id.uuidString)", maxCharacters: 120)
+            lineageId: bounded("reflection:\(receipt.id.uuidString)", maxCharacters: 120),
+            occurrences: [(tainted ? Self.taintedOccurrencePrefix : "") + Self.reflectionOccurrenceKey(receipt)],
+            because: bounded(because, maxCharacters: 240),
+            wouldChangeMind: bounded(wouldChangeMind, maxCharacters: 200)
         )
         standingViews[id] = view
         // Bound the awaiting-User set SYNCHRONOUSLY (before any await): a 13th proposal
@@ -179,8 +241,11 @@ extension CognitiveSubstrate {
                 displaced.append(old)
             }
         }
+        pruneRetiredStandingViews()
         markDirty(at: now)
         await persistStandingView(view)
+        await recordUndo(key: "view:\(id.uuidString)", what: "formed view: \(view.title)",
+                         previous: .null, stamp: Self.undoStamp(view))
         _ = await recordTimelineEvent(
             kind: .schemaProposal,
             // A revision says so on its face. "Revised" and "proposed" are two
@@ -223,7 +288,16 @@ extension CognitiveSubstrate {
     /// Negation is deliberately KEPT: "he means it" and "he does not mean it"
     /// must never normalize together.
     static func normalizedStandingViewBody(_ body: String) -> String {
-        let folded = body.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+        var folded = body.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+            .replacingOccurrences(of: "’", with: "'")
+        for (contraction, expanded) in [
+            ("can't", "can not"), ("won't", "will not"), ("shan't", "shall not"),
+        ] {
+            folded = folded.replacingOccurrences(
+                of: "\\b\(contraction)\\b", with: expanded, options: .regularExpression)
+        }
+        folded = folded.replacingOccurrences(
+            of: "\\b([a-z]+)n't\\b", with: "$1 not", options: .regularExpression)
         let stripped = folded.unicodeScalars.map { scalar -> Character in
             CharacterSet.alphanumerics.contains(scalar) ? Character(scalar) : " "
         }
@@ -258,6 +332,12 @@ extension CognitiveSubstrate {
         return (leftNegations % 2) != (rightNegations % 2)
     }
 
+    /// Odd or even count of negation tokens — a body's polarity.
+    static func negationParity(_ body: String) -> Int {
+        normalizedStandingViewBody(body).split(separator: " ")
+            .filter { standingViewNegationTokens.contains(String($0)) }.count % 2
+    }
+
     static func boundedEvidenceExcerpts(_ excerpts: [String]) -> [String] {
         var seen = Set<String>()
         var out: [String] = []
@@ -287,16 +367,36 @@ extension CognitiveSubstrate {
         receipt: CognitiveReflectionReceipt,
         evidenceNodeIds: [UUID],
         evidenceExcerpts: [String],
+        because: String = "",
+        wouldChangeMind: String = "",
+        tainted: Bool = false,
         at now: Date
     ) async -> CognitiveStandingView {
+        guard !tainted else { return existing }
+        // Phase 5 D (Agent, binding): REPEATED INGESTION IS NOT CONVICTION.
+        // A revisit counts only as an independent occurrence — a day this view
+        // has not seen AND source material it has not seen. Re-reflecting on
+        // the same dream or the same conversation adds nothing, not even
+        // evidence nodes (that is how one view reached 147 with 0 revisits).
+        let key = Self.reflectionOccurrenceKey(receipt)
+        let known = existing.occurrences.isEmpty
+            ? [Self.occurrenceKey(day: existing.createdAt, source: existing.lineageId)]
+            : existing.occurrences
+        guard Self.isIndependentOccurrence(key, of: known) else { return existing }
         var view = existing
+        view.occurrences = Array((known + [key]).suffix(CognitiveStandingView.maximumOccurrences))
+        // The same conclusion, now with its reasons: they fill an empty field
+        // and never overwrite one she already gave.
+        if view.because.isEmpty { view.because = bounded(because, maxCharacters: 240) }
+        if view.wouldChangeMind.isEmpty { view.wouldChangeMind = bounded(wouldChangeMind, maxCharacters: 200) }
         let knownNodes = Set(existing.evidenceNodeIds)
         let freshNodes = unique(evidenceNodeIds).filter { !knownNodes.contains($0) }
         let knownExcerpts = Set(existing.evidenceExcerpts)
         let freshExcerpts = Self.boundedEvidenceExcerpts(evidenceExcerpts)
             .filter { !knownExcerpts.contains($0) }
         let broughtSomethingNew = !freshNodes.isEmpty || !freshExcerpts.isEmpty
-        view.evidenceNodeIds = unique(existing.evidenceNodeIds + freshNodes)
+            || view.because != existing.because || view.wouldChangeMind != existing.wouldChangeMind
+        view.evidenceNodeIds = CognitiveStandingView.boundedEvidenceNodeIds(existing.evidenceNodeIds + freshNodes)
         view.evidenceExcerpts = Self.boundedEvidenceExcerpts(existing.evidenceExcerpts + freshExcerpts)
         view.revisitCount = existing.revisitCount + 1
         view.lastRevisitedAt = now
@@ -304,6 +404,8 @@ extension CognitiveSubstrate {
         standingViews[view.id] = view
         markDirty(at: now)
         await persistStandingView(view)
+        await recordUndo(key: "view:\(view.id.uuidString)", what: "revisited view: \(view.title)",
+                         previous: existing.toJSON(), stamp: Self.undoStamp(view))
         _ = await recordTimelineEvent(
             kind: .schemaProposal,
             title: "Standing view revisited (\(view.revisitCount))",
@@ -320,7 +422,7 @@ extension CognitiveSubstrate {
 
     /// Short title from the first line/clause of the body (≤80 chars). Only for the
     /// Observatory/timeline label — the capsule surfaces the body, not this.
-    private func standingViewTitle(from body: String) -> String {
+    func standingViewTitle(from body: String) -> String {
         let firstLine = body.split(whereSeparator: \.isNewline).first.map(String.init) ?? body
         return capsuleLineText(firstLine, maxCharacters: 80)
     }
@@ -342,13 +444,8 @@ extension CognitiveSubstrate {
         await resolveStandingViewChecked(id: id, approved: approved).view
     }
 
-    /// `resolveStandingView`, reporting whether the transition reached the
-    /// store (2026-09-06). The in-memory commit deliberately stays BEFORE the
-    /// write — the cap invariant above depends on it, and
-    /// `repairStandingViewCapIfNeeded` heals a half-written store on restore —
-    /// but a swallowed `try?` also meant an approval whose artifact never
-    /// landed came back as `.proposed` after a restart while the click had
-    /// reported success. The write's failure now travels to the caller.
+    /// The review and its capacity releases commit together. A failed write
+    /// restores the proposal so the same review controls can retry it.
     @discardableResult
     public func resolveStandingViewChecked(
         id: UUID,
@@ -365,6 +462,8 @@ extension CognitiveSubstrate {
         }
         guard view.status == .proposed else { return StandingViewTransition(view: view) }
         let now = dependencies.now()
+        let previousViews = standingViews
+        beginMaintenanceTransition()
         view.status = approved ? .active : .retired
         view.updatedAt = now
         standingViews[id] = view
@@ -373,16 +472,28 @@ extension CognitiveSubstrate {
         let demoted = approved ? demoteOverflowActiveStandingViews(at: now, protecting: id) : []
         markDirty(at: now)
 
-        var persistenceFailure: String?
         do {
-            if approved {
-                try await persistStandingViewChecked(view)
-            } else {
-                try await deleteArtifactRecordChecked(id: view.id)
-            }
+            try await persistStandingViewTransitionChecked(view, keepingArtifact: approved, retired: demoted, at: now)
         } catch {
-            persistenceFailure = "\(error)"
+            // Restore statuses without discarding evidence a concurrent
+            // reflection may have added while the store was suspended.
+            for changed in [view] + demoted {
+                guard let prior = previousViews[changed.id] else { continue }
+                guard var current = standingViews[changed.id] else {
+                    standingViews[changed.id] = prior
+                    continue
+                }
+                guard current.status == changed.status else { continue }
+                current.status = prior.status
+                if current.updatedAt == changed.updatedAt { current.updatedAt = prior.updatedAt }
+                standingViews[changed.id] = current
+            }
+            endMaintenanceTransition()
+            markDirty(at: dependencies.now())
+            return StandingViewTransition(view: standingViews[id], persistenceFailure: "\(error)")
         }
+        endMaintenanceTransition()
+        pruneRetiredStandingViews()
         _ = await recordTimelineEvent(
             kind: .proposalResolution,
             title: approved ? "Standing view active" : "Standing view retired",
@@ -394,17 +505,6 @@ extension CognitiveSubstrate {
                 : CognitiveSubstrate.growthOutcomeTag(.declined)]
         )
         for retired in demoted {
-            // 2026-09-06: the cap demotions are part of THIS transition. A
-            // demotion whose delete never reached the store leaves that view
-            // active on disk, so the next restore comes back over the cap while
-            // the click reported a clean save. Reported like the primary write;
-            // the first failure is the one carried.
-            do {
-                try await deleteArtifactRecordChecked(id: retired.id)
-            } catch {
-                persistenceFailure = persistenceFailure
-                    ?? "cap demotion of \(retired.id.uuidString) not saved: \(error)"
-            }
             _ = await recordTimelineEvent(
                 kind: .proposalResolution,
                 // The active set holds five. A sixth approval pushes the least
@@ -428,8 +528,28 @@ extension CognitiveSubstrate {
             await integrateDisposition(
                 tone: standingViewDispositionTone(for: view), at: now, source: "a view settled")
         }
-        return StandingViewTransition(
-            view: standingViews[id], persistenceFailure: persistenceFailure)
+        return StandingViewTransition(view: view)
+    }
+
+    private func persistStandingViewTransitionChecked(
+        _ view: CognitiveStandingView,
+        keepingArtifact: Bool,
+        retired: [CognitiveStandingView],
+        at now: Date
+    ) async throws {
+        guard configuration.persistenceEnabled else { return }
+        guard let store else { throw CognitivePersistenceError.storeUnavailable }
+        guard !persistenceWritesBlocked else {
+            throw CognitivePersistenceError.writesBlocked(
+                status: persistenceHealth.status, detail: persistenceHealth.failureDetail)
+        }
+        try await store.commitArtifactTransition(
+            artifacts: keepingArtifact ? [CognitiveArtifactWrite(
+                kind: "standing_view", id: view.id, status: view.status.rawValue,
+                score: max(0, view.moodValenceAtFormation), payload: view.toJSON())] : [],
+            deletedArtifactIDs: retired.map(\.id) + (keepingArtifact ? [] : [view.id]),
+            at: now
+        )
     }
 
     // MARK: - Retirement by the user (2026-09-02)
@@ -464,25 +584,41 @@ extension CognitiveSubstrate {
     /// retirement that only happened in memory came back on the next restore
     /// after the click had already said it was done.
     @discardableResult
-    public func retireStandingViewChecked(id: UUID) async -> StandingViewTransition {
+    public func retireStandingViewChecked(id: UUID, undoable: Bool = false) async -> StandingViewTransition {
         await waitForMaintenanceTransition()
         guard configuration.enabled, var view = standingViews[id] else {
             return StandingViewTransition(view: nil)
         }
-        guard view.isLeaning else { return StandingViewTransition(view: view) }
+        guard view.isLeaning || view.isHers else { return StandingViewTransition(view: view, conflict: true) }
+        let previous = view
         let now = dependencies.now()
-        let wasHeld = view.status == .held
+        let wasHeld = view.isHers
+        beginMaintenanceTransition()
         view.status = .retired
         view.updatedAt = now
         standingViews[id] = view
         markDirty(at: now)
         // Same shape as the cap-demotion path: the artifact goes, the timeline
         // keeps the history.
-        var persistenceFailure: String?
         do {
             try await deleteArtifactRecordChecked(id: view.id)
         } catch {
-            persistenceFailure = "\(error)"
+            if var current = standingViews[id], current.status == view.status {
+                current.status = previous.status
+                if current.updatedAt == view.updatedAt { current.updatedAt = previous.updatedAt }
+                standingViews[id] = current
+            } else if standingViews[id] == nil {
+                standingViews[id] = previous
+            }
+            endMaintenanceTransition()
+            markDirty(at: dependencies.now())
+            return StandingViewTransition(view: standingViews[id], persistenceFailure: "\(error)")
+        }
+        endMaintenanceTransition()
+        pruneRetiredStandingViews()
+        if undoable {
+            await recordUndo(key: "view:\(id.uuidString)", what: "released view: \(view.title)",
+                             previous: previous.toJSON(), stamp: Self.undoStamp(view))
         }
         await recordReceipt(
             kind: wasHeld ? "standing_view.released" : "standing_view.retired",
@@ -499,8 +635,7 @@ extension CognitiveSubstrate {
             lineageId: view.lineageId,
             externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.letGo)]
         )
-        return StandingViewTransition(
-            view: standingViews[id], persistenceFailure: persistenceFailure)
+        return StandingViewTransition(view: view)
     }
 
     // MARK: - The HELD tier (User, 2026-09-02: "she should be able to have some views of her own")
@@ -529,12 +664,8 @@ extension CognitiveSubstrate {
         await holdStandingViewChecked(id: id, seat: seat).view
     }
 
-    /// `holdStandingView`, reporting whether the transition reached the store
-    /// (2026-09-06) — the same reason as the resolve/release seams: the hold
-    /// persisted through the unchecked `persistStandingView`, so a view whose
-    /// artifact never landed reported as held and came back `.proposed` after a
-    /// restart. The in-memory commit and the cap math deliberately stay BEFORE
-    /// the write, exactly as the active path does it.
+    /// The hold and its capacity releases commit together. A failed write
+    /// restores the proposal and displaced views so the same hold can retry.
     @discardableResult
     public func holdStandingViewChecked(
         id: UUID,
@@ -547,25 +678,41 @@ extension CognitiveSubstrate {
         // Only a PROPOSED view can be held. An active view is already stronger
         // than held (holding it would be a demotion nobody asked for) and a
         // retired one is over.
-        if view.status == .held, let releasedIDs = pendingStandingViewHolds[id] {
-            return await retryStandingViewHold(view, releasedIDs: releasedIDs)
-        }
-        guard view.status == .proposed else { return StandingViewTransition(view: view) }
+        guard view.status == .proposed else { return StandingViewTransition(view: view, conflict: true) }
+        let previous = view
+        let previousViews = standingViews
         let now = dependencies.now()
+        beginMaintenanceTransition()
         view.status = .held
         view.updatedAt = now
         standingViews[id] = view
         // Cap math before any await, exactly as the active path does it.
         let released = releaseOverflowHeldStandingViews(at: now, protecting: id)
-        pendingStandingViewHolds[id] = Set(released.map(\.id))
         markDirty(at: now)
-        var persistenceFailure: String?
-        var persistenceFailureIsPartial = false
         do {
-            try await persistStandingViewChecked(view)
+            try await persistStandingViewTransitionChecked(view, keepingArtifact: true, retired: released, at: now)
         } catch {
-            persistenceFailure = "\(error)"
+            // Preserve evidence added during the write while restoring only
+            // the statuses and timestamps staged by this transition.
+            for changed in [view] + released {
+                guard let prior = previousViews[changed.id] else { continue }
+                guard var current = standingViews[changed.id] else {
+                    standingViews[changed.id] = prior
+                    continue
+                }
+                guard current.status == changed.status else { continue }
+                current.status = prior.status
+                if current.updatedAt == changed.updatedAt { current.updatedAt = prior.updatedAt }
+                standingViews[changed.id] = current
+            }
+            endMaintenanceTransition()
+            markDirty(at: dependencies.now())
+            return StandingViewTransition(view: standingViews[id], persistenceFailure: "\(error)")
         }
+        endMaintenanceTransition()
+        pruneRetiredStandingViews()
+        await recordUndo(key: "view:\(id.uuidString)", what: "held view: \(view.title)",
+                         previous: previous.toJSON(), stamp: Self.undoStamp(view))
         await recordReceipt(
             kind: "standing_view.held",
             payload: .object([
@@ -583,20 +730,6 @@ extension CognitiveSubstrate {
             externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.held)]
         )
         for old in released {
-            // 2026-09-06: the cap releases are part of THIS transition, like the
-            // active path's demotions — a release whose delete never reached the
-            // store leaves that view held on disk while the call reported a
-            // clean save. The first failure is the one carried.
-            do {
-                try await deleteArtifactRecordChecked(id: old.id)
-            } catch {
-                if persistenceFailure == nil {
-                    // The hold itself landed; this is the displaced view that
-                    // could not be let go, and it stays held in the store.
-                    persistenceFailure = "cap release of \(old.id.uuidString) not saved: \(error)"
-                    persistenceFailureIsPartial = true
-                }
-            }
             await recordReceipt(
                 kind: "standing_view.released",
                 payload: .object([
@@ -620,43 +753,7 @@ extension CognitiveSubstrate {
         // nothing yet, and letting it move the slow layer would give her a
         // self-serve lever on her own mood — the exact self-appraisal ratchet
         // design law 3 killed in two other layers.
-        if persistenceFailure == nil { pendingStandingViewHolds.removeValue(forKey: id) }
-        return StandingViewTransition(
-            view: standingViews[id],
-            persistenceFailure: persistenceFailure,
-            persistenceFailureIsPartial: persistenceFailureIsPartial)
-    }
-
-    /// Retry only storage, without repeating the hold's cap math or receipts.
-    private func retryStandingViewHold(
-        _ view: CognitiveStandingView,
-        releasedIDs: Set<UUID>
-    ) async -> StandingViewTransition {
-        var failure: String?
-        var partial = false
-        do {
-            try await persistStandingViewChecked(view)
-        } catch {
-            failure = "\(error)"
-        }
-        for id in releasedIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
-            // A later transition can replace a capacity release while this
-            // failed hold is awaiting a retry. Never delete a newly leaning view.
-            guard standingViews[id]?.status == .retired else { continue }
-            do {
-                try await deleteArtifactRecordChecked(id: id)
-            } catch {
-                if failure == nil {
-                    failure = "cap release of \(id.uuidString) not saved: \(error)"
-                    partial = true
-                }
-            }
-        }
-        if failure == nil { pendingStandingViewHolds.removeValue(forKey: view.id) }
-        return StandingViewTransition(
-            view: standingViews[view.id],
-            persistenceFailure: failure,
-            persistenceFailureIsPartial: partial)
+        return StandingViewTransition(view: standingViews[id])
     }
 
     /// She lets one of her own views go. Same transition the user's retire makes,
@@ -672,10 +769,11 @@ extension CognitiveSubstrate {
         id: UUID,
         seat: StudioCanonTurnProvenance
     ) async -> StandingViewTransition {
-        guard seat.isComplete, standingViews[id]?.status == .held else {
-            return StandingViewTransition(view: standingViews[id])
+        await waitForMaintenanceTransition()
+        guard seat.isComplete, standingViews[id]?.isHers == true else {
+            return StandingViewTransition(view: standingViews[id], conflict: seat.isComplete)
         }
-        return await retireStandingViewChecked(id: id)
+        return await retireStandingViewChecked(id: id, undoable: true)
     }
 
     /// SYNCHRONOUS cap math for the held tier — LRU by `updatedAt`, never
@@ -731,6 +829,7 @@ extension CognitiveSubstrate {
             standingViews[view.id] = view
             demoted.append(view)
         }
+        pruneRetiredStandingViews()
         return demoted
     }
 
@@ -738,9 +837,9 @@ extension CognitiveSubstrate {
     /// cap ACTIVE in the store, demote the overflow (LRU) and heal the store by deleting
     /// their artifacts. No-op in the normal case (gpt-5.5 review, 2026-07-02).
     ///
-    /// 2026-09-06: it now covers the HELD tier too. A hold persists the newly
-    /// held view first and only then deletes the views it displaced, so a
-    /// partial failure there leaves cap+1 held on disk — and this repair, which
+    /// 2026-09-06: it now covers the HELD tier too. Older holds persisted the newly
+    /// held view first and only then deleted the views they displaced, so a
+    /// partial failure left cap+1 held on disk — and this repair, which
     /// filtered `.active` only, walked past them on every launch.
     func repairStandingViewCapIfNeeded() async {
         let now = dependencies.now()
@@ -748,6 +847,10 @@ extension CognitiveSubstrate {
             status: .active, cap: Self.maximumActiveStandingViews, at: now)
         await repairStandingViewCapIfNeeded(
             status: .held, cap: Self.maximumHeldStandingViews, at: now)
+        await repairStandingViewCapIfNeeded(
+            status: .opinion, cap: Self.maximumOpinions, at: now)
+        await repairStandingViewCapIfNeeded(
+            status: .interest, cap: Self.maximumInterests, at: now)
     }
 
     private func repairStandingViewCapIfNeeded(
@@ -770,6 +873,7 @@ extension CognitiveSubstrate {
             standingViews[view.id] = view
             demoted.append(view)
         }
+        pruneRetiredStandingViews()
         for retired in demoted {
             // 2026-09-06: this repair ran through the swallowing delete, so a
             // store that cannot accept deletes healed nothing and silently
@@ -806,26 +910,6 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// Retire `.proposed` views left unresolved past the max age (no zombie proposals). Rides
-    /// the maintenance sweep after Wave D's consolidation. Retirement uses createdAt (a view
-    /// is "stale" if it has sat unresolved since it was formed); restore clamps any
-    /// future-dated createdAt, so clock skew can't make a proposal immortal.
-    /// Await-free lifecycle transition used by the atomic maintenance pass.
-    /// Timeline creation remains with the caller so the deletion and its audit
-    /// lineage can share one SQLite commit.
-    func retireStaleProposedStandingViewsInMemory(at now: Date) -> [CognitiveStandingView] {
-        var stale: [CognitiveStandingView] = []
-        for var view in standingViews.values
-        where view.status == .proposed
-            && now.timeIntervalSince(view.createdAt) > Self.standingViewProposalMaxAge {
-            view.status = .retired
-            view.updatedAt = now
-            standingViews[view.id] = view
-            stale.append(view)
-        }
-        return stale.sorted { lhs, rhs in lhs.id.uuidString < rhs.id.uuidString }
-    }
-
     // MARK: - Capsule surfacing (called from innerStateCapsuleLines)
 
     /// Frozen candidates for the durable `Inner` line. Each candidate carries
@@ -834,11 +918,19 @@ extension CognitiveSubstrate {
     /// rereads live views or affect.
     func standingViewCapsuleCandidates() -> [CognitiveStandingViewCapsuleCandidate] {
         let concerns = appraisalConcerns()
+        // Phase 5 D: her opinions and live interests join the held tier, only
+        // while the experiment is on and only when relevant (below).
+        let experiment = configuration.viewsExperimentEnabled
+        let now = dependencies.now()
         // Both leaning tiers. `isHeld` rides the candidate so the frozen render
         // can keep held views strictly under the signed ones without rereading
         // live view state.
         return standingViews.values
-            .filter({ $0.isLeaning })
+            .filter({ view in
+                view.isLeaning || (experiment && (view.status == .opinion
+                    || (view.status == .interest
+                        && view.interestWeight(at: now) >= CognitiveStandingView.interestFloor)))
+            })
             .sorted(by: { lhs, rhs in
                 if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
                 return lhs.id.uuidString < rhs.id.uuidString
@@ -860,12 +952,23 @@ extension CognitiveSubstrate {
                 let effective = distinctive.isEmpty
                     ? concerns.filter { Self.concernMatches($0, in: lowered) }.flatMap(\.keywords)
                     : distinctive
+                let line: String
+                switch view.status {
+                case .opinion:
+                    line = "- Inner: You think: \(capsuleLineText(view.body, maxCharacters: 140)) "
+                        + "(because \(capsuleLineText(view.because, maxCharacters: 110)))"
+                case .interest:
+                    line = "- Inner: You've been wondering: \(capsuleLineText(view.body, maxCharacters: 160))"
+                default:
+                    line = "- Inner: \(text)"
+                }
                 return CognitiveStandingViewCapsuleCandidate(
                     id: view.id,
-                    line: "- Inner: \(text)",
+                    line: line,
                     concernKeywords: Array(Set(effective)).sorted(),
                     updatedAt: view.updatedAt,
-                    isHeld: view.status == .held
+                    isHeld: view.status != .active,
+                    onlyWhenRelevant: view.status == .opinion || view.status == .interest
                 )
             }
     }
@@ -901,6 +1004,18 @@ extension CognitiveSubstrate {
         candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil,
         relevanceEnabled: Bool? = nil
     ) -> [String] {
+        activeStandingViewInnerCandidates(
+            relevantTo: userMessage, candidates: frozenCandidates, relevanceEnabled: relevanceEnabled
+        ).map(\.candidate.line)
+    }
+
+    /// The same ranking with each view's relevance score (nil when relevance
+    /// is off) — Phase 5 B0 records it as the reason a view led.
+    func activeStandingViewInnerCandidates(
+        relevantTo userMessage: String,
+        candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil,
+        relevanceEnabled: Bool? = nil
+    ) -> [(candidate: CognitiveStandingViewCapsuleCandidate, score: Double?)] {
         let candidates = frozenCandidates ?? standingViewCapsuleCandidates()
         guard !candidates.isEmpty else { return [] }
         let enabled = relevanceEnabled ?? configuration.standingViewCapsuleRelevanceEnabled
@@ -908,7 +1023,7 @@ extension CognitiveSubstrate {
         // the canary-off path, where relevance is not consulted at all.
         let signed = candidates.filter { !$0.isHeld }
         let held = candidates.filter(\.isHeld)
-        guard enabled else { return (signed + held).map(\.line) }
+        guard enabled else { return (signed + held).filter { !$0.onlyWhenRelevant }.map { ($0, nil) } }
         guard !userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         // Each tier is scored WITHIN ITSELF and the lists are concatenated, so a
         // held view can never outrank a signed one however well it matches the
@@ -916,11 +1031,11 @@ extension CognitiveSubstrate {
         // afterwards would let the held set's vocabulary move the idf of the
         // signed set's terms — the tier would change the signed ranking, which
         // is exactly what "ranked below" must not mean.)
-        let rankedSigned = Self.relevantCandidates(in: signed, for: userMessage).map(\.line)
+        let rankedSigned = Self.scoredRelevantCandidates(in: signed, for: userMessage)
         let rankedHeld = held.isEmpty
             ? []
-            : Self.relevantCandidates(in: held, for: userMessage).map(\.line)
-        return rankedSigned + rankedHeld
+            : Self.scoredRelevantCandidates(in: held, for: userMessage)
+        return (rankedSigned + rankedHeld).map { ($0.candidate, $0.score) }
     }
 
     // MARK: - Relevance (BM25)
@@ -961,6 +1076,13 @@ extension CognitiveSubstrate {
         in candidates: [CognitiveStandingViewCapsuleCandidate],
         for userMessage: String
     ) -> [CognitiveStandingViewCapsuleCandidate] {
+        scoredRelevantCandidates(in: candidates, for: userMessage).map(\.candidate)
+    }
+
+    static func scoredRelevantCandidates(
+        in candidates: [CognitiveStandingViewCapsuleCandidate],
+        for userMessage: String
+    ) -> [(candidate: CognitiveStandingViewCapsuleCandidate, score: Double)] {
         let queryTerms = appraisalConcernTerms(in: userMessage)
         guard !queryTerms.isEmpty else { return [] }
         let documents = candidates.map { Set($0.concernKeywords) }
@@ -1028,7 +1150,7 @@ extension CognitiveSubstrate {
                 if lhs.score != rhs.score { return lhs.score > rhs.score }
                 return lhs.order < rhs.order
             }
-            .map(\.candidate)
+            .map { ($0.candidate, $0.score) }
     }
 
     /// Compatibility read for non-turn diagnostics. It intentionally retains
@@ -1041,7 +1163,11 @@ extension CognitiveSubstrate {
     // MARK: - Surfaces
 
     public func standingViewSnapshot() async -> [CognitiveStandingView] {
-        standingViews.values.sorted { lhs, rhs in
+        // Phase 5 D: flag off, opinions and interests leave every surface.
+        let experiment = configuration.viewsExperimentEnabled
+        return standingViews.values
+            .filter { experiment || ($0.status != .opinion && $0.status != .interest) }
+            .sorted { lhs, rhs in
             if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
             return lhs.id.uuidString < rhs.id.uuidString
         }
@@ -1082,38 +1208,60 @@ extension CognitiveSubstrate {
     @discardableResult
     func restoreStandingViews(from payloads: [JSONValue]) -> [UUID] {
         standingViews.removeAll(keepingCapacity: true)
-        pendingStandingViewHolds.removeAll(keepingCapacity: true)
         let now = dependencies.now()
         var clamped: [UUID] = []
         for payload in payloads {
-            guard case .object(let object) = payload,
-                  let id = uuidValue(object["id"]),
-                  let title = stringValue(object["title"]),
-                  let body = stringValue(object["body"]),
-                  let statusRaw = stringValue(object["status"]),
-                  let status = CognitiveStandingView.Status(rawValue: statusRaw),
-                  let createdAt = dateValue(object["createdAt"]),
-                  let updatedAt = dateValue(object["updatedAt"]) else {
-                continue
-            }
-            if createdAt > now || updatedAt > now { clamped.append(id) }
-            standingViews[id] = CognitiveStandingView(
-                id: id,
-                title: title,
-                body: body,
-                status: status,
-                moodValenceAtFormation: doubleValue(object["moodValenceAtFormation"]) ?? 0,
-                evidenceNodeIds: uuidArrayValue(object["evidenceNodeIds"]),
-                evidenceExcerpts: stringArrayValue(object["evidenceExcerpts"]),
-                revisitCount: intValue(object["revisitCount"]) ?? 0,
-                lastRevisitedAt: dateValue(object["lastRevisitedAt"]),
-                revisesViewId: uuidValue(object["revisesViewId"]),
-                createdAt: min(createdAt, now),
-                updatedAt: min(updatedAt, now),
-                lineageId: stringValue(object["lineageId"]) ?? ""
-            )
+            guard var view = standingView(fromPayload: payload) else { continue }
+            if view.createdAt > now || view.updatedAt > now { clamped.append(view.id) }
+            view.createdAt = min(view.createdAt, now)
+            view.updatedAt = min(view.updatedAt, now)
+            standingViews[view.id] = view
         }
+        pruneRetiredStandingViews()
         return clamped
+    }
+
+    /// One persisted view payload, or nil when a required field is missing.
+    /// Shared by restore and undo (B0), so both read a view the same way.
+    func standingView(fromPayload payload: JSONValue) -> CognitiveStandingView? {
+        guard case .object(let object) = payload,
+              let id = uuidValue(object["id"]),
+              let title = stringValue(object["title"]),
+              let body = stringValue(object["body"]),
+              let statusRaw = stringValue(object["status"]),
+              let status = CognitiveStandingView.Status(rawValue: statusRaw),
+              let createdAt = dateValue(object["createdAt"]),
+              let updatedAt = dateValue(object["updatedAt"]) else {
+            return nil
+        }
+        return CognitiveStandingView(
+            id: id,
+            title: title,
+            body: body,
+            status: status,
+            moodValenceAtFormation: doubleValue(object["moodValenceAtFormation"]) ?? 0,
+            evidenceNodeIds: uuidArrayValue(object["evidenceNodeIds"]),
+            evidenceExcerpts: stringArrayValue(object["evidenceExcerpts"]),
+            revisitCount: intValue(object["revisitCount"]) ?? 0,
+            lastRevisitedAt: dateValue(object["lastRevisitedAt"]),
+            revisesViewId: uuidValue(object["revisesViewId"]),
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            lineageId: stringValue(object["lineageId"]) ?? "",
+            occurrences: stringArrayValue(object["occurrences"]),
+            because: stringValue(object["because"]) ?? "",
+            wouldChangeMind: stringValue(object["wouldChangeMind"]) ?? "",
+            revisions: {
+                guard case .array(let rows)? = object["revisions"] else { return [] }
+                return rows.compactMap { row -> CognitiveViewRevision? in
+                    guard case .object(let fields) = row, let stance = stringValue(fields["priorStance"]),
+                          let at = dateValue(fields["at"]) else { return nil }
+                    return CognitiveViewRevision(
+                        priorStance: stance, priorBecause: stringValue(fields["priorBecause"]) ?? "",
+                        evidence: stringValue(fields["evidence"]) ?? "", at: at)
+                }
+            }()
+        )
     }
 
     /// Persist the timestamp repairs `restoreStandingViews` made in memory, so a clamped

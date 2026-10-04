@@ -169,7 +169,8 @@ public struct OutcomeFeedbackStore: Sendable {
                 maxLines: Self.maximumExistingRows,
                 logLabel: "OutcomeFeedbackStore",
                 takeLock: false,
-                trimWhenBytesExceed: Self.maximumExistingBytes
+                maxBytes: Self.maximumExistingBytes,
+                capCheckStride: 1
             )
             return record
         }
@@ -209,10 +210,9 @@ public struct OutcomeFeedbackStore: Sendable {
                   assistant["role"] == .string("assistant"),
                   assistant["sessionId"] == .string(sessionID),
                   case .string(let assistantRunID)? = assistant["runId"],
-                  case .object(let requestRow) = rows[rows.count - 3],
-                  requestRow["role"] == .string("user"),
-                  requestRow["sessionId"] == .string(sessionID),
-                  requestRow["runId"] == .string(assistantRunID),
+                  Self.hasOriginatingRequest(
+                    in: rows[..<(rows.count - 2)].reversed(),
+                    sessionID: sessionID, runID: assistantRunID),
                   case .string(let messageID)? = assistant["id"],
                   case .object(let metadata)? = assistant["metadata"],
                   case .object(let outcome)? = metadata["outcomeObservation"],
@@ -268,10 +268,29 @@ public struct OutcomeFeedbackStore: Sendable {
                 maxLines: Self.maximumExistingRows,
                 logLabel: "OutcomeFeedbackStore",
                 takeLock: false,
-                trimWhenBytesExceed: Self.maximumExistingBytes
+                maxBytes: Self.maximumExistingBytes,
+                capCheckStride: 1
             )
             return record
         }
+    }
+
+    /// Walk only same-run tool receipts back to the originating request.
+    /// Another role, session or run breaks attribution.
+    package static func hasOriginatingRequest(
+        in precedingRows: some Sequence<JSONValue>,
+        sessionID: String,
+        runID: String
+    ) -> Bool {
+        guard closedToken(runID, maximum: 128) != nil else { return false }
+        for value in precedingRows {
+            guard case .object(let row) = value,
+                  row["sessionId"] == .string(sessionID),
+                  row["runId"] == .string(runID) else { return false }
+            if row["role"] == .string("user") { return true }
+            guard row["role"] == .string("tool") else { return false }
+        }
+        return false
     }
 
     /// Exact outcome anchors with structured reaction evidence. Legacy rows

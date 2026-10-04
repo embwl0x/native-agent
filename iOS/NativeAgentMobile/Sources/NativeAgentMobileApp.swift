@@ -271,7 +271,7 @@ struct NativeAgentMobileApp: App {
     private var shouldShowMainApp: Bool {
         PairingSkipPresentation.mainAppState(
             isPaired: pairingStore.isPaired,
-            pairingSkipped: pairingSkipped
+            pairingSkipped: pairingSkipped || pairingStore.connectionRepairPending
         ) != .pairingRequired
     }
 
@@ -305,7 +305,8 @@ struct NativeAgentMobileApp: App {
                             // the phone's network path returns, instead of
                             // waiting for the user to notice and retry.
                             bridgeClient.onNetworkPathRestored = { [weak chatStore = chatStore] in
-                                chatStore?.resumeQueuedSends()
+                                chatStore?.recoverQueuedSendTransport()
+                                PhoneTurnActivity.shared.resume()
                             }
                             configureNotifications()
                             configureTransport()
@@ -367,9 +368,13 @@ struct NativeAgentMobileApp: App {
     }
 
     private func announcePhoneToMac() {
-        guard pairingStore.iCloudPairingSecret != nil else { return }
+        guard pairingStore.iCloudPairingSecret != nil,
+              !pairingStore.connectionRepairPending, !pairingStore.isRepairingConnection else { return }
         iCloudSyncEngine.shared.pairingStore = pairingStore
-        Task { _ = try? await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true) }
+        Task {
+            guard !pairingStore.connectionRepairPending, !pairingStore.isRepairingConnection else { return }
+            _ = try? await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true)
+        }
     }
 
     private func configureNotifications() {
@@ -420,6 +425,7 @@ struct NativeAgentMobileApp: App {
     // was cleared by a migration).  iCloudPairingSecret presence is sufficient to
     // route to iCloud; isICloudPaired is a convenience flag that can fall behind.
     private func configureTransport() {
+        guard !pairingStore.isRepairingConnection else { return }
         // Inject pairingStore into both iCloud surfaces so they can sign messages:
         //   - iCloudSyncEngine: action channel (Mac control, Workshop, approvals)
         //   - iCloudBridge:     chat channel (BridgeMessage)
@@ -435,6 +441,8 @@ struct NativeAgentMobileApp: App {
         if pairingStore.usesICloudTransport {
             bridgeClient.configureICloud()
             startBridgeNotificationObserver()
+        } else if pairingStore.connectionRepairPending {
+            iCloudBridge.shared.setup()
         } else {
             stopBridgeNotificationObserver()
             bridgeClient.disconnect()
@@ -444,7 +452,7 @@ struct NativeAgentMobileApp: App {
     private func startBridgeNotificationObserver() {
         guard bridgeNotificationObserverID == nil else { return }
         bridgeNotificationObserverID = iCloudBridge.shared.observeNotifications { msg in
-            NativeAgentBridgeNotificationScheduler.schedule(msg)
+            await NativeAgentBridgeNotificationScheduler.schedule(msg)
         }
     }
 

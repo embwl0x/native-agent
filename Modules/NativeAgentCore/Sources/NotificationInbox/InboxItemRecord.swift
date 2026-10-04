@@ -33,12 +33,15 @@ public struct InboxItemRecord: Identifiable, Encodable, Hashable, Sendable {
     // after a successful read action, without waiting on a full reload.
     public var status: String        // unread | read | archived | dismissed
     public let read_at: String?
+    /// The conversation an interaction card was mirrored into for User
+    /// (`ApprovalChatCards`); the phone draws the card in that chat.
+    public let chat_session_id: String?
 
     enum CodingKeys: String, CodingKey {
         case id, created_at, source, severity, title, summary, detail
         case relatedWorkshopExecutionId = "related_mission_id" // compatibility wire ID
         case related_approval_id, related_paths, related_groups
-        case actions, status, read_at
+        case actions, status, read_at, chat_session_id
     }
 
     /// A row without a string `id` is not a card. Every other field keeps the
@@ -75,6 +78,7 @@ public struct InboxItemRecord: Identifiable, Encodable, Hashable, Sendable {
         actions = Self.all(o["actions"], Self.action) ?? []
         status = Self.string(o["status"]) ?? "unread"
         read_at = Self.string(o["read_at"])
+        chat_session_id = Self.string(o["chat_session_id"])
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -93,6 +97,7 @@ public struct InboxItemRecord: Identifiable, Encodable, Hashable, Sendable {
         try c.encode(actions, forKey: .actions)
         try c.encode(status, forKey: .status)
         try c.encodeIfPresent(read_at, forKey: .read_at)
+        try c.encodeIfPresent(chat_session_id, forKey: .chat_session_id)
     }
 
     // MARK: - Row fields
@@ -167,5 +172,56 @@ extension InboxItemRecord {
     /// resolved rows.
     public var isActivityPending: Bool {
         normalizedStatus == "unread" || normalizedStatus == "active"
+    }
+
+    // MARK: - W6/G12 — "For you" vs "System"
+
+    /// Sources whose vocabulary is OPERATIONS, not work.
+    ///
+    /// G12's finding is a ratio problem, not a producer problem: count the
+    /// producers and the machine-health lanes outnumber the human-shaped ones,
+    /// so User opens his day to *Background loop "heartbeat" started failing ·
+    /// Disk hygiene · Review scheduler errors*. This predicate is the whole
+    /// split — no producer changes, no new store, no new card shape.
+    ///
+    /// The seven named in the L5 evidence, plus the operational sources found
+    /// in the live feed that the doc's enumeration predates (`provider_vitals`,
+    /// the `memory_*` maintenance jobs, `self_test`). Every one of them reports
+    /// on the app's own machinery.
+    public static let systemLaneSources: Set<String> = [
+        "background_loop",
+        "disk_hygiene",
+        "doctor",
+        "heartbeat",
+        "provider_vitals",
+        "self_test",
+        "memory_consolidation",
+        "memory_repair",
+        "memory_kind_backfill",
+    ]
+
+    /// Proactive-scan kinds that are self-referential housekeeping. These
+    /// arrive as `proactive_autonomy:<kind>:<opportunityId>`, so the lane test
+    /// has to read the KIND component — matching on the raw source would put
+    /// every proactive card in one lane regardless of what it is about.
+    public static let systemLaneProactiveKinds: Set<String> = [
+        "scheduler_health",
+        "approval_backlog",
+        "inbox_digest",
+    ]
+
+    public var isSystemLane: Bool {
+        let lower = source.lowercased()
+        if Self.systemLaneSources.contains(lower) { return true }
+        if lower.hasPrefix("proactive_autonomy:") {
+            let parts = lower.split(separator: ":", omittingEmptySubsequences: false)
+            if parts.count >= 2, Self.systemLaneProactiveKinds.contains(String(parts[1])) {
+                return true
+            }
+        }
+        // `loop-failure:*` and the maintenance producers prefix rather than
+        // match exactly.
+        if lower.hasPrefix("background_loop") || lower.hasPrefix("loop-failure:") { return true }
+        return false
     }
 }

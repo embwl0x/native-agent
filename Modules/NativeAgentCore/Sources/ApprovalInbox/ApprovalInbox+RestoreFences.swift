@@ -97,11 +97,12 @@ extension SwiftNativeApprovalInbox {
                     "restore fence id \(id) refers to different approval payloads"
                 )
             }
-            // Resolution and execution facts only move forward. Descriptive
-            // payload/title bytes still come from the selected backup.
+            // Resolution, execution and continuation facts only move forward.
+            // Descriptive payload/title bytes still come from the selected backup.
             for key in [
                 "status", "decision", "resolvedAt", "decidedBy",
                 "resolutionProvenance", "executedAction", "detail",
+                "chatContinuation",
             ] where safetyObject[key] != nil {
                 targetObject[key] = safetyObject[key]
             }

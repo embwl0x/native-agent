@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Desk
 
 public enum GitHubConnectorError: Error, Sendable, Equatable, LocalizedError, ConnectorCredentialsMissing {
     case invalidInput(String)
@@ -296,16 +297,44 @@ public enum GitHubConnectorActions {
         maxPages: Int = 3
     ) async throws -> Any {
         var rows: [[String: Any]] = []
+        var identifiers = Set<Int64>()
         for page in 1...max(1, maxPages) {
             var pageParams = params
             pageParams["per_page"] = "100"
             pageParams["page"] = String(page)
             let result = try await call(path: path, params: pageParams, dataRoot: dataRoot)
-            guard let pageRows = result as? [[String: Any]], !pageRows.isEmpty else { break }
+            guard let pageRows = result as? [[String: Any]] else {
+                throw GitHubConnectorError.invalidResponse("paginated response page was not an array of objects")
+            }
+            guard pageRows.count <= 100 else {
+                throw GitHubConnectorError.invalidResponse("paginated response exceeded the requested page size")
+            }
+            for row in pageRows {
+                guard let id = row["id"] as? Int64, id > 0,
+                      identifiers.insert(id).inserted else {
+                    throw GitHubConnectorError.invalidResponse("paginated response contained malformed or repeated rows")
+                }
+                let user = row["user"] as? [String: Any]
+                guard row["user"] is NSNull || (user?["login"] as? String)?.isEmpty == false else {
+                    throw GitHubConnectorError.invalidResponse("paginated response contained a malformed author")
+                }
+                if path.hasSuffix("/reviews") {
+                    guard let state = row["state"] as? String,
+                          ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"].contains(state),
+                          state == "PENDING" || (row["submitted_at"] as? String).flatMap(DeskClock.parseISO) != nil else {
+                        throw GitHubConnectorError.invalidResponse("paginated response contained a malformed review")
+                    }
+                } else if path.hasSuffix("/comments") {
+                    guard row["body"] is String,
+                          (row["created_at"] as? String).flatMap(DeskClock.parseISO) != nil else {
+                        throw GitHubConnectorError.invalidResponse("paginated response contained a malformed comment")
+                    }
+                }
+            }
             rows.append(contentsOf: pageRows)
-            if pageRows.count < 100 { break }
+            if pageRows.count < 100 { return rows }
         }
-        return rows
+        throw GitHubConnectorError.invalidResponse("paginated response reached the read limit; history is incomplete")
     }
 
     // 2026-09-06: exact/tracking classification must never treat the first page

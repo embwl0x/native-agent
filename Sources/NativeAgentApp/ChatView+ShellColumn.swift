@@ -140,7 +140,7 @@ extension ChatView {
                     Task { await appModel.selectChatSession(session) }
                 }
             )) {
-                if sections.rows.isEmpty && sections.working.isEmpty {
+                if sections.rows.isEmpty && sections.briefs.isEmpty && sections.working.isEmpty {
                     Text(
                         ChatSessionListEmptyStatePresentation.message(
                             totalSessionCount: appModel.engine.transcripts.sessions.count,

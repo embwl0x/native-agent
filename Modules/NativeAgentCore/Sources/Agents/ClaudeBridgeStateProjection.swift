@@ -7,6 +7,7 @@ import Context
 import ContextFlow
 import PersistenceCore
 import Procedures
+import PersonaEngine
 
 /// App-owned preferences and transport activity, plus the existing runtime owners.
 /// Core chooses state fields; the app encodes and writes the resulting payload.
@@ -60,26 +61,6 @@ public enum ClaudeBridgeStateProjection {
             "lastDurationMilliseconds": telemetry.lastDurationMilliseconds ?? NSNull(),
             "controlAuthority": false,
         ]
-    }
-
-    /// HTTP is only the immediate operator feedback. The telemetry record is
-    /// emitted first and remains the audit surface even when this response is
-    /// not delivered before the bridge deadline.
-    public static func organismReflexReviewHTTPStatus(for status: OrganismReflexReviewApplyStatus) -> Int {
-        switch status {
-        case .applied:
-            // An `applied` outcome without its required receipt is an internal
-            // consistency failure, not a successful review.
-            return 500
-        case .organismDisabled, .persistenceFailed:
-            return 503
-        case .candidateNotFound:
-            return 404
-        case .reviewInFlight, .notAwaitingReview:
-            return 409
-        case .approvalRequiresLowRisk:
-            return 422
-        }
     }
 
     static func contextFlowHealthJSON(
@@ -182,11 +163,6 @@ public enum ClaudeBridgeStateProjection {
                     "evidenceBasis": belief.evidenceBasis.rawValue,
                 ] as [String: Any]
             },
-            "reflex": Self.reflexSummaryJSON(
-                snapshot.reflexSummary,
-                candidates: snapshot.reflexCandidates,
-                receipts: snapshot.reflexReviewReceipts
-            ),
             "behavior": Self.organismBehaviorJSON(OrganismBehaviorPosture.from(snapshot: snapshot)),
         ]
     }
@@ -317,14 +293,6 @@ public enum ClaudeBridgeStateProjection {
             "notificationRequiresReceipt": posture.notificationRequiresReceipt,
             "directives": posture.directives,
             "reviewSignals": posture.reviewSignals,
-            "approvedReflexBiases": posture.approvedReflexBiases,
-            "reviewRequiredReflexCount": posture.reviewRequiredReflexCount ?? 0,
-            "approvedLowRiskReflexTotalCount": max(
-                posture.approvedReflexBiasSampleCount,
-                posture.approvedLowRiskReflexTotalCount ?? posture.approvedReflexBiasSampleCount
-            ),
-            "approvedReflexBiasSampleCount": posture.approvedReflexBiasSampleCount,
-            "approvedReflexBiasesAreSampled": posture.approvedReflexBiasesAreSampled,
         ]
     }
 
@@ -381,87 +349,19 @@ public enum ClaudeBridgeStateProjection {
             },
         ]
     }
-
-    private static func reflexSummaryJSON(
-        _ summary: OrganismReflexSummary,
-        candidates: [OrganismReflexCandidate] = [],
-        receipts: [OrganismReflexReviewReceipt] = []
-    ) -> [String: Any] {
-        let iso = ISO8601DateFormatter()
-        return [
-            "candidateCount": summary.candidateCount,
-            "reviewRequiredCount": summary.reviewRequiredCount,
-            "lowRiskCount": summary.lowRiskCount,
-            "approvedLowRiskCount": summary.approvedLowRiskCount,
-            "confirmRequiredCount": summary.confirmRequiredCount,
-            "highRiskCount": summary.highRiskCount,
-            "reviewReceiptCount": summary.reviewReceiptCount,
-            "highestConfidence": summary.highestConfidence,
-            "lastCandidatePattern": summary.lastCandidatePattern ?? NSNull(),
-            "lastUpdatedAt": summary.lastUpdatedAt.map { iso.string(from: $0) } ?? NSNull(),
-            "candidates": candidates.map { Self.reflexCandidateJSON($0, iso: iso) },
-            "reviewReceipts": receipts.map { Self.reflexReviewReceiptJSON($0, iso: iso) },
-        ]
-    }
-
-    private static func reflexCandidateJSON(_ candidate: OrganismReflexCandidate, iso: ISO8601DateFormatter) -> [String: Any] {
-        [
-            "id": candidate.id,
-            "pattern": candidate.pattern,
-            "trustClass": candidate.trustClass.rawValue,
-            "evidenceCount": candidate.evidenceCount,
-            "successCount": candidate.successCount,
-            "failureCount": candidate.failureCount,
-            "confidence": candidate.confidence,
-            "reviewRequired": candidate.reviewRequired,
-            "autoActivationAllowed": candidate.autoActivationAllowed,
-            "approvedAt": candidate.approvedAt.map { iso.string(from: $0) } ?? NSNull(),
-            "retiredAt": candidate.retiredAt.map { iso.string(from: $0) } ?? NSNull(),
-            "rejectedAt": candidate.rejectedAt.map { iso.string(from: $0) } ?? NSNull(),
-            "permanentlyDeliberate": candidate.isPermanentlyDeliberate,
-            "lastReviewDecision": candidate.lastReviewDecision?.rawValue ?? NSNull(),
-            "lastReviewedAt": candidate.lastReviewedAt.map { iso.string(from: $0) } ?? NSNull(),
-            "lastReviewedBy": candidate.lastReviewedBy ?? NSNull(),
-            "reviewNote": candidate.reviewNote ?? NSNull(),
-            "firstSeenAt": iso.string(from: candidate.firstSeenAt),
-            "lastUpdatedAt": iso.string(from: candidate.lastUpdatedAt),
-        ]
-    }
-
-    private static func reflexReviewReceiptJSON(
-        _ receipt: OrganismReflexReviewReceipt,
-        iso: ISO8601DateFormatter
-    ) -> [String: Any] {
-        [
-            "id": receipt.id,
-            "candidateId": receipt.candidateID,
-            "pattern": receipt.pattern,
-            "trustClass": receipt.trustClass.rawValue,
-            "decision": receipt.decision.rawValue,
-            "reviewedAt": iso.string(from: receipt.reviewedAt),
-            "reviewedBy": receipt.reviewedBy,
-            "source": receipt.source,
-            "note": receipt.note ?? NSNull(),
-            "evidenceCount": receipt.evidenceCount,
-            "successCount": receipt.successCount,
-            "failureCount": receipt.failureCount,
-            "confidence": receipt.confidence,
-            "autoActivationAllowed": receipt.autoActivationAllowed,
-            "permanentlyDeliberate": receipt.permanentlyDeliberate,
-        ]
-    }
-
 }
 
 extension ClaudeBridgeStateProjection {
     public static func statePayload(dataRoot: URL, port: any ClaudeBridgeStatePort) async -> [String: Any] {
         let readErrors = BridgeReadErrors()
-        let surfaces = readSurfaces(dataRoot: dataRoot, errors: readErrors)
-        let chatSurface = surfaces["chat"] ?? [:]
-        let activeModel = chatSurface["model"] as? String
-        // Provider is not persisted per-surface in surfaces.json; infer from
-        // model prefix as a best-effort signal.
-        let activeProvider = inferProvider(model: activeModel)
+        let routing: ProviderRoutingSnapshot?
+        do { routing = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshot() }
+        catch {
+            routing = nil
+            readErrors.note(dataRoot.appendingPathComponent("providers"), error.localizedDescription)
+        }
+        let activeModel = routing?.preferences["chat"]?.model
+        let activeProvider = routing?.activeProviders["chat"]
         let activePersona = readActivePersona(dataRoot: dataRoot, preferred: port.preferredPersona)
         let (activeSessionId, _) = readBridgeActiveSession(dataRoot: dataRoot, preferred: { port.preferredSessionID }, errors: readErrors)
         let recentInbox = readRecentInbox(dataRoot: dataRoot, limit: 10, errors: readErrors)
@@ -481,7 +381,9 @@ extension ClaudeBridgeStateProjection {
             "activePersona": activePersona ?? NSNull(),
             "activeModel": activeModel ?? NSNull(),
             "activeProvider": activeProvider ?? NSNull(),
-            "chatReady": true,
+            "chatReady": routing != nil && routing?.unusablePickNotice(for: "chat") == nil
+                && !(activeModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                && !(activeProvider?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
             // Empty when every state file was readable OR legitimately absent.
             // A non-empty row means a file exists but could not be read or
             // decoded — the empty payload above is a failure, not "nothing yet".
@@ -548,42 +450,10 @@ extension ClaudeBridgeStateProjection {
         }
     }
 
-    private static func readSurfaces(dataRoot: URL, errors: BridgeReadErrors? = nil) -> [String: [String: Any]] {
-        let url = dataRoot.appendingPathComponent("providers/surfaces.json")
-        guard let data = readStateFile(url, errors: errors) else { return [:] }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            errors?.note(url, "decode failed: not a JSON object")
-            return [:]
-        }
-        var out: [String: [String: Any]] = [:]
-        for (k, v) in json {
-            if let dict = v as? [String: Any] { out[k] = dict }
-        }
-        return out
-    }
-
-    private static func inferProvider(model: String?) -> String? {
-        guard let m = model?.lowercased() else { return nil }
-        // Kimi Code exact ids BEFORE the kimi- prefix → moonshot branch, same
-        // ordering as the three ProviderRouting classifiers (gpt-5.5 review
-        // LOW: this local status classifier had drifted).
-        if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(m) { return "kimi-code" }
-        if m.hasPrefix("claude") || m.hasPrefix("anthropic/") { return "anthropic" }
-        if m.hasPrefix("gpt") || m.hasPrefix("openai/") || m.hasPrefix("o1") || m.hasPrefix("o3") { return "openai" }
-        if m.hasPrefix("kimi-") || m.hasPrefix("moonshot-") { return "moonshot" }
-        if m.contains("/") { return "openrouter" }
-        return nil
-    }
-
     public static func readActivePersona(dataRoot: URL, preferred: String?) -> String? {
-        // Persona is selected via UserDefaults "chatPersona" in Mac UI; the
-        // compiled persona profile is the source-of-truth. Read the default.
         if let s = preferred, !s.isEmpty { return s }
-        let personaDir = dataRoot.deletingLastPathComponent().appendingPathComponent("persona", isDirectory: true)
-        if let entries = try? FileManager.default.contentsOfDirectory(atPath: personaDir.path) {
-            return entries.sorted().first { !$0.hasPrefix(".") }
-        }
-        return nil
+        let root = PersonaRootResolver.resolve(dataRootProvider: { dataRoot })
+        return try? PersonaCompiler.selectedPersonaID(root: root, personaOverride: nil)
     }
 
     public static func readBridgeActiveSession(

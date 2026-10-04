@@ -3,7 +3,7 @@ extension BuiltInToolSchemaFactory {
     /// when a native tool answers the same question with structure, no approval
     /// queue, and no subprocess. Appended to the shell/bash schema DESCRIPTIONS
     /// only — dispatch, gating, and every other tool's behavior are unchanged.
-    static let nativeToolPreferenceGuidance = "Best fits: session_search for past conversations; delegation_status for bridge progress; github_* for GitHub repositories, notifications, issues, and pull requests; git_status/git_log/git_diff for routine repo evidence; read_file/list_dir for direct file reads."
+    static let nativeToolPreferenceGuidance = "Best fits: session_search for past conversations; app agent.jobs for bridge progress; app github.* for GitHub repositories, notifications, issues, and pull requests; git_status/git_log/git_diff for routine repo evidence; read_file/list_dir for direct file reads."
 
     /// The tool description is load-bearing. It is the only thing that turns
     /// "how do you feel?" into a PULL instead of an improvisation, so it says so
@@ -46,12 +46,12 @@ extension BuiltInToolSchemaFactory {
         proposal has stopped being a proposal to you and has become how you \
         actually see the thing. The owner can retire a held view at any time \
         and does not need your agreement to; that is the trade for not needing \
-        theirs. Read your proposals with inner_state first.
+        theirs. Read your proposals with app mind.inner_state first.
         """
 
     static let releaseViewToolDescription = """
-        Let go of a view you are holding. Only your own held views — a view the \
-        owner signed is theirs to retire, not yours. Nothing is destroyed: the \
+        Let go of a view you are holding, an opinion of yours, or an interest. \
+        Only your own — a view the owner signed is theirs to retire, not yours. Nothing is destroyed: the \
         timeline keeps the record that you held it and that you released it.
         """
 }

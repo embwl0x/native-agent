@@ -234,6 +234,36 @@ extension MemoryStorage {
                 )
             """)
         }
+        // Keep the first core choice after every pinned row is unpinned or
+        // deleted. Triggers cover every writer in the pin's own transaction.
+        m.registerMigration("v11_user_core_chosen") { db in
+            try db.execute(sql: """
+                CREATE TABLE memory_metadata (
+                  key TEXT NOT NULL PRIMARY KEY,
+                  value INTEGER NOT NULL
+                );
+                INSERT INTO memory_metadata (key, value)
+                SELECT 'user_core_chosen', 1 WHERE EXISTS (
+                  SELECT 1 FROM memories
+                  WHERE json_extract(metadata_json, '$.pinned') = 1
+                     OR json_extract(metadata_json, '$.pinned_order') IS NOT NULL
+                );
+                CREATE TRIGGER memory_user_core_chosen_insert
+                AFTER INSERT ON memories
+                WHEN json_extract(NEW.metadata_json, '$.pinned') = 1
+                BEGIN
+                  INSERT OR IGNORE INTO memory_metadata (key, value)
+                  VALUES ('user_core_chosen', 1);
+                END;
+                CREATE TRIGGER memory_user_core_chosen_update
+                AFTER UPDATE OF metadata_json ON memories
+                WHEN json_extract(NEW.metadata_json, '$.pinned') = 1
+                BEGIN
+                  INSERT OR IGNORE INTO memory_metadata (key, value)
+                  VALUES ('user_core_chosen', 1);
+                END;
+            """)
+        }
         return m
     }
 

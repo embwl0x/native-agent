@@ -1,6 +1,7 @@
 import ApprovalInbox
 import Foundation
 import MemoryV2
+import NotificationInbox
 import PersistenceCore
 import Desk
 import StandingBots
@@ -20,6 +21,7 @@ struct HerWorld: @unchecked Sendable {
     var chats: [HerScreen.BridgeChat] = []
     var contacts: [HerScreen.Contact] = []
     var answered: [String: Date] = [:]
+    var health: [String: AgentLocalHealth] = [:]
     var desk: DeskState?
     var split = HerScreen.DeskSplit()
     var bots: [BotDefinition] = []
@@ -29,9 +31,14 @@ struct HerWorld: @unchecked Sendable {
     /// Live board rows whose process is still alive.
     var crews: [[String: Any]] = []
     var moments = 0
-    /// Memory proposals waiting on the owner's review (the Today page's rule).
+    /// Memory proposals waiting for review: hers, not the owner's.
     var reviews: (count: Int, capped: Bool) = (0, false)
+    /// Inbox cards asking the owner to choose (OwnerAttentionPolicy.inboxAsks);
+    /// an approval's own card counts once, as the approval.
+    var asks = 0
     var phonePlaces: [PhonePlaceEvent] = []
+    /// Arrivals no other home line names (a failed wake, a recovery).
+    var arrivals: [ResidentWake.Item] = []
     /// Some part is older than its files, or missing.
     var stale = false
     /// Parts with no value at all yet (never read), by key.
@@ -44,39 +51,68 @@ struct HerWorld: @unchecked Sendable {
 final class HerMemo: @unchecked Sendable {
     static let shared = HerMemo()
     private let lock = NSLock()
-    private var store: [String: (stamp: [String], value: Any, generation: Int)] = [:]
+    private var store: [String: (stamp: [String], value: Any, generation: Int, used: Date)] = [:]
+    private var generation = 0
     private var refreshing: Set<String> = []
     private var glances: [String: String?] = [:]
     private var glanceOrder: [String] = []
 
+    /// Only the recent working window is retained, including transcript and send keys.
+    private func prune(_ now: Date) {
+        store = store.filter { now.timeIntervalSince($0.value.used) <= 1800 }
+        while store.count > 128, let oldest = store.min(by: { $0.value.used < $1.value.used }) {
+            store.removeValue(forKey: oldest.key)
+        }
+    }
+
+    private func keep(_ key: String, stamp: [String], value: Any) {
+        generation += 1
+        let now = Date()
+        store[key] = (stamp, value, generation, now)
+        prune(now)
+    }
+
     func value<T>(_ key: String, stamp: [String], compute: () async -> T) async -> T {
         let (hit, generation): (T?, Int) = lock.withLock {
-            (store[key].flatMap { $0.stamp == stamp ? $0.value as? T : nil }, store[key]?.generation ?? 0)
+            let now = Date()
+            prune(now)
+            store[key]?.used = now
+            return (store[key].flatMap { $0.stamp == stamp ? $0.value as? T : nil }, store[key]?.generation ?? 0)
         }
         if let hit { return hit }
         let value = await compute()
         lock.withLock {
-            if (store[key]?.generation ?? 0) == generation { store[key] = (stamp, value, generation + 1) }
+            if (store[key]?.generation ?? 0) == generation { keep(key, stamp: stamp, value: value) }
         }
         return value
     }
 
     /// `value`, for a synchronous compute.
     func cached<T>(_ key: String, stamp: [String], compute: () -> T) -> T {
-        let hit: T? = lock.withLock { store[key].flatMap { $0.stamp == stamp ? $0.value as? T : nil } }
+        let hit: T? = lock.withLock {
+            let now = Date()
+            prune(now)
+            store[key]?.used = now
+            return store[key].flatMap { $0.stamp == stamp ? $0.value as? T : nil }
+        }
         if let hit { return hit }
         let value = compute()
-        lock.withLock { store[key] = (stamp, value, (store[key]?.generation ?? 0) + 1) }
+        lock.withLock { keep(key, stamp: stamp, value: value) }
         return value
     }
 
     /// Whatever is kept, and whether its stamp is still current.
     func peek<T>(_ key: String, stamp: [String]) -> (value: T, current: Bool)? {
-        lock.withLock { store[key].flatMap { entry in (entry.value as? T).map { ($0, entry.stamp == stamp) } } }
+        lock.withLock {
+            let now = Date()
+            prune(now)
+            store[key]?.used = now
+            return store[key].flatMap { entry in (entry.value as? T).map { ($0, entry.stamp == stamp) } }
+        }
     }
 
     func put(_ key: String, _ value: Any) {
-        lock.withLock { store[key] = ([], value, (store[key]?.generation ?? 0) + 1) }
+        lock.withLock { keep(key, stamp: [], value: value) }
     }
 
     /// One inline glance read per data root at a time.
@@ -110,7 +146,7 @@ final class HerMemo: @unchecked Sendable {
 }
 
 /// Resumes once: with the work's answer, or nil when the budget runs out first.
-private final class OnceResume<T: Sendable>: @unchecked Sendable {
+final class OnceResume<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<T?, Never>?
     init(_ continuation: CheckedContinuation<T?, Never>) { self.continuation = continuation }
@@ -143,11 +179,13 @@ extension HerScreen {
     enum Reach { case fresh, unlocked, kept }
 
     static func readWorld(_ dataRoot: URL, now: Date = Date(), reach: Reach = .fresh) async -> HerWorld {
+        if reach == .fresh { AgentWorkspacePorts.current.conversations.refreshHealth(dataRoot: dataRoot) }
         let fresh = reach == .fresh, locked = reach == .fresh
         let root = dataRoot.standardizedFileURL.path + "\u{0}"
         func at(_ path: String) -> URL { dataRoot.appendingPathComponent(path) }
         let memo = HerMemo.shared
         var world = HerWorld()
+        world.health = AgentLocalHealth.read(dataRoot)
         func part<T>(_ key: String, _ stamp: [String], _ compute: () async -> T?) async -> T? {
             if fresh { return await memo.value(root + key, stamp: stamp) { await compute() } ?? nil }
             let kept: (value: T?, current: Bool)? = memo.peek(root + key, stamp: stamp)
@@ -163,6 +201,9 @@ extension HerScreen {
         if let events: [PhonePlaceEvent] = await part("phone places", [stamp(PhonePlaceHistory.url(dataRoot))], {
             try? PhonePlaceHistory.read(dataRoot)
         }) { world.phonePlaces = events }
+        if let arrivals: [ResidentWake.Item] = await part("arrivals", [stamp(ResidentWake.url(dataRoot))], {
+            ResidentWake.homeItems(dataRoot)
+        }) { world.arrivals = arrivals }
 
         typealias People = (records: [AgentConversationRecord], chats: [BridgeChat], contacts: [Contact], answered: [String: Date],
                             handed: Set<String>)
@@ -231,6 +272,16 @@ extension HerScreen {
             return (pending.filter { SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }.count,
                     pending.count == 100)
         }) { world.reviews = reviews }
+        let inboxPath = LiveNotificationInbox.livePath(dataRoot: dataRoot)
+        if let asks: Int = await part("asks", [stamp(inboxPath)], {
+            let inbox = inboxPath == LiveNotificationInbox.livePath(dataRoot: PersistenceCore.defaultDataRoot()) ? LiveNotificationInbox.shared : LiveNotificationInbox(path: inboxPath)
+            guard let rows = try? await inbox.rows() else { return nil }
+            return rows.compactMap(InboxItemRecord.init(row:)).filter { item in
+                item.id != item.related_approval_id
+                    && OwnerAttentionPolicy.inboxAsks(pending: item.isActivityPending, systemLane: item.isSystemLane,
+                        severity: item.severity, linkedApproval: !(item.related_approval_id ?? "").isEmpty, actionIDs: item.actions.map(\.id))
+            }.count
+        }) { world.asks = asks }
         let board: [[String: Any]] = await part("crews", [stamp(at("swarms/live.json"))]) { rows(at("swarms/live.json")) } ?? []
         world.crews = board.filter { row in
             guard let pid = row["pid"] as? Int else { return false }
@@ -277,11 +328,12 @@ extension HerScreen {
         withNames(dataRoot) { book in
             for contact in world.contacts {
                 let slug = book.slug(id: contact.id, name: contact.name)
-                let record = latest(contact, records: world.records, contacts: world.contacts)
+                let record = latest(contact, records: world.records)
                 let message: String? = if case .string(let id)? = record?.readInput?["message_id"] { id } else { nil }
                 let answered = message.flatMap { world.answered[$0] }
                 let bare = Contact(id: contact.id, name: contact.name, builtIn: contact.builtIn, kind: nil)
-                let text = state(bare, record: record, chat: nil, answered: world.answered, now: now).text
+                let health = world.health[record?.agent ?? contact.id] ?? world.health[contact.id]
+                let text = state(bare, record: record, chat: nil, answered: world.answered, now: now, health: health).text
                 var line = ""
                 // A live hand-off is her own send landing; its answer comes as a chat ("wrote").
                 // Already in her hands (her call's result, or the turn that
@@ -290,9 +342,6 @@ extension HerScreen {
                 } else if text.hasPrefix("✓ delivered") {
                 } else if text.hasPrefix("✓") {
                     line = slug + " replied"
-                    if contact.builtIn, let record, let reply = replyText(unwrap(record.receipt)) ?? record.exchanges?.last?.reply {
-                        line += " \"" + clip(firstLine(reply), 30) + "\""
-                    }
                 } else if text.hasPrefix("? asks") { line = slug + " asks for input" }
                 else if text.hasPrefix("✗ sends failing") { line = slug + " send failed" }
                 else if text.hasPrefix("✗ not sent") { line = slug + " not sent" }
@@ -300,6 +349,12 @@ extension HerScreen {
                 else if text.hasPrefix("? send") { line = slug + " send unconfirmed" }
                 marks[slug] = Mark(fp: [fp(record?.updatedAt), fp(answered), record?.phase ?? "-"].joined(separator: "|"),
                     line: line, at: ([record?.updatedAt, answered].compactMap { $0 }.max() ?? .distantPast).timeIntervalSince1970)
+                for id in Set([contact.id] + contact.agents) {
+                    if let health = world.health[id], health.current {
+                        marks["health:" + id] = Mark(fp: health.status + ":" + health.detail,
+                            line: health.problem.map { slug + ": " + $0 } ?? "", at: health.checkedAt.timeIntervalSince1970)
+                    }
+                }
                 // A chat she already answered is not news: she was there. (Every
                 // bridge drive opens a new chat, so this said "claude replied"
                 // on nearly every turn and sent her to look.)
@@ -320,7 +375,8 @@ extension HerScreen {
                     case .waitingForApproval, .waitingOnPerson: line = slug + " waiting on " + person
                     }
                 }
-                marks[slug] = Mark(fp: (entry?.id.uuidString ?? "-") + (running ? "|running" : ""), line: line,
+                marks[slug] = Mark(fp: [entry?.id.uuidString ?? "-", entry?.runtimeStatus.rawValue ?? "-",
+                                      entry?.statusDetail ?? "-", entry?.approvalID ?? "-", running ? "running" : "idle"].joined(separator: "|"), line: line,
                                    at: (running ? now : entry?.runAt ?? .distantPast).timeIntervalSince1970)
             }
             for row in world.crews {
@@ -356,6 +412,9 @@ extension HerScreen {
             let line = prefix + place + when
             marks["phone-place:" + event.id] = Mark(fp: event.id, line: line, new: line,
                 at: event.timestamp.timeIntervalSince1970)
+        }
+        for item in world.arrivals {
+            marks["arrival:" + item.id] = Mark(fp: item.id, line: "", new: item.line, at: item.at.timeIntervalSince1970)
         }
         marks["moments"] = Mark(fp: String(world.moments), line: "", at: now.timeIntervalSince1970)
         return marks
@@ -483,7 +542,7 @@ extension HerScreen {
         return text
     }
 
-    private struct GlanceText: Sendable { let text: String? }
+    struct GlanceText: Sendable { let text: String? }
 
     static func renderGlance(dataRoot: URL, scope: String?, now: Date, reach: Reach) async -> String? {
         let world = await readWorld(dataRoot, now: now, reach: reach)
@@ -514,10 +573,11 @@ extension HerScreen {
             let waiting = desk.items.filter(OwnerAttentionPolicy.waitsOnOwner).sorted { $0.updatedAt > $1.updatedAt }
             waits += waiting.prefix(2).map { "desk." + $0.alias } + (waiting.count > 2 ? ["+\(waiting.count - 2) desk"] : [])
         }
-        if world.reviews.count > 0 { waits.append("memories \(world.reviews.count)\(world.reviews.capped ? "+" : "")") }
+        if world.asks > 0 { waits.append("notes \(world.asks)") }
         if world.moments > 0 { mine.append("moments \(world.moments)") }
+        if world.reviews.count > 0 { mine.append("memories \(world.reviews.count)\(world.reviews.capped ? "+" : "")") }
         withNames(dataRoot) { book in
-            for contact in world.contacts where state(contact, record: latest(contact, records: world.records, contacts: world.contacts),
+            for contact in world.contacts where state(contact, record: latest(contact, records: world.records),
                                                       chat: nil, answered: world.answered, now: now).asks {
                 mine.append(book.slug(id: contact.id, name: contact.name) + " asks")
             }
@@ -535,6 +595,6 @@ extension HerScreen {
         if !waits.isEmpty { parts.append(person + " waits on: " + waits.joined(separator: ", ") + ".") }
         if !mine.isEmpty { parts.append("Mine: " + mine.joined(separator: ", ") + ".") }
         if !unread.isEmpty { parts.append("Not read yet: " + unread.joined(separator: ", ") + ", so there may be news there.") }
-        return parts.joined(separator: " ") + " (workspace for home)"
+        return parts.joined(separator: " ") + " (app {} for home)"
     }
 }

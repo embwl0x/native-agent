@@ -461,18 +461,22 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     var coreMLLastLoadError: String?
     var coreMLLoadCount: Int
     var embeddingMode: String
+    var requestedEmbeddingBackend: String
+    var effectiveEmbeddingBackend: String
     var spotlightReindexed: Bool
     var spotlightIndexedCount: Int
     var cloudKitAccountStatus: String
     var dataRootPath: String
 
     /// Visual + textual status derived from the runtime fields above.
-    /// One of: working / loaded / ready / broken / missing.
+    /// Distinguishes real-model readiness from disabled or mock search.
     enum EmbedderHealth {
         case working(loadCount: Int)   // green
         case ready                      // orange — resources present, never loaded
         case broken(reason: String)     // red — lastLoadError set
         case missing                    // red — bundled resources not reachable
+        case disabled
+        case mock
 
         var label: String {
             switch self {
@@ -480,6 +484,8 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
             case .ready: return "ready, not yet loaded"
             case .broken(let r): return "BROKEN: \(r)"
             case .missing: return "MODEL MISSING"
+            case .disabled: return "turned off"
+            case .mock: return "test vectors"
             }
         }
         var isHealthy: Bool {
@@ -498,6 +504,12 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     /// render — typical: green for working, orange for ready, red for
     /// broken/missing.
     var embedderHealth: EmbedderHealth {
+        if requestedEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
+            return .disabled
+        }
+        if effectiveEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
+            return .mock
+        }
         if let err = coreMLLastLoadError {
             return .broken(reason: err)
         }
@@ -512,6 +524,7 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
 
     var shouldPollEmbeddingStartup: Bool {
         embeddingMode == ManagedEmbeddingProvider.performanceMode
+            && effectiveEmbeddingBackend == ManagedEmbeddingProvider.coreMLBackend
             && coreMLReady
             && !coreMLLoaded
             && coreMLLastLoadError == nil
@@ -529,6 +542,8 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         coreMLLastLoadError: nil,
         coreMLLoadCount: 0,
         embeddingMode: "unknown",
+        requestedEmbeddingBackend: "unknown",
+        effectiveEmbeddingBackend: "unknown",
         spotlightReindexed: false,
         spotlightIndexedCount: 0,
         cloudKitAccountStatus: "checking…",
@@ -548,10 +563,9 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         // explicit so the panel cannot present it as an empty memory profile.
         do {
             let store = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            let memories = try await store.listMemories(persona: nil, status: nil, limit: nil)
-            snap.storageReadable = true
-            snap.sqliteRecordCount = memories.count
             let activeMemories = try await store.listMemories(persona: nil, status: "active", limit: nil)
+            snap.storageReadable = true
+            snap.sqliteRecordCount = activeMemories.count
             spotlightEligibleCount = activeMemories.filter {
                 !$0.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix)
             }.count
@@ -648,6 +662,8 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
             return
         }
         embeddingMode = runtime.mode
+        requestedEmbeddingBackend = runtime.requestedBackend
+        effectiveEmbeddingBackend = runtime.effectiveBackend
         coreMLLoaded = runtime.coreMLLoaded
         coreMLLastLoadError = runtime.lastLoadError
         coreMLLoadCount = runtime.loadCount
@@ -687,8 +703,7 @@ enum MemoryStatusPlainCopy {
     /// Prefer the v2 status counts when the app has them; fall back to the
     /// direct SQLite probe on a fresh install where status has not loaded yet.
     static func savedCount(active: Int?, sqliteRecordCount: Int) -> Int {
-        if let active, active > 0 { return active }
-        return sqliteRecordCount
+        active ?? sqliteRecordCount
     }
 
     /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
@@ -703,7 +718,7 @@ enum MemoryStatusPlainCopy {
         }
         switch health {
         case .working: return "ok"
-        case .ready: return "warn"
+        case .ready, .disabled, .mock: return "warn"
         case .broken, .missing: return "failed"
         }
     }
@@ -783,14 +798,19 @@ enum MemoryStatusPlainCopy {
         case .ready:
             return "Smart search starts the first time you search."
         case .broken:
-            return "Smart search could not start. Searches fall back to matching words. Open Advanced Diagnostics for the reason."
+            return "Memory search is unavailable because the search model could not load. Open Advanced Diagnostics for the reason."
         case .missing:
-            return "The on-device search model is not installed. Searches fall back to matching words."
+            return "Memory search is unavailable because the on-device search model is not installed."
+        case .disabled:
+            return "Memory search by meaning is turned off in Settings."
+        case .mock:
+            return "Memory search uses test vectors, so results do not reflect meaning."
         }
     }
 
     static func searchQualityLine(
         realSemanticAvailable: Bool,
+        health: MemoryV2NativeStackSnapshot.EmbedderHealth,
         storage: StorageAvailability = .readable
     ) -> String {
         switch storage {
@@ -803,9 +823,18 @@ enum MemoryStatusPlainCopy {
         case .readable:
             break
         }
-        return realSemanticAvailable
-            ? "Search finds memories by meaning, not just matching words."
-            : "Search matches words for now. Meaning-based search turns on once the on-device model is ready."
+        switch health {
+        case .broken, .missing:
+            return "Memory search is unavailable until the on-device model is ready."
+        case .disabled:
+            return "Turn on memory search by meaning in Settings to use the on-device model."
+        case .mock:
+            return "Search results use test vectors rather than meaning."
+        case .ready, .working:
+            return realSemanticAvailable
+                ? "Search finds memories by meaning, not just matching words."
+                : "Meaning-based search uses the on-device model when you search."
+        }
     }
 }
 
@@ -886,6 +915,7 @@ private struct MemoryV2NativeStackPanel: View {
                 }
                 Text(MemoryStatusPlainCopy.searchQualityLine(
                     realSemanticAvailable: summaryStatus?.embedding?.realSemanticAvailable == true,
+                    health: snapshot.embedderHealth,
                     storage: storageAvailability
                 ))
                 .font(.caption)
@@ -949,7 +979,7 @@ private struct MemoryV2NativeStackPanel: View {
                         tint: {
                             switch snapshot.embedderHealth {
                             case .working: return .green
-                            case .ready: return .orange
+                            case .ready, .disabled, .mock: return .orange
                             case .broken, .missing: return .red
                             }
                         }()
@@ -1056,6 +1086,13 @@ private struct MemoryV2SummaryBar: View {
         }
         if report.status == "refused" {
             return "\(runLabel): probe gate refused to stage" + nextSuffix(for: report)
+        }
+        if report.status == "failed" {
+            return "\(runLabel): failed; no consolidation changes applied"
+        }
+        if report.status == "projection_failed" {
+            let applied = parts.isEmpty ? "changes applied" : parts.joined(separator: ", ")
+            return "\(runLabel): \(applied); projection reconciliation failed, retry pending"
         }
         if changed == 0 {
             return "\(runLabel): \(scanned), no cleanup needed" + nextSuffix(for: report)

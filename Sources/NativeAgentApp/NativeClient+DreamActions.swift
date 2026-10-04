@@ -80,6 +80,7 @@ extension NativeClient {
         )
         let result = try await impl.runREM(force: force)
         let response = try Self.foundationDictionary(result.rawResponse)
+        guard response["skipReason"] == nil else { return response }
         let proposals = Self.dreamNumber(response["proposalsGenerated"])
         let archived = Self.dreamNumber(response["archivedEntries"])
         await NativeAgentEngine.liveCognition.ingestOrganismSignal(

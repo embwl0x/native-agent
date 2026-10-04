@@ -65,76 +65,10 @@ extension InboxItemRecord {
         }
     }
 
-    // MARK: - W6/G12 — "For you" vs "System"
-
-    /// Sources whose vocabulary is OPERATIONS, not work.
-    ///
-    /// G12's finding is a ratio problem, not a producer problem: count the
-    /// producers and the machine-health lanes outnumber the human-shaped ones,
-    /// so User opens his day to *Background loop "heartbeat" started failing ·
-    /// Disk hygiene · Review scheduler errors*. This predicate is the whole
-    /// split — no producer changes, no new store, no new card shape.
-    ///
-    /// The seven named in the L5 evidence, plus the operational sources found
-    /// in the live feed that the doc's enumeration predates (`provider_vitals`,
-    /// the `memory_*` maintenance jobs, `self_test`). Every one of them reports
-    /// on the app's own machinery.
-    static let systemLaneSources: Set<String> = [
-        "background_loop",
-        "disk_hygiene",
-        "doctor",
-        "heartbeat",
-        "provider_vitals",
-        "self_test",
-        "memory_consolidation",
-        "memory_repair",
-        "memory_kind_backfill",
-    ]
-
-    /// Proactive-scan kinds that are self-referential housekeeping. These
-    /// arrive as `proactive_autonomy:<kind>:<opportunityId>`, so the lane test
-    /// has to read the KIND component — matching on the raw source would put
-    /// every proactive card in one lane regardless of what it is about.
-    static let systemLaneProactiveKinds: Set<String> = [
-        "scheduler_health",
-        "approval_backlog",
-        "inbox_digest",
-    ]
-
-    var isSystemLane: Bool {
-        let lower = source.lowercased()
-        if Self.systemLaneSources.contains(lower) { return true }
-        if lower.hasPrefix("proactive_autonomy:") {
-            let parts = lower.split(separator: ":", omittingEmptySubsequences: false)
-            if parts.count >= 2, Self.systemLaneProactiveKinds.contains(String(parts[1])) {
-                return true
-            }
-        }
-        // `loop-failure:*` and the maintenance producers prefix rather than
-        // match exactly.
-        if lower.hasPrefix("background_loop") || lower.hasPrefix("loop-failure:") { return true }
-        return false
-    }
-
     /// Everything else — deliberately the DEFAULT. An unrecognized source is a
     /// card nobody has classified yet; putting it in front of User is the
     /// recoverable error, hiding it in a lane he does not open is not.
     var isForYouLane: Bool { !isSystemLane }
-
-    /// A decision or an action is pending on HIM — as opposed to something she
-    /// simply told him about. Reading an FYI is not resolving it, so an unread
-    /// informational note must never age into an obligation on Today.
-    ///
-    /// The reading verbs (`view`/`read`) and the two filing verbs
-    /// (`archive`/`dismiss`) are what every card gets by default; a producer
-    /// that attached anything else is asking for a choice.
-    var needsYou: Bool {
-        if hasLinkedApproval || isApprovalBacklogCard { return true }
-        if severity.lowercased() == "actionable" { return true }
-        if relatedWorkshopExecutionId != nil { return true }
-        let filing: Set<String> = ["view", "read", "archive", "dismiss"]
-        return actions.contains { !filing.contains($0.id.lowercased()) }
-    }
 
     var sourceIcon: String {
         if hasLinkedApproval { return "checkmark.shield.fill" }
@@ -389,7 +323,6 @@ struct InboxStripView: View {
     let onAction: @MainActor (String, String) async throws -> Void
 
     @State private var selectedItem: InboxItemRecord?
-    @State private var showSheet = false
     @State private var actionFlight = InboxRowActionFlight()
 
     private var display: InboxStripDisplay {
@@ -397,15 +330,13 @@ struct InboxStripView: View {
     }
 
     var body: some View {
-        if display.isQuiet { EmptyView() }
-        else {
-            VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
+            if !display.isQuiet {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(display.visibleItems) { item in
                             InboxCardView(item: item) {
                                 selectedItem = item
-                                showSheet = true
                             }
                         }
                         if display.overflowCount > 0 {
@@ -422,19 +353,19 @@ struct InboxStripView: View {
                 }
                 Divider()
             }
-            .sheet(item: $selectedItem) { item in
-                InboxItemDetailSheet(
-                    item: item,
-                    allItems: items,
-                    onAction: { actionID in
-                        await actionFlight.perform {
-                            try await onAction(item.id, actionID)
-                        }
-                    },
-                    onClose: { selectedItem = nil }
-                )
-                .presentationDetents([.medium, .large])
-            }
+        }
+        .sheet(item: $selectedItem) { item in
+            InboxItemDetailSheet(
+                item: item,
+                allItems: items,
+                onAction: { actionID in
+                    await actionFlight.perform {
+                        try await onAction(item.id, actionID)
+                    }
+                },
+                onClose: { selectedItem = nil }
+            )
+            .presentationDetents([.medium, .large])
         }
     }
 }
@@ -490,6 +421,7 @@ struct InboxItemDetailSheet: View {
     var allItems: [InboxItemRecord] = []
     let onAction: @MainActor (String) async -> InboxRowActionFlight.Outcome
     var onOpenGroup: ((InboxRelatedGroup) -> Void)? = nil
+    var closesOnGroupSelection = true
     let onClose: () -> Void
 
     @State private var isActing = false
@@ -563,7 +495,7 @@ struct InboxItemDetailSheet: View {
                                     ForEach(relatedGroups) { group in
                                         Button {
                                             onOpenGroup(group)
-                                            onClose()
+                                            if closesOnGroupSelection { onClose() }
                                         } label: {
                                             HStack(spacing: 10) {
                                                 Image(systemName: "tray.full")
@@ -969,6 +901,10 @@ final class InboxLoadState {
 /// population: visible unread cards. This is a rendered truth contract, not a
 /// second inbox state owner.
 struct InboxView: View {
+    init(initialGroup: InboxRelatedGroup? = nil) {
+        _groupFilter = State(initialValue: initialGroup)
+    }
+
     @Environment(AppModel.self) private var appModel
 
     @State private var inboxLoadState = InboxLoadState()

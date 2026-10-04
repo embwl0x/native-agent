@@ -74,6 +74,7 @@ public enum OrganismResolutionFelt {
         var out: [OrganismResolutionFeltEvent] = []
         for (id, resolved) in after.predictions {
             guard let prior = before.predictions[id], prior.status == .pending else { continue }
+            guard OrganismProspectiveAffect.carriesFeeling(prior.kind) else { continue }
             // Item 5 (2026-09-02): HORIZON rows share `.semanticExpectation`'s
             // kind but not its feeling. This buffer is drained by
             // `NativeCognitionRuntime.drainFeltResolutionsIntoSubstrate`, whose

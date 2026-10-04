@@ -174,7 +174,7 @@ struct CognitionProposalsView: View {
             reviewError = "\(action) not applied: \(message)"
             appModel.systemToasts.push(error: reviewError ?? message)
         case .notSaved(let detail):
-            reviewError = "\(action) was not saved and will not survive a restart: \(detail)"
+            reviewError = "\(action) was not saved: \(detail)"
             appModel.systemToasts.push(error: reviewError ?? detail)
         }
     }

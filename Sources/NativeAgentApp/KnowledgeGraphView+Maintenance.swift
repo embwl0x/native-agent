@@ -1,5 +1,6 @@
 import Foundation
 import KnowledgeGraph
+import MemoryV2
 
 extension KnowledgeGraphView {
     /// Policy authority is read separately from graph contents so unreadable
@@ -37,6 +38,10 @@ extension KnowledgeGraphView {
         // never under a fabricated healthy empty state. The read's own error
         // lives on the shared graph (`shownError`).
         await memory.loadGraph()
+        guard !Task.isCancelled, memory.graphLoadError == nil else { return }
+        let status = await KGNativeStackStatus.load(graphCounts: (totalEntities, totalEdges ?? 0))
+        guard !Task.isCancelled else { return }
+        nativeStack = status
     }
 
     func enableKnowledgeGraph(enabled: Bool = true) async {

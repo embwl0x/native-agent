@@ -422,6 +422,28 @@ struct ContinuityField: Sendable {
         enforceCapacity(configuration.maximumActiveNodes)
     }
 
+    /// Initial restoration may suspend while resident events are accepted.
+    /// Their values, decay checkpoints and replay guards take precedence.
+    mutating func mergeRestoredNodes(
+        _ nodes: [CognitiveNode],
+        decayAnchorsByID: [UUID: Date],
+        configuration: CognitiveConfiguration
+    ) {
+        let resident = self
+        replaceNodes(nodes, decayAnchorsByID: decayAnchorsByID, configuration: configuration)
+        nodesByKey.merge(resident.nodesByKey) { _, live in live }
+        decayAnchorsByKey.merge(resident.decayAnchorsByKey) { _, live in live }
+        associationTokensByKey.merge(resident.associationTokensByKey) { _, live in live }
+        turnKindByNodeID.merge(resident.turnKindByNodeID) { _, live in live }
+        nonLiveNodeKeys = Set(nodesByKey.compactMap { key, node in
+            cachedTurnKind(for: node).contributesToLivedState ? nil : key
+        })
+        seenEventKeys = resident.seenEventKeys
+        seenEventKeyOrder = resident.seenEventKeyOrder
+        associationWeights = resident.associationWeights
+        enforceCapacity(configuration.maximumActiveNodes)
+    }
+
     mutating func clear() {
         nodesByKey.removeAll(keepingCapacity: false)
         decayAnchorsByKey.removeAll(keepingCapacity: false)

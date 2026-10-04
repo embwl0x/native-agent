@@ -23,7 +23,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
 import Research
 import MultimodalTTS
@@ -190,7 +189,9 @@ extension AppModel {
         do {
             latestCapabilityUpdateCheck = try await client.checkCapabilityUpdates()
             capabilityCatalogSources = (try? await client.getCapabilityCatalogSources()) ?? capabilityCatalogSources
-            statusText = "Capability updates checked"
+            statusText = latestCapabilityUpdateCheck?.status == "unavailable"
+                ? "Capability update checking is unavailable; source versions are not compared."
+                : "Capability updates checked"
         } catch {
             statusText = "Update check failed: \(error.localizedDescription)"
         }
@@ -344,22 +345,6 @@ extension AppModel {
                 message: disabledFeature ?? "Demo capability pack install is disabled."
             )
             statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
-        } catch {
-            capabilityCatalogInstallOutcome = .refused(message: error.localizedDescription)
-            statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
-        }
-    }
-
-    /// Shared catalog action for an already-acquired pack. The client verifies
-    /// its signing identity and signature before it writes a pack or catalog record.
-    @MainActor
-    func installCapabilityPackForCatalog(_ pack: [String: JSONValue]) async {
-        do {
-            let receipt = try await client.installCapabilityPack(pack)
-            let name = receipt.name ?? receipt.packId
-            capabilityCatalogInstallOutcome = .installed(name: name)
-            statusText = "Installed signed pack \(name)"
-            await refreshAll()
         } catch {
             capabilityCatalogInstallOutcome = .refused(message: error.localizedDescription)
             statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"

@@ -13,7 +13,7 @@ struct AppWorkshopPumpPlatform: WorkshopPumpPlatform {
 
     func artifactIsReadable(dataRoot: URL, handle: String, relativePath: String) -> Bool {
         let reader = WorkshopArtifactWriter(dataRoot: dataRoot, handle: handle)
-        return (try? reader.read(relativePath: relativePath, maximumBytes: 1)) != nil
+        return reader.isReadable(relativePath: relativePath)
     }
 
     func validateArtifactComponent(_ value: String) throws -> String {

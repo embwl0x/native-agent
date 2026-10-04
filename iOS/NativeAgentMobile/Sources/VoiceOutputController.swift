@@ -49,6 +49,7 @@ final class VoiceOutputController: NSObject, ObservableObject {
     /// with `.notifyOthersOnDeactivation` hands the route back.
     private let deactivateAudioSession: () throws -> Void
     private var playbackState: VoiceOutputPlaybackState = .idle
+    private var activeUtterance: AVSpeechUtterance?
 
     init(
         configureAudioSession: @escaping () throws -> Void = {
@@ -113,6 +114,7 @@ final class VoiceOutputController: NSObject, ObservableObject {
             return
         }
         guard playbackState.beginIfIdle() else { return }
+        activeUtterance = utterance
         synth.speak(utterance)
         error = nil
         isSpeaking = playbackState.isSpeaking
@@ -162,9 +164,15 @@ final class VoiceOutputController: NSObject, ObservableObject {
     }
 
     private func finishPlayback() {
+        activeUtterance = nil
         playbackState.finish()
         isSpeaking = playbackState.isSpeaking
         releaseAudioSessionIfIdle()
+    }
+
+    private func finishPlayback(for utteranceID: ObjectIdentifier) {
+        guard let activeUtterance, ObjectIdentifier(activeUtterance) == utteranceID else { return }
+        finishPlayback()
     }
 
     /// E5: hand the audio route back once nothing is speaking. Only meaningful
@@ -186,10 +194,12 @@ final class VoiceOutputController: NSObject, ObservableObject {
 
 extension VoiceOutputController: AVSpeechSynthesizerDelegate {
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.finishPlayback() }
+        let utteranceID = ObjectIdentifier(utterance)
+        Task { @MainActor in self.finishPlayback(for: utteranceID) }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.finishPlayback() }
+        let utteranceID = ObjectIdentifier(utterance)
+        Task { @MainActor in self.finishPlayback(for: utteranceID) }
     }
 }

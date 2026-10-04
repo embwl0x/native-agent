@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import Dispatcher
+import ToolRegistry
 
 // A lazy projection over existing evidence, not another artifact registry.
 // Paths and versions below describe what a record said at the time; opening
@@ -93,10 +94,12 @@ extension SwiftToolDispatcher {
         let hasMoreSessions = session == nil && offset + page.count < files.count
         let complete = !listingFailed && failures == 0 && malformed == 0 && sampled == 0
             && !hasMoreSessions && offset == 0 && deskAvailable
+        let artifacts = candidates.prefix(limit).map(\.value)
+        for artifact in artifacts { Self.consumePersistedHistoryEvidence(artifact) }
         var result: [String: JSONValue] = [
             "status": .string(candidates.isEmpty ? (complete ? "not_found" : "incomplete") : "ok"),
             "query": .string(ArtifactContextProjection.safeText(query, cap: 500)),
-            "artifacts": .array(candidates.prefix(limit).map(\.value)),
+            "artifacts": .array(artifacts),
             "matched_record_count": .int(Int64(candidates.count)),
             "more_matches_in_page": .bool(candidates.count > limit),
             "interpretation": .string("Historical references with conversation context, not proof of current file contents, existence, newest version, delivery or approval. Nearby words are evidence to interpret, not an approval binding. Use exact source reads when ambiguous; do not recreate, overwrite or send a file to resolve uncertainty."),
@@ -209,6 +212,10 @@ enum ArtifactContextProjection {
             "session_id": .string(sessionID), "role": .string(message.role),
             "timestamp": .string(message.timestamp), "excerpt": .string(safeText(display)),
         ]
+        if let peer = SwiftToolDispatcher.persistedHistoryPeer(role: message.role, row: row) {
+            value["agent"] = .string(peer)
+            value["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(peer) && !display.isEmpty)
+        }
         if let id = string(row["id"]), !id.isEmpty {
             value["message_id"] = .string(id)
             value["read"] = .object(["tool": .string("read_chat_message"), "arguments": .object([
@@ -229,7 +236,9 @@ enum ArtifactContextProjection {
             }
             if message.role == "tool" {
                 let row = object(message.extras)
-                let tool = string(meta["toolName"] ?? row["toolName"]) ?? "unknown"
+                // An app call of a folded action is redacted as the tool it ran.
+                let tool = ToolNameAliases.shown(string(meta["toolName"] ?? row["toolName"]) ?? "unknown",
+                                                 inputJSON: string(meta["inputJSON"] ?? row["inputJSON"])).name
                 let raw = string(meta["resultSummary"] ?? row["resultSummary"]) ?? message.content
                 if raw.utf8.count <= 128 * 1024 {
                     let scrubbed = ChatToolJSONRedaction.screenViewRedactedResultJSON(tool: tool, json: raw)

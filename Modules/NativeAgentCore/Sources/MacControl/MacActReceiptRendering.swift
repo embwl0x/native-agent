@@ -173,9 +173,9 @@ enum MacActReceiptRendering {
         if let reason = diff.diffIncomparableReason {
             out["diff_incomparable_reason"] = .string(reason)
             out["diff_incomparable_note"] = .string(
-                "the affordances added/removed census is NOT counted as evidence of change here — "
+                "the affordance and readout added/removed counts are not counted as evidence of change here — "
                 + "the two compiles did not see the same window. The rows are still listed; the "
-                + "identity-keyed channels (changed, focus, modal, window title, readouts) are unaffected."
+                + "identity-keyed channels (changed, focus, modal, window title, readout values) are unaffected."
             )
         }
         if diff.focusChanged {

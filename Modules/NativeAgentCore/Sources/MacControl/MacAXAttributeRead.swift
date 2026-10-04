@@ -4,6 +4,16 @@ import ApplicationServices
 
 /// Nil-tolerant AX attribute copies shared by perception and actuation.
 enum MacAXAttributeRead {
+    static func copyTextRange(_ element: AXUIElement) -> NSRange? {
+        guard let raw = copyRaw(element, kAXSelectedTextRangeAttribute),
+              CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(raw as! AXValue, .cfRange, &range),
+              range.location >= 0, range.length >= 0,
+              range.location <= Int.max - range.length else { return nil }
+        return NSRange(location: range.location, length: range.length)
+    }
+
     static func copyRaw(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
         var raw: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success else { return nil }
@@ -38,11 +48,14 @@ enum MacAXAttributeRead {
     /// separate label ("Save As:", "Where:") — that label's text: its
     /// AXTitleUIElement, else the previous sibling static text ending in ":".
     /// The ONE name rule for perception and for the act-side drift check.
-    static func copyLabel(_ element: AXUIElement, role: String) -> String? {
+    static func copyLabel(
+        _ element: AXUIElement, role: String,
+        prepare: (AXUIElement) -> AXUIElement = { $0 }
+    ) -> String? {
         if let own = copyString(element, kAXTitleAttribute) ?? copyString(element, kAXDescriptionAttribute) {
             return own
         }
-        let fallback = copyCaption(element, role: role)
+        let fallback = copyCaption(element, role: role, prepare: prepare)
         guard fallback == nil, hintNamedRoles.contains(role) else { return fallback }
         // Last resort for a control that names itself nowhere else: its
         // placeholder ("Reply to Claude…") or its tooltip. Controls only — the
@@ -58,17 +71,20 @@ enum MacAXAttributeRead {
         "AXCheckBox", "AXRadioButton", "AXLink", "AXSlider", "AXDisclosureTriangle",
     ]
 
-    private static func copyCaption(_ element: AXUIElement, role: String) -> String? {
+    private static func copyCaption(
+        _ element: AXUIElement, role: String, prepare: (AXUIElement) -> AXUIElement
+    ) -> String? {
         guard MacPerceptionCompiler.captionedRoles.contains(role) else { return nil }
         if let caption = copyElement(element, kAXTitleUIElementAttribute) {
+            let caption = prepare(caption)
             return MacPerceptionCompiler.captionText(
                 copyString(caption, kAXValueAttribute) ?? copyString(caption, kAXTitleAttribute)
             )
         }
-        guard let parent = copyElement(element, kAXParentAttribute) else { return nil }
+        guard let parent = copyElement(element, kAXParentAttribute).map(prepare) else { return nil }
         let siblings = copyElementArray(parent, kAXChildrenAttribute)
         guard let index = siblings.firstIndex(where: { CFEqual($0, element) }), index > 0 else { return nil }
-        let previous = siblings[index - 1]
+        let previous = prepare(siblings[index - 1])
         guard copyString(previous, kAXRoleAttribute) == "AXStaticText",
               let raw = copyString(previous, kAXValueAttribute) ?? copyString(previous, kAXTitleAttribute),
               raw.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(":") else { return nil }

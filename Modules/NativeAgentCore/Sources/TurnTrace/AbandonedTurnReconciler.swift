@@ -28,6 +28,9 @@ public struct AbandonedTurnReconciler: Sendable {
     /// that has been off for months would read its whole trace history.
     public static let maximumDayWindow = 30
 
+    /// Bound guarded rereads as well as durable appends, including failed writes.
+    public static let maximumWritesPerPass = 25
+
     /// This process's epoch. A turn accepted at or after it belongs to THIS
     /// run: it is either live right now or it already wrote its own terminal,
     /// and either way this sweep has no business judging it (GPT-5.6 round
@@ -96,7 +99,11 @@ public struct AbandonedTurnReconciler: Sendable {
         var terminated: Set<String> = []
 
         let scan = scanRange(today: today)
-        for dayOffset in scan.newestOffset...scan.oldestOffset {
+        // Catch-up terminals are written today, outside a historical window.
+        // Read them before selecting candidates so prior passes do not spend
+        // the attempt budget again. Today's accepted turns stay outside that window.
+        let terminalOnlyDays = scan.newestOffset > 0 ? [0] : []
+        for dayOffset in terminalOnlyDays + Array(scan.newestOffset...scan.oldestOffset) {
             guard let day = Self.dayCalendar.date(byAdding: .day, value: -dayOffset, to: today)
             else { continue }
             let path = lane.path(for: day)
@@ -118,6 +125,7 @@ public struct AbandonedTurnReconciler: Sendable {
                       !turnId.isEmpty, turnId != "unknown" else { continue }
                 switch kind {
                 case "turn.accepted":
+                    guard dayOffset >= scan.newestOffset else { continue }
                     guard accepted[turnId] == nil else { continue }
                     guard case .string(let stamp)? = row["ts"],
                           let ts = Self.iso8601(stamp) else { continue }
@@ -136,6 +144,9 @@ public struct AbandonedTurnReconciler: Sendable {
 
         var tooRecent = 0
         var written: [String] = []
+        var writeAttempts = 0
+        var persistenceFailed = false
+        var deferred = false
         var interrupted: [(sessionId: String, surface: String)] = []
         let candidates = accepted
             .filter { !terminated.contains($0.key) }
@@ -148,6 +159,11 @@ public struct AbandonedTurnReconciler: Sendable {
                 tooRecent += 1
                 continue
             }
+            guard writeAttempts < Self.maximumWritesPerPass else {
+                deferred = true
+                break
+            }
+            writeAttempts += 1
             let minutes = Int((age / 60).rounded())
             // CHECK AND APPEND IN ONE CRITICAL SECTION. The scan above is
             // unlocked, so a real terminal can land between it and this write;
@@ -180,52 +196,61 @@ public struct AbandonedTurnReconciler: Sendable {
             )
             .filter { $0 != lane.path(for: today) }
             .sorted { $0.path < $1.path }
-            let wrote = await lane.appendGuarded(
-                TurnTraceEvent(
-                    turnId: turnId,
-                    ts: today,
-                    kind: "turn.terminal",
-                    sessionId: row.sessionId,
-                    surface: row.surface,
-                    payload: .object([
-                        "schema": .string("turn.lifecycle.v1"),
-                        "status": .string("abandoned"),
-                        "observedBy": .string("terminal_reconciliation"),
-                        "reason": .string("abandoned: no terminal after \(minutes) minutes"),
-                        "acceptedAt": .string(Self.iso8601String(row.ts)),
-                    ])
-                ),
-                alsoLocking: siblingDays,
-                shouldAppend: { current in
-                    if Self.containsTerminal(forTurn: turnId, in: current) { return false }
-                    for path in siblingDays {
-                        // Missing sibling: nothing there. Unreadable sibling:
-                        // it may hold the real terminal, so refuse to write.
-                        guard FileManager.default.fileExists(atPath: path.path) else { continue }
-                        guard let text = try? String(contentsOf: path, encoding: .utf8) else {
-                            return false
-                        }
-                        if Self.containsTerminal(forTurn: turnId, in: text) { return false }
-                    }
-                    return true
-                }
+            let event = TurnTraceEvent(
+                turnId: turnId,
+                ts: today,
+                kind: "turn.terminal",
+                sessionId: row.sessionId,
+                surface: row.surface,
+                payload: .object([
+                    "schema": .string("turn.lifecycle.v1"),
+                    "status": .string("abandoned"),
+                    "observedBy": .string("terminal_reconciliation"),
+                    "reason": .string("abandoned: no terminal after \(minutes) minutes"),
+                    "acceptedAt": .string(Self.iso8601String(row.ts)),
+                ])
             )
-            if wrote {
-                written.append(turnId)
-                if processEpoch.timeIntervalSince(row.ts) <= 3600,
-                   let sessionId = row.sessionId, let surface = row.surface {
-                    interrupted.append((sessionId, surface))
+            do {
+                let wrote = try await lane.appendGuarded(
+                    event,
+                    alsoLocking: siblingDays,
+                    shouldAppend: { current in
+                        if Self.containsTerminal(forTurn: turnId, in: current) { return false }
+                        for path in siblingDays {
+                            // Missing sibling: nothing there. Unreadable sibling:
+                            // it may hold the real terminal, so fail the sweep.
+                            guard FileManager.default.fileExists(atPath: path.path) else { continue }
+                            let text = try String(contentsOf: path, encoding: .utf8)
+                            if Self.containsTerminal(forTurn: turnId, in: text) { return false }
+                        }
+                        return true
+                    }
+                )
+                if wrote {
+                    await TurnTraceBus.shared.deliverToSubscribers(event)
+                    written.append(turnId)
+                    if processEpoch.timeIntervalSince(row.ts) <= 3600,
+                       let sessionId = row.sessionId, let surface = row.surface {
+                        interrupted.append((sessionId, surface))
+                    }
                 }
+            } catch {
+                persistenceFailed = true
+                FileHandle.standardError.write(
+                    Data("TurnTracePersistLane: guarded append failed (turn \(turnId)): \(error)\n".utf8)
+                )
             }
         }
-        // Every eligible candidate in the days ACTUALLY SCANNED has now been
-        // judged, so the cursor advances over exactly those days and no
+        // Once every eligible candidate in the days ACTUALLY SCANNED has been
+        // confirmed, the cursor advances over exactly those days and no
         // further. When the backlog was longer than `maximumDayWindow` the
         // newest scanned day is not today: the unscanned remainder stays
         // behind the cursor and the next sweep continues from there, instead
         // of the old jump to today that abandoned it forever (GPT-5.6 round
         // review, 2026-09-11).
-        if let newestScannedDay = Self.dayCalendar.date(
+        // A failed read/append or deferred candidate leaves the window pending.
+        // Already confirmed terminals make the next pass idempotent.
+        if !persistenceFailed, !deferred, let newestScannedDay = Self.dayCalendar.date(
             byAdding: .day, value: -scan.newestOffset, to: today
         ) {
             writeCursor(day: newestScannedDay)

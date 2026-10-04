@@ -200,7 +200,8 @@ public struct ActivityQueryService: Sendable {
             // The ONLY title-ish field, named so nobody mistakes it for the raw
             // window title. Nil whenever titles are off, the app is a browser
             // without the browser opt-in, or app-name-only mode is set.
-            out["title_redacted"] = span.titleRedacted.map { JSONValue.string($0) } ?? .null
+            let title = policy.allowsTitleCapture(bundleID: span.bundleId) ? span.titleRedacted : nil
+            out["title_redacted"] = title.map { JSONValue.string($0) } ?? .null
             out["seconds"] = .double(span.duration)
             out["event_count"] = .int(Int64(span.eventCount))
             out["close_reason"] = span.closeReason.map { JSONValue.string($0.rawValue) } ?? .null

@@ -3,7 +3,7 @@ import CryptoKit
 
 public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
     public var generatedAt: Date
-    /// Preregistered five-residual product used by operational/Dream lanes.
+    /// Preregistered five-residual product used by Dream/recalibration lanes.
     public var pressure: Double
     /// Existing bounded field-repair signal. Kept distinct because the
     /// preregistered product can contribute at most 0.15 from field charge and
@@ -81,9 +81,8 @@ public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
 public enum OrganismResidualRepair {
     public static let minimumPressure = 0.30
     public static let quietInterval: TimeInterval = 2 * 60
-    public static let operationalPressure = 0.45
-    public static let operationalQuietInterval: TimeInterval = 10 * 60
-    public static let operationalRefractoryInterval: TimeInterval = 6 * 60 * 60
+    public static let recalibrationPressure = 0.45
+    public static let recalibrationQuietInterval: TimeInterval = 10 * 60
     /// The preregistered product formula has a hard maximum of 0.6787 when all
     /// five normalized residuals equal one. A 0.70 gate is therefore
     /// unreachable theater; 0.60 preserves a deliberately high threshold.
@@ -293,7 +292,7 @@ public enum OrganismResidualRepair {
         let latestEvidenceAt = [trustedIngestionAt, trustedRepairAt].compactMap { $0 }.max()
             ?? fallbackEvidenceAt
         let localQuietUntil = latestEvidenceAt?.addingTimeInterval(quietInterval) ?? now
-        let operationalQuietUntil = latestEvidenceAt?.addingTimeInterval(operationalQuietInterval) ?? now
+        let recalibrationQuietUntil = latestEvidenceAt?.addingTimeInterval(recalibrationQuietInterval) ?? now
         let dreamQuietUntil = latestEvidenceAt?.addingTimeInterval(dreamQuietInterval) ?? now
         let resourceInhibited = resourcePressure != .nominal
         let localEligible = localRepairPressure >= minimumPressure
@@ -301,32 +300,6 @@ public enum OrganismResidualRepair {
             && repairableFieldEvidenceCount > 0
         let localReady = localEligible && !resourceInhibited && now >= localQuietUntil
         let localNext = localEligible && !resourceInhibited ? max(now, localQuietUntil) : nil
-
-        let sameOperationalGeneration = repairState.sleepControl.lastOperationalEvidenceGeneration
-            == evidenceGeneration
-        let operationalRefractoryUntil = repairState.sleepControl.lastOperationalConsolidationAt?
-            .addingTimeInterval(operationalRefractoryInterval)
-        let operationalCandidateAt = [operationalQuietUntil, operationalRefractoryUntil]
-            .compactMap { $0 }.max() ?? operationalQuietUntil
-        let operationalDisposition: OrganismSleepLaneDisposition
-        let operationalNext: Date?
-        if pressure < operationalPressure || evidenceCount == 0 {
-            operationalDisposition = .inactive
-            operationalNext = nil
-        } else if resourceInhibited {
-            operationalDisposition = .resourceInhibited
-            operationalNext = nil
-        } else if sameOperationalGeneration {
-            operationalDisposition = .refractory
-            operationalNext = nil
-        } else if now < operationalCandidateAt {
-            operationalDisposition = operationalRefractoryUntil.map { now < $0 } == true
-                ? .refractory : .waitingForQuiet
-            operationalNext = operationalCandidateAt
-        } else {
-            operationalDisposition = .ready
-            operationalNext = now
-        }
 
         let dreamRefractoryUntil = repairState.sleepControl.lastProviderDreamAt?
             .addingTimeInterval(dreamRefractoryInterval)
@@ -356,7 +329,7 @@ public enum OrganismResidualRepair {
         let controlledOnly = !provenance.isEmpty
             && evidenceClasses.isSubset(of: [.generated, .frozenControlled])
         let recalibrationDisposition: OrganismSleepLaneDisposition
-        if pressure < operationalPressure || supplemental.evidence.isEmpty {
+        if pressure < recalibrationPressure || supplemental.evidence.isEmpty {
             recalibrationDisposition = .inactive
         } else if resourceInhibited {
             recalibrationDisposition = .resourceInhibited
@@ -364,7 +337,7 @@ public enum OrganismResidualRepair {
             recalibrationDisposition = .privacyGateRequired
         } else if repairState.sleepControl.lastGeneratedEvidenceGeneration == evidenceGeneration {
             recalibrationDisposition = .refractory
-        } else if now < operationalQuietUntil {
+        } else if now < recalibrationQuietUntil {
             recalibrationDisposition = .waitingForQuiet
         } else {
             recalibrationDisposition = .ready
@@ -381,13 +354,6 @@ public enum OrganismResidualRepair {
                 nextEligibleAt: localNext
             ),
             OrganismSleepLaneOpportunity(
-                lane: .operationalConsolidation,
-                threshold: operationalPressure,
-                quietInterval: operationalQuietInterval,
-                disposition: operationalDisposition,
-                nextEligibleAt: operationalNext
-            ),
-            OrganismSleepLaneOpportunity(
                 lane: .identityDreamProposal,
                 threshold: dreamPressure,
                 quietInterval: dreamQuietInterval,
@@ -396,10 +362,10 @@ public enum OrganismResidualRepair {
             ),
             OrganismSleepLaneOpportunity(
                 lane: .generatedFrozenRecalibration,
-                threshold: operationalPressure,
-                quietInterval: operationalQuietInterval,
+                threshold: recalibrationPressure,
+                quietInterval: recalibrationQuietInterval,
                 disposition: recalibrationDisposition,
-                nextEligibleAt: recalibrationDisposition == .waitingForQuiet ? operationalQuietUntil : nil
+                nextEligibleAt: recalibrationDisposition == .waitingForQuiet ? recalibrationQuietUntil : nil
             ),
         ]
 
@@ -407,21 +373,9 @@ public enum OrganismResidualRepair {
             .filter { $0.status == .pending && $0.dueAt > now }
             .map(\.dueAt)
             .min()
-        // Only deadlines with a production consumer may wake the resident
-        // runtime. Operational consolidation is still diagnostic bookkeeping and
-        // manufactures no wakeup.
-        //
-        // The identity-Dream lane ACQUIRED a production consumer on 2026-09-01
-        // (NORTHSTAR clause 4, sweep item 39): the cognition runtime now fires
-        // the same DreamCycleRunner path the 03:30 job uses when this lane says
-        // a dream is due, so 03:30 is the integrity fallback rather than the
-        // mechanism. Its eligibility boundary — the end of the 30-minute quiet
-        // window, or of the 24-hour refractory — is therefore a real deadline
-        // something waits on, not a manufactured one. When the lane is ALREADY
-        // eligible `dreamNext` is `now`, and the `> now` filter below keeps that
-        // from arming a zero-delay timer: the consumer acts on the reading it
-        // already holds instead of spinning against itself.
-        let candidateDeadlines = [localNext, dreamNext, pendingPredictionDue, supplemental.nextModelReviewAt]
+        // The pressure-driven Dream consumer is retired. Its eligibility is
+        // diagnostic only; only deadlines with live consumers wake the runtime.
+        let candidateDeadlines = [localNext, pendingPredictionDue, supplemental.nextModelReviewAt]
             .compactMap { $0 }
             .filter { $0 > now }
         // Below threshold, monotonic residual decay cannot create a crossing;
@@ -439,16 +393,11 @@ public enum OrganismResidualRepair {
         let nextWake: Date?
         if resourceInhibited {
             let uninhibitedLocalNext = localEligible ? max(now, localQuietUntil) : nil
-            // The dream lane's consumer (see candidateDeadlines above) needs the
-            // same self-recovery: a Mac that cools while a dream is pending must
-            // re-sample instead of staying disarmed until an unrelated event.
-            let uninhibitedDreamNext = dreamEligible ? max(now, dreamCandidateAt) : nil
             let uninhibitedCandidateDeadlines =
-                [uninhibitedLocalNext, uninhibitedDreamNext, pendingPredictionDue, supplemental.nextModelReviewAt]
+                [uninhibitedLocalNext, pendingPredictionDue, supplemental.nextModelReviewAt]
                     .compactMap { $0 }
                     .filter { $0 > now }
             let wouldWakeAbsentInhibition = localEligible
-                || dreamEligible
                 || !uninhibitedCandidateDeadlines.isEmpty
             if wouldWakeAbsentInhibition {
                 let fallback = now.addingTimeInterval(resourceRecheckInterval)

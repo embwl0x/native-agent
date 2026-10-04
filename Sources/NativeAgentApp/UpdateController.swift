@@ -123,6 +123,7 @@ final class UpdateController: NSObject {
         /// Display version of the update Sparkle found; nil when none known.
         var availableVersion: String? = nil
         var canCheckForUpdates = false
+        var automaticChecksEnabled = false
     }
 
     struct PersistedNotice: Codable, Equatable {
@@ -157,7 +158,11 @@ final class UpdateController: NSObject {
     let status = Status()
 
     private var updaterController: SPUStandardUpdaterController?
+    /// The agent's probe in flight; resumed with the failure, or nil.
+    private var probe: CheckedContinuation<String?, Never>?
+    private var probeGeneration = 0
     private var canCheckObservation: NSKeyValueObservation?
+    private var automaticChecksObservation: NSKeyValueObservation?
     private let unavailability: Unavailability?
     private let info: [String: Any]
     private let preferences: UserDefaults
@@ -212,6 +217,15 @@ final class UpdateController: NSObject {
                 }
             }
             status.canCheckForUpdates = updaterController?.updater.canCheckForUpdates ?? false
+            automaticChecksObservation = updaterController?.updater.observe(
+                \.automaticallyChecksForUpdates, options: [.initial, .new]
+            ) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.status.automaticChecksEnabled = self.updaterController?.updater.automaticallyChecksForUpdates ?? false
+                }
+            }
+            status.automaticChecksEnabled = updaterController?.updater.automaticallyChecksForUpdates ?? false
         }
     }
 
@@ -226,6 +240,8 @@ final class UpdateController: NSObject {
         guard updatesAreAvailable else { return false }
         return status.canCheckForUpdates
     }
+
+    var automaticChecksEnabled: Bool { updatesAreAvailable && status.automaticChecksEnabled }
 
     /// Menu title. It never says "Check for Updates…" unless a check will actually run,
     /// and it names a known-available update outright.
@@ -243,16 +259,17 @@ final class UpdateController: NSObject {
 
     /// Compact copy shared by the visible Settings row and its footer.
     var settingsDetail: String {
-        Self.settingsDetail(for: unavailability)
+        Self.settingsDetail(for: unavailability, automaticChecksEnabled: automaticChecksEnabled)
     }
 
     /// Pure copy boundary for the Settings row. Keeping this separate from the
     /// Sparkle controller makes the three truthful states testable without
     /// starting an updater (which can otherwise contact the network at init).
-    static func settingsDetail(for unavailability: Unavailability?) -> String {
+    static func settingsDetail(for unavailability: Unavailability?, automaticChecksEnabled: Bool) -> String {
         guard let unavailability else {
-            return "NativeAgent checks the signed release feed automatically. "
-                + "You can also check now."
+            return automaticChecksEnabled
+                ? "NativeAgent checks the signed release feed automatically. You can also check manually."
+                : "Automatic update checks are off. You can still check the signed release feed manually."
         }
         return unavailability.detail
     }
@@ -321,6 +338,40 @@ final class UpdateController: NSObject {
         }
         // Sparkle owns the "a check is already running" case and surfaces it itself.
         updaterController.checkForUpdates(nil)
+    }
+
+    /// The agent's check (interaction_act check_updates): Sparkle's
+    /// information-only probe, which shows nothing and installs nothing.
+    /// Found or not lands in `status` as any check does; installing stays User's.
+    func probeForUpdate() async -> (detail: String, refusal: (reason: String, detail: String)?) {
+        guard updatesAreAvailable, let updater = updaterController?.updater else {
+            let reason = unavailability ?? .notConfigured
+            return ("", ("updates_unavailable", reason.message + " " + reason.detail))
+        }
+        guard probe == nil, !updater.sessionInProgress, updater.canCheckForUpdates else {
+            return ("", ("check_running", "An update check is already running. Ask again in a minute."))
+        }
+        probeGeneration &+= 1
+        let generation = probeGeneration
+        let failure = await withCheckedContinuation { continuation in
+            probe = continuation
+            updater.checkForUpdateInformation()
+            // A probe Sparkle never finishes must not hold `probe` forever.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(45))
+                guard let self, self.probeGeneration == generation, let probe = self.probe else { return }
+                self.probe = nil
+                probe.resume(returning: "No answer from the update feed within 45 seconds.")
+            }
+        }
+        if let failure {
+            return ("", ("check_failed", "The update check failed: \(failure) Try again later."))
+        }
+        guard let version = status.availableVersion else {
+            let installed = info["CFBundleShortVersionString"] as? String ?? "this version"
+            return ("NativeAgent is up to date (\(installed)).", nil)
+        }
+        return ("NativeAgent \(version) is available. Installing it is User's: \"\(menuTitle)\" in the app menu.", nil)
     }
 
     private func presentUnavailableExplanation() {
@@ -533,6 +584,13 @@ extension UpdateController: SPUUpdaterDelegate {
         didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
         error: Error?
     ) {
+        if updateCheck == .updateInformation, let probe {
+            self.probe = nil
+            let failure = error as NSError?
+            let noUpdate = failure?.domain == SUSparkleErrorDomain && failure?.code == Int(SUError.noUpdateError.rawValue)
+            probe.resume(returning: noUpdate ? nil : failure?.localizedDescription)
+            return
+        }
         guard updateCheck == .updatesInBackground else { return }
         handleScheduledCheckCompletion(error: error)
     }

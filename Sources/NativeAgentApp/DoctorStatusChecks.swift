@@ -28,30 +28,29 @@ enum DoctorStatusChecks {
             let contradictions = contradictoryParents(in: items)
             let waiting = items.filter { $0.requiresOwnerInput }
             let blocked = items.filter { $0.status == .blocked && !$0.requiresOwnerInput }
-            let requiredApprovals: Int
+            let pendingApprovals: Int
             do {
-                requiredApprovals = LivingAttentionPolicy.requiredApprovalCount(
-                    in: try await appModel.engine.approvals.list()
-                )
+                pendingApprovals = try await appModel.engine.approvals.list()
+                    .filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }.count
             } catch {
                 return (CheckResult(id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
-                                    detail: "Required approvals could not be read: \(NativeClient.safeDoctorDetail(error.localizedDescription)).",
+                                    detail: "Approvals could not be read: \(NativeClient.safeDoctorDetail(error.localizedDescription)).",
                                     human_action: "Open Approvals and refresh its pending list; inspect the approval store before changing any saved request."), repaired)
             }
             let id = "status.desk_attention"
             let title = "Desk work and decisions"
-            guard requiredApprovals > 0 || !waiting.isEmpty || !blocked.isEmpty || !contradictions.isEmpty else {
+            guard pendingApprovals > 0 || !waiting.isEmpty || !blocked.isEmpty || !contradictions.isEmpty else {
                 return (CheckResult(id: id, title: title, status: "ok",
                                     detail: "No blocked Desk work, owner decision, or terminal-parent contradiction."), repaired)
             }
             var parts: [String] = []
             if !waiting.isEmpty { parts.append("\(waiting.count) item(s) wait on your decision: " + labels(waiting)) }
-            if requiredApprovals > 0 { parts.append("\(requiredApprovals) required approval(s) wait for your decision.") }
+            if pendingApprovals > 0 { parts.append("\(pendingApprovals) pending approval(s) wait for your decision.") }
             if !blocked.isEmpty { parts.append("\(blocked.count) blocked item(s): " + blockedDetails(blocked)) }
             if !contradictions.isEmpty { parts.append("\(contradictions.count) terminal parent(s) contain open descendants: " + labels(contradictions)) }
             var actions: [String] = []
             if !waiting.isEmpty { actions.append("Open Desk and decide items \(labels(waiting)) marked waiting on you.") }
-            if requiredApprovals > 0 { actions.append("Open Approvals and decide the \(requiredApprovals) pending required request(s).") }
+            if pendingApprovals > 0 { actions.append("Open Approvals and decide the \(pendingApprovals) pending request(s).") }
             if !blocked.isEmpty { actions.append("Open Desk and resolve \(labels(blocked)) using each recorded blocked reason or waiting party; if neither is recorded, clarify the block in Desk.") }
             if !contradictions.isEmpty { actions.append("Open Desk and inspect terminal parents \(labels(contradictions)) if Repair Safe Issues cannot reconcile them.") }
             let severity = contradictions.isEmpty && blocked.isEmpty ? "ok" : "warn"

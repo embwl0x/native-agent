@@ -4,7 +4,7 @@ Use this when deciding whether something should be remembered, or when a piece o
 
 ## Before you answer from memory
 
-Recall first with `recall_memory`. Keep three things apart in your own head and in what you say: what memory holds, what this session established, and what you are inferring. When memory and present evidence disagree, name the conflict and prefer the verified newer source.
+Recall first with app `memory.recall`. Keep three things apart in your own head and in what you say: what memory holds, what this session established, and what you are inferring. When memory and present evidence disagree, name the conflict and prefer the verified newer source.
 
 ## What earns a memory
 

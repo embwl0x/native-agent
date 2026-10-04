@@ -436,12 +436,7 @@ struct TurnTraceReplayReader {
         }
         guard let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else {
-            let empty: TurnTraceReplayCache.Result = ([], 0)
-            if let before,
-               before == TurnTraceReplayCache.fileStamp(url) {
-                replayCache.store(key: key, stamp: before, result: empty)
-            }
-            return empty
+            return ([], 0)
         }
         let result = parse(text)
         if let before,

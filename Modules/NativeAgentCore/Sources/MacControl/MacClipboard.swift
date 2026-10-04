@@ -3,7 +3,7 @@
 // The Mac's clipboard is the one place where every app already agrees to hand
 // its content to whoever asks. Agent could press ⌘C through `act` and then had
 // nowhere to read the result: the pasteboard existed only in UI code
-// (ChatPlatformAdapters, DeskView, RunsView), never as an organ. That made
+// (ChatPlatformAdapters, the Desk, RunsView), never as an organ. That made
 // "copy this document and tell me what it says" impossible for a reason that
 // was pure omission.
 //
@@ -26,7 +26,7 @@
 //     wrote, and echoing would put it through the redactor's blind spot.
 //
 // NON-TEXT is REPORTED, never dumped. An image or a file promise on the
-// pasteboard is named by its UTI and its size; the bytes never enter a result.
+// pasteboard is named by its UTI; its size stays unknown without reading bytes.
 // "There is a PNG here" is the honest answer, and it is the useful one.
 
 import Foundation
@@ -91,14 +91,15 @@ public struct SystemMacPasteboardSource: MacPasteboardSource {
 
     public func read() -> MacPasteboardContents? {
         let board = NSPasteboard.general
+        let text = board.string(forType: .string)
         let types = (board.types ?? []).map { type in
             MacPasteboardType(
                 identifier: type.rawValue,
-                bytes: board.data(forType: type)?.count
+                bytes: type == .string ? text?.utf8.count : nil
             )
         }
         return MacPasteboardContents(
-            text: board.string(forType: .string),
+            text: text,
             types: types,
             changeCount: board.changeCount
         )
@@ -164,9 +165,8 @@ public enum MacClipboardRead {
     /// here.
     ///
     /// Line by line, because a copied document is prose with at most a secret
-    /// IN it: `MacScreenViewTextRedaction.standaloneSecretReason` answers "is
-    /// this line ITSELF a secret", which is exactly the question a clipboard
-    /// line poses. A line that is a secret is replaced by its reason — never
+    /// IN it. The shared redactor checks each line on its own and under the
+    /// preceding line's label. A secret is replaced by its reason — never
     /// dropped silently, because a caller who cannot tell redaction from a
     /// short clipboard will re-read forever.
     ///
@@ -176,8 +176,23 @@ public enum MacClipboardRead {
     public static func redacted(_ raw: String) -> Redaction {
         var lines: [String] = []
         var flagged: [RedactedLine] = []
+        var previousLine: String?
         for (index, line) in raw.components(separatedBy: "\n").enumerated() {
-            if let reason = MacScreenViewTextRedaction.standaloneSecretReason(line) {
+            let redacted = MacScreenViewTextRedaction.redactedLegendString(
+                line, valueChars: line.count, under: previousLine
+            )
+            var reason: String?
+            if case .object(let details) = redacted,
+               case .string(let sharedReason)? = details["reason"] {
+                reason = sharedReason
+            } else if let label = previousLine?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      label.hasSuffix(":"),
+                      MacScreenViewTextRedaction.looksLikeSecretLabel(label),
+                      !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                reason = "labeled_secret_nearby"
+            }
+            previousLine = line
+            if let reason {
                 flagged.append(RedactedLine(line: index + 1, reason: reason))
                 lines.append("[redacted: \(reason)]")
             } else {

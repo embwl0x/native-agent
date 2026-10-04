@@ -3,7 +3,10 @@ import NativeAgentCore
 import PersistenceCore
 
 extension AppToolExecutor {
-    public static func appToolSchemas(pageIDs: [String], drawOnlyPageIDs: [String]) -> [LLMToolSchema] {
+    /// `includeDoor: false` leaves out `app` itself, whose description reads
+    /// the action registry: the registry's fold table reads the other
+    /// schemas from here, and must not reach back into its own initializer.
+    public static func appToolSchemas(includeDoor: Bool = true) -> [LLMToolSchema] {
         func obj(_ pairs: [(String, JSONValue)]) -> JSONValue {
             var d: [String: JSONValue] = [:]
             for (k, v) in pairs { d[k] = v }
@@ -62,125 +65,39 @@ extension AppToolExecutor {
             ])
             return (try? v.serializedData(pretty: false)) ?? Data("{}".utf8)
         }
-        return [
+        let door: [LLMToolSchema] = !includeDoor ? [] : [
+            // One door: always on, static. Pages and actions travel in its
+            // results; only the hot actions ride its description, and they
+            // change only at a release.
+            LLMToolSchema(
+                name: "app",
+                description: "NativeAgent itself, worked in process: your home, its pages, settings and buttons, and every tool you have. Nothing comes forward on User's screen unless an action says screen. {} is your home first, where you left off (open agent windows, work in progress, what waits and what arrived, each with a name like desk.4, claude or mail), then the pages and their action ids. item alone opens a name or ref from home or one of its rooms; its text or fields go in args. page (+item) reads one: what it shows, its settings, its version, and its actions as id(args) label; User's ones say why and where he does them. action + args does one; the receipt says what changed and what else the app did. preview:true says what it would do and does nothing. expected_version refuses if the page changed since that read. find takes words (\"disconnect telegram\") and returns the matching pages and actions. script runs JavaScript that finishes a task in one call: app.<page>.<action>(args) for any action id, as app.inbox.archive({ids, reason}), plus app.read(page, item), app.find(words) and app.log(text); return what you want back. Each call is checked as its own action and gets a ledger row; one that is User's, blocked or waiting on his card stops the script at that line, and the calls before it stay done. "
+                    + "Call these without a read first: " + AppActions.hot.map(\.hotLine).joined(separator: "; ") + ".",
+                parametersJSON: params(
+                    properties: [
+                        ("page", strSchema("A page id from {}, such as inbox, chat or providers.")),
+                        ("item", strSchema("With page: one thing on it, a note id on inbox or a conversation id on chat. Alone: a name or ref from home or its rooms (desk.4, claude, mail.find), with args {text} or {fields} when it needs them.")),
+                        ("action", strSchema("An action id from a read, such as inbox.archive.")),
+                        ("args", obj([("type", .string("object")),
+                                      ("description", .string("The action's arguments by name, as its id(args) line shows; for a home item, text or fields."))])),
+                        ("preview", boolSchema("With action or script: report what it would do; nothing is done.")),
+                        ("expected_version", strSchema("With action: the version a read returned. Refused, with nothing done, if that page changed since. It hashes what the page shows, so a page changed and changed back has its old version again.")),
+                        ("find", strSchema("What you want done, in words. Returns the matching pages and actions. With page home: finds your work, documents and conversations.")),
+                        ("script", strSchema("JavaScript calling app.* only: no network or files. Up to 8 KB, 50 actions, 60 seconds; 20 per call.")),
+                    ],
+                    required: []
+                )
+            ),
+        ]
+        return door + [
             LLMToolSchema(
                 name: "chat_reply",
-                description: "Reply to an exact opened human conversation's saved destination; workspace binds its conversation/latest message. Creates no user turn or foreground-chat change. Answer your active conversation normally. Never automatically resend uncertain delivery.",
+                description: "Reply to an exact opened human conversation's saved destination; the chat read binds its conversation/latest message. Creates no user turn or foreground-chat change. Answer your active conversation normally. Never automatically resend uncertain delivery.",
                 parametersJSON: params(properties: [
-                    ("conversation_session_id", strSchema("Exact conversation_session_id from chat_conversations.")),
+                    ("conversation_session_id", strSchema("Exact conversation id from app {page:\"chat\", item}.")),
                     ("last_message_id", strSchema("Exact last_message_id from the opened conversation; changed conversations must be read again.")),
                     ("text", strSchema("The assistant reply, up to 16000 characters."))
                 ], required: ["conversation_session_id", "last_message_id", "text"])
-            ),
-            LLMToolSchema(
-                name: "reflex_review",
-                description: "Review one live organism reflex through NativeAgent's in-process owner. Approve activates low-risk candidates only, as soft posture bias; hold keeps inactive while evidence accrues; reject makes permanently deliberate, preventing re-proposal. Returns a durable reviewer receipt.",
-                parametersJSON: params(
-                    properties: [
-                        ("candidate_id", strSchema("Exact reflex candidate id from organism state, such as tool:tool-grep.")),
-                        ("decision", enumStringSchema(
-                            ["approve", "hold", "reject"],
-                            "Review decision. Approve is low-risk-only; reject is permanent."
-                        )),
-                        ("note", strSchema("Optional bounded reason recorded with the audit receipt.")),
-                    ],
-                    required: ["candidate_id", "decision"]
-                )
-            ),
-            // ── Quiet self-administration (0.4.14) ────────────────────────
-            // NativeAgent's OWN pages only. Nothing here can see or touch
-            // another app; the Mac verbs remain the only route to the desktop.
-            LLMToolSchema(
-                name: "app_page_read",
-                description: "Read a NativeAgent page's content, controls and Trust mode in the background, without opening/showing it. To show it: interaction_act(target: composer, verb: set_page, value: page name). Reads work in every Trust mode.",
-                parametersJSON: params(
-                    properties: [
-                        ("page", enumStringSchema(
-                            pageIDs + ["current"],
-                            "Which page to read, by the name on the rail, or current for the visible page."
-                        )),
-                    ],
-                    required: ["page"]
-                )
-            ),
-            LLMToolSchema(
-                name: "app_page_screenshot",
-                description: "Return an offscreen image of NativeAgent's own page to inspect appearance; app_page_read reads content. Draws the app view, not the screen: no screen recording, other-app capture or foregrounding. Allowed in every Trust mode.",
-                parametersJSON: params(
-                    properties: [
-                        ("page", enumStringSchema(
-                            pageIDs + drawOnlyPageIDs,
-                            "Which page to draw, by the name on the rail; simple is the Simple view, simple_settings_menu the same with its settings menu open."
-                        )),
-                        ("height", intSchema("Height to draw at, 400 to 2400 points; 860 when omitted. A short height shows how the page behaves in a small window.")),
-                    ],
-                    required: ["page"]
-                )
-            ),
-            LLMToolSchema(
-                name: "app_settings_list",
-                description: "List NativeAgent page settings: exact id, type, allowed values and agent editability. Call before app_setting_set; never guess IDs. owner_only settings are the person's Trust posture: readable, never editable here.",
-                parametersJSON: params(
-                    properties: [
-                        ("page", enumStringSchema(
-                            pageIDs,
-                            "Narrow to one page. Omit for every setting on every page."
-                        )),
-                    ],
-                    required: []
-                )
-            ),
-            LLMToolSchema(
-                name: "app_setting_set",
-                description: "Change a NativeAgent page setting via its control's in-process action: visible immediately, without foregrounding or synthesized clicks. Receipt includes page, setting, old/new values. Allowed in Work mode/Builder/Full Mac; Safe explicitly refuses. Cannot change Trust posture: presets, Full Mac, unattended work, Mac control or Mac service access.",
-                parametersJSON: params(
-                    properties: [
-                        ("setting", strSchema("Exact setting id from app_settings_list, such as providers.chat_model.")),
-                        ("value", obj([("description", .string("The new value: a boolean, a string, or a number, matching the setting's stated type."))])),
-                        ("page", enumStringSchema(
-                            pageIDs,
-                            "Optional. When given it must be the page the setting belongs to."
-                        )),
-                    ],
-                    required: ["setting", "value"]
-                )
-            ),
-            LLMToolSchema(
-                name: "interaction_act",
-                description: "Open/show/go to a NativeAgent page (settings/chat/desk/providers): target=composer, verb=set_page, value=page name. Answer inline cards in the open conversation (Connect Notion/Allow Desktop/Which model); get interaction_id from app_page_read page=chat. Uses the card's own writer then owner verification: rejected tokens fail in the connector's words and retain retry. Never foregrounds/focuses windows. Page/browser-sign-in controls (Trust posture/OAuth/Providers group picker) return needs_glass with a reason. Refuses phone/Telegram cards addressed to the person. Allowed in Work mode/Builder/Full Mac; Safe explicitly refuses. For the in-process composer, use target=composer + verb instead of interaction_id: read, set/send draft, pick model/thinking level, open/close cards, switch rail page. No accessibility calls: they would deadlock the turn.",
-                parametersJSON: params(
-                    properties: [
-                        ("interaction_id", strSchema("The card's interaction id, from app_page_read page=chat.")),
-                        ("action", enumStringSchema(
-                            ["primary", "decline", "retry"],
-                            "Required with an interaction_id, and only then: primary takes the card's own action, decline says \"not now\", retry re-runs a failed one. With target=composer the verb says what to do, so leave action out."
-                        )),
-                        ("value", strSchema("Never ask for a secret in chat: the person types keys and tokens into the card itself. Pass one here only if it reached you outside the conversation. Never echoed back; the receipt says [redacted].")),
-                        ("choice", strSchema("The id of the option picked, for a choose or model_choice card. With target=composer and verb=set_model, the model id.")),
-                        ("target", enumStringSchema(
-                            ["composer"],
-                            "Instead of a card: work the app's own composer, in process. Pass verb. Our own window can never be worked over accessibility (it deadlocks the turn asking), so only these verbs reach it."
-                        )),
-                        ("verb", enumStringSchema(
-                            ["read", "set_draft", "send", "set_model", "set_think", "open_card", "close_card", "set_page"],
-                            "target=composer only, and then action is not passed at all. read returns draft, model, think, trust word, ring fraction and which pane of the composer shell is open. set_draft takes value. send sends the draft. set_model takes the provider in value and the model id in choice, through the same picker the person uses, and its receipt waits for the write to land. set_think takes a level in value. open_card takes model, think, trust or context in value — one shell, one pane at a time, so opening one is switching to it; close_card closes it. set_page takes a rail page in value. There is no verb that sets Trust posture: that stays the person's."
-                        )),
-                    ],
-                    // Sol, 2026-09-17: `action` belongs to a card, and composer
-                    // dispatch ignores it — requiring it here made a strict
-                    // caller invent one to reach a documented composer verb.
-                    required: []
-                )
-            ),
-            LLMToolSchema(
-                name: "doctor_status",
-                description: "Run bounded read-only NativeAgent Doctor checks, without repairs. Global status retains all warnings; active_path_status covers this turn's serving path. maintenance_status covers dormant/aggregate integration upkeep only when the active provider is independently confirmed ready.",
-                parametersJSON: params(properties: [], required: [])
-            ),
-            LLMToolSchema(
-                name: "telegram_status",
-                description: "Read a bounded summary of NativeAgent Telegram config, live poller health and diagnostic-ledger freshness. Separates historical error/policy-block counts from unrecovered errors. Never returns tokens, chat/user IDs or message contents.",
-                parametersJSON: params(properties: [], required: [])
             ),
             LLMToolSchema(
                 name: "browser.status",
@@ -242,23 +159,23 @@ extension AppToolExecutor {
             ),
             LLMToolSchema(
                 name: "browser.chrome_acquire",
-                description: "Rarely needed: browser.chrome_navigate{url} opens and manages its own tab. Use to claim an exact existing tab (mode claim, tab_id, expected_url) or to open an X post in the visible work window. Leases slide: each call keeps the tab for five more idle minutes.",
+                description: "Rarely needed: browser.chrome_navigate{url} opens and manages its own tab. Use to claim an exact existing tab (mode claim, tab_id, expected_url) or explicitly request a visible work window with rendering_mode. Leases slide: each call keeps the tab for five more idle minutes.",
                 parametersJSON: params(
                     properties: [
                         ("mode", enumStringSchema(["create", "claim"], "Create an inactive tab in the purple NativeAgent group alongside the user's tabs in their existing Chrome window, or claim an exact existing user tab. Defaults create; never claim a user tab just to start ordinary browsing.")),
                         ("initial_url", strSchema("Optional HTTP(S) URL for a created background tab.")),
-                        ("rendering_mode", strSchema("Create only: optional grouped_background or visible_work_window. X/Twitter post URLs automatically use their own unfocused visible work window to load replies; other URLs default to grouped background tabs. Never selects your existing tabs. Inspect snapshot rendering evidence; visibility does not guarantee complete content.")),
+                        ("rendering_mode", strSchema("Create only: optional grouped_background or visible_work_window. All URLs default to grouped background tabs; use visible_work_window only when the task explicitly requests a visible work window. Never selects your existing tabs. Inspect snapshot rendering evidence; visibility does not guarantee complete content.")),
                         ("tab_id", intSchema("Exact Chrome tab id for claim mode.")),
                         ("expected_url", strSchema("Exact current URL for claim mode.")),
                         ("expected_title", strSchema("Exact current title for claim mode.")),
-                        ("lease_duration_ms", intSchema("Lease duration from 30000 through 300000 milliseconds. Defaults 60000.")),
+                        ("lease_duration_ms", intSchema("Lease duration from 30000 through 300000 milliseconds. Defaults 300000.")),
                     ],
                     required: []
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_renew",
-                description: "Rarely needed: every Chrome call already keeps its tab alive (five idle minutes, sliding). Extends this conversation's tab lease now.",
+                description: "Rarely needed: Chrome calls already renew an active lease as needed. Extends this conversation's tab lease now.",
                 parametersJSON: params(
                     properties: [
                         ("lease_id", nullable(strSchema("Omit for this chat's tab."))),
@@ -321,7 +238,7 @@ extension AppToolExecutor {
                         ("delta_x", intSchema("Horizontal scroll delta.")),
                         ("delta_y", intSchema("Vertical scroll delta.")),
                     ],
-                    required: ["delta_x", "delta_y"]
+                    required: ["delta_y"]
                 )
             ),
             LLMToolSchema(

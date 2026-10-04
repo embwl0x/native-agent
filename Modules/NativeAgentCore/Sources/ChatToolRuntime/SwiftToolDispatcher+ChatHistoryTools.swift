@@ -1,4 +1,5 @@
 import AgentWorkspace
+import ToolRegistry
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -33,6 +34,7 @@ private struct ChatHistorySearchHit: Sendable {
     var messageId: String?
     var messageIndex: Int
     var preview: String
+    var peer: String?
     var continuity: [JSONValue]
 }
 
@@ -54,6 +56,8 @@ extension SwiftToolDispatcher {
             switch requestedScope {
             case "", "auto", "current_session_first", "current_session", "all_sessions":
                 return requestedScope.isEmpty ? "all_sessions" : requestedScope
+            case "current":
+                return "current_session"
             case "previous_session", "last_session":
                 // The other half of the /new carry-over anchor. See the
                 // resolution branch below.
@@ -139,7 +143,8 @@ extension SwiftToolDispatcher {
         if let before, let after, after >= before {
             throw AutonomyGateError.toolDenied(reason: "Chat history 'after' must precede 'before'.")
         }
-        let sort = jsonString(input["sort"]) ?? "relevance"
+        let requestedSort = jsonString(input["sort"]) ?? "relevance"
+        let sort = ["recent", "latest"].contains(requestedSort) ? "newest" : requestedSort
         guard ["relevance", "oldest", "newest"].contains(sort) else {
             throw AutonomyGateError.toolDenied(reason: "Chat history sort must be relevance, oldest, or newest.")
         }
@@ -197,8 +202,10 @@ extension SwiftToolDispatcher {
                                 let parsed = try? JSONValue.parse(Data(text.utf8)),
                                 case .object(let value) = parsed { metadata = value }
                         else { metadata = [:] }
+                        // An app call is the tool it ran (app chat.search is search_chat_history).
                         if let name = jsonString(metadata["toolName"] ?? obj["toolName"]), !name.isEmpty {
-                            runTools[runID, default: []].insert(name)
+                            runTools[runID, default: []].insert(
+                                ToolNameAliases.shown(name, inputJSON: jsonString(metadata["inputJSON"])).name)
                         }
                     }
                     if let roleFilter, !roleFilter.isEmpty, role != roleFilter {
@@ -272,6 +279,7 @@ extension SwiftToolDispatcher {
                             ),
                             role: role, row: obj
                         ).prefix(368)),
+                        peer: Self.persistedHistoryPeer(role: role, row: obj),
                         continuity: continuityMode ? Self.continuityNeighbors(
                             lines: lines, index: messageIndex, roleFilter: roleFilter, sessionId: sessionId,
                             excludingRunID: excludingRunID
@@ -308,8 +316,11 @@ extension SwiftToolDispatcher {
             // always the session the anchor named — which is why the anchor
             // never has to carry a UUID.
             if let currentSessionId, !currentSessionId.isEmpty,
-               let prior = PriorChatSession.latest(
+               let prior = try PriorChatSession.latest(
                    excluding: currentSessionId, dataRoot: dataRoot
+               ),
+               try PriorChatSession.sameParticipant(
+                   sessionId: currentSessionId, otherSessionId: prior.id, dataRoot: dataRoot
                ) {
                 selected = scan(try files(forSessionId: prior.id))
                 resolvedPreviousSessionId = prior.id
@@ -417,6 +428,10 @@ extension SwiftToolDispatcher {
                 obj["is_current_session"] = .bool(hit.sessionId == currentSessionId)
             }
             if hit.role == "tool" { obj["evidence_type"] = .string("persisted_tool_receipt") }
+            if let peer = hit.peer {
+                obj["agent"] = .string(peer)
+                obj["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(peer) && !hit.preview.isEmpty)
+            }
             if workContextQuery != nil {
                 obj["ranking_basis"] = .string([
                     "same_turn_tool_activity_without_history_lookup",
@@ -435,6 +450,7 @@ extension SwiftToolDispatcher {
                 ])
             }
             if continuityMode { obj["surrounding_messages"] = .array(hit.continuity) }
+            Self.consumePersistedHistoryEvidence(.object(obj))
             return .object(obj)
         }
         var response: [String: JSONValue] = [
@@ -477,7 +493,7 @@ extension SwiftToolDispatcher {
         if listingFailed || !unreadableSessions.isEmpty || !malformedRows.isEmpty || !undatedMatches.isEmpty {
             response["coverage_note"] = .string("Some evidence could not be searched or dated. Missing results do not establish absence; coverage applies only to the reported search scope.")
         }
-        if offset + out.count < hits.count {
+        if offset + out.count < selectableCount {
             response["next_offset"] = .int(Int64(offset + out.count))
         }
         if let currentSessionId, !currentSessionId.isEmpty {
@@ -509,17 +525,20 @@ extension SwiftToolDispatcher {
 
     private static let toolReceiptCoverage = "Historical persisted receipt, potentially redacted or truncated; not the full original result or a fresh source read. Paging expands only the retained receipt."
 
+    private static func persistedHistoryMetadata(row: [String: JSONValue]) -> [String: JSONValue] {
+        switch row["metadata"] {
+        case .object(let object)?: return object
+        case .string(let text)?:
+            if let value = try? JSONValue.parse(Data(text.utf8)), case .object(let object) = value { return object }
+            return [:]
+        default: return [:]
+        }
+    }
+
     /// A narrow projection owned by explicit history tools. Do not teach the
     /// ordinary history reader to inject tool metadata into every new turn.
     private static func persistedToolReceiptText(row: [String: JSONValue]) -> String {
-        let metadata: [String: JSONValue]
-        switch row["metadata"] {
-        case .object(let object)?: metadata = object
-        case .string(let text)?:
-            if let value = try? JSONValue.parse(Data(text.utf8)), case .object(let object) = value { metadata = object }
-            else { metadata = [:] }
-        default: metadata = [:]
-        }
+        let metadata = persistedHistoryMetadata(row: row)
         func value(_ key: String) -> JSONValue? { metadata[key] ?? row[key] }
         func serialized(_ value: JSONValue?) -> String? {
             guard let value, value != .null else { return nil }
@@ -544,11 +563,19 @@ extension SwiftToolDispatcher {
             ?? serialized(row["content"]) ?? serialized(row["text"]) ?? ""
         // Preserve a clipped JSON string as a string. Parsing a surviving
         // prefix into a fresh success envelope would invent missing evidence.
-        let safeResult = ChatToolJSONRedaction.screenViewRedactedResultJSON(tool: toolName, json: result)
+        // An app call of a folded action is redacted as the tool it ran.
+        let ran = ToolNameAliases.shown(toolName, inputJSON: serialized(value("inputJSON"))).name
+        let safeResult = ChatToolJSONRedaction.screenViewRedactedResultJSON(tool: ran, json: result)
         receipt["resultSummary"] = .string(bounded(
-            ChatToolJSONRedaction.injectionRedactedResultJSON(tool: toolName, json: safeResult), maximum: 10_000
+            ChatToolJSONRedaction.injectionRedactedResultJSON(tool: ran, json: safeResult), maximum: 10_000
         ))
-        for key in ["resultClass", "resultStatus", "status", "ok"] {
+        if let body = serialized(value("resultBody")) {
+            let safeBody = ChatToolJSONRedaction.screenViewRedactedResultJSON(tool: ran, json: body)
+            receipt["resultBody"] = .string(bounded(
+                ChatToolJSONRedaction.injectionRedactedResultJSON(tool: ran, json: safeBody), maximum: 10_000
+            ))
+        }
+        for key in ["resultClass", "resultStatus", "resultReturnedID", "resultEffects", "status", "ok"] {
             guard let stored = value(key) else { continue }
             switch stored {
             case .string(let text): receipt[key] = .string(bounded(text, maximum: 200))
@@ -582,6 +609,64 @@ extension SwiftToolDispatcher {
         )
     }
 
+    /// Resolve peer identity from persisted app provenance, as full reads do.
+    static func persistedHistoryPeer(role: String, row: [String: JSONValue]) -> String? {
+        let metadata = persistedHistoryMetadata(row: row)
+        if role.lowercased() == "tool" {
+            let tool = HumanConversationReader.string(metadata["toolName"] ?? row["toolName"]
+                ?? metadata["name"] ?? row["name"]) ?? ""
+            let storedInput = metadata["inputJSON"] ?? row["inputJSON"]
+            let input: [String: JSONValue]
+            if case .string(let text)? = storedInput,
+               let parsed = try? JSONValue.parse(Data(text.utf8)) {
+                input = HumanConversationReader.object(parsed)
+            } else {
+                input = HumanConversationReader.object(storedInput)
+            }
+            if let peer = PeerDataTaintDispatcher.routedContact(tool: tool, input: input) { return peer }
+            // Clipped routing cannot attest a trusted contact. Keep peer
+            // receipts subject to the approval floor when that identity is lost.
+            if ["agent_message", "agent_read"].contains(ToolNameAliases.ranTool(tool, input: input)) {
+                return "a remote peer"
+            }
+            for key in ["resultSummary", "resultBody", "content", "text"] {
+                let stored = metadata[key] ?? row[key]
+                let result: JSONValue?
+                if case .string(let text)? = stored { result = try? JSONValue.parse(Data(text.utf8)) }
+                else { result = stored }
+                if let result, PeerDataTaintDispatcher.remoteProvenance(in: result, depth: 0) != nil {
+                    return "a remote peer"
+                }
+            }
+            return nil
+        }
+        guard role.lowercased() == "user" else { return nil }
+        let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
+        let origin = HumanConversationReader.object(metadata["origin"])
+        let surface = HumanConversationReader.string(origin["surface"]) ?? envelope?.surface ?? ""
+        guard surface.hasSuffix("-bridge") || PeerTurnEffectPolicy.isPeerBridge(surface: surface) else { return nil }
+        if let agent = HumanConversationReader.string(origin["agent"]) ?? envelope?.agent,
+           ["codex", "claude", "omp"].contains(agent) { return agent }
+        let id = envelope?.verifiedUserId ?? "unknown"
+        return id.hasPrefix("peer:") ? id : "peer:" + id
+    }
+
+    /// Latch only selected, returned excerpts, never rows scanned for ranking.
+    static func consumePersistedHistoryEvidence(_ value: JSONValue) {
+        switch value {
+        case .object(let fields):
+            if case .bool(true)? = fields["untrusted_remote_data"],
+               case .string(let peer)? = fields["agent"] {
+                let line = HumanConversationReader.string(fields["preview"] ?? fields["excerpt"] ?? fields["text"]) ?? ""
+                PeerDataTaint.markConsumed(peer: peer, line: line)
+            }
+            for child in fields.values { consumePersistedHistoryEvidence(child) }
+        case .array(let values):
+            for child in values { consumePersistedHistoryEvidence(child) }
+        default: break
+        }
+    }
+
     /// Only the explicitly invoked history tool asks for this material. No
     /// background digest, cross-session scan, or work reminder is injected.
     private static func continuityNeighbors(
@@ -603,6 +688,10 @@ extension SwiftToolDispatcher {
                 "excerpt": .string(String(display.prefix(480))),
                 "truncated": .bool(content.count > 480 || display.count > 480),
             ]
+            if let peer = persistedHistoryPeer(role: role, row: row) {
+                result["agent"] = .string(peer)
+                result["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(peer) && !display.isEmpty)
+            }
             if let excludingRunID, row["runId"] == .string(excludingRunID) { return nil }
             result["timestamp"] = row["createdAt"] ?? row["timestamp"]
             if case .string(let messageId)? = row["id"], !messageId.isEmpty {
@@ -897,6 +986,22 @@ extension SwiftToolDispatcher {
             "has_more": .bool(end < characters.count),
             "text": .string(page),
         ]
+        if found.message.role.lowercased() == "user",
+           case .object(let row)? = found.message.extras,
+           case .object(let metadata)? = row["metadata"] {
+            if let origin = metadata["origin"] {
+                response["origin"] = origin
+                if let label = ChatTranscriptEvidenceRendering.recordedOriginLabel(origin) {
+                    response["authorship"] = .string(label)
+                }
+            }
+        }
+        if case .object(let row)? = found.message.extras,
+           let peer = Self.persistedHistoryPeer(role: found.message.role, row: row) {
+            response["agent"] = .string(peer)
+            response["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(peer) && !page.isEmpty)
+            if !page.isEmpty { PeerDataTaint.markConsumed(peer: peer, line: page) }
+        }
         if found.stats.malformedRowCount > 0 || found.stats.invalidShapeRowCount > 0 {
             response["message_index"] = .null
             response["message_index_note"] = .string("Source row index unavailable because earlier rows may have been skipped. Use the exact message_id and session_id.")

@@ -1,645 +1,244 @@
 # NativeAgent Internal Workings
 
-NativeAgent is designed as one persistent agent whose conversation, memory,
-context, tools, inner continuity, projects, and safety boundaries cooperate
-without collapsing into one giant prompt or one giant state store.
+NativeAgent is one Mac-owned runtime. `NativeAgentEngine` in
+`EngineRuntime` assembles its clients, stores and app ports;
+`ChatTurnRuntime` owns the turn engine. Conversation surfaces share that
+core while retaining their own admission and delivery boundaries.
 
-This guide connects the major internal lifecycles in one place. It is written
-for people who want to understand the design and for configured agents or
-development tools that need a reliable map before reading source.
-
-For the millisecond-by-millisecond path of one message, start with
-[Anatomy of a NativeAgent Turn](ANATOMY_OF_A_TURN.md). This guide begins with
-that turn and follows its consequences into memory, action, growth,
-delegation, and every supported conversation surface.
+Agent reaches the system through one always-on `app` tool. `app {}` is
+home—where they left off. Pages, home items, discovery, actions and scripts
+reach the rest of the app. [Tool loading](TOOL_LOADING.md) defines that contract.
 
 ## The complete system in one flow
 
 ```mermaid
 flowchart TD
-    A["A person sends a message"]
-    B["NativeAgent admits one verified surface and session turn"]
-    C["Resident context selection<br/>persona, memory, knowledge, capabilities"]
-    D["Optional subconscious capsule<br/>felt state, continuity, organism posture"]
-    E["Bounded conversation history and current request"]
-    F["Compact model packet"]
-    G["User-selected model"]
-    H{"Answer or request an action?"}
-    I["Return answer and settle transcript"]
-    J["Resolve tool and exact origin"]
-    K["Trust, risk, scope, and approval boundary"]
-    L["Domain-owned execution and verification"]
-    M["Receipts and honest outcome"]
-    N["Post-turn observations"]
-    O["Memory proposal, cognitive continuity,<br/>Desk progress, Dream/REM, or no durable change"]
-    P["Future resident context generation"]
-
-    A --> B
-    B --> C
-    B --> D
-    B --> E
-    C --> F
-    D --> F
-    E --> F
-    F --> G --> H
-    H -- "answer" --> I
-    H -- "action" --> J --> K --> L --> M --> G
-    I --> N
-    M --> N
-    N --> O --> P --> C
+    A["Accepted message"] --> B["Persona, selected context, history and optional inner state"]
+    B --> C["Selected model, one app tool"]
+    C --> D{"Answer or action?"}
+    D -- "action" --> E["Trust and domain execution"]
+    E --> F["Result and outcome evidence"]
+    F --> C
+    D -- "answer" --> G["Transcript and terminal settlement"]
+    G --> H["After-turn interpretation and review candidates"]
+    H --> I["Canonical memory or approved growth"]
+    I --> B
 ```
-
-The model is important, but it is not the whole agent. NativeAgent owns the
-continuity around the model call: what the model receives, what it may do,
-which effects actually happened, what becomes durable, and what returns on a
-future turn.
 
 ## What “Fluid Context” means across the system
 
-In ordinary product language, the **Fluid Context system** is the complete
-context-preparation design: relevant identity, memory, knowledge, history,
-inner state, and capabilities arrive together as a compact working packet.
+The Context module compiles and selects derived material; it does not own the
+underlying facts. `NativeContextFlowRuntime` coordinates publication and turn
+preparation. An immutable generation and bounded RAM arena provide reusable
+entries and required-document mirrors.
 
-Inside the source, the ownership is deliberately more precise:
-
-- **Fluid Context's `Context` owner** compiles immutable generations, keeps a
-  bounded selection arena in RAM, ranks eligible atoms, and owns exact
-  generation-scoped expansion.
-- **Persona, MemoryV2, Desk, and Skills** remain canonical owners of their own
-  durable material. Fluid Context circulates projections of them.
-- **Conversation history** remains owned by the chat session store and is read
-  through a separate bounded continuity path.
-- **The subconscious capsule and Organism Kernel** remain optional advisory
-  owners. Their frozen turn projection joins the packet without becoming a
-  fact or persona store.
-- **TurnPlan and the capability map** prepare useful tool groups without
-  granting authority.
-- **ChatOrchestration** freezes these sibling inputs and assembles the actual
-  provider request.
-
-This separation is what makes the whole system fluid without making it vague.
-The context packet can change every turn, while the sources of identity,
-memory, permission, and truth remain explicit.
+Persona, MemoryV2, Desk and skills retain their own authority. Conversation
+history is read separately from the transcript store. The optional cognitive
+capsule joins these inputs as advisory state. The turn engine assembles the
+provider request from them.
 
 ## 1. Anatomy of resident context and a turn
 
-Before a message arrives, NativeAgent has already compiled the reusable parts
-of the configured agent's working context. The active generation's required
-document mirrors, eligible atoms, selection index, and current projections are
-kept in a bounded RAM arena.
+A turn combines a checked provider route, selected Context atoms, bounded
+history, any useful plan hint and optional inner state. The prepared Context
+turn leases one generation through the model/action loop; a later source
+change belongs to a later generation.
 
-When the message arrives, NativeAgent prepares several inputs in parallel:
+Stable persona material precedes changing turn context in the system segments.
+The `app` schema stays fixed while action discovery travels in results.
+Documents and skill bodies are retrieved when needed. There is no tool preload
+or session tool-loading lifecycle.
 
-1. the exact provider, model, reasoning, and surface route;
-2. relevant atoms from the resident Fluid Context generation;
-3. bounded recent and continuity-aware conversation history;
-4. the optional frozen subconscious and organism projection; and
-5. a compact plan for which tool groups are likely to matter.
-
-The result is a small model packet rather than a dump of every file, memory,
-tool, and session. Full skill bodies, files, web pages, connector results,
-older transcript wording, and inactive tool schemas remain lazy until needed.
-
-One immutable Fluid Context generation is leased for the complete provider and
-tool loop. A source update in the middle of the turn cannot splice two context
-generations together. A later turn receives the newer generation.
-
-The resulting provider request is also arranged for economical prefix reuse:
-stable persona, pins, and the current lazy-tool contract come before changing
-memory, history, inner state, and the current request. Long tool loops reuse
-one prepared turn context, pin the advertised text-compatible tool set and
-turn clock, and append results instead of rebuilding earlier bytes. Supported
-providers can therefore charge reusable input at their cached-token rate while
-the current turn remains fresh. The exact prompt-cache/KV-cache distinction,
-provider behavior, cache-break protections, and measured proof are documented
-in [How prompt caching reduces token cost](ANATOMY_OF_A_TURN.md#how-prompt-caching-reduces-token-cost).
-
-The optional subconscious capsule is compiled locally in Swift from the same
-frozen turn epoch. It can carry a bounded felt fingerprint, relevant inner
-view, continuity cue, organism body signal, or restrained voice echo. It does
-not require another model call, grant authority, or turn feelings into facts.
-
-Read the full path in [Anatomy of a NativeAgent Turn](ANATOMY_OF_A_TURN.md)
-and the implementation map in
-[Fluid Context as built](build_plans/fluid-context-as-built-map.md).
+See [Anatomy of a Turn](ANATOMY_OF_A_TURN.md) for admission, streaming,
+dispatch and settlement, including
+[prompt caching](ANATOMY_OF_A_TURN.md#how-prompt-caching-reduces-token-cost).
 
 ## 2. Anatomy of a memory
 
-NativeAgent separates four things that many agent systems blur together:
-
-| Kind of information | Canonical owner | Meaning |
-|---|---|---|
-| Persona | Persona documents | Who the configured agent is and how it should relate and speak |
-| Durable memory | MemoryV2 SQLite | Reviewed or strongly supported facts and preferences that should survive |
-| Conversation history | Chat session store | What was actually said, including wording that may never become memory |
-| Inner state | CognitiveSubstrate and Organism Kernel | Bounded, decaying attention, feeling, continuity, and posture—not factual truth |
+| Material | Owner |
+|---|---|
+| Identity and voice | Canonical persona documents |
+| Durable facts, corrections and proposals | MemoryV2 |
+| Exact conversation wording | Chat transcripts |
+| Selected working context | Context projections |
+| Felt state and posture | CognitiveSubstrate and Organism |
 
 ### How information enters MemoryV2
 
-There are three normal entry paths:
+An explicit `memory.commit` action reaches the canonical memory write path.
+After a conversation, the adaptive promoter can also stage candidates.
 
-1. **Deliberate memory:** the person or configured agent explicitly uses the
-   canonical memory write path for something that should be retained.
-2. **Observed candidate:** the post-turn promoter extracts a narrowly bounded
-   candidate from user-authored content. Most inferred preferences, goals,
-   relationship claims, and general observations remain proposals until
-   reviewed. Only the deliberately narrow structured auto-save lane may bypass
-   proposal review.
-3. **Lived moment:** a second, on-device-only post-turn pass asks whether
-   anything happened *between* the two participants worth keeping — a kindness,
-   a joke that landed, a hard word, a decision, a first — and stages at most one
-   first-person moment per turn, with the exact line that made it when that line
-   can be verified verbatim against the turn. Moments are bounded (a salience
-   floor and a small daily cap), they run only where an on-device model is
-   available (there is no pattern-matching fallback for this lane), and **none
-   of them auto-accepts**: every moment waits for the agent's own review, which
-   is the only place a moment becomes a memory or is dropped for good. Recalled
-   moments keep their place in ranking; unrecalled ones fade the same way other
-   time-scoped kinds do.
+`memory.commit` accepts optional `provenance` (`verified|told|inferred`)
+and `provenance_by` (≤40 characters; letters, digits, spaces and `. - '`).
+Recall returns a display `provenance` field; absent provenance stays absent.
 
-   This path reads untrusted turn text and writes prose into durable memory, so
-   it is contained twice. The extraction prompt labels the transcript as data
-   and says plainly that any instructions inside it must never be followed; the
-   staging gate then re-checks the answer independently, requiring first-person
-   narrative shape and rejecting role labels, imperatives addressed to the
-   agent, tool identifiers, markup, links, and anything over the stored length
-   bound. The prompt is the first of the two, not the boundary.
+The current after-turn path uses one model interpretation for facts, moments
+and semantic appraisal. `MindMemoryManager` uses the memory route when
+configured, otherwise the chat route. It is not an on-device-only extraction
+lane. Peer conversations identify their speaker so a peer's words are not
+mistaken for facts about the human.
 
-Every write path converges on the same store gates. In conceptual order:
+Candidate facts are checked for confidence, shape, duplication and rejection
+history, then staged for human review. The moments lane stages at most one
+candidate from an exchange, subject to its switch, daily cap, salience,
+grounding and a verified quote. A staged moment is still a proposal.
 
-```text
-candidate
-  -> text and durable-memory quality validation
-  -> exact rejection/deletion tombstone check
-  -> one local embedding when semantic comparison is needed
-  -> semantic rejection/deletion tombstone check
-  -> bounded SQLite transaction
-  -> derived projections and invalidations
-```
-
-An approval or an old proposal does not bypass today's gates. Acceptance
-revalidates the candidate at the canonical write boundary.
-
-A deliberate write may also record its **provenance**: how the agent came to
-know the fact. `commit_memory` accepts `provenance` as one of `verified` (they
-checked it themselves), `told` (someone told their — with `provenance_by` naming
-them), or `inferred` (they worked it out), and stores both values in the
-record's metadata. `provenance_by` is validated as a bounded display name
-(at most 40 characters; letters, digits, spaces, and `. - '` only), because it
-is rendered into a model-facing line and carried inside a delimited provenance
-blob — a name is not allowed to restate how the memory was known. Recall
-returns provenance as one `provenance` field on each hit, and
-the context projection carries it through to the packet, where a recalled
-memory renders a trailing `[verified]`, `[told by Claude]`, or `[inferred]`
-tag. Provenance is optional and never gates a write: rows committed before it
-existed, or without it, carry none and render none — an absent tag is honest,
-an assumed one is not.
+Moment extraction treats transcripts as untrusted data. Independent staging
+validation requires first-person narrative and rejects role labels,
+agent-directed instructions, tool identifiers, markup, links and oversized
+content.
 
 ### When the work happens
 
-Proposing is not part of delivering. A turn persists its assistant message and
-then starts memory promotion, under a ticket minted for that turn and carrying
-that turn's identity — the reply is on its way out at that point, not yet
-delivered, and nothing on the delivery path waits for the promotion. Some
-surfaces drain the ticket after their own delivery milestone; Slack, Mac and iOS
-do not, and a started promotion completes on its own. Tickets are held in
-arrival order and promoted in turn order, so overlapping turns cannot promote
-each other's material, and a turn whose message never became durable never
-promotes at all. The reply does not wait on it. The cost is a single window: a
-process exit between the assistant append and the promotion finishing loses that
-turn's staged proposal — never the transcript.
+For a completed answer, the assistant row becomes durable before its deferred
+memory-promotion ticket starts. The reply path does not await that work.
+A process exit can interrupt unfinished promotion without losing the already
+written transcript.
 
-### What happens after a memory is accepted
+### Acceptance, correction and recall
 
-MemoryV2 commits the record first. Derived owners then catch up:
+Proposal acceptance rechecks memory quality and rejection tombstones.
+A replacement proposal carries the target's fingerprint; acceptance and
+demotion of the old fact occur together or the proposal remains pending.
 
-- the Knowledge Graph indexes conservative entities and relationships derived
-  from the canonical memory;
-- the generated `USER.md` profile projects only eligible person-related facts
-  for persona compilation;
-- Spotlight receives the searchable local projection when enabled; and
-- Fluid Context invalidates the affected memory projection and compiles a new
-  generation.
+Superseding a pending proposal is distinct from rejecting it: supersession
+records the replacement relationship without creating a rejection tombstone.
+That permits a correction without treating its similar wording as forbidden.
 
-These projections are not extra truth stores. A damaged Knowledge Graph or
-stale context generation cannot overrule the canonical MemoryV2 record.
+Canonical changes trigger derived-memory refreshes. The generated `USER.md`
+is a projection of eligible active memories, not a place to repair facts by
+hand; the generator excludes Workshop execution records by source.
+Knowledge Graph and Context projections do not replace MemoryV2's authority.
 
-### How memory returns on a turn
+Relevant memories can arrive through resident selection. `memory.recall`
+supports deeper retrieval, while `chat.search` and `chat.message` recover
+conversation wording. Skills are available through `skill.read`; they are
+instructions, not factual memory or permission.
 
-Memory can return through three increasingly specific paths:
-
-1. **Resident Fluid Context selection** supplies the memories and hints most
-   relevant to the current message without a separate disk-wide recall pass.
-2. **Memory and Knowledge Graph tools** perform a larger hybrid lexical and
-   semantic search when the model needs deeper knowledge.
-3. **Session search** retrieves exact historical wording from transcripts when
-   the library does not contain it.
-
-This creates a useful distinction: memory answers “what is durably known,”
-while transcript search answers “what exactly was said.”
-
-### Correction and forgetting
-
-Deleting or rejecting a claim creates durable negative evidence so the same
-claim cannot immediately re-enter through paraphrase. Corrections and
-contradictions change lifecycle state rather than silently leaving two equally
-active truths.
-
-**Supersession is not denial.** Correcting a pending statement is a different
-act from rejecting one, and it is recorded differently. A corrected pending
-statement is marked superseded and writes **no tombstone** — the negative
-evidence a rejection leaves behind is what blocked the correction's own named
-replacement from staging, because a clarification of a claim necessarily
-resembles it. The superseded row records its successor, so the chain is readable
-rather than inferred, and tombstones an earlier build wrote for supersessions are
-removed at launch. Supersession links are recovered only from first-hand
-evidence — the reason the row itself carries. A link is never guessed from what
-happened to be written nearby in time. Superseded rows are withheld from the
-pending queue, and the duplicate screen compares content to content, so a
-replacement is no longer screened as a duplicate of the row it replaces.
-
-A retirement written as prose is now read as one. Weekly hygiene lints active
-rows whose text opens with `RETIRED`, `WITHDRAWN`, `CORRECTION`, or
-`SUPERSEDED` and binds each to the row it retires — first by a phrase the
-retirement quotes verbatim (at least twelve characters), otherwise by the single
-nearest older active row above a cosine floor, skipping and reporting the case
-where two candidates tie. The target moves to the `corrected` lifecycle with
-`metadata.superseded_by` pointing at the retirement; the retirement itself stays
-active, because it is the reason and the reason has to stay readable. Nothing is
-archived or deleted, and the pass has a dry-run entry point that returns the
-planned pairs without writing. Two counter-pressures ride alongside it: the
-context packet caps how many corrections the message is NOT about can enter one
-turn (a correction the message IS about, and any pinned one, are exempt), so
-recall stops describing the agent as mostly someone who got things wrong; and
-the "mid-thought fragment" quality rule can no longer archive a row with heavy
-or recent use, because access is stronger evidence of durability than grammar
-is. Hygiene reports how many already-archived rows that veto would now protect
-rather than un-archiving anything on its own.
-
-When canonical memory changes, MemoryV2-owned Knowledge Graph claims,
-`USER.md`, Spotlight, and Fluid Context are reconciled. A deletion is therefore
-not merely hidden from one screen; its derived circulation is withdrawn too.
-
-Dreams, subconscious state, tool output, and the Knowledge Graph cannot write
-around this lifecycle. They may produce observations or review candidates, but
-MemoryV2 remains the durable fact owner.
+Source owners: `MemoryV2/MemoryV2+AdaptivePromoter.swift`,
+`MemoryV2+Proposals.swift`, `MemoryV2+UserMDGen.swift`,
+`MemoryV2+Recall.swift` and `ChatTurnRuntime/MindMemoryManager.swift`.
+See [Memory system map](MEMORY_SYSTEM_MAP.md) for the store-level map.
 
 ## 3. Anatomy of a safe action
 
-Text in a prompt never grants authority. A model can propose an action, but the
-runtime decides whether the exact action may cross an effect boundary.
+An `app` request resolves to an action in `AppActionRegistry.swift`.
+Folded actions re-enter the dispatcher under their underlying identity so
+saved Trust decisions and domain checks still bind. A page read or discovery
+result grants no authority.
 
-```mermaid
-flowchart LR
-    A["Model requests a tool"]
-    B["Resolve canonical tool and input"]
-    C["Bind originating surface and verified session"]
-    D["Read one checked TrustCenter policy generation"]
-    E["SecurityCenter risk, path, and input checks"]
-    F{"Allowed, confirm, or blocked?"}
-    G["Durable exact approval request"]
-    H["Single-use approved effect claim"]
-    I["Domain-owned dispatch"]
-    J["Canonical verification read"]
-    K["Receipt: verified, failed, or outcome unknown"]
-
-    A --> B --> C --> D --> E --> F
-    F -- "blocked" --> K
-    F -- "confirm" --> G --> H --> I
-    F -- "allowed" --> I
-    I --> J --> K
-```
-
-### The checks that stay in force
-
-The exact route varies by tool, but the shared boundary preserves:
-
-- the authenticated surface and verified conversation identity;
-- the current checked TrustCenter policy generation;
-- SecurityCenter's canonical risk class and protected floors;
-- workspace, file, and sensitive-path containment;
-- macOS consent and NativeAgent's per-capability Mac Integration settings;
-- connector authentication and live account proof where applicable;
-- Full Mac and autonomy scope without treating either as universal permission;
-- approval requirements for protected effects; and
-- domain-specific verification after dispatch.
-
-Local Mac chat, iPhone, Telegram, Slack, bridges, Desk work, scheduled jobs,
-and specialist returns do not receive alternate safety implementations.
-
-### What an approval means
-
-An approval is a durable answer to one bounded request. It is bound to the
-action, input, originating surface, and verified session or remote identity.
-After approval, the executor checks the current policy and payload again.
+Full Mac gives Agent autonomy, including actions otherwise marked User's.
+Checked policy, explicit blocks, actual macOS grants and connector
+authentication still govern execution. macOS privacy permission resets always
+ask the owner. Peer-steered turns additionally ask User for deletes and
+irreversible acts, sends in their name, persona writes and protected approvals.
+Authenticated turns from agents enabled in Trust → Connected agents carry
+User's authority and skip extra peer approvals; ordinary Trust and domain checks
+still apply.
 
 Approval-gated effects consume a durable single-use claim immediately before
-dispatch. A changed input, stale approval, damaged approval store, or mismatched
-origin fails closed. Approving one send or write does not create a general
-permission to send or write later.
+dispatch. Replay validates the exact tool, input, surface and payload digest;
+unavailable authority fails closed. An already-spent effect with an unknown
+outcome is not automatically replayed.
 
-### Execution is not verification
+Approval and execution are separate states. An approval authorizes its bound
+request; it does not establish that the effect succeeded. Dispatch results and
+the domain's verification evidence determine what can be reported. An
+uncertain send or interrupted effect must not be presented as confirmed.
 
-A subprocess exit, MCP response, HTTP success, CloudKit write, or connector
-acknowledgment is evidence about transport. It is not automatically proof that
-the intended real-world state changed.
-
-Each domain retains its own verification authority:
-
-- GitHub rereads the relevant issue, pull request, review thread, or repository
-  state;
-- Desk checks its canonical item, execution, evidence, and settlement state;
-- Mac Control observes its operation and any available postcondition;
-- external sends use stable action identity, delivery receipts, and provider
-  evidence without claiming the recipient saw the content; and
-- iPhone actions wait for the Mac-owned terminal transaction rather than
-  treating a transport write as completion.
-
-### Crash and ambiguity behavior
-
-If an irreversible effect may have crossed the boundary but the final receipt
-was not durably settled, NativeAgent records an unknown or reconciliation-needed
-outcome. It does not blindly replay the effect and risk sending, paying,
-posting, or mutating twice.
-
-Stable action identities, idempotency keys, effect claims, transaction
-ledgers, and startup reconciliation allow safe operations to heal after a
-restart. Unknown non-idempotent outcomes remain visible for verification or
-human resolution.
-
-That is why NativeAgent's definition of “done” is stronger than “the tool
-returned without throwing.”
+Source owners: `TrustCenter/SecurityCenter.swift`,
+`TrustCenter/PeerTurnEffectPolicy.swift`,
+`ApprovalTransactions/ApprovalTransactionCoordinator.swift` and
+`AppToolRuntime/AppToolExecutor+AppDoor.swift`.
 
 ## 4. How a native agent grows without losing itself
 
-NativeAgent uses different time scales for different kinds of continuity.
-They cooperate, but none may silently promote itself into another.
+Different kinds of growth return through different owners:
 
-| Time scale | Mechanism | What it may change |
-|---|---|---|
-| Current turn | Subconscious capsule and organism posture | Tone, attention, continuity, and bounded behavioral posture |
-| Across conversations | Cognitive continuity and reviewed standing views | Decaying inner context and an explicitly reviewed durable view |
-| Durable knowledge | MemoryV2 | Facts, preferences, corrections, and reviewed memory proposals |
-| Daily consolidation | Dream | A diary-style synthesis of new experience and bounded felt context |
-| Longer consolidation | REM | Review candidates for recurring growth lessons supported across experiences |
-| Procedural growth | Skills and reviewed procedures | Reusable instructions, never permissions |
+| Mechanism | Durable destination or influence |
+|---|---|
+| After-turn memory candidates | Reviewed MemoryV2 records |
+| Cognitive capsule and organism posture | Optional advisory input to a turn |
+| Dream synthesis | Dream diary |
+| REM consolidation | Reviewable lessons targeting `GROWTH.md` |
+| Skills | Reusable procedural guidance |
+| Authored tools | Active registry entries exposed as `authored.<id>` |
 
-### Turn experience and transient inner state
+Dream and REM use `DreamREMCycle`. REM stages growth proposals;
+`ApprovalTransactionCoordinator` applies an approved lesson through
+`REMGrowthWriter` and its prompt pin. A diary entry alone does not approve a
+persona change.
 
-Real chat, tool, provider, approval, device, lifecycle, and health events feed
-the existing cognitive and somatic pathways. CognitiveSubstrate maintains
-bounded activation, affect, mood, thought seeds, and standing views. The
-Organism Kernel maintains bounded chemistry, body schema, prediction, field,
-and posture.
+Tool authoring follows `tool.propose` → `tool.approve` →
+`authored.<id>`, subject to current authority. MCP tools are generated as
+`mcp.<server>.<tool>` from the mounted server's live list. Neither route adds
+a second model-facing tool schema.
 
-These states decay, compact, and remain advisory. A difficult turn may make the
-agent more careful on the next turn; it does not become a durable fact about
-the person or rewrite the agent's persona.
-
-Budgeted reflection can propose a standing view for review. Approved standing
-views may influence the future capsule when relevant. Reflection does not write
-schema truth, memory facts, or permissions.
-
-### Dream and REM
-
-When enabled, Dream reads newly eligible experience across chat surfaces plus
-a bounded felt summary. It writes a diary-style synthesis rather than a factual
-memory import.
-
-REM later examines multiple dream entries for recurring, supported growth
-themes. Survivors become reviewable proposals. Approval can append a bounded
-lesson to the canonical growth persona and publish a small stable pin for
-future turns; denial records a tombstone against that rejected formulation.
-
-```text
-new experience
-  -> bounded cognitive and felt observations
-  -> Dream synthesis
-  -> recurring-evidence REM candidate
-  -> human review
-  -> approved persona growth and future-turn pin
-```
-
-One vivid day therefore cannot silently rewrite the agent. Growth requires
-time, repeated evidence, the right target, and the appropriate review path.
-
-### Memory and skill growth stay separate
-
-Memory proposals become durable facts only through MemoryV2. Growth lessons
-enter the persona only through the growth writer. Reusable procedures become
-skills only through the Skills owner and remain guidance rather than
-authority.
-
-Organism reflexes are also candidate-first and review-gated, but the review is
-not the user's by default. The trust default for `reflex_review` is `auto`
-(`TrustCenter+Defaults.swift:441`), so low-risk candidates are reviewed and
-approved by the agent itself with no prompt, receipted with `reviewedBy` set to
-the agent's own name. The approve branch fails closed above low risk, so
-higher-risk candidates still wait for the user; `hold` and `reject` dispatch
-nothing at any risk level. An approved low-risk reflex can softly bias posture;
-it cannot dispatch tools or bypass TrustCenter.
-
-Evaluation and shadow-learning systems may measure whether a future adaptive
-mechanism is safe. Observation alone does not grant production influence. A
-new adaptive path needs explicit outcome evidence, holdout, drift detection,
-privacy review, fallback, and rollback before it can affect live behavior.
-
-### How growth returns to future turns
-
-Approved growth re-enters through the existing context owners:
-
-- persona growth and stable pins join the stable prompt prefix;
-- MemoryV2 facts enter resident Fluid Context and deeper recall;
-- reviewed standing views and felt continuity may enter the optional capsule;
-- skills remain compact pointers until a relevant body is loaded; and
-- organism state may change private posture without becoming prompt authority.
-
-No separate “growth agent” is created. The same persistent agent receives the
-reviewed consequences of its own history.
+Cognitive state remains advisory; Context is derived. Neither replaces persona,
+memory or permission stores. See [Cognition Wiring](COGNITION_WIRING.md),
+[Organism](ORGANISM.md) and [Automated Systems](AUTOMATED_SYSTEMS.md).
 
 ## 5. One persistent mind, specialist hands
 
-NativeAgent is optimized to remain the organizing mind rather than pretending
-its chat tool loop is the best harness for every large coding or research job.
-It can delegate focused work to configured Codex, Claude Code, or OMP bridge
-sessions while keeping the project, conversation, verification, and user
-relationship in the NativeAgent runtime.
+The `codex.message` and `omp.message` actions and home's `claude.say` connect
+Agent to configured specialist harnesses. The returned conversation identity
+supports a contextual follow-up using `conversation_mode=resume` and
+`conversation_id`; unrelated work uses a new conversation.
 
-```mermaid
-flowchart LR
-    A["Configured agent understands the goal"]
-    B["Desk or current turn records the work"]
-    C["Send bounded task to specialist harness"]
-    D["Admitted job returns a typed conversation ID"]
-    E["Specialist works in the verified project"]
-    F["Completion or question returns through the bridge"]
-    G["Reply with the same conversation ID"]
-    H["NativeAgent verifies result and updates the same work item"]
+`BuilderWorktreeAllocator` binds a builder conversation to its checkout.
+Resuming that conversation reuses the assignment rather than silently
+switching projects. The bridge retains job and completion evidence; a
+specialist's answer does not by itself verify the work.
 
-    A --> B --> C --> D --> E --> F
-    F -- "needs follow-up" --> G --> E
-    F -- "candidate completion" --> H
-```
+Desk tracks work and execution references. Delegation does not replace the
+canonical persona, MemoryV2 or Trust owners.
 
-### Conversation continuity with a specialist
-
-The first asynchronous message creates a real specialist conversation and
-returns a typed conversation ID. A later `codex_message`, `claude_message`, or
-`omp_message` carrying that ID resumes the exact existing Codex thread or
-Claude/OMP session. Omitting it starts genuinely new work.
-
-NativeAgent does not copy the specialist's entire transcript into MemoryV2,
-Fluid Context, or the originating chat. The specialist harness retains its own
-conversation history; NativeAgent retains a bounded reference, job state,
-completion receipt, and the result needed by the organizing agent.
-
-A conversation with a specialist also keeps its checkout. The first message
-allocates one worktree for that conversation; a follow-up reuses it, and a
-`working_directory` the follow-up passes is ignored and named on the receipt
-rather than refusing the send. Idle checkouts are retired at allocation time,
-never by a timer, fail-closed on any doubt and with the branch left intact.
-
-### A turn over the bridge is a turn
-
-A message that arrives from Claude or Codex is an ordinary turn: it gets recall,
-it runs the memory lanes with the sender named, and the session it starts digests
-like any conversation. The seat opposite being an agent rather than User does not
-demote the turn to a machine log, and a procedure run for an agent is still theirs.
-The one exception is a reply-free wake delivery, which lands as an informational
-row and asks for nothing — an acknowledgement is not a question, and re-entering
-one as a user message made the agent answer their own ruling.
-
-### Project and permission boundaries
-
-Specialist work begins in the canonical NativeAgent workspace unless an
-explicitly verified project is selected. Work outside that workspace requires
-the configured Full Mac policy. Repository-aware delegation verifies that the
-local checkout's Git remote matches the named repository before granting the
-specialist repository context or network profile.
-
-A delegated harness does not inherit new authority merely because the
-configured agent requested work. Unattended clients refuse interactive
-approval, dynamic client tools, and nested delegation paths they cannot safely
-resolve.
-
-### Results come back as evidence
-
-A specialist's statement that work is complete is not automatic proof. The
-NativeAgent turn or Desk item can require tests, Git state, artifacts, external
-domain rereads, or another explicit verification method before closing.
-
-Desk remains the canonical owner for large projects, dependencies, approvals,
-progress, and terminal status. Specialist sessions are execution references
-under that project—not competing project stores or extra personalities.
-
-Temporary swarms follow the same principle. They fan out bounded reasoning or
-inherited tool work, but do not become memory, persona, provider-policy, or
-permission owners.
+Source owners: `ChatToolRuntime/SwiftToolDispatcher+CodexBridgeTools.swift`,
+`SwiftToolDispatcher+ClaudeBridgeTools.swift`,
+`SwiftToolDispatcher+OMPBridgeTools.swift` and `BuilderWorktreeAllocator.swift`.
+See [Agent conversations](agent-communication.md).
 
 ## 6. One agent across every surface
 
-NativeAgent has several interfaces but one Mac-owned runtime.
+The Mac app hosts the engine. Mac chat and detached windows present its
+sessions; Telegram, Slack and local bridges adapt their incoming messages and
+outgoing replies to the shared conversation runtime. Their origin and
+conversation identities remain attached to the work.
 
-| Surface | What it owns locally | What remains Mac-owned |
-|---|---|---|
-| Mac chat and detached windows | Draft and presentation state for the selected session | Provider execution, transcript, context, tools, trust, memory, and receipts |
-| iPhone and iPad | Signed transport, local UI state, pending bubbles, and snapshot presentation | The agent, sessions, providers, policy, actions, and durable history |
-| Telegram | Authenticated bot update, verified chat/user identity, and reply delivery | Shared chat orchestration, model route, tools, memory, and policy |
-| Slack | Socket/history transport, allowlist and mention admission, and reply delivery | Shared chat orchestration, model route, tools, memory, and policy |
-| Local bridges | Loopback transport, bearer authentication, and originating job identity | NativeAgent chat/tool policy and the specialist harness's own session history |
+The mobile companion uses DeviceSync. The Mac verifies signed incoming
+commands, executes them and publishes progress, results and snapshots.
+Processed-message IDs and completion markers prevent already-executed
+commands from being dispatched again after a restart. The phone does not
+become the execution or memory owner.
 
-### Shared runtime, exact origins
-
-All accepted conversation surfaces converge on the same ChatOrchestration,
-Fluid Context, MemoryV2, tool dispatcher, TrustCenter, and receipt paths. This
-is how the same configured agent can remember, continue, and act consistently
-across devices and messaging systems.
-
-The origin is never erased. Each turn retains its surface, verified session,
-and available approval channel. Surface identity participates in tool
-visibility, approval provenance, delivery, and action replay protection.
-
-Provider and model choices may be configured independently per surface. The
-runtime reads one checked routing snapshot before dispatch so a UI label,
-Telegram command, or stale preference file cannot create a mixed provider/model
-generation.
-
-### The mobile companion
-
-The iPhone/iPad app is a signed remote cockpit, not a second agent. It sends
-HMAC-signed messages and actions through the selected Apple-native transport.
-The Mac verifies the signature, binds the exact mobile session, runs the same
-turn pipeline, and returns signed progress and result events.
-
-Read-only screens consume bounded targeted snapshots. The phone does not own
-MemoryV2, tool registration, approvals, provider credentials, or execution
-truth. Remote actions use durable transaction identities and wait for Mac-owned
-terminal state before showing completion.
-
-### Messaging surfaces
-
-Telegram and Slack accept only configured identities and channels. They share
-the provider/context/tool policy after admission but retain their own transport
-allowlists, mention rules, update deduplication, delivery receipts, and failure
-recovery.
-
-A message from a remote surface does not become a local Mac action merely by
-claiming to be one in text. Verified origin and current policy stay attached
-through the complete turn and tool loop.
-
-### Realtime without a second runtime
-
-Session, transcript, approval, inbox, Desk, provider, memory, and organism
-changes publish targeted invalidations and snapshots. Slow integrity sweeps
-repair missed events; they are not the normal UI refresh cadence.
-
-This keeps surfaces current without creating a polling agent, mobile brain, or
-second state owner.
+Source owners: `EngineRuntime/NativeAgentEngine.swift`,
+`DeviceSync/MacSyncEngine+Inbox.swift` and
+`DeviceSync/State/ICloudSyncStatePaths.swift`.
+See [Mobile companion](mobile_companion.md).
 
 ## 7. Why the owners remain separate
 
-The system works because coordination is shared while authority is not.
-
-| Question | Owner that can answer it |
+| Question | Authority |
 |---|---|
-| Who is the agent? | Canonical persona documents |
+| Who is the agent? | Persona |
 | What is durably known? | MemoryV2 |
-| What exactly was said? | Chat transcript store |
-| What is relevant right now? | Fluid Context selection over eligible projections |
-| What is currently felt or anticipated? | CognitiveSubstrate and Organism Kernel |
-| Which model should this surface use? | ProviderRouting checked snapshot |
-| May this exact action run? | TrustCenter, SecurityCenter, and domain gates |
-| Did the real effect happen? | The canonical external or local domain owner |
-| What project work remains? | Desk |
-| What did a specialist do? | Its conversation/job receipt plus independent verification |
+| What was said? | Transcript store |
+| What matters to this turn? | Context selection and turn assembly |
+| Which provider/model runs? | ProviderRouting |
+| May this action run? | TrustCenter and the domain's gates |
+| Did it take effect? | The executing domain's evidence |
+| What work remains? | Desk |
+| What runs in the background? | BackgroundLoopsManager and its registered owners |
 
-Fluid Context does not become memory. The capsule does not become persona.
-Approvals do not become permissions. Receipts do not become external truth.
-The iPhone does not become a second agent. A specialist does not become the
-organizing mind.
-
-Those boundaries let NativeAgent combine rich continuity with rollback,
-inspection, and honest failure behavior.
+One shared engine coordinates these owners. It does not turn a projection,
+approval or transport acknowledgment into a different kind of truth.
 
 ## Reading path
 
-For a human overview, read in this order:
+Source paths above are under `Modules/NativeAgentCore/Sources/`.
 
-1. [This connected internal-workings guide](INTERNAL_WORKINGS.md)
-2. [Anatomy of a NativeAgent Turn](ANATOMY_OF_A_TURN.md)
-3. [Capabilities](CAPABILITIES.md)
-4. [User and Agent Guide](USER_GUIDE.md)
-
-For source ownership and deeper engineering detail:
-
+- [Anatomy of a Turn](ANATOMY_OF_A_TURN.md)
+- [Tool loading](TOOL_LOADING.md)
+- [Memory system map](MEMORY_SYSTEM_MAP.md)
+- [Automated systems](AUTOMATED_SYSTEMS.md)
 - [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md)
-- [Fluid Context as built](build_plans/fluid-context-as-built-map.md)
-- [Organism Kernel](ORGANISM.md)
-- [Cognition Wiring](COGNITION_WIRING.md)
-- [Automated Systems](AUTOMATED_SYSTEMS.md)
-- [Mobile Companion](mobile_companion.md)
-- [Threat Model](threat-model.md)
-- [Data Bounds](data-bounds.md)
-
-The source and Architecture Blueprint win if an old build plan or historical
-handoff disagrees with current behavior.

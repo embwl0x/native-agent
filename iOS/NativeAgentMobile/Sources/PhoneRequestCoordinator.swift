@@ -113,7 +113,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
     }
 
     func accept(_ message: BridgeMessage, secret: Data) async -> Bool {
-        var refusedRequest: PhoneRequest?
+        var validRequest = false
         do {
             let request = try JSONDecoder().decode(PhoneRequest.self, from: Data(message.text.utf8))
             guard request.id == message.id, request.params.isEmpty,
@@ -123,7 +123,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
                 NSLog("[PhoneRequest] Dropping invalid request %@", message.id)
                 return true
             }
-            refusedRequest = request
+            validRequest = true
             try load()
             expireObsolete(pairing: pairing)
             try save()
@@ -138,21 +138,10 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
             return true
         } catch {
             errorMessage = "Could not accept phone request: \(error.localizedDescription)"
-            NSLog("[PhoneRequest] Dropping unaccepted request %@: %@", message.id, error.localizedDescription)
-            if let request = refusedRequest {
-                Task {
-                    guard AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests)
-                            == AgentNameCache.fingerprint(secret) else { return }
-                    do {
-                        let result = PhoneRequestResult(requestID: request.id, status: .denied,
-                            message: "The phone could not accept this request.")
-                        _ = try await iCloudBridge.shared.sendChatMessage(id: "phone-result-\(request.id)",
-                            text: String(decoding: try JSONEncoder().encode(result), as: UTF8.self),
-                            correlationID: request.id, metadata: ["kind": PhoneRequestResult.messageKind])
-                    } catch { NSLog("[PhoneRequest] Could not publish refusal: %@", error.localizedDescription) }
-                }
-            }
-            return true
+            NSLog("[PhoneRequest] Could not accept request %@: %@", message.id, error.localizedDescription)
+            // Malformed requests are terminal; valid requests remain eligible
+            // for transport redelivery until acceptance is durable.
+            return !validRequest
         }
     }
 
@@ -325,7 +314,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
             guard let data = try await item.loadTransferable(type: Data.self) else {
                 throw DeviceSyncError.underlying(message: "The selected photo could not be read.")
             }
-            await finishPhoto(data, request: request)
+            await finishPhoto(.data(data), request: request)
         } catch { await complete(request.id, status: .failed, message: error.localizedDescription) }
     }
 
@@ -343,22 +332,42 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
         return active?.id == request.id && request.expiresAt > Date()
     }
 
-    func finishPhoto(_ data: Data, request: PhoneRequest) async {
+    enum PhotoSource: Sendable {
+        case data(Data)
+        case image(UIImage)
+    }
+
+    func finishPhoto(_ photo: PhotoSource, request: PhoneRequest) async {
         do {
-            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-                  let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                    kCGImageSourceCreateThumbnailFromImageAlways: true,
-                    kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: 1280
-                  ] as CFDictionary),
-                  let jpeg = UIImage(cgImage: image).jpegData(compressionQuality: 0.7) else {
-                throw DeviceSyncError.underlying(message: "The selected photo could not be read.")
-            }
-            guard jpeg.count <= 450_000 else {
-                throw DeviceSyncError.payloadTooLarge(actualBytes: jpeg.count, maximumBytes: 450_000)
-            }
-            await complete(request.id, status: .completed, attachments: [MultimodalAttachment(
-                type: "image", base64: jpeg.base64EncodedString(), mime: "image/jpeg", name: "phone-photo.jpg", byteSize: jpeg.count)])
+            let attachment = try await Task.detached(priority: .userInitiated) {
+                let image: UIImage
+                switch photo {
+                case .data(let data):
+                    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                          let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                            kCGImageSourceCreateThumbnailFromImageAlways: true,
+                            kCGImageSourceCreateThumbnailWithTransform: true,
+                            kCGImageSourceThumbnailMaxPixelSize: 1280
+                          ] as CFDictionary) else {
+                        throw DeviceSyncError.underlying(message: "The selected photo could not be read.")
+                    }
+                    image = UIImage(cgImage: thumbnail)
+                case .image(let captured):
+                    guard let thumbnail = captured.preparingThumbnail(of: CGSize(width: 1280, height: 1280)) else {
+                        throw DeviceSyncError.underlying(message: "The captured photo could not be read.")
+                    }
+                    image = thumbnail
+                }
+                guard let jpeg = image.jpegData(compressionQuality: 0.7) else {
+                    throw DeviceSyncError.underlying(message: "The selected photo could not be read.")
+                }
+                guard jpeg.count <= 450_000 else {
+                    throw DeviceSyncError.payloadTooLarge(actualBytes: jpeg.count, maximumBytes: 450_000)
+                }
+                return MultimodalAttachment(
+                    type: "image", base64: jpeg.base64EncodedString(), mime: "image/jpeg", name: "phone-photo.jpg", byteSize: jpeg.count)
+            }.value
+            await complete(request.id, status: .completed, attachments: [attachment])
         } catch { await complete(request.id, status: .failed, message: error.localizedDescription) }
     }
 }
@@ -420,11 +429,7 @@ struct PhoneRequestSheet: View {
                 camera = false
                 Task {
                     guard let image else { await coordinator.complete(request.id, status: .cancelled); return }
-                    guard let data = image.jpegData(compressionQuality: 0.9) else {
-                        await coordinator.complete(request.id, status: .failed, message: "The captured photo could not be read.")
-                        return
-                    }
-                    await coordinator.finishPhoto(data, request: request)
+                    await coordinator.finishPhoto(.image(image), request: request)
                 }
             }.ignoresSafeArea()
         }

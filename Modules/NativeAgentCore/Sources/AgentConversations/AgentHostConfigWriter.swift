@@ -24,6 +24,8 @@ public enum AgentHostConfigWriter {
         case tooLarge
         case backupFailed
         case writeFailed
+        case cleanupFailed
+        case rollbackFailed(String)
         case changedUnderneath
 
         public var errorDescription: String? {
@@ -35,6 +37,8 @@ public enum AgentHostConfigWriter {
             case .tooLarge: return "The configuration file exceeds the bounded size this writer will edit. Nothing was changed."
             case .backupFailed: return "A timestamped backup could not be written beside the configuration file, so the file was left untouched."
             case .writeFailed: return "The configuration file could not be replaced atomically. Nothing was changed."
+            case .cleanupFailed: return "The configuration was saved, but its previous file could not be removed."
+            case .rollbackFailed(let path): return "The settings changed during replacement and could not be restored safely. The displaced file was preserved at \(path); review both files before retrying."
             }
         }
     }
@@ -60,6 +64,56 @@ public enum AgentHostConfigWriter {
     }
 
     // MARK: - The two formats
+
+    static func writeEnvironment(path: String, descriptorPath: String, peerID: String, secret: String) throws -> Outcome {
+        let directory = URL(fileURLWithPath: path).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        // Create-exclusive and 0600 from the first byte; never replace an existing file.
+        try replaceAtomically(path: path, data: environmentData(descriptorPath: descriptorPath, peerID: peerID, secret: secret), unchangedSince: nil)
+        return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
+    }
+
+    static func ensureEnvironment(path: String, descriptorPath: String, peerID: String, secret: String) throws -> Bool {
+        var info = stat()
+        if lstat(path, &info) != 0, errno == ENOENT {
+            _ = try writeEnvironment(path: path, descriptorPath: descriptorPath, peerID: peerID, secret: secret)
+            return true
+        }
+        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid() else {
+            throw Failure.unreadable("it is not a regular file owned by you")
+        }
+        let identity = FileIdentity(info)
+        let expected = environmentData(descriptorPath: descriptorPath, peerID: peerID, secret: secret)
+        let (current, readIdentity) = try read(path: path)
+        guard readIdentity == identity else { throw Failure.changedUnderneath }
+        if info.st_mode & 0o7777 == 0o600 {
+            if current == expected { return false }
+        }
+        try replaceAtomically(path: path, data: expected, unchangedSince: identity, original: current)
+        return true
+    }
+
+    private static func environmentData(descriptorPath: String, peerID: String, secret: String) -> Data {
+        let values = [(AgentHostDirectory.bridgeDescriptorVariable, descriptorPath),
+                      (AgentHostDirectory.peerIDVariable, peerID), (AgentHostDirectory.peerSecretVariable, secret)]
+        return Data((values.map { $0.0 + "=" + AgentHostDirectory.shellQuoted($0.1) }.joined(separator: "\n") + "\n").utf8)
+    }
+
+    static func removeEnvironment(path: String, peerID: String) throws -> Outcome {
+        var info = stat()
+        if lstat(path, &info) != 0, errno == ENOENT {
+            return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: true)
+        }
+        let (data, identity) = try read(path: path)
+        let ownership = AgentHostDirectory.peerIDVariable + "=" + AgentHostDirectory.shellQuoted(peerID)
+        guard String(decoding: data, as: UTF8.self).split(separator: "\n").contains(Substring(ownership)),
+              lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG, FileIdentity(info) == identity else {
+            throw Failure.changedUnderneath
+        }
+        try FileManager.default.removeItem(atPath: path)
+        return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: true)
+    }
 
     /// Only this connection's two conversation tools, never an MCP wildcard.
     static func antigravityMessagingRules(server: String) throws -> [String] {
@@ -291,20 +345,20 @@ public enum AgentHostConfigWriter {
                 // Both versions belong to the host. Keep both files and splice
                 // only our entry out of the displaced version as well.
                 if let fresh = try splice(current) {
-                    try replaceAtomically(path: claimed, data: fresh.data, unchangedSince: currentIdentity)
+                    try replaceAtomically(path: claimed, data: fresh.data, unchangedSince: currentIdentity, original: current)
                 }
             }
             var now = stat()
             if lstat(path, &now) == 0 {
                 let (latest, latestIdentity) = try read(path: path)
                 if let fresh = try splice(latest) {
-                    try replaceAtomically(path: path, data: fresh.data, unchangedSince: latestIdentity)
+                    try replaceAtomically(path: path, data: fresh.data, unchangedSince: latestIdentity, original: latest)
                 }
             } else if errno != ENOENT {
                 throw Failure.writeFailed
             }
         } else {
-            try replaceAtomically(path: path, data: result.data, unchangedSince: identity)
+            try replaceAtomically(path: path, data: result.data, unchangedSince: identity, original: existing)
         }
         if removing && cleanupBackups { try removeBackups(path: path, recordURL: backupRecordURL) }
         return Outcome(path: path, backupPath: removing ? nil : backup,
@@ -447,7 +501,7 @@ public enum AgentHostConfigWriter {
         try saveBackupRecords(records.filter { $0.path == keeping }, at: recordURL)
     }
 
-    private static func replaceAtomically(path: String, data: Data, unchangedSince identity: FileIdentity?) throws {
+    private static func replaceAtomically(path: String, data: Data, unchangedSince identity: FileIdentity?, original: Data? = nil) throws {
         concurrentSaveHookForTests?()
         var now = stat()
         let status = lstat(path, &now)
@@ -455,14 +509,45 @@ public enum AgentHostConfigWriter {
                 : (status == 0 && now.st_mode & S_IFMT == S_IFREG && FileIdentity(now) == identity) else {
             throw Failure.changedUnderneath
         }
-        let temporary = path + ".nativeagent-tmp-\(getpid())"
+        let temporary = path + ".nativeagent-tmp-" + UUID().uuidString
         guard write(data, to: temporary) else { throw Failure.writeFailed }
-        // A new destination must never replace a file another app just created.
-        let replaced = identity == nil ? Darwin.link(temporary, path) : rename(temporary, path)
-        if identity == nil { _ = Darwin.unlink(temporary) }
-        guard replaced == 0 else {
-            _ = temporary.withCString { Darwin.unlink($0) }
-            throw Failure.writeFailed
+        var removeTemporary = true
+        defer { if removeTemporary { _ = Darwin.unlink(temporary) } }
+        guard let identity else {
+            // A new destination must never replace a file another app just created.
+            guard Darwin.link(temporary, path) == 0 else { throw Failure.changedUnderneath }
+            return
+        }
+        // Swap keeps the host pathname present, including across a crash.
+        // The displaced file stays beside it until validation or rollback.
+        let (_, replacementIdentity) = try read(path: temporary)
+        let (beforeSwap, beforeSwapIdentity) = try read(path: path)
+        guard beforeSwapIdentity == identity, original == nil || beforeSwap == original else { throw Failure.changedUnderneath }
+        guard renamex_np(temporary, path, UInt32(RENAME_SWAP)) == 0 else { throw Failure.changedUnderneath }
+        removeTemporary = false
+        do {
+            let (current, currentIdentity) = try read(path: temporary)
+            guard currentIdentity == identity, original == nil || current == original else { throw Failure.changedUnderneath }
+        } catch {
+            // Check before and after rollback; a host can save between them.
+            // A collision retains both versions for explicit recovery.
+            guard let (published, publishedIdentity) = try? read(path: path),
+                  publishedIdentity == replacementIdentity, published == data,
+                  renamex_np(temporary, path, UInt32(RENAME_SWAP)) == 0 else {
+                throw Failure.rollbackFailed(temporary)
+            }
+            guard let (rolledBack, rolledBackIdentity) = try? read(path: temporary),
+                  rolledBackIdentity == replacementIdentity, rolledBack == data else {
+                // Restore the detected newer save with one compensating swap.
+                // Even if another save races this swap, delete neither version.
+                _ = renamex_np(temporary, path, UInt32(RENAME_SWAP))
+                throw Failure.rollbackFailed(temporary)
+            }
+            removeTemporary = true
+            throw error
+        }
+        guard Darwin.unlink(temporary) == 0 else {
+            throw Failure.cleanupFailed
         }
     }
 
@@ -528,6 +613,10 @@ enum JSONEntrySplice {
         -> (data: Data, replaced: Bool, removed: Bool)? {
         let bytes = try validatedBytes(data, comments: comments, trailingCommas: trailingCommas)
         _ = try validatedBytes(Data((fragment ? "{\"value\":" + entryJSON + "}" : entryJSON).utf8), comments: comments, trailingCommas: trailingCommas)
+        func validated(_ output: Data, replaced: Bool) throws -> (data: Data, replaced: Bool, removed: Bool) {
+            _ = try validatedBytes(output, comments: comments, trailingCommas: trailingCommas)
+            return (output, replaced, false)
+        }
         let original = [UInt8](data)
         let root = try members(bytes, from: try objectStart(bytes))
         guard let container = try unique(root.members, named: containerKey, called: "section") else {
@@ -536,7 +625,7 @@ enum JSONEntrySplice {
             let indent = indentation(bytes, memberStart: root.members.first?.start)
             let member = originalMember ?? (quoted(name) + ": " + reindented(entryJSON, by: indent + indent))
             let body = "\"\(containerKey)\": {\n\(indent)\(indent)" + member + "\n\(indent)}"
-            return (insertMember(original, into: root, text: body, indent: indent), false, false)
+            return try validated(insertMember(original, into: root, text: body, indent: indent), replaced: false)
         }
         let valueStart = try valueOffset(bytes, member: container)
         guard bytes[valueStart] == UInt8(ascii: "{") else {
@@ -546,10 +635,10 @@ enum JSONEntrySplice {
         let indent = indentation(bytes, memberStart: inner.members.first?.start)
         if let existing = try unique(inner.members, named: name, called: "server") {
             let replacement = originalMember ?? (quoted(name) + ": " + reindented(entryJSON, by: indent))
-            return (splice(original, range: existing.start..<existing.end, with: replacement), true, false)
+            return try validated(splice(original, range: existing.start..<existing.end, with: replacement), replaced: true)
         }
         let body = originalMember ?? (quoted(name) + ": " + reindented(entryJSON, by: indent))
-        return (insertMember(original, into: inner, text: body, indent: indent), false, false)
+        return try validated(insertMember(original, into: inner, text: body, indent: indent), replaced: false)
     }
 
     static func remove(_ data: Data, name: String, containerKey: String = "mcpServers", comments: Bool = false, trailingCommas: Bool = true) throws
@@ -561,7 +650,10 @@ enum JSONEntrySplice {
         guard bytes[valueStart] == UInt8(ascii: "{") else { return nil }
         let inner = try members(bytes, from: valueStart)
         guard let existing = try unique(inner.members, named: name, called: "server") else { return nil }
-        return (splice([UInt8](data), range: deletionRange(bytes, of: existing, in: inner), with: ""), false, true)
+        let separators = try validatedBytes(data, comments: comments, trailingCommas: trailingCommas, preservingTrailingCommas: true)
+        let output = splice([UInt8](data), range: deletionRange(separators, of: existing, in: inner), with: "")
+        _ = try validatedBytes(output, comments: comments, trailingCommas: trailingCommas)
+        return (output, false, true)
     }
 
     static func entry(_ data: Data, name: String, containerKey: String, comments: Bool,
@@ -582,6 +674,7 @@ enum JSONEntrySplice {
                            containerKey: String, comments: Bool, trailingCommas: Bool) throws
         -> (data: Data, replaced: Bool, removed: Bool)? {
         let bytes = try validatedBytes(data, comments: comments, trailingCommas: trailingCommas)
+        let separators = try validatedBytes(data, comments: comments, trailingCommas: trailingCommas, preservingTrailingCommas: true)
         var ranges: [Range<Int>] = []
         func walk(_ start: Int) throws {
             if bytes[start] == 123 {
@@ -593,7 +686,7 @@ enum JSONEntrySplice {
                     let env = object?["env"] as? [String: Any]
                     if object?["command"] as? String == owner.command,
                        env?[AgentHostDirectory.peerIDVariable] as? String == owner.peerID {
-                        ranges.append(deletionRange(bytes, of: member, in: scan))
+                        ranges.append(deletionRange(separators, of: member, in: scan))
                     } else { try walk(value) }
                 }
             } else if bytes[start] == 91 {
@@ -630,6 +723,7 @@ enum JSONEntrySplice {
                     originalMember: owner.originalMember)!.data
             }
         }
+        _ = try validatedBytes(output, comments: comments, trailingCommas: trailingCommas)
         return output == data ? nil : (output, false, !ranges.isEmpty)
     }
 
@@ -637,7 +731,8 @@ enum JSONEntrySplice {
 
     /// Mask JSONC trivia with spaces, keeping every byte offset into the original.
     /// Foundation validates the entire document, including nested values and EOF.
-    static func validatedBytes(_ data: Data, comments: Bool, trailingCommas: Bool = true) throws -> [UInt8] {
+    static func validatedBytes(_ data: Data, comments: Bool, trailingCommas: Bool = true,
+                               preservingTrailingCommas: Bool = false) throws -> [UInt8] {
         var bytes = [UInt8](data)
         guard String(data: data, encoding: .utf8) != nil else {
             throw AgentHostConfigWriter.Failure.unparsable("the file is not valid text")
@@ -662,6 +757,7 @@ enum JSONEntrySplice {
                 } else { i += 1 }
             }
         }
+        let withoutComments = bytes
         var i = 0
         while i < bytes.count {
             if bytes[i] == 34 { _ = try string(bytes, &i); continue }
@@ -683,7 +779,7 @@ enum JSONEntrySplice {
         guard (try? JSONSerialization.jsonObject(with: Data(bytes))) is [String: Any] else {
             throw AgentHostConfigWriter.Failure.unparsable("the settings are not a complete object")
         }
-        return bytes
+        return preservingTrailingCommas ? withoutComments : bytes
     }
 
     private static func objectStart(_ bytes: [UInt8]) throws -> Int {
@@ -829,6 +925,11 @@ enum JSONEntrySplice {
             // First of several: take up to the start of the next member.
             return member.start..<scan.members[1].start
         }
+        var end = member.end
+        skipWhitespace(bytes, &end)
+        if end < scan.close, bytes[end] == UInt8(ascii: ",") {
+            return member.start..<(end + 1)
+        }
         return member.start..<member.end
     }
 
@@ -898,7 +999,7 @@ enum TOMLEntrySplice {
         var values: [String: String] = [:]
         for raw in block.components(separatedBy: .newlines) {
             let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("[") { section = line; continue }
+            if let header = try tableHeader(in: line) { section = header; continue }
             guard let equal = line.firstIndex(of: "=") else { continue }
             let key = line[..<equal].trimmingCharacters(in: .whitespaces)
             let wanted = (section == "[mcp_servers.\(name)]" && key == "command")
@@ -928,8 +1029,8 @@ enum TOMLEntrySplice {
         let text = try readable(data)
         var names = Set<String>()
         for raw in text.components(separatedBy: .newlines) {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("[mcp_servers."), line.hasSuffix("]") else { continue }
+            guard let line = try tableHeader(in: raw.trimmingCharacters(in: .whitespaces)),
+                  line.hasPrefix("[mcp_servers.") else { continue }
             let name = String(line.dropFirst("[mcp_servers.".count).dropLast())
             guard !name.contains(".") else { continue }
             guard name.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil else {
@@ -1031,12 +1132,13 @@ enum TOMLEntrySplice {
         while cursor < text.endIndex {
             let lineEnd = text[cursor...].firstIndex(of: "\n").map { text.index(after: $0) } ?? text.endIndex
             let line = text[cursor..<lineEnd].trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.hasPrefix("[") {
-                guard line.hasSuffix("]") else {
-                    throw AgentHostConfigWriter.Failure.unparsable("a table header is malformed")
-                }
+            if let line = try tableHeader(in: line) {
                 try rejectEquivalentSpelling(line, name: name)
                 let isOurs = line == header || line.hasPrefix(nested)
+                guard !isOurs || end == text.endIndex else {
+                    throw AgentHostConfigWriter.Failure.unparsable(
+                        "this app's table has a subtable after an unrelated table; keep its tables together before editing")
+                }
                 if line == header { blocks += 1 }
                 if isOurs, start == nil { start = cursor }
                 if !isOurs, start != nil, end == text.endIndex { end = cursor }
@@ -1053,6 +1155,16 @@ enum TOMLEntrySplice {
         }
         guard let start else { return nil }
         return start..<end
+    }
+
+    // Parse only the header; splice ranges still refer to the untouched text.
+    private static func tableHeader(in line: String) throws -> String? {
+        guard line.hasPrefix("[") else { return nil }
+        let pattern = #"^\[(?:[^\"'#]|\"(?:[^\"\\]|\\.)*\"|'[^']*')*\](?=\s*(?:#.*)?$)"#
+        guard let match = line.range(of: pattern, options: .regularExpression) else {
+            throw AgentHostConfigWriter.Failure.unparsable("a table header is malformed")
+        }
+        return String(line[match])
     }
 
     /// TOML basic-string escaping for a value this app puts in the file.

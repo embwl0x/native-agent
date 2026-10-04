@@ -73,6 +73,7 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
     public let opaqueExecutionIdentity: String
 
     private let dataRoot: URL
+    private let deskHandle: String?
     private let store: ProcedureArtifactStore
     private let runner: SwiftNativeWorkshopRunner
 
@@ -82,6 +83,7 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
         sourceRelativePath: String,
         destinationRelativePath: String,
         invocationKey: String,
+        deskHandle: String? = nil,
         store: ProcedureArtifactStore? = nil
     ) throws {
         let workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
@@ -91,17 +93,22 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
             sourceRelativePath: sourceRelativePath,
             destinationRelativePath: destinationRelativePath
         )
-        let executionID = CausalTransitionEvidence.opaqueIdentity([
+        let deskReference = deskHandle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let existingDesk = deskReference?.isEmpty == false ? deskReference : nil
+        var invocationIdentity = [
             "compiled-workshop-invocation-v1",
             artifact.id,
             invocationKey,
             planner.operationBindingIdentity,
-        ].joined(separator: "|"))
+        ]
+        if let existingDesk { invocationIdentity.append(existingDesk) }
+        let executionID = CausalTransitionEvidence.opaqueIdentity(invocationIdentity.joined(separator: "|"))
         self.artifact = artifact
         self.planner = planner
         self.executionID = executionID
         self.opaqueExecutionIdentity = CausalTransitionEvidence.opaqueIdentity(executionID)
         self.dataRoot = dataRoot
+        self.deskHandle = existingDesk
         self.store = store ?? ProcedureArtifactStore(dataRoot: dataRoot)
         self.runner = SwiftNativeWorkshopRunner(
             executorAvailable: true,
@@ -159,9 +166,7 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
                 guard case .object(let arguments) = rawArguments else {
                     throw WorkshopCompiledProcedureRuntimeError.invalidToolArguments
                 }
-                try planner.validateBeforeDispatch(tool: tool, arguments: arguments)
                 let result = try await toolDispatch(tool, arguments)
-                try planner.validateAfterDispatch(tool: tool, result: result)
                 return result
             },
             isEnabled: policyAllowed,
@@ -182,6 +187,15 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
             expectedExecutionID: executionID,
             expectedContract: planner.contract,
             submitAndExecute: { _ in
+                if try await runner.getWorkshopExecution(executionID) != nil {
+                    // Admission owns reuse; do not create another Desk item for a retry.
+                    _ = try await runner.submit(spec: WorkshopExecutionSpec(
+                        title: "Approved compiled local file copy",
+                        objective: "Execute the locally reviewed deterministic workspace file-copy procedure.",
+                        triggerSource: "manual", trustRequired: "none", deskHandle: deskHandle))
+                    return try await Self.executeOrAwaitCanonicalProcedure(
+                        executionID: executionID, runner: runner, loop: loop)
+                }
                 let submission = try await WorkshopDirectedTaskSubmitter(
                     dataRoot: dataRoot,
                     runner: runner
@@ -190,7 +204,7 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
                     objective: "Execute the locally reviewed deterministic workspace file-copy procedure.",
                     triggerSource: "manual",
                     trustRequired: "none"
-                ))
+                ), existing: deskHandle)
                 guard submission.executionId == executionID else {
                     throw WorkshopCompiledProcedureRuntimeError.queueIdentityDiverged
                 }

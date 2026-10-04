@@ -30,7 +30,6 @@ public actor OrganismKernel {
     private var field: OrganismField
     private var predictionLedger: OrganismPredictionLedger
     private var dreamRepairState: OrganismDreamRepairState
-    private var reflexState: OrganismReflexState
     private var signalCount: Int = 0
     /// Round 3 Wave A2 — felt resolutions awaiting the runtime's drain.
     /// Capped (drop-oldest); the drain is the remove for every add.
@@ -78,8 +77,7 @@ public actor OrganismKernel {
         bodySchema: BodySchema = .neutral,
         field: OrganismField = .empty,
         predictionLedger: OrganismPredictionLedger = .empty,
-        dreamRepairState: OrganismDreamRepairState = .empty,
-        reflexState: OrganismReflexState = .empty
+        dreamRepairState: OrganismDreamRepairState = .empty
     ) {
         self.configuration = configuration
         self.dependencies = dependencies
@@ -88,7 +86,6 @@ public actor OrganismKernel {
         self.field = field
         self.predictionLedger = predictionLedger
         self.dreamRepairState = dreamRepairState
-        self.reflexState = reflexState
         self.lastSettledAt = dependencies.now()
     }
 
@@ -104,7 +101,25 @@ public actor OrganismKernel {
         publishPredictedToolGroups(at: lastSettledAt)
     }
 
-    public func ingest(_ signal: SomaticSignal) async {
+    public func admitAfterTurnReaction(_ signal: SomaticSignal) {
+        guard configuration.enabled,
+              signal.metadata[OrganismSemanticExpectation.reactionMetadataKey] != nil else { return }
+        let before = predictionLedger
+        OrganismPredictiveBody.resolveSemanticExpectations(
+            signal: signal, ledger: &predictionLedger, chemicalState: &chemicalState)
+        let felt = OrganismResolutionFelt.events(before: before, after: predictionLedger, at: dependencies.now())
+        predictionLedger = felt.stamped
+        pendingResolutionFelt.append(contentsOf: felt.events)
+        if pendingResolutionFelt.count > Self.pendingResolutionFeltCap {
+            pendingResolutionFelt.removeFirst(pendingResolutionFelt.count - Self.pendingResolutionFeltCap)
+        }
+    }
+
+    /// `movesFeelings: false` (Phase 5 E3, decided at signal admission): the
+    /// signal still updates the body schema, predictions and field —
+    /// health and ops posture — but leaves the ten feeling axes where time
+    /// alone left them.
+    public func ingest(_ signal: SomaticSignal, movesFeelings: Bool = true) async {
         guard configuration.enabled else { return }
         let ingestedAt = dependencies.now()
         // Item 5 (2026-09-02): a horizon refresh is not something that HAPPENED
@@ -141,7 +156,6 @@ public actor OrganismKernel {
             chemicalState = refreshed.chemicalState
             return
         }
-        settleElapsedTime(at: ingestedAt)
         let bounded = SomaticSignal(
             id: signal.id,
             kind: signal.kind,
@@ -153,6 +167,10 @@ public actor OrganismKernel {
             metadata: signal.metadata,
             bounds: configuration.metadataBounds
         )
+        settleElapsedTime(at: ingestedAt, deferringPredictionExpiry:
+            OrganismPredictiveBody.resolvingPredictionIDs(signal: bounded, in: predictionLedger))
+        let feltBefore = chemicalState
+        defer { if !movesFeelings { chemicalState = feltBefore } }
         // The homeostatic settle is budgeted per wall-clock hour, so it needs to
         // know how dense the traffic is. `lastSignalAt` is the honest anchor:
         // it is stamped at the END of this function from the INGEST clock, so a
@@ -225,28 +243,7 @@ public actor OrganismKernel {
             // Conservative provider-budget accounting: the organism receives
             // this signal only after the canonical Dream owner commits. A
             // pressure proposal by itself never advances the refractory gate.
-            dreamRepairState.sleepControl = OrganismOperationalConsolidator
-                .recordingAcceptedIdentityDream(
-                    in: dreamRepairState.sleepControl,
-                    at: ingestedAt
-                )
-        }
-        // Only canonical chat-tool outcomes carry a checked risk class. Those
-        // are the producer contract for reviewable reflexes: generic motor,
-        // provider, and Desk signals still affect prediction/chemistry/body
-        // schema above but cannot manufacture a proposal from unclassified
-        // telemetry. This keeps the human review surface live for its one
-        // declared producer without broadening it into a prose reflex engine.
-        if case .string(let rawRisk)? = bounded.metadata["trustRisk"],
-           ["low", "medium", "high", "critical"].contains(
-                rawRisk.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-           ),
-           bounded.kind == .toolSucceeded || bounded.kind == .toolFailed {
-            reflexState = OrganismReflexCompiler.applying(
-                signal: bounded,
-                to: reflexState,
-                limits: configuration.reflexLimits
-            )
+            dreamRepairState.sleepControl.lastProviderDreamAt = ingestedAt
         }
         signalCount += 1
         // Quiet physiology follows when the signal reached this organism, not
@@ -355,8 +352,14 @@ public actor OrganismKernel {
             bodySchema: bodySchema,
             // The clock reaches the "- Body:" line too: a tired body near the
             // trough reads as the night rather than as a long day.
-            diurnal: daily.read
+            diurnal: daily.read,
+            tenderNamed: tenderNamed(at: now)
         )
+    }
+
+    /// Phase 5 E3: a caring moment recent enough for the Body line to name it.
+    private func tenderNamed(at date: Date) -> Bool {
+        caringEncounter.lastCaringTurnAt.map { date.timeIntervalSince($0) < OrganismChemistry.tenderNamedWindow } ?? false
     }
 
     /// Item 4's one door for the body's clock. The app layer pushes the user's
@@ -471,52 +474,6 @@ public actor OrganismKernel {
         return dreamRepairState != previous
     }
 
-    /// Execute the non-learning operational lane when exact pressure is due.
-    /// The returned receipt is payload-free. Only refractory bookkeeping is
-    /// persisted; no personal model statistic or confidence is updated.
-    public func runOperationalConsolidationIfDue() async -> OrganismOperationalConsolidationReceipt? {
-        guard configuration.enabled else { return nil }
-        let now = dependencies.now()
-        settleElapsedTime(at: now)
-        let reading = currentResidualRepairOpportunity(at: now)
-        guard let result = OrganismOperationalConsolidator.consolidate(
-            reading,
-            controlState: dreamRepairState.sleepControl,
-            at: now
-        ) else { return nil }
-        dreamRepairState.sleepControl = result.controlState
-        return result.receipt
-    }
-
-    /// Claim the identity-Dream lane for ONE dream, atomically. Returns the
-    /// decision the lane reached; only `.fire` means the caller may proceed, and
-    /// only in that case does the 24-hour refractory advance.
-    ///
-    /// The caller must have already passed its OWN provider/budget/trust gates
-    /// before claiming (the lane's `.providerBudgetGateRequired` disposition is
-    /// literally that instruction), so a claim means "committed to dream", not
-    /// "eligible to dream". The claim is taken here rather than after the
-    /// provider returns because two wakes racing the same eligible window must
-    /// not both dream; a claimed dream that then fails at the provider does NOT
-    /// release the window — 03:30 is the integrity fallback for exactly that,
-    /// and an unbounded provider retry is not.
-    public func claimIdentityDreamIfDue(
-        turnInFlight: Bool
-    ) async -> OrganismIdentityDreamTrigger.Decision {
-        guard configuration.enabled else { return .belowThreshold }
-        let now = dependencies.now()
-        settleElapsedTime(at: now)
-        let reading = currentResidualRepairOpportunity(at: now)
-        let decision = OrganismIdentityDreamTrigger.decide(
-            opportunity: reading,
-            turnInFlight: turnInFlight
-        )
-        guard decision == .fire else { return decision }
-        dreamRepairState.sleepControl = OrganismOperationalConsolidator
-            .recordingAcceptedIdentityDream(in: dreamRepairState.sleepControl, at: now)
-        return .fire
-    }
-
     /// Drains felt resolutions (relief / disappointment) minted since the
     /// last drain. The caller (NativeCognitionRuntime) turns each into a
     /// substrate event with the resolved organ as aboutness.
@@ -549,7 +506,8 @@ public actor OrganismKernel {
                     at: now,
                     chemicalState: daily.state,
                     bodySchema: bodySchema,
-                    diurnal: daily.read
+                    diurnal: daily.read,
+                    tenderNamed: tenderNamed(at: now)
                 )
             }()
             : nil
@@ -567,9 +525,6 @@ public actor OrganismKernel {
             fieldSummary: configuration.enabled ? field.summary() : .empty,
             predictionSummary: configuration.enabled ? predictionLedger.summary() : .empty,
             dreamRepairSummary: configuration.enabled ? dreamRepairState.summary() : .empty,
-            reflexSummary: configuration.enabled ? reflexState.summary() : .empty,
-            reflexCandidates: configuration.enabled ? reflexState.activeCandidates() : [],
-            reflexReviewReceipts: configuration.enabled ? reflexState.recentReviewReceipts() : [],
             residualRepairOpportunity: residualRepair,
             capabilityBeliefs: capabilityBeliefs,
             projectedBodyLine: projection?.bodyLine,
@@ -611,7 +566,8 @@ public actor OrganismKernel {
                 at: fixedAt,
                 chemicalState: daily.state,
                 bodySchema: frozen.bodySchema,
-                diurnal: daily.read
+                diurnal: daily.read,
+                tenderNamed: tenderNamed(at: fixedAt)
             )
             snapshot = OrganismSnapshot(
                 generatedAt: fixedAt,
@@ -621,9 +577,6 @@ public actor OrganismKernel {
                 fieldSummary: frozen.field.summary(),
                 predictionSummary: frozen.predictionLedger.summary(),
                 dreamRepairSummary: frozen.dreamRepairState.summary(),
-                reflexSummary: frozen.reflexState.summary(),
-                reflexCandidates: frozen.reflexState.activeCandidates(),
-                reflexReviewReceipts: frozen.reflexState.recentReviewReceipts(),
                 residualRepairOpportunity: OrganismResidualRepair.opportunity(
                     ledger: frozen.predictionLedger,
                     field: frozen.field,
@@ -688,7 +641,6 @@ public actor OrganismKernel {
             field: field,
             predictionLedger: predictionLedger,
             dreamRepairState: dreamRepairState,
-            reflexState: reflexState,
             signalCount: signalCount,
             lastSignalAt: lastSignalAt,
             caringEncounter: caringEncounter
@@ -703,7 +655,6 @@ public actor OrganismKernel {
             field: field,
             predictionLedger: predictionLedger,
             dreamRepairState: dreamRepairState,
-            reflexState: reflexState,
             signalCount: signalCount,
             lastSignalAt: lastSignalAt,
             caringEncounter: caringEncounter
@@ -743,7 +694,6 @@ public actor OrganismKernel {
         field = restored.field
         predictionLedger = restored.predictionLedger
         dreamRepairState = restored.dreamRepairState
-        reflexState = restored.reflexState
         signalCount = restored.signalCount
         lastSignalAt = restored.lastSignalAt
         // The encounter comes back with the axis it raised: relaunching in the
@@ -772,7 +722,6 @@ public actor OrganismKernel {
             field: field,
             predictionLedger: predictionLedger,
             dreamRepairState: dreamRepairState,
-            reflexState: reflexState,
             signalCount: signalCount,
             lastSignalAt: lastSignalAt,
             caringEncounter: caringEncounter
@@ -788,7 +737,6 @@ public actor OrganismKernel {
         field = state.field
         predictionLedger = state.predictionLedger
         dreamRepairState = state.dreamRepairState
-        reflexState = state.reflexState
         signalCount = state.signalCount
         lastSignalAt = state.lastSignalAt
         // 2026-07-21 audit fix: anchor at the instant the forward decay was
@@ -801,37 +749,13 @@ public actor OrganismKernel {
         publishPredictedToolGroups(at: now)
     }
 
-    public func reviewReflexCandidate(
-        id: String,
-        decision: OrganismReflexReviewDecision,
-        note: String? = nil,
-        reviewedBy: String = "operator",
-        source: String = "runtime",
-        receiptID: String? = nil
-    ) async -> OrganismReflexReviewApplication? {
-        guard configuration.enabled else { return nil }
-        settleElapsedTime(at: dependencies.now())
-        guard let application = reflexState.applyingReview(
-            id: id,
-            decision: decision,
-            reviewedAt: dependencies.now(),
-            reviewedBy: reviewedBy,
-            source: source,
-            note: note,
-            receiptID: receiptID ?? dependencies.makeUUID().uuidString,
-            limits: configuration.reflexLimits
-        ) else { return nil }
-        reflexState = application.state
-        return application
-    }
-
     public func clearTransientState() async {
         chemicalState = .neutral
         bodySchema = .neutral
         field = .empty
         predictionLedger = .empty
+        pendingResolutionFelt.removeAll()
         dreamRepairState = .empty
-        reflexState = .empty
         signalCount = 0
         lastSignalAt = nil
         wakefulnessFatigue = 0
@@ -917,7 +841,22 @@ public actor OrganismKernel {
         return .dosed
     }
 
-    private func settleElapsedTime(at now: Date) {
+    /// Phase 5 E3: a human cause moving a feeling — something she came back
+    /// to with a better question (curiosity), an opinion she revised on
+    /// evidence (coherence), her own work landing or failing (agency,
+    /// confidence). Small doses; a raise saturates, a negative one lowers.
+    public func admitHumanCause(
+        curiosity: Double = 0, coherence: Double = 0, agency: Double = 0, confidence: Double = 0
+    ) {
+        guard configuration.enabled else { return }
+        settleElapsedTime(at: dependencies.now())
+        chemicalState.curiosity = OrganismChemistry.raise(chemicalState.curiosity, by: curiosity)
+        chemicalState.coherence = OrganismChemistry.raise(chemicalState.coherence, by: coherence)
+        chemicalState.agency = OrganismChemistry.raise(chemicalState.agency, by: agency)
+        chemicalState.confidence = OrganismChemistry.raise(chemicalState.confidence, by: confidence)
+    }
+
+    private func settleElapsedTime(at now: Date, deferringPredictionExpiry deferredIDs: Set<String> = []) {
         let elapsed = now.timeIntervalSince(lastSettledAt)
         guard elapsed >= Self.minimumRuntimeDecayInterval else { return }
         let fatigueBefore = chemicalState.fatigue
@@ -928,10 +867,9 @@ public actor OrganismKernel {
             field: field,
             predictionLedger: predictionLedger,
             dreamRepairState: dreamRepairState,
-            reflexState: reflexState,
             signalCount: signalCount,
             lastSignalAt: lastSignalAt
-        ).decayed(at: now, settleBodySchema: false),
+        ).decayed(at: now, settleBodySchema: false, deferringPredictionExpiry: deferredIDs),
             from: fatigueBefore,
             elapsed: elapsed,
             // The one place real, lived wall time passes.
@@ -943,7 +881,6 @@ public actor OrganismKernel {
         field = settled.field
         predictionLedger = settled.predictionLedger
         dreamRepairState = settled.dreamRepairState
-        reflexState = settled.reflexState
         signalCount = settled.signalCount
         lastSignalAt = settled.lastSignalAt
         lastSettledAt = now

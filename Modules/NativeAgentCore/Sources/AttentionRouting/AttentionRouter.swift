@@ -1,9 +1,11 @@
+import ApprovalInbox
 import FeedPolicy
 import ChatOrchestration
 import CryptoKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
+import NotificationInbox
 import PersistenceCore
 import TelegramBot
 import DeviceSync
@@ -52,6 +54,8 @@ public enum AttentionImportance: String, Sendable, CaseIterable {
     /// News and scheduled deliveries (the morning brief). One phone push; the
     /// inbox card is the receipt.
     case informational
+    /// The result of explicitly requested work, from any ingress.
+    case requestedResult = "requested_result"
 
     /// Map an inbox-card severity onto a class. The existing severity
     /// vocabulary is the closest thing the codebase already had to an
@@ -177,6 +181,8 @@ public struct AttentionOutcome: Sendable {
     /// `data/notify/attention-router-failures.jsonl`, and the ledger is left
     /// untouched so the next pass can still deliver the fact.
     public let deliveryFailed: Bool
+    /// Her resident wake's knock in quiet hours: kept in the inbox, sent when they end.
+    public var heldForResidentWake = false
 
     init(
         delivery: AttentionDelivery,
@@ -245,6 +251,10 @@ public struct AttentionOutcome: Sendable {
     /// receipt. Fails loud rather than fabricating one — a receipt must record
     /// something that actually ran (NORTHSTAR clause 2).
     public func requireReceipt() throws -> MobileNotificationDeliveryReceipt {
+        if heldForResidentWake {
+            throw NSError(domain: "AttentionRouter", code: -503, userInfo: [NSLocalizedDescriptionKey:
+                "Held, not sent: the person's quiet hours are on. It waits in the inbox and goes to his phone when they end."])
+        }
         guard let receipt else {
             throw NSError(domain: "AttentionRouter", code: -503, userInfo: [
                 NSLocalizedDescriptionKey:
@@ -327,6 +337,8 @@ public actor AttentionRouter {
             // Already in the rollup. Interrupting User to say a thing worked is
             // the exact noise this router exists to remove.
             return .none
+        case .requestedResult:
+            return .phone
         case .informational:
             // The morning brief and its kind: the phone, once. Not the surface
             // he happens to be on — an informational delivery is something he
@@ -410,6 +422,65 @@ public actor AttentionRouter {
         honorsQuietHours(importance) && inQuietHours(at: date, dataRoot: dataRoot)
     }
 
+    // MARK: - Held for quiet hours (her resident wake)
+
+    /// Her resident wake runs in the person's quiet hours too (Agent 10-02);
+    /// anything it would put in front of him waits until they end. True for
+    /// a knock from that turn (or naming its session) while the window is open.
+    public static func holdsResidentWake(session: String?, dataRoot: URL, at date: Date = Date()) -> Bool {
+        (session ?? ChatToolSessionContext.verifiedSessionId) == ResidentWake.session && inQuietHours(at: date, dataRoot: dataRoot)
+    }
+
+    /// Kept in the inbox, not yet delivered: `held_delivery` names the ways
+    /// out it is owed ("phone", "mac"); `releaseHeld` sends them. An
+    /// approval's push names it, so release skips one already decided.
+    public static func hold(dataRoot: URL, title: String, body: String, ways: [String], approvalID: String? = nil) async {
+        let id = "held:" + UUID().uuidString.lowercased()
+        var row: [String: JSONValue] = ["id": .string(id), "source": .string("resident_wake"),
+            "created_at": .string(NotificationInboxClock.nowISO()), "severity": .string("info"), "status": .string("unread"),
+            "title": .string(String(title.prefix(160))), "summary": .string(String(body.prefix(500))),
+            "held_delivery": .array(ways.map(JSONValue.string))]
+        if let approvalID { row["approval_id"] = .string(approvalID) }
+        do { try await LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot)).appendUnique(.object(row), id: id) }
+        catch { NSLog("attention_router: could not hold a quiet-hours knock: %@", error.localizedDescription) }
+    }
+
+    public static func hasHeld(dataRoot: URL) async -> Bool {
+        let rows = (try? await LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot)).rows()) ?? []
+        return rows.contains { if case .object(let row) = $0 { row["held_delivery"] != nil } else { false } }
+    }
+
+    /// Once quiet hours end, each held row's push and banner go out and the
+    /// row keeps no hold. Best effort, once: a failed send is logged, not retried.
+    public static func releaseHeld(dataRoot: URL, router: AttentionRouter,
+                                   banner: @Sendable (String, String) async -> Bool) async -> Int {
+        guard !inQuietHours(at: Date(), dataRoot: dataRoot) else { return 0 }
+        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        var released = 0
+        for case .object(let row) in (try? await inbox.rows()) ?? [] {
+            guard case .array(let ways)? = row["held_delivery"], case .string(let id)? = row["id"] else { continue }
+            let title = if case .string(let text)? = row["title"] { text } else { "" }
+            let body = if case .string(let text)? = row["summary"] { text } else { "" }
+            // A card settled or an approval decided meanwhile is no longer news.
+            let approval: String? = if case .string(let value)? = row["approval_id"] { value } else { nil }
+            var live = row["status"] != .string("archived") && row["status"] != .string("dismissed")
+            if live, let approval {
+                live = (try? await SwiftNativeApprovalInbox(root: dataRoot).get(approval))?.status == "pending"
+            }
+            if live, ways.contains(.string("phone")) {
+                do {
+                    try await router.route(eventId: id, importance: .ownerWaiting, title: title, body: body,
+                        userInfo: approval.map { ["screen": "approvals", "source": "approval", "approvalId": $0] }
+                            ?? ["screen": "inbox", "itemId": id], pinnedTo: .phone)
+                } catch { NSLog("attention_router: held push failed: %@", error.localizedDescription) }
+            }
+            if live, ways.contains(.string("mac")), !(await banner(title, body)) { NSLog("attention_router: held banner failed") }
+            _ = try? await inbox.patch(id: id, ["held_delivery": .null])
+            released += 1
+        }
+        return released
+    }
+
     // MARK: - Durable dedupe ledger
 
     private struct State: Codable {
@@ -432,6 +503,16 @@ public actor AttentionRouter {
             for old in evicted { reasons.removeValue(forKey: old) }
             order.removeFirst(evicted.count)
         }
+    }
+
+    /// What the ledger says was delivered, event id → reason digest. The `app`
+    /// door diffs it around one action to report the knocks that action set off.
+    public static func deliveredKnocks(dataRoot: URL) -> [String: String] {
+        let url = dataRoot.appendingPathComponent("notify", isDirectory: true)
+            .appendingPathComponent("attention_router.json")
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(State.self, from: data) else { return [:] }
+        return state.reasons
     }
 
     /// Well above any live burst; the ledger is a dedupe window, not history.
@@ -462,6 +543,9 @@ public actor AttentionRouter {
     private let surfaceReader: SurfaceReader
     private var cached: State?
     private var inFlight: [String: Task<AttentionOutcome, Error>] = [:]
+    var resultScanInFlight = false
+    var settledResultFiles: [URL: Date] = [:]
+    var resultRetryOffset = 0
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -534,7 +618,7 @@ public actor AttentionRouter {
         // (below, via `lastActive`), never a conversation, so only an EXPLICIT
         // origin is allowed to choose `.conversation` delivery.
         let explicitOrigin = origin
-        let origin = origin ?? LastActiveSurfaceReader.lastActiveOrigin(dataRoot: dataRoot)
+        let origin = origin ?? (importance == .requestedResult ? nil : LastActiveSurfaceReader.lastActiveOrigin(dataRoot: dataRoot))
         // The person's channel switches apply to a PINNED delivery too. A
         // pinned call skips the routing table because the tool's name is its
         // channel contract — but "don't use my phone" is not a routing opinion
@@ -546,6 +630,14 @@ public actor AttentionRouter {
             origin: explicitOrigin
         )
         guard delivery != .none else { return .routineSuccess }
+        // Her resident wake runs in his quiet hours; what it would put in
+        // front of him, pinned or not, waits in the inbox for them to end.
+        if Self.holdsResidentWake(session: nil, dataRoot: dataRoot, at: date) {
+            await Self.hold(dataRoot: dataRoot, title: title, body: body, ways: ["phone"])
+            var held = AttentionOutcome.quietHours
+            held.heldForResidentWake = true
+            return held
+        }
         // A knock Agent CHOSE to make, and a request she is waiting on, are
         // hers to hold until morning; a knock she was forced into by something
         // going wrong is not. A PINNED call is exempt because it is not an
@@ -579,7 +671,7 @@ public actor AttentionRouter {
             var enriched = userInfo
             enriched["importance"] = importance.rawValue
             enriched["routedTo"] = delivery.rawValue
-            if let lastActive { enriched["lastActiveSurface"] = lastActive.rawValue }
+            if let lastActive, importance != .requestedResult { enriched["lastActiveSurface"] = lastActive.rawValue }
             // Honest urgency, PROJECTED from the class instead of asserted by
             // the site. `urgency: urgent` is what the phone turns into a
             // time-sensitive delivery that pierces Sleep Focus, so a site is
@@ -661,7 +753,7 @@ public actor AttentionRouter {
                 // Merge into their latest committed ledger, not the old snapshot.
                 var state = await load()
                 state.remember(eventId: ledgerKey, digest: digest, limit: Self.ledgerLimit)
-                persist(state)
+                try persist(state)
             }
             return AttentionOutcome(delivery: landedOn, receipt: receipt, suppressed: false)
         }
@@ -672,28 +764,19 @@ public actor AttentionRouter {
         return try await send.value
     }
 
-    /// 2026-09-22: urgent alerts go to the single private (positive id) chat
-    /// in telegram/session_map.json, on the bot's own send path. Zero or
-    /// several private chats means no clear owner: throw, and the phone takes it.
+    /// Owner alerts require the configured single owner's bound private chat.
     private static func sendToOwnerTelegram(
         _ text: String, dataRoot: URL, send: AttentionDeliveryPorts.TelegramSender
     ) async throws {
-        let mapURL = dataRoot
-            .appendingPathComponent("telegram", isDirectory: true)
-            .appendingPathComponent("session_map.json")
-        var privateChats: [Int] = []
-        if let data = try? Data(contentsOf: mapURL),
-           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let chats = root["chats"] as? [String: Any] {
-            privateChats = chats.keys.compactMap { Int($0) }.filter { $0 > 0 }
-        }
-        guard privateChats.count == 1, let chatId = privateChats.first,
-              let config = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot),
+        guard let config = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot),
               config.enabled, !config.botToken.isEmpty,
-              config.allowedChatIds.contains(Int64(chatId)) || config.allowedUserIds.contains(Int64(chatId))
+              config.allowedUserIds.count == 1,
+              let chatId = config.allowedUserIds.first.flatMap({ Int(exactly: $0) }), chatId > 0,
+              let sessionId = await TelegramSessionStore(dataRoot: dataRoot).boundSessionId(chatId: chatId),
+              !sessionId.isEmpty
         else {
             throw NSError(domain: "AttentionRouter", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "No single private Telegram chat to notify."
+                NSLocalizedDescriptionKey: "No verified owner Telegram conversation to notify."
             ])
         }
         try await send(
@@ -825,10 +908,15 @@ public actor AttentionRouter {
         try? FileManager.default.createDirectory(
             at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        try? await SwiftNativePersistenceCore().appendJSONLDurable(
+        try? await appendJSONLCapped(
             .object(row),
             to: stateURL.deletingLastPathComponent()
-                .appendingPathComponent("attention-router-failures.jsonl")
+                .appendingPathComponent("attention-router-failures.jsonl"),
+            using: SwiftNativePersistenceCore(),
+            maxLines: 1000,
+            logLabel: "attention_router_failures",
+            maxBytes: 1024 * 1024,
+            durable: true
         )
     }
 
@@ -898,21 +986,13 @@ public actor AttentionRouter {
         return (trimmed, data)
     }
 
-    private func persist(_ state: State) {
-        do {
-            try FileManager.default.createDirectory(
-                at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true
-            )
-            let capped = try Self.encodeWithinByteCap(state)
-            try capped.data.write(to: stateURL, options: .atomic)
-            // Do not advance the process cache until the durable state landed:
-            // a duplicate knock after a persistence failure is safer than
-            // permanently suppressing one. Cache what was actually WRITTEN, so
-            // an entry the byte cap evicted is not still believed in memory.
-            cached = capped.state
-        } catch {
-            NSLog("attention_router: state persistence failed: %@", error.localizedDescription)
-        }
+    private func persist(_ state: State) throws {
+        try FileManager.default.createDirectory(
+            at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let capped = try Self.encodeWithinByteCap(state)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(capped.data, to: stateURL)
+        cached = capped.state
     }
 }
 

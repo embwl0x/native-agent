@@ -295,8 +295,8 @@ public actor ChatSessionIndexReconciler {
                 ?? createdAt
             let firstUserContent = objectRows.first(where: {
                 Self.string($0["role"])?.lowercased() == "user"
-            }).flatMap { Self.string($0["content"]) }
-            let lastContent = objectRows.last.flatMap { Self.string($0["content"]) } ?? ""
+            }).flatMap { Self.content($0) }
+            let lastContent = objectRows.last.flatMap { Self.content($0) } ?? ""
             // 2026-09-06: a session's `source` says what the conversation
             // IS, and the live writer stamps it ONCE at creation and never
             // restamps it (see the §1.3 note in
@@ -413,7 +413,7 @@ public actor ChatSessionIndexReconciler {
                     candidate: candidate,
                     messageCount: Int64(objectRows.count),
                     preview: Self.bounded(
-                        lastSpoken.flatMap { Self.string($0["content"]) } ?? "",
+                        lastSpoken.flatMap { Self.content($0) } ?? "",
                         to: 160
                     ),
                     hasConversationalRow: lastSpoken != nil,
@@ -579,7 +579,7 @@ public actor ChatSessionIndexReconciler {
 
     /// The shape both passes demand of a transcript before an index row is
     /// written from it: every physical line a JSON object, every object
-    /// carrying string `role` and `content`, and no object claiming a
+    /// carrying string `role` and `content` or legacy `text`, and no object claiming a
     /// different session.
     private nonisolated static func rowsAreTrustworthy(
         _ objectRows: [[String: JSONValue]],
@@ -589,12 +589,22 @@ public actor ChatSessionIndexReconciler {
         guard objectRows.count == parsedRowCount else { return false }
         return !objectRows.contains { object in
             guard case .string(_)? = object["role"],
-                  case .string(_)? = object["content"] else { return true }
+                  contentValue(object) != nil else { return true }
             if case .string(let storedSession)? = object["sessionId"] {
                 return storedSession != sessionID
             }
             return false
         }
+    }
+
+    private nonisolated static func contentValue(_ object: [String: JSONValue]) -> JSONValue? {
+        if case .string? = object["content"] { return object["content"] }
+        if case .string? = object["text"] { return object["text"] }
+        return nil
+    }
+
+    private nonisolated static func content(_ object: [String: JSONValue]) -> String? {
+        string(contentValue(object))
     }
 
     private nonisolated static func string(_ value: JSONValue?) -> String? {

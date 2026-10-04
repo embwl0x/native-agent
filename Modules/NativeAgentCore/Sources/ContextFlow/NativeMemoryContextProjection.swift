@@ -178,29 +178,46 @@ enum NativeMemoryContextProjectionError: Error, Equatable, Sendable {
     case invalidEmbedding(batchIndex: Int)
 }
 
-/// Packet provenance (2026-07-11): atomID → memory RECORD ID, rebuilt on every
-/// projection compile. Atom/source IDs are one-way digests, so this index is
+/// Packet provenance (2026-07-11): atomID → memory RECORD ID, accepted with
+/// each published generation. Atom/source IDs are one-way digests, so this index is
 /// the ONLY way back from a packet's memory atoms to record identity — and it
 /// lives with the projection owner, never in core. Pure derived state:
-/// rebuildable, never persisted, replaced wholesale each compile. Because
-/// atomID is a deterministic hash of record identity, a refreshed index can
-/// never map an older generation's atom to a WRONG record — a just-deleted
-/// record is a benign miss.
+/// rebuildable, never persisted. Pinned turns retain their generation's mapping;
+/// attention lookup uses only the current accepted generation.
 public final class MemoryAtomRecordIndex: @unchecked Sendable {
     private let lock = NSLock()
     private var atomToRecord: [ContextAtomID: String] = [:]
+    private var generationMappings: [Int64: [ContextAtomID: String]] = [:]
+    private var recordToAtom: [String: ContextAtomID] = [:]
 
-    func replaceAll(_ mapping: [ContextAtomID: String]) {
-        lock.withLock { atomToRecord = mapping }
+    func publish(
+        _ mapping: [ContextAtomID: String]?,
+        generationID: Int64,
+        liveAtomIDs: Set<ContextAtomID>,
+        retaining generationIDs: Set<Int64>
+    ) {
+        lock.withLock {
+            atomToRecord = (mapping ?? atomToRecord).filter { liveAtomIDs.contains($0.key) }
+            generationMappings = generationMappings.filter { generationIDs.contains($0.key) }
+            generationMappings[generationID] = atomToRecord
+            recordToAtom = Dictionary(atomToRecord.map { ($0.value, $0.key) }, uniquingKeysWith: { first, _ in first })
+        }
+    }
+
+    func atomID(forRecordID recordID: String) -> ContextAtomID? {
+        let normalized = NativeMemoryContextProjection.normalizedRecordID(recordID)
+        return lock.withLock { recordToAtom[normalized] }
     }
 
     func recordIDs(for atomIDs: [ContextAtomID]) -> [String] {
         lock.withLock { atomIDs.compactMap { atomToRecord[$0] } }
     }
 
-    func recordMap(for atomIDs: [ContextAtomID]) -> [ContextAtomID: String] {
+    func recordMap(for atomIDs: [ContextAtomID], generationID: Int64) -> [ContextAtomID: String] {
         let requested = Set(atomIDs)
-        return lock.withLock { atomToRecord.filter { requested.contains($0.key) } }
+        return lock.withLock {
+            (generationMappings[generationID] ?? [:]).filter { requested.contains($0.key) }
+        }
     }
 
     var count: Int {
@@ -215,9 +232,8 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     var invalidationNamespaces: Set<String> { ["memory-v2"] }
     let invalidationSourceURL: URL?
 
-    // v2 (2026-09-01): skill-pointer rows now carry the `.procedure` content
-    // role so the selector can reserve their share of the memory lane.
-    private static let schemaVersion = "memory-context-projection-v2"
+    // v3: creation time is separate from update freshness for memory age tags.
+    private static let schemaVersion = "memory-context-projection-v3"
     private let memory: any NativeMemoryContextProjectionMemory
     let limits: NativeMemoryContextProjectionLimits
     private let provenanceIndex: MemoryAtomRecordIndex?
@@ -251,19 +267,16 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
             .map(\.descriptor.id))
         let removed = previousOwnedIDs.subtracting(selectedIDs)
 
-        // Refresh BEFORE the empty guard so a projection that publishes zero
-        // records also clears the reverse index — stale identity must not
-        // outlive the records it named. `selected` is the full published set
-        // (not just changed sources), so replace-all semantics are exact.
-        provenanceIndex?.replaceAll(Dictionary(
+        let atomRecordIDs = Dictionary(
             selected.map { ($0.atomID, $0.recordID) },
             uniquingKeysWith: { first, _ in first }
-        ))
+        )
 
         guard !selected.isEmpty else {
             return ContextCompiledProjectionResult(
                 changedSources: [],
-                removedSourceIDs: removed
+                removedSourceIDs: removed,
+                atomRecordIDs: atomRecordIDs
             )
         }
 
@@ -323,7 +336,23 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
         }
         return ContextCompiledProjectionResult(
             changedSources: changedSources,
-            removedSourceIDs: removed
+            removedSourceIDs: removed,
+            atomRecordIDs: atomRecordIDs
+        )
+    }
+
+    func didPublish(
+        _ result: ContextCompiledProjectionResult?,
+        generation: ContextStoredGeneration,
+        retaining generationIDs: Set<Int64>
+    ) {
+        provenanceIndex?.publish(
+            result?.atomRecordIDs,
+            generationID: generation.generation.id,
+            liveAtomIDs: Set(generation.atoms.lazy
+                .filter { $0.validToGeneration == nil }
+                .map(\.draft.id)),
+            retaining: generationIDs
         )
     }
 
@@ -437,6 +466,7 @@ private extension NativeMemoryContextProjection {
         guard let updatedAt = parseDate(record.updatedAt) ?? parseDate(record.createdAt) else {
             return nil
         }
+        let createdAt = parseDate(record.createdAt)
         let tags = normalizedTags(record.tags, limits: limits)
         guard let provenance = provenanceText(record, limit: limits.maximumProvenanceUTF8Bytes) else {
             return nil
@@ -463,7 +493,10 @@ private extension NativeMemoryContextProjection {
             id: recordID,
             kind: record.memoryKind ?? MemoryRecallScoring.kind(of: record.extras)
         )
-        let contentRole: ContextContentRole = skillPointer ? .procedure : .memory
+        // Phase 5 C3: what happened between them rides its own lane.
+        let personal = !correction && Self.personalKinds.contains(
+            (record.memoryKind ?? MemoryRecallScoring.kind(of: record.extras) ?? "").lowercased())
+        let contentRole: ContextContentRole = skillPointer ? .procedure : (personal ? .personal : .memory)
         guard let disclosure = MemoryRecordDisclosurePolicy.classify(
             personaID: record.personaId,
             status: record.status,
@@ -562,6 +595,7 @@ private extension NativeMemoryContextProjection {
             String(sourceQuality.bitPattern),
             String(decayState.bitPattern),
             String(updatedAt.timeIntervalSince1970.bitPattern),
+            createdAt.map { String($0.timeIntervalSince1970.bitPattern) } ?? "",
             tags.joined(separator: "\u{1f}"),
             provenance,
             record.validFrom ?? "",
@@ -583,7 +617,7 @@ private extension NativeMemoryContextProjection {
             sourceHash: sourceHash,
             authority: authority,
             confidence: confidence,
-            freshness: ContextFreshness(updatedAt: updatedAt),
+            freshness: ContextFreshness(updatedAt: updatedAt, createdAt: createdAt),
             tags: tags,
             entities: entities,
             importance: importance,
@@ -591,6 +625,9 @@ private extension NativeMemoryContextProjection {
             decayState: decayState
         )
     }
+
+    /// Memory kinds the personal lane carries (Phase 5 C3).
+    static let personalKinds: Set<String> = ["moment", "relationship", "lesson_origin"]
 
     static func isActive(_ record: NativeMemoryProjectionRecord) -> Bool {
         let status = record.status?
@@ -651,7 +688,8 @@ private extension NativeMemoryContextProjection {
         var components: [String] = []
         if let source = record.sourceRunId?.trimmingCharacters(in: .whitespacesAndNewlines),
            !source.isEmpty {
-            guard !NativeContextProjectionText.containsDisallowedControl(source) else { return nil }
+            guard !NativeContextProjectionText.containsDisallowedControl(source),
+                  !source.contains(";"), !source.contains("=") else { return nil }
             components.append("source_run_id=\(source)")
         }
         if let provenance = record.provenance ?? objectValue(record.extras, key: "provenance") {
@@ -781,16 +819,9 @@ private extension NativeMemoryContextProjection {
 
 }
 
-// Mind-into-circulation (2026-07-10): the attention translator
-// (NativeContextFlowRuntime.memoryRecordAtomID) must mirror this projection's
-// EXACT id pipeline or activation weights land on phantom atoms. These two
-// internal forwards expose the private helpers to it without widening the
-// whole private extension.
+// Record lookup uses the projection's canonical identity normalization.
 extension NativeMemoryContextProjection {
     static func normalizedRecordID(_ value: String) -> String {
         normalizedID(value)
-    }
-    static func recordIDContainsDisallowedControl(_ value: String) -> Bool {
-        NativeContextProjectionText.containsDisallowedControl(value)
     }
 }

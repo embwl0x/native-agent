@@ -52,7 +52,7 @@ public struct WorkshopDirectedTaskSubmitter: Sendable {
                 $0.handle == reference || $0.alias == reference
             }) else {
                 throw WorkshopExecutionError.invalidRequest(
-                    "no live Desk item numbered or handled '\(reference)' — call desk_read first, or omit desk_handle to open a new one")
+                    "no live Desk item numbered or handled '\(reference)' — read app desk.read first, or omit desk_handle to open a new one")
             }
             guard !live.status.isTerminal else {
                 throw WorkshopExecutionError.invalidRequest(
@@ -83,7 +83,7 @@ public struct WorkshopDirectedTaskSubmitter: Sendable {
             )
             _ = try? await store.appendNote(
                 item.handle,
-                text: "Workshop execution queued: \(enqueued.executionId)"
+                text: "Workshop work queued."
             )
             let state = try await store.liveState()
             let current = state.items.first(where: { $0.handle == item.handle }) ?? item
@@ -238,7 +238,7 @@ public enum WorkshopDeskReceiptBridge {
                case .string("planner_fallback")? = object["event"] { return true }
             return false
         }
-        let summary = terminalSummary(record, reason: reason)
+        let summary = terminalSummary(record, reason: reason ?? record.terminalReason)
         let receipt = WorkshopDirectedTaskReceipt(
             handle: handle,
             executionId: record.id,
@@ -253,87 +253,71 @@ public enum WorkshopDeskReceiptBridge {
             wasStub: wasStub,
             verificationStatus: record.verification?.status
         )
+        let receiptHandoffPath = timelinePath.deletingLastPathComponent()
+            .appendingPathComponent("receipt_handoff.json")
+        let settlementPath = timelinePath.deletingLastPathComponent()
+            .appendingPathComponent("desk_settlement.json")
+        let receiptJSON = receipt.toJSON()
+        if (try? await persistence.readJSON(receiptHandoffPath, ifMissing: .null)) == receiptJSON,
+           (try? await persistence.readJSON(settlementPath, ifMissing: .null)) == receiptJSON {
+            return
+        }
 
         do {
             try await persistence.withFileLock(receiptPath) {
+                if try await persistence.readJSON(receiptHandoffPath, ifMissing: .null) == receiptJSON {
+                    return
+                }
                 let existing = try await persistence.readJSONL(receiptPath)
                     .compactMap(WorkshopDirectedTaskReceipt.fromJSON)
-                guard !existing.contains(where: {
+                if !existing.contains(where: {
                     $0.executionId == receipt.executionId
                         && $0.status == receipt.status
                         && $0.verificationStatus == receipt.verificationStatus
-                }) else { return }
-                try await persistence.appendJSONLDurable(receipt.toJSON(), to: receiptPath)
+                }) {
+                    try await persistence.appendJSONLDurable(receiptJSON, to: receiptPath)
+                }
+                try await persistence.writeJSON(receiptJSON, to: receiptHandoffPath)
             }
         } catch {
             FileHandle.standardError.write(Data(
                 "Workshop Desk receipt write failed for \(record.id): \(error)\n".utf8))
         }
 
-        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        guard let state = try? await store.liveState(),
-              let item = state.items.first(where: { $0.handle == handle }) else { return }
-        let note = "[\(deskNoteStatus(for: record))] \(summary)"
-        if !item.notes.contains(where: { $0.text == note }) {
-            do {
-                _ = try await store.appendNote(handle, text: note)
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "Workshop Desk note settlement failed for \(record.id): \(error)\n".utf8))
-            }
-        }
-        switch record.status {
-        case "completed", "done", "succeeded":
-            if record.verification?.status == .satisfied, !item.status.isTerminal {
-                do { _ = try await store.closeItem(handle, outcomeSummary: summary) }
-                catch {
-                    FileHandle.standardError.write(Data(
-                        "Workshop Desk completion settlement failed for \(record.id): \(error)\n".utf8))
+        do {
+            try await persistence.withFileLock(settlementPath) {
+                if try await persistence.readJSON(settlementPath, ifMissing: .null) == receipt.toJSON() {
+                    return
                 }
-            } else if !item.status.isTerminal {
-                // A model/tool sequence finishing is not evidence that its
-                // claimed effect happened. Keep the durable commitment open
-                // until a canonical domain verifier (or the operator) resolves
-                // it; no follow-up LLM is recruited for this classification.
-                let detail = record.verification?.detail
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let reason: String
-                if let detail, !detail.isEmpty {
-                    reason = "Workshop finished but remains unverified: \(String(detail.prefix(480)))"
-                } else {
-                    reason = "Workshop finished without an exact verification record."
+                let status: DeskStatus
+                var settlementSummary = summary
+                var waitingOn: String?
+                switch record.status.lowercased() {
+                case "completed", "done", "succeeded":
+                    if record.verification?.status == .satisfied {
+                        status = .done
+                    } else {
+                        status = .blocked
+                        waitingOn = "domain verification"
+                        if let detail = record.verification?.detail, !detail.isEmpty {
+                            settlementSummary = "Workshop finished but remains unverified: \(String(detail.prefix(480)))"
+                        } else {
+                            settlementSummary = "Workshop finished without an exact verification record."
+                        }
+                    }
+                case "cancelled", "canceled": status = .canceled
+                default: status = .blocked
                 }
-                guard item.status != .blocked
-                        || item.blockedReason != reason
-                        || item.waitingOn != "domain verification" else { break }
-                do {
-                    _ = try await store.setStatus(handle, status: .blocked,
-                                                  blockedReason: reason,
-                                                  waitingOn: "domain verification")
-                } catch {
-                    FileHandle.standardError.write(Data(
-                        "Workshop Desk verification settlement failed for \(record.id): \(error)\n".utf8))
+                let settled = try await SwiftNativeDeskStore(dataRoot: dataRoot).settleWorkshopExecution(
+                    handle, executionId: record.id, note: "[\(deskNoteStatus(for: record))] \(summary)",
+                    status: status, summary: settlementSummary, waitingOn: waitingOn)
+                if settled {
+                    try await persistence.writeJSON(receipt.toJSON(), to: settlementPath)
                 }
             }
-        case "cancelled", "canceled":
-            if !item.status.isTerminal {
-                do { _ = try await store.closeItem(handle, outcomeSummary: summary, canceled: true) }
-                catch {
-                    FileHandle.standardError.write(Data(
-                        "Workshop Desk cancellation settlement failed for \(record.id): \(error)\n".utf8))
-                }
-            }
-        case "failed":
-            if !item.status.isTerminal,
-               item.status != .blocked || item.blockedReason != summary {
-                do { _ = try await store.setStatus(handle, status: .blocked, blockedReason: summary) }
-                catch {
-                    FileHandle.standardError.write(Data(
-                        "Workshop Desk failure settlement failed for \(record.id): \(error)\n".utf8))
-                }
-            }
-        default:
-            break
+        } catch {
+            FileHandle.standardError.write(Data(
+                "Workshop Desk settlement failed for \(record.id): \(error)\n".utf8))
         }
     }
 

@@ -1,5 +1,8 @@
 import Agents
+import AttentionRouting
 import ChatOrchestration
+import CognitiveSubstrate
+import CryptoKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -7,6 +10,7 @@ import PersistenceCore
 import SlackConnector
 import TelegramBot
 import DeviceSync
+import Transcripts
 
 struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
   let authorizeTelegramReply: (@Sendable (TelegramConfig, Int) -> Bool)?
@@ -34,7 +38,7 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       case .missingIOSSourceKey: return "The originating iOS device route key is missing."
       case .slackRejected(let detail): return "Slack rejected the completion: \(detail)"
       case .emptyCompletion: return "The agent produced no completion text or attachment."
-      case .notificationNotAccepted: return "APNS did not return an acceptance receipt."
+      case .notificationNotAccepted: return "The requested result has not been accepted for phone delivery."
       }
     }
   }
@@ -67,14 +71,20 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
         _ = try Self.mobileAttachments(attachments)
       }
     }
+    if artifacts.allSatisfy({ if case .iosNotification = $0.payload { return true }; return false }) { return }
     switch surface {
+    case "caller-result":
+      _ = try await NativeAgentEngine.live.agents.tasks.callerResultTarget(route)
     case "telegram":
       guard let config = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot),
             config.enabled, !config.botToken.isEmpty else {
         throw DeliveryError.telegramNotConfigured
       }
-      guard let rawChatId = route.destinationId, Int(rawChatId) != nil else {
+      guard let rawChatId = route.destinationId, let chatId = Int(rawChatId) else {
         throw DeliveryError.invalidTelegramDestination
+      }
+      if let authorizeTelegramReply, !authorizeTelegramReply(config, chatId) {
+        throw DeliveryError.telegramReplyNotAuthorized
       }
     case "slack":
       guard let channel = route.destinationId, !channel.isEmpty else {
@@ -137,7 +147,23 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
     surface: String,
     route: AgentBridgeCompletionRoute
   ) async throws {
+    if case .iosNotification(_, let deliveryID) = artifact.payload {
+      guard try await AttentionRouter.shared.deliverRequestedResult(
+        deliveryID: deliveryID, sessionID: route.turnSessionId ?? route.sessionId,
+        opening: route.turnSessionId == nil ? nil : route.sessionId, dataRoot: dataRoot
+      ) else { throw DeliveryError.notificationNotAccepted }
+      return
+    }
     switch surface {
+    case "caller-result":
+      let part: AgentContactPart
+      switch artifact.payload {
+      case .text(let text): part = .text(text)
+      case .attachment(let attachment):
+        part = try AgentContactPart.output(attachment, taskID: "na3.\(route.threadId ?? "").\(route.correlationId ?? "")")
+      case .iosBundle, .iosNotification: throw DeliveryError.emptyCompletion
+      }
+      try await NativeAgentEngine.live.agents.tasks.appendCallerResult(part, artifactID: idempotencyKey, route: route)
     case "telegram":
       guard let config = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot),
             config.enabled, !config.botToken.isEmpty else {
@@ -242,15 +268,8 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
             messageID: idempotencyKey
           )
         }.value
-      case .iosNotification(let text, let fallbackCorrelationId):
-        let correlationId = route.correlationId ?? fallbackCorrelationId
-        let accepted = await NativeAgentEngine.liveDeviceSync.relay.sendICloudReplyPushNotification(
-          text: text,
-          sessionID: route.sessionId,
-          correlationID: correlationId,
-          kind: "codex_completion"
-        )
-        if !accepted { throw DeliveryError.notificationNotAccepted }
+      case .iosNotification:
+        throw DeliveryError.emptyCompletion
       case .text, .attachment:
         throw DeliveryError.emptyCompletion
       }
@@ -298,5 +317,112 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       }
       throw DeliveryError.slackRejected(detail)
     }
+  }
+}
+
+/// User, 2026-10-01: what is said in the conversation he is in reaches his other
+/// doors — and only that conversation. After a turn User started there at the
+/// Mac, the phone or Slack (never an agent's, judged by the turn's user row),
+/// its reply goes to the Telegram chat bound to that session, and to the phone
+/// as a push unless the phone asked. A Telegram turn travels nowhere: Telegram
+/// already notifies his phone, and a second push doubled it. It runs off the
+/// completion signal, never inside a turn, so no door's stream waits on another.
+enum AnchorReplyMirror {
+  private static let doors = ["app": "Mac", "chat": "Mac", "ios": "iPhone", "slack": "Slack"]
+
+  static func start(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
+    // Replies written before this launch never travel.
+    let startedAt = Date()
+    NotificationCenter.default.addObserver(forName: .chatTurnCompleted, object: nil, queue: nil) { note in
+      guard let sessionId = note.object as? String else { return }
+      Task.detached { await mirror(sessionId: sessionId, since: startedAt, dataRoot: dataRoot) }
+    }
+  }
+
+  private static func mirror(sessionId: String, since startedAt: Date, dataRoot: URL) async {
+    guard sessionId == ConversationAnchor.currentSessionId(dataRoot: dataRoot),
+          let safeId = NativeAgentChatSessionID.normalizedPathComponent(sessionId),
+          let rows = try? await SwiftNativePersistenceCore().readJSONL(
+            dataRoot.appendingPathComponent("chat/messages/\(safeId).jsonl")),
+          case .object(let reply)? = rows.last(where: {
+            if case .object(let row) = $0 { return row["role"] == .string("assistant") }
+            return false
+          }),
+          case .string(let rowId)? = reply["id"],
+          case .string(let text)? = reply["content"],
+          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          case .string(let created)? = reply["createdAt"],
+          let createdAt = date(created),
+          createdAt >= startedAt,
+          case .string(let runId)? = reply["runId"], !runId.isEmpty,
+          // Who started the turn is on its USER row: bridge lanes and peers
+          // stamp `origin` there, and the reply row carries none of it. No
+          // user row of this run (a continuation, a resumed card) is not User.
+          case .object(let ask)? = rows.last(where: {
+            if case .object(let row) = $0 { return row["role"] == .string("user") && row["runId"] == .string(runId) }
+            return false
+          }),
+          case .object(let metadata)? = ask["metadata"],
+          metadata["origin"] == nil,
+          metadata[CognitiveMechanicalRowKind.metadataKey] == nil,
+          case .object(let envelope)? = metadata["envelope"],
+          envelope["agent"] == nil,
+          case .string(let surface)? = envelope["surface"],
+          let door = doors[surface] else { return }
+    let lifecycle = CodexCompletionLifecycle(
+      receiptURL: dataRoot.appendingPathComponent("chat/anchor-mirror/receipts.jsonl"),
+      ownerInstanceId: CodexCompletionLifecycle.processOwnerInstanceId, dataRoot: dataRoot)
+    let deliveryId = "anchor-mirror:\(rowId)"
+    let digest = SHA256.hash(data: Data((rowId + "\u{1f}" + text).utf8))
+      .map { String(format: "%02x", $0) }.joined()
+    // One claim per reply: the many completion signals of one turn mirror once.
+    guard (try? await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: sessionId)) == .start
+    else { return }
+    if door != "iPhone" {
+      let relay = await MainActor.run { NativeAgentEngine.liveDeviceSync.relay }
+      await relay.sendICloudReplyPushNotification(text: text, sessionID: sessionId, correlationID: rowId, kind: "reply")
+    }
+    guard let telegram = boundTelegramChat(sessionId: sessionId, dataRoot: dataRoot) else { return }
+    do {
+      try await lifecycle.cacheResponse(
+        ChatOrchestration.ChatResponse(runId: deliveryId, model: "anchor-mirror", output: text, sessionId: sessionId),
+        deliveryId: deliveryId, requestDigest: digest)
+    } catch {
+      NSLog("[anchor-mirror] could not record reply %@: %@", rowId, error.localizedDescription)
+      return
+    }
+    let delivery = await AgentBridgeCompletionRouter.deliver(
+      deliveryId: deliveryId, requestDigest: digest, text: "[\(door)]\n\(text)", attachments: [],
+      route: AgentBridgeCompletionRoute(surface: "telegram", sessionId: sessionId,
+                                        destinationId: telegram.chat, threadId: telegram.thread),
+      sender: LiveAgentBridgeCompletionSender(dataRoot: dataRoot, authorizeTelegramReply: { config, chatID in
+        TelegramPollLoop.inboundAuthorizationDecision(
+          allowedChatIds: config.allowedChatIds, allowedUserIds: config.allowedUserIds,
+          chatId: chatID, fromUserId: chatID > 0 ? chatID : nil
+        ) == .allowed
+      }), lifecycle: lifecycle,
+      notifyRequestedResult: false)
+    if delivery.status != "completed" {
+      NSLog("[anchor-mirror] Telegram copy of %@ %@: %@", rowId, delivery.status, delivery.reason ?? "")
+    }
+  }
+
+  private static func date(_ raw: String) -> Date? {
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+  }
+
+  /// The Telegram chat (and forum topic) whose map points at this session.
+  private static func boundTelegramChat(sessionId: String, dataRoot: URL) -> (chat: String, thread: String?)? {
+    guard let data = try? Data(contentsOf: dataRoot.appendingPathComponent("telegram/session_map.json")),
+          case .object(let root)? = try? JSONValue.parse(data),
+          case .object(let chats)? = root["chats"],
+          let key = chats.first(where: {
+            if case .object(let entry) = $0.value { return entry["activeSessionId"] == .string(sessionId) }
+            return false
+          })?.key else { return nil }
+    let parts = key.split(separator: ":", maxSplits: 1).map(String.init)
+    return (parts[0], parts.count > 1 ? parts[1] : nil)
   }
 }

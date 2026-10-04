@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
@@ -204,37 +203,6 @@ extension SwiftNativeMacControl {
         return path
     }
 
-    /// Read complete bytes from the retained editor, including an empty value.
-    private func craftEditorValue(_ node: MacAXNode) -> String? {
-        #if canImport(ApplicationServices) && os(macOS)
-        guard let source = accessibilitySource as? SystemMacAXElementSource,
-              let ref = node.element, let element = source.element(ref),
-              let raw = MacAXAttributeRead.copyRaw(element, kAXValueAttribute),
-              CFGetTypeID(raw) == CFStringGetTypeID() else { return nil }
-        let value = raw as! CFString as String
-        return value.utf8.count <= 4096 ? value : nil
-        #else
-        return nil
-        #endif
-    }
-
-    /// Recheck the object at the effect boundary, including menu actions that
-    /// otherwise address an app rather than a particular document window.
-    func craftDocumentMatches(pid: Int32) -> Bool {
-        guard let expected = MacCraftReplacement.documentPath else { return true }
-        guard accessibilitySource.appInfo(pid: pid)?.bundleIdentifier == "com.apple.TextEdit",
-              let root = accessibilitySource.windowRoot(pid: pid),
-              let path = documentPath(window: root, pid: pid),
-              Data(path.utf8) == Data(expected.utf8) else { return false }
-        let snapshot = MacAccessibilityReader.walk(source: accessibilitySource, root: root, limits: .init())
-        guard !snapshot.truncated,
-              !snapshot.nodes.contains(where: { ["AXSheet", "AXDialog"].contains($0.attributes.role) }) else { return false }
-        let editors = snapshot.nodes.filter { $0.attributes.role == "AXTextArea" && $0.attributes.enabled }
-        guard editors.count == 1, let editor = editors.first,
-              let value = craftEditorValue(editor) else { return false }
-        return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined() == MacCraftReplacement.editorDigest
-    }
-
     /// The file-policy clearance an AX-INFERRED document path must pass before
     /// it may be opened, reported as a reason string or `nil` for cleared.
     ///
@@ -283,7 +251,7 @@ extension SwiftNativeMacControl {
         do {
             data = try fileManagerAdapter.readData(
                 at: url,
-                maxBytes: MacDocumentRead.maxFileBytes
+                maxBytes: MacDocumentRead.maxFileBytes + 1
             )
         } catch {
             return .failure(.unreadableDocument)
@@ -371,22 +339,23 @@ extension SwiftNativeMacControl {
         // gpt-5.5 review — THE CLOCK. See `MacDocumentRead`'s "The clock" note:
         // this organ runs outside the operation store's deadline path on
         // purpose, and it is the heaviest AX caller in the module, so it carries
-        // its own two bounds. The per-call one is scoped to THIS app's element
-        // and put back on the way out; the wall-clock one is checked between
-        // frames below.
+        // its own two bounds. The per-call one is scoped to THIS app's objects
+        // and put back on the way out; the wall-clock one is checked inside
+        // the container search and each frame walk.
         let deadline = now().addingTimeInterval(MacDocumentRead.deadlineSeconds)
+        func walkShouldStop() -> Bool { Task.isCancelled || now() >= deadline }
         #if canImport(ApplicationServices) && os(macOS)
-        if accessibilitySource is SystemMacAXElementSource {
-            SystemMacAXElementSource.setMessagingTimeout(
+        if let source = accessibilitySource as? SystemMacAXElementSource {
+            source.setMessagingTimeout(
                 pid: app.processIdentifier,
                 seconds: MacDocumentRead.axMessagingTimeoutSeconds
             )
         }
         defer {
-            if accessibilitySource is SystemMacAXElementSource {
+            if let source = accessibilitySource as? SystemMacAXElementSource {
                 // 0 restores the system default — the bound belonged to this
                 // read, not to the app.
-                SystemMacAXElementSource.setMessagingTimeout(pid: app.processIdentifier, seconds: 0)
+                source.setMessagingTimeout(pid: app.processIdentifier, seconds: 0)
             }
         }
         #endif
@@ -397,17 +366,19 @@ extension SwiftNativeMacControl {
         var container = window
         var containerRole = accessibilitySource.attributes(of: window)?.role ?? "AXWindow"
         for role in MacDocumentRead.containerRoles {
+            if walkShouldStop() { break }
             if let hit = MacAccessibilityReader.findFirst(
                 role: role,
                 source: accessibilitySource,
-                root: window
+                root: window,
+                shouldStop: walkShouldStop
             ).hit {
                 container = hit.ref
                 containerRole = role
                 break
             }
         }
-        let containerFrame = accessibilitySource.attributes(of: container)?.frame
+        let containerFrame = walkShouldStop() ? nil : accessibilitySource.attributes(of: container)?.frame
         let scrollContainer = container
         let takeover = MacDocumentReadTakeover()
         let observation = attentionEventSource.start { _ in takeover.mark() }
@@ -429,8 +400,11 @@ extension SwiftNativeMacControl {
         }
 
         var accumulator = MacDocumentRead.Accumulator()
-        let firstFrame = MacDocumentRead.frameLines(source: accessibilitySource, root: container)
+        let firstFrame = MacDocumentRead.frameLines(source: accessibilitySource, root: container, shouldStop: walkShouldStop)
         if firstFrame.lines.isEmpty {
+            if Task.isCancelled {
+                return refuse("cancelled", "The document read was cancelled before any text was read.")
+            }
             if firstFrame.secureNodes > 0 {
                 return refuse("secure_content", MacDocumentRead.secureContentWords)
             }
@@ -448,21 +422,25 @@ extension SwiftNativeMacControl {
             return refuse("no_readable_text", MacDocumentRead.emptyScreenWords)
         }
         _ = accumulator.absorb(firstFrame.lines)
+        var framesTruncated = firstFrame.truncated
+        var framesRedacted = firstFrame.didRedact
 
         // Can we move the viewport at all? Answer honestly rather than
         // returning one screenful as if it were the document.
-        let scrollRestoration = MacDocumentScrollRestoration.capture(source: accessibilitySource, container: container)
+        let scrollRestoration = walkShouldStop() ? nil : MacDocumentScrollRestoration.capture(source: accessibilitySource, container: container)
         let canScroll = eventSink.isAvailable && (containerFrame?.h ?? 0) > 0 && scrollRestoration != nil
         var framesRead = 1
         var steps = 0
         var reachedEnd = false
-        var truncationReason: String?
+        var truncationReason: String? = Task.isCancelled ? "cancelled"
+            : (now() >= deadline ? MacDocumentRead.deadlineTruncationReason
+               : (accumulator.remainingCharacters == 0 || accumulator.truncated ? "char_cap" : nil))
 
         if canScroll, let frame = containerFrame {
             let delta = MacDocumentRead.scrollStepPoints(viewportHeight: frame.h)
             let centreX = frame.x + frame.w / 2
             let centreY = frame.y + frame.h / 2
-            truncationReason = await stopReason()
+            if truncationReason == nil { truncationReason = await stopReason() }
             if truncationReason == nil {
                 eventSink.post(mouse: MacMouseEvent(phase: .move, button: .left, x: centreX, y: centreY))
             }
@@ -485,11 +463,18 @@ extension SwiftNativeMacControl {
                 steps += 1
                 await Self.settleForDocumentRead()
                 if let reason = await stopReason() { truncationReason = reason; break }
-                let next = MacDocumentRead.frameLines(source: accessibilitySource, root: container)
+                let next = MacDocumentRead.frameLines(
+                    source: accessibilitySource, root: container,
+                    characterLimit: accumulator.remainingCharacters, shouldStop: walkShouldStop
+                )
                 framesRead += 1
+                framesTruncated = framesTruncated || next.truncated
+                framesRedacted = framesRedacted || next.didRedact
                 let absorbed = accumulator.absorb(next.lines)
+                if Task.isCancelled { truncationReason = "cancelled"; break }
+                if now() >= deadline { truncationReason = MacDocumentRead.deadlineTruncationReason; break }
                 if case .nothingNew = absorbed {
-                    reachedEnd = true
+                    reachedEnd = !next.truncated
                     break
                 }
                 if accumulator.characters >= MacDocumentRead.maxAccumulatedChars {
@@ -526,7 +511,7 @@ extension SwiftNativeMacControl {
             "frames": .int(Int64(framesRead)),
             "scroll_steps": .int(Int64(steps)),
             "reached_end": .bool(reachedEnd),
-            "truncated": .bool(truncationReason != nil || firstFrame.truncated),
+            "truncated": .bool(truncationReason != nil || framesTruncated),
             "gaps": .bool(accumulator.sawGap),
             "chars": .int(Int64(redaction.text.count)),
             "text": .string(redaction.text),
@@ -551,6 +536,7 @@ extension SwiftNativeMacControl {
             )
         }
         Self.attachRedaction(redaction, to: &output)
+        if framesRedacted { output["redacted"] = .bool(true) }
         return result(ok: true, output)
     }
 
@@ -616,12 +602,12 @@ extension SwiftNativeMacControl {
     static let selfInspectionNote =
         "this app's own window can never be captured: reading our own UI over AX "
         + "deadlocks the app (in-process AppKit re-entry), so self-inspection is "
-        + "always refused. Our own window is worked IN PROCESS instead: "
-        + "app_page_read and app_page_screenshot read any page, app_settings_list "
-        + "and app_setting_set work its controls, and interaction_act "
-        + "target=composer reads the composer and sets or sends the draft, picks "
-        + "the model, sets the thinking level, opens or closes a card, and "
-        + "switches the rail page. Use desk_read, inner_state or agent_introspect "
+        + "always refused. Our own window is worked IN PROCESS instead, through "
+        + "app: {page} reads any page with its settings and actions, "
+        + "page.screenshot draws one, setting.set works its controls, and the "
+        + "chat.* actions set or send the draft, pick the model, set the thinking "
+        + "level and open or close a card; page.show switches the rail page. "
+        + "Use app (desk.read, mind.inner_state, agent.introspect) "
         + "for our own state, and screen only for another app\'s window."
 
     private func selfInspectionResult(action: String, started: Date) -> MacControlResult {
@@ -1403,10 +1389,21 @@ extension SwiftNativeMacControl {
             )
         }
         let limits = Self.axLimits(from: body)
+        let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
+        if let continuation {
+            if let refusal = continuation.refusal() {
+                return MacControlResult(ok: false, action: "look",
+                    output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
+                    durationMs: 0, viaSwift: true)
+            }
+            anchorPid = continuation.app?.processIdentifier
+            anchoredApp = continuation.app
+        }
         let snapshotted = await lookSnapshot(
             limits: limits,
             scope: scope,
-            anchorPid: anchorPid
+            anchorPid: anchorPid,
+            anchorWindow: continuation?.window
         )
         var read = snapshotted.read
         var seam = snapshotted.seam
@@ -1438,10 +1435,10 @@ extension SwiftNativeMacControl {
             // frontmost window": the app is running but has no readable window
             // (minimized, or all windows closed). Saying the frontmost thing
             // would describe a window that was never asked about.
-            // A locked session publishes no app windows at all — say THAT,
-            // not "minimized or closed".
-            let locked = MacScreenLock.isLocked()
-            let status = locked ? "mac_locked"
+            // The session flag also covers a passwordless saver. Only the
+            // shared wake owner can report a remaining login window as locked.
+            let covered = MacScreenLock.isLocked()
+            let status = covered ? "display_obstructed"
                 : minimized ? "window_minimized"
                 : anchoredApp == nil ? "no_frontmost_window" : "no_window_in_app"
             var output: [String: JSONValue] = [
@@ -1450,7 +1447,7 @@ extension SwiftNativeMacControl {
                 "status": .string(status),
                 "error": .string(status),
             ]
-            if locked {
+            if covered {
                 output["message"] = .string(MacScreenLock.reply)
             } else if minimized {
                 let name = anchoredApp?.name ?? read?.app?.name ?? "The app"
@@ -1558,22 +1555,6 @@ extension SwiftNativeMacControl {
                 output["window_frame"] = windowFrame.toJSON()
             }
             if let windowKind { output["window_kind"] = .string(windowKind) }
-            // Exact object and complete editor bytes for the TextEdit method.
-            if fourVerbs, read.app?.bundleIdentifier == "com.apple.TextEdit",
-               !read.snapshot.truncated,
-               !read.snapshot.nodes.contains(where: { ["AXSheet", "AXDialog"].contains($0.attributes.role) }),
-               let pid = read.app?.processIdentifier,
-               let path = documentPath(window: read.root, pid: pid) {
-                let editors = percept.affordances.filter { $0.role == "AXTextArea" && $0.enabled && !$0.secret }
-                if editors.count == 1, let editor = editors.first,
-                   let node = read.snapshot.nodes.first(where: { $0.path == editor.path }),
-                   let value = craftEditorValue(node) {
-                    output["craft_document"] = .object([
-                        "path": .string(path), "handle": .string(editor.handle),
-                        "editor_sha256": .string(SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()),
-                    ])
-                }
-            }
             if grade == "glance" {
                 output["glance"] = .string(percept.glanceLine())
                 output["addressable_handles"] = .int(Int64(percept.affordances.count))

@@ -2,13 +2,14 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+import CognitiveSubstrate
 
 // MARK: - AdaptiveMemoryPromoter
 //
 // The after-turn promotion path: observe a (user, assistant) turn and stage
 // what is worth keeping as a proposal for the person to approve.
 //
-// Two lanes run here, both on the agent's real model:
+// One interpretation feeds the existing fact and moment lanes:
 //   • THE FACT LANE is the memory manager (MemoryV2+MemoryManager.swift,
 //     2026-09-11). It sees the exchange, the top-K memories already kept, and
 //     what is already pending, and returns add/update/skip decisions. It
@@ -69,77 +70,31 @@ public struct AdaptiveMemoryObservation: Sendable {
     /// near-duplicate of something already kept or pending, tombstoned, or a
     /// staging error.
     public let hygieneRejectedCount: Int
+    public let savedCorrectionCount: Int
+    public let pendingCorrectionCount: Int
+    public let failedCorrectionCount: Int
+    /// Why the novelty gate skipped the memory call this turn, or nil when it
+    /// ran (Phase 5A). Rides to the turn trace so the skip rate is measurable.
+    public var noveltySkipReason: String?
 
     init(
         proposals: [ProposalRecord],
         extraction: AdaptiveExtractionReport,
         toolEvidenceCandidateCount: Int = 0,
         momentOutcome: String = "unreported",
-        hygieneRejectedCount: Int = 0
+        hygieneRejectedCount: Int = 0,
+        savedCorrectionCount: Int = 0,
+        pendingCorrectionCount: Int = 0,
+        failedCorrectionCount: Int = 0
     ) {
         self.proposals = proposals
         self.extraction = extraction
         self.toolEvidenceCandidateCount = max(0, toolEvidenceCandidateCount)
         self.momentOutcome = momentOutcome
         self.hygieneRejectedCount = max(0, hygieneRejectedCount)
-    }
-}
-
-// MARK: - Tool evidence (sweep item 35)
-
-/// What she DID in a turn, as already-projected lines.
-///
-/// The chat layer owns the projection: eligibility (only dispatches that
-/// SUCCEEDED and carry a stable fact shape), the head+tail result shape
-/// SessionHistory already renders for later turns, and secret redaction. This
-/// type receives finished text and never sees a raw tool envelope, so MemoryV2
-/// gains no dependency on the orchestration layer. The caps below are
-/// re-asserted here anyway: a boundary that trusts its caller's bound is not
-/// bounded.
-///
-/// NORTHSTAR clause 6: this adds NOTHING to her prompt. It only widens what
-/// the after-turn promoter may PROPOSE, and every proposal it mints stays
-/// pending for approval (see `scoreFloor` below).
-public enum AdaptiveToolEvidence {
-    /// At most this many evidence lines reach the promoter per turn.
-    public static let maxLines = 6
-    /// Per-line character ceiling.
-    public static let maxLineChars = 240
-    /// Shortest line worth proposing — below this there is no fact in it.
-    static let minLineChars = 12
-    /// Evidence candidates score ABOVE `defaultThreshold` (so they stage) and
-    /// BELOW `defaultAutoAcceptThreshold` (so they never auto-accept). The
-    /// `kind` below is also outside `shouldAutoAccept`'s allowlist, so the
-    /// gate holds even if a caller lowers the auto-accept floor.
-    public static let score = 0.65
-    /// Kind stamped on every evidence proposal. Deliberately NOT one of the
-    /// auto-acceptable kinds (identity/location/employment/schedule).
-    public static let kind = "environment"
-    /// User, 2026-09-02: a tool receipt is not a lasting fact. Every path-shaped
-    /// dispatch was landing in Memory Proposals as
-    /// "observed: go(name=/Users/…) ok: {…}" for a person to approve, and an
-    /// approved one is junk in the store. The projection still feeds the
-    /// procedural lane; it no longer mints proposals unless a caller opts in.
-    nonisolated(unsafe) public static var proposalsEnabled = false
-
-    /// Turn projected lines into promotion candidates. Bounded, de-duplicated,
-    /// order-preserving. Empty input ⇒ empty output ⇒ prose-only behavior.
-    public static func candidates(from lines: [String]) -> [AdaptiveCandidate] {
-        guard !lines.isEmpty else { return [] }
-        var seen = Set<String>()
-        var out: [AdaptiveCandidate] = []
-        for raw in lines {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmed.count >= minLineChars else { continue }
-            let bounded = trimmed.count > maxLineChars
-                ? String(trimmed.prefix(maxLineChars))
-                : trimmed
-            let content = "observed: \(bounded)"
-            guard seen.insert(content.lowercased()).inserted else { continue }
-            out.append(AdaptiveCandidate(content: content, score: score, kind: kind))
-            if out.count >= maxLines { break }
-        }
-        return out
+        self.savedCorrectionCount = savedCorrectionCount
+        self.pendingCorrectionCount = pendingCorrectionCount
+        self.failedCorrectionCount = failedCorrectionCount
     }
 }
 
@@ -209,29 +164,16 @@ public enum AdaptiveCandidateHygiene {
 public actor AdaptiveMemoryPromoter {
     public static let shared = AdaptiveMemoryPromoter()
 
-    public static let defaultThreshold: Double = 0.6
-    /// Minimum confidence considered by the narrow structured-fact auto-accept
-    /// lane. Preferences, relationships, goals, skills, and broad inferred
-    /// facts remain proposals regardless of model confidence; a single small-
-    /// model score is not corroboration.
-    /// Closes the post-Swift-native-cutover seam where AdaptiveMemoryPromoter staged
-    /// proposals (657 accumulated) but nothing was promoting them to
-    /// memories — recall_memory had nothing to recall.
-    public static let defaultAutoAcceptThreshold: Double = 0.8
-
     private var memory: SwiftNativeMemoryV2?
     /// The fact lane (2026-09-11). nil = off, and off stages no facts at all —
     /// there is no regex conformer to fall back to, by design.
     private var memoryManager: (any MemoryManaging)?
     /// The person's configured name, read fresh so a rename shows up.
     private var personName: (@Sendable () -> String?)? = nil
-    private var threshold: Double
-    private var autoAcceptThreshold: Double
-    /// The moments lane (2026-09-02). nil = off, and off is byte-identical to
-    /// the pre-moments promoter. There is deliberately NO default conformer
-    /// here: the fact lane falls back to regex when Apple Intelligence is
-    /// missing, and a moment must never be invented by a pattern.
-    private var momentExtractor: (any MomentExtracting)?
+    private var prepareInterpretation: (@Sendable (AfterTurnOrigin) async -> AfterTurnContext?)?
+    /// The Bool is true when the novelty gate skipped the call (Phase 5A).
+    private var finishInterpretation: (@Sendable (AfterTurnContext, AfterTurnInterpretation?, Bool) async -> Void)?
+    private var observationTail: Task<AdaptiveMemoryObservation, Never>?
     /// The Setup page's "Moments she keeps" switch, injected as a closure so
     /// this module never reads UserDefaults. nil = no owner configured, which
     /// means ON — an embedder that never wires the switch keeps the lane's
@@ -262,17 +204,11 @@ public actor AdaptiveMemoryPromoter {
     public init(
         memory: SwiftNativeMemoryV2? = nil,
         memoryManager: (any MemoryManaging)? = nil,
-        threshold: Double = AdaptiveMemoryPromoter.defaultThreshold,
-        autoAcceptThreshold: Double = AdaptiveMemoryPromoter.defaultAutoAcceptThreshold,
-        momentExtractor: (any MomentExtracting)? = nil,
         momentsEnabled: (@Sendable () -> Bool)? = nil,
         adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil
     ) {
         self.memory = memory
         self.memoryManager = memoryManager
-        self.threshold = threshold
-        self.autoAcceptThreshold = autoAcceptThreshold
-        self.momentExtractor = momentExtractor
         self.momentsEnabled = momentsEnabled
         self.adaptivePromotionEnabled = adaptivePromotionEnabled
     }
@@ -280,9 +216,6 @@ public actor AdaptiveMemoryPromoter {
     public func configure(
         memory: SwiftNativeMemoryV2?,
         memoryManager: (any MemoryManaging)? = nil,
-        threshold: Double? = nil,
-        autoAcceptThreshold: Double? = nil,
-        momentExtractor: (any MomentExtracting)? = nil,
         momentsEnabled: (@Sendable () -> Bool)? = nil,
         adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil,
         personName: (@Sendable () -> String?)? = nil
@@ -290,9 +223,6 @@ public actor AdaptiveMemoryPromoter {
         self.memory = memory
         if let memoryManager { self.memoryManager = memoryManager }
         if let personName { self.personName = personName }
-        if let threshold { self.threshold = threshold }
-        if let autoAcceptThreshold { self.autoAcceptThreshold = autoAcceptThreshold }
-        if let momentExtractor { self.momentExtractor = momentExtractor }
         if let momentsEnabled { self.momentsEnabled = momentsEnabled }
         if let adaptivePromotionEnabled {
             self.adaptivePromotionEnabled = adaptivePromotionEnabled
@@ -324,10 +254,37 @@ public actor AdaptiveMemoryPromoter {
         sessionId: String,
         surface: String = "chat"
     ) async -> AdaptiveMemoryObservation {
+        let origin = AfterTurnSource.origin
+        let previous = observationTail
+        let operation = Task {
+            _ = await previous?.value
+            return await self.interpretAndObserve(userMessage: userMessage,
+                assistantMessage: assistantMessage,
+                sessionId: sessionId, surface: surface, origin: origin)
+        }
+        observationTail = operation
+        return await withTaskCancellationHandler {
+            await operation.value
+        } onCancel: {
+            operation.cancel()
+        }
+    }
+
+    public func configureInterpretation(
+        prepare: @escaping @Sendable (AfterTurnOrigin) async -> AfterTurnContext?,
+        finish: @escaping @Sendable (AfterTurnContext, AfterTurnInterpretation?, Bool) async -> Void
+    ) {
+        prepareInterpretation = prepare
+        finishInterpretation = finish
+    }
+
+    private func interpretAndObserve(userMessage: String, assistantMessage: String,
+                                     sessionId: String,
+                                     surface: String, origin: AfterTurnOrigin?) async -> AdaptiveMemoryObservation {
         let skipped = AdaptiveMemoryObservation(proposals: [], extraction: .init(
             candidates: [], semanticStatus: .skipped
         ))
-        guard let memory else { return skipped }
+        guard !Task.isCancelled, let memory else { return skipped }
         // A bot's session has the agent's own brief in the user seat: no person
         // is there, nothing happens "between them", and its brief recurring on
         // every run minted "user values ..." about User (2026-09-10).
@@ -357,18 +314,33 @@ public actor AdaptiveMemoryPromoter {
         let peerSeat = Self.isAgentSeatUserMessage(userMessage)
         let peerSpeaker = peerSeat ? Self.bridgeSender(userMessage) : nil
         let momentAuthor = MemoryMoments.authorTag(forUserMessage: userMessage)
+        let hasReply = !assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let requestedMoments = hasReply && (momentsEnabled?() ?? true)
+        let reservedMoment = requestedMoments ? await reserveMomentSlot(memory: memory, now: Date()) : false
+        lastMomentOutcome = requestedMoments ? (reservedMoment ? "unreported" : "capped") : "disabled"
+        let managerResult = await runMemoryManager(
+            speaker: peerSpeaker, memory: memory, userMessage: userMessage,
+            assistantMessage: assistantMessage, sessionId: sessionId, surface: surface,
+            momentsAllowed: reservedMoment, origin: origin)
         let momentProposal = await stageMomentIfAny(
             memory: memory,
             userMessage: userMessage,
             assistantMessage: assistantMessage,
             sessionId: sessionId,
             surface: surface,
-            author: momentAuthor
+            author: momentAuthor,
+            outcome: managerResult.moment,
+            reserved: reservedMoment,
+            friction: AfterTurnNoveltyGate.frictionSignal(
+                userMessage: userMessage, assistantMessage: assistantMessage)
+                ?? (managerResult.savedCorrectionCount + managerResult.pendingCorrectionCount > 0
+                    ? "correction" : nil)
         )
         // THE DECLINE LEAVES A RECEIPT (Astra comb 3, lane2 finding 9,
         // 2026-09-12). `lastMomentOutcome` used to reach only the turn's
         // `memory.promotion` stage, so a missing moment had no explanation
         // anywhere the moment the stage itself went missing.
+        if managerResult.noveltySkipReason != nil { lastMomentOutcome = "noveltySkipped" }
         await MemoryMoments.recordOutcomeReceipt(
             outcome: lastMomentOutcome,
             sessionId: sessionId,
@@ -382,63 +354,27 @@ public actor AdaptiveMemoryPromoter {
         // Read fresh per turn. The moments lane ran above under its OWN switch
         // and is deliberately untouched by this one.
         if let adaptivePromotionEnabled, !adaptivePromotionEnabled() {
-            return AdaptiveMemoryObservation(
+            var observation = AdaptiveMemoryObservation(
                 proposals: momentProposal.map { [$0] } ?? [],
                 extraction: .init(candidates: [], semanticStatus: .skipped),
                 momentOutcome: lastMomentOutcome
             )
+            observation.noveltySkipReason = managerResult.noveltySkipReason
+            return observation
         }
-        let evidenceCandidates = AdaptiveToolEvidence.proposalsEnabled
-            ? AdaptiveToolEvidence.candidates(from: toolEvidence)
-            : []
         var staged: [ProposalRecord] = momentProposal.map { [$0] } ?? []
-        var hygieneRejected = 0
-        let managerResult = await runMemoryManager(
-            speaker: peerSpeaker,
-            memory: memory,
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            sessionId: sessionId,
-            surface: surface
-        )
         staged.append(contentsOf: managerResult.proposals)
-        hygieneRejected += managerResult.rejectedCount
-        let extraction = managerResult.report
-        for cand in evidenceCandidates where cand.score >= threshold {
-            do {
-                if try await memory.isRejected(content: cand.content) { continue }
-                let proposal = try await memory.propose(
-                    content: cand.content,
-                    source: "adaptive-promoter:\(sessionId)",
-                    confidence: cand.score,
-                    kind: cand.kind,
-                    supportingSessionIDs: [sessionId],
-                    recurrenceCount: 1
-                )
-                staged.append(proposal)
-                // HOTFIX 2026-06-03 memory-seam: high-confidence candidates
-                // auto-accept into `memories` so recall_memory sees them in
-                // the same session. Below autoAcceptThreshold the proposal
-                // remains pending for inbox review (existing review flow).
-                // Best-effort: a failed accept leaves the proposal staged
-                // for manual review, which is the SAFE failure mode.
-                if Self.shouldAutoAccept(cand, confidenceFloor: autoAcceptThreshold) {
-                    _ = try? await memory.acceptProposal(id: proposal.id)
-                }
-            } catch {
-                // Best-effort: a single extraction failure must never break the
-                // turn. The Python promoter swallowed proposal errors for the
-                // same reason — staging is a side-channel, not the chat path.
-                continue
-            }
-        }
-        return AdaptiveMemoryObservation(
+        var observation = AdaptiveMemoryObservation(
             proposals: staged,
-            extraction: extraction,
-            toolEvidenceCandidateCount: evidenceCandidates.count,
+            extraction: managerResult.report,
             momentOutcome: lastMomentOutcome,
-            hygieneRejectedCount: hygieneRejected
+            hygieneRejectedCount: managerResult.rejectedCount,
+            savedCorrectionCount: managerResult.savedCorrectionCount,
+            pendingCorrectionCount: managerResult.pendingCorrectionCount,
+            failedCorrectionCount: managerResult.failedCorrectionCount
         )
+        observation.noveltySkipReason = managerResult.noveltySkipReason
+        return observation
     }
 
     // MARK: - The fact lane: the memory manager
@@ -447,6 +383,11 @@ public actor AdaptiveMemoryPromoter {
         let proposals: [ProposalRecord]
         let report: AdaptiveExtractionReport
         let rejectedCount: Int
+        var moment: MomentExtractionOutcome = .failed
+        var noveltySkipReason: String?
+        var savedCorrectionCount = 0
+        var pendingCorrectionCount = 0
+        var failedCorrectionCount = 0
     }
 
     /// One manager pass over one turn.
@@ -454,40 +395,72 @@ public actor AdaptiveMemoryPromoter {
     /// The shape, in order: show it what is already known (so it can say "already
     /// covered" instead of re-minting), ask once, then gate what came back on
     /// confidence, shape, embedding near-duplication and the tombstone list.
-    /// Every survivor stages as a PENDING proposal — nothing here promotes itself
-    /// except through the pre-existing narrow structured-fact allowlist.
+    /// Every survivor stages for human review. Free-form model output cannot
+    /// prove that an apparent fact or rule leaves identity untouched.
     private func runMemoryManager(
         speaker: String? = nil,
         memory: SwiftNativeMemoryV2,
         userMessage: String,
         assistantMessage: String,
         sessionId: String,
-        surface: String
+        surface: String,
+        momentsAllowed: Bool,
+        origin: AfterTurnOrigin?
     ) async -> MemoryManagerOutcome {
         func empty(_ status: MemorySemanticExtractionStatus) -> MemoryManagerOutcome {
             MemoryManagerOutcome(
                 proposals: [],
                 report: AdaptiveExtractionReport(candidates: [], semanticStatus: status),
-                rejectedCount: 0
+                rejectedCount: 0,
+                moment: status == .failed ? (Task.isCancelled ? .cancelled : .failed) : .unavailable
             )
         }
         guard let memoryManager else { return empty(.unavailable) }
-        let user = userMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = origin?.userMessage ?? userMessage
         let assistant = assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !user.isEmpty, !assistant.isEmpty else { return empty(.emptyInput) }
+        guard !user.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return empty(.emptyInput) }
 
         // What is already known about this exchange. `recordingUsage: false`:
         // reading the store to decide what to keep is not the agent USING a
         // memory, and use_count is the signal that vetoes eviction.
-        let existing: [MemoryManagerExistingMemory] = await {
+        let factsEnabled = !assistant.isEmpty && (adaptivePromotionEnabled?() ?? true)
+        let keepsMoments = momentsAllowed
+        let context: AfterTurnContext?
+        if let origin, origin.sessionId == sessionId {
+            context = await prepareInterpretation?(origin)
+        } else { context = nil }
+        guard factsEnabled || keepsMoments || context != nil else { return empty(.skipped) }
+        // Phase 5A: nothing new worth keeping → no model call. The deferred
+        // affect turn still closes, exactly as a failed call closes it.
+        let priorUserTurns = context?.caring?.context.filter { $0.speaker == .person }.map(\.text) ?? []
+        if let reason = AfterTurnNoveltyGate.skipReason(userMessage: user, priorUserTurns: priorUserTurns) {
+            if let context { await finishInterpretation?(context, nil, true) }
+            var skipped = empty(.skipped)
+            skipped.noveltySkipReason = reason
+            return skipped
+        }
+        var existing: [MemoryManagerExistingMemory] = await {
+            guard factsEnabled else { return [] }
             guard let response = try? await memory.recall(
                 MemoryV2RecallRequest(text: "\(user)\n\(assistant)", topK: MemoryManagerLane.recallTopK),
                 recordingUsage: false
             ) else { return [] }
             return response.scored.map {
-                MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text)
+                MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text,
+                    correctionSubject: MemoryMoments.metadataString($0.record.extras, "correction_subject"),
+                    kind: $0.record.memoryKind)
             }
         }()
+        if factsEnabled, let corrections = try? await memory.listMemory(kind: "correction") {
+            for record in corrections.filter({ ($0.status ?? "active") == "active" })
+                .sorted(by: { ($0.createdAt ?? "") > ($1.createdAt ?? "") }).prefix(24) {
+                let subject = MemoryMoments.metadataString(record.extras, "correction_subject")
+                let known = MemoryManagerExistingMemory(id: record.id, content: record.text,
+                                                        correctionSubject: subject, kind: record.memoryKind)
+                if let index = existing.firstIndex(where: { $0.id == record.id }) { existing[index] = known }
+                else { existing.append(known) }
+            }
+        }
         // What is already waiting on the person. Moments are a different lane
         // and a different card; they are not facts to dedupe against.
         // Shown WITH their ids (2026-09-11, found driving it: a correction of a
@@ -495,6 +468,7 @@ public actor AdaptiveMemoryPromoter {
         // row instead of replacing the first). An update naming a pending id
         // retires that row and stages the correction in its place.
         let pendingRows: [ProposalRecord] = await {
+            guard factsEnabled else { return [] }
             guard let all = try? await memory.listProposals(status: "pending") else { return [] }
             return Array(all
                 .filter { !MemoryMoments.isMoment($0.metadata) }
@@ -507,17 +481,22 @@ public actor AdaptiveMemoryPromoter {
         let pendingPrompt: [String] = pendingRows.map { "[\($0.id)] \($0.content)" }
         let pending: [String] = pendingRows.map(\.content)
 
-        guard let decisions = await memoryManager.review(MemoryManagerRequest(
+        let interpretation = await memoryManager.interpret(MemoryManagerRequest(
             userMessage: user,
             assistantMessage: assistant,
             existing: existing,
             pending: pendingPrompt,
             personName: speaker ?? personName?()
-        )) else { return empty(.failed) }
+        ), context: context, factsEnabled: factsEnabled, momentsEnabled: keepsMoments)
+        if let context { await finishInterpretation?(context, Task.isCancelled ? nil : interpretation, false) }
+        guard !Task.isCancelled, let interpretation else { return empty(.failed) }
+        let decisions = factsEnabled && (adaptivePromotionEnabled?() ?? true) ? interpretation.memories : []
 
         var staged: [ProposalRecord] = []
         var accepted: [AdaptiveCandidate] = []
         var rejected = 0
+        var pendingCorrections = 0
+        var failedCorrections = 0
         // Everything the statement must not merely repeat: what is kept, what is
         // pending, and what this same pass already minted this turn.
         var comparisons = existing.map(\.content) + pending
@@ -534,12 +513,43 @@ public actor AdaptiveMemoryPromoter {
                 rejected += 1
                 continue
             }
-            if MemoryManagerLane.statementRejectionReason(
-                decision.statement, userMessage: user, assistantMessage: assistant
-            ) != nil {
+            let isCorrection = decision.kind == "correction"
+            if isCorrection, origin?.occurredAt == nil || origin?.sessionId != sessionId {
+                rejected += 1
+                failedCorrections += 1
+                NSLog("MemoryV2: standing correction not saved: originating turn timestamp unavailable")
+                continue
+            }
+            if isCorrection, let updateTarget,
+               updateTarget.kind != "correction"
+                || (updateTarget.correctionSubject != nil && updateTarget.correctionSubject != decision.correctionSubject) {
                 rejected += 1
                 continue
             }
+            if isCorrection, let old = supersededPending {
+                guard MemoryMoments.metadataString(old.metadata, "kind") == "correction",
+                      MemoryMoments.metadataString(old.metadata, "correction_subject") == decision.correctionSubject,
+                      let timestamp = MemoryMoments.metadataString(old.metadata, "observed_at"),
+                      let priorDate = MemoryRecallScoring.parseTimestamp(timestamp),
+                      let sourceDate = origin?.occurredAt, priorDate <= sourceDate else {
+                    rejected += 1
+                    failedCorrections += 1
+                    NSLog("MemoryV2: standing correction not saved: pending rule chronology or subject unavailable or newer")
+                    continue
+                }
+            }
+            let refusal = isCorrection
+                ? MemoryManagerLane.correctionRejectionReason(decision, userMessage: user,
+                    isPeer: speaker != nil || context?.event.sourceClass == .imported, personName: personName?())
+                : MemoryManagerLane.statementRejectionReason(decision.statement, userMessage: user, assistantMessage: assistant)
+            if refusal != nil {
+                rejected += 1
+                continue
+            }
+            if isCorrection, existing.contains(where: {
+                $0.correctionSubject == decision.correctionSubject
+                    && MemoryManagerLane.contentFingerprint($0.content) == MemoryManagerLane.contentFingerprint(decision.statement)
+            }) { continue }
             // The row an update REPLACES is not competition for it: screening a
             // correction against the statement it corrects rejects exactly the
             // work the manager was asked to do (2026-09-11 audit, finding 4).
@@ -548,32 +558,34 @@ public actor AdaptiveMemoryPromoter {
             let screened: [String] = replacedContent.map { target in
                 comparisons.filter { $0 != target }
             } ?? comparisons
-            if await Self.isNearDuplicate(
+            if !isCorrection, await Self.isNearDuplicate(
                 decision.statement, of: screened, memory: memory
             ) {
                 rejected += 1
                 continue
             }
             do {
+                try Task.checkCancellation()
                 if try await memory.isRejected(content: decision.statement) {
                     rejected += 1
                     continue
                 }
                 let proposal = try await memory.propose(
                     content: decision.statement,
-                    source: "\(MemoryManagerLane.sourcePrefix):\(sessionId)",
+                    source: "\(isCorrection ? "standing-correction" : MemoryManagerLane.sourcePrefix):\(sessionId)",
                     confidence: decision.confidence,
                     kind: decision.kind,
                     supportingSessionIDs: [sessionId],
                     recurrenceCount: 1,
                     extraMetadata: MemoryManagerLane.metadata(
                         for: decision, sessionId: sessionId, surface: surface,
-                        updateTarget: updateTarget
+                        updateTarget: updateTarget,
+                        observedAt: origin?.occurredAt
                     )
                 )
                 staged.append(proposal)
                 comparisons.append(decision.statement)
-                if let old = supersededPending {
+                if let old = supersededPending, old.id != proposal.id {
                     _ = try? await memory.supersedeProposal(id: old.id, by: proposal.id)
                 }
                 let candidate = AdaptiveCandidate(
@@ -582,14 +594,13 @@ public actor AdaptiveMemoryPromoter {
                     kind: decision.kind
                 )
                 accepted.append(candidate)
-                // The pre-existing narrow structured-fact allowlist, unchanged:
-                // identity/location/employment/schedule only, at its own floor.
-                if Self.shouldAutoAccept(candidate, confidenceFloor: autoAcceptThreshold) {
-                    _ = try? await memory.acceptProposal(id: proposal.id)
+                if isCorrection {
+                    pendingCorrections += 1
                 }
             } catch {
                 // Best-effort: staging is a side-channel, never the turn path.
                 rejected += 1
+                if isCorrection { failedCorrections += 1 }
                 continue
             }
         }
@@ -600,7 +611,11 @@ public actor AdaptiveMemoryPromoter {
                 semanticStatus: .succeeded,
                 semanticCandidateCount: decisions.count
             ),
-            rejectedCount: rejected
+            rejectedCount: rejected,
+            moment: interpretation.moment.map(MomentExtractionOutcome.candidate) ?? .abstained,
+            savedCorrectionCount: 0,
+            pendingCorrectionCount: pendingCorrections,
+            failedCorrectionCount: failedCorrections
         )
     }
 
@@ -617,13 +632,17 @@ public actor AdaptiveMemoryPromoter {
         guard !others.isEmpty else { return false }
         let fold: (String) -> String = { MemoryMoments.wordFold($0) }
         let needle = fold(statement)
-        if others.contains(where: { fold($0) == needle }) { return true }
+        if others.contains(where: {
+            fold($0) == needle && MemorySemanticDuplicateGuard.sameQuantityAndNegation(statement, $0)
+        }) { return true }
         guard let vectors = try? await memory.embedForDerivedContext([statement] + others),
               vectors.count == others.count + 1,
               let query = vectors.first, !query.isEmpty else {
             return false
         }
-        for vector in vectors.dropFirst() where vector.count == query.count {
+        for (other, vector) in zip(others, vectors.dropFirst()) {
+            guard vector.count == query.count,
+                  MemorySemanticDuplicateGuard.sameQuantityAndNegation(statement, other) else { continue }
             var dot: Float = 0
             for i in 0..<query.count { dot += query[i] * vector[i] }
             if Double(dot) >= MemoryManagerLane.duplicateSimilarity { return true }
@@ -633,10 +652,7 @@ public actor AdaptiveMemoryPromoter {
 
     // MARK: - The moments lane
 
-    /// The second extraction pass. Runs only when a moment extractor is
-    /// configured (production: Apple Foundation Models), stages at most one
-    /// proposal, and returns nil for every ordinary exchange — which is nearly
-    /// all of them.
+    /// The moment section of the shared interpretation stages at most one proposal.
     ///
     /// ORDER MATTERS: the daily cap is checked BEFORE the model call, because
     /// the cheap gate belongs in front of the expensive one.
@@ -650,8 +666,15 @@ public actor AdaptiveMemoryPromoter {
         sessionId: String,
         surface: String,
         author: String,
+        outcome: MomentExtractionOutcome,
+        reserved: Bool,
+        friction: String? = nil,
         now: Date = Date()
     ) async -> ProposalRecord? {
+        guard reserved else { return nil }
+        var staged = false
+        defer { if !staged { releaseMomentSlot() } }
+        guard !Task.isCancelled else { lastMomentOutcome = "cancelled"; return nil }
         // The switch comes FIRST, ahead of the extractor and the day-slot
         // reservation: off means nothing is read, nothing is reserved and no
         // model is called — the same "not installed" shape her hour uses.
@@ -659,28 +682,18 @@ public actor AdaptiveMemoryPromoter {
             lastMomentOutcome = "disabled"
             return nil
         }
-        lastMomentOutcome = "noExtractor"
-        guard let momentExtractor else { return nil }
         // RESERVE FIRST. An actor is reentrant across `await`, so a
         // check-then-await-then-increment shape lets every concurrent turn read
         // the same stale quota and all of them stage — the cap would hold only
         // when turns happened to be serial. The slot is taken synchronously
         // here and released on every path that does not stage.
-        lastMomentOutcome = "capped"
-        guard await reserveMomentSlot(memory: memory, now: now) else { return nil }
         // The outcome is now the EXTRACTOR'S word, not a placeholder set before
         // the call (lane5 finding 3): "abstained" means the model read the hour
         // and said there was no moment in it; "extractionFailed" means no answer
         // was obtained. The ledger could not tell those apart while both wrote
         // `none`.
         lastMomentOutcome = "unreported"
-        var staged = false
-        defer { if !staged { releaseMomentSlot() } }
 
-        let outcome = await momentExtractor.extractMomentOutcome(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage
-        )
         guard let candidate = outcome.candidate else {
             lastMomentOutcome = outcome.receiptOutcome
             return nil
@@ -715,6 +728,7 @@ public actor AdaptiveMemoryPromoter {
         ) == nil else { return nil }
         lastMomentOutcome = "failed"
         do {
+            try Task.checkCancellation()
             if try await memory.isRejected(content: content) {
                 lastMomentOutcome = "tombstoned"
                 return nil
@@ -732,7 +746,7 @@ public actor AdaptiveMemoryPromoter {
                     sessionId: sessionId,
                     surface: surface,
                     author: author
-                )
+                ).merging(friction.map { ["friction": .string($0)] } ?? [:]) { current, _ in current }
             )
             // Kept whatever the dedup path did with it: a re-staged moment
             // still consumed a model call and a day slot.
@@ -835,24 +849,5 @@ public actor AdaptiveMemoryPromoter {
         let name = inside.prefix { $0 != "," }.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let first = name.first else { return nil }
         return String(first).uppercased() + name.dropFirst()
-    }
-
-    public func currentThreshold() -> Double { threshold }
-
-    static func shouldAutoAccept(
-        _ candidate: AdaptiveCandidate,
-        confidenceFloor: Double
-    ) -> Bool {
-        let kind = candidate.kind
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        switch kind {
-        case "identity":
-            return candidate.score >= max(confidenceFloor, 0.90)
-        case "location", "employment", "schedule":
-            return candidate.score >= max(confidenceFloor, 0.85)
-        default:
-            return false
-        }
     }
 }

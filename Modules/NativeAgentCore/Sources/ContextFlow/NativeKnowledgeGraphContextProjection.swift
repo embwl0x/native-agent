@@ -51,6 +51,11 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
 
     private let loadRelations: @Sendable () async throws -> [KnowledgeGraphContextRelation]
     private let diagnostics: @Sendable (String) -> Void
+    private let dataRoot: URL
+
+    var excludedSourceOwners: Set<String> {
+        MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) ? [] : [Self.owner]
+    }
 
     init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -62,6 +67,7 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
     ) {
         let sqlite = dataRoot.appendingPathComponent("memory/memory.sqlite").standardizedFileURL
         self.invalidationSourceURL = sqlite
+        self.dataRoot = dataRoot
         self.diagnostics = diagnostics
         let total = max(0, maximumRelations)
         let perEntity = max(1, maximumRelationsPerEntity)
@@ -77,6 +83,14 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
+        guard MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) else {
+            return ContextCompiledProjectionResult(
+                changedSources: [],
+                removedSourceIDs: Set(previousSources.values.lazy
+                    .filter { $0.descriptor.owner == Self.owner }
+                    .map(\.descriptor.id))
+            )
+        }
         let relations: [KnowledgeGraphContextRelation]
         do {
             relations = try await loadRelations()

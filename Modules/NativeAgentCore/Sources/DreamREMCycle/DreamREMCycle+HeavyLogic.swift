@@ -1,83 +1,47 @@
 import Foundation
 import CommonCrypto
 import PersistenceCore
+import PersonaEngine
+import NativeAgentCore
 
 // Heavy logic for the REM consolidation pipeline:
-//   - topic clustering of dream entries
 //   - .rem_tombstones exclusion of denied proposals
-//   - GROWTH.md size-cap eviction (caller distills evicted slice into KG)
 //   - 14-day archival of old dream_diary entries
 //
 // Mirrors the retired daemon behaviors (_REM_MAX_PROPOSALS gate, .rem_tombstones
 // denylist, GROWTH cap eviction-to-KG, 14-day archive). Persistence + approval
 // gating remain with the caller — these are stateless helpers / file actors.
 
-// MARK: - Topic clustering
-
-public struct DreamEntryCluster: Sendable {
-    public let topicKey: String
-    public let entries: [DreamEntry]
-    public let dateRange: (earliest: String, latest: String)
-
-    public init(topicKey: String, entries: [DreamEntry], dateRange: (earliest: String, latest: String)) {
-        self.topicKey = topicKey
-        self.entries = entries
-        self.dateRange = dateRange
-    }
-}
-
-private func wordSet(_ s: String, prefix: Int = 100) -> Set<String> {
-    let head = String(s.prefix(prefix)).lowercased()
-    let parts = head.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-    return Set(parts.map(String.init).filter { !$0.isEmpty })
-}
-
-private func jaccard(_ a: Set<String>, _ b: Set<String>) -> Double {
-    if a.isEmpty && b.isEmpty { return 1.0 }
-    let inter = a.intersection(b).count
-    let uni = a.union(b).count
-    if uni == 0 { return 0 }
-    return Double(inter) / Double(uni)
-}
-
-private func topicLabel(_ s: String) -> String {
-    let head = String(s.prefix(100)).lowercased()
-    let parts = head.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
-    let stop: Set<String> = ["the", "a", "an", "and", "or", "of", "to", "in", "is", "it", "for", "on"]
-    let sig = parts.filter { !stop.contains($0) && $0.count > 1 }
-    return sig.prefix(4).joined(separator: "-")
-}
-
-/// Group dream entries by similar leading-text topic via Jaccard ≥ 0.5 on the
-/// first 100 chars' word-set. Greedy single-pass assignment; entries that don't
-/// reach the threshold against any existing cluster become their own singleton.
-public func clusterDreamEntries(_ entries: [DreamEntry]) -> [DreamEntryCluster] {
-    var clusters: [(key: String, sets: [Set<String>], entries: [DreamEntry])] = []
-    for entry in entries {
-        let text = entry.content ?? ""
-        let ws = wordSet(text)
-        var placed = false
-        for i in 0..<clusters.count {
-            // Compare to first member's word set (representative).
-            if let rep = clusters[i].sets.first, jaccard(ws, rep) >= 0.5 {
-                clusters[i].sets.append(ws)
-                clusters[i].entries.append(entry)
-                placed = true
-                break
-            }
-        }
-        if !placed {
-            clusters.append((key: topicLabel(text), sets: [ws], entries: [entry]))
+/// Use the live compiler's checked active-persona selection while preserving
+/// Dream/REM's full-document rendering and GROWTH hygiene.
+func readDreamPersonaDocs(
+    dataRoot: URL, personaRoot: URL, surface: String
+) async throws -> [String: String] {
+    let compiler = PersonaCompiler(
+        engine: SwiftNativePersonaEngine(root: personaRoot, dataRoot: dataRoot)
+    )
+    let snapshot = try await compiler.contextSourceSnapshot(surface: surface)
+    // Phase 5A: USER rides as the pinned core (the same projection chat and
+    // reflection use), not the ~25 KB generated body. The dream's delta is the
+    // memory-delta channel it already gets; REM reads the diaries that carry it.
+    let userCore = await DreamUserCore.provider?(dataRoot)
+    var docs: [String: String] = [:]
+    for id in ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"] {
+        let raw = snapshot.packet.activeDocs[id] ?? ""
+        switch id {
+        case "GROWTH": docs["\(id).md"] = DreamREMGrowthHygiene.stripEpisodicLines(raw)
+        case "USER": docs["\(id).md"] = UserMDAutogenMarkers.promptText(raw, pinnedCore: userCore)
+        default: docs["\(id).md"] = raw
         }
     }
-    return clusters.map { c in
-        let dates = c.entries.map { $0.date }.sorted()
-        return DreamEntryCluster(
-            topicKey: c.key,
-            entries: c.entries,
-            dateRange: (earliest: dates.first ?? "", latest: dates.last ?? "")
-        )
-    }
+    return docs
+}
+
+/// The pinned USER core for Dream/REM. MemoryV2 owns it and this module cannot
+/// import MemoryV2, so the app installs the reader at cognition bootstrap. Nil
+/// (never installed) keeps the whole document, exactly as before.
+public enum DreamUserCore {
+    nonisolated(unsafe) public static var provider: (@Sendable (URL) async -> [String]?)?
 }
 
 // MARK: - REMTombstoneStore
@@ -286,79 +250,6 @@ public actor REMTombstoneStore {
         let fp = _tombstone_fp(proposal.proposalText)
         let dict = try loadAll()
         return dict[fp] != nil
-    }
-}
-
-// MARK: - GrowthDocManager
-
-public actor GrowthDocManager {
-    private let path: URL
-    private let fm = FileManager.default
-
-    public init(personaRoot: URL) {
-        self.path = personaRoot.appendingPathComponent("GROWTH.md")
-    }
-
-    public func growthSize() async -> Int {
-        guard fm.fileExists(atPath: path.path) else { return 0 }
-        let attrs = (try? fm.attributesOfItem(atPath: path.path)) ?? [:]
-        return (attrs[.size] as? NSNumber)?.intValue ?? 0
-    }
-
-    private func readText() throws -> String {
-        guard fm.fileExists(atPath: path.path) else { return "" }
-        return (try? String(contentsOf: path, encoding: .utf8)) ?? ""
-    }
-
-    private struct EntryBlock {
-        let date: String
-        let text: String  // includes trailing newline if any
-        let range: Range<String.Index>
-    }
-
-    /// Parse lines starting with `YYYY-MM-DD` as entry boundaries. Lines before
-    /// the first date prefix belong to a synthetic "" header block we never evict.
-    private func parseEntries(_ body: String) -> [EntryBlock] {
-        let dateRegex = try! NSRegularExpression(
-            pattern: "(^|\\n)(\\d{4}-\\d{2}-\\d{2})",
-            options: []
-        )
-        let ns = body as NSString
-        let matches = dateRegex.matches(in: body, options: [], range: NSRange(location: 0, length: ns.length))
-        var blocks: [EntryBlock] = []
-        for (i, m) in matches.enumerated() {
-            let dateNS = m.range(at: 2)
-            let date = ns.substring(with: dateNS)
-            let blockStart = (m.range(at: 1).length > 0) ? m.range(at: 1).location + 1 : m.range.location
-            let nextStart: Int
-            if i + 1 < matches.count {
-                let nm = matches[i + 1]
-                nextStart = (nm.range(at: 1).length > 0) ? nm.range(at: 1).location + 1 : nm.range.location
-            } else {
-                nextStart = ns.length
-            }
-            let chunkRange = NSRange(location: blockStart, length: nextStart - blockStart)
-            let chunk = ns.substring(with: chunkRange)
-            guard let r = Range(chunkRange, in: body) else { continue }
-            blocks.append(EntryBlock(date: date, text: chunk, range: r))
-        }
-        return blocks
-    }
-
-    public func evictionCandidates(maxBytes: Int) async throws -> String {
-        let body = try readText()
-        let size = body.utf8.count
-        if size <= maxBytes { return "" }
-        var blocks = parseEntries(body)
-        blocks.sort { $0.date < $1.date }
-        var evicted = ""
-        var remaining = size
-        for b in blocks {
-            if remaining <= maxBytes { break }
-            evicted += b.text
-            remaining -= b.text.utf8.count
-        }
-        return evicted
     }
 }
 

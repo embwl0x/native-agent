@@ -62,6 +62,75 @@ extension MemoryStorage {
 
     // MARK: - Proposals
 
+    /// Retain recent review history, today's quota evidence and every proposal
+    /// referenced by retained rows or memories. Denial lives in tombstones,
+    /// which this bound never changes. Historical supersession repairs must
+    /// finish before their evidence can be forgotten.
+    static func pruneTerminalProposals(in db: Database, at now: Date = Date()) throws {
+        let terminalCount = try Int.fetchOne(db, sql: """
+            SELECT COUNT(*) FROM proposals WHERE status IN ('accepted', 'rejected', 'merged', 'superseded')
+            """) ?? 0
+        guard terminalCount > 512 else { return }
+        let dayStart = MemoryDueDateStamp.iso8601(Calendar.current.startOfDay(for: now))
+        try db.execute(sql: """
+            WITH RECURSIVE retained(id) AS (
+                SELECT id FROM proposals WHERE status NOT IN ('accepted', 'rejected', 'merged', 'superseded')
+                UNION
+                SELECT id FROM proposals WHERE julianday(staged_at) >= julianday(?)
+                UNION
+                SELECT id FROM (
+                    SELECT id FROM proposals WHERE status IN ('accepted', 'rejected', 'merged', 'superseded')
+                    ORDER BY COALESCE(resolved_at, staged_at) DESC, id LIMIT 512
+                )
+                UNION
+                SELECT p.id FROM proposals p JOIN memories m ON m.id = p.id
+                UNION
+                SELECT p.id FROM memories m, json_tree(m.metadata_json) link
+                    JOIN proposals p ON p.id = link.value WHERE link.type = 'text'
+                UNION
+                SELECT id FROM proposals WHERE
+                    (status = 'rejected' AND rejection_reason LIKE 'superseded by a correction:%')
+                    OR (status = 'superseded' AND (
+                        json_extract(metadata_json, '$.supersededBy') IS NULL
+                        OR content IN (SELECT content FROM tombstones)
+                    ))
+                UNION
+                SELECT target.id FROM retained r JOIN proposals p ON p.id = r.id,
+                    json_tree(p.metadata_json) link JOIN proposals target ON target.id = link.value
+                    WHERE link.type = 'text'
+                UNION
+                SELECT p.id FROM retained r JOIN proposals p
+                    ON json_extract(p.metadata_json, '$.supersededBy') = r.id
+            )
+            DELETE FROM proposals WHERE status IN ('accepted', 'rejected', 'merged', 'superseded')
+                AND id NOT IN (SELECT id FROM retained)
+            """, arguments: [dayStart])
+    }
+
+    public func supersedeProposal(id: String, by successorId: String) async throws -> Bool {
+        guard id != successorId else { return false }
+        return try await dbPool.write { db in
+            guard let proposal = try Row.fetchOne(
+                db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id]
+            ).map(Self.decodeProposal) else { throw MemoryV2Error.recordNotFound }
+            guard proposal.status == "pending" else { return proposal.status == "superseded" }
+            var metadata: [String: JSONValue] = [:]
+            if case .object(let existing)? = proposal.metadata { metadata = existing }
+            let now = Self.nowISO8601()
+            metadata["supersededBy"] = .string(successorId)
+            metadata["supersededAt"] = .string(now)
+            try db.execute(sql: "DELETE FROM tombstones WHERE content_hash = ?",
+                           arguments: [Self.contentHash(proposal.content)])
+            try db.execute(sql: """
+                UPDATE proposals SET metadata_json = ?, status = 'superseded',
+                    resolved_at = ?, rejection_reason = ? WHERE id = ?
+                """, arguments: [Self.encodeMetadata(.object(metadata)), now,
+                                  SwiftNativeMemoryV2.supersessionReasonPrefix + successorId, id])
+            try Self.pruneTerminalProposals(in: db)
+            return true
+        }
+    }
+
     @discardableResult
     public func insertProposal(_ proposal: StoredProposal) async throws -> StoredProposal {
         try await dbPool.write { db in
@@ -83,6 +152,7 @@ extension MemoryStorage {
                 Self.encodeMetadata(proposal.metadata),
                 proposal.embeddingEpoch
             ])
+            try Self.pruneTerminalProposals(in: db)
         }
         return proposal
     }
@@ -145,6 +215,7 @@ extension MemoryStorage {
                 Self.encodeMetadata(proposal.metadata),
                 proposal.embeddingEpoch
             ])
+            try Self.pruneTerminalProposals(in: db)
             return proposal
         }
     }
@@ -158,7 +229,7 @@ extension MemoryStorage {
         // an outcome instead of throwing mid-transaction (a throw inside
         // dbPool.write rolls back everything — including the rejection row).
         enum AcceptOutcome {
-            case accepted(StoredMemory, evicted: [StoredMemory], demoted: StoredMemory?)
+            case accepted(StoredMemory, evicted: [StoredMemory], demoted: [StoredMemory])
             case tombstoned
         }
         let outcome = try await dbPool.write { db -> AcceptOutcome in
@@ -192,6 +263,7 @@ extension MemoryStorage {
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                     WHERE id = ?
                 """, arguments: [Self.nowISO8601(), "tombstoned: exact match to a rejected claim", id])
+                try Self.pruneTerminalProposals(in: db)
                 return .tombstoned
             }
             // Semantic tombstone gate at acceptance, in the SAME transaction
@@ -210,6 +282,7 @@ extension MemoryStorage {
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                     WHERE id = ?
                 """, arguments: [Self.nowISO8601(), "tombstoned: semantic match to a rejected claim", id])
+                try Self.pruneTerminalProposals(in: db)
                 return .tombstoned
             }
             let now = Self.nowISO8601()
@@ -221,6 +294,29 @@ extension MemoryStorage {
                 if case .object(let o)? = proposal.metadata { return o }
                 return [:]
             }()
+            var subjectPredecessors: [StoredMemory] = []
+            if case .string("correction")? = proposalMeta["kind"] {
+                guard case .string(let subject)? = proposalMeta["correction_subject"],
+                      case .string(let observedAt)? = proposalMeta["observed_at"],
+                      let ruleDate = MemoryRecallScoring.parseTimestamp(observedAt) else {
+                    throw MemoryStorageError.invalidTemporalEvidence("standing correction requires its subject and originating turn time")
+                }
+                subjectPredecessors = try Row.fetchAll(db, sql: """
+                    SELECT * FROM memories WHERE persona_id = ? AND status = 'active'
+                      AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                      AND json_extract(metadata_json, '$.kind') = 'correction'
+                      AND json_extract(metadata_json, '$.correction_subject') = ?
+                    """, arguments: [proposal.personaId, subject]).map(Self.decodeMemory)
+                for predecessor in subjectPredecessors {
+                    guard let observedAt = predecessor.observedAt,
+                          let priorDate = MemoryRecallScoring.parseTimestamp(observedAt) else {
+                        throw MemoryStorageError.invalidTemporalEvidence("prior standing correction time is not ISO-8601")
+                    }
+                    guard priorDate <= ruleDate else {
+                        throw MemoryV2Error.underlying("a newer standing correction already governs this subject")
+                    }
+                }
+            }
             let stampedConfidence: Double = {
                 // Accept double / int / numeric-string forms and clamp to 0...1
                 // (gpt-5.5 review finding 2: a string "0.85" must not silently
@@ -236,6 +332,15 @@ extension MemoryStorage {
                 guard let raw else { return 1.0 }
                 return min(max(raw, 0.0), 1.0)
             }()
+            let kindMetadata = MemoryKindStamp.stampingDefaultKind(proposal.metadata)
+            let originatingTimestamp = Self.metadataString(proposalMeta, "observed_at", fallback: "observedAt")
+                ?? proposal.stagedAt
+            let stampedMetadata: JSONValue?
+            if let origin = MemoryRecallScoring.parseTimestamp(originatingTimestamp) {
+                stampedMetadata = MemoryDueDateStamp.stamping(kindMetadata, text: proposal.content, at: origin)
+            } else {
+                stampedMetadata = kindMetadata
+            }
             let mem = StoredMemory(
                 id: proposal.id,
                 content: proposal.content,
@@ -260,10 +365,7 @@ extension MemoryStorage {
                 // explicit `commit_memory` store above and this promoter
                 // acceptance — stamp through the same extractor, so a plan is
                 // dated the same way however it got remembered.
-                metadata: MemoryDueDateStamp.stamping(
-                    MemoryKindStamp.stampingDefaultKind(proposal.metadata),
-                    text: proposal.content
-                )
+                metadata: stampedMetadata
             )
             try Self.validateTemporalEvidence(mem)
             try db.execute(sql: """
@@ -290,14 +392,22 @@ extension MemoryStorage {
             // transaction, so the new memory and the demotion of the one it
             // replaces either both land or neither does. A throw here rolls the
             // acceptance back and the proposal stays pending.
-            let demoted: StoredMemory? = try superseding.map {
-                try Self.demoteSuperseded($0, by: mem, in: db)
+            var demoted: [StoredMemory] = []
+            if let superseding {
+                demoted.append(try Self.demoteSuperseded(superseding, by: mem, in: db))
+            }
+            for predecessor in subjectPredecessors where predecessor.id != superseding?.targetId {
+                demoted.append(try Self.demoteSuperseded(SupersedingAcceptance(
+                    targetId: predecessor.id, expectedContentHash: Self.contentHash(predecessor.content),
+                    reason: "superseded by explicit standing correction on the same subject"
+                ), by: mem, in: db))
             }
             let evicted = try Self.pruneMemoriesToBound(
                 in: db,
                 limit: memoryLimit,
                 preservingIDs: [mem.id]
             )
+            try Self.pruneTerminalProposals(in: db)
             return .accepted(mem, evicted: evicted, demoted: demoted)
         }
         switch outcome {
@@ -307,9 +417,9 @@ extension MemoryStorage {
             invalidateRecallCache()
             pokeUserMDRegen(persona: result.personaId)
             await pokeProjectionHooks(result)
-            if let demoted {
-                pokeUserMDRegen(persona: demoted.personaId)
-                await pokeProjectionHooks(demoted)
+            for predecessor in demoted {
+                pokeUserMDRegen(persona: predecessor.personaId)
+                await pokeProjectionHooks(predecessor)
             }
             await handleBoundEvictions(evicted, reason: "proposal_acceptance")
             return result
@@ -322,7 +432,7 @@ extension MemoryStorage {
     /// erasure — with one addition: the row must still hash to what it hashed
     /// to when the proposal was staged. If it has changed, or is gone, or is
     /// already terminal, this throws and the whole acceptance rolls back.
-    private static func demoteSuperseded(
+    static func demoteSuperseded(
         _ superseding: SupersedingAcceptance,
         by replacement: StoredMemory,
         in db: Database
@@ -404,6 +514,7 @@ extension MemoryStorage {
                 UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                 WHERE id = ?
             """, arguments: [now, reason, id])
+            try Self.pruneTerminalProposals(in: db)
             return tomb
         }
     }
@@ -452,6 +563,7 @@ extension MemoryStorage {
             try db.execute(sql: """
                 UPDATE proposals SET status = 'merged', resolved_at = ? WHERE id = ?
                 """, arguments: [resolvedAt, id])
+            try Self.pruneTerminalProposals(in: db)
             return memory
         }
         invalidateRecallCache()
@@ -474,6 +586,7 @@ extension MemoryStorage {
                 UPDATE proposals SET status = ?, resolved_at = COALESCE(?, resolved_at)
                 WHERE id = ?
             """, arguments: [status, resolvedAt, id])
+            try Self.pruneTerminalProposals(in: db)
         }
     }
 

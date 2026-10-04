@@ -11,6 +11,15 @@ package enum ChatToolJSONRedaction {
     /// entirely for a secret-bearing tool: an unparseable payload we cannot
     /// redact is not a payload worth keeping.
     package nonisolated static func injectionRedactedArgJSON(tool: String, json: String) -> String {
+        // The app door: only an action whose args carry a key or token, or a
+        // script naming one, is rewritten, so every other call keeps its
+        // exact arguments.
+        if MacInjectionArgRedaction.normalized(tool) == "app" {
+            guard let parsed = try? JSONValue.parse(Data(json.utf8)), case .object(let input) = parsed,
+                  MacInjectionArgRedaction.appDoorCarriesSecret(input) else { return json }
+            return (try? JSONValue.object(MacInjectionArgRedaction.redacted(tool: tool, input: input))
+                .serialize(pretty: false)) ?? "[redacted: \(tool) arguments]"
+        }
         guard MacInjectionArgRedaction.carriesSecretArgs(tool: tool) else { return json }
         guard let parsed = try? JSONValue.parse(Data(json.utf8)),
               case .object = parsed,

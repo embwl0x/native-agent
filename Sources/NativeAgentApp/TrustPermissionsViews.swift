@@ -10,6 +10,7 @@ import NativeAgentShared
 import MemoryV2
 import PersistenceCore
 import ChromeControl
+import BackgroundWork
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -148,12 +149,8 @@ struct ChromeControlPermissionsView: View {
 struct MultimodalPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @AppStorage("voiceAutoRead") private var voiceAutoRead = false
-    @State private var draftPolicy = TrustMultimodalPolicy()
+    @State private var draftPolicy: TrustMultimodalPolicy?
     @State private var isSaving = false
-
-    private var currentPolicy: TrustMultimodalPolicy {
-        draftPolicy
-    }
 
     /// Alive glass (2026-09-23): one group card of switch rows. Every change
     /// here applies at once; Trust's feature footnote says so.
@@ -164,21 +161,28 @@ struct MultimodalPermissionsView: View {
                 detail: "I capture your screen when you click the camera button in Chat.",
                 isOn: policyBinding(\.screen_capture)
             )
+            .disabled(isSaving || draftPolicy == nil)
             FeatureSwitchRow(
                 title: "Allow image understanding",
                 detail: "I send images you attach to your AI provider so I can read them. This counts toward your subscription usage.",
                 isOn: policyBinding(\.vision_api_calls)
             )
+            .disabled(isSaving || draftPolicy == nil)
             FeatureSwitchRow(
                 title: "Allow reading PDFs",
                 detail: "I read the text of a PDF you attach into the conversation. With this off, I skip the attachment and I'm told I did, so I never guess at what it says. A PDF that is only pictures of pages has no text to read.",
                 isOn: policyBinding(\.file_ingestion_pdf)
             )
+            .disabled(isSaving || draftPolicy == nil)
             FeatureSwitchRow(
                 title: "Allow image generation",
                 detail: "I make images when you ask for one.",
                 isOn: policyBinding(\.image_generation_openai)
             )
+            .disabled(isSaving || draftPolicy == nil)
+            if draftPolicy == nil {
+                FeatureNote("Permissions unavailable. Reload Trust to check your saved settings.")
+            }
             FeatureSwitchRow(
                 title: "Read replies aloud automatically",
                 detail: "I read new replies aloud with your saved voice settings. The OpenAI voice needs its own permission.",
@@ -194,17 +198,17 @@ struct MultimodalPermissionsView: View {
 
     private func policyBinding(_ keyPath: WritableKeyPath<TrustMultimodalPolicy, Bool>) -> Binding<Bool> {
         Binding(
-            get: { currentPolicy[keyPath: keyPath] },
+            get: { draftPolicy?[keyPath: keyPath] ?? false },
             set: { newValue in savePolicy(keyPath, value: newValue) }
         )
     }
 
     private func savePolicy(_ keyPath: WritableKeyPath<TrustMultimodalPolicy, Bool>, value: Bool) {
-        var next = draftPolicy
+        guard !isSaving, var next = draftPolicy else { return }
         next[keyPath: keyPath] = value
         draftPolicy = next
+        isSaving = true
         Task {
-            isSaving = true
             _ = await appModel.saveMultimodalPolicy(next)
             isSaving = false
             syncDraftPolicy()
@@ -212,9 +216,7 @@ struct MultimodalPermissionsView: View {
     }
 
     private func syncDraftPolicy() {
-        if let policy = appModel.engine.trust.policy?.multimodalPolicy {
-            draftPolicy = policy
-        }
+        draftPolicy = appModel.engine.trust.policy?.multimodalPolicy
     }
 }
 
@@ -250,7 +252,7 @@ struct TrainingPermissionsView: View {
                 FeatureSwitchRow(
                     title: "Let me work unattended",
                     detail: unattendedForced
-                        ? "Full Mac access lets me work unattended: bots on their schedules, practice runs and background improvement. Changing the access mode above is how to turn it off. Run once is you asking, so it works either way."
+                        ? "Your current Trust settings let me work unattended: bots on their schedules, practice runs and background improvement. Change those settings in Trust to turn it off. Run once is you asking, so it works either way."
                         : "The main switch for background work: scheduled bots and replies to events, practice runs and app improvements. Run once is you asking, so it works either way. Even with this on, I can only change my own files inside NativeAgent, never the rest of your Mac.",
                     isOn: Binding(
                         get: { draftEnableAutonomy || unattendedForced },
@@ -279,7 +281,10 @@ struct TrainingPermissionsView: View {
                                 next.route_through_promotion = false
                             }
                             draftTraining = next
-                            Task { await saveAll(training: next, promotion: draftPromotion) }
+                            let patch = newValue
+                                ? ["autonomous_training": true]
+                                : ["autonomous_training": false, "dream_scheduler": false, "route_through_promotion": false]
+                            Task { await savePracticePolicy(training: patch) }
                         }
                     )
                 )
@@ -330,10 +335,13 @@ struct TrainingPermissionsView: View {
                                 training.route_through_promotion = false
                                 draftTraining = training
                                 draftPromotion = next
-                                Task { await saveAll(training: training, promotion: next) }
+                                Task {
+                                    await savePracticePolicy(training: ["route_through_promotion": false],
+                                                             promotion: ["enabled": false, "auto_promote_tier_a": false])
+                                }
                             } else {
                                 draftPromotion = next
-                                Task { await saveAll(training: draftTraining, promotion: next) }
+                                Task { await savePracticePolicy(promotion: ["enabled": true]) }
                             }
                         }
                     )
@@ -348,10 +356,9 @@ struct TrainingPermissionsView: View {
                         get: { draftPromotion.auto_promote_tier_a },
                         set: { newValue in
                             var next = draftPromotion
-                            next.enabled = true
                             next.auto_promote_tier_a = newValue
                             draftPromotion = next
-                            Task { await saveAll(training: draftTraining, promotion: next) }
+                            Task { await savePracticePolicy(promotion: ["auto_promote_tier_a": newValue]) }
                         }
                     )
                 )
@@ -363,13 +370,9 @@ struct TrainingPermissionsView: View {
                         get: { draftTraining.route_through_promotion },
                         set: { newValue in
                             var training = draftTraining
-                            training.autonomous_training = true
                             training.route_through_promotion = newValue
-                            var promotion = draftPromotion
-                            promotion.enabled = true
                             draftTraining = training
-                            draftPromotion = promotion
-                            Task { await saveAll(training: training, promotion: promotion) }
+                            Task { await savePracticePolicy(training: ["route_through_promotion": newValue]) }
                         }
                     )
                 )
@@ -404,14 +407,14 @@ struct TrainingPermissionsView: View {
         .accessibilityElement(children: .contain)
     }
 
-    /// The one gate every unattended lane asks, minus the raw toggle: what is
-    /// left is the access mode admitting work the toggle's own value denies.
+    /// Check the authority override independently of the raw autonomy toggle.
     private func refreshUnattended() async {
         let request = unattendedReadGate.begin()
         let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let allowed = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
+        let fullMac = appModel.engine.trust.policy.map(AppModel.fullMacGrantIsActive) ?? false
+        let yolo = await WorkshopBackgroundWork.isWideOpenTrust(dataRoot: root)
         guard !Task.isCancelled, unattendedReadGate.accepts(request) else { return }
-        unattendedForced = allowed && !(appModel.engine.trust.policy?.enableAutonomy ?? false)
+        unattendedForced = fullMac || yolo
     }
 
     private func refreshDreamComposite() async {
@@ -448,21 +451,9 @@ struct TrainingPermissionsView: View {
         syncDraftsFromPolicy()
     }
 
-    private func saveAll(training: TrustTrainingPolicy, promotion: TrustPromotionPolicy) async {
-        guard let policy = appModel.engine.trust.policy else { return }
+    private func savePracticePolicy(training: [String: Bool] = [:], promotion: [String: Bool] = [:]) async {
         isSaving = true
-        await appModel.saveTrustPolicyWithPromotion(
-            permissionLevel: policy.permissionLevel,
-            autonomyDefault: policy.autonomyDefault ?? "supervised",
-            requireBackups: policy.filePolicy?.requireBackupBeforeWrite ?? true,
-            outsideDefault: policy.filePolicy?.outsideWorkspaceDefault ?? "deny",
-            developerMode: policy.developerMode,
-            autonomousTraining: training.autonomous_training,
-            dreamScheduler: training.dream_scheduler,
-            routeThroughPromotion: training.route_through_promotion,
-            promotionEnabled: promotion.enabled,
-            autoPromoteTierA: promotion.auto_promote_tier_a
-        )
+        await appModel.patchTrainingAndPromotion(training: training, promotion: promotion)
         isSaving = false
         syncDraftsFromPolicy()
     }
@@ -490,7 +481,7 @@ struct WorkshopPermissionsView: View {
                 isOn: Binding(
                     get: { workshopExecutionsEnabled },
                     set: { newValue in
-                        Task { await saveWorkshopPolicy(enabled: newValue, showTimeline: showTimeline) }
+                        Task { await saveWorkshopPolicy(enabled: newValue) }
                     }
                 )
             )
@@ -499,7 +490,7 @@ struct WorkshopPermissionsView: View {
                 isOn: Binding(
                     get: { showTimeline },
                     set: { newValue in
-                        Task { await saveWorkshopPolicy(enabled: workshopExecutionsEnabled, showTimeline: newValue) }
+                        Task { await saveWorkshopPolicy(showTimeline: newValue) }
                     }
                 )
             )
@@ -511,9 +502,9 @@ struct WorkshopPermissionsView: View {
         }
     }
 
-    private func saveWorkshopPolicy(enabled: Bool, showTimeline: Bool) async {
-        draftPolicy.enabled = enabled
-        draftPolicy.showTimeline = showTimeline
+    private func saveWorkshopPolicy(enabled: Bool? = nil, showTimeline: Bool? = nil) async {
+        if let enabled { draftPolicy.enabled = enabled }
+        if let showTimeline { draftPolicy.showTimeline = showTimeline }
         isSaving = true
         await appModel.saveWorkshopPolicyToggle(enabled: enabled, showTimeline: showTimeline)
         isSaving = false

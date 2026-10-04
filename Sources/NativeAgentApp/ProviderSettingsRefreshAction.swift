@@ -8,11 +8,15 @@ import ProviderRouting
 @MainActor
 enum ProviderSettingsRefreshAction {
     struct Snapshot {
+        let routing: ProviderRoutingSnapshot
         let providers: [ProviderInfo]
         let catalog: ModelCatalogResponse?
+        let catalogError: String?
         let rowSet: ProviderSurfaceRowSet
         let activeProviders: [String: String]
         let preferences: [String: SurfacePreference]
+        /// Accounts whose own last test failed, by id (`LLMProviderStatusFeed.failedTest`).
+        var failedTests: [String: String] = [:]
     }
 
     enum Outcome {
@@ -26,23 +30,39 @@ enum ProviderSettingsRefreshAction {
     ) async -> Outcome {
         do {
             let facade = appModel.engine.providers
-            let catalog: ModelCatalogResponse?
-            if refreshCatalog {
-                catalog = try await facade.modelCatalog(refresh: true)
-            } else {
-                catalog = try? await facade.modelCatalog(refresh: false)
+            defer {
+                if !refreshCatalog { facade.refreshAccountModelsInBackground() }
             }
-            let providers = try await facade.list()
-            let routing = facade.routing
-            let rowSet = try await routing.providerSurfaceRowSet()
-            let activeProviders = try await facade.activeProviders()
-            let preferences = try await routing.computeModelPreferences()
+            var catalog: ModelCatalogResponse?
+            var catalogError: String?
+            if refreshCatalog {
+                do { catalog = try await facade.modelCatalog(refresh: true) }
+                catch { catalogError = error.localizedDescription }
+            }
+            let snapshot = try await facade.routing.checkedProviderSnapshot()
+            let providers = try ProvidersFacade.connections(from: snapshot)
+            if catalog == nil {
+                do {
+                    catalog = try await facade.modelCatalog(refresh: false, routingSnapshot: snapshot.routing)
+                } catch { catalogError = error.localizedDescription }
+            }
+            let config = try ProvidersFacade.modelRoutingConfig(from: snapshot.routing)
+            catalog?.current = config.current
+            catalog?.defaultModel = config.current.chat.model
             return .loaded(Snapshot(
+                routing: snapshot.routing,
                 providers: providers,
                 catalog: catalog,
-                rowSet: rowSet,
-                activeProviders: activeProviders,
-                preferences: preferences
+                catalogError: catalogError,
+                rowSet: snapshot.rowSet,
+                activeProviders: snapshot.routing.activeProviders,
+                preferences: snapshot.routing.preferences,
+                failedTests: Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    LLMProviderStatusFeed.failedTest(
+                        providerID: provider.provider_id,
+                        dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                    ).map { (provider.provider_id, $0) }
+                })
             ))
         } catch {
             return .failed(error.localizedDescription)

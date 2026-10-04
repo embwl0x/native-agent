@@ -28,7 +28,11 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         let limit = clampedInt(input["limit"] ?? input["max"], defaultValue: 20, min: 1, max: 100)
         let calendarName = inputString(input["calendar_name"] ?? input["calendarName"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let events = await upcomingEventRows(window: window, calendarName: calendarName, limit: limit)
+        let calendarID = inputString(input["calendar_id"])
+        if let calendarID, !store.calendars(for: .event).contains(where: { $0.calendarIdentifier == calendarID }) {
+            return .object(["status": .string("failed"), "reason": .string("Unknown calendar_id.")])
+        }
+        let events = await upcomingEventRows(window: window, calendarName: calendarName, calendarID: calendarID, limit: limit)
 
         var payload: [String: JSONValue] = [
             "status": .string("completed"),
@@ -58,6 +62,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     nonisolated private static func upcomingEventRows(
         window: CalendarListWindow,
         calendarName: String?,
+        calendarID: String?,
         limit: Int
     ) async -> [JSONValue] {
         await Task.detached(priority: .userInitiated) { () -> [JSONValue] in
@@ -66,7 +71,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
                 let needle = name.lowercased()
                 return { $0.lowercased().contains(needle) }
             }
-            return Store.withEvents(start: window.start, end: window.end, calendarMatches: calendarMatches) { events in
+            return Store.withEvents(start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ in
                 events
                     .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
                     .prefix(limit)
@@ -75,9 +80,56 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         }.value
     }
 
+    public static func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue {
+        let store = Store()
+        guard try await store.requestCalendarAccess(.read) else {
+            return permissionEnvelope(actionId: "mac.calendar_calendars", source: "calendar", status: calendarAuthorizationState())
+        }
+        return .object(["status": .string("completed"), "calendars": .array(store.calendars(for: .event).map {
+            .object(["calendarId": .string($0.calendarIdentifier), "title": .string($0.title),
+                     "source": .string($0.sourceTitle), "writable": .bool($0.allowsContentModifications)])
+        })])
+    }
+
+    public static func calendarFreeBusy(input: [String: JSONValue]) async throws -> JSONValue {
+        guard case .array(let values)? = input["calendar_ids"], !values.isEmpty, values.count <= 50,
+              values.allSatisfy({ inputString($0)?.isEmpty == false }),
+              let start = parseInputDate(input["start"]), let end = parseInputDate(input["end"]),
+              end > start, end.timeIntervalSince(start) <= 31 * 86_400 else {
+            return .object(["status": .string("failed"), "reason": .string("Provide 1-50 exact calendar_ids and a valid start/end window of at most 31 days.")])
+        }
+        let calendarIDs = values.compactMap { inputString($0) }
+        guard Set(calendarIDs).count == calendarIDs.count else {
+            return .object(["status": .string("failed"), "reason": .string("Unknown calendar_id.")])
+        }
+        let store = Store()
+        guard try await store.requestCalendarAccess(.read) else {
+            return permissionEnvelope(actionId: "mac.calendar_free_busy", source: "calendar", status: calendarAuthorizationState())
+        }
+        let available = Set(store.calendars(for: .event).map(\.calendarIdentifier))
+        guard Set(calendarIDs).isSubset(of: available) else {
+            return .object(["status": .string("failed"), "reason": .string("Unknown calendar_id; enumerate calendars before checking availability.")])
+        }
+        let rows = await Task.detached(priority: .userInitiated) {
+            Store.withEvents(start: start, end: end, calendarIDs: calendarIDs, calendarMatches: nil) { events, observedCalendarIDs in
+                calendarIDs.map { calendarID -> JSONValue in
+                    let intervals = events.filter { $0.calendarIdentifier == calendarID && !$0.isCancelled && $0.availability != "free" }
+                    let unknown = !observedCalendarIDs.contains(calendarID)
+                        || intervals.contains { $0.availability == "unknown" || $0.startDate == nil || $0.endDate == nil }
+                    return .object(["calendarId": .string(calendarID), "availability": .string(unknown ? "unknown" : intervals.isEmpty ? "free" : "busy"),
+                        "intervals": .array(intervals.map { event in .object([
+                            "start": event.startDate.map { .string(iso(max(start, $0))) } ?? .null,
+                            "end": event.endDate.map { .string(iso(min(end, $0))) } ?? .null,
+                            "availability": .string(event.availability)]) })])
+                }
+            }
+        }.value
+        return .object(["status": .string("completed"), "scope": .string("local_events"), "start": .string(iso(start)), "end": .string(iso(end)), "calendars": .array(rows)])
+    }
+
     public static func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue {
         let store = Store()
-        let granted = try await store.requestReminderAccess(allowPrompt: ReminderCraftBinding.current == nil)
+        let granted = try await store.requestReminderAccess(allowPrompt: true)
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.reminders_list_due_today",
@@ -86,9 +138,6 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             )
         }
 
-        if let binding = ReminderCraftBinding.current {
-            return await craftReminderEvidence(store: store, binding: binding)
-        }
         let includeCompleted = inputBool(input["include_completed"] ?? input["includeCompleted"], defaultValue: false)
         let limit = clampedInt(input["limit"] ?? input["max"], defaultValue: 50, min: 1, max: 200)
         let listName = inputString(input["list_name"] ?? input["listName"])?
@@ -102,13 +151,19 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             value: 1,
             to: Calendar.current.startOfDay(for: Date())
         ) ?? Date().addingTimeInterval(24 * 3600)
-        let reminders = await fetchDueReminderJSON(
+        guard let reminders = await fetchDueReminderJSON(
             store: store,
             calendars: calendars,
             includeCompleted: includeCompleted,
             endOfToday: endOfToday,
             limit: limit
-        )
+        ) else {
+            return .object([
+                "status": .string("failed"),
+                "actionId": .string("mac.reminders_list_due_today"),
+                "reason": .string("Reminders read is unavailable."),
+            ])
+        }
 
         return .object([
             "status": .string("completed"),
@@ -118,6 +173,174 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             "includeCompleted": .bool(includeCompleted),
             "count": .int(Int64(reminders.count)),
             "reminders": .array(Array(reminders)),
+        ])
+    }
+
+    public static func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue {
+        let actionId = "mac.reminders_query"
+        let start = parseInputDate(input["due_start"])
+        let end = parseInputDate(input["due_end"])
+        let undatedOnly = inputBool(input["undated_only"], defaultValue: false)
+        guard (input["due_start"] == nil || start != nil),
+              (input["due_end"] == nil || end != nil),
+              !(undatedOnly && (start != nil || end != nil)),
+              start == nil || end == nil || start! < end! else {
+            return .object(["status": .string("failed"), "actionId": .string(actionId),
+                "reason": .string("Provide valid due_start/due_end with start before end; undated_only cannot be combined with a due range.")])
+        }
+        let store = Store()
+        guard try await store.requestReminderAccess(allowPrompt: true) else {
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+        }
+        let includeCompleted = inputBool(input["include_completed"], defaultValue: false)
+        let query = inputString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let listName = inputString(input["list_name"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let calendars = filteredCalendars(store.calendars(for: .reminder), matching: listName)
+        let offset = clampedInt(input["offset"], defaultValue: 0, min: 0, max: Int.max)
+        let limit = clampedInt(input["limit"], defaultValue: 20, min: 1, max: 100)
+        return await withCheckedContinuation { continuation in
+            store.fetchReminders(in: calendars, incompleteOnly: !includeCompleted) { reminders in
+                guard let reminders else {
+                    continuation.resume(returning: .object(["status": .string("failed"), "actionId": .string(actionId),
+                        "reason": .string("Reminders read is unavailable.")]))
+                    return
+                }
+                let matching = reminders.filter { reminder in
+                    if !includeCompleted && reminder.isCompleted { return false }
+                    if let listName, !listName.isEmpty, !reminder.calendarTitle.localizedCaseInsensitiveContains(listName) { return false }
+                    if !query.isEmpty && !(reminder.title ?? "").localizedCaseInsensitiveContains(query)
+                        && !(reminder.notes ?? "").localizedCaseInsensitiveContains(query) { return false }
+                    let due = reminder.dueDateComponents?.date
+                    if undatedOnly { return due == nil }
+                    if start != nil || end != nil {
+                        guard let due else { return false }
+                        if let start, due < start { return false }
+                        if let end, due >= end { return false }
+                    }
+                    return true
+                }.sorted {
+                    let left = $0.dueDateComponents?.date ?? .distantFuture
+                    let right = $1.dueDateComponents?.date ?? .distantFuture
+                    return left == right ? $0.calendarItemIdentifier < $1.calendarItemIdentifier : left < right
+                }
+                let rows = matching.dropFirst(offset).prefix(limit).map { Self.reminderJSON($0) }
+                let next = offset + rows.count
+                continuation.resume(returning: .object([
+                    "status": .string("completed"), "actionId": .string(actionId), "source": .string("eventkit"),
+                    "includeCompleted": .bool(includeCompleted), "count": .int(Int64(rows.count)),
+                    "total": .int(Int64(matching.count)), "offset": .int(Int64(offset)),
+                    "next_offset": next < matching.count ? .int(Int64(next)) : .null,
+                    "reminders": .array(rows),
+                ]))
+            }
+        }
+    }
+
+    public static func remindersRead(input: [String: JSONValue]) async throws -> JSONValue {
+        let actionId = "mac.reminders_read"
+        guard let id = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else {
+            return .object(["status": .string("failed"), "actionId": .string(actionId), "reason": .string("Provide an exact reminder id.")])
+        }
+        let store = Store()
+        guard try await store.requestReminderAccess(allowPrompt: true) else {
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+        }
+        guard let reminder = store.reminder(withIdentifier: id) else {
+            return .object(["status": .string("failed"), "actionId": .string(actionId), "reason": .string("The exact reminder was not found.")])
+        }
+        return .object(["status": .string("completed"), "actionId": .string(actionId), "source": .string("eventkit"),
+            "reminder": liveReminderJSON(reminder)])
+    }
+
+    private struct ReminderUpdateArguments {
+        let id: String
+        var title: String?
+        var notes: String?
+        var due: DateComponents?
+        var changesDue = false
+    }
+
+    private static func reminderUpdateArguments(input: [String: JSONValue]) throws(CalendarArgumentError) -> ReminderUpdateArguments {
+        func invalid(_ reason: String) -> CalendarArgumentError { .init(action: "mac.reminders_update", reason: reason) }
+        guard case .string(let rawID)? = input["id"], !rawID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw invalid("Provide an exact reminder id.")
+        }
+        var arguments = ReminderUpdateArguments(id: rawID.trimmingCharacters(in: .whitespacesAndNewlines))
+        var cleared: Set<String> = []
+        if let raw = input["clear_fields"] {
+            guard case .array(let fields) = raw else { throw invalid("clear_fields must be an array containing only notes or due_date.") }
+            for field in fields {
+                guard case .string(let name) = field, ["notes", "due_date"].contains(name) else {
+                    throw invalid("clear_fields must be an array containing only notes or due_date.")
+                }
+                cleared.insert(name)
+            }
+        }
+        if let raw = input["title"] {
+            guard case .string(let title) = raw, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw invalid("title must be a nonempty string.")
+            }
+            arguments.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let raw = input["notes"] {
+            guard case .string(let notes) = raw else { throw invalid("notes must be a string; use clear_fields to remove them.") }
+            guard !cleared.contains("notes") || notes.isEmpty else { throw invalid("Do not both set and clear notes.") }
+            arguments.notes = notes
+        }
+        if cleared.contains("notes") { arguments.notes = "" }
+        if let raw = input["due_date"] {
+            arguments.changesDue = true
+            if raw != .string("") || !cleared.contains("due_date") {
+                guard !cleared.contains("due_date") else { throw invalid("Do not both set and clear due_date.") }
+                guard let due = parseInputDate(raw) else { throw invalid("due_date must be an ISO-8601 date or epoch seconds; use clear_fields to remove it.") }
+                arguments.due = reminderDueComponents(from: due, input: raw)
+            }
+        }
+        if cleared.contains("due_date") { arguments.changesDue = true }
+        guard arguments.title != nil || arguments.notes != nil || arguments.changesDue else {
+            throw invalid("Provide at least one of: title, notes, due_date, clear_fields.")
+        }
+        return arguments
+    }
+
+    public static func remindersUpdate(input: [String: JSONValue]) async throws -> JSONValue {
+        let actionId = "mac.reminders_update"
+        let arguments: ReminderUpdateArguments
+        do { arguments = try reminderUpdateArguments(input: input) }
+        catch { return error.result }
+        let store = Store()
+        guard try await store.requestReminderAccess(allowPrompt: true) else {
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+        }
+        guard let reminder = store.reminder(withIdentifier: arguments.id) else {
+            return .object(["status": .string("failed"), "actionId": .string(actionId), "reason": .string("The exact reminder was not found.")])
+        }
+        guard reminder.calendar.allowsContentModifications else {
+            return .object(["status": .string("failed"), "actionId": .string(actionId), "reason": .string("The reminder list is read-only.")])
+        }
+        if let title = arguments.title { reminder.title = title }
+        if let notes = arguments.notes { reminder.notes = notes }
+        if arguments.changesDue {
+            reminder.dueDateComponents = arguments.due
+        }
+        try Task.checkCancellation()
+        do { try store.save(reminder) }
+        catch {
+            return .object(["status": .string("failed"), "actionId": .string(actionId), "reason": .string(error.localizedDescription)])
+        }
+        return .object(["status": .string("completed"), "actionId": .string(actionId), "source": .string("eventkit"),
+            "reminderId": .string(reminder.calendarItemIdentifier), "reminder": liveReminderJSON(reminder)])
+    }
+
+    private static func liveReminderJSON(_ reminder: Store.Reminder) -> JSONValue {
+        .object([
+            "id": .string(reminder.calendarItemIdentifier),
+            "title": .string(NativeAppSecretRedactor.redactText(reminder.title ?? "(Untitled reminder)")),
+            "list": .string(reminder.calendar.title), "listId": .string(reminder.calendar.calendarIdentifier),
+            "completed": .bool(reminder.isCompleted),
+            "dueAt": reminder.dueDateComponents?.date.map { .string(iso($0)) } ?? .null,
+            "completedAt": reminder.completionDate.map { .string(iso($0)) } ?? .null,
+            "notes": .string(NativeAppSecretRedactor.redactText(reminder.notes ?? "")),
         ])
     }
 
@@ -148,16 +371,17 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             ])
         }
         let endDate = parseInputDate(input["end"]) ?? startDate.addingTimeInterval(3600)
+        guard endDate > startDate, input["end"] == nil || parseInputDate(input["end"]) != nil else {
+            return .object(["status": .string("failed"), "reason": .string("end must be a valid time after start.")])
+        }
         let notes = inputString(input["notes"])
         let location = inputString(input["location"])
         let calendarNameField = input["calendar_name"] ?? input["calendarName"]
         let calendarName = inputString(calendarNameField)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        // 2026-09-06: only an ABSENT (or null) key means "use the default
-        // calendar". A supplied-but-empty name used to fall through to the
-        // default, so `calendar_name: "  "` silently wrote to whatever calendar
-        // the default happened to be — the same silent-wrong-destination the
-        // no-such-name error above exists to prevent.
+        if input["calendar_id"] != nil, inputString(input["calendar_id"])?.isEmpty != false {
+            return .object(["status": .string("failed"), "reason": .string("Unknown calendar_id.")])
+        }
         let calendarNameSupplied: Bool = {
             guard let calendarNameField else { return false }
             if case .null = calendarNameField { return false }
@@ -167,27 +391,23 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             return .object([
                 "status": .string("failed"),
                 "actionId": .string("mac.calendar_create_event"),
-                "reason": .string(
-                    "calendar_name was supplied but names no calendar. Omit calendar_name to "
-                    + "use the default calendar, or pass the name of a real one."
-                ),
+                "reason": .string("Choose an explicit calendar_id or a unique exact calendar_name."),
             ])
         }
 
-        // gpt-5.5 review NEEDS_FIX: `.writeOnly` users CAN write but CANNOT
-        // enumerate calendars. The old code called store.calendars(for:.event)
-        // unconditionally, which is a read operation that errors / returns
-        // empty under writeOnly. Skip the picker when status is .writeOnly
-        // and go straight to defaultCalendarForNewEvents (the only calendar
-        // a writeOnly user is allowed to write to anyway).
         let isWriteOnly = Store.calendarIsWriteOnly
-        // 2026-09-06: the schema says the default calendar is used when
-        // `calendar_name` is OMITTED. A supplied name that matched nothing used
-        // to fall back to the default too, so the event silently landed on a
-        // different calendar than the one asked for. A named destination that
-        // does not exist is an error that names the real ones.
         let pickedCalendar: Store.Calendar?
-        if isWriteOnly {
+        if let calendarID = inputString(input["calendar_id"]), !calendarID.isEmpty {
+            let calendars = isWriteOnly ? store.defaultCalendarForNewEvents.map { [$0] } ?? [] : store.calendars(for: .event)
+            guard let matched = calendars.first(where: { $0.calendarIdentifier == calendarID }),
+                  calendarName == nil || matched.title.caseInsensitiveCompare(calendarName!) == .orderedSame else {
+                return .object(["status": .string("failed"), "reason": .string("calendar_id is unavailable or does not match calendar_name.")])
+            }
+            pickedCalendar = matched
+        } else if isWriteOnly {
+            guard input["calendar_id"] == nil || input["calendar_id"] == .null else {
+                return .object(["status": .string("failed"), "reason": .string("calendar_id is unavailable or does not match calendar_name.")])
+            }
             if let calendarName, !calendarName.isEmpty {
                 return .object([
                     "status": .string("failed"),
@@ -202,17 +422,18 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             pickedCalendar = store.defaultCalendarForNewEvents
         } else if let calendarName, !calendarName.isEmpty {
             let calendars = store.calendars(for: .event)
-            guard let matched = pickCalendar(calendars, named: calendarName) else {
+            let matches = calendars.filter { $0.title.caseInsensitiveCompare(calendarName) == .orderedSame }
+            guard matches.count == 1, let matched = matches.first else {
                 return .object([
                     "status": .string("failed"),
                     "actionId": .string("mac.calendar_create_event"),
-                    "reason": .string("No calendar named '\(calendarName)'"),
-                    "available": .array(calendars.map { .string($0.title) }),
+                    "reason": .string("Calendar name is missing or ambiguous; choose an exact calendar_id."),
+                    "available": .array(calendars.map { .object(["title": .string($0.title), "calendarId": .string($0.calendarIdentifier)]) }),
                 ])
             }
             pickedCalendar = matched
         } else {
-            pickedCalendar = store.defaultCalendarForNewEvents
+            return .object(["status": .string("failed"), "reason": .string("Choose an explicit calendar_id or a unique exact calendar_name.")])
         }
         guard let targetCalendar = pickedCalendar else {
             return .object([
@@ -220,6 +441,10 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
                 "actionId": .string("mac.calendar_create_event"),
                 "reason": .string("No calendar available to write to"),
             ])
+        }
+
+        guard isWriteOnly || targetCalendar.allowsContentModifications else {
+            return .object(["status": .string("failed"), "reason": .string("The selected calendar is read-only.")])
         }
 
         let event = store.makeEvent()
@@ -249,6 +474,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             "start": .string(iso(startDate)),
             "end": .string(iso(endDate)),
             "calendar": .string(targetCalendar.title),
+            "calendarId": .string(targetCalendar.calendarIdentifier),
+            "invitations": .string("not_sent"),
         ])
     }
 
@@ -330,6 +557,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             case "mac_calendar_modify_event": _ = try calendarModifyArguments(input: input)
             case "mac_calendar_delete_event": _ = try calendarDeleteExpectation(input: input)
             case "mac_reminders_delete": _ = try reminderDeleteExpectation(input: input)
+            case "mac_reminders_update": _ = try reminderUpdateArguments(input: input)
             default: break
             }
             return nil
@@ -441,7 +669,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
 
     public static func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue {
         let store = Store()
-        let granted = try await store.requestReminderAccess(allowPrompt: ReminderCraftBinding.current == nil)
+        let granted = try await store.requestReminderAccess(allowPrompt: true)
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.reminders_create",
@@ -450,26 +678,6 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             )
         }
 
-        if let binding = ReminderCraftBinding.current {
-            // Re-resolve the list and inspect for an already-landed creation
-            // immediately before save, inside the permission-checked owner.
-            let observed = await craftReminderEvidence(store: store, binding: binding)
-            guard case .object(let evidence) = observed, evidence["ok"] == .bool(true),
-                  evidence["state"] == .string("absent"),
-                  let list = craftReminderList(store: store, binding: binding),
-                  input["title"] == .string(binding.title),
-                  input["list_name"] == .string(binding.listName),
-                  parseInputDate(input["due_date"]) == binding.dueDate else { return observed }
-            try Task.checkCancellation()
-            let reminder = store.makeReminder()
-            reminder.calendar = list
-            reminder.title = binding.title
-            var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-            reminder.dueDateComponents = calendar.dateComponents([.calendar, .timeZone, .year, .month, .day, .hour, .minute, .second], from: binding.dueDate)
-            try store.save(reminder)
-            return .object(["status": .string("completed"), "reminderId": .string(reminder.calendarItemIdentifier)])
-        }
         guard let title = inputString(input["title"])?.trimmingCharacters(in: .whitespacesAndNewlines),
               !title.isEmpty else {
             return .object([
@@ -479,7 +687,15 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             ])
         }
         let notes = inputString(input["notes"])
-        let dueDate = parseInputDate(input["due_date"] ?? input["dueDate"])
+        let dueDateField = input["due_date"] ?? input["dueDate"]
+        let dueDate = parseInputDate(dueDateField)
+        guard dueDateField == nil || dueDate != nil else {
+            return .object([
+                "status": .string("failed"),
+                "actionId": .string("mac.reminders_create"),
+                "reason": .string("due_date could not be parsed. Supply a valid date or omit due_date for an undated reminder."),
+            ])
+        }
         let listNameField = input["list_name"] ?? input["listName"]
         let listName = inputString(listNameField)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -506,12 +722,20 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         let pickedList: Store.Calendar?
         if let listName, !listName.isEmpty {
             let lists = store.calendars(for: .reminder)
-            guard let matched = pickCalendar(lists, named: listName) else {
+            let matches = lists.filter { $0.title.lowercased() == listName.lowercased() }
+            guard let matched = matches.first else {
                 return .object([
                     "status": .string("failed"),
                     "actionId": .string("mac.reminders_create"),
                     "reason": .string("No reminder list named '\(listName)'"),
                     "available": .array(lists.map { .string($0.title) }),
+                ])
+            }
+            guard matches.count == 1 else {
+                return .object([
+                    "status": .string("failed"),
+                    "actionId": .string("mac.reminders_create"),
+                    "reason": .string("Multiple reminder lists are named '\(listName)'. Give the intended list a unique name before retrying."),
                 ])
             }
             pickedList = matched
@@ -530,10 +754,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         reminder.title = title
         if let notes, !notes.isEmpty { reminder.notes = notes }
         if let dueDate {
-            reminder.dueDateComponents = Calendar.current.dateComponents(
-                [.year, .month, .day, .hour, .minute, .second],
-                from: dueDate
-            )
+            reminder.dueDateComponents = reminderDueComponents(from: dueDate, input: dueDateField)
         }
         reminder.calendar = targetList
 
@@ -561,9 +782,18 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         return .object(payload)
     }
 
+    private static func reminderDueComponents(from date: Date, input: JSONValue?) -> DateComponents {
+        let dateOnly = inputString(input)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .range(of: #"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"#, options: .regularExpression) != nil
+        let fields: Set<Calendar.Component> = dateOnly
+            ? [.calendar, .year, .month, .day]
+            : [.calendar, .timeZone, .year, .month, .day, .hour, .minute, .second]
+        return Calendar(identifier: .gregorian).dateComponents(fields, from: date)
+    }
+
     public static func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue {
         let store = Store()
-        let granted = try await store.requestReminderAccess(allowPrompt: ReminderCraftBinding.current == nil)
+        let granted = try await store.requestReminderAccess(allowPrompt: true)
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.reminders_complete",
@@ -676,12 +906,6 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         }
     }
 
-    private static func pickCalendar(_ calendars: [Store.Calendar], named name: String?) -> Store.Calendar? {
-        guard let name, !name.isEmpty else { return nil }
-        let needle = name.lowercased()
-        return calendars.first { $0.title.lowercased() == needle }
-    }
-
     private static func parseInputDate(_ raw: JSONValue?) -> Date? {
         switch raw {
         case .string(let s):
@@ -750,6 +974,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
     }
 
     private static func permissionEnvelope(actionId: String, source: String, status: String) -> JSONValue {
+        // A skill never opens a macOS prompt or asks for a grant: it hands back to her.
+        if SkillRunContext.handsBack { return SkillRunContext.handBack("macOS \(source.capitalized) permission") }
         let message: String
         if status == "probe_needed" {
             message = "Open NativeAgent > Mac Integration and click Grant beside \(source.capitalized) so macOS can register the permission request."
@@ -772,58 +998,23 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
         return filtered.isEmpty ? [] : filtered
     }
 
-    private static func craftReminderList(store: Store, binding: ReminderCraftBinding) -> Store.Calendar? {
-        let lists = store.calendars(for: .reminder).filter { $0.title == binding.listName }
-        guard lists.count == 1, let list = lists.first, list.allowsContentModifications,
-              binding.listID == nil || binding.listID == list.calendarIdentifier else { return nil }
-        return list
-    }
-
-    private static func craftReminderEvidence(store: Store, binding: ReminderCraftBinding) async -> JSONValue {
-        guard let list = craftReminderList(store: store, binding: binding) else {
-            return .object(["ok": .bool(false), "reason": .string("The exact writable reminder list is missing, ambiguous, or changed.")])
-        }
-        let listID = list.calendarIdentifier
-        return await withCheckedContinuation { continuation in
-            store.fetchReminders(in: [list], incompleteOnly: false) { reminders in
-                continuation.resume(returning: Self.craftReminderJSON(reminders, binding: binding, listID: listID))
-            }
-        }
-    }
-
-    nonisolated private static func craftReminderJSON(_ reminders: [Store.ReminderRead]?, binding: ReminderCraftBinding, listID: String) -> JSONValue {
-        guard let reminders else {
-            return .object(["ok": .bool(false), "reason": .string("Reminders readback is unavailable.")])
-        }
-        let correlated = reminders.filter { $0.calendarItemIdentifier == binding.reminderID }
-        let matching = reminders.filter { $0.title == binding.title && $0.dueDateComponents?.date == binding.dueDate }
-        var result: [String: JSONValue] = ["ok": .bool(true), "list_id": .string(listID)]
-        if correlated.isEmpty, matching.isEmpty, binding.reminderID == nil {
-            result["state"] = .string("absent")
-        } else if correlated.count == 1, let reminder = correlated.first,
-                  matching.count == 1, matching.first?.calendarItemIdentifier == reminder.calendarItemIdentifier,
-                  !reminder.isCompleted, reminder.calendarIdentifier == listID {
-            result["state"] = .string("verified")
-            result["reminder_id"] = .string(reminder.calendarItemIdentifier)
-        } else {
-            result["state"] = .string("drift")
-        }
-        return .object(result)
-    }
-
     private static func fetchDueReminderJSON(
         store: Store,
         calendars: [Store.Calendar]?,
         includeCompleted: Bool,
         endOfToday: Date,
         limit: Int
-    ) async -> [JSONValue] {
+    ) async -> [JSONValue]? {
         // Read views stay on EventKit's queue; filter and render to Sendable
         // values before resuming Core, preserving the platform's isolation.
         await withCheckedContinuation { continuation in
             store.fetchReminders(in: calendars, incompleteOnly: false) { reminders in
+                guard let reminders else {
+                    continuation.resume(returning: nil)
+                    return
+                }
                 let values = Self.processReminders(
-                    reminders ?? [],
+                    reminders,
                     includeCompleted: includeCompleted,
                     endOfToday: endOfToday,
                     limit: limit
@@ -844,7 +1035,7 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             .filter { reminder in
                 if !includeCompleted && reminder.isCompleted { return false }
                 guard let due = reminder.dueDateComponents?.date else { return false }
-                return due <= endOfToday
+                return due < endOfToday
             }
             .sorted {
                 ($0.dueDateComponents?.date ?? .distantFuture) < ($1.dueDateComponents?.date ?? .distantFuture)
@@ -862,6 +1053,8 @@ public enum LocalPIMConnectorActions<Store: LocalPIMStore> {
             "id": .string(event.eventIdentifier ?? ""),
             "title": .string(NativeAppSecretRedactor.redactText(event.title ?? "(Untitled event)")),
             "calendar": .string(event.calendarTitle),
+            "calendarId": .string(event.calendarIdentifier),
+            "availability": .string(event.availability),
             "allDay": .bool(event.isAllDay),
         ]
         if let start = event.startDate { obj["startAt"] = .string(iso(start)) }

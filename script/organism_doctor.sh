@@ -157,11 +157,8 @@ if [ "$bridge_rc" -eq 0 ]; then
   loop_budget="$(jq -r '.organism.behavior.loopBudget // "unknown"' "$state_file")"
   signal_count="$(jq -r '.organism.signalCount // 0' "$state_file")"
   body_line="$(jq -r '.organism.promptVisibleBodyLine // "quiet"' "$state_file")"
-  review_count="$(jq -r '.organism.reflex.reviewRequiredCount // 0' "$state_file")"
-  approved_biases="$(jq -r '.organism.reflex.approvedLowRiskCount // 0' "$state_file")"
   dream_proposals="$(jq -r '.organism.dreamRepair.proposedStandingViews // 0' "$state_file")"
   evidence_count="$(jq -r '(.organism.dreamRepair.latestEvidence // []) | length' "$state_file")"
-  candidate_count="$(jq -r '(.organism.reflex.candidates // []) | length' "$state_file")"
 
   bool_status "$chat_ready" "chat ready" "false; bridge can answer state but chat is not ready"
   if [ -n "$repo_revision" ] && [ "$running_dirty" = "false" ] && [ "$running_revision" = "$repo_revision" ]; then
@@ -173,7 +170,7 @@ if [ "$bridge_rc" -eq 0 ]; then
   status INFO "active model" "$active_model"
   status INFO "behavior posture" "posture=$posture claims=$claims strategy=$strategy loops=$loop_budget"
   status INFO "body line" "$body_line"
-  status INFO "organism counters" "signals=$signal_count candidates=$candidate_count reviews=$review_count approvedBiases=$approved_biases dreamEvidence=$evidence_count dreamProposals=$dream_proposals"
+  status INFO "organism counters" "signals=$signal_count dreamEvidence=$evidence_count dreamProposals=$dream_proposals"
 
   providers="$(jq -r '.organism.bodySchema.providersHealthy // false' "$state_file")"
   tools="$(jq -r '.organism.bodySchema.toolHandsAvailable // false' "$state_file")"
@@ -234,8 +231,7 @@ if [ -f "$ORGANISM_STATE_PATH" ]; then
     saved_at="$(jq -r '.savedAt // "unknown"' "$ORGANISM_STATE_PATH")"
     persisted_signals="$(jq -r '.signalCount // 0' "$ORGANISM_STATE_PATH")"
     field_nodes="$(jq -r '(.field.nodes // {}) | length' "$ORGANISM_STATE_PATH")"
-    reflex_candidates="$(jq -r '(.reflexState.candidates // {}) | length' "$ORGANISM_STATE_PATH")"
-    status PASS "organism_state.json" "schema=$schema savedAt=$saved_at signals=$persisted_signals fieldNodes=$field_nodes reflexCandidates=$reflex_candidates"
+    status PASS "organism_state.json" "schema=$schema savedAt=$saved_at signals=$persisted_signals fieldNodes=$field_nodes"
   else
     status FAIL "organism_state.json" "exists but is not valid JSON: $ORGANISM_STATE_PATH"
   fi
@@ -249,15 +245,12 @@ if [ -n "$snapshot_path" ] && [ -f "$snapshot_path" ]; then
   if jq empty "$snapshot_path" >/dev/null 2>&1; then
     generated="$(jq -r '.generatedAt // "unknown"' "$snapshot_path")"
     ios_posture="$(jq -r '.posture // "unknown"' "$snapshot_path")"
-    ios_reviews="$(jq -r '.counters.reflexesNeedReview // 0' "$snapshot_path")"
-    ios_biases="$(jq -r '.counters.approvedReflexBiases // 0' "$snapshot_path")"
-    ios_candidates="$(jq -r '(.reflexCandidates // []) | length' "$snapshot_path")"
     ios_proposals="$(jq -r '(.standingViewProposals // []) | length' "$snapshot_path")"
     snapshot_mtime="$(stat -f '%m' "$snapshot_path" 2>/dev/null || echo 0)"
     snapshot_age="$(( $(date +%s) - snapshot_mtime ))"
     if [ "$snapshot_age" -lt 0 ]; then snapshot_age=0; fi
     if [ "$snapshot_mtime" -gt 0 ] && [ "$snapshot_age" -le 600 ]; then
-      status PASS "organism_living_status" "generatedAt=$generated age=${snapshot_age}s posture=$ios_posture reviews=$ios_reviews biases=$ios_biases candidates=$ios_candidates proposals=$ios_proposals"
+      status PASS "organism_living_status" "generatedAt=$generated age=${snapshot_age}s posture=$ios_posture proposals=$ios_proposals"
     else
       status WARN "organism_living_status" "stale snapshot generatedAt=$generated age=${snapshot_age}s posture=$ios_posture"
     fi

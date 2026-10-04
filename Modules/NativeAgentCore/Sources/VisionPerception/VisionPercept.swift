@@ -1,24 +1,11 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import MacControl
 
 // MARK: - The emitted rows
 //
-// The shared contract is `MacLookPercept` and this module emits one. But
-// `MacLookAffordance` has no place to put per-attribute confidence, evidence
-// source, provenance or an abstain marker — and MacControl is not this
-// module's to change. So a vision percept is BOTH:
-//
-//   • `VisionPercept.percept` — the real `MacLookPercept`, so glance/look and
-//     every existing consumer work unchanged; and
-//   • `VisionPercept.rows` — the per-row vision sidecar, aligned by handle,
-//     carrying the trust contract.
-//
-// `VisionPercept.toJSON()` emits ONE merged row per affordance, which is what
-// actually rides out. There is no path by which a vision affordance reaches a
-// consumer without `provenance: "vision"` and all five confidences attached,
-// because the merge happens in the serializer, not at the call site.
+// Vision rows retain provenance and per-attribute confidence for the shared
+// screen/target adapter and JSON serializer.
 
 public struct VisionAffordanceRow: Sendable, Equatable {
     public let handle: String
@@ -218,8 +205,6 @@ public struct VisionRecognizedText: Sendable, Equatable {
 }
 
 public struct VisionPercept: Sendable, Equatable {
-    /// The SHARED contract shape, so existing consumers need no branch.
-    public let percept: MacLookPercept
     public let rows: [VisionAffordanceRow]
     public let readouts: [VisionReadoutRow]
     public let abstain: VisionAbstainReport
@@ -235,7 +220,6 @@ public struct VisionPercept: Sendable, Equatable {
     public let notes: [String]
 
     public init(
-        percept: MacLookPercept,
         rows: [VisionAffordanceRow],
         readouts: [VisionReadoutRow],
         abstain: VisionAbstainReport,
@@ -246,7 +230,6 @@ public struct VisionPercept: Sendable, Equatable {
         recognizedText: [VisionRecognizedText],
         notes: [String]
     ) {
-        self.percept = percept
         self.rows = rows
         self.readouts = readouts
         self.abstain = abstain
@@ -268,14 +251,6 @@ public struct VisionPercept: Sendable, Equatable {
 
     public func row(handle: String) -> VisionAffordanceRow? {
         rows.first { $0.handle == handle }
-    }
-
-    /// The one line a glance prints. Delegated to the shared compiler's own
-    /// renderer so a vision glance and an AX glance read identically — with
-    /// the provenance stated, because a caller must never have to guess which
-    /// organ produced a sentence.
-    public func glanceLine() -> String {
-        "[vision] " + percept.glanceLine()
     }
 
     public func toJSON() -> JSONValue {
@@ -300,56 +275,4 @@ public struct VisionPercept: Sendable, Equatable {
         return .object(object)
     }
 
-    // MARK: - TARGET confidence against an actual request
-
-    /// `target` on a bare percept answers "how separately addressable is this
-    /// row" — the prior. When a caller names what they are after, this is what
-    /// refines it into the question Agent actually posed: "how sure are you
-    /// this is THE element I asked for", which is the attribute that gates
-    /// acting.
-    ///
-    /// Deliberately conservative: a query matching two rows drags BOTH down
-    /// rather than picking a winner, because picking is precisely the forced
-    /// best guess the abstain contract forbids.
-    public func resolving(_ query: String) -> [VisionAffordanceRow] {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !needle.isEmpty else { return rows }
-        func score(_ row: VisionAffordanceRow) -> Double {
-            guard let label = row.displayLabel?.lowercased(), !label.isEmpty else { return 0 }
-            if label == needle { return 1 }
-            if label.hasPrefix(needle) || needle.hasPrefix(label) { return 0.75 }
-            if label.contains(needle) || needle.contains(label) { return 0.5 }
-            return 0
-        }
-        let scored = rows.map { (row: $0, match: score($0)) }.filter { $0.match > 0 }
-        let best = scored.map(\.match).max() ?? 0
-        let tied = scored.filter { $0.match >= best }.count
-        return scored.map { entry in
-            // Ambiguity between two equally-good label matches is an ABSTAIN,
-            // not a coin flip.
-            let contested = tied > 1 && entry.match >= best
-            let refined = contested
-                ? min(entry.row.confidence.target, 0.25)
-                : min(1, entry.row.confidence.target * (0.5 + 0.5 * entry.match) + 0.25 * entry.match)
-            return VisionAffordanceRow(
-                handle: entry.row.handle,
-                handleAmbiguity: entry.row.handleAmbiguity,
-                roleGuess: entry.row.roleGuess,
-                roleRationale: entry.row.roleRationale,
-                label: entry.row.label,
-                rect: entry.row.rect,
-                confidence: entry.row.confidence.withTarget(refined),
-                state: entry.row.state,
-                evidence: entry.row.evidence,
-                ambiguous: contested
-                    ? "query \"\(query)\" matches \(tied) rows equally well — abstaining"
-                    : entry.row.ambiguous,
-                destructiveRisk: entry.row.destructiveRisk,
-                salience: entry.row.salience,
-                visualContrast: entry.row.visualContrast,
-                visualColor: entry.row.visualColor,
-                visualShape: entry.row.visualShape
-            )
-        }.sorted { $0.confidence.target > $1.confidence.target }
-    }
 }
