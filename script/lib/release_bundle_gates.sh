@@ -537,7 +537,10 @@ release_assert_scanner_canary() {
 # release_collect_identity_gate_binaries <bundle>
 # Fills RELEASE_IDENTITY_BINARIES with the app-owned executables. Contents/
 # Frameworks (Sparkle, third-party) is deliberately out of scope — we do not
-# build it and it cannot carry our identity strings.
+# build it and it cannot carry our identity strings. The pinned upstream
+# `codex` executable (script/fetch_codex.sh, an OpenAI release download) is
+# out of scope for the same reason; its Unicode tables and stopword lists
+# are exactly the jumbled byte runs the raw pass mistakes for names.
 #
 # rc 0 = the list is complete and non-empty. rc 2 = the enumeration failed or
 # found nothing, which is a staging failure, NOT a clean binary. The previous
@@ -560,7 +563,7 @@ release_collect_identity_gate_binaries() {
   status_file="$(mktemp "${TMPDIR:-/tmp}/nativeagent-gate-find.XXXXXX")" || return 2
   while IFS= read -r -d '' f; do
     RELEASE_IDENTITY_BINARIES+=("$f")
-  done < <(find "$dir" -type f -perm -u+x -print0; printf '%s' "$?" > "$status_file")
+  done < <(find "$dir" -type f -perm -u+x ! -name codex -print0; printf '%s' "$?" > "$status_file")
   find_rc="$(cat "$status_file")"
   rm -f "$status_file"
   if [[ "$find_rc" != "0" ]]; then
