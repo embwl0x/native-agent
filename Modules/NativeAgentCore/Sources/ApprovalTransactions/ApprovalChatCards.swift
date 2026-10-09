@@ -36,27 +36,24 @@ public enum ApprovalChatCards {
         telegram: TelegramApprovalFiler? = nil,
         quiet: Bool = false
     ) async -> Outcome {
-        guard record.status == "pending", !record.chatCardDelivered,
-              !record.isAgentsOwnDecision,               // hers to decide
-              !hasTelegramPrompt(record),                // its turn's chat has buttons
+        guard record.status == "pending", !record.isAgentsOwnDecision else { return .skipped }  // hers to decide
+        // A Telegram turn's approval: its chat has buttons, and no Mac card.
+        let outcome = hasTelegramPrompt(record) ? .skipped : await postCard(record, dataRoot: dataRoot)
+        if let telegram, !quiet { await promptTelegram(record, telegram: telegram, dataRoot: dataRoot) }
+        return outcome
+    }
+
+    /// The card in the conversation User is in, unless it was raised there.
+    private static func postCard(_ record: ApprovalRecord, dataRoot: URL) async -> Outcome {
+        guard !record.chatCardDelivered,
               let anchor = record.chatCardSessionId ?? usersConversation(unless: record.chatOriginSessionId, dataRoot: dataRoot)
         else { return .skipped }
-        // Telegram only reaches the bot's verified owner, in his own DM, when
-        // that DM is the conversation he is in. A script install gets a line
-        // there, never a button: Telegram cannot show the whole script.
-        let ownerChat = telegram == nil ? nil : await ownerDM(boundTo: anchor, dataRoot: dataRoot)
-        let isScript = record.action == SwiftNativeApprovalInbox.skillScriptInstallAction
-        let buttonsChat = record.remoteResolvable && !record.localOnly && !isScript ? ownerChat : nil
-        var card: [String: JSONValue] = [
+        let card: JSONValue = .object([
             "sessionId": .string(anchor),
             "at": .string(ISO8601DateFormatter().string(from: Date())),
-        ]
-        if let buttonsChat { card["telegramChatId"] = .string(String(buttonsChat)) }
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let claimed: ApprovalRecord
-        let destination: String
+        ])
         do {
-            guard let saved = try await inbox.claimChatCard(record.id, card: .object(card), deliver: { pending in
+            guard let saved = try await SwiftNativeApprovalInbox(root: dataRoot).claimChatCard(record.id, card: card, deliver: { pending in
                 guard let sessionID = pending.chatCardSessionId,
                       NativeAgentChatSessionID.normalizedPathComponent(sessionID) == sessionID else {
                     throw ApprovalInboxError.malformedResponse("invalid chat-card session")
@@ -66,22 +63,47 @@ public enum ApprovalChatCards {
             guard let sessionID = saved.chatCardSessionId else {
                 throw ApprovalInboxError.malformedResponse("invalid chat-card session")
             }
-            claimed = saved
-            destination = sessionID
+            return .posted(sessionID)
         } catch {
             // The strip remains visible until delivery is confirmed.
-            NSLog("[approval-chat-card] delivery failed: %@", error.localizedDescription)
+            nativeLog("[approval-chat-card] delivery failed: %@", error.localizedDescription)
             return .failed
         }
-        if let telegram, let ownerChat, !quiet, buttonsChat != nil || isScript {
-            do {
-                try await telegram.promptChatCard(redactedForTelegram(claimed), chatId: ownerChat,
-                                                  payload: NativeAppSecretRedactor.redactArguments(decisionPayload(claimed)))
-            } catch {
-                NSLog("[approval-chat-card] Telegram prompt failed: %@", error.localizedDescription)
+    }
+
+    /// User, 10-07: every approval reaches his Telegram DM once, wherever it
+    /// was raised and whichever conversation he is in. That DM is User, with
+    /// the signed phone's authority. A script install gets a line there,
+    /// never a button: Telegram cannot show the whole script.
+    private static func promptTelegram(_ record: ApprovalRecord, telegram: TelegramApprovalFiler, dataRoot: URL) async {
+        guard !telegramPrompted(record), let owner = ownerDM(dataRoot: dataRoot) else { return }
+        do {
+            try await telegram.promptChatCard(redactedForTelegram(record), chatId: owner,
+                                              payload: NativeAppSecretRedactor.redactArguments(decisionPayload(record)))
+            var mark: [String: JSONValue] = ["telegramPromptedAt": .string(ISO8601DateFormatter().string(from: Date()))]
+            if record.action != SwiftNativeApprovalInbox.skillScriptInstallAction {
+                mark["telegramChatId"] = .string(String(owner))
             }
+            try await SwiftNativeApprovalInbox(root: dataRoot).markChatCard(record.id, mark)
+        } catch {
+            nativeLog("[approval-chat-card] Telegram prompt failed: %@", error.localizedDescription)
         }
-        return .posted(destination)
+    }
+
+    /// When the bot starts: each pending approval that never reached User's DM
+    /// gets its prompt, once.
+    public static func promptPending(dataRoot: URL, telegram: TelegramApprovalFiler) async {
+        guard let rows = try? await SwiftNativeApprovalInbox(root: dataRoot).list(filter: ApprovalFilter(status: "pending"))
+        else { return }
+        for row in rows where !row.isAgentsOwnDecision {
+            await promptTelegram(row, telegram: telegram, dataRoot: dataRoot)
+        }
+    }
+
+    /// Delivered to his DM: marked only after the send succeeded.
+    private static func telegramPrompted(_ record: ApprovalRecord) -> Bool {
+        guard case .object(let card)? = record.chatCard else { return false }
+        return card["telegramPromptedAt"] != nil
     }
 
     /// The conversation User is in (the anchor), or nil when there is none or
@@ -93,13 +115,17 @@ public enum ApprovalChatCards {
         return anchor
     }
 
-    /// The bot's owner: its one allowlisted Telegram user, whose private chat
-    /// (a DM's id is its user's id) must be the conversation User is in. No
-    /// single verified owner, no Telegram prompt.
+    /// The bot's owner DM, when it is the conversation User is in.
     public static func ownerDM(boundTo anchor: String, dataRoot: URL) async -> Int? {
-        guard let owners = TelegramConfig.loadFromDisk(dataRoot: dataRoot)?.allowedUserIds,
-              owners.count == 1, let owner = owners.first.flatMap({ Int(exactly: $0) }), owner > 0,
+        guard let owner = ownerDM(dataRoot: dataRoot),
               await TelegramSessionStore(dataRoot: dataRoot).boundSessionId(chatId: owner) == anchor
+        else { return nil }
+        return owner
+    }
+
+    /// The bot's single configured owner, whose private chat id is his user id.
+    static func ownerDM(dataRoot: URL) -> Int? {
+        guard let owner = TelegramConfig.loadFromDisk(dataRoot: dataRoot)?.ownerUserId.flatMap({ Int(exactly: $0) })
         else { return nil }
         return owner
     }
@@ -181,6 +207,31 @@ public enum ApprovalChatCards {
                 try await persistence.appendJSONL(row, to: path)
             }
         }
-        NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: sessionID)
+        await publishTranscriptChanges(sessionIDs: [sessionID], dataRoot: dataRoot)
+    }
+
+    /// Card projections change without a new message. Advance the same version
+    /// the phone's transcript cache and ordering already consume.
+    static func publishTranscriptChanges(sessionIDs: Set<String>, dataRoot: URL) async {
+        let path = dataRoot.appendingPathComponent("chat/sessions.json")
+        let persistence = SwiftNativePersistenceCore()
+        do {
+            try await persistence.withFileLock(path) {
+                var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
+                var changed = false
+                for index in rows.indices {
+                    guard case .string(let id)? = rows[index]["id"], sessionIDs.contains(id) else { continue }
+                    changed = ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index]) || changed
+                }
+                guard changed else { return }
+                try await persistence.writeDataAtomicDurable(
+                    ChatSessionIndexFile.serializedData(for: rows), to: path)
+            }
+        } catch {
+            nativeLog("[approval-chat-card] transcript generation bump failed: %@", error.localizedDescription)
+        }
+        for sessionID in sessionIDs {
+            NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: sessionID)
+        }
     }
 }

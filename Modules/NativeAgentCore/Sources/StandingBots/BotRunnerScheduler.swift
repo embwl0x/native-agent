@@ -33,19 +33,21 @@ public actor BotRunnerScheduler {
     /// keeps secondary/test roots, which have no trust policy, unchanged.
     private let isAutonomyEnabled: @Sendable () async -> Bool
     public private(set) var failure: String?
+    private var inFlight: [UUID: Task<Void, Never>] = [:]
+    private var settled: [String] = []
+    private var deadlineFailures: [UUID: String] = [:]
 
     public init(
         dataRoot: URL,
         session: @escaping BotRunnerSession,
-        isAutonomyEnabled: @escaping @Sendable () async -> Bool = { true },
-        conditionMet: @escaping @Sendable (BotDefinition, ShelfEntry) async -> Void = { _, _ in }
+        isAutonomyEnabled: @escaping @Sendable () async -> Bool = { true }
     ) {
         self.isAutonomyEnabled = isAutonomyEnabled
         disk = StandingBotsDisk(dataRoot: dataRoot)
         shelf = ShelfStore(dataRoot: dataRoot)
         events = BotEventStore(dataRoot: dataRoot)
         definitions = BotDefinitionStore(dataRoot: dataRoot)
-        runner = BotRunner(dataRoot: dataRoot, session: session, conditionMet: conditionMet)
+        runner = BotRunner(dataRoot: dataRoot, session: session)
         queue = BotRunQueue(dataRoot: dataRoot)
     }
 
@@ -56,10 +58,10 @@ public actor BotRunnerScheduler {
         let disk = StandingBotsDisk(dataRoot: dataRoot)
         return try disk.locked {
             let jobs = try disk.read([String: Job].self, at: disk.root.appendingPathComponent("runner-jobs.json")) ?? [:]
-            return Dictionary(uniqueKeysWithValues: jobs.compactMap { key, job in
+            return Dictionary(jobs.compactMap { key, job in
                 guard let id = UUID(uuidString: key), job.reason == nil, job.next != .distantFuture else { return nil }
                 return (id, job.next)
-            })
+            }, uniquingKeysWith: { first, _ in first })
         }
     }
 
@@ -68,10 +70,10 @@ public actor BotRunnerScheduler {
         let disk = StandingBotsDisk(dataRoot: dataRoot)
         return try disk.locked {
             let jobs = try disk.read([String: Job].self, at: disk.root.appendingPathComponent("runner-jobs.json")) ?? [:]
-            return Dictionary(uniqueKeysWithValues: jobs.compactMap { key, job in
+            return Dictionary(jobs.compactMap { key, job in
                 guard let id = UUID(uuidString: key), let missed = job.missed else { return nil }
                 return (id, missed)
-            })
+            }, uniquingKeysWith: { first, _ in first })
         }
     }
 
@@ -217,7 +219,7 @@ public actor BotRunnerScheduler {
     /// infers it, and infers wrong: a switch flipped off and back on during the
     /// claim wait reads as enabled again and the occurrence is filed `.notRun`,
     /// and a pause is filed the same way with nothing saying so.
-    private var lastUnattendedHold: (reason: BotMissedRun.Reason, detail: String?)?
+    private var lastUnattendedHold: [UUID: (reason: BotMissedRun.Reason, detail: String?)] = [:]
 
     /// The unattended gates, re-read after an event-woken request has won its
     /// claim. `paused` is the definition the claim itself read, under the store
@@ -228,7 +230,7 @@ public actor BotRunnerScheduler {
         let detail = enabled ? "the bot is paused" : "Autonomy is off"
         // There is no `.paused` reason; `.notRun` plus the gate's own words is
         // the honest record for a bot paused under us.
-        lastUnattendedHold = enabled ? (.notRun, detail) : (.autonomyOff, nil)
+        lastUnattendedHold[id] = enabled ? (.notRun, detail) : (.autonomyOff, nil)
         try? events.hold(bot: id, detail: detail)
         return true
     }
@@ -249,25 +251,32 @@ public actor BotRunnerScheduler {
         do {
             let bots = try definitions.list()
             let jobs = try reconciled(bots)
-            if try queue.pending().keys.contains(where: { jobs[$0.uuidString]?.reason == nil }) { return now }
+            if try queue.pending().keys.contains(where: { inFlight[$0] == nil && jobs[$0.uuidString]?.reason == nil }) { return now }
             // Autonomy off: no scheduled occurrence is admissible, so none is a
             // deadline either. Reporting one would wake this loop on a due job
             // the gate then refuses, forever.
             guard await isAutonomyEnabled() else { return nil }
-            return bots.filter { !$0.paused && jobs[$0.id.uuidString]?.reason == nil }
+            return bots.filter { !$0.paused && inFlight[$0.id] == nil && jobs[$0.id.uuidString]?.reason == nil }
                 .compactMap { jobs[$0.id.uuidString]?.next }.min()
         } catch { failure = "Bot scheduling unavailable: \(error)"; return nil }
     }
 
+    public func shutdown() {
+        // Claims and handles stay owned until the cancelled runners settle.
+        for task in inFlight.values { task.cancel() }
+    }
+
     public func runDue() async -> [String] {
         guard await BotRunGate.isReady() else { return [] }
-        failure = nil
-        var completed: [String] = []
+        failure = deadlineFailures.values.sorted().first
+        let completed = settled
+        settled.removeAll()
         do {
             let bots = try definitions.list()
             let reconciledJobs = try reconciled(bots)
             let requests = try queue.pending()
             for (id, request) in requests {
+                guard inFlight[id] == nil else { continue }
                 let requestID = request.runID
                 try Task.checkCancellation()
                 guard reconciledJobs[id.uuidString]?.reason == nil else {
@@ -278,9 +287,6 @@ public actor BotRunnerScheduler {
                 // here long after it was accepted — behind other work, or after
                 // a restart. The gates are read where it actually runs, not only
                 // where it was taken in. A manual Run once is the person asking.
-                // Both are read HERE, per request: an earlier run in this pass
-                // is a whole model turn long, and the switch or the bot can
-                // change under us while it runs.
                 if request.isEvent {
                     let enabled = await isAutonomyEnabled()
                     let paused = (try? definitions.get(id))?.paused ?? false
@@ -301,33 +307,19 @@ public actor BotRunnerScheduler {
                     guard isEvent else { return false }
                     return await self.holdUnattendedRun(bot: id, paused: claimed.paused)
                 }
-                do {
-                    if let entry = try await runner.run(bot: id, requestID: requestID,
-                                                        holdUnattended: holdUnattended) {
-                        try self.completed(id, at: Date(), reschedule: isEvent)
-                        completed.append("bot:\(entry.botId.uuidString)")
-                    }
-                } catch let error as BotRunAdmissionError {
-                    failure = "Bot request rejected: \(error.rawValue)"
-                } catch BotRunnerError.cannotRun(let problem) {
-                    // The gate refused before any turn: the request is already
-                    // consumed and no shelf entry exists, so the only record of
-                    // why nothing happened is this one.
-                    try recordMissed(id, due: Date(), reason: .blocked, detail: problem)
-                    failure = "Bot request rejected: \(problem)"
-                } catch BotRunnerError.dailySpendLimit {
-                    // Same shape as a scheduled occurrence: the reservation was
-                    // refused, so the turn never started and no shelf entry
-                    // exists. Left to the generic catch this was a run-once or
-                    // event request that simply vanished.
-                    try recordMissed(id, due: Date(), reason: .overBudget)
-                    failure = "Bot request rejected: \(BotRunnerError.dailySpendLimit.description)"
-                } catch is CancellationError { throw CancellationError() }
-                catch { failure = "Bot request unavailable: \(error)" }
+                try Task.checkCancellation()
+                inFlight[id] = Task {
+                    defer { self.finished(id) }
+                    do {
+                        if let entry = try await runner.run(bot: id, requestID: requestID,
+                                                            holdUnattended: holdUnattended,
+                                                            deadlineExceeded: { await self.reportDeadline(id, detail: $0) }) {
+                            try self.completed(id, at: Date(), reschedule: isEvent)
+                            settled.append("bot:\(entry.botId.uuidString)")
+                        }
+                    } catch { rejected(id, due: Date(), error: error) }
+                }
             }
-            // Queued work above can take minutes. The gate and the definitions
-            // are read again here, so a switch flipped or a bot paused during it
-            // holds the scheduled occurrences that follow.
             let autonomyEnabled = await isAutonomyEnabled()
             let scheduledBots = try definitions.list()
             let scheduledJobs = try reconciled(scheduledBots)
@@ -335,13 +327,9 @@ public actor BotRunnerScheduler {
             // Unattended admission boundary: scheduled occurrences only.
             guard autonomyEnabled else { return completed }
             for bot in scheduledBots where !bot.paused {
+                guard inFlight[bot.id] == nil else { continue }
                 try Task.checkCancellation()
                 guard scheduledJobs[bot.id.uuidString]?.reason == nil else { continue }
-                // Every run below is a whole model turn. The gate and the
-                // definitions are read again for EACH occurrence, so Autonomy
-                // switched off, this bot paused, or its schedule edited while an
-                // earlier bot ran decides this occurrence — not the state the
-                // pass started with.
                 guard await isAutonomyEnabled() else { break }
                 let live = try definitions.list()
                 guard let fresh = live.first(where: { $0.id == bot.id }), !fresh.paused else { continue }
@@ -365,6 +353,9 @@ public actor BotRunnerScheduler {
                 }
                 // A manual request also satisfies a coincident due occurrence.
                 if let due = reserved, requests[bot.id] == nil {
+                    try Task.checkCancellation()
+                    inFlight[bot.id] = Task {
+                    defer { self.finished(bot.id) }
                     do {
                         // The claim below can wait out a whole bot_ask turn, so
                         // the same gate an event request re-reads after its claim
@@ -372,14 +363,15 @@ public actor BotRunnerScheduler {
                         // behind an active bot_ask reserves and spends after
                         // unattended work was switched off.
                         let botID = bot.id
-                        lastUnattendedHold = nil
+                        lastUnattendedHold.removeValue(forKey: botID)
                         let holdUnattended: @Sendable (BotDefinition) async -> Bool = { claimed in
                             await self.holdUnattendedRun(bot: botID, paused: claimed.paused)
                         }
-                        if let entry = try await runner.run(bot: bot.id, holdUnattended: holdUnattended) {
+                        if let entry = try await runner.run(bot: bot.id, holdUnattended: holdUnattended,
+                                                          deadlineExceeded: { await self.reportDeadline(bot.id, detail: $0) }) {
                             try self.completed(bot.id, at: Date())
-                            completed.append("bot:\(entry.botId.uuidString)")
-                        } else if let held = lastUnattendedHold {
+                            settled.append("bot:\(entry.botId.uuidString)")
+                        } else if let held = lastUnattendedHold[botID] {
                             // The post-claim gate held it and already knows why.
                             try recordMissed(bot.id, due: due, reason: held.reason,
                                              detail: held.detail)
@@ -387,21 +379,7 @@ public actor BotRunnerScheduler {
                             // Claimed nothing — the claim's own pause guard.
                             try recordMissed(bot.id, due: due, reason: .notRun)
                         }
-                    } catch let error as BotRunAdmissionError {
-                        // Refused admission, so this occurrence never ran.
-                        try recordMissed(bot.id, due: due,
-                                         reason: error == .overBudget ? .overBudget : .queueBusy)
-                        failure = "Bot request rejected: \(error.rawValue)"
-                    } catch BotRunnerError.cannotRun(let problem) {
-                        // A retired model or a disconnected account: the turn
-                        // never started, so the occurrence says why rather than
-                        // leaving the last good result standing unexplained.
-                        try recordMissed(bot.id, due: due, reason: .blocked, detail: problem)
-                        failure = "Bot request rejected: \(problem)"
-                    } catch BotRunnerError.dailySpendLimit {
-                        // The turn never started: no spend, no shelf entry.
-                        try recordMissed(bot.id, due: due, reason: .overBudget)
-                        failure = "Bot request rejected: \(BotRunnerError.dailySpendLimit.description)"
+                    } catch { rejected(bot.id, due: due, error: error) }
                     }
                 }
                 } catch is CancellationError { throw CancellationError() }
@@ -409,5 +387,34 @@ public actor BotRunnerScheduler {
             }
         } catch { failure = "Bot run unavailable: \(error)" }
         return completed
+    }
+
+    private func reportDeadline(_ id: UUID, detail: String) {
+        deadlineFailures[id] = detail
+        failure = detail
+    }
+
+    private func rejected(_ id: UUID, due: Date, error: Error) {
+        do {
+            switch error {
+            case let admission as BotRunAdmissionError:
+                try recordMissed(id, due: due, reason: admission == .overBudget ? .overBudget : .queueBusy)
+                failure = "Bot request rejected: \(admission.rawValue)"
+            case BotRunnerError.cannotRun(let problem):
+                try recordMissed(id, due: due, reason: .blocked, detail: problem)
+                failure = "Bot request rejected: \(problem)"
+            case BotRunnerError.dailySpendLimit:
+                try recordMissed(id, due: due, reason: .overBudget)
+                failure = "Bot request rejected: \(BotRunnerError.dailySpendLimit.description)"
+            default: failure = "Bot run unavailable: \(error)"
+            }
+        } catch { failure = "Bot scheduling unavailable: \(error)" }
+    }
+
+    private func finished(_ id: UUID) {
+        inFlight.removeValue(forKey: id)
+        deadlineFailures.removeValue(forKey: id)
+        lastUnattendedHold.removeValue(forKey: id)
+        NotificationCenter.default.post(name: BotRunQueue.didChange, object: disk.root.deletingLastPathComponent())
     }
 }

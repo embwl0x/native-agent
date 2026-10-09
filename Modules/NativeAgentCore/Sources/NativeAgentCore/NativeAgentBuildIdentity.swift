@@ -16,12 +16,14 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
     public let build: String
     public let sourceRevision: String?
     public let sourceDirty: Bool
+    public let sourceContentID: String?
 
-    public init(version: String, build: String, sourceRevision: String?, sourceDirty: Bool) {
+    public init(version: String, build: String, sourceRevision: String?, sourceDirty: Bool, sourceContentID: String? = nil) {
         self.version = version
         self.build = build
         self.sourceRevision = sourceRevision
         self.sourceDirty = sourceDirty
+        self.sourceContentID = sourceContentID
     }
 
     public static var current: NativeAgentBuildIdentity {
@@ -51,7 +53,10 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
             // be promoted into exact byte identity accidentally. Likewise,
             // both builder stamps must agree when both are present; a copied
             // or partially restamped bundle is never exact proof.
-            sourceDirty: stampedDirty || !revisionStampsAgree
+            sourceDirty: stampedDirty || !revisionStampsAgree,
+            sourceContentID: nonempty(infoDictionary["NativeAgentSourceContentID"] as? String).flatMap {
+                Self.isFullGitObjectID($0) ? $0.lowercased() : nil
+            }
         )
     }
 
@@ -70,6 +75,7 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
             "build": build,
             "sourceRevision": sourceRevision ?? NSNull(),
             "sourceDirty": sourceDirty,
+            "sourceContentID": sourceContentID ?? NSNull(),
             "exactSourceRevision": exactSourceRevision ?? NSNull(),
         ]
     }
@@ -82,6 +88,8 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
             "version": version,
             "build": build,
             "sourceRevision": sourceRevision ?? NSNull(),
+            "sourceDirty": sourceDirty,
+            "sourceContentID": sourceContentID ?? NSNull(),
             "writtenAt": ISO8601DateFormatter().string(from: at),
         ]
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

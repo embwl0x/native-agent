@@ -1,5 +1,6 @@
 import Context
 import Foundation
+import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
@@ -57,6 +58,7 @@ extension SwiftToolDispatcher {
         guard let rawAtomID = given, !rawAtomID.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("missing_atom_id"),
                 "message": .string(offered.isEmpty
                     ? "Nothing in this turn's context is cut short, so there is nothing to expand."
@@ -70,6 +72,7 @@ extension SwiftToolDispatcher {
         }) else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("pointer_not_offered_this_turn"),
                 "message": .string("That atom id is not in this turn's context pointer list (ids from earlier turns expire); use an id listed this turn, or read the source directly."),
                 "atom_id": .string(rawAtomID),
@@ -105,7 +108,7 @@ extension SwiftToolDispatcher {
                 receiptID: result.receipt.id
             )
         }
-        return .object([
+        var fields: [String: JSONValue] = [
             "status": .string("ok"),
             "generation_id": .int(result.receipt.generationID),
             "atom_id": .string(result.receipt.atomID.rawValue),
@@ -116,6 +119,11 @@ extension SwiftToolDispatcher {
             "full_character_count": .int(Int64(result.receipt.fullCharacterCount)),
             "truncated": .bool(result.truncated),
             "receipt_id": .string(result.receipt.id),
-        ])
+        ]
+        let sources = prepared.packet.selectedItems.first { $0.pointer == pointer }?.untrustedSources ?? []
+        let provenance = JSONValue.object(["peer_sources": .array(sources.map(JSONValue.string))])
+        MemoryDataProvenance.consume(provenance)
+        fields.merge(MemoryDataProvenance.fields(in: provenance)) { _, value in value }
+        return .object(fields)
     }
 }

@@ -99,7 +99,7 @@ extension NativeOAuthFlow {
             do {
                 _ = try await ChatGPTAccountModelRefresh.shared.refresh(dataRoot: dataRoot, force: true)
             } catch {
-                NSLog("ChatGPT account model refresh after sign-in failed: %@", error.localizedDescription)
+                nativeLog("ChatGPT account model refresh after sign-in failed: %@", error.localizedDescription)
             }
         }
         return OAuthFlowResult(ok: true, error: nil)

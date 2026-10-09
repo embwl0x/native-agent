@@ -137,6 +137,29 @@ public actor MemoryStorage {
         await pokeDerivedState(stored, deleted: deleted)
     }
 
+    /// Re-read and enqueue the complete batch without an actor suspension.
+    /// A deleted row must not be reinserted by an older captured warning update.
+    func refreshProjectionHooks(ids: [String]) async throws {
+        let current = try enqueueCurrentProjectionHooks(ids: ids)
+        for row in current {
+            await pokeDerivedState(row, deleted: !Self.projectionEligible(row))
+        }
+    }
+
+    private func enqueueCurrentProjectionHooks(ids: [String]) throws -> [StoredMemory] {
+        let current = try dbPool.read { db in
+            try ids.compactMap { id in
+                try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory)
+            }
+        }
+        for row in current {
+            let deleted = !Self.projectionEligible(row)
+            pokeSpotlight(row, deleted: deleted)
+            pokeKnowledgeGraph(row, deleted: deleted)
+        }
+        return current
+    }
+
     public init(dataRoot: URL, memoryLimit: Int = memoryStoredRowCap) throws {
         let dir = dataRoot.appendingPathComponent("memory", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -292,7 +315,7 @@ public actor MemoryStorage {
         memoryPath: URL
     ) {
         guard !evicted.isEmpty else { return }
-        NSLog("MemoryV2 bound: pruned %d overflow row(s) while opening %@",
+        nativeLog("MemoryV2 bound: pruned %d overflow row(s) while opening %@",
               evicted.count, memoryPath.lastPathComponent)
         Task {
             for memory in evicted {
@@ -345,7 +368,7 @@ public actor MemoryStorage {
                 logLabel: "MemoryV2.retention"
             )
         } catch {
-            NSLog("MemoryV2 bound: retention receipt failed: %@", String(describing: error))
+            nativeLog("MemoryV2 bound: retention receipt failed: %@", String(describing: error))
         }
     }
 
@@ -356,6 +379,9 @@ public actor MemoryStorage {
     public func admitMemory(
         _ memory: StoredMemory, insertIfMissing: Bool, preserveID: Bool
     ) async throws -> StoredMemory? {
+        var stamped = memory
+        stamped.metadata = try MemorySenseProvenance.stamping(stamped.metadata)
+        let memory = stamped
         let result = try await dbPool.write { db -> (StoredMemory?, [StoredMemory]) in
             try Self.requireNotTombstoned(memory, in: db)
             let incoming = MemoryRecord(stored: memory)
@@ -407,8 +433,15 @@ public actor MemoryStorage {
                 guard !overflow else {
                     throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count overflow")
                 }
-                let patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
+                var patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
                     existing: MemoryRecord(stored: row), newSource: memory.source, newMetadata: memory.metadata)
+                // Explicit scope replaces scope only on the same text, never
+                // on a merely similar record. Omission retains the old scope.
+                if MemoryConsolidator.normalizedContentKey(row.content) == key,
+                   case .object(let incoming)? = memory.metadata,
+                   case .array(let topics)? = incoming["context_topics"], !topics.isEmpty {
+                    patch["context_topics"] = .array(topics)
+                }
                 for (key, value) in patch {
                     if key == "observed_at", case .string(let observed) = value {
                         row.observedAt = observed
@@ -417,20 +450,27 @@ public actor MemoryStorage {
                     }
                 }
                 metadata["recall_count"] = .int(next)
-                row.metadata = .object(metadata)
+                row.metadata = MemoryDataProvenance.preserving(
+                    existing: memory.metadata, incoming: .object(metadata))
                 row.updatedAt = Self.nowISO8601()
                 try Self.validateTemporalEvidence(row)
                 try db.execute(sql: """
                     UPDATE memories SET metadata_json = ?, observed_at = ?, updated_at = ? WHERE id = ?
                 """, arguments: [Self.encodeMetadata(row.metadata), row.observedAt, row.updatedAt, row.id])
-                return (row, [])
+                guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [row.id]).map(Self.decodeMemory) else {
+                    throw MemoryStorageError.databaseUnavailable("committed memory is missing")
+                }
+                return (saved, [])
             }
             guard insertIfMissing else { return (nil, []) }
             try Self.validateTemporalEvidence(memory)
             try Self.requireWritableEpoch(in: db, vector: memory.embedding, epoch: memory.embeddingEpoch)
             try Self.executeMemoryInsert(memory, in: db)
             let evicted = try Self.pruneMemoriesToBound(in: db, limit: memoryLimit, preservingIDs: [memory.id])
-            return (memory, evicted)
+            guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [memory.id]).map(Self.decodeMemory) else {
+                throw MemoryStorageError.databaseUnavailable("committed memory is missing")
+            }
+            return (saved, evicted)
         }
         if let row = result.0 {
             invalidateRecallCache()
@@ -446,7 +486,10 @@ public actor MemoryStorage {
         _ memory: StoredMemory,
         superseding: [SupersedingAcceptance] = []
     ) async throws -> StoredMemory {
-        let (demoted, evicted) = try await dbPool.write { db -> ([StoredMemory], [StoredMemory]) in
+        var stamped = memory
+        stamped.metadata = try MemorySenseProvenance.stamping(stamped.metadata)
+        let memory = stamped
+        let (saved, demoted, evicted) = try await dbPool.write { db -> (StoredMemory, [StoredMemory], [StoredMemory]) in
             try Self.requireNotTombstoned(memory, in: db)
             try Self.validateTemporalEvidence(memory)
             try Self.requireWritableEpoch(
@@ -464,17 +507,20 @@ public actor MemoryStorage {
             if !superseding.isEmpty, evicted.contains(where: { $0.id == memory.id }) {
                 throw MemoryStorageError.capacityExceeded
             }
-            return (demoted, evicted)
+            guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [memory.id]).map(Self.decodeMemory) else {
+                throw MemoryStorageError.databaseUnavailable("committed memory is missing")
+            }
+            return (saved, demoted, evicted)
         }
         invalidateRecallCache()
         pokeUserMDRegen(persona: memory.personaId)
-        await pokeProjectionHooks(memory)
+        await pokeProjectionHooks(saved)
         for predecessor in demoted {
             pokeUserMDRegen(persona: predecessor.personaId)
             await pokeProjectionHooks(predecessor)
         }
         await handleBoundEvictions(evicted, reason: "insert")
-        return memory
+        return saved
     }
 
     /// The row INSERT, shared by `insertMemory` and `importLegacyMemory` so the
@@ -511,6 +557,18 @@ public actor MemoryStorage {
         case skippedExisting
     }
 
+    static func normalizingPeerMomentOrigin(_ metadata: JSONValue?, source: String?) -> JSONValue? {
+        guard let source,
+              ["moment-promoter:agent-", "moment-promoter:bot-"].contains(where: {
+                  source.hasPrefix($0) && source.count > $0.count
+              }),
+              case .object(var object)? = metadata,
+              object["author"] == .string("user"),
+              object["lane"] == .string("moment") || object["kind"] == .string("moment") else { return metadata }
+        object["author"] = .string("peer")
+        return .object(object)
+    }
+
     /// Land one legacy memory: insert if absent, refresh only if the canonical
     /// row is empty, otherwise leave the live row alone.
     ///
@@ -523,6 +581,9 @@ public actor MemoryStorage {
     /// repair path — a blank or half-written canonical row was never refreshed,
     /// and the one-way completion sentinel made that permanent.
     public func importLegacyMemory(_ memory: StoredMemory) async throws -> LegacyImportOutcome {
+        var normalized = memory
+        normalized.metadata = Self.normalizingPeerMomentOrigin(memory.metadata, source: memory.source)
+        let memory = normalized
         let result = try await dbPool.write { db -> (LegacyImportOutcome, [StoredMemory]) in
             let existing = try Row.fetchOne(
                 db,
@@ -591,10 +652,13 @@ public actor MemoryStorage {
     }
 
     public func updateMemory(id: String, patch: MemoryPatch) async throws -> StoredMemory? {
+        let turnProvenance = try MemorySenseProvenance.stamping(nil)
+        let turnDataProvenance = MemoryDataProvenance.stamping(nil)
         let updated = try await dbPool.write { db -> StoredMemory? in
             guard var existing = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory) else {
                 return nil
             }
+            let priorMetadata = existing.metadata
             if let c = patch.content { existing.content = c }
             if let s = patch.source { existing.source = s }
             if let conf = patch.confidence { existing.confidence = conf }
@@ -619,6 +683,16 @@ public actor MemoryStorage {
                     metadata["pinned_order"] = .int(next)
                 }
                 for (key, value) in merge { metadata[key] = value }
+                existing.metadata = .object(metadata)
+            }
+            existing.metadata = try MemorySenseProvenance.preserving(existing: priorMetadata, incoming: existing.metadata)
+            existing.metadata = MemoryDataProvenance.preserving(existing: priorMetadata, incoming: existing.metadata)
+            existing.metadata = MemoryDataProvenance.preserving(existing: turnDataProvenance, incoming: existing.metadata)
+            let provenance = MemorySenseProvenance.merging(existing: existing.metadata, incoming: turnProvenance)
+            if !provenance.isEmpty {
+                var metadata: [String: JSONValue] = [:]
+                if case .object(let current)? = existing.metadata { metadata = current }
+                metadata.merge(provenance) { _, incoming in incoming }
                 existing.metadata = .object(metadata)
             }
             existing.updatedAt = Self.nowISO8601()
@@ -651,7 +725,7 @@ public actor MemoryStorage {
                 Self.encodeMetadata(existing.metadata),
                 existing.id
             ])
-            return existing
+            return try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [existing.id]).map(Self.decodeMemory)
         }
         if let u = updated {
             invalidateRecallCache()
@@ -736,7 +810,9 @@ public actor MemoryStorage {
                 ORDER BY COALESCE(json_extract(metadata_json, '$.pinned_order'), 0), created_at, id
             """).map(Self.decodeMemory).map(MemoryRecord.init(stored:)).filter {
                 MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: nil) == true
-            }.map(\.text)
+            }.map { record in
+                (MemorySenseProvenance.warning(in: record.extras).map { "[\($0)]\n" } ?? "") + record.text
+            }
         }
     }
 

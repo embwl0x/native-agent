@@ -1,13 +1,38 @@
 import Foundation
 import PersistenceCore
+import SlackConnector
 
 public enum ConnectorOAuthRegistry {
+    public static func migrateXCredentials(dataRoot: URL) async throws {
+        let paths = ["secrets/x.json", "oauth_tokens/x.json", "connectors/x/auth.json", "connectors/x/oauth_app.json"]
+        var failures: [String] = []
+        for relative in paths {
+            let path = dataRoot.appendingPathComponent(relative)
+            guard FileManager.default.fileExists(atPath: path.path) else { continue }
+            do { _ = try ConnectorCredentialFile.read(at: path) }
+            catch { failures.append(relative) }
+        }
+        let repairState = "credential_migration_failed"
+        let row = try await readConnectorRegistryEntry(root: dataRoot, provider: "x")
+        guard !failures.isEmpty || connectorString(row?["runtimeStatus"]) == repairState else { return }
+        let detail = failures.isEmpty ? nil : "X credentials could not move to this Mac's Keychain (\(failures.joined(separator: ", "))). Saved credentials were retained. Unlock Keychain and reopen NativeAgent; if this persists, repair the saved files before reconnecting X."
+        _ = try await mutateConnectorRegistryEntry(root: dataRoot, provider: "x", createIfMissing: true) { row in
+            if let detail {
+                row["runtimeStatus"] = .string(repairState)
+                row["runtimeDetail"] = .string(detail)
+            } else if connectorString(row["runtimeStatus"]) == repairState {
+                row.removeValue(forKey: "runtimeStatus")
+                row.removeValue(forKey: "runtimeDetail")
+            }
+        }
+    }
+
     public static func mutateConnectorRegistryEntry(
         root: URL,
         provider: String,
         createIfMissing: Bool,
         prepare: @escaping @Sendable () async throws -> Void = {},
-        publish: @escaping @Sendable (@Sendable () async throws -> Void) async throws -> Void = { try await $0() },
+        publish: @escaping @Sendable (JSONValue, @Sendable () async throws -> Void) async throws -> Void = { _, write in try await write() },
         mutate: @escaping @Sendable (inout [String: JSONValue]) -> Void
     ) async throws -> [String: JSONValue] {
         let providerID = normalizedConnectorID(provider)
@@ -19,6 +44,9 @@ public enum ConnectorOAuthRegistry {
         let path = connectorRegistryPath(root: root)
         let persistence = SwiftNativePersistenceCore()
         return try await persistence.withFileLock(path) {
+            // Finish an interrupted Slack registry publication before any
+            // connector mutation can advance that registry generation.
+            try SlackCredentials.recoverPendingSave(dataRoot: root)
             let current = try readRegistry(at: path)
             _ = try checkedConnectorRows(from: current)
             switch current {
@@ -33,7 +61,7 @@ public enum ConnectorOAuthRegistry {
                     _ = try checkedConnectorRows(from: .array(rows))
                     try await prepare()
                     let updated = JSONValue.array(rows)
-                    try await publish { try await persistence.writeJSON(updated, to: path) }
+                    try await publish(updated) { try await persistence.writeJSON(updated, to: path) }
                     return entry
                 }
                 guard createIfMissing else {
@@ -47,7 +75,7 @@ public enum ConnectorOAuthRegistry {
                 _ = try checkedConnectorRows(from: .array(rows))
                 try await prepare()
                 let updated = JSONValue.array(rows)
-                try await publish { try await persistence.writeJSON(updated, to: path) }
+                try await publish(updated) { try await persistence.writeJSON(updated, to: path) }
                 return entry
             case .object(var object):
                 var entry: [String: JSONValue]
@@ -71,7 +99,7 @@ public enum ConnectorOAuthRegistry {
                 _ = try checkedConnectorRows(from: .object(object))
                 try await prepare()
                 let updated = JSONValue.object(object)
-                try await publish { try await persistence.writeJSON(updated, to: path) }
+                try await publish(updated) { try await persistence.writeJSON(updated, to: path) }
                 return entry
             default:
                 throw PersistenceCoreError.ioFailure("Connector registry is not an array or object")
@@ -139,18 +167,19 @@ public enum ConnectorOAuthRegistry {
 
     /// Credential and OAuth app files are authority too. Only absence permits
     /// creation; callers retain their path lock through publication or unlink.
-    public static func checkedCredentialObject(at path: URL) throws -> [String: JSONValue] {
+    public static func checkedCredentialObject(at path: URL, resolveSecrets: Bool = true) throws -> [String: JSONValue] {
         do {
             _ = try FileManager.default.attributesOfItem(atPath: path.path)
         } catch CocoaError.fileReadNoSuchFile {
             return [:]
         }
-        guard case .object(let object) = try JSONValue.parse(Data(contentsOf: path)) else {
+        let data = try resolveSecrets ? ConnectorCredentialFile.read(at: path) : ConnectorCredentialFile.metadata(at: path)
+        guard case .object(let object) = try JSONValue.parse(data) else {
             throw PersistenceCoreError.ioFailure("Saved connector credentials must be a JSON object")
         }
         for field in ["access_token", "refresh_token", "oauth_token", "token", "token_type", "scope",
                       "client_id", "client_secret", "connector_id", "redirect_uri", "provider",
-                      "saved_at", "validated_at", "credential_store", "auth_mode", "bot_token", "app_token",
+                      "saved_at", "validated_at", "credential_store", "credential_keychain_ref", "auth_mode", "bot_token", "app_token",
                       "socket_mode_app_token", "team_id", "team", "url", "user", "bot_id", "enterprise_id",
                       "login", "name", "html_url", "type", "account_id", "refresh_token_account_id",
                       "account_sub", "refresh_token_account_sub"] {

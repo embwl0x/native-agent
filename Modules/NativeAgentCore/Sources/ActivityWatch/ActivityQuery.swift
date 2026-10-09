@@ -225,6 +225,7 @@ public struct ActivityQueryService: Sendable {
         )
 
         var out: [String: JSONValue] = [:]
+        out["status"] = .string("ok")
         out["from"] = .double(bundle.from)
         out["to"] = .double(bundle.to)
         out["timezone"] = .string(bundle.timezoneIdentifier)

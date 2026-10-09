@@ -56,11 +56,16 @@ public protocol DoctorActionPort: Sendable {
     func doctorTelegramSnapshot() async throws -> DoctorTelegramSnapshot
     func doctorSearchURL() async throws -> String?
     func doctorProbeSearch(base: String) async -> Bool
+    /// Codex web search, the route that answers first: is its login live?
+    func doctorProbeCodexSearch() async -> Bool
+    /// Doctor state: Docker was checked for this search URL and holds no SearXNG.
+    func doctorSearchBackendAbsent(base: String) -> Bool
     func doctorLiveRepair(for check: CheckResult, scope: DoctorRepairScope) async -> DoctorExecutableRepair?
     func doctorRecordRepair(checkID: String, receipt: String, status: String) async throws
     func doctorToolSnapshots() async throws -> [DoctorToolSnapshot]
     func doctorAutonomySnapshot() async throws -> DoctorAutonomySnapshot
     func doctorBridgeSnapshots() async -> [DoctorBridgeSnapshot]
+    func doctorAgentConnectionsCheck() async -> CheckResult
     func doctorBackgroundLoopsCheck() async -> CheckResult
     func doctorBackgroundLoopChecks() async -> [CheckResult]
     func doctorCognitionChecks() async -> [CheckResult]
@@ -74,7 +79,7 @@ public protocol DoctorActionPort: Sendable {
 private let liveMemoryQuickCheck = Mutex<(at: Date, rows: [String])?>(nil)
 private let liveMemoryQuickCheckMaxAge: TimeInterval = 600
 private let doctorRepairInFlight = Mutex(false)
-private let liveSearchReading = Mutex<(base: String, healthy: Bool, at: Date)?>(nil)
+private let liveSearchReading = Mutex<(base: String, healthy: Bool, codex: Bool, at: Date)?>(nil)
 
 public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
     private let port: Port
@@ -146,24 +151,25 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                         let row = checks[index]
                         checks[index] = CheckResult(id: row.id, title: row.title, status: "warn",
                                                     detail: row.detail, repair: row.repair,
-                                                    human_action: row.human_action)
+                                                    human_action: row.human_action, ask: row.ask)
                     }
                 }
                 let verified = checks[index]
                 var text = safeDoctorDetail(receipt)
-                NSLog("[Doctor repair] %@: %@; recheck=%@", id, text, verified.status)
+                nativeLog("[Doctor repair] %@: %@; recheck=%@", id, text, verified.status)
                 do {
                     try await port.doctorRecordRepair(checkID: id, receipt: text, status: verified.status)
                 } catch {
                     let failure = "Repair receipt could not be saved: \(safeDoctorDetail(error.localizedDescription))"
-                    NSLog("[Doctor repair] %@", failure)
+                    nativeLog("[Doctor repair] %@", failure)
                     text += " " + failure
                 }
                 repairReceipts.append(CheckResult(id: id, title: before.title, status: verified.status, detail: text, receipt: text))
                 checks[index] = CheckResult(
                     id: id, title: verified.title, status: verified.status,
                     detail: verified.detail,
-                    repair: verified.repair, receipt: text, human_action: verified.human_action
+                    repair: verified.repair, receipt: text, human_action: verified.human_action,
+                    ask: verified.ask
                 )
             }
         }
@@ -186,18 +192,15 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                 }
             }
             let coreAvailable = executable.contains(row.id)
-            let buttonOnly = coreAvailable && !DoctorSafeRepairPolicy.automaticCoreIDs.contains(row.id)
             let humanAction = row.recoveryAction(repairAvailable: liveAvailable || coreAvailable) ?? (liveAvailable
                 ? "Open Diagnostics → Doctor and press Repair to retry this live service."
                 : coreAvailable && row.id == "persona_engine"
                 ? "Persona and identity documents require your decision. Open Diagnostics → Doctor and press Repair to create missing persona documents; automatic checks never write them."
-                : buttonOnly
-                ? "Open Diagnostics → Doctor and press Repair to run this file repair. Existing files are backed up before replacement; automatic checks leave them unchanged."
                 : nil)
             checks[index] = CheckResult(id: row.id, title: row.title, status: row.status, detail: row.detail,
                         repair: liveAvailable ? "Run Repair Safe Issues to retry this live service." : (coreAvailable ? row.repair : nil),
                         receipt: row.receipt,
-                        human_action: humanAction, repair_available: liveAvailable || coreAvailable)
+                        human_action: humanAction, repair_available: liveAvailable || coreAvailable, ask: row.ask)
         }
         return (status: rollup, repaired: repaired, checks: checks)
     }
@@ -212,6 +215,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         case "live.telegram": return await telegramDoctorCoverageCheck()
         case "live.background_loops": return await backgroundLoopsDoctorCoverageCheck()
         case "live.bridges": return await bridgesDoctorCoverageCheck()
+        case "live.agent_connections": return await port.doctorAgentConnectionsCheck()
         case "live.memory": return await memoryDoctorCoverageCheck()
         case "live.inspector_feed": return await port.doctorInspectorCheck()
         case "live.embedding_download": return await port.doctorEmbeddingDownloadCheck()
@@ -231,7 +235,8 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             checks[index] = CheckResult(
                 id: row.id, title: row.title, status: row.status, detail: row.detail,
                 repair: available ? "Run Repair Safe Issues to retry this live service." : nil,
-                receipt: row.receipt, human_action: row.recoveryAction(repairAvailable: available), repair_available: available
+                receipt: row.receipt, human_action: row.recoveryAction(repairAvailable: available), repair_available: available,
+                ask: row.ask
             )
         }
         return checks
@@ -252,29 +257,22 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         async let loopDetails = port.doctorBackgroundLoopChecks()
         async let memory = memoryDoctorCoverageCheck()
         async let bridges = bridgesDoctorCoverageCheck()
+        async let agents = port.doctorAgentConnectionsCheck()
         async let inspector = port.doctorInspectorCheck()
         async let embedding = port.doctorEmbeddingDownloadCheck()
-        let common = await [providers, telegram, search, tools, autonomy, loops, memory, bridges, inspector, embedding] + (await loopDetails)
+        let common = await [providers, telegram, search, tools, autonomy, loops, memory, bridges, agents, inspector, embedding] + (await loopDetails)
         return includeCognition ? common + (await port.doctorCognitionChecks()) : common
     }
 
     /// The store the running app actually holds — not a second reader over the
-    /// file (that is `memory_store`). An open failure at launch leaves memory
-    /// unwired until restart runs the complete migration/projection startup.
+    /// file (that is `memory_store`). Attachment retries on the same owner.
     private func memoryDoctorCoverageCheck() async -> CheckResult {
         let title = "Live memory store"
-        if let failure = SwiftNativeMemoryV2.sharedOpenFailure {
-            return CheckResult(
-                id: "live.memory", title: title, status: "fail",
-                detail: "The canonical memory store is not attached: \(safeDoctorDetail(failure))",
-                human_action: "Restart NativeAgent — memory didn't open at launch"
-            )
-        }
         guard let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() else {
             return CheckResult(
                 id: "live.memory", title: title, status: "fail",
-                detail: "The running app has no memory store attached.",
-                human_action: "Restart NativeAgent — memory didn't open at launch"
+                detail: "The canonical memory store is not attached: \(safeDoctorDetail(SwiftNativeMemoryV2.sharedOpenFailure ?? "attachment unavailable"))",
+                repair: "Run Repair Safe Issues to retry canonical memory attachment."
             )
         }
         let storage = await bridge.underlyingStorage()
@@ -282,6 +280,13 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         do {
             // Every call: the pool the running app writes through answers.
             _ = try await storage.listMemories(persona: nil, status: nil, limit: 1)
+            if let failure = SwiftNativeMemoryV2.graphProjectionFailure {
+                return CheckResult(
+                    id: "live.memory", title: title, status: "fail",
+                    detail: "The memory knowledge graph is waiting for canonical reconciliation: \(safeDoctorDetail(failure))",
+                    repair: "Run Repair Safe Issues to reconcile the canonical memory graph."
+                )
+            }
             let cached = liveMemoryQuickCheck.withLock { $0 }
             let rows: [String]
             if let cached, Date().timeIntervalSince(cached.at) < liveMemoryQuickCheckMaxAge {
@@ -378,7 +383,8 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                     detail: "\(registryCheck.detail) \(safeDoctorDetail(detail))",
                     human_action: detail.hasPrefix("No usable provider")
                         ? "Open Providers and activate an authenticated provider for Chat."
-                        : "Open Providers and run Test Connection for the active provider. If it fails, use its reported authentication or connectivity step."
+                        : "Open Providers and run Test Connection for the active provider. If it fails, use its reported authentication or connectivity step.",
+                    ask: detail.hasPrefix("No usable provider") ? .signIn : nil
                 )
             case .unavailable:
                 break
@@ -490,7 +496,8 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             return CheckResult(
                 id: "live.providers", title: "Providers and OAuth", status: "warn",
                 detail: "Provider registry is readable, but no provider currently reports ready authentication.",
-                human_action: "Open the Providers tab in the sidebar and authenticate one provider."
+                human_action: "Open the Providers tab in the sidebar and authenticate one provider.",
+                ask: .signIn
             )
         }
         return CheckResult(
@@ -510,7 +517,8 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             return CheckResult(
                 id: "live.telegram", title: "Telegram", status: "fail",
                 detail: "Telegram is enabled but no bot token is configured.",
-                human_action: "Open Settings → Telegram and configure the bot token."
+                human_action: "Open Settings → Telegram and configure the bot token.",
+                ask: .signIn
             )
         }
         if status.isTransientPollInterruption && status.hasFreshSuccessfulPoll {
@@ -526,7 +534,9 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
                 detail: "Telegram's last recorded error is: \(safeDoctorDetail(lastError))",
                 human_action: lastError.contains("401") || lastError.localizedCaseInsensitiveContains("unauthorized")
                     ? "Open Settings → Telegram and replace the bot token with the current token from @BotFather."
-                    : nil
+                    : nil,
+                ask: lastError.contains("401") || lastError.localizedCaseInsensitiveContains("unauthorized")
+                    ? .signIn : nil
             )
         }
         guard status.pollerEnabled else {
@@ -550,38 +560,48 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
     }
 
     private func searchDoctorCoverageCheck(_ raw: String, probe: Bool) async -> CheckResult {
-        guard !raw.isEmpty else {
-            return CheckResult(
-                id: "live.search", title: "Search", status: "ok",
-                detail: "External SearXNG search is not configured.", repair: nil
-            )
-        }
-        guard let url = URL(string: raw),
-              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-              url.host?.isEmpty == false, url.query == nil, url.fragment == nil else {
-            return CheckResult(
-                id: "live.search", title: "Search", status: "fail",
-                detail: "The configured SearXNG URL is invalid.",
-                human_action: "Open Research → Search service, enter a complete HTTP(S) URL in SearXNG URL without a query or fragment, then click Save."
-            )
-        }
+        let validCategoryURL = URL(string: raw).map {
+            ["http", "https"].contains($0.scheme?.lowercased() ?? "")
+                && $0.host?.isEmpty == false && $0.query == nil && $0.fragment == nil
+        } ?? false
+        // Only a Doctor run probes (launch, auto run, Run/Repair); the health
+        // pill reads this reading and spawns nothing.
         if probe {
-            let healthy = await port.doctorProbeSearch(base: raw)
-            liveSearchReading.withLock { $0 = (raw, healthy, Date()) }
+            async let healthy = validCategoryURL ? port.doctorProbeSearch(base: raw) : false
+            async let codex = port.doctorProbeCodexSearch()
+            let reading = (raw, await healthy, await codex, Date())
+            liveSearchReading.withLock { $0 = reading }
         }
         guard let reading = liveSearchReading.withLock({ $0 }), reading.base == raw,
               Date().timeIntervalSince(reading.at) < 600 else {
             return CheckResult(id: "live.search", title: "Search", status: "unmeasured",
-                               detail: "SearXNG has no recent probe result. Run Doctor to check it.")
+                               detail: "Web search has no recent probe result. Run Doctor to check it.")
+        }
+        let codexLine = reading.codex
+            ? "Codex web search, which handles general searches, is signed in."
+            : "General search is unavailable: the bundled Codex executable or NativeAgent's ChatGPT sign-in needs attention. Check ChatGPT in Providers, then run Doctor."
+        if raw.isEmpty {
+            return CheckResult(id: "live.search", title: "Search", status: reading.codex ? "ok" : "warn",
+                               detail: codexLine + " Optional SearXNG category search is not configured.",
+                               human_action: reading.codex ? nil : "Check ChatGPT in Providers, then run Doctor.",
+                               ask: reading.codex ? nil : .signIn)
+        }
+        if !validCategoryURL {
+            return CheckResult(id: "live.search", title: "Search", status: "fail",
+                               detail: codexLine + " The configured SearXNG URL is invalid.",
+                               human_action: "Open Research → Search service, enter a complete HTTP(S) URL in SearXNG URL without a query or fragment, then click Save.")
         }
         if reading.healthy {
-            return CheckResult(id: "live.search", title: "Search", status: "ok",
-                               detail: "The configured SearXNG endpoint answered the bounded search probe successfully.")
+            return CheckResult(id: "live.search", title: "Search", status: reading.codex ? "ok" : "warn",
+                               detail: codexLine + " SearXNG answered the bounded search probe.",
+                               human_action: reading.codex ? nil : "Check ChatGPT in Providers, then run Doctor.",
+                               ask: reading.codex ? nil : .signIn)
         }
         return CheckResult(
             id: "live.search", title: "Search", status: "warn",
-            detail: "The configured SearXNG endpoint failed the bounded search probe.",
-            human_action: "Open Research → Search service and verify the SearXNG URL and that server's availability. If its container is stopped and ownership is not configured, confirm which container to start."
+            detail: codexLine + " " + (port.doctorSearchBackendAbsent(base: raw)
+                ? "No SearXNG backend: nothing answers at \(safeDoctorDetail(raw)) and Docker holds no SearXNG container for it, so category searches (news, it, science) are off."
+                : "SearXNG at \(safeDoctorDetail(raw)) did not answer the bounded search probe, so category searches (news, it, science) are down.")
         )
     }
 

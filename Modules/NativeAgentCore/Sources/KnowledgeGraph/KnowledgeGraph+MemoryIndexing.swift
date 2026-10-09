@@ -105,6 +105,23 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     /// removed (every add has a remove).
     private var perIDTails: [String: Task<Void, Never>] = [:]
     private var perIDPending: [String: Int] = [:]
+    private var projectionGeneration = 0
+    private var reconciledProjectionGeneration: Int?
+
+    public func markProjectionDirty() {
+        projectionGeneration += 1
+    }
+
+    public func reconcileProjectionIfNeeded(producing: Bool) async throws {
+        let generation = projectionGeneration
+        guard reconciledProjectionGeneration != generation else { return }
+        if producing {
+            _ = try await reconcileMemoryIndexFingerprints()
+        } else {
+            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: false)
+        }
+        reconciledProjectionGeneration = generation
+    }
 
     /// The pool resolves lazily through KnowledgeGraphPoolCache to the owning
     /// MemoryStorage's pool; that storage's migrator owns the kg_* schema.

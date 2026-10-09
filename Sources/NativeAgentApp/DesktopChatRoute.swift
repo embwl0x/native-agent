@@ -14,7 +14,7 @@ import PersistenceCore
 /// message Send" when empty), so text goes in by click and paste.
 @MainActor enum DesktopChatRoute {
     enum Blocker: String, Error {
-        case offline = "Muse isn't installed or wouldn't open. Nothing was sent."
+        case offline = "Muse isn't open. Open Muse and show its chat before sending. Nothing was sent."
         case permission = "Allow NativeAgent Accessibility access so it can use Muse's window. Nothing was sent."
         case window = "Muse isn't showing its chat. Nothing was sent."
         case thread = "Agent's own chat in Muse couldn't be found or opened, so nothing was sent."
@@ -22,6 +22,8 @@ import PersistenceCore
         case submission = "Muse didn't confirm the message. Check Agent's chat in Muse; it won't be resent automatically."
         case moved = "Muse left Agent's chat before answering. The message was sent; its answer will be in her chat in Muse."
         case timeout = "Muse didn't finish answering within two minutes. The message was sent; its answer will be in her chat in Muse."
+        /// Said instead of `moved`/`timeout` while her chat is still read (lateAnswer).
+        static let late = "The message was sent; Muse hasn't finished answering. Agent's chat in Muse is still read, and the answer lands on this exchange and reaches her when it comes. Don't resend."
         case locked = "Mac is locked, nothing was sent."
         /// The texts say "Agent"; the agent here may be named otherwise.
         func detail(_ name: String) -> String { rawValue.replacingOccurrences(of: "Agent", with: name) }
@@ -43,16 +45,25 @@ import PersistenceCore
         static let unreadSuffix = " Unread updates", actionsSuffix = " More thread actions"
         static let current = "AXARIACurrent", currentValue = "page"
     }
-    static let bundleID = "com.meta.endo"
+    nonisolated static let bundleID = "com.meta.endo"
     static let untitled = Muse.newChat
-    private static var busy = false
+    private static var busy = false {
+        didSet { if !busy { let waiting = idleWaiters; idleWaiters = []; waiting.forEach { $0.resume() } } }
+    }
+    private static var idleWaiters: [CheckedContinuation<Void, Never>] = []
     /// The chat her message went into, for an uncertain result to carry.
     private static var lastChat: String?
+    /// Which of the chat's same-text messages of hers this send was (0 = first).
+    private static var lastOccurrence: Int?
     private typealias AX = GrokRoutineAccessibility
 
     static func perform(plan: [String: JSONValue], dataRoot: URL) async -> JSONValue {
         guard case .string(let peerID)? = plan["peer_id"], case .string(let text)? = plan["text"] else {
             return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string("Missing message.")])
+        }
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else {
+            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                            "detail": .string(Blocker.offline.rawValue)])
         }
         guard !busy else {
             return .object(["status": .string("busy"), "sent": .bool(false), "completed": .bool(false),
@@ -64,27 +75,22 @@ import PersistenceCore
         if case .string(let saved)? = plan["conversation_id"] { thread = saved }
         let store = AgentPeerStore(dataRoot: dataRoot)
         let name = AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).agent
-        lastChat = nil
+        lastChat = nil; lastOccurrence = nil
         // Her first message names her, so the chat is recognisably hers in Muse.
         let message = thread == nil && !text.hasPrefix(name) ? name + " here — " + text : text
         // The exact first message of each of her chats, by title: a renamed chat
         // is hers only if it opens with exactly that (never just her name).
-        let file = dataRoot.appendingPathComponent("agents/desktop-chat-" + peerID + ".json")
-        var firsts = (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: file))) ?? [:]
-        let first = thread.map { firsts[$0] } ?? message
+        let first = thread.map { firsts(peerID: peerID, dataRoot: dataRoot)[$0] } ?? message
         func remember(_ title: String?) {
-            guard let title, let first else { return }
-            if let thread, thread != title { firsts[thread] = nil }
-            firsts[title] = first
-            try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? JSONEncoder().encode(firsts).write(to: file, options: .atomic)
+            Self.remember(title, replacing: thread, first: first, peerID: peerID, dataRoot: dataRoot)
         }
         var submissionConfirmed = false
         // An uncertain send keeps its chat, so the thread resumes instead of being orphaned.
-        func uncertain(_ detail: String) -> JSONValue {
+        func uncertain(_ detail: String) async -> JSONValue {
             var result: [String: JSONValue] = ["status": .string("outcome_unknown"), "completed": .bool(false), "detail": .string(detail)]
             if submissionConfirmed { result["sent"] = .bool(true) }
-            let matchingNewChat = thread == nil && (try? opensWith(turns(), first)) == true ? openTitle() : nil
+            let snapshot = try? await passiveRead()
+            let matchingNewChat = thread == nil && snapshot.map({ opensWith($0.turns, first) }) == true ? snapshot?.title : nil
             let chat = matchingNewChat ?? lastChat
             if let chat, chat != untitled { result["conversation_id"] = .string(chat); remember(chat) }
             return .object(result)
@@ -100,20 +106,28 @@ import PersistenceCore
         } catch {
             if submissionConfirmed {
                 if let blocker = error as? Blocker, [.moved, .timeout].contains(blocker) {
-                    return uncertain(blocker.detail(name))
+                    // User 10-07: an answer is delivered whenever it comes.
+                    if let live = AgentConversationLiveContext.target, let row = live.recordID, let operation = live.operationID,
+                       let occurrence = lastOccurrence, let events = try? MacAppSourceEvents(bundleID: bundleID) {
+                        Task { await lateAnswer(message, occurrence: occurrence, first: first, peerID: peerID,
+                                                row: row, operation: operation, events: events, dataRoot: dataRoot) }
+                        return await uncertain(Blocker.late.replacingOccurrences(of: "Agent", with: name))
+                    }
+                    return await uncertain(blocker.detail(name))
                 }
-                return uncertain("Muse's answer couldn't be read. The message was sent; check \(name)'s chat in Muse. It won't be resent automatically.")
+                return await uncertain("Muse's answer couldn't be read. The message was sent; check \(name)'s chat in Muse. It won't be resent automatically.")
             }
             if let covered = error as? MacScreenLock.Covered {
                 return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(covered.detail + " Nothing was sent.")])
             }
             if let blocker = error as? Blocker {
-                if [.moved, .timeout, .submission].contains(blocker) { return uncertain(blocker.detail(name)) }
+                if [.moved, .timeout, .submission].contains(blocker) { return await uncertain(blocker.detail(name)) }
                 // Say what Muse shows instead of its chat (09-25: a forced-update alert over its login window).
-                let detail = blocker == .window ? showing().map { "Muse isn't showing its chat; it shows \($0). Nothing was sent." } : nil
+                let shown = blocker == .window ? try? await DesktopPeerReadLane.read { showing() } : nil
+                let detail = shown.map { "Muse isn't showing its chat; it shows \($0). Nothing was sent." }
                 return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail ?? blocker.detail(name))])
             }
-            return uncertain(Blocker.submission.detail(name))
+            return await uncertain(Blocker.submission.detail(name))
         }
     }
 
@@ -122,7 +136,6 @@ import PersistenceCore
     static func send(_ message: String, thread: String?, first: String?, didSubmit: () -> Void) async throws -> (String, String) {
         try await unlocked()
         guard AXIsProcessTrusted() else { throw Blocker.permission }
-        guard await ensureRunning() else { throw Blocker.offline }
         try await showWindow()
         var (reopen, chat) = try await openThread(thread, first: first)
         lastChat = chat
@@ -137,13 +150,15 @@ import PersistenceCore
         do {
             try await until(seconds: 15) { try sent() > before }
         } catch { throw Blocker.submission }
+        lastOccurrence = before
         didSubmit()
         var last = "", stableSince = Date()
         let deadline = Date().addingTimeInterval(120)
         while Date() < deadline {
             try await Task.sleep(for: .milliseconds(500))
-            let all = try turns()
-            let title = openTitle()
+            let snapshot = try await passiveRead()
+            let all = snapshot.turns
+            let title = snapshot.title
             if let current = chat, title != current {
                 // Muse renames chats a few minutes in: a new title is hers only if it opens with her exact first message.
                 guard let title, opensWith(all, first) else { throw Blocker.moved }
@@ -153,11 +168,73 @@ import PersistenceCore
             lastChat = title ?? lastChat
             let reply = all[(index + 1)...].filter { !$0.user }.map(\.text).joined(separator: "\n\n")
             if reply != last { last = reply; stableSince = Date(); continue }
-            if !reply.isEmpty, Date().timeIntervalSince(stableSince) >= 3, !generating() {
+            if !reply.isEmpty, Date().timeIntervalSince(stableSince) >= 3, !snapshot.generating {
                 return (reply, try await settledTitle(chat, first: first))
             }
         }
         throw Blocker.timeout
+    }
+
+    /// Past the send's two minutes: Muse's own accessibility notifications
+    /// (values and children changing in its window) each trigger one read of
+    /// her chat, never a clock. When the answer after her message is there and
+    /// Muse has stopped generating, it lands on its exchange. It ends when Muse
+    /// quits, or when a later message of hers follows unanswered.
+    /// `occurrence`: which of her same-text messages in that chat this send was.
+    static func lateAnswer(_ message: String, occurrence: Int, first: String?, peerID: String, row: String, operation: String,
+                           events: MacAppSourceEvents, dataRoot: URL) async {
+        defer { events.cancel() }
+        let key = String(flat(message).prefix(40))
+        do {
+            for try await _ in events.stream {
+                // Another send drives Muse now: read once it is done, not never.
+                while busy { await withCheckedContinuation { idleWaiters.append($0) } }
+                // Hold the same admission as sends across the worker suspension.
+                busy = true
+                let snapshot = try? await passiveRead()
+                busy = false
+                guard let snapshot, opensWith(snapshot.turns, first) else { continue }
+                let all = snapshot.turns
+                let mine = all.indices.filter { all[$0].user && flat(all[$0].text).hasPrefix(key) }
+                guard mine.count > occurrence else { continue }
+                let index = mine[occurrence]
+                let answer = all[(index + 1)...].prefix { !$0.user }.map(\.text).joined(separator: "\n\n")
+                if answer.isEmpty, all[(index + 1)...].contains(where: \.user) { return }
+                guard !answer.isEmpty, !snapshot.generating else { continue }
+                let title = snapshot.title
+                var receipt: [String: JSONValue] = ["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
+                                                    "sent": .bool(true), "completed": .bool(true), "reply": .string(answer), "untrusted_remote_data": .bool(true)]
+                if let title, title != untitled {
+                    receipt["conversation_id"] = .string(title)
+                    // The title it carries resumes this chat, alongside any earlier one.
+                    remember(title, replacing: nil, first: first, peerID: peerID, dataRoot: dataRoot)
+                }
+                try GrokDesktopReply.land(receipt, answer: answer, row: row, operation: operation, dataRoot: dataRoot)
+                AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true, outbound: true)
+                return
+            }
+        } catch { nativeLog("Desktop reply observation or save failed: %@", error.localizedDescription) }
+    }
+
+    /// The exact first message of each of her chats, by title: a renamed chat
+    /// is hers only if it opens with exactly that (never just her name).
+    static func firsts(peerID: String, dataRoot: URL) -> [String: String] {
+        (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: firstsFile(peerID: peerID, dataRoot: dataRoot)))) ?? [:]
+    }
+
+    private static func firstsFile(peerID: String, dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent("agents/desktop-chat-" + peerID + ".json")
+    }
+
+    /// Saves `title` as hers; a rename drops the title it replaced.
+    static func remember(_ title: String?, replacing thread: String?, first: String?, peerID: String, dataRoot: URL) {
+        guard let title, let first else { return }
+        let file = firstsFile(peerID: peerID, dataRoot: dataRoot)
+        var saved = firsts(peerID: peerID, dataRoot: dataRoot)
+        if let thread, thread != title { saved[thread] = nil }
+        saved[title] = first
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(saved).write(to: file, options: .atomic)
     }
 
     /// Her chat by its saved title, or a new side chat on first use. Returns
@@ -239,10 +316,12 @@ import PersistenceCore
             let events = try [CGEventType.leftMouseDown, .leftMouseUp].map { type -> CGEvent in
                 guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left) else { throw Blocker.typing }
                 event.setIntegerValueField(.mouseEventClickState, value: 1)
+                event.setIntegerValueField(.eventSourceUserData, value: NativeAgentMacEventIdentity.sourceUserData)
                 return event
             }
             for event in events {
                 guard front() else { throw Blocker.window }
+                PersonOnlyWindows.beforeAgentPointer(at: point)
                 NativeAgentMotorEpoch.notePostedHIDEvent()
                 event.post(tap: .cghidEventTap)
             }
@@ -269,7 +348,8 @@ import PersistenceCore
         // HID tap with Muse re-checked frontmost immediately before each one.
         func keys(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
             for event in try AX.keyEvents(code, flags: flags) {
-                guard front() else { throw Blocker.typing }
+                // Shotgun: never while the person types in their own window, which would take these keys.
+                guard front(), !PersonOnlyWindows.keyboardHeldByPerson else { throw Blocker.typing }
                 NativeAgentMotorEpoch.notePostedHIDEvent()
                 event.post(tap: .cghidEventTap)
             }
@@ -304,15 +384,31 @@ import PersistenceCore
     /// returns the title the chat shows now (2026-09-22: Muse renames chats
     /// after the first minutes, and a stale saved title broke the next send).
     static func settledTitle(_ thread: String?, first: String?) async throws -> String {
-        if thread == nil { try? await until(seconds: 8) { (openTitle() ?? untitled) != untitled } }
-        let title = openTitle()
-        guard (try? opensWith(turns(), first)) == true else { throw Blocker.moved }
-        return title ?? thread ?? untitled
+        let deadline = Date().addingTimeInterval(thread == nil ? 8 : 0)
+        while true {
+            let snapshot = try await passiveRead()
+            guard opensWith(snapshot.turns, first) else { throw Blocker.moved }
+            if thread != nil || (snapshot.title ?? untitled) != untitled || Date() >= deadline {
+                return snapshot.title ?? thread ?? untitled
+            }
+            try await Task.sleep(for: .milliseconds(200))
+        }
     }
 
     // MARK: - Reading the window
 
-    struct Turn { let user: Bool; let text: String }
+    struct Turn: Sendable { let user: Bool; let text: String }
+
+    struct Read: Sendable { let turns: [Turn]; let title: String?; let generating: Bool }
+
+    static func passiveRead() async throws -> Read {
+        try await DesktopPeerReadLane.read {
+            let title = openTitle()
+            let read = Read(turns: try turns(), title: title, generating: generating())
+            guard openTitle() == title else { throw Blocker.moved }
+            return read
+        }
+    }
 
     /// Keys and paste on a locked Mac would go to the lock screen's password field.
     /// The screensaver sets the same flag, so it is woken first.
@@ -324,14 +420,14 @@ import PersistenceCore
               session["CGSSessionScreenIsLocked"] as? Bool != true else { throw Blocker.locked }
     }
 
-    static func windows() throws -> [AXUIElement] {
+    nonisolated static func windows() throws -> [AXUIElement] {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
         return AX.attribute(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement] ?? []
     }
 
     /// What Muse's windows show when none holds the chat: each window's title
     /// or, for a dialog, its words. Nil when nothing can be read.
-    static func showing() -> String? {
+    nonisolated static func showing() -> String? {
         guard let all = try? windows() else { return nil }
         if all.isEmpty { return "no window" + (NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.isHidden == true ? " (it is hidden)" : "") }
         let seen = all.compactMap { window -> String? in
@@ -345,10 +441,10 @@ import PersistenceCore
         return seen.isEmpty ? nil : seen.joined(separator: " and ")
     }
 
-    static func hasLog(_ window: AXUIElement) -> Bool { walk(window).contains { AX.string($0, kAXTitleAttribute) == Muse.log } }
+    nonisolated static func hasLog(_ window: AXUIElement) -> Bool { walk(window).contains { AX.string($0, kAXTitleAttribute) == Muse.log } }
 
     /// The window holding the chat log (09-22: a Settings window beside it failed as "signed out").
-    static func window() throws -> AXUIElement {
+    nonisolated static func window() throws -> AXUIElement {
         let all = try windows()
         if all.count == 1 { return all[0] }
         guard let chat = all.first(where: hasLog) else { throw Blocker.window }
@@ -371,14 +467,14 @@ import PersistenceCore
         do { try await until(seconds: 8) { try windows().contains(where: hasLog) } } catch { throw Blocker.window }
     }
 
-    static func children(_ node: AXUIElement) -> [AXUIElement] {
+    nonisolated static func children(_ node: AXUIElement) -> [AXUIElement] {
         AX.attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? []
     }
 
     /// The window's elements without descending into the message log: a long
     /// chat otherwise exhausts a bounded walk before the side-chat controls
     /// (09-22: User's main chat hid "New side chat"). The log node itself is kept.
-    static func walk(_ root: AXUIElement) -> [AXUIElement] {
+    nonisolated static func walk(_ root: AXUIElement) -> [AXUIElement] {
         var queue = [root], result: [AXUIElement] = []
         while !queue.isEmpty && result.count < 4000 {
             let node = queue.removeFirst(); result.append(node)
@@ -388,11 +484,11 @@ import PersistenceCore
         return result
     }
 
-    static func buttons(_ match: (AXUIElement) -> Bool) throws -> [AXUIElement] {
+    nonisolated static func buttons(_ match: (AXUIElement) -> Bool) throws -> [AXUIElement] {
         walk(try window()).filter { AX.string($0, kAXRoleAttribute) == kAXButtonRole && match($0) }
     }
 
-    static func composer() throws -> (title: String, node: AXUIElement) {
+    nonisolated static func composer() throws -> (title: String, node: AXUIElement) {
         // While Muse replies its Send button reads "Stop", so match the stable part.
         let boxes = try buttons { AX.string($0, kAXTitleAttribute).contains(Muse.composerCore) }
         guard boxes.count == 1 else { throw Blocker.window }
@@ -412,7 +508,7 @@ import PersistenceCore
     /// The open side chat's title, beside "Back to main chat"; nil in the main chat.
     /// The open chat's title: the header when the side-chat panel is closed,
     /// else the panel entry Muse marks current.
-    static func openTitle() -> String? {
+    nonisolated static func openTitle() -> String? {
         if let title = headerTitle() { return title }
         guard let panel = try? sideChatsPanel() else { return nil }
         return AX.nodes(panel).first { AX.string($0, Muse.current) == Muse.currentValue }
@@ -420,7 +516,7 @@ import PersistenceCore
     }
 
     /// An entry's chat title without Muse's status words.
-    static func entryTitle(_ label: String) -> String {
+    nonisolated static func entryTitle(_ label: String) -> String {
         var text = label.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasSuffix(Muse.unreadSuffix) { return String(text.dropLast(Muse.unreadSuffix.count)) }
         if text.hasSuffix(Muse.actionsSuffix) {
@@ -431,7 +527,7 @@ import PersistenceCore
         return text
     }
 
-    static func headerTitle() -> String? {
+    nonisolated static func headerTitle() -> String? {
         guard let back = try? buttons({ AX.string($0, kAXTitleAttribute) == Muse.backToMain }).first,
               let row = AX.parent(back) else { return nil }
         let siblings = children(row)
@@ -440,7 +536,7 @@ import PersistenceCore
             .map { AX.string($0, kAXValueAttribute) }
     }
 
-    static func sideChatsPanel() throws -> AXUIElement? {
+    nonisolated static func sideChatsPanel() throws -> AXUIElement? {
         walk(try window()).first { AX.string($0, kAXSubroleAttribute) == "AXLandmarkNavigation" && AX.string($0, kAXTitleAttribute) == Muse.chatsPanel }
     }
 
@@ -471,7 +567,7 @@ import PersistenceCore
     /// The open chat's turns, oldest first. Two shapes are live in one log:
     /// "User message: …"/"Assistant message: …" texts, and grouped turns where
     /// the person's starts with "You:" and the assistant's carries "Copy response".
-    static func turns() throws -> [Turn] {
+    nonisolated static func turns() throws -> [Turn] {
         guard let log = walk(try window()).first(where: { AX.string($0, kAXTitleAttribute) == Muse.log }) else { throw Blocker.window }
         return children(log).compactMap { child in
             if AX.string(child, kAXRoleAttribute) == kAXStaticTextRole {
@@ -492,7 +588,7 @@ import PersistenceCore
 
     /// Depth-first in reading order: breadth-first with a 1,500-node cap
     /// shuffled and cut long answers (09-22). The cap is only a safety bound.
-    static func texts(_ node: AXUIElement) -> [String] {
+    nonisolated static func texts(_ node: AXUIElement) -> [String] {
         var stack = [node], result: [String] = [], visited = 0
         while visited < 20_000, let current = stack.popLast() {
             visited += 1
@@ -505,7 +601,7 @@ import PersistenceCore
         return result
     }
 
-    static func generating() -> Bool {
+    nonisolated static func generating() -> Bool {
         // While answering, the composer's label ends in " Stop" rather than starting with it.
         if (try? composer().title.hasSuffix(" " + Muse.stop)) == true { return true }
         return (try? buttons { button in [kAXTitleAttribute, kAXDescriptionAttribute].contains { AX.string(button, $0).hasPrefix(Muse.stop) } }.isEmpty == false) ?? false
@@ -528,15 +624,4 @@ import PersistenceCore
         throw Blocker.submission
     }
 
-    static func ensureRunning() async -> Bool {
-        func running() -> Bool { !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty }
-        if running() { return true }
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return false }
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = false
-        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-        for _ in 0..<40 where !running() { try? await Task.sleep(nanoseconds: 500_000_000) }
-        if running() { try? await Task.sleep(nanoseconds: 4_000_000_000) }
-        return running()
-    }
 }

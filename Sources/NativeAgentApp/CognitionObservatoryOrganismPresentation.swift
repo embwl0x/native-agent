@@ -1,22 +1,6 @@
 import Foundation
 import CognitiveSubstrate
 
-/// The control contract for the Organism toggle in Cognition Observatory.
-/// Keeping its availability and selected state in this shared presentation
-/// seam lets the view and its behavioral coverage agree without depending on
-/// an AppKit representation of a SwiftUI Toggle.
-struct CognitionObservatoryOrganismControlPresentation: Equatable, Sendable {
-    static let label = "Body signals"
-
-    let isEnabled: Bool
-    let isOn: Bool
-
-    init(cognitiveSubstrateEnabled: Bool, organismKernelEnabled: Bool) {
-        self.isEnabled = cognitiveSubstrateEnabled
-        self.isOn = organismKernelEnabled
-    }
-}
-
 /// Read-only mapping for the mounted Organism Body panel. The kernel owns the
 /// snapshot; this presentation layer makes the difference between a real empty
 /// body, an off kernel, and a stale or malformed sample visible to the operator.
@@ -71,7 +55,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
         }
 
         guard snapshot.enabled else {
-            state = .disabled("Body signals are off — there is no live body readout.")
+            state = .disabled("Moods, energy, and a clock of my own are off in Settings — there is no live body readout.")
             statusText = "Off"
             statusKind = "warn"
             sampledAtText = "body readout off"

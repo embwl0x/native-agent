@@ -2,6 +2,21 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// One installation-wide persona selection for every conversation door.
+/// Retains the existing preference key so the Mac's saved pick survives upgrades.
+public enum PersonaSelection {
+    public static func current(defaults: UserDefaults = .standard) -> String? {
+        let name = defaults.string(forKey: "chatPersona")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name?.isEmpty == false ? name : nil
+    }
+
+    public static func select(_ name: String, defaults: UserDefaults = .standard) {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.isEmpty { defaults.removeObject(forKey: "chatPersona") }
+        else { defaults.set(clean, forKey: "chatPersona") }
+    }
+}
+
 // MARK: - PersonaRoot resolution contract
 //
 // One rule, owned by `PersistenceCore.defaultPersonaRoot`: a checkout's

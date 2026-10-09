@@ -65,67 +65,6 @@ public struct HeartbeatBackgroundWork: Sendable {
         )
     }
 
-    /// Self-healing hook (U2b wave 3 item 2). Watches the auto-doctor loop's
-    /// latest.json for a healthy→fail transition and the live error sinks
-    /// (`SelfHealingHook.errorFeeds`) for a burst;
-    /// on either, runs a diagnostic LLM pass (diagnostics surface picker) and
-    /// files a `needs_diff` evolution proposal with redacted evidence. The
-    /// proposal filing is injected so the module gains no SelfImprovement dep
-    /// (same rule as WeeklySelfImprovementLoop's fileCodeFinding).
-    public func makeSelfHealingHook(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        llm: any LLMClient
-    ) -> some EventDeadlineLoopRunner {
-        let hook = SelfHealingHook(
-            // Domain faults are the primary wake path. The inherited cadence
-            // is deliberately only a missed-event integrity verification.
-            interval: 24 * 60 * 60,
-            llm: llm,
-            dataRoot: dataRoot,
-            isEnabled: { await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot) },
-            fileProposal: { title, evidence in
-                // Rethrow: the hook stamps its cooldown + consumes the doctor
-                // transition only on durable success. Swallowing a store-write
-                // failure here would burn the cooldown with no proposal filed.
-                let store = EvolutionProposalStore(dataRoot: dataRoot)
-                _ = try await store.propose(
-                    source: .selfHeal, title: title, evidence: evidence)
-            },
-            closeDoctorFailureProposals: {
-                _ = await closeResolvedDoctorSelfHealProposals(dataRoot: dataRoot)
-            }
-        )
-        return SelfHealingEventDeadlineRunner(hook: hook, dataRoot: dataRoot, port: port)
-    }
-
-    private struct SelfHealingEventDeadlineRunner: EventDeadlineLoopRunner {
-        let hook: SelfHealingHook
-        let dataRoot: URL
-        let port: any BackgroundWorkEventPort
-
-        var loopId: String { hook.loopId }
-        var interval: TimeInterval { hook.interval }
-        var tickTimeoutOverride: TimeInterval? { hook.tickTimeoutOverride }
-        let eventCoalescingDelay: TimeInterval = 0.5
-
-        func tick() async { await hook.tick() }
-        func tickOutcome() async -> LoopTickOutcome { await hook.tickOutcome() }
-
-        func physiologyEvents() -> AsyncStream<Void> {
-            port.storeAndFileEvents(
-                paths: [
-                    dataRoot.appendingPathComponent("doctor", isDirectory: true)
-                        .appendingPathComponent("latest.json"),
-                ] + SelfHealingHook.errorFeeds.map { $0.url(dataRoot: dataRoot) },
-                loopId: loopId
-            )
-        }
-
-        func nextMeaningfulDeadline(after now: Date) async -> Date? {
-            hook.nextMeaningfulDeadline(after: now)
-        }
-    }
-
     /// Closes unresolved Doctor-failure self-heal proposals once the current
     /// Doctor snapshot is green again. This keeps the proposal queue honest
     /// after restarts: a no-longer-reproducing Doctor failure should not stay
@@ -142,7 +81,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             active = try await store.list(statuses: [.needsDiff])
         } catch {
             FileHandle.standardError.write(Data(
-                "SelfHealingHook: resolved Doctor proposal scan failed: \(error)\n".utf8))
+                "HeartbeatLoop: resolved Doctor proposal scan failed: \(error)\n".utf8))
             return 0
         }
 
@@ -162,13 +101,13 @@ public struct HeartbeatBackgroundWork: Sendable {
                 if result.applied { closed += 1 }
             } catch {
                 FileHandle.standardError.write(Data(
-                    "SelfHealingHook: resolved Doctor proposal close failed for \(proposal.id): \(error)\n".utf8))
+                    "HeartbeatLoop: resolved Doctor proposal close failed for \(proposal.id): \(error)\n".utf8))
             }
         }
 
         if closed > 0 {
             FileHandle.standardError.write(Data(
-                "SelfHealingHook: closed \(closed) resolved Doctor self-heal proposal(s)\n".utf8))
+                "HeartbeatLoop: closed \(closed) resolved Doctor self-heal proposal(s)\n".utf8))
         }
         return closed
     }
@@ -273,7 +212,6 @@ public struct HeartbeatBackgroundWork: Sendable {
     }
 
     private let heartbeatExecutionStuckAge: TimeInterval = 6 * 60 * 60
-    private let heartbeatSelfHealStaleAge: TimeInterval = 6 * 60 * 60
     /// A failed candidate is not terminal: it can return to `proposed` after
     /// correction, but it is otherwise easy to leave indefinitely in the one
     /// proposal array. Name that stalled branch before it becomes invisible
@@ -494,23 +432,6 @@ public struct HeartbeatBackgroundWork: Sendable {
                     HeartbeatCardAction.repair.noticeAction
                 ]
             ))
-        } else {
-            let staleSelfHeal = selfHealNeedsDiff.filter {
-                heartbeatAgeSeconds(updatedAt: $0.updatedAt, createdAt: $0.createdAt, now: now)
-                    .map { $0 >= heartbeatSelfHealStaleAge } ?? false
-            }
-            if !staleSelfHeal.isEmpty {
-                let titles = staleSelfHeal.prefix(3).map {
-                    "\($0.title) (filed \($0.createdAt))"
-                }.joined(separator: "; ")
-                issues.append(HeartbeatIssue(
-                    id: "self-heal-needs-diff",
-                    summary: "\(staleSelfHeal.count) earlier self-heal proposal(s) await review.",
-                    detail: "These retained proposals have awaited a diff for over \(Int(heartbeatSelfHealStaleAge / 3600))h; their original incident titles do not assert a current error burst: \(titles).",
-                    priority: 25,
-                    actions: []
-                ))
-            }
         }
 
         let failedCandidates = active.filter {
@@ -625,8 +546,8 @@ public struct HeartbeatBackgroundWork: Sendable {
         dataRoot: URL,
         now: Date
     ) -> (line: String, issue: HeartbeatIssue?) {
-        let statuses = SelfHealingHook.scanErrorFeeds(dataRoot: dataRoot, now: now)
-        let windowMinutes = Int(SelfHealingHook.errorBurstWindow / 60)
+        let statuses = ErrorFeeds.scanErrorFeeds(dataRoot: dataRoot, now: now)
+        let windowMinutes = Int(ErrorFeeds.errorBurstWindow / 60)
         let perFeed = statuses
             .map { "\($0.feed.label) \($0.recentCount) row(s)" }
             .joined(separator: ", ")
@@ -651,7 +572,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             ))
         }
 
-        guard total >= SelfHealingHook.errorBurstThreshold else { return (line, nil) }
+        guard total >= ErrorFeeds.errorBurstThreshold else { return (line, nil) }
         let samples = statuses
             .flatMap { status in status.recentLines.map { "[\(status.feed.label)] \($0)" } }
             .suffix(3)
@@ -660,7 +581,7 @@ public struct HeartbeatBackgroundWork: Sendable {
         return (line, HeartbeatIssue(
             id: "error-burst",
             summary: "\(total) errors logged in \(windowMinutes)m.",
-            detail: "A recent error burst crossed the \(SelfHealingHook.errorBurstThreshold)-row threshold. Recent samples:\n\(samples)",
+            detail: "A recent error burst crossed the \(ErrorFeeds.errorBurstThreshold)-row threshold. Recent samples:\n\(samples)",
             priority: 18,
             actions: []
         ))

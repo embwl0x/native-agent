@@ -104,14 +104,11 @@ extension NativeClient {
         )
     }
 
-    func getPrivacyMap(includeInventory: Bool = true) async throws -> PrivacyMap {
+    func getPrivacyMap() async throws -> PrivacyMap {
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         return PrivacyMap(
             dataRoot: dataRoot.path,
-            categories: Self.privacyCategories(
-                dataRoot: dataRoot,
-                includeInventory: includeInventory
-            ),
+            categories: Self.privacyCategories(dataRoot: dataRoot),
             generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date())
         )
     }
@@ -166,7 +163,7 @@ extension NativeClient {
     //    the persisted assistant turn's metadata.persona for downstream
     //    consolidation, but does NOT change which compiled persona the LLM sees
     //    on this turn. Default-persona users see no regression.
-    //  * personaFingerprint = first-16-hex of sha256(profile.name|profile.personaKind).
+    //  * personaFingerprint hashes the persona documents admitted for the turn.
     //  * contextFingerprint = first-16-hex of sha256(sorted recalledIds join),
     //    nil when empty — opaque comparator, never raw record identity
     //    (packet-provenance 2026-07-11).

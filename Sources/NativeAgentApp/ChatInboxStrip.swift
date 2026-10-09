@@ -37,7 +37,10 @@ enum InboxStripPresentation {
     }
 }
 
-struct InboxStripContainer: View {
+struct InboxStripContainer<Header: View>: View {
+    /// Fluid glass A2: unread notes are one capsule; the host places it (the
+    /// chat header) and the strip keeps other chats' approvals and cards.
+    @ViewBuilder let header: (InboxNotesCapsule) -> Header
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var items: [InboxItemRecord] = []
@@ -64,6 +67,22 @@ struct InboxStripContainer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
+        header(InboxNotesCapsule(
+            items: items.filter { $0.source != InteractionCardDelivery.source && !$0.hasLinkedApproval },
+            onAction: { id, actionID in
+                try await appModel.inboxAction(id, action: actionID)
+                // Every successful action changes inbox state. Reload now so
+                // a read item leaves the unread count immediately instead of
+                // lingering until the next poll, then publish the same state
+                // to peripheral surfaces.
+                await reload()
+                if let inboxSnapshotWriterOverride = appModel.inboxSnapshotWriterOverride {
+                    await inboxSnapshotWriterOverride()
+                } else {
+                    await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
+                }
+            }
+        ))
         if let approvalError {
             Text(approvalError).foregroundStyle(.orange)
         }
@@ -73,7 +92,7 @@ struct InboxStripContainer: View {
                 ForEach(stripApprovals.prefix(2)) { approval in
                     Group {
                         if ApprovalPayloadPreviewPresentation.canResolve(approval) {
-                            InlineApprovalCard(message: approvalMessage(approval))
+                            InlineApprovalCard(message: InlineApprovalCard.message(for: approval))
                         } else {
                             Text(ApprovalPayloadPreviewPresentation.unavailableText)
                         }
@@ -87,29 +106,14 @@ struct InboxStripContainer: View {
             .padding(.horizontal, 16)
         }
         if let loadError {
-            Label("Inbox unavailable: \(loadError)", systemImage: "exclamationmark.triangle")
+            Label(loadError, systemImage: "exclamationmark.triangle")
                 .font(.caption)
                 .foregroundStyle(.orange)
                 .lineLimit(2)
                 .help("The unread-inbox read failed; items shown may be stale. The strip retries when the inbox changes.")
                 .accessibilityIdentifier("inbox-strip-load-error")
         }
-        InboxStripView(
-            items: items.filter { $0.source != InteractionCardDelivery.source && !$0.hasLinkedApproval },
-            onAction: { id, actionID in
-                try await appModel.inboxAction(id, action: actionID)
-                // Every successful action changes inbox state. Reload now so
-                // a read item leaves the unread strip immediately instead of
-                // lingering until the next poll, then publish the same state
-                // to peripheral surfaces.
-                await reload()
-                if let inboxSnapshotWriterOverride = appModel.inboxSnapshotWriterOverride {
-                    await inboxSnapshotWriterOverride()
-                } else {
-                    await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
-                }
-            }
-        )
+        }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             let inboxPath = (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
@@ -132,15 +136,6 @@ struct InboxStripContainer: View {
                 }
             }
         }
-        }
-    }
-
-    private func approvalMessage(_ approval: ApprovalRecord) -> ChatMessage {
-        var metadata = ChatMessageMetadata()
-        metadata.kind = ChatMessageMetadata.approvalPendingKind
-        metadata.approvalId = approval.id
-        return ChatMessage(id: approval.id, role: "tool",
-            content: "\(approval.title)\n\(approval.reason)\n\(approval.payloadPreview)", metadata: metadata)
     }
 
     func reload() async {
@@ -164,7 +159,7 @@ struct InboxStripContainer: View {
             // inline error row above renders the real failure.
             let next = InboxStripPresentation.failed(
                 previousItems: items,
-                errorDescription: error.localizedDescription
+                errorDescription: UserFacingError.message(error, action: "read your inbox")
             )
             guard generation == reloadGeneration else { return }
             items = next.items

@@ -6,6 +6,7 @@ import PersistenceCore
 import Desk
 import StandingBots
 import WorkshopExecution
+import SwarmRuns
 import NativeAgentShared
 
 /// Her world, read once and kept (her-screen Phase 2, 2026-09-23). Home,
@@ -28,7 +29,7 @@ struct HerWorld: @unchecked Sendable {
     var latest: [UUID: ShelfEntry] = [:]
     var running: Set<UUID> = []
     var approvals: [ApprovalRecord] = []
-    /// Live board rows whose process is still alive.
+    /// Shared live and retained crew projection; all identities keep their names.
     var crews: [[String: Any]] = []
     var moments = 0
     /// Memory proposals waiting for review: hers, not the owner's.
@@ -282,11 +283,10 @@ extension HerScreen {
                         severity: item.severity, linkedApproval: !(item.related_approval_id ?? "").isEmpty, actionIDs: item.actions.map(\.id))
             }.count
         }) { world.asks = asks }
-        let board: [[String: Any]] = await part("crews", [stamp(at("swarms/live.json"))]) { rows(at("swarms/live.json")) } ?? []
-        world.crews = board.filter { row in
-            guard let pid = row["pid"] as? Int else { return false }
-            return kill(pid_t(pid), 0) == 0 || errno != ESRCH
-        }
+        if let crews: [[String: Any]] = await part("crews", [stamp(at("swarms/live.json")), stamp(at("swarms/runs.json"))], {
+            try? SwiftNativeSwarmRunsReader(runsPath: at("swarms/runs.json")).readCrews(locked: locked)
+        }) { world.crews = crews }
+        else if !world.unread.contains("crews") { world.unread.append("crews") }
         // The run queue takes the helpers' store lock and moments are SQLite:
         // read fresh for home and rooms, the kept value for the glance.
         if reach != .kept {
@@ -379,7 +379,7 @@ extension HerScreen {
                                       entry?.statusDetail ?? "-", entry?.approvalID ?? "-", running ? "running" : "idle"].joined(separator: "|"), line: line,
                                    at: (running ? now : entry?.runAt ?? .distantPast).timeIntervalSince1970)
             }
-            for row in world.crews {
+            for row in world.crews where row["pid"] != nil {
                 guard let id = row["id"] as? String else { continue }
                 let name = "crew.\(book.number("crew", id: id) { Set(world.crews.compactMap { $0["id"] as? String }) })"
                 let task = clip(firstLine(row["objective"] as? String ?? "A task"), 36)
@@ -512,8 +512,9 @@ extension HerScreen {
     /// - Never blocks: kept values and stats only, under a 150 ms budget;
     ///   stale parts refresh in the background for a later turn.
     /// - Never advances what she has seen; never User's screen or activity data.
-    package static func glance(dataRoot: URL, scope: String?, turn: Date?) async -> String? {
+    package static func glance(dataRoot: URL, scope: String?, turn: Date?, includingMoments: Bool = true) async -> String? {
         let key = (scope ?? "-") + "\u{0}" + (turn.map { String($0.timeIntervalSince1970) } ?? "-")
+            + "\u{0}" + String(includingMoments)
         if turn != nil, let kept = HerMemo.shared.glance(key) { return kept }
         let now = turn ?? Date()
         // Parts whose files moved are recomputed inline (read-only, no locks)
@@ -528,7 +529,7 @@ extension HerScreen {
                 let once = OnceResume<GlanceText>(continuation)
                 Task.detached(priority: .userInitiated) {
                     let said = await AgentWorkspacePorts.$binding.withValue(ports) {
-                        await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .unlocked)
+                        await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .unlocked, includingMoments: includingMoments)
                     }
                     HerMemo.shared.end(root)
                     once.resume(GlanceText(text: said))
@@ -536,15 +537,15 @@ extension HerScreen {
                 Task.detached { try? await Task.sleep(for: .milliseconds(150)); once.resume(nil) }
             }
             text = done?.text
-            if done == nil { text = await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .kept) }
-        } else { text = await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .kept) }
+            if done == nil { text = await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .kept, includingMoments: includingMoments) }
+        } else { text = await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .kept, includingMoments: includingMoments) }
         if turn != nil { HerMemo.shared.keepGlance(key, text) }
         return text
     }
 
     struct GlanceText: Sendable { let text: String? }
 
-    static func renderGlance(dataRoot: URL, scope: String?, now: Date, reach: Reach) async -> String? {
+    static func renderGlance(dataRoot: URL, scope: String?, now: Date, reach: Reach, includingMoments: Bool = true) async -> String? {
         let world = await readWorld(dataRoot, now: now, reach: reach)
         let person = names(dataRoot).person
         let seen = await lastSeen(dataRoot)
@@ -571,10 +572,11 @@ extension HerScreen {
         }
         if let desk = world.desk {
             let waiting = desk.items.filter(OwnerAttentionPolicy.waitsOnOwner).sorted { $0.updatedAt > $1.updatedAt }
-            waits += waiting.prefix(2).map { "desk." + $0.alias } + (waiting.count > 2 ? ["+\(waiting.count - 2) desk"] : [])
+            waits += waiting.prefix(2).map { "desk." + $0.alias + " — " + clip($0.title, 28) }
+                + (waiting.count > 2 ? ["+\(waiting.count - 2) desk"] : [])
         }
         if world.asks > 0 { waits.append("notes \(world.asks)") }
-        if world.moments > 0 { mine.append("moments \(world.moments)") }
+        if includingMoments, world.moments > 0 { mine.append("moments \(world.moments)") }
         if world.reviews.count > 0 { mine.append("memories \(world.reviews.count)\(world.reviews.capped ? "+" : "")") }
         withNames(dataRoot) { book in
             for contact in world.contacts where state(contact, record: latest(contact, records: world.records),

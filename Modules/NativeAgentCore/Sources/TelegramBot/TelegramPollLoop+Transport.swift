@@ -97,9 +97,7 @@ extension TelegramPollLoop {
             }
         }
 
-    /// chat-smoothness phase 5: sendMessage that returns the created
-    /// message_id so the growing draft can edit it. Single message only —
-    /// the draft window is pre-capped to one Telegram-safe chunk.
+    /// Send one ordinary system message and return its created message_id.
     public static let defaultSendMessageReturningId: @Sendable (String, TelegramDestination, String) async throws -> Int = { token, destination, text in
         return try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
             let result = try await _tgPostJSON(
@@ -115,7 +113,7 @@ extension TelegramPollLoop {
         }
     }
 
-    /// chat-smoothness phase 5: edit the growing draft in place. Telegram
+    /// Update an ordinary system message in place. Telegram
     /// 400s "message is not modified" when text is unchanged — treated as
     /// success (the draft already shows this text).
     public static let defaultEditMessageText: @Sendable (String, Int, Int, String) async throws -> Void = { token, chatId, messageId, text in

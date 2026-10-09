@@ -150,7 +150,8 @@ extension SwiftNativeDeskStore {
                 // non-pursuit is tolerated (skipped). Dedup by id so a replayed
                 // reserve op is idempotent — the caps count DISTINCT rows.
                 guard var item = byHandle[op.handle], var p = item.pursuit else { continue }
-                if !accounting.hasWorkSlot(handle: op.handle, id: reservationId) {
+                if !accounting.hasWorkSlot(handle: op.handle, id: reservationId),
+                   !p.reservations.contains(where: { $0.reservationId == reservationId }) {
                     p.reservations.append(WorkReservation(reservationId: reservationId, day: day, slot: slot, reservedAt: op.ts))
                     accounting.chargeWorkSlot(handle: op.handle, day: day, id: reservationId)
                 }
@@ -177,16 +178,20 @@ extension SwiftNativeDeskStore {
                     p.reservations[idx].completedAt = op.ts
                     p.reservations[idx].disposition = disposition
                     p.reservations[idx].artifactRefs = Array(artifactRefs.prefix(16))
+                    if disposition == .unstarted {
+                        accounting.releaseWorkSlot(handle: op.handle, day: p.reservations[idx].day, id: reservationId)
+                    }
                 }
                 Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
-                p.lastWorkedAt = op.ts
+                if disposition != .unstarted { p.lastWorkedAt = op.ts }
                 Self.recomputePursuitCounters(&p, slotsByDay: accounting.workSlotsByDay, handle: op.handle)
                 item.pursuit = p
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .reserveWorkAttempt(attemptId, lane, day, slot):
                 guard var item = byHandle[op.handle] else { continue }
-                if !accounting.hasWorkSlot(handle: op.handle, id: attemptId) {
+                if !accounting.hasWorkSlot(handle: op.handle, id: attemptId),
+                   !item.workAttempts.contains(where: { $0.attemptId == attemptId }) {
                     item.workAttempts.append(DeskWorkAttempt(
                         attemptId: attemptId,
                         lane: lane,
@@ -198,14 +203,20 @@ extension SwiftNativeDeskStore {
                 }
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
-            case let .completeWorkAttempt(attemptId, receipt):
+            case let .completeWorkAttempt(attemptId, receipt, disposition):
                 guard var item = byHandle[op.handle],
                       let index = item.workAttempts.firstIndex(where: { $0.attemptId == attemptId }) else { continue }
                 item.workAttempts[index].receipt = receipt
                 item.workAttempts[index].completedAt = op.ts
+                item.workAttempts[index].disposition = disposition
+                if disposition == .unstarted {
+                    accounting.releaseWorkSlot(handle: op.handle, day: item.workAttempts[index].day, id: attemptId)
+                }
                 Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
-                item.cadence.lastRefreshAt = op.ts
-                item.cadence.nextRefreshAt = Self.nextCadenceRefresh(after: op.ts, cadence: item.cadence)
+                if disposition != .unstarted {
+                    item.cadence.lastRefreshAt = op.ts
+                    item.cadence.nextRefreshAt = Self.nextCadenceRefresh(after: op.ts, cadence: item.cadence)
+                }
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .handOffWorkReceipt(reservationId):
@@ -247,12 +258,16 @@ extension SwiftNativeDeskStore {
             }
         }
 
+        // Revision and retention share the committed feed clock, never wall time.
+        let revision = [ops.last?.ts, base?.state.generatedTs].compactMap { $0 }.max() ?? ""
+        let currentDay = DeskClock.parseISO(revision).map(DeskClock.dayStamp)
         let live = createOrder.compactMap { byHandle[$0] }.filter { !archived.contains($0.handle) }.map { item in
             var retained = item
             let settledAttempts = item.workAttempts.filter { $0.completedAt != nil && $0.receiptHandedOff }
             let recentAttempts = Set(settledAttempts.suffix(4).map(\.attemptId))
             retained.workAttempts.removeAll {
                 $0.completedAt != nil && $0.receiptHandedOff && !recentAttempts.contains($0.attemptId)
+                    && ($0.disposition != .unstarted || $0.day < (currentDay ?? ""))
             }
             if var pursuit = retained.pursuit {
                 let settledReservations = pursuit.reservations.filter { $0.completedAt != nil && $0.receiptHandedOff }
@@ -260,27 +275,19 @@ extension SwiftNativeDeskStore {
                 if let satisfied = pursuit.reservations.last(where: { $0.disposition == .goalSatisfied }) {
                     recentReservations.insert(satisfied.reservationId)
                 }
-                for reservation in settledReservations where !recentReservations.contains(reservation.reservationId) {
+                for reservation in settledReservations where !recentReservations.contains(reservation.reservationId)
+                    && reservation.disposition != .unstarted {
                     pursuit.retiredSessionsByDay[reservation.day, default: 0] += 1
                 }
                 pursuit.reservations.removeAll {
                     $0.completedAt != nil && $0.receiptHandedOff && !recentReservations.contains($0.reservationId)
+                        && ($0.disposition != .unstarted || $0.day < (currentDay ?? ""))
                 }
                 retained.pursuit = pursuit
             }
             return retained
         }
         let ordered = orderByAlias(live)
-        // DETERMINISTIC fold: the rev stamp is the newest of (last op ts, base
-        // stamp) — NOT wall-clock — so the same feed always folds to an equal
-        // DeskState and state.json never drifts on a no-op recompaction. The
-        // max matters: the raw append path does not restamp, so a tail op can
-        // carry a ts OLDER than the base; taking just ops.last would regress
-        // generatedTs, and if that state became the next base an empty-tail
-        // maxCommittedTs would floor future commit stamps on the stale value
-        // (gpt-5.5 compaction review MED — Lamport floor regression).
-        let revision = [ops.last?.ts, base?.state.generatedTs].compactMap { $0 }.max() ?? ""
-        let currentDay = DeskClock.parseISO(revision).map(DeskClock.dayStamp)
         let liveSlots = DeskState(items: ordered, generatedTs: revision).workSlotsByDay
         accounting.workSlotsByDay = accounting.workSlotsByDay.reduce(into: [:]) { retained, row in
             let (day, handles) = row

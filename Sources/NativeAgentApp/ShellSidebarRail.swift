@@ -99,10 +99,18 @@ struct ShellRailItem: View {
 /// inset like the plate's own corners, instead of the square system ring.
 struct ShellRailFocusRing: View {
     @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    private var ringColor: Color {
+        if contrast == .increased { return NativeAgentShell.text }
+        let haze = HazeColor(stored: hazeRaw)
+        return colorScheme == .dark ? haze.edgeLight : Color(nsColor: haze.control(dark: false, labelled: false))
+    }
 
     var body: some View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .strokeBorder(HazeColor(stored: hazeRaw).edgeLight, lineWidth: 1.5)
+            .strokeBorder(ringColor, lineWidth: colorScheme == .light || contrast == .increased ? 2 : 1.5)
             .padding(.horizontal, 4)
             .padding(.vertical, 4)
             .allowsHitTesting(false)
@@ -127,9 +135,6 @@ struct ShellSidebarRail: View {
     @Namespace private var selectionBar
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    /// Clear with a dark tint (User 09-27): macOS 27 diffuses more, and plain
-    /// glass over the dark haze read milky. Never mix clear and regular on one screen.
-    static let plateGlass: Glass = .clear.tint(.black.opacity(0.28))
 
     var body: some View {
         VStack(spacing: 4) {
@@ -191,7 +196,7 @@ struct ShellSidebarRail: View {
             ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.railPlateRadius)
         }
         .glassEffect(
-            reduceTransparency ? .identity : Self.plateGlass,
+            reduceTransparency ? .identity : HouseGlass.plate,
             in: RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous)
         )
         .padding([.top, .bottom, .leading], NativeAgentShellLayout.railPlateInset)

@@ -14,24 +14,24 @@ import TrustCenter
 
 struct ShellRoomHeader: View {
     var name: String
+    /// The settled posture is the composer's to say (its trust word, wave 3:
+    /// once, not in both places); the dot shows when something waits or went
+    /// wrong.
     var status: ChatShellStatus
-    var trustPolicy: TrustPolicy?
-    /// Simple view: the settled posture line is the composer's to say; the
-    /// dot still shows when something waits or went wrong.
-    var showsPosture = true
     /// Simple view has no conversations list; this is its one way to start a
     /// fresh thread besides /new (User 09-27). The phone follows the Mac.
     var onNewChat: (() -> Void)? = nil
+    /// Fluid glass A2: unread notes as one "N updates" capsule.
+    var notes: InboxNotesCapsule? = nil
+    /// The Work pane's button, main window only (WorkPane.swift).
+    var work: WorkPaneHeaderButton? = nil
 
-    // Full Mac has no timer (2026-09-10), so nothing in the header goes
-    // stale on a clock; policy changes come from AppModel observation.
-    private var permissionRefreshDates: [Date] { [Date()] }
     private var isSettled: Bool { if case .settled = status { true } else { false } }
 
     var body: some View {
         HStack(spacing: 8) {
             Text(name)
-                .font(ShellType.bodyMedium.weight(.semibold))
+                .font(ShellType.columnTitle)
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
                 .accessibilityAddTraits(.isHeader)
@@ -58,34 +58,31 @@ struct ShellRoomHeader: View {
             // Conversation… (⌘F) — so this one is simply gone.
             // Conversation controls live beside the draft in the composer.
 
-            if showsPosture || !isSettled {
-                TimelineView(.explicit(permissionRefreshDates)) { context in
-                    let currentStatus: ChatShellStatus = if case .settled = status {
-                        .settled(.make(policy: trustPolicy, now: context.date))
-                    } else {
-                        status
+            work
+
+            notes
+
+            if !isSettled {
+                Button {
+                    NotificationCenter.default.post(name: .openCommandRouteRequest, object: "trust")
+                } label: {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(status.color)
+                            .frame(width: 8, height: 8)
+                        Text(status.text)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .lineLimit(1)
                     }
-                    Button {
-                        NotificationCenter.default.post(name: .openCommandRouteRequest, object: "trust")
-                    } label: {
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(currentStatus.color)
-                                .frame(width: 8, height: 8)
-                            Text(currentStatus.text)
-                                .font(ShellType.label)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                                .lineLimit(1)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Review permissions in Trust")
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel("\(currentStatus.text). Open Trust")
-                    .accessibilityIdentifier("chat.shell.status-dot")
-                    .padding(.leading, 4)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .help("Review permissions in Trust")
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(status.text). Open Trust")
+                .accessibilityIdentifier("chat.shell.status-dot")
+                .padding(.leading, 4)
             }
         }
         // Agent, 2026-09-02: her name used to float at the far left of the
@@ -102,11 +99,8 @@ struct ShellRoomHeader: View {
         .padding(.leading, NativeAgentShellLayout.roomLeadingInset)
         .padding(.trailing, NativeAgentShellLayout.roomTrailingInset)
         .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
-        // The shell baseline: 20 semibold in a 24pt-tall row, 22 down from the
-        // title strip, puts her name on window y 72 with "Chat" and
-        // "Conversations".
         // User, 2026-10-04: a slim bar like Claude's, not a band over her chat.
-        .padding(.top, 6)
+        .padding(.top, NativeAgentShellLayout.columnHeaderTopInset)
         .padding(.bottom, 4)
     }
 }
@@ -136,21 +130,37 @@ struct ShellConversationRow: View {
     var body: some View {
         // The native List draws selection and takes the click (User 09-27:
         // all controls Mac native); the row is just its words and the pin.
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(ChatShellConversationRow.title(for: session))
-                    .font(ShellType.bodySemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+        let title = ChatShellConversationRow.title(for: session)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            // Wave 3: rows sharing a title ("Codex check-in") are told
+            // apart by their last line; the title never changes with it.
+            let preview = ChatShellConversationRow.listPreview(for: session, title: title)
+            HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
+                if !preview.isEmpty {
+                    Text(preview)
+                        .font(ShellType.labelMedium)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(1)
+                    Spacer(minLength: 0)
+                }
                 Text(ChatShellConversationRow.subtitle(for: session))
-                    .font(ShellType.labelMedium)
+                    .font(preview.isEmpty ? ShellType.labelMedium : ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
             }
-            .accessibilityElement(children: .combine)
-            .accessibilityValue(selected ? "Selected" : "Not selected")
-            Spacer(minLength: 4)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(selected ? "Selected" : "Not selected")
+        .padding(.trailing, isPinned ? 26 : 0)
+        .frame(maxWidth: .infinity, minHeight: NativeAgentShellLayout.listRowHeight, alignment: .leading)
+        .overlay(alignment: .trailing) {
             Button(action: onTogglePin) {
                 Image(systemName: isPinned ? "pin.fill" : "pin")
                     .font(ShellType.labelMedium)
@@ -161,10 +171,10 @@ struct ShellConversationRow: View {
             .buttonStyle(.plain)
             .focused($pinFocused)
             .opacity(isPinned || hovering || pinFocused ? 1 : 0)
+            .allowsHitTesting(isPinned || hovering || pinFocused)
             .help(isPinned ? "Unpin" : "Pin to the top")
             .accessibilityLabel(isPinned ? "Unpin conversation" : "Pin conversation to the top")
         }
-        .frame(maxWidth: .infinity, minHeight: NativeAgentShellLayout.listRowHeight, alignment: .leading)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onDisappear { hovering = false }
@@ -174,62 +184,109 @@ struct ShellConversationRow: View {
 
 // MARK: - Tool traffic
 
-/// A worker's reply, folded: the headline row opens onto the words, and the
-/// routing slip it came wrapped in never renders here.
-struct ShellEnvelopeRow: View {
-    var content: String
-    @State private var expanded = false
+/// Fluid glass A2: the transcript's ONE activity row. Tool folds, the live
+/// tool line, single tool calls, working notes and worker replies were four
+/// styles (an arrow with Show/Hide, a spinner box, a 24pt-indented card in
+/// system fonts with a Details label, a small chevron); they are all this
+/// now. One chevron that turns, one indent for what opens, the shell's type.
+/// It is a hinge, not a card (Agent, 2026-09-03): no fill, no border.
+struct ChatActivityRow<Leading: View, Detail: View>: View {
+    let title: String
+    var trailing: String = ""
+    @Binding var isExpanded: Bool
+    var accessibilityLabel: String? = nil
+    @ViewBuilder var leading: () -> Leading
+    @ViewBuilder var detail: () -> Detail
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    /// Where opened detail starts: past the chevron and its gap.
+    static var indent: CGFloat { 18 }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 0) {
             Button {
                 withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.standard, reduceMotion: reduceMotion
-                )) { expanded.toggle() }
+                    NativeAgentMotion.arrive, reduceMotion: reduceMotion
+                )) { isExpanded.toggle() }
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: "arrow.uturn.backward")
-                        .font(ShellType.labelSemibold)
-                    Text(ChatShellEnvelope.headline(content))
+                    Image(systemName: "chevron.right")
+                        .font(ShellType.captionSemibold)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: 10)
+                    leading()
+                    Text(title)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                     Spacer(minLength: 8)
-                    Text(expanded ? "Hide" : "Show")
+                    if !trailing.isEmpty {
+                        Text(trailing)
+                            .font(ShellType.caption)
+                            .foregroundStyle(NativeAgentShell.tertiary)
+                    }
                 }
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            if expanded {
-                Text(ChatShellEnvelope.reply(content))
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .textSelection(.enabled)
-                    .padding(.leading, 19)
-                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+            .buttonFocusable()
+            .shellKeyboardTarget(.receipt)
+            .accessibilityLabel(accessibilityLabel ?? title)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+
+            VStack(alignment: .leading, spacing: 0) {
+                if isExpanded {
+                    detail()
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .textSelection(.enabled)
+                        .padding(.leading, Self.indent)
+                        .padding(.top, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(NativeAgentMotion.arrivalFade)
+                }
             }
+            // Clip the transition's travel, not the moving rows themselves.
+            .clipped()
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.vertical, NativeAgentSpacing.xs)
         .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-        .background(
-            NativeAgentShell.softFill,
-            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+    }
+}
+
+extension ChatActivityRow where Leading == EmptyView {
+    init(
+        title: String,
+        trailing: String = "",
+        isExpanded: Binding<Bool>,
+        accessibilityLabel: String? = nil,
+        @ViewBuilder detail: @escaping () -> Detail
+    ) {
+        self.init(title: title, trailing: trailing, isExpanded: isExpanded,
+                  accessibilityLabel: accessibilityLabel,
+                  leading: { EmptyView() }, detail: detail)
+    }
+}
+
+/// A worker's reply, folded: the headline row opens onto the words, and the
+/// routing slip it came wrapped in never renders here.
+struct ShellEnvelopeRow: View {
+    var content: String
+    @State private var expanded = false
+
+    var body: some View {
+        ChatActivityRow(title: ChatShellEnvelope.headline(content), isExpanded: $expanded) {
+            Text(ChatShellEnvelope.reply(content))
         }
     }
 }
 
 /// ONE quiet row per turn. Opening it says what she actually touched, in
-/// sentences. Raw JSON never renders in the room — the Turn Inspector inside
-/// Diagnostics is where a developer goes looking for it, and it is unchanged.
+/// sentences, and each sentence opens onto that call's result.
 struct ShellToolRow: View {
     var messages: [ChatMessage]
     @State private var expanded = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Only a recorded FALSE is a failure; most rows record no outcome at all
     /// (2026-09-06, same rule the detail lines use). 2026-09-14: a row that
@@ -264,60 +321,25 @@ struct ShellToolRow: View {
 
     var body: some View {
         let all = details
-        let shown = Array(all.prefix(ChatShellToolSummary.detailLimit))
-        VStack(alignment: .leading, spacing: expanded ? 6 : 0) {
-            Button {
-                withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.standard, reduceMotion: reduceMotion
-                )) { expanded.toggle() }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "arrow.down")
-                        .font(ShellType.labelSemibold)
-                    Text(ChatShellToolSummary.headline(
-                        count: messages.count, failed: failedCount,
-                        needsYou: needsYouCount))
-                    Spacer(minLength: 8)
-                    Text(expanded ? "Hide" : "Show")
-                }
-                .font(ShellType.label)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .shellKeyboardTarget(.receipt)
-
+        let shown = Array(zip(messages, all).prefix(ChatShellToolSummary.detailLimit))
+        let headline = ChatShellToolSummary.headline(
+            count: messages.count, failed: failedCount, needsYou: needsYouCount)
+        ChatActivityRow(title: headline, isExpanded: $expanded) {
             VStack(alignment: .leading, spacing: 0) {
-                if expanded {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(Array(shown.enumerated()), id: \.offset) { _, line in
-                            Text(line)
-                                .font(ShellType.label)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                                .textSelection(.enabled)
-                        }
-                        if let overflow = ChatShellToolSummary.overflowLine(
-                            total: all.count, shown: shown.count
-                        ) {
-                            Text(overflow)
-                                .font(ShellType.label)
-                                .foregroundStyle(NativeAgentShell.tertiary)
-                        }
-                    }
-                    .padding(.leading, 19)
-                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+                ForEach(shown, id: \.0.id) { pair in
+                    ToolPillView(message: pair.0, headline: pair.1)
+                }
+                if let overflow = ChatShellToolSummary.overflowLine(
+                    total: all.count, shown: shown.count
+                ) {
+                    Text(overflow)
+                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .padding(.vertical, NativeAgentSpacing.xs)
                 }
             }
-            // Clip the transition's travel, not the moving rows themselves.
-            .clipped()
         }
-        .padding(.vertical, 6)
-        .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-        // Agent, 2026-09-03: the fold row is a hinge, not a card. No fill, no
-        // border; chevron and words sit on the room like the rest of the turn.
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(ChatShellToolSummary.headline(
-            count: messages.count, failed: failedCount, needsYou: needsYouCount))
+        .accessibilityLabel(headline)
     }
 }
 
@@ -348,14 +370,7 @@ struct ShellEmptyRoom: View {
                             .foregroundStyle(NativeAgentShell.text)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 10)
-                            .background(
-                                NativeAgentShell.quietFill,
-                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            )
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-                            }
+                            .houseSurface(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .help("Start with: \(chip)")
@@ -370,49 +385,85 @@ struct ShellEmptyRoom: View {
 
 // MARK: - Trouble
 
-/// One orange card in the room describing the unfinished turn.
+/// One orange card in the room describing the unfinished turn: what it
+/// provably did, and the one retry that fits. The failed bubble above keeps
+/// the cause; the raw error stays under Details.
 struct ShellTroubleCard: View {
+    /// The failed assistant row at the tail.
+    var message: ChatMessage
+    var failure: ChatTurnFailure
     var showsStuckLink: Bool
-    /// Keep the reassurance on turns without tool calls. It makes no claim
-    /// about whether a provider received the request.
-    var showsNothingSentLine: Bool
+    var onRetry: () -> Void
+    var onContinue: () -> Void
     var onOpenSettings: () -> Void
+    @State private var confirming: ChatTurnFailure?
+    @State private var showsDetails = false
+
+    private var meta: ChatMessageMetadata? { message.metadata }
+    /// Nil where Retry cannot run: a rejected turn that may have run steps is
+    /// refused by regenerate itself, so the card offers no button it can't keep.
+    private var retryLabel: String? {
+        if meta?.providerRefusalDraft == true { return "Retry draft" }
+        if meta?.providerRefusal == true { return nil }
+        return "Try again"
+    }
+    private var rawDetail: String? {
+        guard let raw = meta?.error?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty, raw != message.content else { return nil }
+        return raw
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: "exclamationmark.circle")
                     .foregroundStyle(NativeAgentShell.trouble)
-                Text(ChatShellCopy.errorTitle)
+                Text(failure.line(model: meta?.model ?? meta?.requestedModel))
                     .font(ShellType.bodySemibold)
                     .foregroundStyle(NativeAgentShell.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("chat.shell.trouble-line")
             }
-            if showsNothingSentLine {
-                Text(ChatShellCopy.errorDetail)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
+            HStack(spacing: 14) {
+                if let retryLabel {
+                    Button(failure.retryNeedsConfirmation ? retryLabel + "\u{2026}" : retryLabel) {
+                        if failure.retryNeedsConfirmation { confirming = failure } else { onRetry() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("chat.shell.trouble-retry")
+                }
+                if rawDetail != nil {
+                    Button(showsDetails ? "Hide details" : "Details") { showsDetails.toggle() }
+                        .buttonStyle(.plain)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .accessibilityIdentifier("chat.shell.trouble-details")
+                }
+                if showsStuckLink {
+                    Button(ChatShellCopy.errorStuckLink, action: onOpenSettings)
+                        .buttonStyle(.plain)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .underline()
+                        .accessibilityIdentifier("chat.shell.stuck-settings-link")
+                }
             }
-            if showsStuckLink {
-                Button(ChatShellCopy.errorStuckLink, action: onOpenSettings)
-                    .buttonStyle(.plain)
-                    .font(ShellType.label)
+            .padding(.leading, 24)
+            if showsDetails, let rawDetail {
+                Text(rawDetail)
+                    .font(ShellType.code)
                     .foregroundStyle(NativeAgentShell.secondary)
-                    .underline()
-                    .padding(.top, 2)
-                    .accessibilityIdentifier("chat.shell.stuck-settings-link")
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 24)
             }
         }
+        .modifier(FailedTurnRetryConfirmation(failure: $confirming, onRetry: onRetry, onContinue: onContinue))
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-        .background(
-            NativeAgentShell.trouble.opacity(0.08),
-            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(NativeAgentShell.trouble.opacity(0.30), lineWidth: 1)
-        }
+        .houseSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("chat.shell.trouble-card")
     }

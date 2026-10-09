@@ -1,3 +1,4 @@
+import AgentWorkspace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -17,10 +18,13 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
     /// The peers the PERSON has elevated in Trust → Connected agents. Nil on
     /// surfaces with no peer configuration, which simply taint as before.
     private let peerStore: AgentPeerStore?
+    /// Where the person's name and sender allowlist live; nil names no one.
+    private let dataRoot: URL?
 
-    public init(inner: any ToolDispatchClient, peerStore: AgentPeerStore? = nil) {
+    public init(inner: any ToolDispatchClient, peerStore: AgentPeerStore? = nil, dataRoot: URL? = nil) {
         self.inner = inner
         self.peerStore = peerStore
+        self.dataRoot = dataRoot
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -46,25 +50,54 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         }
         if let peerIdentity,
            let refusal = PeerTurnEffectPolicy.memoryProvenanceRefusal(
-            tool: tool, input: input, peer: peerIdentity, readPeerData: readPeerData
+            tool: tool, input: input, peer: peerIdentity, readPeerData: readPeerData,
+            person: readPeerData && taint?.restored != true && PeerTurnEffectPolicy.normalized(tool) == "commit_memory"
+                ? await personOnOwnDoor(surface: surface) : nil
            ) {
             throw AutonomyGateError.toolDenied(reason: refusal)
         }
-        let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
+        var result = try await inner.dispatch(tool: tool, input: input, surface: surface)
+        let ranTool = ToolNameAliases.ranTool(tool, input: input)
+        if ["read_page", "mcp__searxng-local__search", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(ranTool),
+           case .object(var fields) = result,
+           fields["status"] != .string("failed"), fields["isError"] != .bool(true),
+           ["text", "content", "results", "links", "nodes", "raw"].contains(where: { fields[$0].map(Self.containsStructuredText) == true }) {
+            fields["agent"] = .string("web content")
+            fields["untrusted_remote_data"] = .bool(true)
+            fields["source_boundary"] = .bool(true)
+            result = .object(fields)
+            PeerDataTaint.markConsumed(peer: "web content", line: Self.peerLine(in: result, depth: 0) ?? "", attested: false)
+        }
         // Latch on the RESULT's own provenance label rather than on a list of
         // tool names, so a transport added later is covered the day it starts
         // labelling its output honestly.
         if let peer = Self.remoteProvenance(in: result, depth: 0) {
-            // The app's own agent transport read from the contact it routed
-            // to: that route is attested, so an elevated one is the person's
-            // own (PeerTrust). A label inside the result never is.
-            if let route = Self.routedContact(tool: tool, input: input), PeerDataTaint.ownerTrusts(route) { return result }
             let line = Self.peerLine(in: result, depth: 0) ?? ""
-            // The result's own label: never the person's trust (`attested: false`).
-            if isElevated(peer) { PeerDataTaint.markElevated(peer: peer, line: line, attested: false) }
-            else { PeerDataTaint.markConsumed(peer: peer, line: line, attested: false) }
+            // Trusted transports label their own content before returning it.
+            // A selected route or a result-supplied name cannot clear a nested
+            // source's explicit untrusted provenance.
+            PeerDataTaint.markConsumed(peer: peer, line: line, attested: false)
         }
         return result
+    }
+
+    /// The person's name when he started this turn himself, on one of his own
+    /// doors (the same test as `reachesUser`: no out-of-band origin, no agent
+    /// lane; Telegram and Slack only from an allowlisted sender), never a wake
+    /// or a helper's session. Nil on every other turn.
+    private func personOnOwnDoor(surface: String) async -> String? {
+        guard let dataRoot else { return nil }
+        let envelope = TurnEnvelope.current(surface: surface)
+        let door = envelope.surface.lowercased()
+        let session = ChatToolSessionContext.verifiedSessionId ?? ""
+        guard ChatPersistenceContext.originProvenance == nil, envelope.agent == nil,
+              ["chat", "app", "mac", "ios", "telegram", "slack"].contains(door),
+              session != ResidentWake.session, !session.hasPrefix("bot-") else { return nil }
+        if ["telegram", "slack"].contains(door) {
+            guard await SwiftNativeSecurityCenter(dataRoot: dataRoot).remoteSenderIsAllowlisted(.currentTurn(
+                verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)) else { return nil }
+        }
+        return AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).user
     }
 
     /// The contact the app's own agent tools routed this call to: the
@@ -108,25 +141,6 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         fields["agent"] = .string(agent)
         fields["untrusted_remote_data"] = .bool(!PeerTrust.ownerTrusts(agent, dataRoot: dataRoot))
         return .object(fields)
-    }
-
-    /// Agent, 2026-09-15: peer text cannot grant authority, but the person's
-    /// EXISTING authorization still counts — a collaboration he set up in
-    /// Trust → Connected agents should not make him re-approve every routine
-    /// step. So a result from a peer he elevated does not taint the turn.
-    ///
-    /// Keyed on the peer RECORD behind the result's `peer:<id>` provenance,
-    /// never on anything the peer wrote: the handle is minted by
-    /// `SwiftToolDispatcher+AgentCommunication` from the configured contact
-    /// the caller asked for, `allowElevation` has exactly one writer
-    /// (`AgentPeerStore.setElevation`, Trust Center only), and anything that
-    /// is not an exact configured id — including the anonymous "a remote
-    /// peer" label — falls through to tainting.
-    private func isElevated(_ provenance: String) -> Bool {
-        guard let peerStore, provenance.hasPrefix("peer:") else { return false }
-        let id = String(provenance.dropFirst("peer:".count))
-        guard !id.isEmpty, let peers = try? peerStore.list() else { return false }
-        return peers.first(where: { $0.id == id })?.elevationAllowed == true
     }
 
     /// The configured contact's display name for an attested peer id. Read
@@ -180,8 +194,8 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         switch value {
         case .object(let object):
             if provenanceFlags.contains(where: { if case .bool(true)? = object[$0] { return true } else { return false } }) {
-                if case .string(let agent)? = object["agent"] { return agent }
-                return "a remote peer"
+                if case .string(let agent)? = object["agent"],
+                   !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return agent }
             }
             for (_, nested) in object {
                 if let found = remoteProvenance(in: nested, depth: depth + 1) { return found }

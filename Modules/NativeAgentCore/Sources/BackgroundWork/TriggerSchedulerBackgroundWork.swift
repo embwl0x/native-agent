@@ -10,6 +10,7 @@ public enum TriggerSchedulerBackgroundWork {
         public let runDueJobs: @Sendable () async -> [String]
         public let activityFailure: @Sendable () async -> String?
         public let nextDeadline: @Sendable (Date) async -> Date?
+        public let shutdown: @Sendable () async -> Void
     }
 
     public static func makeJobWork(
@@ -35,7 +36,8 @@ public enum TriggerSchedulerBackgroundWork {
                 let botDeadline = await bots.nextDeadline(after: date)
                 let continuationDeadline = await continuations?.nextDeadline(after: date)
                 return [jobs, botDeadline, continuationDeadline].compactMap { $0 }.min()
-            }
+            },
+            shutdown: { await bots.shutdown() }
         )
     }
 
@@ -68,7 +70,7 @@ public enum TriggerSchedulerBackgroundWork {
             try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         },
         failureMarker: @escaping @Sendable (String) -> Void = { marker in
-            NSLog("%@", marker)
+            nativeLog("%@", marker)
         }
     ) -> MorningBriefSynthesizer {
         return { request in
@@ -228,6 +230,7 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     let schedulerJobsPath: URL
     let triggerScheduler: SwiftNativeTriggerScheduler
     let runDueJobs: @Sendable () async -> [String]
+    let shutdownJobs: @Sendable () async -> Void
     /// Read immediately after `runDueJobs`. A durable scheduler effect without
     /// its activity evidence is deliberately a failed loop receipt, not a
     /// quiet "nothing due" tick that lets later trigger effects proceed.
@@ -241,6 +244,7 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         schedulerJobsPath: URL,
         triggerScheduler: SwiftNativeTriggerScheduler,
         runDueJobs: @escaping @Sendable () async -> [String],
+        shutdownJobs: @escaping @Sendable () async -> Void,
         schedulerActivityFailure: @escaping @Sendable () async -> String? = { nil },
         nextSchedulerJobDeadline: @escaping @Sendable (Date) async -> Date?,
         mirrorFire: @escaping @Sendable (TriggerFireResult) async -> Bool
@@ -250,6 +254,7 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         self.schedulerJobsPath = schedulerJobsPath
         self.triggerScheduler = triggerScheduler
         self.runDueJobs = runDueJobs
+        self.shutdownJobs = shutdownJobs
         self.schedulerActivityFailure = schedulerActivityFailure
         self.nextSchedulerJobDeadline = nextSchedulerJobDeadline
         self.mirrorFire = mirrorFire
@@ -289,6 +294,8 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         let trigger = await triggerScheduler.nextMeaningfulDeadline(after: now)
         return [schedulerJob, trigger].compactMap { $0 }.min()
     }
+
+    public func shutdown() async { await shutdownJobs() }
 
     public func tick() async {
         _ = await tickOutcome()

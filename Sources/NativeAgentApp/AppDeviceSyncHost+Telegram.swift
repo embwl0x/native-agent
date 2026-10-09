@@ -3,14 +3,15 @@ import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import TelegramBot
+import NativeAgentCore
 
 extension AppDeviceSyncHost {
     func telegramSnapshot() async throws -> MobileTelegramSnapshot {
-        try await NativeClient(baseURL: "").mobileTelegramSnapshot()
+        try await NativeClient().mobileTelegramSnapshot()
     }
 
     func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot {
-        let client = NativeClient(baseURL: "")
+        let client = NativeClient()
         try await client.changeTelegramSettings(change)
         return try await client.mobileTelegramSnapshot()
     }
@@ -27,14 +28,8 @@ extension NativeClient {
             let existing = TelegramConfig.loadFromDisk(dataRoot: root, includeDisconnected: true)
             var token = existing?.botToken ?? ""
             var enabled = existing?.enabled ?? false
-            var requireMention = existing?.requireMention ?? false
+            let requireMention = existing?.requireMention ?? false
             switch change {
-            case .enabled(let value):
-                guard !token.isEmpty else { throw TelegramConfigurationError.existingConfigurationUnreadable }
-                enabled = value
-            case .requireMention(let value):
-                guard !token.isEmpty else { throw TelegramConfigurationError.existingConfigurationUnreadable }
-                requireMention = value
             case .disconnect:
                 token = ""
                 enabled = false
@@ -74,15 +69,16 @@ extension NativeClient {
             }
         } catch CocoaError.fileReadNoSuchFile { return }
         catch { throw TelegramConfigurationError.existingConfigurationUnreadable }
+        try TelegramConfig.validateSavedConfiguration(dataRoot: root)
+        guard TelegramConfig.loadFromDisk(dataRoot: root, includeDisconnected: true) != nil else {
+            throw TelegramConfigurationError.existingConfigurationUnreadable
+        }
         guard let data = try? Data(contentsOf: url),
               let object = try? JSONSerialization.jsonObject(with: data),
-              let fields = object as? [String: Any],
-              let token = (fields["bot_token"] ?? fields["token"]) as? String
+              let fields = object as? [String: Any]
         else {
             throw TelegramConfigurationError.existingConfigurationUnreadable
         }
-        // Empty is a valid explicit-clear state. A non-string token is not.
-        _ = token
         for key in ["enabled", "require_mention", "voice_transcription_enabled", "voice_enabled"] {
             // Missing fields retain legacy defaults; present authority must
             // be a JSON boolean, never a coerced number or decoder fallback.
@@ -147,29 +143,24 @@ extension NativeClient {
             // Validate before decoding legacy spellings or a disconnected state,
             // so malformed settings never appear as saved defaults.
             try Self.validateMobileTelegramConfiguration(at: root)
-            let saved: TelegramConfig?
-            if FileManager.default.fileExists(atPath: url.path) {
-                guard let configuration = TelegramConfig.loadFromDisk(dataRoot: root, includeDisconnected: true) else {
-                    throw TelegramConfigurationError.existingConfigurationUnreadable
-                }
-                saved = configuration
-            } else {
-                saved = nil
-            }
             let routing = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
             guard let preference = routing.preferences["telegram"] else {
                 throw TelegramConfigurationError.existingConfigurationUnreadable
             }
-            let loops = await backgroundLoopsManager.status()
-            let enabled = saved?.botToken.isEmpty == false && saved?.enabled == true
+            let status = try await TelegramFacade(dataRoot: root).loadStatus(
+                manager: backgroundLoopsManager.coreManager, routingSnapshot: routing
+            )
+            let enabled = status.tokenConfigured && status.enabled
             return MobileTelegramSnapshot(
                 observedAt: observedAt,
-                tokenConfigured: saved?.botToken.isEmpty == false,
-                enabled: enabled, requireMention: saved?.requireMention ?? false,
-                allowedChatIDs: saved?.allowedChatIds.sorted().map(String.init) ?? [],
-                allowedUserIDs: saved?.allowedUserIds.sorted().map(String.init) ?? [],
+                tokenConfigured: status.tokenConfigured,
+                enabled: enabled, requireMention: status.requireMention,
+                allowedChatIDs: status.allowedChatIds,
+                allowedUserIDs: status.allowedUserIds,
                 model: preference.model,
-                pollerRunning: enabled && loops.contains { $0.loopId == "telegram_poll" && $0.running }
+                pollerRunning: enabled && status.pollerEnabled,
+                pollStatusMessage: status.pollStatusMessage,
+                lastSuccessfulPollAt: status.lastPollAt
             )
         }
     }

@@ -405,31 +405,16 @@ public enum SlackConnectorActions {
         return try loadToken(dataRoot: dataRoot)
     }
 
+    /// search.messages needs a user token; a bot token gets not_allowed_token_type.
+    public static func canSearch(dataRoot: URL) -> Bool {
+        guard let token = try? loadToken(dataRoot: dataRoot) else { return false }
+        return token.hasPrefix("xoxp-") || token.hasPrefix("xoxe.xoxp-")
+    }
+
+    /// Keychain only (SlackCredentials); the files hold no token since 10-07.
     private static func loadToken(dataRoot root: URL = PersistenceCore.defaultDataRoot()) throws -> String {
-        let paths = [
-            root
-                .appendingPathComponent("oauth_tokens", isDirectory: true)
-                .appendingPathComponent("slack.json"),
-            root
-                .appendingPathComponent("connectors", isDirectory: true)
-                .appendingPathComponent("slack", isDirectory: true)
-                .appendingPathComponent("auth.json"),
-        ]
-        for path in paths {
-            guard let data = try? Data(contentsOf: path),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-            // Keep the delivery boundary aligned with Connectors' auth-state
-            // derivation. Older imports and connector-local auth stores can use
-            // `oauth_token` or `token`; reporting those credentials connected
-            // while the sender rejects them creates a false-ready surface.
-            for key in credentialKeys {
-                guard let token = object[key] as? String else { continue }
-                let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
-        }
-        throw SlackConnectorCredentialsMissing()
+        guard let token = try SlackCredentials.read(.bot, dataRoot: root) else { throw SlackConnectorCredentialsMissing() }
+        return token
     }
 
     static func envelope(
@@ -449,9 +434,9 @@ public enum SlackConnectorActions {
             obj["error"] = .string(error)
             // What to do next, in words, for the codes that have one.
             let fix: String? = switch error {
-            case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The Slack token no longer works; reconnect Slack in Connectors."
-            case "missing_scope": "The Slack app lacks the scope \((response["needed"] as? String) ?? "this needs"); add it in the Slack app settings and reconnect."
-            case "not_allowed_token_type": "Slack search requires a user token; bot tokens cannot search. Connect user OAuth with search:read for search. For channel reads, keep using the existing bot token."
+            case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The owner must sign in to Slack in Settings > Connectors."
+            case "missing_scope": "The owner must add \((response["needed"] as? String) ?? "the required scope") in the Slack app settings, then sign in to Slack in Settings > Connectors."
+            case "not_allowed_token_type": "Slack search needs a user token with search:read. The owner must sign in to Slack in Settings > Connectors."
             case "channel_not_found": "No channel by that name or id; app {action:\"slack.channels\"} shows them."
             case "not_in_channel": "The bot isn't in that channel; invite it there with /invite first."
             case "ratelimited": "Slack is rate limiting; wait a minute before trying again."

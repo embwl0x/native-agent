@@ -49,8 +49,9 @@ extension SwiftToolDispatcher {
             switch self {
             case .invalidReasoningEffort(let requested, let model, let supported):
                 var object: [String: JSONValue] = [
-                    "status": .string("failed"),
+                    "status": .string("failed"), "effects": .string("none"),
                     "reason": .string("unsupported_reasoning_effort"),
+                    "detail": .string("reasoning_effort \(requested) is not offered here; use one of supported."),
                     "requested": .string(requested),
                     "supported": .array(supported.map(JSONValue.string)),
                 ]
@@ -58,7 +59,7 @@ extension SwiftToolDispatcher {
                 return .object(object)
             case .invalidFastValue:
                 return .object([
-                    "status": .string("failed"),
+                    "status": .string("failed"), "effects": .string("none"),
                     "reason": .string("invalid_fast_value"),
                     "fix": .string("fast must be true or false."),
                 ])
@@ -158,6 +159,7 @@ extension SwiftToolDispatcher {
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("missing_text"),
                 "fix": .string("codex_message requires a non-empty 'text' parameter."),
             ])
@@ -393,7 +395,9 @@ extension SwiftToolDispatcher {
         guard appendResult.status != "conflict" else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("message_id_conflict"),
+                "detail": .string("That message_id already names a different message, so nothing was queued. Use a new message_id, or omit it."),
                 "messageId": .string(messageId),
             ])
         }
@@ -502,7 +506,14 @@ extension SwiftToolDispatcher {
         }
         // A wake that failed admitted nothing to act on the row; "queued" would
         // tell her the answer is coming (the Claude lane already says so).
-        if Self.claudeReceiptStatus(response["wakeup"]) == "failed" { response["status"] = .string("failed") }
+        if Self.claudeReceiptStatus(response["wakeup"]) == "failed" {
+            response["status"] = .string("failed")
+            // The wake's own reason is the failure's, not the queued receipt's promise.
+            let wakeup = response["wakeup"] ?? .null
+            if let why = Self.stringField("fix", in: wakeup) ?? Self.stringField("message", in: wakeup) ?? Self.stringField("detail", in: wakeup) {
+                response["detail"] = .string(why)
+            }
+        }
         Self.markWakeStartedNothing(&response, agent: "Codex", dataRoot: dataRoot)
         return .object(response)
     }
@@ -876,7 +887,9 @@ extension SwiftToolDispatcher {
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("missing_text"),
+                "detail": .string("Pass the task for Codex as text, a non-empty string."),
             ])
         }
         let context: String = {
@@ -976,6 +989,14 @@ extension SwiftToolDispatcher {
 
             process.terminationHandler = { proc in
                 let (stdoutText, stderrText) = outputCapture.finish()
+                let header = stderrText.components(separatedBy: "--------").dropFirst().first ?? ""
+                let fields = Dictionary(header.split(separator: "\n").compactMap { line -> (String, String)? in
+                    let pair = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+                    return pair.count == 2 && !pair[1].isEmpty ? (pair[0], pair[1]) : nil
+                }, uniquingKeysWith: { first, _ in first })
+                let reportedBrain = CodexBrainControls(model: fields["model"], reasoningEffort: fields["reasoning effort"],
+                    serviceTier: fields["service tier"], fast: nil)
+                let brainSource = header.isEmpty ? "unreported" : "codex_cli_header"
                 let lastMessage = (try? String(contentsOf: lastMessageURL, encoding: .utf8)) ?? ""
                 let replyText = lastMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? stdoutText
@@ -1004,11 +1025,12 @@ extension SwiftToolDispatcher {
                     "stdout": stdoutText,
                     "stderr": stderrText,
                     "lastMessagePath": lastMessageURL.path,
+                    "brainSource": brainSource,
                 ]
                 if let commitHash { auditEntry["commitHash"] = commitHash }
-                if let model { auditEntry["model"] = model }
-                if let effort = brain.reasoningEffort { auditEntry["reasoningEffort"] = effort }
-                if let tier = brain.serviceTier { auditEntry["serviceTier"] = tier }
+                if let model = reportedBrain.model { auditEntry["model"] = model }
+                if let effort = reportedBrain.reasoningEffort { auditEntry["reasoningEffort"] = effort }
+                if let tier = reportedBrain.serviceTier { auditEntry["serviceTier"] = tier }
                 if let fast = brain.fast { auditEntry["fast"] = fast }
                 if let data = try? JSONSerialization.data(withJSONObject: auditEntry, options: [.prettyPrinted]) {
                     try? data.write(to: auditURL)
@@ -1025,7 +1047,9 @@ extension SwiftToolDispatcher {
                         "exitCode": .int(Int64(exitCode)),
                         "sandbox": .string(sandbox),
                         "launch": launch.receipt,
-                        "brain": brain.jsonValue,
+                        "brain": reportedBrain.jsonValue,
+                        "brain_source": .string(brainSource),
+                        "requested_brain": brain.jsonValue,
                         "auditPath": .string(auditURL.path),
                     ]))
                 } else {
@@ -1042,7 +1066,9 @@ extension SwiftToolDispatcher {
                         "exitCode": .int(Int64(exitCode)),
                         "timedOut": .bool(didTimeOut),
                         "sandbox": .string(sandbox),
-                        "brain": brain.jsonValue,
+                        "brain": reportedBrain.jsonValue,
+                        "brain_source": .string(brainSource),
+                        "requested_brain": brain.jsonValue,
                         "auditPath": .string(auditURL.path),
                     ]))
                 }

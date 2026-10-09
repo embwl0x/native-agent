@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import Darwin
 
 // MARK: - Native connector-action registry
 //
@@ -46,6 +47,36 @@ public struct LocalConnectorActions: Sendable {
 
     public var toolNames: Set<String> { Set(handlers.keys) }
 
+    public static func saveAttachment(_ attachment: (filename: String, data: Data),
+        input: [String: JSONValue], ctx: ConnectorActionContext) -> JSONValue {
+        let folder = FileSystemActions.resolvePath(FileSystemActions.stringField(input, "path"), repoRoot: ctx.repoRoot)
+        let filename = attachment.filename
+        guard !filename.isEmpty, filename != ".", filename != "..", !filename.contains("/"), !filename.contains("\0") else {
+            return FileSystemActions.errResult("Attachment filename is not a safe file name.", code: "bad_input")
+        }
+        let name = filename as NSString
+        var number = 1
+        while true {
+            let suffix = number == 1 ? "" : " \(number)"
+            let target = folder.appendingPathComponent(number == 1 ? filename
+                : (name.pathExtension.isEmpty ? filename : name.deletingPathExtension) + suffix
+                    + (name.pathExtension.isEmpty ? "" : "." + name.pathExtension))
+            if let refusal = FileSystemActions.mutationRefusal(target, ctx) { return refusal }
+            do {
+                let parent = try VerifiedPath.openParent(of: target, createIntermediates: true)
+                defer { parent.release() }
+                let fd = try VerifiedPath.openFinal(parent, flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o666)
+                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                defer { try? handle.close() }
+                try handle.write(contentsOf: attachment.data)
+                return .object(["status": .string("completed"), "path": .string(target.path),
+                    "size": .int(Int64(attachment.data.count))])
+            } catch VerifiedPath.Failure.posix(EEXIST) { number += 1 }
+            catch let failure as VerifiedPath.Failure { return FileSystemActions.errResult(failure.message, code: failure.code) }
+            catch { return FileSystemActions.errResult(error.localizedDescription, code: "attachment_save_failed") }
+        }
+    }
+
     /// All file, repository and persona/system handlers available in this module.
     /// Production NativeActionDispatch composes the read-only subsets below.
 
@@ -55,6 +86,9 @@ public struct LocalConnectorActions: Sendable {
             "read_file":    { FileSystemActions.readFile($0, $1) },
             "file_excerpt": { FileSystemActions.fileExcerpt($0, $1) },
             "write_file":   { FileSystemActions.writeFile($0, $1) },
+            "move_file":    { FileSystemActions.transferFile($0, $1, copy: false) },
+            "copy_file":    { FileSystemActions.transferFile($0, $1, copy: true) },
+            "trash_file":   { FileSystemActions.trashFile($0, $1) },
             "list_dir":     { FileSystemActions.listDir($0, $1) },
             "system_info":  { FileSystemActions.systemInfo($0, $1) },
             // Wave 32 W08 — read-only repo introspection
@@ -69,8 +103,7 @@ public struct LocalConnectorActions: Sendable {
             "workspace_list":      { PersonaSystemActions.workspaceList($0, $1) },
             "time_now":            { PersonaSystemActions.timeNow($0, $1) },
         ],
-        // Only write_file mutates the filesystem.
-        sideEffecting: ["write_file"],
+        sideEffecting: ["write_file", "move_file", "copy_file", "trash_file"],
         // Successful read-only results are sufficient verification.
         trivialVerify: [
             "read_file", "file_excerpt", "list_dir", "system_info",

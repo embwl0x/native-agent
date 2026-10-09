@@ -184,7 +184,7 @@ enum MacBridgeStatusRefreshPolicy {
             // (review fix, 2026-08-28: a long-settled stale state kept a 60s
             // wakeup forever; the label's own granularity is the honest tick).
             let age = now.timeIntervalSince(lastSeenAt)
-            if age <= recentLastSeenInterval { return activeInterval }
+            if age <= recentLastSeenInterval { return max(activeInterval, recentLastSeenInterval - age) }
             return age < 3600 ? minuteCounterInterval : 3600
         }
         // Never seen, not connecting, already past the unreachable threshold:
@@ -223,6 +223,9 @@ final class MacBridgeClient: ObservableObject {
         }
     }
     private var missedPathRestore = false
+    /// When the presence beat was last re-read for a stale status: at most
+    /// once a minute (the stale label's own tick), only while the app is open.
+    private var presenceRereadAt: Date?
     /// nil until NWPathMonitor reports; nil never paints an outage. Republished
     /// here so views observing the client see the transition.
     @Published private(set) var deviceIsOffline: Bool?
@@ -236,7 +239,9 @@ final class MacBridgeClient: ObservableObject {
     /// `.macUnreachable` instead of the generic `.offline`.
     weak var pairingStore: PairingStore?
 
-    private static let recentLastSeenInterval: TimeInterval = 60
+    /// The Mac beats every two minutes when nothing else goes out
+    /// (`NAMacPresence`); a minute's silence was never evidence of anything.
+    private static let recentLastSeenInterval = NAMacPresence.phoneWindow
     private static let initialConnectingInterval: TimeInterval = 30
     private static let macUnreachableThreshold: TimeInterval = 30
 
@@ -472,6 +477,18 @@ final class MacBridgeClient: ObservableObject {
 
     func refreshBridgeStatus(now: Date = Date()) {
         let next = computedBridgeStatus(now: now)
+        // Stale while the app is open: the presence beat is pushed to no one,
+        // so read it (a fresh beat returns to online). Going stale from online
+        // waits for that read rather than flashing "unreachable".
+        if case .stale = next, UIApplication.shared.applicationState == .active,
+           now.timeIntervalSince(presenceRereadAt ?? .distantPast) >= MacBridgeStatusRefreshPolicy.minuteCounterInterval {
+            presenceRereadAt = now
+            Task { @MainActor [weak self] in
+                await self?.bridge.readMacPresence()
+                self?.refreshBridgeStatus()
+            }
+            if bridgeStatus == .online { return }
+        }
         if bridgeStatus != next {
             bridgeStatus = next
         }
@@ -533,15 +550,15 @@ final class MacBridgeClient: ObservableObject {
         isPaired: Bool,
         now: Date
     ) -> BridgeStatus {
+        let connecting = connectingStartedAt.map { now.timeIntervalSince($0) <= initialConnectingInterval } ?? false
         if bridgeAvailable, let lastSeenAt {
             let age = now.timeIntervalSince(lastSeenAt)
             if age <= recentLastSeenInterval { return .online }
-            return .stale(minutesAgo: minutesAgo(since: lastSeenAt, now: now))
+            // Opening the app re-reads the Mac's beat; an old sighting is not
+            // "unreachable" until that read has had its chance.
+            if !connecting { return .stale(minutesAgo: minutesAgo(since: lastSeenAt, now: now)) }
         }
-        if let connectingStartedAt,
-           now.timeIntervalSince(connectingStartedAt) <= initialConnectingInterval {
-            return .connecting
-        }
+        if connecting { return .connecting }
         if bridgeAvailable { return .awaitingMacActivity }
         // Paired + unavailable means the transport is reachable enough to
         // diagnose, but the Mac has not resumed its side of the boundary.
@@ -592,7 +609,11 @@ final class MacBridgeClient: ObservableObject {
         //     so the rebuilt ChatMessage on refresh preserves attachments.
         return records.compactMap { rec in
             let roleStr = rec.role
-            guard roleStr == "user" || roleStr == "assistant" else { return nil }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let interaction = rec.interactionJSON.flatMap { try? decoder.decode(InlineInteraction.self, from: Data($0.utf8)) }
+            let descriptor = rec.interactionDescriptorJSON.flatMap { try? decoder.decode(InlineInteractionDescriptor.self, from: Data($0.utf8)) }
+            guard roleStr == "user" || roleStr == "assistant" || interaction != nil else { return nil }
             let role: ChatMessage.Role = roleStr == "user" ? .user : .assistant
             let uuid = UUID(uuidString: rec.id) ?? UUID()
             let attachments: [ChatAttachmentSummary] = (rec.metadata?.attachments ?? []).map { a in
@@ -604,7 +625,14 @@ final class MacBridgeClient: ObservableObject {
                     byteSize: a.byteSize.map(Int.init)
                 )
             }
-            return ChatMessage(id: uuid, role: role, text: rec.content, attachments: attachments)
+            var message = ChatMessage(id: uuid, role: role, text: interaction == nil ? rec.content : "", attachments: attachments, runId: rec.runId,
+                interaction: interaction, interactionDescriptor: descriptor, interactionSessionID: rec.interactionSessionID)
+            if roleStr == "assistant" {
+                message.failureDetail = rec.metadata?.error
+                message.completionState = rec.metadata?.failureWork != nil || rec.metadata?.error != nil ? "failed"
+                    : rec.metadata?.partial == true || rec.metadata?.cancelled == true ? "incomplete" : rec.metadata?.completionState
+            }
+            return message
         }
     }
 }

@@ -6,10 +6,21 @@ enum TelegramAssistantDeliveryOutcome: Sendable, Equatable {
     case outcomeUnknown(reason: String)
 }
 
-/// Owns exactly one assistant-response lane for a turn. Rich drafts are
-/// ephemeral, so any draft failure can safely move to the ordinary streamer.
-/// A final rich send falls back only when Telegram supplied evidence that no
-/// rich message was accepted; ambiguous final transport is never replayed.
+struct TelegramAssistantDeliveryState: Sendable, Equatable, Codable {
+    let reply: String
+    var confirmedMessageIds: [Int] = []
+    var outcomeUnknown = false
+    var imagePaths: [String]? = nil
+    var confirmedImageCount: Int? = nil
+
+    var isDelivered: Bool {
+        confirmedMessageIds.count == TelegramRichMessageRenderer.render(reply).count
+            && (confirmedImageCount ?? 0) == (imagePaths?.count ?? 0) && !outcomeUnknown
+    }
+}
+
+/// Native rich drafts preview the reply without creating durable messages.
+/// Finals retain confirmed progress; an ambiguous chunk needs explicit resend.
 actor TelegramAssistantDeliveryDriver {
     typealias SendRichDraft = @Sendable (
         _ token: String,
@@ -22,84 +33,61 @@ actor TelegramAssistantDeliveryDriver {
         _ destination: TelegramDestination,
         _ richMessage: TelegramInputRichMessage
     ) async throws -> Int
-    typealias SendOrdinary = @Sendable (
-        _ token: String,
-        _ destination: TelegramDestination,
-        _ text: String
-    ) async throws -> Void
     typealias Clock = @Sendable () -> Date
     typealias FailureRecorder = @Sendable (_ redactedError: String) async -> Void
-
-    private enum Lane: Sendable, Equatable {
-        case rich
-        case ordinary
-        case terminal
-    }
+    typealias PersistDelivery = @Sendable (TelegramAssistantDeliveryState) async throws -> Void
 
     private let token: String
     private let destination: TelegramDestination
     private let draftId: Int
-    private let ordinary: TelegramDraftStreamer
-    private let sendOrdinary: SendOrdinary
     private let sendRichDraft: SendRichDraft?
     private let sendRichFinal: SendRichFinal?
     private let clock: Clock
     private let richDraftInterval: TimeInterval
     private let recordFailure: FailureRecorder
+    private let persistDelivery: PersistDelivery
+    private let sendGeneratedImage: @Sendable (String) async throws -> Void
 
-    private var lane: Lane
+    private var terminal = false
+    private var draftsUnavailable = false
     private var lastRichDraftAt = Date.distantPast
-    private var latestAccumulatedText = ""
     private var pendingRichText: String?
     private var richDraftFlush: Task<Void, Never>?
-    private var richDraftSleeping = false
-    private var settling = false
 
     init(
         token: String,
         destination: TelegramDestination,
         turnId: UUID,
-        ordinary: TelegramDraftStreamer,
-        sendOrdinary: @escaping SendOrdinary,
         sendRichDraft: SendRichDraft?,
         sendRichFinal: SendRichFinal?,
         richDraftInterval: TimeInterval = 2,
         clock: @escaping Clock = Date.init,
-        recordFailure: @escaping FailureRecorder = { _ in }
+        recordFailure: @escaping FailureRecorder = { _ in },
+        persistDelivery: @escaping PersistDelivery,
+        sendGeneratedImage: @escaping @Sendable (String) async throws -> Void
     ) {
         self.token = token
         self.destination = destination
         self.draftId = Self.draftId(for: turnId)
-        self.ordinary = ordinary
-        self.sendOrdinary = sendOrdinary
         self.sendRichDraft = sendRichDraft
         self.sendRichFinal = sendRichFinal
         self.richDraftInterval = max(0, richDraftInterval)
         self.clock = clock
         self.recordFailure = recordFailure
-        self.lane = sendRichDraft != nil && sendRichFinal != nil ? .rich : .ordinary
+        self.persistDelivery = persistDelivery
+        self.sendGeneratedImage = sendGeneratedImage
     }
 
     func onDelta(_ accumulated: String) async {
-        guard lane != .terminal, !settling else { return }
+        guard !terminal, !draftsUnavailable else { return }
         let safeAccumulated = TelegramRichMessageRenderer.sanitize(
             TelegramRichMessageRenderer.stripBoldMarkers(accumulated)
         )
         guard !safeAccumulated.isEmpty else { return }
-        latestAccumulatedText = safeAccumulated
-        switch lane {
-        case .ordinary:
-            await ordinary.onDelta(safeAccumulated)
-        case .rich:
-            // Bot API rich drafts are private-chat only. Group/supergroup ids
-            // are negative; keep the rich final lane without manufacturing a
-            // predictable draft rejection and false health error.
-            guard destination.chatId > 0 else { return }
-            pendingRichText = safeAccumulated
-            scheduleRichDraftFlush()
-        case .terminal:
-            return
-        }
+        // Native drafts are private-chat previews; groups retain rich finals.
+        guard destination.chatId > 0 else { return }
+        pendingRichText = safeAccumulated
+        scheduleRichDraftFlush()
     }
 
     private func scheduleRichDraftFlush() {
@@ -110,142 +98,140 @@ actor TelegramAssistantDeliveryDriver {
     }
 
     private func flushRichDrafts() async {
-        while pendingRichText != nil, lane == .rich, !settling {
+        while pendingRichText != nil, !terminal, !draftsUnavailable {
             let wait = richDraftInterval - clock().timeIntervalSince(lastRichDraftAt)
             if wait > 0 {
-                richDraftSleeping = true
                 do {
                     try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
                 } catch {
                     break
                 }
-                richDraftSleeping = false
                 continue
             }
             guard let text = pendingRichText else { break }
             pendingRichText = nil
-            guard let rich = TelegramRichMessageRenderer.render(text),
-                  let sendRichDraft else {
-                await fallBackToOrdinary(reason: "rich draft was not safely representable")
+            guard let sendRichDraft else {
+                draftsUnavailable = true
+                await recordFailure("Telegram native draft delivery is unavailable for chat \(destination.chatId)")
                 break
             }
+            // An opening code fence alone has no visible block yet. The next
+            // delta can complete it without disabling the native preview.
+            guard let rich = TelegramRichMessageRenderer.render(text).last else { continue }
             // One task owns the wire and claims this window before the send.
             lastRichDraftAt = clock()
             do {
                 try await sendRichDraft(token, destination, draftId, rich)
             } catch {
-                // Rich drafts are ephemeral, so ordinary delivery is safe.
+                guard !terminal, !Task.isCancelled else { break }
+                draftsUnavailable = true
                 await reportFailure(step: "rich draft", error: error)
-                await fallBackToOrdinary(reason: nil)
                 break
             }
         }
-        richDraftSleeping = false
         richDraftFlush = nil
     }
 
-    private func settleRichDrafts() async {
-        settling = true
+    private func cancelRichDrafts() {
         pendingRichText = nil
-        while let task = richDraftFlush {
-            if richDraftSleeping { task.cancel() }
-            await task.value
-            if richDraftFlush == task { richDraftFlush = nil }
-        }
+        richDraftFlush?.cancel()
+        richDraftFlush = nil
     }
 
-    func finalize(reply: String) async -> TelegramAssistantDeliveryOutcome {
-        await settleRichDrafts()
-        guard lane != .terminal else {
+    func finalize(
+        reply: String,
+        imagePaths: [String] = [],
+        savedDelivery: TelegramAssistantDeliveryState? = nil,
+        resendUnknown: Bool = false
+    ) async -> TelegramAssistantDeliveryOutcome {
+        cancelRichDrafts()
+        guard !terminal else {
             return .outcomeUnknown(reason: "assistant delivery was already terminal")
         }
-        let safeReply = TelegramRichMessageRenderer.sanitize(
+        // Claim the final before the wire: reentrant finalize/abort cannot send
+        // it again while Telegram is accepting a chunk.
+        terminal = true
+        let safeReply = savedDelivery?.reply ?? TelegramRichMessageRenderer.sanitize(
             TelegramRichMessageRenderer.stripBoldMarkers(reply)
         )
-        guard !safeReply.isEmpty else {
-            lane = .terminal
+        let messages = TelegramRichMessageRenderer.render(safeReply)
+        guard !messages.isEmpty else {
             return .failed(reason: "reply contained no safe user-visible content")
         }
-        switch lane {
-        case .ordinary:
-            return await finalizeOrdinary(reply: safeReply)
-        case .rich:
-            guard let rich = TelegramRichMessageRenderer.render(safeReply),
-                  let sendRichFinal else {
-                return await finalizeOrdinary(reply: safeReply)
-            }
-            do {
-                let messageId = try await sendRichFinal(token, destination, rich)
-                lane = .terminal
-                return .delivered(messageId: messageId)
-            } catch {
-                await reportFailure(step: "rich final", error: error)
-                guard Self.isKnownNotDelivered(error) else {
-                    lane = .terminal
-                    return .outcomeUnknown(reason: Self.safeReason(error))
-                }
-                // Telegram explicitly rejected the method/request. No rich
-                // reply exists, so the ordinary path is safe and lossless.
-                lane = .ordinary
-                return await finalizeOrdinary(reply: safeReply)
-            }
-        case .terminal:
-            return .outcomeUnknown(reason: "assistant delivery was already terminal")
+        var delivery = savedDelivery ?? TelegramAssistantDeliveryState(reply: safeReply, imagePaths: imagePaths)
+        guard !delivery.outcomeUnknown || resendUnknown else {
+            return .outcomeUnknown(reason: "use /retry resend to resend the unconfirmed part; it may arrive twice")
         }
-    }
-
-    func abortDelivering(notice: String) async -> Bool {
-        await settleRichDrafts()
-        guard lane != .terminal else { return false }
-        switch lane {
-        case .ordinary:
-            return await ordinary.abortDelivering(notice: notice)
-        case .rich:
-            // Ephemeral rich drafts expire by themselves. Do not manufacture a
-            // new message when the durable work card already states terminal.
-            lane = .terminal
-            return false
-        case .terminal:
-            return false
+        guard delivery.reply == safeReply, delivery.confirmedMessageIds.count <= messages.count,
+              (0...(delivery.imagePaths?.count ?? 0)).contains(delivery.confirmedImageCount ?? 0) else {
+            return .failed(reason: "saved reply delivery is inconsistent; check the Mac error log")
         }
-    }
-
-    private func fallBackToOrdinary(reason: String?) async {
-        guard lane == .rich else { return }
-        lane = .ordinary
-        if let reason {
-            await recordFailure("Telegram \(reason) for chat \(destination.chatId); using ordinary draft")
-        }
-        if !latestAccumulatedText.isEmpty {
-            await ordinary.onDelta(latestAccumulatedText)
-        }
-    }
-
-    private func finalizeOrdinary(reply: String) async -> TelegramAssistantDeliveryOutcome {
-        lane = .ordinary
         do {
-            for chunk in await ordinary.finalize(reply: reply) {
-                try await sendOrdinary(token, destination, chunk)
+            try await persistDelivery(delivery)
+            guard let sendRichFinal else {
+                return .failed(reason: "native Telegram reply delivery is unavailable; use /retry after fixing the connection")
             }
-            lane = .terminal
-            // 2026-09-06: a draft send OR final edit crossed the wire without a
-            // response, so finalize deliberately withheld the chunk it carried.
-            // Whether the user can see that text is unknowable; say so on the
-            // work card instead of claiming a clean delivery.
-            if await ordinary.hasUnknownOutcome {
-                return .outcomeUnknown(
-                    reason: "the draft update was not confirmed, so part of the reply may be missing"
-                )
+            for message in messages.dropFirst(delivery.confirmedMessageIds.count) {
+                // A crash after acceptance but before confirmation is uncertain,
+                // too. Persist that boundary before touching the wire.
+                delivery.outcomeUnknown = true
+                try await persistDelivery(delivery)
+                let messageId: Int
+                do {
+                    messageId = try await sendRichFinal(token, destination, message)
+                } catch {
+                    if Self.isKnownNotDelivered(error) {
+                        var rejected = delivery
+                        rejected.outcomeUnknown = false
+                        try await persistDelivery(rejected)
+                        delivery = rejected
+                    }
+                    throw error
+                }
+                var confirmed = delivery
+                confirmed.confirmedMessageIds.append(messageId)
+                confirmed.outcomeUnknown = false
+                try await persistDelivery(confirmed)
+                delivery = confirmed
             }
-            return .delivered(messageId: nil)
+            return try await deliverGeneratedImages(&delivery)
         } catch {
-            lane = .terminal
-            await reportFailure(step: "ordinary final", error: error)
-            if TelegramTurnReplyDeliveryFailure.isAmbiguous(error) {
-                return .outcomeUnknown(reason: Self.safeReason(error))
+            await reportFailure(step: "rich final", error: error)
+            if !delivery.outcomeUnknown {
+                return .failed(reason: "reply delivery failed; use /retry to deliver the saved answer")
             }
-            return .failed(reason: Self.safeReason(error))
+            return .outcomeUnknown(reason: "\(Self.safeReason(error)); use /retry resend to resend the unconfirmed part; it may arrive twice")
         }
+    }
+
+    private func deliverGeneratedImages(_ delivery: inout TelegramAssistantDeliveryState) async throws -> TelegramAssistantDeliveryOutcome {
+        for path in (delivery.imagePaths ?? []).dropFirst(delivery.confirmedImageCount ?? 0) {
+            delivery.outcomeUnknown = true
+            try await persistDelivery(delivery)
+            do {
+                try await sendGeneratedImage(path)
+            } catch {
+                if Self.isKnownNotDelivered(error) {
+                    var rejected = delivery
+                    rejected.outcomeUnknown = false
+                    try await persistDelivery(rejected)
+                    delivery = rejected
+                }
+                throw error
+            }
+            var confirmed = delivery
+            confirmed.confirmedImageCount = (confirmed.confirmedImageCount ?? 0) + 1
+            confirmed.outcomeUnknown = false
+            try await persistDelivery(confirmed)
+            delivery = confirmed
+        }
+        return .delivered(messageId: delivery.confirmedMessageIds.last)
+    }
+
+    func stop() async {
+        cancelRichDrafts()
+        terminal = true
+        // Native previews expire. The durable work card owns the stop notice.
     }
 
     private func reportFailure(step: String, error: Error) async {

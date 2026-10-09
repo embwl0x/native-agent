@@ -38,17 +38,17 @@ public struct ContextSelector: Sendable {
 
         let groups = try conflictGroups(for: need, generation: generation)
         let resolutionLosers: [ContextAtomID: ContextEligibilityReason] = Dictionary(
-            uniqueKeysWithValues: groups.flatMap { group -> [(ContextAtomID, ContextEligibilityReason)] in
+            groups.flatMap { group -> [(ContextAtomID, ContextEligibilityReason)] in
             guard let resolved = group.resolvedAtomID else { return [] }
             return group.memberAtomIDs.filter { $0 != resolved }.map {
                 ($0, ContextEligibilityReason.supersededByConflictResolution)
             }
-        })
-        let sourceByID = Dictionary(uniqueKeysWithValues: generation.sources.map {
+        }, uniquingKeysWith: { first, _ in first })
+        let sourceByID = Dictionary(generation.sources.map {
             ($0.descriptor.id, $0)
-        })
+        }, uniquingKeysWith: { first, _ in first })
         let sortedAtoms = generation.atoms.sorted { $0.draft.id < $1.draft.id }
-        let atomByID = Dictionary(uniqueKeysWithValues: sortedAtoms.map { ($0.draft.id, $0) })
+        let atomByID = Dictionary(sortedAtoms.map { ($0.draft.id, $0) }, uniquingKeysWith: { first, _ in first })
 
         var decisions: [ContextEligibilityDecision] = []
         var eligible: [ContextStoredAtom] = []
@@ -92,9 +92,9 @@ public struct ContextSelector: Sendable {
             throw ContextSelectionError.mandatoryUnavailable(unavailableMandatory)
         }
 
-        let groupByAtom = Dictionary(uniqueKeysWithValues: groups.flatMap { group in
+        let groupByAtom = Dictionary(groups.flatMap { group in
             group.memberAtomIDs.map { ($0, group.id) }
-        })
+        }, uniquingKeysWith: { first, _ in first })
         // Precovered sources are already present in the stable prompt. Keep
         // their eligibility receipts, but do not spend per-turn ranking work
         // on atoms that cannot become dynamic candidates. Explicit mandatory
@@ -103,13 +103,13 @@ public struct ContextSelector: Sendable {
             !need.precoveredSourceIDs.contains($0.draft.sourceID)
                 || mandatoryIDs.contains($0.draft.id)
         }
-        let lexicalIndex = Dictionary(uniqueKeysWithValues: scorable.map { atom in
+        let lexicalIndex = Dictionary(scorable.map { atom in
             (
                 atom.draft.id,
                 snapshot?.selectionIndex[atom.draft.id]
                     ?? ContextSelectionIndexEntry(atom: atom.draft)
             )
-        })
+        }, uniquingKeysWith: { first, _ in first })
         let scoreContext = makeScoreContext(need, lexicalIndex: lexicalIndex)
         var scores: [ContextAtomID: ContextCandidateScoreFeatures] = [:]
         for atom in scorable {
@@ -291,7 +291,7 @@ public struct ContextSelector: Sendable {
         var correctionCapDropped = 0
         var omittedConflictIDs = Set<String>()
         let selectedTokenSets = selectedItems.map { Self.tokens($0.text) }
-        var redundancyByAtom = Dictionary(uniqueKeysWithValues: boundedCandidates.map { atom in
+        var redundancyByAtom = Dictionary(boundedCandidates.map { atom in
             (
                 atom.draft.id,
                 maximumTokenSimilarity(
@@ -299,7 +299,7 @@ public struct ContextSelector: Sendable {
                     selectedTokenSets
                 )
             )
-        })
+        }, uniquingKeysWith: { first, _ in first })
 
         while !units.isEmpty && selectedDynamicCount < configuration.maximumDynamicAtoms {
             var reranked: [(unit: SelectionUnit, value: Double)] = []
@@ -772,8 +772,6 @@ private extension ContextSelector {
             need.executionID,
         ].compactMap { $0 }
             + recentTurns
-            + need.contextualTerms.sorted()
-            + need.predictedToolGroups.sorted()
             + need.extractedEntities.flatMap { [$0.id, $0.label] })
             .joined(separator: " ")
     }

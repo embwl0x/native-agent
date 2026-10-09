@@ -15,8 +15,18 @@ extension BuiltInToolSchemaFactory {
         if includeFullMacFileTools {
             schemas.append(contentsOf: [
                 requestedSchema(
+                    name: "mac_screenshot_save",
+                    description: "Save a system screenshot as PNG with macOS screencapture, without displaying pixels to the model. Defaults to all displays, Desktop and macOS screenshot naming; returns saved paths. Optional window_id, app (front visible window by exact app name) or region selects one capture. Requires Full Mac file access, the Accessibility category and Screen Recording permission; existing files are refused. Use mac.look pixels:true separately to view masked model pixels.",
+                    parametersJSON: params(properties: [
+                        ("path", strSchema("PNG destination path; defaults to Desktop/Screenshot with the local date and time. Additional displays get numbered PNG paths.")),
+                        ("window_id", intSchema("Exact visible window number; cannot combine with app or region.", minimum: 1)),
+                        ("app", strSchema("Exact running app name; captures its front visible window without activating it.")),
+                        ("region", strSchema("x,y,width,height in screen points; cannot combine with app or window_id.")),
+                    ], required: [])
+                ),
+                requestedSchema(
                     name: "file_excerpt",
-                    description: "Read a bounded, line-numbered section of a local text file on the Mac filesystem. Available only when Trust Center Full Mac file access is active.",
+                    description: "Read numbered lines of a local text file. Returns start_line, end_line, total_lines, has_more and next arguments. For byte windows use files.read. Requires Trust Center Full Mac file access.",
                     parametersJSON: params(
                         properties: [
                             ("path", strSchema("Absolute path or path relative to the NativeAgent repo root.")),
@@ -48,11 +58,12 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "git_diff",
-                    description: "Read staged or unstaged changes, optionally limited to a path. Available only when Trust Center Full Mac file access is active.",
+                    description: "Read staged or unstaged changes, or committed patches since a date, optionally limited to a path. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
                             ("cwd", strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
                             ("staged", boolSchema("Use --staged.")),
+                            ("since", strSchema("Optional committed history boundary: today means local midnight; otherwise a Git date. Cannot combine with staged.")),
                             ("path", strSchema("Optional path filter.")),
                         ],
                         required: []
@@ -60,11 +71,13 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "git_log",
-                    description: "Read recent commits. Available only when Trust Center Full Mac file access is active.",
+                    description: "Read commits and changed files across them, optionally since a date. With since, the file union covers the entire period even when commit details reach their limit. Returns per-commit files and has_more coverage. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
                             ("cwd", strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
                             ("limit", intSchema("Commit count, default 10, capped at 100.")),
+                            ("since", strSchema("Optional history boundary: today means local midnight; otherwise a Git date.")),
+                            ("path", strSchema("Optional path filter.")),
                         ],
                         required: []
                     )
@@ -136,7 +149,7 @@ extension BuiltInToolSchemaFactory {
                     parametersJSON: params(
                         properties: [
                             ("package_path", strSchema("Optional Swift package directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical workspace. Active Full Mac YOLO may select an ordinary external package directory.")),
-                            ("configuration", strSchema("Optional. debug or release. Defaults to debug.")),
+                        ("configuration", enumStringSchema(["debug", "release"], "Optional. debug or release. Defaults to debug.")),
                             ("product", strSchema("Optional product name to build. Mutually exclusive with target.")),
                             ("target", strSchema("Optional target name to build. Mutually exclusive with product.")),
                             ("jobs", intSchema("Optional SwiftPM --jobs value, clamped 1...64.")),
@@ -152,7 +165,7 @@ extension BuiltInToolSchemaFactory {
                     parametersJSON: params(
                         properties: [
                             ("package_path", strSchema("Optional Swift package directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical workspace. Active Full Mac YOLO may select an ordinary external package directory.")),
-                            ("configuration", strSchema("Optional. debug or release. Defaults to debug.")),
+                            ("configuration", enumStringSchema(["debug", "release"], "Optional. debug or release. Defaults to debug.")),
                             ("filter", strSchema("Optional SwiftPM --filter regex/specifier.")),
                             ("jobs", intSchema("Optional SwiftPM --jobs value, clamped 1...64.")),
                             ("timeout_seconds", intSchema("Optional. Default 900, max 3600.")),
@@ -257,11 +270,33 @@ extension BuiltInToolSchemaFactory {
             ])
         }
         if includeFullMacSystemTools {
+            schemas.append(requestedSchema(
+                name: "mac_media",
+                description: "Control the Mac's Now Playing app with a system media key: play/pause, next or previous across Music, Spotify, browsers and podcasts. Play/pause is a toggle; the receipt reports the key sent and observed Music/Spotify states without claiming an unknown app's playback state. Requires Full Mac system access; never launches Music or Spotify to read their states.",
+                parametersJSON: params(properties: [
+                    ("action", obj([("type", .string("string")),
+                        ("enum", .array(["play", "resume", "pause", "toggle", "next", "skip", "previous"].map(JSONValue.string))),
+                        ("description", .string("play / resume / pause / toggle send the play-pause key; next / skip send next; previous sends previous."))])),
+                ], required: ["action"])
+            ))
+            schemas.append(requestedSchema(
+                name: "mac_volume",
+                description: "Read or change this Mac's output volume and mute state directly; no screen or guide read is needed. With no args, read only. Set level, adjust by signed percentage points, or set muted; returns the observed level and mute state.",
+                parametersJSON: params(properties: [
+                    ("level", intSchema("Output volume percent (0–100); cannot combine with adjust.", minimum: 0, maximum: 100)),
+                    ("adjust", intSchema("Signed percentage points (−100–100), e.g. −10 to turn it down.", minimum: -100, maximum: 100)),
+                    ("muted", boolSchema("true to mute, false to unmute; omit to preserve mute state.")),
+                ], required: [])
+            ))
             schemas.append(
                 requestedSchema(
                     name: "system_info",
-                    description: "Read basic local system/disk/memory information through the Swift dispatcher. Available only when Trust Center Full Mac system access is active.",
-                    parametersJSON: params(properties: [], required: [])
+                    description: "Read this Mac's system, disk, memory, top five CPU/memory processes, battery, network, local/public IP, connected macOS VPN services and Wi-Fi SSID directly; unavailable fields are labeled. Public IP uses a 3-second HTTPS lookup. Only when requested, speed_test:true measures upload/download and responsiveness with networkQuality, limited to 20 seconds and using internet bandwidth. With app, only read that installed app's bundle version by exact name or full .app path in the standard application directories. With check_updates:true, only list available macOS software updates, read-only with a 30-second deadline; this does not check NativeAgent or App Store apps. Use app, check_updates or speed_test separately. Check App Store → Updates for App Store app updates. No app opening, screen or guide read is needed. Available only when Trust Center Full Mac system access is active.",
+                    parametersJSON: params(properties: [
+                        ("check_updates", boolSchema("List macOS software updates instead of system information; never installs anything.")),
+                        ("app", strSchema("Exact installed app name or full .app path; read CFBundleShortVersionString and build directly without launching it.")),
+                        ("speed_test", boolSchema("Only on request: measure internet upload/download and responsiveness for at most 20 seconds; uses bandwidth. Omit for an ordinary system read.")),
+                    ], required: [])
                 )
             )
         }
@@ -321,11 +356,13 @@ extension BuiltInToolSchemaFactory {
                 // Perception grades let the caller request only the detail needed.
                 requestedSchema(
                     name: "screen",
-                    description: "Look at the live screen now. Default: a structured page in words — SCREEN (app/window), WHERE (navigation), LIST/GRID or CANVAS, DO (controls), SAYS (status). Address a numbered row as 'row 3' (a bare number means a control labeled with it); look again for fresh evidence. Pass part to inspect a section or thing; part: menu reads the app's menu bar. Pass app to read another running app's window without activating it; act with the same app works there in the background. Structured reads of NativeAgent itself are refused because self Accessibility reads deadlock; use app (desk.read, mind.inner_state, agent.introspect) for internal state. When a window's accessibility is thin (canvas, game, video), screen attaches one small image of just that window; part: 'visual region N' crops to that region. For actual visible desktop pixels, including our own visible window, use pixels:true with no app or part. This separate capture uses no Accessibility calls and does not claim an action succeeded just because a screenshot was captured.",
+                    description: "Look at the live screen now. Default: a structured page in words — SCREEN (app/window), WHERE (navigation), LIST/GRID or CANVAS, DO (controls), SAYS (status). Address a numbered row as 'row 3' (a bare number means a control labeled with it); look again for fresh evidence. Pass part to inspect a section or thing; part: menu reads the app's menu bar. Pass app to read another running app's window without activating it; act with the same app works there in the background. Structured reads of NativeAgent itself are refused because self Accessibility reads deadlock; use app (desk.read, mind.inner_state, agent.introspect) for internal state. When a window's accessibility is thin (canvas, game, video), screen attaches one small image of just that window; part: 'visual region N' crops to that region. For actual visible desktop pixels, use pixels:true with no app or part. That capture reads the other windows through Accessibility only to find secret fields (passwords, card codes, keys), which it masks; a window it cannot fully inspect, including NativeAgent's own, is masked in full. It does not claim an action succeeded just because a screenshot was captured.",
                     parametersJSON: params(
                         properties: [
-                            ("pixels", boolSchema("Set true for actual primary-desktop pixels to verify visual outcomes, including NativeAgent's visible window, overlapping windows and Liquid Glass. Requires existing Full Mac read authority and Screen Recording permission. No AX/self-read, focus change or permission prompt. With app or part it instead attaches that window's or region's image even when its accessibility is rich. Image is transient and bounded to 1600px; capture success is not action verification. Default false keeps the structured screen read.")),
+                            ("pixels", boolSchema("Set true for actual primary-desktop pixels to verify visual outcomes, including overlapping windows and Liquid Glass. Secret fields are masked; a window that cannot be fully inspected through Accessibility, including NativeAgent's own, is masked in full. Requires existing Full Mac read authority and Screen Recording permission. No focus change or permission prompt. With app or part it instead attaches that window's or region's image even when its accessibility is rich. Image is transient and bounded to 1600px; capture success is not action verification. Default false keeps the structured screen read.")),
                             ("structured", boolSchema("Include bounded, already-redacted controls for workspace selections in detail.controls. Each control's handle is bound to that result's frame_id; return both to act for an exact selection. Default false keeps the concise natural screen.")),
+                            ("__sense_screen_frame", strSchema("The frozen screen identity from More. Pass the entire More object as mac.look args to continue that page with its original handles.")),
+                            ("__sense_text_offset", intSchema("The reading position from More; pass it unchanged with __sense_screen_frame and app.")),
                             ("part", strSchema("Optional: a section, thing, or status readout to inspect by name. Use hud/readouts for observed status values, or a label such as Last drag or Energy to reveal a readout hidden by the ordinary display cap.")),
                             ("app", strSchema("Optional: read this running app's front window instead of whatever is in front, without activating it (\"Mail\", \"Safari\"). If nothing by that name is running, or the name matches more than one, the answer says so and names what is running.")),
                         ],
@@ -390,7 +427,7 @@ extension BuiltInToolSchemaFactory {
                     description: "Summarise which Mac apps were in use over a time range, from a local, on-device activity log the user explicitly opted into and separately allowed this selected AI provider to read. It knows which app was frontmost and for how long — not what was done inside it, not what was typed, and not the contents of any field. Where the user enabled window titles, a secret-redacted title may appear on example spans; treat it as a weak hint, not a description of the work, and never quote it as fact about content. Apps on the user's exclusion list are absent from the answer entirely, even for days when they were still being recorded, so totals can legitimately be lower than a full day. The answer is capped at 50 rows and refuses rather than silently truncating an over-dense source range. Read-only and deterministic; the store is never exposed to iPhone/Telegram/Slack/iCloud/bridges. If capture or Agent Access is off in Trust Center this tool refuses rather than returning an empty day; do not read a refusal as \"nothing happened\".",
                     parametersJSON: params(
                         properties: [
-                            ("range", strSchema("Named range: today, yesterday, last_hour, last_24_hours, last_7_days, last_30_days. Defaults to today. Ignored when `from` is given.")),
+                        ("range", enumStringSchema(["today", "yesterday", "last_hour", "last_24_hours", "last_7_days", "last_30_days", "past_hour", "past_24_hours", "past_week", "this_week", "past_month"], "Named range: today, yesterday, last_hour, last_24_hours, last_7_days, last_30_days. Defaults to today. Ignored when `from` is given.")),
                             ("from", strSchema("Explicit range start: epoch seconds, an ISO-8601 instant, or YYYY-MM-DD (midnight in the asking timezone).")),
                             ("to", strSchema("Explicit range end, same formats as `from`. Defaults to now.")),
                             ("bundle_id", strSchema("Restrict the answer to one app's bundle identifier, e.g. com.apple.Safari.")),
@@ -429,7 +466,7 @@ extension BuiltInToolSchemaFactory {
                         properties: [
                             ("verb", enumStringSchema(["click", "double_click", "right_click", "open", "type", "select", "toggle", "scroll", "dismiss", "hover", "move", "drag", "hold", "key", "press"], "What to do. press = key for a key/chord (cmd+s, return), click for a named control. double_click and right_click are the real mouse gestures.")),
                             ("target", strSchema("The thing, by name as the screen shows it — a label, a partial label, an ordinal like 'row 3', or a numbered unlabeled target like 'visual region 2'. For hold, `key w d` holds W and D simultaneously for seconds; space-separated keys/chords and bare modifiers are supported. For key, a space-separated sequence remains sequential.")),
-                            ("handle", strSchema("Optional exact control handle from screen structured:true. Requires its frame_id. Used by workspace selections; no name fallback or repeated action if stale. Supports click, open, type, select, toggle, scroll without physical gesture options.")),
+                            ("handle", strSchema("Optional exact control handle from screen structured:true. Requires its frame_id. Used by workspace selections; no name fallback or repeated action if stale. Supports click, open, type, focus, select, toggle, scroll without physical gesture options.")),
                             ("frame_id", strSchema("Required with handle: the same screen's detail.controls.frame_id. Old frames are refused; read the screen again to get current choices.")),
                             ("text", strSchema("For `type`: the literal text. Append adds exactly this text; include a newline when needed.")),
                             ("mode", enumStringSchema(["replace", "append"], "For named `type`: replace (default) keeps form-fill behavior and may replace the whole value; append inserts at the verified end, preserves prior text, and never sets the whole value. Append requires a named accessibility text target and verified contents/end; otherwise it refuses. Omit or use replace for other verbs.")),
@@ -491,11 +528,11 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "go",
-                    description: "Get to an app, file, folder, http/https URL, or System Settings pane link (x-apple.systempreferences:com.apple.wifi-settings-extension) through the canonical Mac-control owner, then read the fresh screen. Requires front:true explicitly requested by the task; otherwise stops with needs_front because opening or switching takes the screen. App activation is independently verified; file/URL opening is reported only as an accepted request unless the screen proves where it landed. Needs active Full Mac Accessibility app control; there is no per-call approval.",
+                    description: "Get to an app, file, folder, http/https URL, or System Settings pane link (x-apple.systempreferences:com.apple.wifi-settings-extension) through the canonical Mac-control owner, then read the fresh screen. Without front it opens or launches behind, activating nothing, and reads that app's window; act with app works there. With front:true, only when the task explicitly asks to bring it forward, it switches the screen and activation is independently verified. File/URL opening is reported only as an accepted request unless the screen proves where it landed. Needs active Full Mac Accessibility app control; there is no per-call approval.",
                     parametersJSON: params(
                         properties: [
                             ("name", strSchema("An app name, a file/folder path (~ allowed), an http/https URL, or an x-apple.systempreferences: pane link.")),
-                            ("front", boolSchema("Explicit permission from the task to open or switch to this destination on the screen. Defaults to false.")),
+                            ("front", boolSchema("Only when the task explicitly asks to bring it forward: switch the screen to this destination. Defaults to false, which opens it behind.")),
                         ],
                         required: ["name"]
                     )

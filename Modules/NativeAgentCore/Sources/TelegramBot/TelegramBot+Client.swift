@@ -85,11 +85,15 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
         let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
         let stateURL = telegramDir.appendingPathComponent("state.json")
         let state = try await persistence.readJSON(stateURL, ifMissing: .object([:]))
-        let stateObj: [String: JSONValue]
+        var stateObj: [String: JSONValue]
         if case .object(let obj) = state {
             stateObj = obj
         } else {
             stateObj = [:]
+        }
+        if let loop = await backgroundLoopsManager.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop,
+           let polledAt = await loop.lastSuccessfulPollAt {
+            stateObj["lastPollAt"] = .string(ISO8601DateFormatter().string(from: polledAt))
         }
         let receipts = (try? await persistence.tailJSONL(
             telegramDir.appendingPathComponent("receipts.jsonl"),
@@ -239,12 +243,44 @@ public func makeTelegramBot() -> any TelegramBotProtocol {
     return SwiftNativeTelegramBot()
 }
 
+/// getUpdates' own connection pool. On URLSession.shared a network blip left
+/// a dead pooled connection that every later long poll reused and timed out
+/// on: Telegram dark 1-3 h while other traffic worked (09-27, 10-05). Two
+/// timeouts in a row drop the pool for a fresh one.
+public actor TelegramLongPollSession {
+    private(set) var current = URLSession(configuration: .ephemeral)
+    private var consecutiveTimeouts = 0
+    public private(set) var lastSuccessfulPollAt: Date?
+    private var lastHealthCheckpointAt: Date?
+
+    public init() {}
+
+    func recordResponse() { consecutiveTimeouts = 0 }
+
+    func recordSuccessfulPoll() -> Bool {
+        let now = Date()
+        lastSuccessfulPollAt = now
+        if let lastHealthCheckpointAt,
+           now.timeIntervalSince(lastHealthCheckpointAt) < SwiftNativeLoopScheduler.healthCheckpointInterval { return false }
+        lastHealthCheckpointAt = now
+        return true
+    }
+
+    func recordTimeout() {
+        consecutiveTimeouts += 1
+        guard consecutiveTimeouts >= 2 else { return }
+        current.invalidateAndCancel()
+        current = URLSession(configuration: .ephemeral)
+        consecutiveTimeouts = 0
+    }
+}
+
 extension SwiftNativeTelegramBot {
     public func longPoll(
         token: String,
         offset: Int,
         timeoutSeconds: Int = 25,
-        session: URLSession = .shared
+        session: TelegramLongPollSession
     ) async throws -> TelegramPollResult {
         guard let url = _tgBuildBotURL(
             token: token,
@@ -263,7 +299,8 @@ extension SwiftNativeTelegramBot {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await session.current.data(for: req)
+            await session.recordResponse()
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as URLError where error.code == .cancelled {
@@ -272,6 +309,7 @@ extension SwiftNativeTelegramBot {
             // misclassified as a Telegram outage by the poll loop.
             throw CancellationError()
         } catch {
+            if (error as? URLError)?.code == .timedOut { await session.recordTimeout() }
             // 2026-09-22: keep the cause. A bare `.unavailable` read as offline,
             // so real TLS/DNS/proxy faults were silent; isOfflineError still
             // matches genuine offline URLError codes in this description.
@@ -457,10 +495,10 @@ extension SwiftNativeTelegramBot {
             let persona = args.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             if persona.isEmpty {
                 let current = try await store.persona(destination: destination) ?? "NativeAgent"
-                return "Telegram persona: \(current)"
+                return "Persona: \(current)"
             }
             let saved = try await store.setPersona(destination: destination, persona: persona)
-            return "Telegram persona set to \(saved)"
+            return "Persona set to \(saved) for all conversations."
         case "remember":
             let text = args.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return "/remember requires text" }

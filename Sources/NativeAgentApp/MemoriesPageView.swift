@@ -154,15 +154,22 @@ enum MemoriesWhen {
         if calendar.isDateInYesterday(at) { return "yesterday" }
         let days = calendar.dateComponents([.day], from: at, to: now).day ?? 0
         if days >= 0, days < 30 {
-            let formatter = RelativeDateTimeFormatter()
-            formatter.unitsStyle = .full
-            return formatter.localizedString(for: at, relativeTo: now)
+            return relativeLock.withLock { relative.localizedString(for: at, relativeTo: now) }
         }
         if calendar.component(.year, from: at) == calendar.component(.year, from: now) {
             return "in \(at.formatted(.dateTime.month(.wide)))"
         }
         return "in \(at.formatted(.dateTime.month(.wide).year()))"
     }
+
+    /// One formatter for every row, not one built per row per redraw. Used
+    /// only under `relativeLock`, since the caller is not tied to one thread.
+    private static let relativeLock = NSLock()
+    nonisolated(unsafe) private static let relative: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
 
     /// The row sorts on the newest of the two stamps the store keeps.
     static func sortDate(_ memory: MemoryV2.MemoryRecord) -> Date {
@@ -224,18 +231,20 @@ enum MemoriesPageContent {
 
     /// Pinned first, then newest. The same order the conversations list keeps.
     static func ordered(_ memories: [MemoryV2.MemoryRecord]) -> [MemoryV2.MemoryRecord] {
-        memories.sorted { lhs, rhs in
+        // Each stamp parsed once, not twice per comparison.
+        memories.map { ($0, MemoriesWhen.sortDate($0)) }.sorted { l, r in
+            let (lhs, la) = l, (rhs, ra) = r
             let lp = lhs.pinned == true, rp = rhs.pinned == true
             if lp != rp { return lp }
-            let la = MemoriesWhen.sortDate(lhs), ra = MemoriesWhen.sortDate(rhs)
             if la != ra { return la > ra }
             return lhs.id < rhs.id
-        }
+        }.map(\.0)
     }
 
     /// "Pinned · in July · I checked it myself".
     static func meta(_ memory: MemoryV2.MemoryRecord, now: Date) -> String {
         var parts: [String] = []
+        if let warning = MemorySenseProvenance.warning(in: memory.extras) { parts.append(warning) }
         if memory.pinned == true { parts.append("Pinned") }
         parts.append(MemoriesWhen.words(MemoriesWhen.stamp(memory), now: now))
         parts.append(MemoriesProvenance.classify(memory.sourceRunId).words)
@@ -307,6 +316,7 @@ struct MemoriesPageView: View {
 
     @State private var query = ""
     @State private var snapshot = MemoriesPageSnapshot.empty
+    @State private var readCount = 0
     @State private var rejectedProposals: [ProposalRecord] = []
     @State private var rejectedShown = MemoriesPageMetrics.foldRowCap
     @State private var now = Date()
@@ -314,6 +324,7 @@ struct MemoriesPageView: View {
     @State private var openFolds: Set<String> = []
     @State private var notice: String?
     @State private var fullText: MemoriesFullText?
+    @State private var savingProposalIDs: Set<String> = []
 
     private enum Fold {
         static let showAll = "show-all"
@@ -330,10 +341,17 @@ struct MemoriesPageView: View {
 
                 MemoriesSearchField(text: $query)
 
+                PageReadStatus(
+                    isReading: !snapshot.loaded || readCount > 0,
+                    text: !snapshot.loaded ? "Reading my memories…" : readCount > 0 ? "Refreshing my memories…" : nil
+                )
+
                 if isSearching {
                     searchSection
                 } else {
-                    if !pendingProposals.isEmpty { waitingCard }
+                    if !pendingProposals.isEmpty {
+                        waitingCard.transition(NativeAgentMotion.arrivalFade)
+                    }
                     keptSection
                     deletedFold
                     // The store's upkeep and status, folded: nobody needs it
@@ -362,7 +380,6 @@ struct MemoriesPageView: View {
                 }
             }
             .padding(.horizontal, embedded ? 0 : 20)
-            .motionArrival(when: snapshot.loaded)
             .padding(.top, embedded ? 0 : TodayMetrics.topPadding)
             .padding(.bottom, 32)
             .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
@@ -510,9 +527,11 @@ struct MemoriesPageView: View {
                         meta: MemoriesPageContent.proposalMeta(
                             quote: snapshot.momentQuotes[proposal.id],
                             staged: "staged \(MemoriesWhen.words(proposal.createdAt, now: now))"),
+                        isSaving: savingProposalIDs.contains(proposal.id),
                         onKeep: { decide(proposal, keep: true) },
                         onNotNow: { decide(proposal, keep: false) }
                     )
+                    .transition(NativeAgentMotion.arrivalFade)
                 }
             }
             .accessibilityIdentifier("memories.waiting-for-you")
@@ -527,6 +546,7 @@ struct MemoriesPageView: View {
 
     @ViewBuilder
     private var keptSection: some View {
+        let ordered = self.ordered
         if ordered.isEmpty {
             if snapshot.loaded, !snapshot.memoryUnreadable,
                appModel.panelRefreshStatus[.memories]?.failedEndpoints.contains("memories") == false {
@@ -605,7 +625,9 @@ struct MemoriesPageView: View {
 
     /// The SAME accept/reject the classic Pending tab calls, one for one.
     private func decide(_ proposal: ProposalRecord, keep: Bool) {
+        guard savingProposalIDs.insert(proposal.id).inserted else { return }
         Task {
+            defer { savingProposalIDs.remove(proposal.id) }
             do {
                 if keep {
                     try await appModel.approveMemoryProposal(id: proposal.id)
@@ -644,8 +666,7 @@ struct MemoriesPageView: View {
 
     @MainActor
     private func delete(_ memory: MemoryV2.MemoryRecord) async {
-        await appModel.deleteMemory(memory)
-        if appModel.statusText.hasPrefix("Memory delete failed:") {
+        if await !appModel.deleteMemory(memory) {
             appModel.systemToasts.push(error: appModel.statusText)
             notice = "I couldn't forget that one."
         } else {
@@ -655,6 +676,8 @@ struct MemoriesPageView: View {
 
     @MainActor
     private func reload() async {
+        readCount += 1
+        defer { readCount -= 1 }
         // The same five-queue read the classic page's Refresh performs, so the
         // memories, the proposals and the status all move together.
         await appModel.refreshForSidebarItem(.memories)
@@ -720,7 +743,7 @@ struct MemoriesFold<Content: View>: View {
     }
 }
 
-/// One kept memory. A line and a meta line, uniform height; Read, Pin and
+/// One kept memory. Up to two prose lines and a meta line; Read, Pin and
 /// Delete appear on hover, the way the conversations list reveals its pin.
 /// A row inside the group card: the card carries the chrome.
 struct MemoriesRowCard: View {
@@ -733,35 +756,40 @@ struct MemoriesRowCard: View {
 
     @State private var hovering = false
     @State private var confirmingDelete = false
+    @FocusState private var focusedAction: Action?
+    private enum Action: Hashable { case read, pin }
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
                 Text(line.isEmpty ? "An empty note" : line)
-                    .font(.system(size: 15, weight: .medium))
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(meta)
-                    .font(.system(size: 13))
+                    .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-            .frame(height: TodayMetrics.rowContentHeight, alignment: .leading)
+            .frame(minHeight: TodayMetrics.rowContentHeight, alignment: .leading)
             Spacer(minLength: 8)
             HStack(spacing: 2) {
                 iconButton("doc.text.magnifyingglass", help: "Read the whole thing", action: onRead)
+                    .focused($focusedAction, equals: .read)
                 iconButton(
                     isPinned ? "pin.fill" : "pin",
                     help: isPinned ? "Unpin" : "Pin to the top",
                     tint: isPinned ? NativeAgentShell.text : nil,
                     action: onTogglePin
                 )
+                .focused($focusedAction, equals: .pin)
             }
             // Pinned rows keep the pin visible; everything else appears under
             // the cursor, so sixty rows read as sixty lines, not sixty toolbars.
-            .opacity(hovering || isPinned ? 1 : 0)
+            .opacity(hovering || isPinned || focusedAction != nil ? 1 : 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
@@ -812,6 +840,7 @@ struct MemoriesRowCard: View {
 struct MemoriesProposalRow: View {
     let line: String
     let meta: String
+    let isSaving: Bool
     let onKeep: () -> Void
     let onNotNow: () -> Void
 
@@ -843,6 +872,18 @@ struct MemoriesProposalRow: View {
                     .accessibilityIdentifier("memories.waiting.keep")
             }
             .fixedSize()
+            .disabled(isSaving)
+            .opacity(isSaving ? 0 : 1)
+            .overlay {
+                if isSaving {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Saving…")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                    }
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

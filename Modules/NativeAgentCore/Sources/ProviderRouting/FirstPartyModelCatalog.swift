@@ -149,6 +149,10 @@ public enum FirstPartyModelCatalog {
         // default effort high); capability flags as Sonnet 5 until proven.
         .init(id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
         .init(id: "claude-opus-5-5", name: "Claude Opus 5.5", contextLength: 1_000_000, defaultReasoningEffort: "medium", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
+        // 2026-10-07: Haiku 5.5 (docs: 1M window, adaptive thinking on by
+        // default, effort low…max with default medium, mid-conversation system
+        // messages supported).
+        .init(id: "claude-haiku-5-5", name: "Claude Haiku 5.5", contextLength: 1_000_000, defaultReasoningEffort: "medium", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true),
         .init(id: "claude-opus-4-8", name: "Claude Opus 4.8", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
         // Fable 5.1 (added 2026-09-01, verified against the live catalog): 1M
         // window, 128K output, thinking always on (adaptive; explicit

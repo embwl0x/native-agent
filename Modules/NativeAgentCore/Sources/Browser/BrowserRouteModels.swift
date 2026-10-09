@@ -36,6 +36,7 @@ public struct NativeActionReceipt: Identifiable, Codable, Hashable {
     public var name: String?
     public var kind: String?
     public var status: String
+    public var detail: String?
     public var dryRun: Bool?
     public var approvalId: String?
     public var createdAt: String?
@@ -68,6 +69,8 @@ public struct NativeActionReceipt: Identifiable, Codable, Hashable {
         self.linksPreview = linksPreview
         self.sourceReceipt = sourceReceipt
         self.screenshotReceipt = screenshotReceipt
+        if status == "failed", case .object(let source)? = sourceReceipt,
+           case .string(let cause)? = source["openError"] { self.detail = cause }
     }
 
     public func hash(into hasher: inout Hasher) { hasher.combine(id) }

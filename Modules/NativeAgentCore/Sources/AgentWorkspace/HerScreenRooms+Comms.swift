@@ -30,7 +30,7 @@ extension HerScreen {
 
     /// Item verbs a list room names under its DO line.
     static let commsItemVerbs: [String: [(name: String, about: String, tool: String)]] = [
-        "mail": [("mail.N.reply", "reply (text)", "mail_reply"), ("mail.N.archive", "archive it", "mail_archive"), ("mail.N.mark-read", "mark it read", "mail_mark_read")],
+        "mail": [("mail.N.draft", "saves an unsent reply in Mail → Drafts (text)", "mail_draft"), ("mail.N.reply", "sends a reply now (text)", "mail_reply"), ("mail.N.archive", "archive it", "mail_archive"), ("mail.N.mark-read", "mark it read", "mail_mark_read")],
         "notes": [("notes.N.append", "add to it (text)", "notes_update")],
     ]
     static var commsRooms: Set<String> { Set(commsFamily.values) }
@@ -92,7 +92,7 @@ extension HerScreen {
         return parts
     }
 
-    static let notConnectedLine = "Not connected — app card.request (kind connector) puts the connect card in this chat; or he opens Settings (the gear, bottom-left), then Connectors."
+    static let notConnectedLine = "Not connected. The owner must sign in in Settings > Connectors."
 
     /// A service that is not connected reads the same everywhere, whatever
     /// its owner called it (a connect card, "failed", "not set up").
@@ -191,9 +191,10 @@ extension HerScreen {
         case "contacts_search": input["identifier"] != nil
         default: false
         }
-        // Not connected: one line, the same for every service.
+        // Keep the connector owner's fix visible.
         if notConnected(object) {
-            return commsScreen([family.uppercased(), "not connected"], [[notConnectedLine]], verbs: [], back: "Back: home.")
+            return commsScreen([family.uppercased(), "not connected"], [[text(object["detail"]) ?? notConnectedLine,
+                text(object["fix"])].compactMap { $0 }], verbs: [], back: "Back: home.")
         }
         if tool == "gmail_status", issue == nil {
             func int(_ value: JSONValue?) -> Int? { if case .int(let n)? = value { Int(n) } else { nil } }
@@ -229,14 +230,17 @@ extension HerScreen {
             let start = int(row["body_offset"]) ?? 0, total = int(row["body_total"]) ?? 0
             let body = tabled(lines, row["body_tables"])
             sections = [section("SUBJECT", [clip(text(row["subject"]) ?? "(no subject)", 100)]), section("BODY", body.isEmpty ? ["(empty)"] : body)]
+            let attachments = mailAttachmentLines(row)
+            if !attachments.isEmpty { sections.append(section("ATTACHMENTS", attachments)) }
             if start + used < total {
                 sections.append(["+\(total - start - used) more characters · \(name).more"])
                 keep[name + ".more"] = .open(.record(tool: "mail_list_recent", input: bound.merging(["body_offset": .int(Int64(start + used))]) { _, new in new }, title: title))
             }
             if case .string(let expectedID)? = bound["expected_message_id"], !expectedID.isEmpty {
                 if (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) == .string("inbox") {
-                    verb("reply", "reply to the sender (text)", .perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true))
-                    verb("reply-all", "reply to everyone (text)", .perform(tool: "mail_reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new },
+                    verb("draft", "saves an unsent reply in Mail → Drafts (text)", .perform(tool: "mail_draft", input: bound, title: "Draft: " + title, textField: "body", isEffect: true))
+                    verb("reply", "sends a reply now to the sender (text)", .perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true))
+                    verb("reply-all", "sends a reply now to everyone (text)", .perform(tool: "mail_reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new },
                                                                           title: "Reply all: " + title, textField: "body", isEffect: true))
                     verb("archive", "archive it", .perform(tool: "mail_archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true))
                     verb("mark-read", "mark it read", .perform(tool: "mail_mark_read", input: bound, title: "Mark read: " + title, textField: nil, isEffect: true))
@@ -261,7 +265,7 @@ extension HerScreen {
             }
             let handles = people.compactMap { text($0["handle"]) }
             if let id = text(thread["thread_id"]), !handles.isEmpty, handles.count == people.count {
-                verb("reply", "send in this thread (text)", .perform(tool: "messages_send", input: ["thread_id": .string(id),
+                verb("reply", "sends a reply now in this thread (text)", .perform(tool: "messages_send", input: ["thread_id": .string(id),
                     "expected_participants": .array(handles.map(JSONValue.string))], title: "Reply: " + title, textField: "body", isEffect: true))
             }
         case "gmail_read", "agentmail_read":
@@ -284,7 +288,7 @@ extension HerScreen {
             }
             if tool == "agentmail_read", let sender, let address = sender.split(whereSeparator: { "<> ".contains($0) }).first(where: { $0.contains("@") }) {
                 let subject = text(object["subject"]) ?? ""
-                verb("reply", "reply from my inbox (text; the person approves the send)", .perform(tool: "agentmail_send",
+                verb("reply", "sends a reply from my inbox after the required send approval (text)", .perform(tool: "agentmail_send",
                     input: ["to": .string(String(address)), "subject": .string(subject.lowercased().hasPrefix("re:") ? subject : "Re: " + subject)],
                     title: "Reply: " + title, textField: "body", isEffect: true))
             }
@@ -316,11 +320,11 @@ extension HerScreen {
             sections = [section("PHONES", phones.isEmpty ? ["none"] : phones.prefix(4).map { clip($0, 40) }),
                         section("EMAILS", emails.isEmpty ? ["none"] : emails.prefix(4).map { clip($0, 60) })]
             if let phone = values(card["phones"], labels: false).first {
-                verb("text", "text \(phones.count > 1 ? "the first number" : "them") (text)", .perform(tool: "messages_send", input: ["to": .string(phone)],
+                verb("text", "sends a text now to \(phones.count > 1 ? "the first number" : "them") (text)", .perform(tool: "messages_send", input: ["to": .string(phone)],
                     title: "Text " + title, textField: "body", isEffect: true))
             }
             if let email = values(card["emails"], labels: false).first {
-                verb("email", "write them an email (form)", .configure(tool: "mail_send", input: ["to": .string(email)], title: "Email " + title))
+                verb("email", "sends an email now (form)", .configure(tool: "mail_send", input: ["to": .string(email)], title: "Email " + title))
             }
             if let id = text(card["identifier"]) {
                 verb("edit", "add a number or email (form)", .configure(tool: "contacts_create_or_update", input: ["identifier": .string(id)], title: "Edit " + title))
@@ -361,6 +365,7 @@ extension HerScreen {
            case .string(let expectedID)? = bound["expected_message_id"], !expectedID.isEmpty {
             if parts[2] != "delete", (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) != .string("inbox") { return nil }
             switch parts[2] {
+            case "draft": return .action(.perform(tool: "mail_draft", input: bound, title: "Draft: " + title, textField: "body", isEffect: true))
             case "reply": return .action(.perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true))
             case "archive": return .action(.perform(tool: "mail_archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true))
             case "mark-read": return .action(.perform(tool: "mail_mark_read", input: bound, title: "Mark read: " + title, textField: nil, isEffect: true))
@@ -404,6 +409,7 @@ extension HerScreen {
                 }
             }
             if let body = text(row["body"]) { lines += tabled(wrap(body, width: 100), row["body_tables"]) }
+            lines += mailAttachmentLines(row)
             if row["truncated"] == .bool(true), let end = row["body_end"], AgentWorkspaceReadiness.allows(tool: "mail_list_recent") {
                 lines.append("Body continues at " + (text(end) ?? "?"))
                 let bound = row.filter { ["message_id", "expected_message_id", "expected_account", "position", "scope"].contains($0.key) }
@@ -419,6 +425,16 @@ extension HerScreen {
     }
 
     // MARK: Home's mail line
+
+    private static func mailAttachmentLines(_ row: [String: JSONValue]) -> [String] {
+        guard case .array(let attachments)? = row["attachments"] else { return text(row["attachments_status"]).map { [$0] } ?? [] }
+        return attachments.compactMap {
+            guard case .object(let part) = $0 else { return nil }
+            return (text(part["index"]) ?? "?") + ": " + (text(part["filename"]) ?? "?")
+                + " · " + (text(part["content_type"]) ?? "?") + " · "
+                + (text(part["size"]).map { $0 + " bytes" } ?? "not downloaded")
+        }
+    }
 
     /// "mail 3 unread of 12 (4m ago)" from the last inbox read anyone made; bare "mail" before one.
     static func mailPulse(now: Date) -> String { HerMailStatus.shared.pulse(now: now) }

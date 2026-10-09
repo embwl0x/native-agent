@@ -58,6 +58,12 @@ public protocol ContextCompiledProjectionProvider: Sendable {
     /// Point-of-use policy exclusions, including sources in retained generations.
     var excludedSourceOwners: Set<String> { get }
 
+    /// Ephemeral sources must be reconciled at the turn boundary as well as
+    /// by push invalidation (expiry and registration/notification races).
+    var refreshesBeforeTurn: Bool { get }
+    func excludedAtomIDs(in generation: ContextStoredGeneration) async -> Set<ContextAtomID>
+    func didDeliver(_ items: [ContextPacketItem]) async
+
     func isInvalidated(by change: DerivedSourceChange) -> Bool
 
     func compiledProjection(
@@ -78,6 +84,9 @@ public extension ContextCompiledProjectionProvider {
     var invalidationNamespaces: Set<String> { [] }
     var invalidationSourceURL: URL? { nil }
     var excludedSourceOwners: Set<String> { [] }
+    var refreshesBeforeTurn: Bool { false }
+    func excludedAtomIDs(in generation: ContextStoredGeneration) async -> Set<ContextAtomID> { [] }
+    func didDeliver(_ items: [ContextPacketItem]) async {}
 
     func didPublish(
         _ result: ContextCompiledProjectionResult?,

@@ -45,25 +45,6 @@ typealias MacControlRunResult = MacControl.MacControlRunResult
 // app-owned Swift entry point.
 
 extension NativeClient {
-    // --- Context feedback ---------------------------------------------------
-    // Exact, payload-free feedback after validating the canonical transcript
-    // row. `dataRoot` is injectable so alternate runtimes and tests cannot
-    // leak ratings into Agent's personal root. Persona is deliberately not
-    // persisted: message/turn identity already supplies exact correlation.
-    func postContextFeedback(
-        messageId: String,
-        sessionId: String,
-        rating: String,
-        persona _: String,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async throws {
-        _ = try await OutcomeFeedbackStore(dataRoot: dataRoot).record(
-            sessionID: sessionId,
-            messageID: messageId,
-            rating: rating
-        )
-    }
-
     // --- Mac control --------------------------------------------------------
     // Zero-daemon Swift path: implemented MacControl actions execute in-process
     // behind the Swift TrustCenter-backed gate. Unknown/unimplemented actions

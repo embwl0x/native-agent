@@ -63,7 +63,7 @@ extension ApprovalChatCards {
                   NativeAgentChatSessionID.normalizedPathComponent(destination) == destination else { return .skipped }
             anchor = destination
         } catch {
-            NSLog("[approval-chat-card] mirror claim failed: %@", error.localizedDescription)
+            nativeLog("[approval-chat-card] mirror claim failed: %@", error.localizedDescription)
             return .failed
         }
         let ownerChat = telegram == nil || !reach.send ? nil : await ownerDM(boundTo: anchor, dataRoot: dataRoot)
@@ -90,7 +90,7 @@ extension ApprovalChatCards {
             if buttons, let ownerChat { completion["telegram_chat_id"] = .string(String(ownerChat)) }
             guard try await inbox.patch(id: noteID, unlessPresent: "chat_mirror_delivered", completion) else { return .skipped }
         } catch {
-            NSLog("[approval-chat-card] mirror write failed: %@", error.localizedDescription)
+            nativeLog("[approval-chat-card] mirror write failed: %@", error.localizedDescription)
             return .failed
         }
         if let telegram, let ownerChat, !quiet {
@@ -107,10 +107,13 @@ extension ApprovalChatCards {
                 ? "Choose the model in Providers on the Mac." : "Answer it on the Mac."
             let text = [title, why, buttons ? "" : guidance].filter { !$0.isEmpty }.joined(separator: "\n\n")
             do {
-                try await telegram.sendChatCard(text: text, chatId: ownerChat,
+                let messageId = try await telegram.sendChatCard(text: text, chatId: ownerChat,
                                                 markup: .object(["inline_keyboard": .array(keyboard)]))
+                // Kept so an answer on the Mac or phone can clear these buttons too.
+                _ = try? await inbox.patch(id: noteID, unlessPresent: "telegram_message_id",
+                    ["telegram_message_id": .string(String(messageId)), "telegram_card_title": .string(title)])
             } catch {
-                NSLog("[approval-chat-card] Telegram card failed: %@", error.localizedDescription)
+                nativeLog("[approval-chat-card] Telegram card failed: %@", error.localizedDescription)
             }
         }
         return .posted(anchor)
@@ -134,6 +137,43 @@ extension ApprovalChatCards {
                   return row["id"] == .string("interaction:\(id)")
               }) else { return nil }
         return note
+    }
+
+    /// The running Telegram filer, set by the app when Telegram starts.
+    nonisolated(unsafe) private static var telegramFiler: TelegramApprovalFiler?
+    private static let telegramFilerLock = NSLock()
+    public static func useTelegram(_ filer: TelegramApprovalFiler?) { telegramFilerLock.withLock { telegramFiler = filer } }
+
+    /// Once a mirrored card is settled (answered on any surface, withdrawn or
+    /// expired), its Telegram copy's buttons go away and it says how it ended.
+    static func settleTelegramCopy(id: String, sessionID: String, dataRoot: URL) async {
+        guard let note = await mirrorNote(id, dataRoot: dataRoot),
+              note["telegram_card_settled"] != .bool(true),
+              case .string(let chat)? = note["telegram_chat_id"], let chatId = Int(chat),
+              case .string(let message)? = note["telegram_message_id"], let messageId = Int(message),
+              let filer = telegramFilerLock.withLock({ telegramFiler }),
+              let card = await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+              !card.state.isOpen else { return }
+        let title: String = if case .string(let saved)? = note["telegram_card_title"] { saved } else { NativeAppSecretRedactor.redactText(card.title) }
+        let summary = card.state.outcome?.summary.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let text = title + "\n\n✓ " + (summary.isEmpty ? "Answered." : NativeAppSecretRedactor.redactText(summary))
+        do {
+            try await filer.settleChatCard(chatId: chatId, messageId: messageId, text: text)
+            let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+            _ = try? await inbox.patch(id: "interaction:\(id)", unlessPresent: "telegram_card_settled", ["telegram_card_settled": .bool(true)])
+        } catch {
+            nativeLog("[approval-chat-card] Telegram settle failed: %@", error.localizedDescription)
+        }
+    }
+
+    static func publishInteractionChange(id: String, sessionID: String, dataRoot: URL) async {
+        await settleTelegramCopy(id: id, sessionID: sessionID, dataRoot: dataRoot)
+        var sessions: Set<String> = [sessionID]
+        if case .string(let mirror)? = await mirrorNote(id, dataRoot: dataRoot)?["chat_session_id"],
+           NativeAgentChatSessionID.normalizedPathComponent(mirror) == mirror {
+            sessions.insert(mirror)
+        }
+        await publishTranscriptChanges(sessionIDs: sessions, dataRoot: dataRoot)
     }
 
     /// A tap on a mirrored card's Telegram button: only the owner, in his own

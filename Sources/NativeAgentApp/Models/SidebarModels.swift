@@ -196,7 +196,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     var shellPageSubtitle: String? {
         switch normalized {
         case .providers: "I think with the model accounts you connect here."
-        case .capabilities: "This is what I can do, what's installed, and what needs a look."
+        case .capabilities: "This is what I can do and what's installed."
         case .inboxPolicy: "I decide here what to bring you and what to keep quiet."
         case .bots: "I run small jobs on my own here, on a schedule you set."
         case .trust: "This is what I'm allowed to do on this Mac without asking you first."

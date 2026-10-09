@@ -141,7 +141,10 @@ extension MacSyncEngine {
         guard isActive, workActivityPublicationTask == nil else { return }
         let generation = snapshotLifecycleGeneration
         workActivityPublicationTask = Task {
-            defer { if generation == snapshotLifecycleGeneration { workActivityPublicationTask = nil } }
+            defer {
+                workActivityPublicationTask = nil
+                if generation != snapshotLifecycleGeneration { requestWorkActivityPublication() }
+            }
             do {
                 try await Task.sleep(for: .milliseconds(500))
                 var publishedVersion: UInt64

@@ -26,7 +26,11 @@ extension TurnEngineError: ProviderFailureWrapping {
 }
 
 extension ProviderRecoveryPolicy {
-    public static func isRecoverableTurnFailure(_ error: Error) -> Bool {
-        isRecoverable(error)
+    /// `replays`: the retry would re-issue the identical request, which is
+    /// refused after an admitted request was cut without the provider saying
+    /// no. A continuation after prose the person watched asks for what
+    /// follows instead.
+    public static func isRecoverableTurnFailure(_ error: Error, replays: Bool) -> Bool {
+        isRecoverable(error) && !(replays && ProviderFailure.forbidsResend(error))
     }
 }

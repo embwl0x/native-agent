@@ -97,7 +97,7 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
         loadEntries: (@Sendable () async throws -> [StudioJournalEntry])? = nil,
         loadCanon: (@Sendable () async throws -> [StudioCanonMember])? = nil,
         loadShelfSlots: (@Sendable () throws -> [StudioWorkingShelf.Slot])? = nil,
-        diagnostics: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }
+        diagnostics: @escaping @Sendable (String) -> Void = { nativeLog("%@", $0) }
     ) {
         let store = SwiftNativeStudioStore(dataRoot: dataRoot)
         self.invalidationSourceURL = store.journalPath.standardizedFileURL

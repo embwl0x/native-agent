@@ -1,5 +1,6 @@
 import NativeAgentCore
 import PersistenceCore
+import Foundation
 
 /// Optional argument validation owned by the executor. Implementations must use
 /// their execution parser, perform no I/O or permission requests, and return the
@@ -79,10 +80,12 @@ public protocol MacIntegrationToolBridge: Sendable {
 
     /// List recent messages from Apple Mail's primary inbox. Read.
     func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue
+    func mailAttachment(input: [String: JSONValue]) async throws -> (filename: String, data: Data)
     func mailReadBatch(input: [String: JSONValue]) async throws -> JSONValue
     func mailTriageBatch(input: [String: JSONValue]) async throws -> JSONValue
     /// Search Apple Mail across mailboxes. Read.
     func mailSearch(input: [String: JSONValue]) async throws -> JSONValue
+    func mailSenders(input: [String: JSONValue]) async throws -> JSONValue
     /// Compose and send an email through Apple Mail. Write.
     func mailSend(input: [String: JSONValue]) async throws -> JSONValue
 
@@ -120,6 +123,8 @@ public protocol MacIntegrationToolBridge: Sendable {
     func calendarDeleteEvent(input: [String: JSONValue]) async throws -> JSONValue
     /// Create a new EKReminder in the user's Reminders. Write.
     func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue
+    func remindersListRename(input: [String: JSONValue]) async throws -> JSONValue
+    func remindersListCreate(input: [String: JSONValue]) async throws -> JSONValue
     /// Mark an EKReminder complete by EKReminder.calendarItemIdentifier. Write.
     func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue
     func remindersDelete(input: [String: JSONValue]) async throws -> JSONValue
@@ -133,10 +138,11 @@ public protocol MacIntegrationToolBridge: Sendable {
     func mailDelete(input: [String: JSONValue]) async throws -> JSONValue
     /// Reply to a Mail message. Write.
     func mailReply(input: [String: JSONValue]) async throws -> JSONValue
+    func mailDraft(input: [String: JSONValue]) async throws -> JSONValue
 
     // Notes update (AppleScript-backed)
-    /// Update an existing Apple Note — set body, append, or rename. Write.
-    func notesUpdate(input: [String: JSONValue]) async throws -> JSONValue
+    /// Update or move an exact Apple Note to Recently Deleted. Write.
+    func notesModify(input: [String: JSONValue], deleting: Bool) async throws -> JSONValue
 
     // Music library (read)
     /// Search the user's Apple Music library (track/artist/album). Read.

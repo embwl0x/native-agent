@@ -184,7 +184,7 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
     ...(metadata.completion ? { completion: metadata.completion } : {}),
   });
 
-  return postWakeCompletion(http, { host, port, path: "/codex/message", timeout: timeoutMs }, token, body, sessionId);
+  return postWakeCompletion(http, { host, port, path: "/codex/message", timeout: timeoutMs }, token, body, sessionId, true);
 }
 
 // Transport-level (not semantic) failures of the delivery POST. These say
@@ -267,7 +267,7 @@ async function postBridgeMessageWithRetry(post, options = {}) {
 //   "retain"   — retryable/unknown failure; leave it for the recovery scan.
 function replyJobDisposition(bridge) {
   if (!bridge) return "retain";
-  if (bridge.status === "delivered" || bridge.status === "dry_run") return "unlink";
+  if (bridge.replyPersisted === true || bridge.status === "delivered" || bridge.status === "dry_run") return "unlink";
   if (!isTerminalBridgeReply(bridge)) return "retain";
   return bridge.replyStatus === "outcome_unknown" || bridge.replyStatus === "conflict"
     ? "preserve"
@@ -279,9 +279,9 @@ function replyJobDisposition(bridge) {
 // because the later NativeAgent handoff was ambiguous or temporarily failed.
 function persistReplyJobDeliveryState(jobPath, job, bridge) {
   const disposition = replyJobDisposition(bridge);
-  const outcome = bridge && (bridge.status === "delivered" || bridge.status === "dry_run")
+  const outcome = bridge && (bridge.replyPersisted === true || bridge.status === "delivered" || bridge.status === "dry_run")
     ? "delivered"
-    : (disposition === "preserve" ? "unknown" : null);
+    : ((bridge && bridge.status === "unknown") || disposition === "preserve" ? "unknown" : null);
   job.phase = outcome === "delivered"
     ? "settled"
     : (outcome === "unknown" ? "delivery_unknown" : "delivery_pending");

@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import CognitiveSubstrate
+import ChatTurnContracts
 
 // MARK: - AdaptiveMemoryPromoter
 //
@@ -42,12 +43,15 @@ public struct AdaptiveExtractionReport: Sendable {
     public let candidates: [AdaptiveCandidate]
     public let semanticStatus: MemorySemanticExtractionStatus
     public let semanticCandidateCount: Int
+    public let failure: AfterTurnMemoryFailure?
+    public var interpretationFailure: AfterTurnInterpretationFailure? { failure?.interpretationFailure }
 
     public init(candidates: [AdaptiveCandidate], semanticStatus: MemorySemanticExtractionStatus,
-                semanticCandidateCount: Int = 0) {
+                semanticCandidateCount: Int = 0, failure: AfterTurnMemoryFailure? = nil) {
         self.candidates = candidates
         self.semanticStatus = semanticStatus
         self.semanticCandidateCount = max(0, semanticCandidateCount)
+        self.failure = failure
     }
 }
 
@@ -240,11 +244,13 @@ public actor AdaptiveMemoryPromoter {
         assistantMessage: String,
         toolEvidence: [String] = [],
         sessionId: String,
-        surface: String = "chat"
+        surface: String = "chat",
+        standingAgentName: String? = nil,
+        turnId: String? = nil
     ) async -> [ProposalRecord] {
         await observeTurnWithReport(userMessage: userMessage, assistantMessage: assistantMessage,
                                     toolEvidence: toolEvidence, sessionId: sessionId,
-                                    surface: surface).proposals
+                                    surface: surface, standingAgentName: standingAgentName, turnId: turnId).proposals
     }
 
     public func observeTurnWithReport(
@@ -252,7 +258,9 @@ public actor AdaptiveMemoryPromoter {
         assistantMessage: String,
         toolEvidence: [String] = [],
         sessionId: String,
-        surface: String = "chat"
+        surface: String = "chat",
+        standingAgentName: String? = nil,
+        turnId: String? = nil
     ) async -> AdaptiveMemoryObservation {
         let origin = AfterTurnSource.origin
         let previous = observationTail
@@ -260,7 +268,8 @@ public actor AdaptiveMemoryPromoter {
             _ = await previous?.value
             return await self.interpretAndObserve(userMessage: userMessage,
                 assistantMessage: assistantMessage,
-                sessionId: sessionId, surface: surface, origin: origin)
+                sessionId: sessionId, surface: surface, origin: origin,
+                standingAgentName: standingAgentName, turnId: turnId ?? origin?.runId)
         }
         observationTail = operation
         return await withTaskCancellationHandler {
@@ -278,50 +287,43 @@ public actor AdaptiveMemoryPromoter {
         finishInterpretation = finish
     }
 
+    public func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String? = nil, topK: Int? = nil) async throws -> Set<String> {
+        guard let memoryManager else {
+            throw MemoryV2Error.underlying("Recall relevance is unavailable. Configure the selected memory model in Settings, then retry this query.")
+        }
+        switch await memoryManager.relevantRecallIDs(query: query, candidates: candidates, generation: generation, topK: topK) {
+        case .success(let ids): return ids
+        case .failure(let failure):
+            throw MemoryV2Error.underlying("Recall relevance could not be checked (\(failure.reason.rawValue)). \(failure.recovery) Nothing was returned as a memory answer.")
+        }
+    }
+
     private func interpretAndObserve(userMessage: String, assistantMessage: String,
                                      sessionId: String,
-                                     surface: String, origin: AfterTurnOrigin?) async -> AdaptiveMemoryObservation {
+                                     surface: String, origin: AfterTurnOrigin?,
+                                     standingAgentName: String?, turnId: String?) async -> AdaptiveMemoryObservation {
         let skipped = AdaptiveMemoryObservation(proposals: [], extraction: .init(
             candidates: [], semanticStatus: .skipped
         ))
         guard !Task.isCancelled, let memory else { return skipped }
-        // A bot's session has the agent's own brief in the user seat: no person
-        // is there, nothing happens "between them", and its brief recurring on
-        // every run minted "user values ..." about User (2026-09-10).
-        if sessionId.hasPrefix("bot-") { return skipped }
-        // 2026-08-14 proposal-hygiene fix: on bridge sessions the "user" seat
-        // is another AGENT (claude/codex/wake runners), machine-tagged with
-        // the "[from: <sender>, via bridge]" prefix that ClaudeBridge/
-        // codex-bridge affix at their single entry points. Extracting "user
-        // ..." facts from agent shop-talk minted proposals like "user is a
-        // language model" about the human. Agent-seat turns never extract.
-        //
-        // Sweep item 35 EXTENDS this guard to the tool-evidence lane: an agent
-        // driving her over the bridge runs tools too, and its file reads are
-        // that agent's errand, not User's environment. One early return covers
-        // BOTH lanes — evidence is only read below this line, never above it.
-        //
-        // MOMENTS ARE THE EXCEPTION, and deliberately so. A peer driving her
-        // over the bridge states no facts ABOUT User, but something can still
-        // happen between them — so the moment pass runs on both seats, tagged
-        // `author: "peer"` when the seat was an agent. It runs BEFORE the fact
-        // guard's early return for exactly that reason.
-        // 2026-09-11, User: "her having her memory with you is kind of
-        // important." The blanket skip above was the regex era's fix; the memory
-        // manager is a model that is TOLD who is speaking, so a bridge turn now
-        // runs both lanes with the sender named (Claude, Codex, …) — a memory
-        // it mints says "Claude …", never "user …" and never User.
+        // Source determines attribution, never whether the memory judge runs.
+        let standingAgent = standingAgentName != nil
         let peerSeat = Self.isAgentSeatUserMessage(userMessage)
-        let peerSpeaker = peerSeat ? Self.bridgeSender(userMessage) : nil
-        let momentAuthor = MemoryMoments.authorTag(forUserMessage: userMessage)
+        let peerSpeaker = standingAgent ? (standingAgentName ?? "standing agent")
+            : (peerSeat ? Self.bridgeSender(userMessage) : nil)
         let hasReply = !assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let requestedMoments = hasReply && (momentsEnabled?() ?? true)
+        let requestedFacts = hasReply && (adaptivePromotionEnabled?() ?? true)
+        // Give yesterday's quota-deferred exchanges their turn before spending
+        // today's slots on new arrivals. Completed facts are never replayed.
+        if requestedMoments { await askHeldMoments(memory: memory, quotaDeferredOnly: true) }
         let reservedMoment = requestedMoments ? await reserveMomentSlot(memory: memory, now: Date()) : false
         lastMomentOutcome = requestedMoments ? (reservedMoment ? "unreported" : "capped") : "disabled"
         let managerResult = await runMemoryManager(
             speaker: peerSpeaker, memory: memory, userMessage: userMessage,
             assistantMessage: assistantMessage, sessionId: sessionId, surface: surface,
-            momentsAllowed: reservedMoment, origin: origin)
+            momentsAllowed: reservedMoment, origin: origin, standingAgent: standingAgent, factsAllowed: requestedFacts)
+        let momentAuthor = standingAgent || managerResult.peerAuthority ? "peer" : "user"
         let momentProposal = await stageMomentIfAny(
             memory: memory,
             userMessage: userMessage,
@@ -334,39 +336,45 @@ public actor AdaptiveMemoryPromoter {
             friction: AfterTurnNoveltyGate.frictionSignal(
                 userMessage: userMessage, assistantMessage: assistantMessage)
                 ?? (managerResult.savedCorrectionCount + managerResult.pendingCorrectionCount > 0
-                    ? "correction" : nil)
+                    ? "correction" : nil),
+            origin: origin, turnId: turnId
         )
         // THE DECLINE LEAVES A RECEIPT (Astra comb 3, lane2 finding 9,
         // 2026-09-12). `lastMomentOutcome` used to reach only the turn's
         // `memory.promotion` stage, so a missing moment had no explanation
         // anywhere the moment the stage itself went missing.
         if managerResult.noveltySkipReason != nil { lastMomentOutcome = "noveltySkipped" }
+        // Preserve every requested lane even when the moment quota was full.
+        if !Task.isCancelled, requestedFacts || requestedMoments,
+           managerResult.noveltySkipReason == nil,
+           managerResult.report.failure != nil || managerResult.stagingFailed || (requestedMoments && !reservedMoment) {
+            lastMomentOutcome = holdMoment(HeldMoment(sessionId: sessionId, surface: surface, user: userMessage,
+                asked: origin?.userMessage ?? userMessage, assistant: assistantMessage,
+                turnId: turnId, runId: origin?.runId, messageId: origin?.messageId, occurredAt: origin?.occurredAt,
+                speaker: peerSpeaker, standingAgent: standingAgent,
+                factsEnabled: requestedFacts && (!managerResult.factsProcessed || managerResult.stagingFailed),
+                momentsEnabled: requestedMoments && (managerResult.report.failure != nil || !reservedMoment
+                    || lastMomentOutcome == "failed"), failure: managerResult.report.failure,
+                humanName: managerResult.humanName, peerAuthority: managerResult.peerAuthority,
+                momentDeferredDay: requestedMoments && !reservedMoment ? MemoryMoments.dayKey(Date()) : nil,
+                envelope: TurnEnvelope.current(surface: surface).persistedMetadata(),
+                sourceCheckpoint: MemoryDataProvenance.sources(in: MemoryDataProvenance.stamping(nil)),
+                elevatedSources: PeerDataTaint.current?.elevatedSources ?? []))
+        }
         await MemoryMoments.recordOutcomeReceipt(
             outcome: lastMomentOutcome,
             sessionId: sessionId,
             surface: surface,
             author: momentAuthor,
             slotsSpentToday: slotsSpentTodayIfKnown(),
-            stagedProposalId: momentProposal?.id
+            stagedProposalId: momentProposal?.id,
+            turnId: turnId, occurredAt: origin?.occurredAt, failure: managerResult.report.failure
         )
-        // Settings ▸ "Memories that recur become facts": off stops the FACT
-        // lane right here — no extraction, no recurrence tracking, no staging.
-        // Read fresh per turn. The moments lane ran above under its OWN switch
-        // and is deliberately untouched by this one.
-        if let adaptivePromotionEnabled, !adaptivePromotionEnabled() {
-            var observation = AdaptiveMemoryObservation(
-                proposals: momentProposal.map { [$0] } ?? [],
-                extraction: .init(candidates: [], semanticStatus: .skipped),
-                momentOutcome: lastMomentOutcome
-            )
-            observation.noveltySkipReason = managerResult.noveltySkipReason
-            return observation
-        }
-        var staged: [ProposalRecord] = momentProposal.map { [$0] } ?? []
-        staged.append(contentsOf: managerResult.proposals)
+        let staged = (momentProposal.map { [$0] } ?? []) + managerResult.proposals
         var observation = AdaptiveMemoryObservation(
             proposals: staged,
-            extraction: managerResult.report,
+            extraction: adaptivePromotionEnabled?() == false && managerResult.report.failure == nil
+                ? .init(candidates: [], semanticStatus: .skipped) : managerResult.report,
             momentOutcome: lastMomentOutcome,
             hygieneRejectedCount: managerResult.rejectedCount,
             savedCorrectionCount: managerResult.savedCorrectionCount,
@@ -374,7 +382,158 @@ public actor AdaptiveMemoryPromoter {
             failedCorrectionCount: managerResult.failedCorrectionCount
         )
         observation.noveltySkipReason = managerResult.noveltySkipReason
+        // It answered: the same model is back, so what waited is asked now.
+        if managerResult.report.semanticStatus == .succeeded { await askHeldMoments(memory: memory) }
         return observation
+    }
+
+    // MARK: - Held moments
+
+    /// A turn whose enabled memory opportunities the model could not judge.
+    struct HeldMoment: Codable {
+        var at = Date()
+        let sessionId, surface, user, asked, assistant: String
+        var turnId, runId, messageId: String?
+        var occurredAt: Date?
+        var speaker: String?
+        var standingAgent, factsEnabled, momentsEnabled: Bool?
+        var failure: AfterTurnMemoryFailure?
+        var humanName: String?
+        var peerAuthority: Bool?
+        var momentDeferredDay: String?
+        var envelope: JSONValue?
+        var sourceCheckpoint, elevatedSources: [String]?
+
+        var origin: AfterTurnOrigin? {
+            guard let messageId else { return nil }
+            return AfterTurnOrigin(sessionId: sessionId, runId: runId, messageId: messageId,
+                                   occurredAt: occurredAt, userMessage: asked)
+        }
+    }
+
+    /// Held turns wait durably in `memory/moments_held.json` for the configured
+    /// memory model, without discarding opportunities during an outage.
+    static func heldPath(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> URL {
+        dataRoot.appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("moments_held.json")
+    }
+
+    static func readHeld(dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> [HeldMoment] {
+        let path = heldPath(dataRoot: dataRoot)
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        return try JSONDecoder().decode([HeldMoment].self, from: Data(contentsOf: path))
+    }
+
+    private func heldMoments() -> [HeldMoment]? {
+        do { return try Self.readHeld() }
+        catch {
+            nativeLog("MemoryV2: held turns unreadable; preserved without mutation: %@", String(describing: error))
+            return nil
+        }
+    }
+
+    private func writeHeld(_ held: [HeldMoment]) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: Self.heldPath().deletingLastPathComponent(), withIntermediateDirectories: true)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(held), to: Self.heldPath())
+            return true
+        } catch {
+            nativeLog("MemoryV2 moments: held turns not written: %@", String(describing: error))
+            return false
+        }
+    }
+
+    /// The receipt word: "held" once it is on disk, and the failure's own
+    /// word when it could not be written.
+    private func holdMoment(_ turn: HeldMoment) -> String {
+        guard let held = heldMoments() else { return MomentExtractionOutcome.failed.receiptOutcome }
+        if let turnId = turn.turnId, held.contains(where: { $0.sessionId == turn.sessionId && $0.turnId == turnId }) { return "held" }
+        return writeHeld(held + [turn]) ? "held" : MomentExtractionOutcome.failed.receiptOutcome
+    }
+
+    /// Reconsider held turns through the same manager and proposal gates.
+    /// Disabled lanes stay held. Recovery never replays tools or doses affect.
+    private func askHeldMoments(memory: SwiftNativeMemoryV2, quotaDeferredOnly: Bool = false) async {
+        guard memoryManager != nil, var held = heldMoments(), !held.isEmpty else { return }
+        let today = MemoryMoments.dayKey(Date())
+        let batch = held.filter { !quotaDeferredOnly || ($0.momentDeferredDay != nil && $0.momentDeferredDay != today) }
+        var reconsidered = 0
+        for pending in batch {
+            // At most one recovery interpretation before and one after a new
+            // exchange. A busy day's backlog never becomes a provider burst.
+            guard !Task.isCancelled, reconsidered < 1 else { return }
+            guard let position = held.firstIndex(where: {
+                $0.sessionId == pending.sessionId && $0.at == pending.at && $0.turnId == pending.turnId
+            }) else { continue }
+            var turn = held[position]
+            let facts = (turn.factsEnabled ?? false) && (adaptivePromotionEnabled?() ?? true)
+            let wantsMoment = (turn.momentsEnabled ?? true) && (momentsEnabled?() ?? true)
+                && turn.momentDeferredDay != today
+            let reserved = wantsMoment ? await reserveMomentSlot(memory: memory, now: Date()) : false
+            if wantsMoment && !reserved {
+                turn.momentDeferredDay = today
+                held[position] = turn
+                guard writeHeld(held) else { return }
+            }
+            guard facts || reserved else { continue }
+            reconsidered += 1
+            let isStandingAgent = turn.standingAgent == true
+            let speaker = turn.speaker ?? (isStandingAgent ? "standing agent"
+                : (Self.isAgentSeatUserMessage(turn.user) ? Self.bridgeSender(turn.user) : nil))
+            let checkpoint = PeerDataTaint(restoring: turn.sourceCheckpoint ?? ["untrusted stored content"],
+                                           elevated: turn.elevatedSources ?? [])
+            let (result, proposal) = await PeerDataTaint.$current.withValue(checkpoint) {
+                await ChatToolSessionContext.$envelope.withValue(TurnEnvelope.fromPersistedMetadata(turn.envelope)) {
+                    let result = await runMemoryManager(speaker: speaker, memory: memory,
+                        userMessage: turn.asked, assistantMessage: turn.assistant, sessionId: turn.sessionId,
+                        surface: turn.surface, momentsAllowed: reserved, origin: turn.origin,
+                        standingAgent: isStandingAgent,
+                        factsAllowed: facts, recovery: true, humanName: turn.humanName, peerAuthority: turn.peerAuthority)
+                    var proposal: ProposalRecord?
+                    if result.report.semanticStatus == .succeeded, !Task.isCancelled {
+                        lastMomentOutcome = reserved ? "unreported" : "disabled"
+                        proposal = await stageMomentIfAny(
+                            memory: memory, userMessage: turn.user, assistantMessage: turn.assistant,
+                            sessionId: turn.sessionId, surface: turn.surface,
+                            author: isStandingAgent || result.peerAuthority ? "peer" : "user",
+                            outcome: result.moment, reserved: reserved,
+                            friction: AfterTurnNoveltyGate.frictionSignal(userMessage: turn.user, assistantMessage: turn.assistant),
+                            origin: turn.origin, turnId: turn.turnId)
+                    }
+                    return (result, proposal)
+                }
+            }
+            let author = isStandingAgent || result.peerAuthority ? "peer" : "user"
+            if let failure = result.report.failure {
+                if reserved { releaseMomentSlot() }
+                turn.failure = failure
+                held.remove(at: position)
+                held.append(turn)
+                guard writeHeld(held) else { return }
+                continue
+            }
+            guard !Task.isCancelled else {
+                if reserved { releaseMomentSlot() }
+                return
+            }
+            guard result.report.semanticStatus == .succeeded else {
+                if reserved { releaseMomentSlot() }
+                continue
+            }
+            if result.factsProcessed && !result.stagingFailed { turn.factsEnabled = false }
+            if reserved && !["failed", "cancelled", "disabled"].contains(lastMomentOutcome) { turn.momentsEnabled = false }
+            if turn.factsEnabled != true && turn.momentsEnabled == false { held.remove(at: position) }
+            else {
+                held.remove(at: position)
+                held.append(turn)
+            }
+            guard writeHeld(held) else { return }
+            await MemoryMoments.recordOutcomeReceipt(
+                outcome: lastMomentOutcome == "disabled" ? "reconsidered" : lastMomentOutcome,
+                sessionId: turn.sessionId, surface: turn.surface, author: author,
+                slotsSpentToday: slotsSpentTodayIfKnown(), stagedProposalId: proposal?.id,
+                turnId: turn.turnId, occurredAt: turn.occurredAt)
+        }
     }
 
     // MARK: - The fact lane: the memory manager
@@ -388,6 +547,10 @@ public actor AdaptiveMemoryPromoter {
         var savedCorrectionCount = 0
         var pendingCorrectionCount = 0
         var failedCorrectionCount = 0
+        var stagingFailed = false
+        var factsProcessed = false
+        var peerAuthority = false
+        var humanName: String?
     }
 
     /// One manager pass over one turn.
@@ -405,7 +568,12 @@ public actor AdaptiveMemoryPromoter {
         sessionId: String,
         surface: String,
         momentsAllowed: Bool,
-        origin: AfterTurnOrigin?
+        origin: AfterTurnOrigin?,
+        standingAgent: Bool = false,
+        factsAllowed: Bool = true,
+        recovery: Bool = false,
+        humanName: String? = nil,
+        peerAuthority: Bool? = nil
     ) async -> MemoryManagerOutcome {
         func empty(_ status: MemorySemanticExtractionStatus) -> MemoryManagerOutcome {
             MemoryManagerOutcome(
@@ -423,17 +591,19 @@ public actor AdaptiveMemoryPromoter {
         // What is already known about this exchange. `recordingUsage: false`:
         // reading the store to decide what to keep is not the agent USING a
         // memory, and use_count is the signal that vetoes eviction.
-        let factsEnabled = !assistant.isEmpty && (adaptivePromotionEnabled?() ?? true)
+        let factsEnabled = factsAllowed && !assistant.isEmpty && (adaptivePromotionEnabled?() ?? true)
         let keepsMoments = momentsAllowed
         let context: AfterTurnContext?
-        if let origin, origin.sessionId == sessionId {
+        if !recovery, let origin, origin.sessionId == sessionId {
             context = await prepareInterpretation?(origin)
         } else { context = nil }
+        let isPeer = peerAuthority ?? (speaker != nil || context?.event.sourceClass == .imported)
+        let originalHumanName = humanName ?? personName?()
         guard factsEnabled || keepsMoments || context != nil else { return empty(.skipped) }
         // Phase 5A: nothing new worth keeping → no model call. The deferred
         // affect turn still closes, exactly as a failed call closes it.
         let priorUserTurns = context?.caring?.context.filter { $0.speaker == .person }.map(\.text) ?? []
-        if let reason = AfterTurnNoveltyGate.skipReason(userMessage: user, priorUserTurns: priorUserTurns) {
+        if !recovery, let reason = AfterTurnNoveltyGate.skipReason(userMessage: user, priorUserTurns: priorUserTurns) {
             if let context { await finishInterpretation?(context, nil, true) }
             var skipped = empty(.skipped)
             skipped.noveltySkipReason = reason
@@ -481,22 +651,59 @@ public actor AdaptiveMemoryPromoter {
         let pendingPrompt: [String] = pendingRows.map { "[\($0.id)] \($0.content)" }
         let pending: [String] = pendingRows.map(\.content)
 
-        let interpretation = await memoryManager.interpret(MemoryManagerRequest(
-            userMessage: user,
-            assistantMessage: assistant,
-            existing: existing,
-            pending: pendingPrompt,
-            personName: speaker ?? personName?()
-        ), context: context, factsEnabled: factsEnabled, momentsEnabled: keepsMoments)
+        let interpretation: AfterTurnInterpretation?
+        do {
+            interpretation = try await memoryManager.interpret(MemoryManagerRequest(
+                userMessage: user,
+                assistantMessage: assistant,
+                existing: existing,
+                pending: pendingPrompt,
+                personName: speaker ?? originalHumanName, standingAgent: standingAgent
+            ), context: context, factsEnabled: factsEnabled, momentsEnabled: keepsMoments)
+        } catch {
+            if let context { await finishInterpretation?(context, nil, false) }
+            let reason: AfterTurnMemoryFailure.Reason
+            if Task.isCancelled || error is CancellationError { reason = .cancelled }
+            else {
+                switch error as? AfterTurnInterpretationFailure {
+                case .authentication: reason = .authExpired
+                case .deadline: reason = .deadline
+                case .cancellation: reason = .cancelled
+                case .envelope: reason = .invalidJSON
+                case .caring: reason = .invalidCaring
+                case .affect: reason = .invalidAffect
+                case .memories: reason = .invalidMemories
+                case .moment: reason = .invalidMoment
+                default: reason = .provider
+                }
+            }
+            let failure = (error as? AfterTurnMemoryFailure) ?? AfterTurnMemoryFailure(
+                reason: reason,
+                recovery: "Check the selected memory model in Settings; held turns are reconsidered after its next successful answer.",
+                model: nil, surface: surface)
+            return MemoryManagerOutcome(proposals: [], report: .init(candidates: [],
+                semanticStatus: failure.reason == .deadline ? .timedOut : .failed, failure: failure),
+                rejectedCount: 0, moment: failure.reason == .cancelled ? .cancelled : .failed,
+                peerAuthority: isPeer, humanName: originalHumanName)
+        }
         if let context { await finishInterpretation?(context, Task.isCancelled ? nil : interpretation, false) }
-        guard !Task.isCancelled, let interpretation else { return empty(.failed) }
-        let decisions = factsEnabled && (adaptivePromotionEnabled?() ?? true) ? interpretation.memories : []
+        guard !Task.isCancelled, let interpretation else {
+            let failure = AfterTurnMemoryFailure(reason: Task.isCancelled ? .cancelled : .missingSections,
+                recovery: "Check the selected memory model in Settings; held turns are reconsidered after its next successful answer.",
+                model: nil, surface: surface)
+            return MemoryManagerOutcome(proposals: [], report: .init(candidates: [],
+                semanticStatus: .failed, failure: failure), rejectedCount: 0,
+                moment: Task.isCancelled ? .cancelled : .failed, peerAuthority: isPeer, humanName: originalHumanName)
+        }
+        let factsProcessed = factsEnabled && (adaptivePromotionEnabled?() ?? true)
+        let decisions = factsProcessed ? interpretation.memories : []
 
         var staged: [ProposalRecord] = []
         var accepted: [AdaptiveCandidate] = []
         var rejected = 0
         var pendingCorrections = 0
         var failedCorrections = 0
+        var stagingFailed = false
         // Everything the statement must not merely repeat: what is kept, what is
         // pending, and what this same pass already minted this turn.
         var comparisons = existing.map(\.content) + pending
@@ -517,7 +724,7 @@ public actor AdaptiveMemoryPromoter {
             if isCorrection, origin?.occurredAt == nil || origin?.sessionId != sessionId {
                 rejected += 1
                 failedCorrections += 1
-                NSLog("MemoryV2: standing correction not saved: originating turn timestamp unavailable")
+                nativeLog("MemoryV2: standing correction not saved: originating turn timestamp unavailable")
                 continue
             }
             if isCorrection, let updateTarget,
@@ -534,13 +741,13 @@ public actor AdaptiveMemoryPromoter {
                       let sourceDate = origin?.occurredAt, priorDate <= sourceDate else {
                     rejected += 1
                     failedCorrections += 1
-                    NSLog("MemoryV2: standing correction not saved: pending rule chronology or subject unavailable or newer")
+                    nativeLog("MemoryV2: standing correction not saved: pending rule chronology or subject unavailable or newer")
                     continue
                 }
             }
             let refusal = isCorrection
                 ? MemoryManagerLane.correctionRejectionReason(decision, userMessage: user,
-                    isPeer: speaker != nil || context?.event.sourceClass == .imported, personName: personName?())
+                    isPeer: isPeer, personName: originalHumanName)
                 : MemoryManagerLane.statementRejectionReason(decision.statement, userMessage: user, assistantMessage: assistant)
             if refusal != nil {
                 rejected += 1
@@ -598,8 +805,7 @@ public actor AdaptiveMemoryPromoter {
                     pendingCorrections += 1
                 }
             } catch {
-                // Best-effort: staging is a side-channel, never the turn path.
-                rejected += 1
+                stagingFailed = true
                 if isCorrection { failedCorrections += 1 }
                 continue
             }
@@ -615,7 +821,11 @@ public actor AdaptiveMemoryPromoter {
             moment: interpretation.moment.map(MomentExtractionOutcome.candidate) ?? .abstained,
             savedCorrectionCount: 0,
             pendingCorrectionCount: pendingCorrections,
-            failedCorrectionCount: failedCorrections
+            failedCorrectionCount: failedCorrections,
+            stagingFailed: stagingFailed,
+            factsProcessed: factsProcessed,
+            peerAuthority: isPeer,
+            humanName: originalHumanName
         )
     }
 
@@ -669,6 +879,8 @@ public actor AdaptiveMemoryPromoter {
         outcome: MomentExtractionOutcome,
         reserved: Bool,
         friction: String? = nil,
+        origin: AfterTurnOrigin? = nil,
+        turnId: String? = nil,
         now: Date = Date()
     ) async -> ProposalRecord? {
         guard reserved else { return nil }
@@ -747,6 +959,8 @@ public actor AdaptiveMemoryPromoter {
                     surface: surface,
                     author: author
                 ).merging(friction.map { ["friction": .string($0)] } ?? [:]) { current, _ in current }
+                    .merging((origin?.occurredAt).map { ["observed_at": .string($0.ISO8601Format())] } ?? [:]) { current, _ in current }
+                    .merging(turnId.map { ["turn_id": .string($0)] } ?? [:]) { current, _ in current }
             )
             // Kept whatever the dedup path did with it: a re-staged moment
             // still consumed a model call and a day slot.

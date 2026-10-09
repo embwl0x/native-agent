@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 
 public struct ProviderStreamGuardConfig: Sendable, Equatable {
     public var idleTimeout: TimeInterval
@@ -31,10 +32,6 @@ public struct ProviderStreamGuardConfig: Sendable, Equatable {
         self.idleTimeout = Self.bounded(idleTimeout, floor: 0)
         self.wallTimeout = Self.bounded(wallTimeout, floor: 0)
         self.checkInterval = Self.bounded(checkInterval, floor: 0.01)
-    }
-
-    public var isEnabled: Bool {
-        idleTimeout > 0 || wallTimeout > 0
     }
 
     public static func fromEnvironment(
@@ -86,13 +83,35 @@ public struct ProviderStreamGuardConfig: Sendable, Equatable {
 }
 
 public enum ProviderStreamGuard {
+    /// No URLSession request or resource cap: the guard's idle and wall bound
+    /// the call, and with the wall configured off nothing but transport
+    /// termination, provider completion or cancellation ends it.
+    public static let stallOnlySession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = .infinity
+        config.timeoutIntervalForResource = .infinity
+        config.waitsForConnectivity = false
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        return URLSession(configuration: config)
+    }()
+
+    public static func wrap<Element: Sendable>(
+        makeUpstream: @escaping @Sendable () -> AsyncThrowingStream<Element, Error>,
+        config: ProviderStreamGuardConfig,
+        providerLabel: String
+    ) -> AsyncThrowingStream<Element, Error> {
+        makeGuardedStream(makeUpstream, config: config, providerLabel: providerLabel,
+                          beforeProducerAdmission: nil, watchdogStarted: nil)
+    }
+
     public static func wrap<Element: Sendable>(
         _ upstream: AsyncThrowingStream<Element, Error>,
         config: ProviderStreamGuardConfig,
         providerLabel: String
     ) -> AsyncThrowingStream<Element, Error> {
         makeGuardedStream(
-            upstream,
+            { upstream },
             config: config,
             providerLabel: providerLabel,
             beforeProducerAdmission: nil,
@@ -110,7 +129,7 @@ public enum ProviderStreamGuard {
         watchdogStarted: @escaping @Sendable () async -> Void
     ) -> AsyncThrowingStream<Element, Error> {
         makeGuardedStream(
-            upstream,
+            { upstream },
             config: config,
             providerLabel: providerLabel,
             beforeProducerAdmission: beforeProducerAdmission,
@@ -119,36 +138,46 @@ public enum ProviderStreamGuard {
     }
 
     private static func makeGuardedStream<Element: Sendable>(
-        _ upstream: AsyncThrowingStream<Element, Error>,
+        _ makeUpstream: @escaping @Sendable () -> AsyncThrowingStream<Element, Error>,
         config: ProviderStreamGuardConfig,
         providerLabel: String,
         beforeProducerAdmission: (@Sendable () async -> Void)?,
         watchdogStarted: (@Sendable () async -> Void)?
     ) -> AsyncThrowingStream<Element, Error> {
-        guard config.isEnabled else { return upstream }
+        if config.wallTimeout == 0 {
+            return workingStream(makeUpstream)
+        }
+        let effectiveConfig = config
 
         return AsyncThrowingStream { continuation in
             let state = ProviderStreamGuardState(startedAt: monotonicNow())
-
             let producer = Task {
                 do {
                     if let beforeProducerAdmission {
                         await beforeProducerAdmission()
                     }
                     try Task.checkCancellation()
-                    var iterator = upstream.makeAsyncIterator()
+                    try await ProviderStreamContext.$stallOnly.withValue(effectiveConfig.wallTimeout == 0) {
+                    try await ProviderStreamContext.$activity.withValue({
+                        _ = state.markProviderActivity(monotonicNow())
+                    }) {
+                    try await ProviderStreamContext.$admitted.withValue({ state.markAdmitted() }) {
                     // Idle time begins only when the producer has actually
-                    // been admitted and is about to ask upstream for its first
-                    // element. Wall time still began at wrapper creation.
+                    // been admitted. Include upstream creation: even a stream
+                    // that never opens or sends its first event can stall.
                     guard state.admitProducer(monotonicNow()) else { return }
+                    var iterator = makeUpstream().makeAsyncIterator()
                     while let chunk = try await iterator.next() {
                         try Task.checkCancellation()
                         guard state.markActivity(monotonicNow()) else { break }
                         continuation.yield(chunk)
                     }
                     state.finish(continuation)
+                    }
+                    }
+                    }
                 } catch {
-                    state.finish(continuation, throwing: error)
+                    state.finish(continuation, throwing: ProviderFailure.normalize(error, admitted: state.snapshot().admitted))
                 }
             }
 
@@ -163,16 +192,21 @@ public enum ProviderStreamGuard {
                     }
 
                     let now = monotonicNow()
-                    if let timeout = timeout(snapshot: snapshot, now: now, config: config) {
-                        state.finish(
+                    if let timeout = timeout(snapshot: snapshot, now: now, config: effectiveConfig) {
+                        let ended = state.finish(
                             continuation,
-                            throwing: timeout.error(providerLabel: providerLabel)
+                            throwing: timeout.error(providerLabel: providerLabel, events: snapshot.eventCount,
+                                                    admitted: snapshot.admitted),
+                            ifUnchanged: snapshot
                         )
-                        producer.cancel()
-                        return
+                        if ended {
+                            producer.cancel()
+                            return
+                        }
+                        continue // provider activity won the timeout race
                     }
 
-                    let delay = nextDelay(snapshot: snapshot, now: now, config: config)
+                    let delay = nextDelay(snapshot: snapshot, now: now, config: effectiveConfig)
                     let nanos = UInt64(max(0.01, delay) * 1_000_000_000)
                     try? await Task.sleep(nanoseconds: nanos)
                 }
@@ -185,6 +219,33 @@ public enum ProviderStreamGuard {
         }
     }
 
+    /// Keep cancellation and real transport activity without an idle or wall
+    /// watchdog. A quiet open response is not evidence of a dead connection.
+    private static func workingStream<Element: Sendable>(
+        _ makeUpstream: @escaping @Sendable () -> AsyncThrowingStream<Element, Error>
+    ) -> AsyncThrowingStream<Element, Error> {
+        AsyncThrowingStream { continuation in
+            let state = ProviderStreamGuardState(startedAt: monotonicNow())
+            let producer = Task {
+                do {
+                    try await ProviderStreamContext.$stallOnly.withValue(true) {
+                    try await ProviderStreamContext.$admitted.withValue({ state.markAdmitted() }) {
+                        for try await chunk in makeUpstream() {
+                            try Task.checkCancellation()
+                            continuation.yield(chunk)
+                        }
+                        try Task.checkCancellation()
+                    }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: ProviderFailure.normalize(error, admitted: state.snapshot().admitted))
+                }
+            }
+            continuation.onTermination = { _ in producer.cancel() }
+        }
+    }
+
     private static func monotonicNow() -> TimeInterval {
         ProcessInfo.processInfo.systemUptime
     }
@@ -193,24 +254,15 @@ public enum ProviderStreamGuard {
         case idle(seconds: TimeInterval)
         case wall(seconds: TimeInterval)
 
-        func error(providerLabel: String) -> LLMError {
+        /// The cut says what it measured, and whether the provider had admitted
+        /// the request (only an unadmitted one may be sent again).
+        func error(providerLabel: String, events: Int, admitted: Bool) -> Error {
             switch self {
-            case .idle(let seconds):
-                return .transient(
-                    message: "\(providerLabel) stream idle timeout after \(format(seconds))s"
-                )
-            case .wall(let seconds):
-                return .transient(
-                    message: "\(providerLabel) stream wall timeout after \(format(seconds))s"
-                )
+            case .idle(let seconds), .wall(let seconds):
+                let cut = ProviderFailure.noReply(provider: providerLabel, seconds: Int(seconds.rounded()), events: events)
+                return ProviderFailure.Diagnostic(cause: cut, detail: cut.errorDescription ?? "",
+                                                  deadlineExpired: true, admitted: admitted)
             }
-        }
-
-        private func format(_ seconds: TimeInterval) -> String {
-            if seconds.rounded() == seconds {
-                return String(Int(seconds))
-            }
-            return String(format: "%.2f", seconds)
         }
     }
 
@@ -255,12 +307,17 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
         /// Nil until the producer task has been admitted and is about to make
         /// its first upstream `next()` call.
         var lastActivityAt: TimeInterval?
+        var eventCount: Int
+        var admitted: Bool
     }
 
     private let lock = NSLock()
     private var finished = false
     private let startedAt: TimeInterval
     private var lastActivityAt: TimeInterval?
+    private var providerEvents = 0
+    private var yieldedEvents = 0
+    private var admitted = false
 
     init(startedAt: TimeInterval) {
         self.startedAt = startedAt
@@ -279,8 +336,29 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
 
     func markActivity(_ now: TimeInterval) -> Bool {
         lock.lock()
+        guard !finished else { lock.unlock(); return false }
+        // Wire progress comes from received response headers and SSE framing.
+        // Adapter presentation yields or synthetic heartbeats cannot hide
+        // wire silence once the transport has begun reporting activity.
+        if providerEvents == 0 {
+            yieldedEvents += 1
+            lastActivityAt = now
+        }
+        lock.unlock()
+        return true
+    }
+
+    func markAdmitted() {
+        lock.lock()
+        admitted = true
+        lock.unlock()
+    }
+
+    func markProviderActivity(_ now: TimeInterval) -> Bool {
+        lock.lock()
         defer { lock.unlock() }
         guard !finished else { return false }
+        providerEvents += 1
         lastActivityAt = now
         return true
     }
@@ -291,18 +369,22 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
         return Snapshot(
             finished: finished,
             startedAt: startedAt,
-            lastActivityAt: lastActivityAt
+            lastActivityAt: lastActivityAt,
+            eventCount: providerEvents > 0 ? providerEvents : yieldedEvents,
+            admitted: admitted
         )
     }
 
+    @discardableResult
     func finish<Element: Sendable>(
         _ continuation: AsyncThrowingStream<Element, Error>.Continuation,
-        throwing error: (any Error)? = nil
-    ) {
+        throwing error: (any Error)? = nil,
+        ifUnchanged snapshot: Snapshot? = nil
+    ) -> Bool {
         lock.lock()
-        guard !finished else {
+        guard !finished, snapshot == nil || snapshot?.lastActivityAt == lastActivityAt else {
             lock.unlock()
-            return
+            return false
         }
         finished = true
         lock.unlock()
@@ -312,5 +394,6 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
         } else {
             continuation.finish()
         }
+        return true
     }
 }

@@ -11,6 +11,8 @@
 	<!-- Required by macOS TCC for Calendar prompts from hardened-runtime builds. -->
 	<key>com.apple.security.personal-information.calendars</key>
 	<true/>
+	<key>com.apple.security.personal-information.photos-library</key>
+	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
 	<key>com.apple.security.network.server</key>

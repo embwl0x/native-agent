@@ -5,6 +5,15 @@
 // telemetry, and error mapping are protocol semantics and stay in callers.
 import Foundation
 
+/// Transport activity is independent of reply content. Bound by the stream
+/// guard before creating an adapter, and inherited by its transport task.
+public enum ProviderStreamContext {
+    @TaskLocal public static var activity: (@Sendable () -> Void)?
+    /// The provider admitted the request: a validated 2xx body is being read.
+    @TaskLocal public static var admitted: (@Sendable () -> Void)?
+    @TaskLocal public static var stallOnly: Bool = false
+}
+
 /// One parsed Server-Sent Event.
 public struct SSEEvent: Sendable, Equatable {
     /// The last `event:` field seen for this event, or nil if the event
@@ -48,13 +57,16 @@ where Bytes.Element == UInt8 {
         self.bytes = bytes
     }
 
+    /// Providers read only a status-validated 2xx body as SSE, so starting to
+    /// read one is the provider's admission of the request.
     public func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(bytes: bytes.makeAsyncIterator())
+        ProviderStreamContext.admitted?()
+        return AsyncIterator(bytes: bytes.makeAsyncIterator())
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
         var bytes: Bytes.AsyncIterator
-        var parser = SSEEventParser()
+        var parser = SSEEventParser(onActivity: ProviderStreamContext.activity)
         var finished = false
         var lineBuf: [UInt8] = []
 
@@ -87,8 +99,11 @@ where Bytes.Element == UInt8 {
 public struct SSEEventParser: Sendable {
     private var dataLines: [String] = []
     private var eventName: String?
+    private let onActivity: (@Sendable () -> Void)?
 
-    public init() {}
+    public init(onActivity: (@Sendable () -> Void)? = nil) {
+        self.onActivity = onActivity
+    }
 
     /// Consume one raw line (LF already stripped). Returns a completed
     /// event on the blank-line delimiter, nil otherwise. The single
@@ -107,7 +122,10 @@ public struct SSEEventParser: Sendable {
         if line.isEmpty {
             return flush()
         }
-        if line.hasPrefix(":") { return nil } // comment / keep-alive
+        if line.hasPrefix(":") {
+            onActivity?() // real provider keep-alive, never reply content
+            return nil
+        }
 
         let name: Substring
         var value: Substring
@@ -140,6 +158,7 @@ public struct SSEEventParser: Sendable {
             dataLines.removeAll(keepingCapacity: true)
             eventName = nil
         }
+        if !dataLines.isEmpty || eventName != nil { onActivity?() }
         guard !dataLines.isEmpty else { return nil }
         return SSEEvent(event: eventName, data: dataLines.joined(separator: "\n"))
     }

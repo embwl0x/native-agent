@@ -1,6 +1,6 @@
 # Memory Recall Verification
 
-Use after landing memory infrastructure, after any sweep/tombstone/migration that mutates memory records, or whenever code review says recall *should* work and you want a live receipt. (Merged 2026-07-03 from explicit-recall-probe-protocol + post-sweep-reindex-check, rewritten for MemoryV2.)
+Use after landing memory infrastructure, after any sweep/tombstone/migration that mutates memory records, or whenever code review says recall *should* work and you want a live receipt.
 
 ## The probe protocol (proving recall is wired end-to-end)
 
@@ -25,3 +25,5 @@ That's not a filter bug — it's a stale index. Recipe:
 ## Operating rule
 
 Any tool that mutates memory records should either reindex as part of its own action or emit an explicit `reindex_required` receipt. "Sweep shipped" is incomplete until embedded-search parity is reverified — flat-read parity alone lies.
+
+_History: merged 2026-07-03 from explicit-recall-probe-protocol + post-sweep-reindex-check, rewritten for MemoryV2._

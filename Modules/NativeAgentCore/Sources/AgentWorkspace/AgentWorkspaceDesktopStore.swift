@@ -129,7 +129,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "read_file", "list_dir": keys = ["path"]; required = keys
             case "agent_read": keys = ["agent", "conversation", "history_before", "history_exchange"]; required = ["agent"]
             case "chat_conversations": keys = ["conversation_session_id"]; required = []
-            case "desk_read": keys = ["handle", "query"]; required = []
+            case "desk_read": keys = ["handle", "query", "updated_on"]; required = []
             case "work_context": keys = ["query", "session_id"]; required = ["query"]
             case "read_skill": keys = ["name"]; required = keys
             case "read_page": keys = ["url"]; required = keys
@@ -139,9 +139,9 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "shelf_read": keys = ["bot_id", "include_read", "newest_first"]; required = []
             case "task_ledger_list": keys = ["task_id"]; required = []
             case "delegation_status": keys = ["task_id"]; required = []
-            case "mail_search": keys = ["query", "scope", "mailbox"]; required = ["query"]
-            case "mail_list_recent": keys = ["expected_message_id", "expected_account", "scope", "mailbox"]; required = []
-            case "messages_recent_threads": keys = ["thread_id"]; required = []
+            case "mail_search": keys = ["query", "scope", "mailbox", "unread", "sort", "from", "since", "category", "attachment"]; required = []
+            case "mail_list_recent": keys = ["expected_message_id", "expected_account", "scope", "mailbox", "all_categories", "unread", "sort", "from", "since", "category"]; required = []
+            case "messages_recent_threads": keys = ["thread_id", "query", "unread_only", "sort", "from_me", "since"]; required = []
             case "screen": keys = ["app", "part"]; required = []
             case "bot_list": keys = ["id"]; required = []
             case "mac_calendar_list_upcoming": keys = ["day", "calendar_name", "calendar_id"]; required = []
@@ -156,6 +156,9 @@ struct AgentWorkspaceDesktopStore: Sendable {
             for key in keys {
                 guard let value = input[key], value != .null else { continue }
                 if (tool == "shelf_read" && ["include_read", "newest_first"].contains(key))
+                    || (["mail_list_recent", "mail_search"].contains(tool) && ["all_categories", "unread"].contains(key))
+                    || (tool == "mail_search" && key == "attachment" && value == .bool(true))
+                    || (tool == "messages_recent_threads" && ["unread_only", "from_me"].contains(key))
                     || (tool == "mac_reminders_query" && ["undated_only", "include_completed"].contains(key)) {
                     guard case .bool = value else { return nil }
                     arguments[key] = value
@@ -197,7 +200,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "work_context": numericKeys = ["desk_offset", "history_offset", "limit"]
             case "mail_list_recent": numericKeys = ["body_offset", "offset", "position"]
             case "mail_search": numericKeys = ["offset"]
-            case "messages_recent_threads": numericKeys = ["before_message_id", "limit"]
+            case "messages_recent_threads": numericKeys = ["before_message_id", "limit", "offset"]
             case "mac_calendar_list_upcoming": numericKeys = ["hours_ahead", "limit"]
             case "mac_reminders_query": numericKeys = ["offset", "limit"]
             default: numericKeys = []

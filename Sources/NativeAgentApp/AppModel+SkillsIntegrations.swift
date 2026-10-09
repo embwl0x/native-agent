@@ -55,29 +55,6 @@ extension AppModel {
     }
 }
 
-enum ToolApprovalEligibility {
-    /// The mounted control only offers activation for an actual proposal that
-    /// the last validator pass marked valid. SwiftNativeToolExecution repeats
-    /// these checks at promotion time; this UI/app-model gate prevents known
-    /// terminal or unloaded records from looking actionable in the meantime.
-    static func refusal(for tool: ToolRecord) -> String? {
-        let status = tool.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard ["proposed", "draft", "drafted"].contains(status) else {
-            if status == "quarantined" {
-                return "Quarantined tools must be reviewed before they can be approved."
-            }
-            if status.isEmpty {
-                return "This tool has no loaded proposal status. Refresh before approving it."
-            }
-            return "Only proposed tools can be approved."
-        }
-        guard tool.validationStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "valid" else {
-            return "This proposal has not passed validation."
-        }
-        return nil
-    }
-}
-
 /// The authored-tools row is a projection of the same promotion boundary the
 /// action repeats. Keeping its enabled state and refusal copy here prevents a
 /// mounted SwiftUI control from becoming a second, untested eligibility rule.
@@ -121,7 +98,7 @@ extension AppModel {
             await refreshAll()
             statusText = partial.localizedDescription
         } catch {
-            statusText = "Skill delete failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "delete that skill")
         }
     }
 
@@ -138,14 +115,16 @@ extension AppModel {
             entries = try await registryEntriesTask
         } catch {
             entries = []
-            failures.append("manifest registry: \(error.localizedDescription)")
+            nativeLog("%@", "[skills] registry read failed: \(error)")
+            failures.append("the skill registry")
         }
         let learnedSkills: [SkillRecord]
         do {
             learnedSkills = try await learnedSkillsTask
         } catch {
             learnedSkills = []
-            failures.append("learned skills: \(error.localizedDescription)")
+            nativeLog("%@", "[skills] learned skills read failed: \(error)")
+            failures.append("learned skills")
         }
         // mainactor_icloud: the per-skill manifest/README reads below use synchronous
         // Data(contentsOf:)/String(contentsOf:) disk I/O. Run them off the main thread
@@ -174,7 +153,7 @@ extension AppModel {
         }.value
         skillManifests = infos
         if !failures.isEmpty {
-            recordSkillManifestFailure("Skill catalog unavailable: \(failures.joined(separator: "; "))")
+            recordSkillManifestFailure("Couldn't read \(failures.joined(separator: " or ")). Try again; if it keeps happening, the details are in the log.")
         } else if skillLifecycleFeedback?.kind == .failure {
             dismissSkillManifestFeedback()
         }
@@ -218,7 +197,7 @@ extension AppModel {
             recordSkillManifestFailure(detail)
             return .failed(detail: detail)
         } catch {
-            let detail = "Install failed: \(error.localizedDescription)"
+            let detail = UserFacingError.message(error, action: "install that skill")
             recordSkillManifestFailure(detail)
             return .failed(detail: detail)
         }
@@ -243,7 +222,7 @@ extension AppModel {
                 outcome: .succeeded
             )
         } catch {
-            recordToolOperationStatus("Tool update failed: \(error.localizedDescription)", outcome: .failed)
+            recordToolOperationStatus(UserFacingError.message(error, action: "update that tool"), outcome: .failed, cause: error)
         }
     }
 
@@ -263,7 +242,7 @@ extension AppModel {
             engine.tools.authored = reloaded
             recordToolOperationStatus("Tool quarantined", outcome: .succeeded)
         } catch {
-            recordToolOperationStatus("Tool quarantine failed: \(error.localizedDescription)", outcome: .failed)
+            recordToolOperationStatus(UserFacingError.message(error, action: "quarantine that tool"), outcome: .failed, cause: error)
         }
     }
 
@@ -291,7 +270,7 @@ extension AppModel {
             engine.tools.authored = reloaded
             recordToolOperationStatus("Tool activated", outcome: .succeeded)
         } catch {
-            recordToolOperationStatus("Tool activation failed: \(error.localizedDescription)", outcome: .failed)
+            recordToolOperationStatus(UserFacingError.message(error, action: "turn that tool on"), outcome: .failed, cause: error)
         }
     }
 
@@ -317,8 +296,8 @@ extension AppModel {
             statusText = "Workspace added and verified"
             return .verified(added)
         } catch {
-            let detail = error.localizedDescription
-            statusText = "Workspace add failed: \(detail)"
+            let detail = UserFacingError.cause(error, action: "add that workspace")
+            setFailureStatus("Couldn't add that workspace. " + detail, cause: error)
             return .failed(detail)
         }
     }
@@ -330,7 +309,7 @@ extension AppModel {
             workspaceSearchResults = response.results
             statusText = "Workspace search found \(response.results.count)"
         } catch {
-            statusText = "Workspace search failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "search the workspace")
         }
     }
 
@@ -349,8 +328,8 @@ extension AppModel {
             statusText = "Connector \(confirmed.enabled ? "enabled" : "disabled") and verified"
             return .verified(confirmed)
         } catch {
-            let detail = error.localizedDescription
-            statusText = "Connector update failed: \(detail)"
+            let detail = UserFacingError.cause(error, action: "turn that connector \(enabled ? "on" : "off")")
+            setFailureStatus("Couldn't turn that connector \(enabled ? "on" : "off"). " + detail, cause: error)
             return .failed(detail)
         }
     }
@@ -361,7 +340,7 @@ extension AppModel {
             let detected = try await client.autodetectSearXNG()
             return applySearXNGAutodetect(detected)
         } catch {
-            return .failed(error.localizedDescription)
+            return .failed(UserFacingError.cause(error, action: "find a SearXNG server"))
         }
     }
 
@@ -451,8 +430,9 @@ extension AppModel {
             telegramSettingsSaveOutcome = outcome
             return outcome
         } catch {
-            statusText = "Telegram save failed: \(error.localizedDescription)"
-            let outcome = TelegramSettingsSaveOutcome.failed(detail: error.localizedDescription)
+            let detail = UserFacingError.cause(error, action: "save Telegram settings")
+            setFailureStatus("Couldn't save Telegram settings. " + detail, cause: error)
+            let outcome = TelegramSettingsSaveOutcome.failed(detail: detail)
             telegramSettingsSaveOutcome = outcome
             return outcome
         }
@@ -481,7 +461,7 @@ extension AppModel {
             await refreshAll()
             statusText = "Telegram bot token cleared"
         } catch {
-            statusText = "Telegram token clear failed: \(error.localizedDescription)"
+            setFailureStatus("Removing the Telegram token failed. " + UserFacingError.cause(error, action: "remove the Telegram token"), cause: error)
         }
     }
 
@@ -494,8 +474,18 @@ extension AppModel {
         let baseline = telegramSettingsDraftBaseline
         telegramStatusRefreshError = nil
         do {
-            let status = try await engine.telegram.load(manager: client.backgroundLoopsManager.coreManager)
+            let status: TelegramPresentationSnapshot
+            var credentialUnavailable = false
+            do {
+                status = try await engine.telegram.load(manager: client.backgroundLoopsManager.coreManager)
+            } catch is DeviceSecretKeychain.Failure {
+                // Keep validated authority fields editable for explicit grant
+                // replacement or disconnect; this is not transport readiness.
+                status = try await engine.telegram.load(manager: client.backgroundLoopsManager.coreManager, credentialUnavailable: true)
+                credentialUnavailable = true
+            }
             guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
+            if credentialUnavailable { telegramStatusRefreshError = UserFacingError.advice(for: DeviceSecretKeychain.Failure.unavailable) }
             engine.telegram.status = status
             telegramTokenConfigured = status.tokenConfigured
             // Refresh untouched fields only. Navigation and a read completing
@@ -512,12 +502,12 @@ extension AppModel {
                 enabled: status.enabled, chats: status.allowedChatIds.joined(separator: ","),
                 users: status.allowedUserIds.joined(separator: ","), requireMention: status.requireMention
             )
-            statusText = "Telegram status refreshed"
+            statusText = telegramStatusRefreshError ?? "Telegram status refreshed"
             return true
         } catch {
             guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
-            telegramStatusRefreshError = error.localizedDescription
-            statusText = "Telegram refresh failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "refresh Telegram")
+            telegramStatusRefreshError = UserFacingError.advice(for: error)
             return false
         }
     }
@@ -534,7 +524,7 @@ extension AppModel {
             await refreshAll()
             statusText = TelegramTestReplyPresentation.summary(for: result)
         } catch {
-            statusText = "Telegram test failed: \(error.localizedDescription)"
+            setFailureStatus("Telegram test failed. " + UserFacingError.cause(error, action: "test Telegram"), cause: error)
         }
     }
 
@@ -552,9 +542,9 @@ extension AppModel {
             telegramClearLogsOutcome = .completed(receipt)
             statusText = TelegramClearLogsPresentation.summary(for: receipt)
         } catch {
-            let detail = error.localizedDescription
+            let detail = UserFacingError.cause(error, action: "clear the Telegram logs")
             telegramClearLogsOutcome = .failed(detail: detail)
-            statusText = "Clear Telegram logs failed: \(detail)"
+            setFailureStatus("Couldn't clear the Telegram logs. " + detail, cause: error)
         }
     }
 
@@ -647,8 +637,8 @@ extension AppModel {
             }
             return .completed(status: report.status, failingChecks: failing)
         } catch {
-            statusText = "Health checks failed: \(error.localizedDescription)"
-            return .unavailable(error.localizedDescription)
+            setFailureStatus(error, action: "run the health checks")
+            return .unavailable(statusText)
         }
     }
 

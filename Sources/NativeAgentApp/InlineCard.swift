@@ -31,13 +31,7 @@ import SwiftUI
 
 // MARK: - Tokens
 
-/// The card's surface, promoted from `settingsCardSurface()` unchanged so the
-/// inline cards and the settings cards stay one family.
 enum InlineCardPalette {
-    static var fill: Color { TodayPalette.cardFill }
-    static var stroke: Color { TodayPalette.cardStroke }
-    static var radius: CGFloat { TodayMetrics.cardRadius }
-
     /// The shared foreground for the primary button: dark ink on the bright
     /// dark-mode teal, white on the darker light-mode teal. The old approval
     /// card paired fixed dark ink with a dynamic teal and lost its contrast in
@@ -59,7 +53,7 @@ enum InlineCardMetrics {
     static let touchTarget: CGFloat = 44
 }
 
-/// Live cards carry the fill; receipts carry the hairline alone; a quiet line
+/// Live cards wear the kit's house glass; receipts carry the hairline alone; a quiet line
 /// (superseded, declined) carries neither — it is scrollback, not an object.
 enum InlineCardSurface {
     case live
@@ -69,28 +63,21 @@ enum InlineCardSurface {
 
 extension View {
     func inlineCardSurface(_ surface: InlineCardSurface) -> some View {
-        let shape = RoundedRectangle(cornerRadius: InlineCardPalette.radius, style: .continuous)
-        return self
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background {
-                switch surface {
-                case .live: shape.fill(InlineCardPalette.fill)
-                case .settled, .quiet: shape.fill(Color.clear)
-                }
+        let shape = RoundedRectangle(cornerRadius: AliveMetrics.cardRadius, style: .continuous)
+        let framed = self.frame(maxWidth: .infinity, alignment: .leading)
+        return Group {
+            switch surface {
+            case .live: framed.aliveCard()
+            case .settled: framed.overlay { shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1) }
+            case .quiet: framed
             }
-            .overlay {
-                switch surface {
-                case .live: shape.strokeBorder(InlineCardPalette.stroke, lineWidth: 1)
-                case .settled: shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-                case .quiet: shape.strokeBorder(Color.clear, lineWidth: 0)
-                }
-            }
-            // Mood in the tint, 2026-09-14: a card sits inside the transcript's
-            // prose guard, where the window pass is punched out, and its own
-            // fill is clear — so what should warm is the room showing through
-            // it. It takes the warmth here instead. One tint, never two.
-            .moodTintSurface(in: shape)
-            .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
+        }
+        // Mood in the tint, 2026-09-14: a card sits inside the transcript's
+        // prose guard, where the window pass is punched out, and its own
+        // fill is clear — so what should warm is the room showing through
+        // it. It takes the warmth here instead. One tint, never two.
+        .moodTintSurface(in: shape)
+        .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
     }
 }
 
@@ -256,6 +243,11 @@ struct InlineCardModel: Identifiable, Sendable, Equatable {
     var canStop: Bool
     /// Whether a failure is safe to retry.
     var canRetry: Bool
+
+    /// A retryable failure still needs the person's answer.
+    var needsAttention: Bool {
+        !state.isTerminal || (state == .failed && canRetry)
+    }
 
     init(
         id: String,
@@ -470,7 +462,7 @@ struct InlineCardDetails<Content: View>: View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             Button {
                 withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.standard, reduceMotion: reduceMotion
+                    NativeAgentMotion.arrive, reduceMotion: reduceMotion
                 )) { open.toggle() }
             } label: {
                 HStack(spacing: 4) {
@@ -491,7 +483,7 @@ struct InlineCardDetails<Content: View>: View {
             .accessibilityValue(open ? "Expanded" : "Collapsed")
             .accessibilityHint(open ? "Hides these details." : "Shows these details.")
             if open {
-                content.transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+                content.transition(NativeAgentMotion.arrivalFade)
             }
         }
     }

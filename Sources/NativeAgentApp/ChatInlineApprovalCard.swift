@@ -73,6 +73,16 @@ struct InlineApprovalCard: View {
         )
     }
 
+    /// An inbox approval as the card's message, for surfaces that hold the
+    /// record rather than a transcript row (the inbox strip, the Work pane).
+    static func message(for approval: ApprovalRecord) -> ChatMessage {
+        var metadata = ChatMessageMetadata()
+        metadata.kind = ChatMessageMetadata.approvalPendingKind
+        metadata.approvalId = approval.id
+        return ChatMessage(id: approval.id, role: "tool",
+            content: "\(approval.title)\n\(approval.reason)\n\(approval.payloadPreview)", metadata: metadata)
+    }
+
     var body: some View {
         VStack(alignment: .leading) {
             shellBody
@@ -80,6 +90,14 @@ struct InlineApprovalCard: View {
                case .resolved(let decision) = state, decision == "approved" {
                 GrokSecureSetupCard(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             }
+        }
+        // After a launch the chat can draw before the approvals list loads;
+        // a card that doesn't know its approval reads the inbox once, so an
+        // answered one never comes back asking.
+        .task(id: approvalId) {
+            guard externalApproval == nil, !approvalId.isEmpty else { return }
+            appModel.engine.approvals.records = (try? await appModel.engine.approvals.list())
+                ?? appModel.engine.approvals.records
         }
     }
 
@@ -139,13 +157,11 @@ struct InlineApprovalCard: View {
             model.busyNote = "Sending your decision…"
         case .resolved(let decision):
             let rejected = decision == "denied" || decision == "rejected"
-            model.state = rejected ? .declined : .settled
-            // "Approved" is the truth at this instant: the decision is made,
-            // and proving the execution belongs to whoever runs it.
-            model.outcome = rejected
-                ? "Left alone — nothing was done"
-                : (decision == "approved" ? "Approved" : "Resolved")
-            model.outcomeMeta = why.isEmpty ? nil : why
+            let approval = externalApproval.map(ApprovalRequest.init(record:))
+            model.state = approval?.isExpired == true ? .unknown
+                : (approval?.executionFailed == true ? .failed : (rejected ? .declined : .settled))
+            model.outcome = approval?.decisionSummary ?? (rejected ? "Denied" : (decision == "approved" ? "Approved" : "Resolved"))
+            model.outcomeMeta = approval?.expirationGuidance(agentName: appModel.agentDisplayName) ?? approval?.executionSummary ?? (why.isEmpty ? nil : why)
         case .unavailable:
             model.state = .unknown
             model.outcome = "I couldn't check this request"
@@ -167,9 +183,16 @@ struct InlineApprovalCard: View {
             // S.4: refresh the global approvals list so other inline cards
             // for the same approval ID reflect the new state immediately.
             await appModel.loadHealthCard()
+        } catch ApprovalInboxError.alreadyResolved {
+            // A stale card: the request was already answered. Settle to the
+            // decision the inbox holds instead of showing an error.
+            appModel.engine.approvals.records = (try? await appModel.engine.approvals.list())
+                ?? appModel.engine.approvals.records
+            resolvedDecision = externalApproval?.decision ?? ""
+            resolved = true
         } catch {
             // B.3: daemon returned an error — keep card actionable
-            resolveError = error.localizedDescription
+            resolveError = UserFacingError.message(error, action: "record that decision")
         }
     }
 }

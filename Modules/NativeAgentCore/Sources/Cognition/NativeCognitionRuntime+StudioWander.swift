@@ -572,6 +572,7 @@ actor StudioWanderToolWitness: ToolDispatchClient {
         "browser.screenshot", "browser_screenshot",
         "read", "read_file", "file_excerpt", "mac_view", "mac_look",
         "browser.text", "browser.links", "mac.read", "files.read", "files.excerpt",
+        "read_page", "web.read",
     ]
 
     private let inner: any ToolDispatchClient
@@ -647,7 +648,22 @@ actor StudioWanderToolWitness: ToolDispatchClient {
             return carriesCapture(result)
         }
         if ["studio_consult_read", "studio.consult_read"].contains(tool) { return false }
+        // A cookie wall or script shell is a stub of the page, not the work.
+        if ["read_page", "web.read"].contains(tool), isThinPage(result) { return false }
         return deliveringOrgans.contains(tool)
+    }
+
+    /// web.read's stub flag, wherever the reply carries it: the raw fields,
+    /// an app envelope around them, or the page view's coverage text.
+    static func isThinPage(_ result: JSONValue) -> Bool {
+        switch result {
+        case .string(let text): return text.contains("\"thin_page\":true")
+        case .object(let object):
+            return object["thin_page"] == .bool(true) || object["reason"] == .string("thin_page")
+                || object.values.contains(where: isThinPage)
+        case .array(let values): return values.contains(where: isThinPage)
+        default: return false
+        }
     }
 
     /// A browser run that actually brought something back. The run receipt
@@ -744,7 +760,7 @@ struct StudioWanderToolAllowlist: ToolDispatchClient {
     let inner: any ToolDispatchClient
 
     static let admittedActions: Set<String> = [
-        "mac.look", "mac.read", "files.read", "files.excerpt",
+        "mac.look", "mac.read", "files.read", "files.excerpt", "web.read",
         "browser.status", "browser.open", "browser.text", "browser.links", "browser.screenshot",
         "studio.journal", "studio.recall", "studio.consult_read",
         "memory.recall", "graph.search", "context.expand", "skill.list", "skill.read",
@@ -780,21 +796,21 @@ struct StudioWanderToolAllowlist: ToolDispatchClient {
         "mac_view", "mac_look",
         // ── The artifact, when it is a local file.
         "read_file", "file_excerpt",
-        // ── The artifact, when it is remote. These are the app's REAL browser
-        //    tools (AppChatToolDispatcher `browserToolNames`), and they
-        //    are the READ half only: open a page, take its text, its links, or a
-        //    picture of it. `web_fetch`/`web_search` do not exist in this
-        //    build's catalog and are deliberately not named here.
+        // ── The artifact, when it is remote. `read_page` (web.read) is the
+        //    headless page reader: a private GET, no browser, about half a
+        //    second. The browser tools below (AppChatToolDispatcher
+        //    `browserToolNames`) are the READ half only: open a page, take its
+        //    text, its links, or a picture of it. Web search is deliberately
+        //    not named here.
+        "read_page",
         //
         //    THE DELIBERATE EXCEPTION (coordinator's call, 2026-09-02):
         //    `browser.open_url` navigates the VISIBLE browser, which is the one
         //    thing in this list that changes something a person could see. It is
-        //    admitted anyway, because it is how she looks at a work: there is no
-        //    headless fetch organ in this build, so refusing navigation would
-        //    not make her hour safer — it would make a remote encounter
-        //    impossible and quietly reduce her studio to whatever is already on
-        //    the local disk. Navigating to a page she chose is looking at
-        //    something; it sends nothing, submits nothing and speaks to nobody.
+        //    admitted anyway, because it is how she SEES a work: a picture or a
+        //    page web.read can't render needs the browser. Navigating to a page
+        //    she chose is looking at something; it sends nothing, submits
+        //    nothing and speaks to nobody.
         //
         //    `browser.navigate` / `browser_navigate` are aliases of it
         //    (ToolNameAliases) and reach this list already resolved to

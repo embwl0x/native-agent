@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ProviderRouting
 import Transcripts
 
 /// Async, fire-and-forget upgrade of the mechanical chat compaction summary.
@@ -49,8 +50,8 @@ public struct ChatCompactionDistiller: Sendable {
     /// with their speaker, so the words she actually heard survive as words.
     public static let distillSystem = """
     You are writing a private memory for yourself. Earlier turns of this \
-    conversation are about to be dropped from your context; this note is the ONLY \
-    thing that will survive, and later you will read it as your own recollection \
+    conversation are about to be dropped from your context; stored tool receipts \
+    remain readable through their source pointers. You will read this note as your own recollection \
     of what happened. Write it so future-you loses as little as possible.
 
     Write it in strict FIRST PERSON, as your own life: "I", "me", "my". Never \
@@ -87,6 +88,8 @@ public struct ChatCompactionDistiller: Sendable {
     shifted, moments that mattered between you. Keep your own voice and warmth \
     continuous.
     - Key actions you took and their outcomes (tools run, files changed, results).
+    Keep receipt read pointers for those actions. Distinguish recorded tool results \
+    from assistant claims, previews from execution, and dispatch from verified effects.
     - Any corrections the user gave you — record them so you don't repeat the \
     mistake.
 
@@ -196,25 +199,71 @@ public struct ChatCompactionDistiller: Sendable {
         surface: String,
         runId: String?
     ) async {
+        let key = dataRoot.standardizedFileURL.path + "/" + sessionId + "/" + summaryRowId
+        guard await PendingDistillations.shared.claim(key) else { return }
+        await performDistillation(
+            sessionId: sessionId, summaryRowId: summaryRowId, backupPath: backupPath,
+            messagesReplaced: messagesReplaced, turnModel: turnModel,
+            providerID: providerID, surface: surface, runId: runId
+        )
+        await PendingDistillations.shared.release(key)
+    }
+
+    private actor PendingDistillations {
+        static let shared = PendingDistillations()
+        var active: Set<String> = []
+        func claim(_ key: String) -> Bool { active.insert(key).inserted }
+        func release(_ key: String) { active.remove(key) }
+    }
+
+    private func performDistillation(
+        sessionId: String,
+        summaryRowId: String,
+        backupPath: String,
+        messagesReplaced: Int,
+        turnModel: String,
+        providerID: String? = nil,
+        surface: String,
+        runId: String?
+    ) async {
         // 1. Recover the replaced content from the pre-compaction backup.
         let backupURL = URL(fileURLWithPath: backupPath)
         let backupRows: [JSONValue]
+        let preservedPendingIDs: Set<String>
         do {
             backupRows = try await persistence.readJSONL(backupURL)
+            let destinationRows = try await persistence.readJSONL(messagesPath(sessionId: sessionId))
+            let destination = destinationRows.first {
+                guard case .object(let object) = $0 else { return false }
+                return object["id"] == .string(summaryRowId)
+            }
+            if case .object(let object)? = destination,
+               case .object(let metadata)? = object["metadata"],
+               case .array(let ids)? = metadata["distill_preserved_pending_ids"] {
+                preservedPendingIDs = Set(ids.compactMap {
+                    guard case .string(let id) = $0 else { return nil }
+                    return id
+                })
+            } else {
+                preservedPendingIDs = []
+            }
         } catch {
-            await settlePendingSummary(sessionId: sessionId, summaryRowId: summaryRowId)
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: turnModel,
-                charsIn: 0, charsOut: 0, runId: runId, status: "skipped"
+                charsIn: 0, charsOut: 0, runId: runId, status: "failed", failure: error
             )
             return
         }
-        let replaced = Array(backupRows.prefix(max(0, messagesReplaced)))
+        let replaced = backupRows.prefix(max(0, messagesReplaced))
+            .filter {
+                guard case .object(let object) = $0,
+                      case .string(let id)? = object["id"] else { return true }
+                return !preservedPendingIDs.contains(id)
+            }
         guard !replaced.isEmpty else {
-            await settlePendingSummary(sessionId: sessionId, summaryRowId: summaryRowId)
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: turnModel,
-                charsIn: 0, charsOut: 0, runId: runId, status: "skipped"
+                charsIn: 0, charsOut: 0, runId: runId, status: "failed", failure: DistillError.empty
             )
             return
         }
@@ -224,7 +273,6 @@ public struct ChatCompactionDistiller: Sendable {
             providerID: providerID, surface: surface, runId: runId,
             summaryRowId: summaryRowId
         ) else {
-            await settlePendingSummary(sessionId: sessionId, summaryRowId: summaryRowId)
             return
         }
         let model = recollection.model
@@ -259,7 +307,8 @@ public struct ChatCompactionDistiller: Sendable {
                           id == summaryRowId,
                           case .object(let meta)? = obj["metadata"],
                           case .string(let kind)? = meta["kind"],
-                          kind == "compaction_summary"
+                          kind == "compaction_summary",
+                          meta["distill"] == .string("pending")
                     else { continue }
                     // The mechanical header carried the "cards kept below"
                     // clause; the distilled text replaces that header, so the
@@ -273,10 +322,13 @@ public struct ChatCompactionDistiller: Sendable {
                     }
                     let clause = InlineInteractionCompactionRetention
                         .summaryClause(preservedCount: preservedCards)
-                    obj["content"] = .string(clause.isEmpty ? distilled : distilled + "\n[" + clause.trimmingCharacters(in: .whitespaces) + "]")
+                    let sourceNote = meta["receipt_source_note"].flatMap { if case .string(let note) = $0 { return note }; return nil } ?? ""
+                    obj["content"] = .string(sourceNote + "\n" + (clause.isEmpty ? distilled : distilled + "\n[" + clause.trimmingCharacters(in: .whitespaces) + "]"))
                     var newMeta = meta
                     newMeta["distill"] = .string("llm")
                     newMeta["distill_model"] = .string(model)
+                    newMeta.removeValue(forKey: "distill_backup")
+                    newMeta.removeValue(forKey: "distill_process")
                     obj["metadata"] = .object(newMeta)
                     segments[index] = try JSONValue.object(obj).serialize(pretty: false)
                     swapped = true
@@ -292,11 +344,10 @@ public struct ChatCompactionDistiller: Sendable {
                 return "ok"
             }
         } catch {
-            await settlePendingSummary(sessionId: sessionId, summaryRowId: summaryRowId)
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: model,
                 charsIn: promptChars, charsOut: distilled.count, runId: runId, status: "failed",
-                promptCharsPerPass: promptCharsPerPass, rowsOmitted: rowsOmitted
+                promptCharsPerPass: promptCharsPerPass, rowsOmitted: rowsOmitted, failure: error
             )
             return
         }
@@ -321,41 +372,6 @@ public struct ChatCompactionDistiller: Sendable {
             thirdPerson: status == "ok" ? thirdPerson : false,
             promptCharsPerPass: promptCharsPerPass, rowsOmitted: rowsOmitted
         )
-    }
-
-    private func settlePendingSummary(sessionId: String, summaryRowId: String) async {
-        let path = messagesPath(sessionId: sessionId)
-        do {
-            let changed = try await persistence.withFileLock(path) {
-                guard FileManager.default.fileExists(atPath: path.path) else { return false }
-                let raw = try String(contentsOf: path, encoding: .utf8)
-                var segments = raw.components(separatedBy: "\n")
-                for index in segments.indices {
-                    guard let parsed = try? JSONValue.parse(Data(segments[index].utf8)),
-                          case .object(var row) = parsed,
-                          row["id"] == .string(summaryRowId),
-                          case .object(var metadata)? = row["metadata"],
-                          metadata["kind"] == .string("compaction_summary"),
-                          metadata["distill"] == .string("pending") else { continue }
-                    metadata["distill"] = .string("mechanical")
-                    row["metadata"] = .object(metadata)
-                    segments[index] = try JSONValue.object(row).serialize(pretty: false)
-                    try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                        Data(segments.joined(separator: "\n").utf8), to: path)
-                    return true
-                }
-                return false
-            }
-            if changed {
-                await Self.publishTranscriptChange(
-                    sessionId: sessionId, dataRoot: dataRoot, persistence: persistence
-                )
-            }
-        } catch {
-            FileHandle.standardError.write(Data(
-                "ChatCompactionDistiller: pending summary could not be settled for session \(sessionId): \(error)\n".utf8
-            ))
-        }
     }
 
     private struct PreparedRecollection: Sendable {
@@ -390,7 +406,7 @@ public struct ChatCompactionDistiller: Sendable {
               !resolved.trimmingCharacters(in: .whitespaces).isEmpty else {
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: turnModel,
-                charsIn: 0, charsOut: 0, runId: runId, status: "skipped"
+                charsIn: 0, charsOut: 0, runId: runId, status: "failed", failure: DistillError.routeUnavailable
             )
             return nil
         }
@@ -434,7 +450,7 @@ public struct ChatCompactionDistiller: Sendable {
                     sessionId: sessionId, surface: surface, model: model,
                     charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
                     runId: runId, status: "failed",
-                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted, failure: error
                 )
                 return nil
             }
@@ -444,7 +460,7 @@ public struct ChatCompactionDistiller: Sendable {
                     sessionId: sessionId, surface: surface, model: model,
                     charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
                     runId: runId, status: "failed",
-                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted, failure: DistillError.empty
                 )
                 return nil
             }
@@ -466,7 +482,7 @@ public struct ChatCompactionDistiller: Sendable {
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: model,
                 charsIn: promptChars, charsOut: 0, runId: runId, status: "failed",
-                promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted, failure: DistillError.empty
             )
             return nil
         }
@@ -500,34 +516,24 @@ public struct ChatCompactionDistiller: Sendable {
                       obj["id"] == .string(summaryRowId),
                       case .object(let meta)? = obj["metadata"] else { return false }
                 return meta["kind"] == .string("compaction_summary")
+                    && meta["distill"] == .string("pending")
             }
         }
     }
 
     private enum DistillError: Error {
-        case timeout
+        case routeUnavailable
         case empty
     }
 
     /// One distillation call inside the bounded timeout. Extracted so every
     /// chained pass shares the same deadline the single pass always had.
     private func callLLM(model: String, prompt: String) async throws -> String {
-        // User, 2026-09-06: this raced the call against a sleep inside a task
-        // group, and leaving a group WAITS for its cancelled children — so a
-        // provider that ignores cancellation never let the timeout return and
-        // the 120 s ceiling was decorative. `withDeadline` runs both sides
-        // unstructured behind a resume-once gate and returns the moment the
-        // ceiling passes. It reports a failed call and a timeout the same way
-        // (nil); both mean "no distillation", and the mechanical summary
-        // stands either way.
         let complete = llmComplete
-        guard let text = await TurnDeadline.withDeadline(
+        return try await TurnDeadline.withThrowingDeadline(
             seconds: Self.timeoutSeconds,
             { try await complete(model, prompt) }
-        ) else {
-            throw DistillError.timeout
-        }
-        return text
+        )
     }
 
     /// 2026-07-21 audit fix: bound the distill prompt. Compaction fires at
@@ -732,7 +738,7 @@ public struct ChatCompactionDistiller: Sendable {
                 try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
             }
         } catch {
-            NSLog("Chat transcript generation bump failed: \(error)")
+            nativeLog("Chat transcript generation bump failed: \(error)")
         }
         await MainActor.run {
             NotificationCenter.default.post(
@@ -758,7 +764,8 @@ public struct ChatCompactionDistiller: Sendable {
         status: String,
         thirdPerson: Bool = false,
         promptCharsPerPass: [Int] = [],
-        rowsOmitted: Int = 0
+        rowsOmitted: Int = 0,
+        failure: (any Error)? = nil
     ) async {
         let tracesPath = dataRoot
             .appendingPathComponent("traces", isDirectory: true)
@@ -773,6 +780,16 @@ public struct ChatCompactionDistiller: Sendable {
         ]
         if let runId, !runId.isEmpty {
             payload["runId"] = .string(runId)
+        }
+        if let failure {
+            payload["distill.errorType"] = .string(String(reflecting: type(of: failure)))
+            payload["distill.error"] = .string(String(describing: failure))
+            payload["distill.deadlineExpired"] = .bool(
+                failure is TurnDeadline.DeadlineExceeded
+                    || (failure as? ProviderFailure.Diagnostic)?.deadlineExpired == true
+                    || (failure as? URLError)?.code == .timedOut
+            )
+            payload["distill.cancelled"] = .bool(failure is CancellationError)
         }
         if thirdPerson {
             payload["distill.thirdPerson"] = .bool(true)

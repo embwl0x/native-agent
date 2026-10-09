@@ -620,7 +620,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
 
         var bytes = [UInt8](repeating: 0, count: 24)
         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            NSLog("NativeAgent browser IPC failed to generate a secure token")
+            nativeLog("NativeAgent browser IPC failed to generate a secure token")
             return
         }
         let token = Data(bytes).base64EncodedString()

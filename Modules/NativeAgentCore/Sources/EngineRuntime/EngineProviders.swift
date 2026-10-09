@@ -41,7 +41,7 @@ public final class ProvidersFacade {
                         self.catalog = try await self.modelCatalog(refresh: false)
                         self.accountModelRevision += 1
                     } catch {
-                        NSLog("ChatGPT account model catalog reload failed: %@", error.localizedDescription)
+                        nativeLog("ChatGPT account model catalog reload failed: %@", error.localizedDescription)
                     }
                 }
             }
@@ -73,7 +73,7 @@ public final class ProvidersFacade {
                 do {
                     _ = try await ChatGPTAccountModelRefresh.shared.refresh(dataRoot: self.dataRoot)
                 } catch {
-                    NSLog("ChatGPT account model refresh failed: %@", error.localizedDescription)
+                    nativeLog("ChatGPT account model refresh failed: %@", error.localizedDescription)
                 }
             }
         }

@@ -133,6 +133,10 @@ extension MemoryStorage {
 
     @discardableResult
     public func insertProposal(_ proposal: StoredProposal) async throws -> StoredProposal {
+        var stamped = proposal
+        stamped.metadata = Self.normalizingPeerMomentOrigin(stamped.metadata, source: stamped.source)
+        stamped.metadata = MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(stamped.metadata))
+        let proposal = stamped
         try await dbPool.write { db in
             try Self.requireWritableEpoch(
                 in: db,
@@ -178,7 +182,10 @@ extension MemoryStorage {
         foldedKey: @Sendable (String) -> String,
         merge: @Sendable (StoredProposal) throws -> JSONValue?
     ) async throws -> StoredProposal? {
-        try await dbPool.write { db -> StoredProposal? in
+        var stamped = proposal
+        stamped.metadata = MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(stamped.metadata))
+        let proposal = stamped
+        return try await dbPool.write { db -> StoredProposal? in
             let key = foldedKey(proposal.content)
             // staged_at DESC matches `listProposals(status:)`, whose order this
             // path's `.first(where:)` used to depend on.
@@ -187,7 +194,16 @@ extension MemoryStorage {
                 sql: "SELECT * FROM proposals WHERE status = 'pending' ORDER BY staged_at DESC"
             ).map(Self.decodeProposal)
             if let existing = pending.first(where: { foldedKey($0.content) == key }) {
-                let merged = try merge(existing)
+                var merged = try MemorySenseProvenance.preserving(existing: existing.metadata, incoming: merge(existing))
+                merged = MemoryDataProvenance.preserving(existing: existing.metadata, incoming: merged)
+                merged = MemoryDataProvenance.preserving(existing: proposal.metadata, incoming: merged)
+                let provenance = MemorySenseProvenance.merging(existing: merged, incoming: proposal.metadata)
+                if !provenance.isEmpty {
+                    var metadata: [String: JSONValue] = [:]
+                    if case .object(let values)? = merged { metadata = values }
+                    metadata.merge(provenance) { _, new in new }
+                    merged = .object(metadata)
+                }
                 try db.execute(sql: """
                     UPDATE proposals SET metadata_json = ?
                     WHERE id = ? AND status = 'pending'
@@ -225,6 +241,7 @@ extension MemoryStorage {
         review: ReviewedMomentAcceptance? = nil,
         superseding: SupersedingAcceptance? = nil
     ) async throws -> StoredMemory {
+        let turnProvenance = try MemorySenseProvenance.stamping(nil)
         // The semantic-gate rejection must COMMIT, so the write closure returns
         // an outcome instead of throwing mid-transaction (a throw inside
         // dbPool.write rolls back everything — including the rejection row).
@@ -238,6 +255,13 @@ extension MemoryStorage {
             }
             guard proposal.status == "pending" else {
                 throw MemoryStorageError.alreadyResolved(id)
+            }
+            let provenance = MemorySenseProvenance.merging(existing: proposal.metadata, incoming: turnProvenance)
+            if !provenance.isEmpty {
+                var metadata: [String: JSONValue] = [:]
+                if case .object(let existing)? = proposal.metadata { metadata = existing }
+                metadata.merge(provenance) { _, incoming in incoming }
+                proposal.metadata = .object(metadata)
             }
             if let review {
                 guard proposal.content == review.expectedContent, MemoryMoments.isMoment(proposal.metadata) else {

@@ -35,6 +35,13 @@ public enum UserMessageIntentSignals {
         return controlHandoffCommands.contains(command)
     }
 
+    /// "Take over": he hands her the work where he left it.
+    public static func isTakeOver(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            .range(of: #"^(?:please )?(?:(?:can|could|will|would) you )?(?:please )?take over(?:$|[\s,:.!?])"#,
+                   options: .regularExpression) != nil
+    }
+
     public static func controlHandoffReply(lastActivity: String?) -> String {
         let activity = lastActivity?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let activity, !activity.isEmpty {

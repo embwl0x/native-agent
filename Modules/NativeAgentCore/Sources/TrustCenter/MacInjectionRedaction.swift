@@ -73,6 +73,12 @@ public enum MacInjectionArgRedaction {
     /// Replace literal text and form fields with count + digest.
     /// Non-secret arguments and non-injection tools pass through untouched.
     public static func redacted(tool: String, input: [String: JSONValue]) -> [String: JSONValue] {
+        // An action id called as a tool name (mac.act) is an app call; redact it as one.
+        let action = JSONValue.string(tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        if tool.contains("."), AppActionPolicy.action(input: ["action": action]) != nil,
+           case .object(let args)? = redacted(tool: "app", input: ["action": action, "args": .object(input)])["args"] {
+            return args
+        }
         if normalized(tool) == "app" {
             var out = input
             if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) {

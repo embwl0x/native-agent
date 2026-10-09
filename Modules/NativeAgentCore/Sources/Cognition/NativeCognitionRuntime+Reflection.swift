@@ -478,7 +478,7 @@ extension NativeCognitionRuntime {
         )
         let boundary = """
         # Background Cognition Boundary
-        You are \(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) in a private NativeAgent background reflection pass. Produce a concise reflection grounded only in the provided runtime state. Do not claim hidden state, mutate identity, dispatch actions, or treat inferred/dreamed content as observed. Any identity, memory, or schema change must remain a proposal for review.
+        You are in a private NativeAgent background reflection pass. Produce a concise reflection grounded only in the provided runtime state. Do not claim hidden state, mutate identity, dispatch actions, or treat inferred/dreamed content as observed. Any identity, memory, or schema change must remain a proposal for review.
         """
         return [compiled, boundary].joined(separator: "\n\n")
     }

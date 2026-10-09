@@ -6,7 +6,7 @@ private func formatMemoryUnavailable(_ error: Error) -> String {
     if let mv2 = error as? MemoryV2Error {
         return "Memory unavailable: \(mv2.errorDescription ?? "unknown")"
     }
-    return "Memory unavailable: \(error.localizedDescription)"
+    return UserFacingError.message(error, action: "reach memory")
 }
 
 struct QueryMemoryIntent: AppIntent {
@@ -29,28 +29,16 @@ struct QueryMemoryIntent: AppIntent {
         guard !trimmed.isEmpty else {
             return .result(value: "Empty query.", dialog: "Empty query.")
         }
-        do {
-            let response = try await SwiftNativeMemoryV2.shared.recall(
-                MemoryV2RecallRequest(text: trimmed, topK: 5, persona: nil)
-            )
-            if response.hits.isEmpty {
-                let msg = "No memories found for \"\(trimmed)\"."
-                return .result(value: msg, dialog: IntentDialog(stringLiteral: msg))
+        let message = "What do you remember about \(trimmed)?"
+        let reply: String
+        if #available(macOS 27, *) {
+            reply = try await performBackgroundTask {
+                try await NativeAgentChatIntent.reply(to: message)
             }
-            let lines = response.hits.prefix(5).enumerated().map { (i, hit) -> String in
-                let score = String(format: "%.2f", hit.score)
-                return "\(i + 1). [\(score)] \(hit.preview)"
-            }
-            let text = lines.joined(separator: "\n")
-            if #available(macOS 27, *), systemContext.isVoiceOnly {
-                let spoken = response.hits.prefix(5).map(\.preview).joined(separator: "\n")
-                return .result(value: text, dialog: IntentDialog(stringLiteral: spoken))
-            }
-            return .result(value: text, dialog: IntentDialog(stringLiteral: text))
-        } catch {
-            let msg = formatMemoryUnavailable(error)
-            return .result(value: msg, dialog: IntentDialog(stringLiteral: msg))
+        } else {
+            reply = try await NativeAgentChatIntent.reply(to: message)
         }
+        return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
     }
 }
 
@@ -74,20 +62,24 @@ struct StoreMemoryIntent: AppIntent {
         guard !trimmed.isEmpty else {
             return .result(value: "Empty content.", dialog: "Nothing to remember.")
         }
-        do {
-            let record = try await SwiftNativeMemoryV2.shared.store(
-                content: trimmed,
-                source: "AppIntent.StoreMemoryIntent",
-                metadata: nil
-            )
-            let msg = "Stored memory \(record.id)."
-            return .result(value: msg, dialog: "I'll remember that.")
-        } catch {
-            let msg = formatMemoryUnavailable(error)
-            return .result(value: msg, dialog: IntentDialog(stringLiteral: msg))
+        let message = "Please remember this: \(content)"
+        let reply: String
+        if #available(macOS 27, *) {
+            reply = try await performBackgroundTask {
+                try await NativeAgentChatIntent.reply(to: message)
+            }
+        } else {
+            reply = try await NativeAgentChatIntent.reply(to: message)
         }
+        return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
     }
 }
+
+@available(macOS 27, *)
+extension QueryMemoryIntent: LongRunningIntent {}
+
+@available(macOS 27, *)
+extension StoreMemoryIntent: LongRunningIntent {}
 
 struct ListPendingMemoryProposalsIntent: AppIntent {
     @available(macOS 27, *)

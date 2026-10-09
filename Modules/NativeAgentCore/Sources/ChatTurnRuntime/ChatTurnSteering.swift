@@ -1,13 +1,11 @@
 import Foundation
 import Transcripts
 
-/// A message the person sent while a turn was already working (third
-/// conversation pass, item 5).
+/// A queued message the person chose to Steer into the turn already working
+/// (third conversation pass, item 5; a choice, not automatic, since User
+/// 2026-10-04 — a send while she works waits in the queue until he steers it).
 ///
-/// Before this, every send during an active turn went into the send-next queue
-/// and waited for the session to go idle — so "actually, just Tuesday" sat
-/// behind a whole tool loop still working from the old request. An offer made
-/// here is picked up by the running loop at its next tool boundary, BEFORE the
+/// An offer made here is picked up by the running loop at its next tool boundary, BEFORE the
 /// model chooses another action, and delivered as ordinary text in that round's
 /// tool_result turn. The model reads it and decides whether it corrects or
 /// extends the task: no steering toggle, no keyword classifier, nothing added
@@ -28,13 +26,18 @@ public actor ChatTurnSteering {
         /// queue entry once the running turn has taken it.
         public let id: String
         public let text: String
+        public let envelope: TurnEnvelope
+        public let origin: ChatMessageOrigin?
         /// Attempt identity, retained even when commitment is still unresolved.
         /// The queue reconciles it before deciding whether to append on replay.
         public internal(set) var enqueuedRunID: String?
+        public internal(set) var receivingTurnID: String?
 
-        public init(id: String, text: String) {
+        public init(id: String, text: String, envelope: TurnEnvelope, origin: ChatMessageOrigin?) {
             self.id = id
             self.text = text
+            self.envelope = envelope
+            self.origin = origin
         }
     }
 
@@ -44,20 +47,17 @@ public actor ChatTurnSteering {
 
     private var pending: [String: [Offer]] = [:]
     private var reserved: [String: [Offer]] = [:]
+    private var delivered: [String: [Offer]] = [:]
     private var stranded: [String: [Offer]] = [:]
-    /// Offer id → its owner's "the running turn has it now", run once when
-    /// the turn reserves it, so the send-next row stays visible until then.
-    private var deliveryHandlers: [String: @MainActor @Sendable () -> Void] = [:]
-    public typealias Persister = @Sendable (String, String, String) async -> Bool
+    /// Queue owner: reserve the attempt (false), then retire it at settlement (true).
+    private var deliveryHandlers: [String: @MainActor @Sendable (Offer, Bool) async -> Bool] = [:]
+    private var returnHandlers: [UUID: [String: @MainActor @Sendable (Offer) async -> Void]] = [:]
+    public typealias Persister = @Sendable (String, Offer) async -> Bool
 
     struct OpenTurn {
         let token: UUID
-        /// How THIS turn's delivered message reaches the transcript, and
-        /// whether that write succeeded. Carried on the open turn rather than
-        /// held process-wide: one shared persister was overwritten by every
-        /// structured turn, so a bot turn starting during a Mac turn stamped
-        /// the Mac turn's steering messages as `bot`, and once that bot client
-        /// went away its weak capture refused persistence for the Mac turn.
+        let turnId: String
+        /// This turn's persister cannot be replaced by another door.
         let persist: Persister?
     }
 
@@ -78,46 +78,29 @@ public actor ChatTurnSteering {
     /// must not deliver it — the queue reconciles its identity before replay.
     @discardableResult
     public func openTurn(
-        sessionId: String, persist: Persister? = nil
+        sessionId: String, turnId: String, persist: Persister? = nil
     ) -> UUID? {
         guard !sessionId.isEmpty else { return nil }
-        let token = UUID()
-        open[sessionId] = OpenTurn(token: token, persist: persist)
+        let token = TurnAdmission.token ?? UUID()
+        open[sessionId] = OpenTurn(token: token, turnId: turnId, persist: persist)
         return token
     }
 
-    /// End the session's steerable window. Anything never picked up is held for
-    /// `takeStranded`, whose owner puts it back in the ordinary queue.
-    public func closeTurn(sessionId: String, token: UUID?) {
+    /// Close only this turn, returning unused offers before admission passes on.
+    public func closeTurn(sessionId: String, token: UUID?) async {
         guard let token, open[sessionId]?.token == token else { return }
         open.removeValue(forKey: sessionId)
-        if let left = reserved.removeValue(forKey: sessionId) {
-            stranded[sessionId, default: []].append(contentsOf: left)
+        for offer in delivered.removeValue(forKey: sessionId) ?? [] {
+            if let handler = deliveryHandlers.removeValue(forKey: offer.id) { _ = await handler(offer, true) }
         }
-        if let left = pending.removeValue(forKey: sessionId) {
-            stranded[sessionId, default: []].append(contentsOf: left)
+        let handlers = returnHandlers.removeValue(forKey: token) ?? [:]
+        let offers = (stranded.removeValue(forKey: sessionId) ?? [])
+            + (reserved.removeValue(forKey: sessionId) ?? [])
+            + (pending.removeValue(forKey: sessionId) ?? [])
+        for offer in offers.reversed() {
+            deliveryHandlers[offer.id] = nil
+            if let handler = handlers[offer.id] { await handler(offer) }
         }
-    }
-
-    /// The single drain point once a turn is over: everything it never took —
-    /// already-stranded offers, plus anything still pending — with the window
-    /// shut behind it. `closeTurn` runs from a deferred task that can lose the
-    /// race with its owner's cleanup; without draining `pending` here too, the
-    /// cleanup could find an empty box and the later close would strand an
-    /// offer after the only requeue pass, with its queue entry already gone.
-    /// The owner puts what comes back at the head of the ordinary queue, so
-    /// every offer still either steers the live turn or runs as its own turn.
-    public func takeStranded(sessionId: String) -> [Offer] {
-        open.removeValue(forKey: sessionId)
-        var out = stranded.removeValue(forKey: sessionId) ?? []
-        if let left = reserved.removeValue(forKey: sessionId) {
-            out.append(contentsOf: left)
-        }
-        if let left = pending.removeValue(forKey: sessionId) {
-            out.append(contentsOf: left)
-        }
-        for offer in out { deliveryHandlers[offer.id] = nil }
-        return out
     }
 
     /// The person removed this message from the queue before the turn took it.
@@ -125,6 +108,7 @@ public actor ChatTurnSteering {
         for key in pending.keys { pending[key]?.removeAll { $0.id == id } }
         for key in stranded.keys { stranded[key]?.removeAll { $0.id == id } }
         deliveryHandlers[id] = nil
+        for token in returnHandlers.keys { returnHandlers[token]?[id] = nil }
     }
 
     /// Whether a turn is narrating this session RIGHT NOW.
@@ -147,19 +131,22 @@ public actor ChatTurnSteering {
     /// taken (no open turn, or the pending bound is reached) and the caller
     /// keeps it queued.
     public func offer(_ offer: Offer, sessionId: String,
-                      onDelivered: (@MainActor @Sendable () -> Void)? = nil) -> Bool {
-        guard open[sessionId] != nil else { return false }
+                      onDelivered: (@MainActor @Sendable (Offer, Bool) async -> Bool)? = nil,
+                      onReturned: (@MainActor @Sendable (Offer) async -> Void)? = nil) -> Bool {
+        guard let turn = open[sessionId] else { return false }
         var queue = pending[sessionId] ?? []
-        guard queue.count < Self.maxPending else { return false }
+        guard queue.count < Self.maxPending, !queue.contains(where: { $0.id == offer.id }) else { return false }
         queue.append(offer)
         pending[sessionId] = queue
         deliveryHandlers[offer.id] = onDelivered
+        returnHandlers[turn.token, default: [:]][offer.id] = onReturned
         return true
     }
 
-    /// Called only after the next provider round is admitted. Keep offers
-    /// reserved through persistence so a Stop returns even committed rows to
-    /// the ordinary queue with their enqueue identity intact.
+    /// Called only after the next provider round is admitted. Offers stay
+    /// reserved until a provider round reads them (`markDelivered`), so a Stop
+    /// or a failed turn returns even committed rows to the ordinary queue with
+    /// their enqueue identity intact.
     public func drain(sessionId: String, cancelFlagPath: URL? = nil) async -> [Offer] {
         guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath),
               reserved[sessionId] == nil,
@@ -180,14 +167,30 @@ public actor ChatTurnSteering {
         // Each gets its attempt identity now, then leaves the visible queue
         // before the save: from here only this turn or cleanup owns it, so a
         // remove or Send next can't race the write.
-        reserved[sessionId] = queue.map { var offer = $0; offer.enqueuedRunID = UUID().uuidString; return offer }
-        for offer in queue {
-            if let handler = deliveryHandlers.removeValue(forKey: offer.id) { await handler() }
+        reserved[sessionId] = queue.map {
+            var offer = $0
+            offer.enqueuedRunID = UUID().uuidString
+            return offer
         }
-        for (index, offer) in queue.enumerated() {
+        var gone: Set<String> = []
+        for offer in reserved[sessionId] ?? [] {
+            // No claim left (removed while reserving): the queue let it go, so the turn does too.
+            guard let handler = deliveryHandlers[offer.id] else { gone.insert(offer.id); continue }
+            if await handler(offer, false) == false {
+                gone.insert(offer.id)
+                deliveryHandlers[offer.id] = nil
+            }
+        }
+        reserved[sessionId]?.removeAll { gone.contains($0.id) }
+        let taken = reserved[sessionId] ?? []
+        guard !taken.isEmpty else {
+            if reserved[sessionId]?.isEmpty == true { reserved[sessionId] = nil }
+            return []
+        }
+        for index in taken.indices {
             if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { return [] }
-            guard let runID = reserved[sessionId]?[index].enqueuedRunID else { return [] }
-            let committed = await persist(sessionId, offer.text, runID)
+            guard let savedOffer = reserved[sessionId]?[index], savedOffer.enqueuedRunID != nil else { return [] }
+            let committed = await persist(sessionId, savedOffer)
             guard open[sessionId]?.token == turn.token else { return [] }
             guard committed else {
                 // Keep their order, including rows saved before this failure.
@@ -197,13 +200,23 @@ public actor ChatTurnSteering {
             }
         }
         guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath) else { return [] }
-        return reserved.removeValue(forKey: sessionId) ?? []
+        return reserved[sessionId] ?? []
     }
 
-    /// A Stop after the actor hop can still prevent provider construction.
-    /// The rows are already saved, so retain their run IDs for queue replay.
-    public func returnUndelivered(_ offers: [Offer], sessionId: String) {
-        stranded[sessionId, default: []].append(contentsOf: offers)
+    /// Delivered means a provider round carrying the offers produced output.
+    /// Only then does the turn's close retire them from the queue.
+    public func markDelivered(_ offers: [Offer], sessionId: String) async -> Bool {
+        guard let turn = open[sessionId] else { return false }
+        for var offer in offers {
+            offer.receivingTurnID = turn.turnId
+            guard let handler = deliveryHandlers[offer.id], await handler(offer, false),
+                  open[sessionId]?.token == turn.token,
+                  let index = reserved[sessionId]?.firstIndex(where: { $0.id == offer.id }) else { return false }
+            reserved[sessionId]?.remove(at: index)
+            delivered[sessionId, default: []].append(offer)
+        }
+        if reserved[sessionId]?.isEmpty == true { reserved[sessionId] = nil }
+        return true
     }
 
     /// How a delivered message announces itself in the round. One line, only

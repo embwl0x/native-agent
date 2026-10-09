@@ -3,10 +3,8 @@ export const PROTOCOL_VERSION = 1;
 
 export const ACTIONS = Object.freeze([
   "attach",
-  "lease.acquire",
-  "lease.renew",
-  "lease.resume",
-  "lease.release",
+  "extension.reload",
+  "tab.close",
   "navigate",
   "page.snapshot.read",
   "page.element.click",
@@ -19,6 +17,7 @@ export const ACTIONS = Object.freeze([
   "page.element.drag",
   "page.wait",
   "page.scroll",
+  "page.media",
 ]);
 
 const ACTION_SET = new Set(ACTIONS);
@@ -73,7 +72,7 @@ export function successResponse(request, result) {
 export function errorResponse(request, error) {
   const normalized = error instanceof ProtocolError
     ? error
-    : new ProtocolError("internal_error", "The extension could not complete the request.");
+    : new ProtocolError("internal_error", `The extension could not complete the request: ${String(error?.message ?? error).slice(0, 300)}`);
   return {
     version: PROTOCOL_VERSION,
     type: "response",
@@ -123,45 +122,42 @@ function validatePayload(action, payload) {
       optionalString(payload.clientName, "clientName", 128);
       optionalString(payload.clientVersion, "clientVersion", 64);
       return;
-    case "lease.acquire": {
-      if (payload.renderingMode !== undefined && (!["visible_work_window", "grouped_background"].includes(payload.renderingMode) || payload.mode !== "create")) {
-        throw new ProtocolError("invalid_payload", "renderingMode supports visible_work_window or grouped_background for created tabs only.");
-      }
-      if (payload.mode !== "create" && payload.mode !== "claim") {
-        throw new ProtocolError("invalid_payload", "lease.acquire mode must be 'create' or 'claim'.");
-      }
-      if (payload.mode === "create") {
-        if (payload.initialUrl !== undefined) requireHttpURL(payload.initialUrl, "initialUrl");
-      } else {
-        requireInteger(payload.tabId, "tabId", 0);
-        const expected = requireObject(payload.expectedTab, "expectedTab");
-        requireString(expected.url, "expectedTab.url", 8192);
-        // 2026-09-22: a loading tab has an empty title; claims must still match it.
-        if (typeof expected.title !== "string" || expected.title.length > 1024) {
-          throw new ProtocolError("invalid_payload", "expectedTab.title must be a bounded string.");
-        }
-      }
-      optionalInteger(payload.leaseDurationMs, "leaseDurationMs", 30000, 300000);
+    case "extension.reload":
+      requireId(payload.reloadId, "reloadId");
       return;
-    }
-    case "lease.renew":
-      requireLeaseAndSequence(payload);
-      optionalInteger(payload.leaseDurationMs, "leaseDurationMs", 30000, 300000);
-      return;
-    case "lease.resume":
-      requireLeaseAndSequence(payload);
-      return;
-    case "lease.release":
-      requireId(payload.leaseId, "leaseId");
-      optionalBoolean(payload.closeCreatedTab, "closeCreatedTab");
+    case "tab.close":
+      requireInteger(payload.tabId, "tabId", 0);
+      optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
       return;
     case "navigate":
-      requireLeaseAndSequence(payload);
-      // "back" / "forward" walk the leased tab's own history.
+      optionalInteger(payload.tabId, "tabId", 0, Number.MAX_SAFE_INTEGER);
+      optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
+      // "back" / "forward" walk the owned tab's own history.
       if (payload.url !== "back" && payload.url !== "forward") requireHttpURL(payload.url);
       return;
     case "page.snapshot.read":
-      requireId(payload.leaseId, "leaseId");
+      requireInteger(payload.tabId, "tabId", 0);
+      optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
+      if (payload.readCursor !== undefined) {
+        const cursor = requireObject(payload.readCursor, "readCursor");
+        requireHttpURL(cursor.url);
+        optionalString(cursor.frameURL, "frameURL", 8192);
+        requireInteger(cursor.frameId, "frameId", 0);
+        optionalString(cursor.elementPath, "elementPath", 32768);
+        optionalString(cursor.addressFragment, "addressFragment", 256);
+        optionalInteger(cursor.textOffset, "textOffset", 0, Number.MAX_SAFE_INTEGER);
+        optionalInteger(cursor.optionOffset, "optionOffset", 0, Number.MAX_SAFE_INTEGER);
+        optionalBoolean(cursor.elementOnly, "elementOnly");
+        if (cursor.viewportObservationId !== undefined) {
+          requireId(cursor.viewportObservationId, "viewportObservationId");
+          if (cursor.elementPath !== undefined || cursor.elementOnly !== undefined || cursor.textOffset !== undefined || cursor.optionOffset !== undefined) {
+            throw new ProtocolError("invalid_payload", "A scroll viewport address cannot also be a folded continuation.");
+          }
+        }
+        if ((cursor.elementOnly === true || cursor.optionOffset !== undefined) && !cursor.elementPath) {
+          throw new ProtocolError("invalid_payload", "A control continuation requires its element path.");
+        }
+      }
       optionalInteger(payload.maxNodes, "maxNodes", 1, 500);
       optionalInteger(payload.maxTextChars, "maxTextChars", 1, 50000);
       if (payload.scope !== undefined && !["page", "main_content"].includes(payload.scope)) {
@@ -169,7 +165,7 @@ function validatePayload(action, payload) {
       }
       return;
     case "page.element.click":
-      requireLeaseAndSequence(payload);
+      requireTabAndSequence(payload);
       requireId(payload.snapshotId, "snapshotId");
       requireId(payload.nodeId, "nodeId");
       optionalString(payload.button, "button", 16);
@@ -203,7 +199,7 @@ function validatePayload(action, payload) {
       requireId(payload.targetNodeId, "targetNodeId");
       return;
     case "page.wait":
-      requireLeaseAndSequence(payload);
+      requireTabAndSequence(payload);
       if (payload.condition === "element_state") {
         requireId(payload.snapshotId, "snapshotId");
         requireId(payload.nodeId, "nodeId");
@@ -216,8 +212,15 @@ function validatePayload(action, payload) {
       optionalInteger(payload.timeoutMs, "timeoutMs", 100, 10_000);
       optionalInteger(payload.settleMs, "settleMs", 0, 2_000);
       return;
+    case "page.media":
+      requireTabAndSequence(payload);
+      if (!["play", "pause", "seek"].includes(payload.operation)) {
+        throw new ProtocolError("invalid_payload", "Media operation must be play, pause or seek.");
+      }
+      if (payload.operation === "seek") requireFiniteNumber(payload.seconds, "seconds", 0, Number.MAX_SAFE_INTEGER);
+      return;
     case "page.scroll":
-      requireLeaseAndSequence(payload);
+      requireTabAndSequence(payload);
       optionalId(payload.snapshotId, "snapshotId");
       optionalId(payload.targetNodeId, "targetNodeId");
       requireFiniteNumber(payload.deltaX, "deltaX", -100000, 100000);
@@ -229,7 +232,7 @@ function validatePayload(action, payload) {
 }
 
 function requireSnapshotNodeAction(payload) {
-  requireLeaseAndSequence(payload);
+  requireTabAndSequence(payload);
   requireId(payload.snapshotId, "snapshotId");
   requireId(payload.nodeId, "nodeId");
 }
@@ -269,8 +272,8 @@ function requireKeySpec(value) {
   }
 }
 
-function requireLeaseAndSequence(payload) {
-  requireId(payload.leaseId, "leaseId");
+function requireTabAndSequence(payload) {
+  requireInteger(payload.tabId, "tabId", 0);
   requireInteger(payload.expectedUserSequence, "expectedUserSequence", 0);
 }
 

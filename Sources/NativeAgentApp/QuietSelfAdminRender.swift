@@ -13,6 +13,9 @@ import StandingBots
 import SwiftUI
 import MacIntegration
 import MemoryV2
+import Studio
+import ToolRegistry
+import PersonaEngine
 
 /// Only screenshots mount an offscreen copy of a page. Text reads load owner
 /// state directly. The screenshot's unordered host never touches the visible
@@ -22,10 +25,21 @@ private struct QuietOffscreenReadKey: EnvironmentKey {
     static let defaultValue = false
 }
 
+/// The tab a screenshot asked for. A tabbed page's offscreen copy draws it, or
+/// its first (default) tab when nil — never the tab User last left open.
+private struct QuietRailTabKey: EnvironmentKey {
+    static let defaultValue: String? = nil
+}
+
 extension EnvironmentValues {
     var quietOffscreenRead: Bool {
         get { self[QuietOffscreenReadKey.self] }
         set { self[QuietOffscreenReadKey.self] = newValue }
+    }
+
+    var quietRailTab: String? {
+        get { self[QuietRailTabKey.self] }
+        set { self[QuietRailTabKey.self] = newValue }
     }
 }
 
@@ -145,23 +159,23 @@ enum QuietSelfAdminRender {
     /// gets measured, small enough that one PNG stays well inside the eight-MiB
     /// tool-image ceiling.
     static let defaultSize = CGSize(width: 1280, height: 860)
-    /// Keep the compatibility outline bounded independently of `content`.
-    static let maxElementRows = 400
 
     // MARK: - The page, built offscreen
 
+    /// `tab` is a tab key of the page's rail page (`ShellTabbedPage`); nil
+    /// draws the page's own tab, or the rail page's default.
     @ViewBuilder
-    static func pageView(for page: QuietPage, appModel: AppModel, size: CGSize = defaultSize) -> some View {
+    static func pageView(for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize) -> some View {
+        // A page that is a tab now (Mac integration, Telegram, MCP, iPhone,
+        // Agents) is drawn on its rail page with that tab open, as the
+        // window shows it: frame, title and tab row included.
+        let home = SidebarItem.shellHome(for: page.item)
         Group {
             if QuietPages.drawOnly.contains(page) {
                 SimpleShellView()
                     .environment(\.simpleSettingsMenuDrawnOpen, page.id == "simple_settings_menu")
-            } else if page.tab == "iphone" {
-                MacPairingView()
-            } else if page.tab == "agents" {
-                ShellRailPage(title: "Agents", alive: true) { AgentContactsSection() }
             } else {
-            switch page.item {
+            switch home?.parent ?? page.item {
             case .chat: ChatView()
             case .activity: TodayView()
             case .memories: MemoriesRailPage()
@@ -169,19 +183,17 @@ enum QuietSelfAdminRender {
             case .inboxPolicy: ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() }
             case .bots: BotsShelfPreviewPage()
             case .personality: PersonalityRailPage()
-            case .providers: ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true, alive: true) { ProviderSettingsView() }
+            case .providers: ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, alive: true) { ProviderSettingsView() }
             case .trust: TrustRailPage()
             case .connectors: ConnectorsRailPage()
-            case .capabilities: ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle, alive: true) { CapabilitiesView() }
+            case .capabilities: CapabilitiesRailPage()
             case .diagnostics: DiagnosticsRailPage()
             case .settings: SetupView()
-            case .telegram: TelegramView()
-            case .mcp: MCPHubView()
-            case .macIntegration: MacIntegrationView()
             default: EmptyView()
             }
             }
         }
+        .environment(\.quietRailTab, tab ?? page.tab ?? home?.tab)
         .environment(appModel)
         // Nobody opened this page. Lifecycle work stays asleep (`liveTask` /
         // `liveOnAppear`), so a read cannot change what the page reports.
@@ -229,15 +241,18 @@ enum QuietSelfAdminRender {
     /// that had never been through a display pass, which is why a
     /// screenshot came back as a title on an empty page.
     private static func withPreparedHost<T>(
-        for page: QuietPage, appModel: AppModel, size: CGSize = defaultSize,
+        for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize,
         _ body: (NSHostingView<AnyView>) -> T
     ) async -> T {
         await loadPageData(for: page, appModel: appModel)
 
         let hosting = NSHostingView(rootView: AnyView(
-            pageView(for: page, appModel: appModel, size: size)
+            pageView(for: page, tab: tab, appModel: appModel, size: size)
                 // A capture is one moment, so nothing is captured mid-animation.
                 .transaction { $0.animation = nil }
+                // Drawn as the front window would be: an inactive switch is a
+                // grey track, so on and off read alike in the picture.
+                .environment(\.appearsActive, true)
         ))
         hosting.frame = CGRect(origin: .zero, size: size)
 
@@ -245,7 +260,7 @@ enum QuietSelfAdminRender {
         // scroll geometry against a window; this one is created, used, and
         // released without ever being ordered in, made key, or given a level —
         // so it exists for AppKit and for nobody else.
-        let host = NSWindow(
+        let host = QuietCaptureWindow(
             contentRect: CGRect(origin: .zero, size: size),
             styleMask: [.borderless],
             backing: .buffered,
@@ -290,6 +305,14 @@ enum QuietSelfAdminRender {
         hosting.displayIfNeeded()
     }
 
+    /// Native controls draw their accent only in the key window. This one is
+    /// never ordered in or made key; it only answers as if it were, so a
+    /// capture shows an on switch as on. Nothing takes focus.
+    private final class QuietCaptureWindow: NSWindow {
+        override var isKeyWindow: Bool { true }
+        override var isMainWindow: Bool { true }
+    }
+
     // MARK: - Picture
 
     /// A PNG of the page, drawn by SwiftUI into a bitmap through the offscreen
@@ -297,9 +320,9 @@ enum QuietSelfAdminRender {
     /// grant, works while the app is behind other apps, and cannot capture
     /// anything that is not ours.
     static func pageImagePNG(
-        for page: QuietPage, appModel: AppModel, size: CGSize = defaultSize
+        for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize
     ) async -> (data: Data, width: Int, height: Int)? {
-        await withPreparedHost(for: page, appModel: appModel, size: size) { hosting in
+        await withPreparedHost(for: page, tab: tab, appModel: appModel, size: size) { hosting in
             // 1x: a retina page doubles the bytes for detail a model does not read.
             guard let bitmap = NSBitmapImageRep(
                 bitmapDataPlanes: nil,
@@ -327,12 +350,9 @@ enum QuietSelfAdminRender {
 // MARK: - The page in words, from the page's own data
 
 /// The same records and formatters the pages draw, without creating a second
-/// SwiftUI tree. `content` owns the words; `elements` is a bounded outline of
-/// that projection, not a claim about rendered controls or their enabled state.
+/// SwiftUI tree.
 extension QuietSelfAdminRender {
-    static func pageRead(
-        for page: QuietPage, appModel: AppModel
-    ) async -> (rows: [JSONValue], truncated: Bool, content: [JSONValue]) {
+    static func pageRead(for page: QuietPage, appModel: AppModel) async -> [JSONValue] {
         await loadPageData(for: page, appModel: appModel)
         // These page tasks load shared owner state in addition to the rail's
         // refresh. Other view tasks only populate local presentation state or
@@ -343,30 +363,33 @@ extension QuietSelfAdminRender {
         } else if page.item == .telegram {
             await appModel.refreshTelegram()
         }
-        let content = await pageProjection(for: page, appModel: appModel)
-        let outline = projectionElements(content)
-        return (outline.rows, outline.truncated, content)
-    }
-
-    private static func projectionElements(_ content: [JSONValue]) -> (rows: [JSONValue], truncated: Bool) {
-        var rows: [JSONValue] = []
-        var truncated = false
-        func append(_ text: String, depth: Int64, role: String) {
-            guard rows.count < maxElementRows else { truncated = true; return }
-            rows.append(.object([
-                "depth": .int(depth), "role": .string(role), "label": .string(bounded(text)),
-            ]))
+        var content = await pageProjection(for: page, appModel: appModel)
+        if ["settings", "providers"].contains(page.id) {
+            let turn = ChatTurnRuntimeContext.current
+            let context = ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
+                forModel: turn?.model ?? appModel.chatModel, providerID: turn?.providerID ?? appModel.chatProvider,
+                dataRoot: dataRoot(appModel))
+            if case .string(let summary)? = context["summary"] { content.append(section("Context window", [summary])) }
         }
-        for case .object(let section) in content {
-            if case .string(let heading)? = section["heading"] {
-                append(heading, depth: 0, role: "heading")
-            }
-            if case .array(let lines)? = section["lines"] {
-                for case .string(let line) in lines { append(line, depth: 1, role: "text") }
-            }
-            if truncated { break }
+        let surfaces: [String] = switch page.id {
+        case "chat": ["chat", "compaction"]
+        case "memories": ["memory"]
+        case "desk": ["desk", "workshop", "swarms"]
+        case "diagnostics": ["diagnostics", "cognition_reflection", "training"]
+        case "settings": ["dream", "rem", "self_improvement", "studio_wander", "heartbeat", "autonomy"]
+        case "pairing": ["ios"]
+        case "telegram": ["telegram"]
+        case "slack": ["slack"]
+        default: []
         }
-        return (rows, truncated)
+        if !surfaces.isEmpty {
+            do {
+                let routing = try await appModel.engine.providers.routing.checkedRoutingSnapshotReadOnly()
+                let members = ProviderSurfaceGroups.all.flatMap(\.members).filter { surfaces.contains($0.surface) }
+                content.append(section("Models", modelLines(members, routing: routing)))
+            } catch { content.append(section("Models", ["Models could not be read: \(error.localizedDescription)"])) }
+        }
+        return content
     }
 
     /// One section of the projection: a heading and the lines under it.
@@ -387,17 +410,24 @@ extension QuietSelfAdminRender {
 
     /// The page, in the words of the records it draws from.
     static func pageProjection(for page: QuietPage, appModel: AppModel) async -> [JSONValue] {
+        if let read = virtualPageReads[page.id] {
+            let registered = AppActions.on(page: page.id).filter { $0.page == page.id }.map(\.id)
+            return [section(page.title, [page.summary, read,
+                "This version covers this page's guidance and registered actions, not a file, command, tab, URL or screen."]),
+                section("Registered actions", registered)]
+        }
         if let service = servicePages[page.id] { return await serviceProjection(page, service, appModel: appModel) }
         switch page.item {
         case .chat: return await chatProjection(appModel: appModel)
         case .bots: return await botsProjection(appModel: appModel)
-        case .activity: return todayProjection(appModel: appModel)
+        case .activity: return await todayProjection(appModel: appModel)
         case .providers: return await providersProjection(appModel: appModel)
         case .trust: return trustProjection(appModel: appModel)
         case .memories: return memoriesProjection(appModel: appModel)
         case .desk: return await deskProjection(appModel: appModel)
         case .inboxPolicy: return notificationsProjection(appModel: appModel)
-        case .diagnostics: return diagnosticsProjection(appModel: appModel)
+        case .diagnostics: return await diagnosticsProjection(appModel: appModel)
+        case .tools: return toolsProjection(appModel: appModel)
         case .capabilities: return capabilitiesProjection(appModel: appModel)
         case .connectors where page.tab == "iphone": return pairingProjection(appModel: appModel)
         case .connectors where page.tab == "agents": return agentsProjection(appModel: appModel)
@@ -409,11 +439,20 @@ extension QuietSelfAdminRender {
                 "Each app's access is a setting below (off, read, write, read_write). Under Full Mac an app "
                 + "left untouched is allowed anyway; one set off here stays off.",
             ])]
-        case .personality: return personalityProjection(appModel: appModel)
+        case .personality: return await personalityProjection(appModel: appModel)
         case .settings: return settingsProjection(appModel: appModel)
         default: return []
         }
     }
+
+    private static let virtualPageReads = [
+        "files": "Read a folder with files.list {path}; read a file with files.read {path}. File and folder results carry their own versions and next arguments.",
+        "shell": "Read repository state with git.status {path}. Run commands with shell.run; a page read runs no command.",
+        "web": "Read a URL with web.read {url}; discover web.search with find. A page read fetches no URL and performs no search.",
+        "browser": "Read current browser state with browser.status, then read a tab with the browser or Chrome actions. A page read opens no tab.",
+        "mac": "Read the current screen with mac.look, or a document with mac.read. A page read captures no screen and moves no control.",
+        "markets": "Market research uses native routes. Read market.status for configured data sources; use market.watchlists, market.quote or market.tradingview for their results.",
+    ]
 
     private static func dataRoot(_ appModel: AppModel) -> URL {
         appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -653,12 +692,12 @@ extension QuietSelfAdminRender {
              runs: try BotRunQueue(dataRoot: root).activeAndQueuedIDs())
         }.value
         guard let loaded else {
-            return [section("Bots", ["The shelf could not be read."])]
+            return [section("Helpers", ["The shelf could not be read."])]
         }
         var sections: [JSONValue] = []
-        var header = [countLine(loaded.records.count, "bot", "bots") + " on the shelf."]
+        var header = [countLine(loaded.records.count, "helper", "helpers") + " on the shelf."]
         if !unattended { header.append(BotsShelfUnattended.pageLine) }
-        sections.append(section("Bots", header))
+        sections.append(section("Helpers", header))
         for record in loaded.records {
             let state = BotState(record: record, running: loaded.runs.active.contains(record.id),
                                  queued: loaded.runs.queued.contains(record.id))
@@ -685,7 +724,7 @@ extension QuietSelfAdminRender {
 
     // MARK: Today
 
-    private static func todayProjection(appModel: AppModel) -> [JSONValue] {
+    private static func todayProjection(appModel: AppModel) async -> [JSONValue] {
         let pending = appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }
         let waitingNotes = appModel.engine.inbox.items.filter { $0.status == "unread" }
         let proposals = appModel.engine.memory.proposals
@@ -694,6 +733,12 @@ extension QuietSelfAdminRender {
         waiting.append(countLine(waitingNotes.count, "unread note", "unread notes"))
         waiting.append(countLine(proposals.count, "memory waiting to be reviewed", "memories waiting to be reviewed"))
         var sections = [section("Waiting on you", waiting)]
+        switch await appModel.engine.cognitionView.pendingProposals() {
+        case .available(let pending):
+            sections.append(section("Proposed views", pending.standingViews.isEmpty ? ["None."]
+                : pending.standingViews.map { "\($0.id): \($0.title)" }))
+        case .unavailable(let reason): sections.append(section("Proposed views", [reason]))
+        }
         if !pending.isEmpty {
             sections.append(section("Approvals", pending.prefix(12).map { "\($0.title) — \($0.action), risk \($0.risk)" }))
         }
@@ -708,6 +753,19 @@ extension QuietSelfAdminRender {
 
     // MARK: Providers
 
+    private static func modelLines(_ members: [ProviderSurfaceMember], routing: ProviderRoutingSnapshot) -> [String] {
+        members.map { member in
+            if let issue = routing.unusablePickNotice(for: member.surface) { return "\(member.label): \(issue)" }
+            let provider = routing.activeProviders[member.surface] ?? "same as Chat"
+            guard let preference = routing.preferences[member.surface] else {
+                return "\(member.label): \(provider) · no model pinned"
+            }
+            let fast = preference.serviceTier == "priority" ? "Fast on" : "Fast off"
+            let think = preference.reasoningEffort.isEmpty ? "no thinking level" : "Think \(preference.reasoningEffort)"
+            return "\(member.label): \(provider) · \(preference.model) · \(think) · \(fast)"
+        }
+    }
+
     /// The three groups, each with the model its whole group runs on, and the
     /// accounts that are connected. User, 2026-09-13: every surface in a group
     /// runs on the group's model, so the projection reads the group's rows.
@@ -721,17 +779,7 @@ extension QuietSelfAdminRender {
         }
         var sections: [JSONValue] = []
         for group in ProviderSurfaceGroups.all {
-            let lines: [String] = group.members.map { member in
-                let surface = member.surface
-                let provider = snapshot.activeProviders[surface] ?? "same as Chat"
-                guard let preference = snapshot.preferences[surface] else {
-                    return "\(member.label): \(provider) · no model pinned"
-                }
-                let fast = preference.serviceTier == "priority" ? "Fast on" : "Fast off"
-                let think = preference.reasoningEffort.isEmpty ? "no thinking level" : "Think \(preference.reasoningEffort)"
-                return "\(member.label): \(provider) · \(preference.model) · \(think) · \(fast)"
-            }
-            sections.append(section(group.title, lines))
+            sections.append(section(group.title, modelLines(group.members, routing: snapshot.routing)))
         }
         let accounts = snapshot.providers.map { info -> String in
             let mode = info.auth_mode.map { " via \($0)" } ?? ""
@@ -758,6 +806,8 @@ extension QuietSelfAdminRender {
         if !rows.isEmpty {
             sections.append(section("Guardrails", rows.map { "\($0.title): \($0.value). \($0.detail)" }))
         }
+        sections.append(section("Backup ids for backup.restore", appModel.engine.trust.backups.isEmpty ? ["None."]
+            : appModel.engine.trust.backups.map { "\($0.id): \($0.createdAt) · \($0.reason)" }))
         return sections
     }
 
@@ -768,6 +818,7 @@ extension QuietSelfAdminRender {
         var head = [MemoriesPageContent.keptLine(memories.count)]
         head.append(countLine(appModel.engine.memory.proposals.count, "proposal waiting", "proposals waiting"))
         head.append(countLine(appModel.graphEntities.count, "thing in the graph", "things in the graph"))
+        head.append(contentsOf: MemoryStatusProjection.afterTurnRecovery(dataRoot: PersistenceCore.defaultDataRoot()).lines)
         var sections = [section("Memories", head)]
         if !memories.isEmpty {
             sections.append(section("Kept", memories.prefix(20).map { record in
@@ -840,7 +891,7 @@ extension QuietSelfAdminRender {
 
     // MARK: The rest
 
-    private static func diagnosticsProjection(appModel: AppModel) -> [JSONValue] {
+    private static func diagnosticsProjection(appModel: AppModel) async -> [JSONValue] {
         // The runtime line comes from the PROBE, like the status line does. A
         // failed read leaves `health` on its cached row; printing "online" off
         // that row under a "Health check failed" status is a claim about a
@@ -852,9 +903,16 @@ extension QuietSelfAdminRender {
             runtime = appModel.engine.doctor.health?.ok == true ? "online" : "not reachable"
         }
         var head = ["Runtime: \(runtime)"]
-        head.append("Status line: \(appModel.statusText)")
+        head.append("Status line: \(appModel.statusForAgent)")
         head.append(countLine(appModel.runs.count, "run recorded", "runs recorded"))
         var sections = [section("Diagnostics", head)]
+        do {
+            let tools = try await appModel.engine.tools.listAuthored()
+            for (title, targets) in [("Tool ids for tool.restore", tools.filter { $0.status == "archived" }),
+                                     ("Tool ids for tool.approve", tools.filter { ToolApprovalEligibility.refusal(for: $0) == nil })] {
+                sections.append(section(title, targets.isEmpty ? ["None."] : targets.map { "\($0.id): \($0.name)" }))
+            }
+        } catch { sections.append(section("Tool targets", ["Unavailable: \(error.localizedDescription)"])) }
         if !appModel.runs.isEmpty {
             // The Run history row's own words: kind, badge, when, how long,
             // model, and the error, output or prompt it previews.
@@ -865,6 +923,36 @@ extension QuietSelfAdminRender {
                     + [run.durationSeconds.map(UserDisplayFormatters.humanizeDuration), run.model].compactMap { $0 }
                         .filter { !$0.isEmpty })
                     .joined(separator: " · ") + ": " + RunPreviewPresentation.preview(for: run).text
+            }))
+        }
+        return sections
+    }
+
+    private static func toolsProjection(appModel: AppModel) -> [JSONValue] {
+        let tools = appModel.engine.tools
+        let state = ChatToolCatalogPresentation.catalogState(catalog: tools.catalog,
+            loadFailed: tools.catalogLoadError != nil, loadError: tools.catalogLoadError)
+        var sections: [JSONValue] = []
+        switch ToolsCatalogSurfacePresentation.state(for: state) {
+        case .loading(let detail), .empty(let detail), .unavailable(let detail):
+            sections.append(section("Tools", [detail.detail]))
+        case .catalog:
+            if let catalog = tools.catalog {
+                if case .stale(_, _, let detail) = state {
+                    sections.append(section("Tools", [detail ?? "The tool list is stale. Press Refresh to try again."]))
+                }
+                sections += ChatToolCatalogPresentation.buckets(for: catalog).map { bucket in
+                    section(bucket.title, bucket.tools.map {
+                        "\($0.name): \(ChatToolCatalogPresentation.toolStatusBadge(for: $0, in: catalog).title) · \($0.description)"
+                    })
+                }
+                sections.append(section("Mac access", [catalog.builderModeDetail]
+                    + catalog.builderAvailable + catalog.macAppAvailable))
+            }
+        }
+        if !tools.authored.isEmpty {
+            sections.append(section("Tools I wrote", tools.authored.map {
+                "\($0.name): \(AuthoredToolPresentation.statusBadge(for: $0).title) · \($0.description)"
             }))
         }
         return sections
@@ -887,11 +975,9 @@ extension QuietSelfAdminRender {
             countLine(appModel.workspaces.count, "workspace", "workspaces"),
             "Telegram: \(appModel.engine.telegram.status?.tokenConfigured == true ? "configured" : "not configured")",
         ])]
-        if !appModel.connectors.isEmpty {
-            sections.append(section("Connected", appModel.connectors.map {
-                "\($0.name)\($0.kind.isEmpty ? "" : " (\($0.kind))"): \($0.enabled ? "on" : "off")"
-            }))
-        }
+        sections.append(section("Connector ids", appModel.connectors.isEmpty ? ["None."] : appModel.connectors.map {
+            "\($0.id): \($0.name)\($0.kind.isEmpty ? "" : " (\($0.kind))"): \($0.enabled ? "on" : "off")"
+        }))
         return sections
     }
 
@@ -951,7 +1037,6 @@ extension QuietSelfAdminRender {
         "notes": (MacIntegrationID.notes, []), "contacts": (MacIntegrationID.contacts, []),
         "messages": (MacIntegrationID.messages, []), "music": (MacIntegrationID.music, []),
         "github": (nil, ["github"]), "slack": (nil, ["slack"]), "notion": (nil, ["notion"]), "x": (nil, ["x"]),
-        "markets": (nil, ["markets"]),
     ]
 
     private static func serviceProjection(_ page: QuietPage, _ service: (mac: String?, connectors: [String]),
@@ -983,20 +1068,36 @@ extension QuietSelfAdminRender {
         let root = dataRoot(appModel)
         let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
         let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-        let peers = (try? AgentPeerStore(dataRoot: root).list()) ?? []
+        guard let peers = try? AgentPeerStore(dataRoot: root).list() else {
+            return [section("Agents", ["Contacts and trusted switches could not be read."])]
+        }
         let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: usable, dataRoot: root)
         var sections = [section("Agents", [countLine(rows.count, "contact", "contacts")])]
         if !rows.isEmpty {
             sections.append(section("Contacts", rows.map { "\($0.displayName): \($0.pillWord)" }))
         }
+        if !peers.isEmpty {
+            sections.append(section("Trusted switches", peers.map { "\($0.name): trusted \($0.elevationAllowed ? "on" : "off")" }))
+        }
         return sections
     }
 
-    private static func personalityProjection(appModel: AppModel) -> [JSONValue] {
+    private static func personalityProjection(appModel: AppModel) async -> [JSONValue] {
         var head: [String] = []
         if let profile = appModel.personality { head.append("Name: \(profile.name)") }
+        head.append("Current persona name: \(appModel.chatPersona).")
         head.append(countLine(appModel.personalityDocs.count, "document", "documents"))
         var sections = [section("Personality", head)]
+        do {
+            let persona = appModel.dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? SwiftNativePersonaEngine()
+            let names = try PersonaCompiler.customPersonaNames(root: await persona.personaRoot)
+            sections.append(section("Custom names for persona.set", names.isEmpty ? ["None."] : names))
+        } catch { sections.append(section("Custom personas", ["Unavailable: \(error.localizedDescription)"])) }
+        do {
+            let consults = try await SwiftNativeStudioStore(dataRoot: dataRoot(appModel)).listConsults()
+            sections.append(section("Consult ids for studio.consult_read", consults.isEmpty ? ["None."]
+                : consults.map { "\($0.id): \($0.question) · \($0.descriptionOnly ? "description only" : "has artifacts")" }))
+        } catch { sections.append(section("Consults", ["Unavailable: \(error.localizedDescription)"])) }
         if !appModel.personalityDocs.isEmpty {
             sections.append(section("Documents", appModel.personalityDocs.map { doc in
                 let first = doc.content.split(whereSeparator: \.isNewline)
@@ -1013,7 +1114,7 @@ extension QuietSelfAdminRender {
             "Agent name: \(appModel.agentDisplayName)",
             "Chat runs on: \(appModel.chatProvider) · \(appModel.chatModel)",
             "File access: \(appModel.chatFileAccess)",
-            "Status line: \(appModel.statusText)",
+            "Status line: \(appModel.statusForAgent)",
         ])]
     }
 }

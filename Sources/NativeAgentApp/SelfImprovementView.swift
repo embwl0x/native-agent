@@ -36,7 +36,7 @@ struct SelfImprovementView: View {
                 .toggleStyle(.switch)
                 .hazeTinted()
                 .padding(14)
-                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
+                .houseInset(in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
 
                 Label("Proposals you can apply with one tap appear in Approvals on Today.",
                       systemImage: "checkmark.seal")
@@ -96,7 +96,7 @@ struct SelfImprovementView: View {
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(12)
-                        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
+                        .houseInset(in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
                 }
             }
             .padding()

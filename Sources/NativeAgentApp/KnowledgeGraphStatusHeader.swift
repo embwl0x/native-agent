@@ -45,15 +45,8 @@ public struct KGNativeStackStatus: Equatable, Sendable {
         if nativeAgentCloudKitAccountProbeEnabled() {
             status.cloudKitState = await withCKTimeout("KGNativeStackStatus.cloudKitAccount") {
                 let s = try await CKContainer.default().accountStatus()
-                switch s {
-                case .available: return "available"
-                case .noAccount: return "noAccount"
-                case .restricted: return "restricted"
-                case .temporarilyUnavailable: return "temporarilyUnavailable"
-                case .couldNotDetermine: return "unknown"
-                @unknown default: return "unknown"
-                }
-            } ?? "timeout"
+                return UserFacingError.iCloudAccount(s)
+            } ?? UserFacingError.iCloudNoAnswer
         } else {
             status.cloudKitState = nativeAgentCloudKitDisabledStatus
         }

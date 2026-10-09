@@ -61,9 +61,18 @@ public enum NativeOAuthSupport {
         return obj
     }
 
-    static func updateProviderCredential(at path: URL, update: (inout [String: Any]) throws -> Void) throws {
+    static func updateProviderCredential(
+        at path: URL,
+        replacingXAIGrant: Bool = false,
+        update: (inout [String: Any]) throws -> Void
+    ) throws {
         try CredentialFileLock.withLock(path) {
-            var object = try ProviderStateValidation.credential(at: path)
+            var object: [String: Any]
+            if replacingXAIGrant {
+                object = try ProviderStateValidation.credentialMetadata(at: path)
+            } else {
+                object = try ProviderStateValidation.credential(at: path)
+            }
             try update(&object)
             try ProviderStateValidation.credential(object)
             try writeJSONObject(object, to: path)
@@ -84,6 +93,11 @@ public enum NativeOAuthSupport {
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        if url.lastPathComponent == "xai_oauth_direct.json",
+           ["access_token", "refresh_token", "id_token", "tokens"].contains(where: { obj[$0] != nil }) {
+            try XAIOAuthCredentialStore.write(obj, to: url)
+            return
+        }
         let data = try JSONSerialization.data(withJSONObject: obj,
             options: [.prettyPrinted, .sortedKeys])
         try CredentialFileLock.withLock(url) {

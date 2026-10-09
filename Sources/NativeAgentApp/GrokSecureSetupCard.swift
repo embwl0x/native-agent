@@ -16,6 +16,7 @@ struct GrokSecureSetupCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let contact, ["creating", "secure-paste"].contains(contact.grokSetup ?? "") {
+                Text("Routine credentials").font(.headline)
                 if contact.grokConversation == nil {
                     Text("Connect briefly brings Grok Bot forward to send the routine request. If the current Bot cannot be identified, enter its exact sidebar name here, then Connect again.").font(.caption)
                     TextField("Bot name", text: $botName)
@@ -31,16 +32,14 @@ struct GrokSecureSetupCard: View {
                         } catch { status = "Could not save the Bot selection." }
                     }.disabled(busy || botName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                Text(contact.grokSetup == "creating" ? "Routine setup is not confirmed. Check Grok Bot for its approval or sign-in prompt; the request will not be resent." : GrokBotRoute.securePasteBlocker).font(.caption)
+                Text(contact.grokSetup == "creating" ? "Routine setup is not confirmed. Check Grok Bot for its approval or sign-in prompt; the request will not be resent. Paste the URL and key together at Agents → Grok Bot → Routine credentials; never in chat." : GrokBotRoute.securePasteBlocker).font(.caption)
                 Button("Read routine securely") { importNative(contact) }.disabled(busy)
-                if contact.grokSetup == "secure-paste" {
-                    SecureField("Paste {\"url\":\"…\",\"key\":\"…\"}", text: $paste)
-                        .textFieldStyle(.roundedBorder).privacySensitive()
-                        .onChange(of: paste) { _, value in
-                            if value.utf8.count > 16_384 { paste = ""; status = "Paste exceeds the secure field limit." }
-                        }
-                    Button("Save securely to Keychain") { save(contact) }.disabled(paste.isEmpty || busy)
-                }
+                SecureField("Paste {\"url\":\"…\",\"key\":\"…\"}", text: $paste)
+                    .textFieldStyle(.roundedBorder).privacySensitive()
+                    .onChange(of: paste) { _, value in
+                        if value.utf8.count > 16_384 { paste = ""; status = "Paste exceeds the secure field limit." }
+                    }
+                Button("Save securely to Keychain") { save(contact) }.disabled(paste.isEmpty || busy)
             }
             if !status.isEmpty { Text(status).font(.caption) }
         }
@@ -65,7 +64,7 @@ struct GrokSecureSetupCard: View {
             }
             let store = AgentPeerStore(dataRoot: dataRoot)
             try store.updateGrok(contact.id) { current in
-                guard current.grokSetup == "secure-paste" else { throw GrokLinkCredential.Failure.invalid }
+                guard ["creating", "secure-paste"].contains(current.grokSetup ?? "") else { throw GrokLinkCredential.Failure.invalid }
                 var credential = try GrokLinkCredential.read(peer: contact.id)
                 try credential.importWebhook(url: url, key: key)
                 try credential.write(peer: contact.id)
@@ -82,7 +81,7 @@ struct GrokSecureSetupCard: View {
             do {
                 guard let current = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == contact.id }),
                       ["creating", "secure-paste"].contains(current.grokSetup ?? "") else { return }
-                try await NativeAgentEngine.live.agents.desktop.importGrokRoutine(peer: contact.id, dataRoot: dataRoot)
+                try await NativeAgentEngine.live.agents.desktop.importGrokRoutine(peer: contact.id, dataRoot: dataRoot, waitForCreation: true)
                 ready()
             } catch {
                 try? AgentPeerStore(dataRoot: dataRoot).updateGrok(contact.id) { $0.grokSetup = "secure-paste" }

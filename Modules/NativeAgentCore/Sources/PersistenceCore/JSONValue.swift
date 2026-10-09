@@ -16,6 +16,15 @@ public enum JSONValue: Sendable, Equatable {
 }
 
 extension JSONValue {
+    /// An object's string fields by key; empty for anything that isn't an object.
+    public var stringFields: [String: String] {
+        guard case .object(let fields) = self else { return [:] }
+        return fields.compactMapValues { value in
+            guard case .string(let text) = value else { return nil }
+            return text
+        }
+    }
+
     /// Convert using the default Codable wire format and the canonical JSON parser.
     public static func fromEncodable<T: Encodable>(_ value: T) throws -> JSONValue {
         try parse(JSONEncoder().encode(value))
@@ -45,11 +54,16 @@ extension JSONValue {
     /// literals) and replace them with `null` before parsing. So
     /// `Python NaN → Swift JSONValue.null` on read.
     public static func parse(_ data: Data) throws -> JSONValue {
-        let sanitized = stripNonFiniteTokens(data)
-        let raw = try JSONSerialization.jsonObject(
-            with: sanitized, options: [.fragmentsAllowed]
-        )
-        return convert(raw)
+        // JSONSerialization's tree is autoreleased, and a busy cooperative
+        // thread may not drain its pool for seconds: at launch every parsed
+        // feed and transcript stayed alive at once. Release it per parse.
+        try autoreleasepool {
+            let sanitized = stripNonFiniteTokens(data)
+            let raw = try JSONSerialization.jsonObject(
+                with: sanitized, options: [.fragmentsAllowed]
+            )
+            return convert(raw)
+        }
     }
 
     /// Build a `JSONValue` from a Foundation `Any` leaf/container — the same

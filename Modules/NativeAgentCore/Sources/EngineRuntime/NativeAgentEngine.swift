@@ -2,6 +2,7 @@ import BackgroundWork
 import ApprovalTransactions
 import AppToolRuntime
 import Foundation
+import NotificationInbox
 import AttentionRouting
 import Agents
 import ChatOrchestration
@@ -55,7 +56,7 @@ public final class NativeAgentEngine: Sendable {
     public let approvals: ApprovalsFacade
     public let inbox: InboxFacade
     /// Chrome control: the socket the bundled relay dials, its handshake,
-    /// Chrome's leases, and the native-host registration.
+    /// Chrome's tabs, and the native-host registration.
     public let chrome: ChromeControlRuntime
     /// TrustCenter (policy, backups, capability trust) and provider routing
     /// (connections, the model catalog, each surface's pick) for this root,
@@ -93,7 +94,19 @@ public final class NativeAgentEngine: Sendable {
         self.memory = MemoryFacade(dataRoot: dataRoot)
         self.approvals = ApprovalsFacade(dataRoot: dataRoot)
         self.inbox = InboxFacade(dataRoot: dataRoot)
-        self.chrome = ChromeControlRuntime()
+        let chromeInbox = self.inbox.store
+        self.chrome = ChromeControlRuntime(dataRoot: dataRoot, signatureFailureNote: { id, message in
+            try await chromeInbox.appendUnique(.object([
+                "id": .string(id),
+                "created_at": .string(NotificationInboxClock.nowISO()),
+                "source": .string("chrome"),
+                "severity": .string("important"),
+                "title": .string("Chrome link blocked by browser signature validation"),
+                "summary": .string(message),
+                "status": .string("unread"),
+                "actions": .array([]),
+            ]), id: id)
+        })
         self.trust = TrustFacade(dataRoot: dataRoot, connectorActionStatuses: ports.connectorActionStatuses)
         self.providers = ProvidersFacade(dataRoot: dataRoot)
         self.telegram = TelegramFacade(dataRoot: dataRoot)
@@ -182,25 +195,18 @@ public final class NativeAgentEngine: Sendable {
             a2aPushConfiguration: (hasBody ? ports : nil).map { ports in { @Sendable peer in
                 await ports.agentBridge.a2aPushConfiguration(for: peer)
             } },
-            standingBotRunEnqueue: (hasBody ? ports : nil).map { ports in { @Sendable id in
-                try ports.standingBotQueue.enqueueRun(bot: id)
+            standingBotRunEnqueue: (hasBody ? ports : nil).map { ports in { @Sendable id, question in
+                try ports.standingBotQueue.enqueueRun(bot: id, question: question)
             } },
             standingBotSession: standingBotSession()
         )
         let appTools: AppChatToolDispatcher
         if let cognition {
-            let contextFlow = self.contextFlow
             appTools = AppChatToolDispatcher(
                 inner: inner,
                 securityCenter: securityCenter,
                 enforceAutonomySecurity: enforceAppAutonomy,
                 appTools: appToolExecutor,
-                organismPostureProvider: {
-                    await cognition.organismBehaviorPosture()
-                },
-                contextPrewarm: { kind, id, terms in
-                    await contextFlow.prewarm(kind: kind, id: id, terms: terms)
-                },
                 motorOutcomeObserver: { reference in
                     let model: MotorActionReadModel?
                     switch reference.domain {
@@ -257,8 +263,6 @@ public final class NativeAgentEngine: Sendable {
                 securityCenter: securityCenter,
                 enforceAutonomySecurity: enforceAppAutonomy,
                 includeAppOwnedTools: false,
-                organismPostureProvider: { nil },
-                contextPrewarm: { _, _, _ in },
                 interactions: ports.interactions, platform: ports.chatPlatform
             )
         }
@@ -404,5 +408,8 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
     }
     func deliverReach(reply: String, itemID: String, turnID: String) async {
         await engine.cognition?.deliverReach(reply: reply, itemID: itemID, turnID: turnID, chat: bridgeChatClient())
+    }
+    func cognitionChanges() async -> AsyncStream<NativeCognitionRuntimeChange>? {
+        await engine.cognition?.changes()
     }
 }

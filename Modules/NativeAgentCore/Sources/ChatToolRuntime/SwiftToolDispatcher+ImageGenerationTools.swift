@@ -164,6 +164,7 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
 
         let trimmedPrompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { throw ImageGenerationToolError.missingPrompt }
+        try await OpenAIOAuthDirectAdapter.prepareCodexChildHome(codexHome)
 
         let runId = UUID().uuidString.lowercased()
         let started = Date()
@@ -809,20 +810,12 @@ extension SwiftToolDispatcher {
                     references: references,
                     background: jsonString(input["background"]) ?? "auto"
                 ).normalizedForBuiltIn()
-                // The CLI runs on the app's OWN Codex home for this route —
-                // the STRICT resolution the chat path uses
-                // (ChatOrchestrationClient+Factories:376) — so image work signs
-                // in as the Work account. The shared-fallback form prefers an
-                // ambient CODEX_HOME and can return an adopted ~/.codex, which
+                // The CLI runs on the access-only copy of the app's OWN
+                // ChatGPT sign-in for this route, so image work signs in as the
+                // Work account. An ambient CODEX_HOME or an adopted ~/.codex
                 // would run image work on whatever account that home holds.
                 let client = SwiftCodexImageGenerationClient(
-                    codexHome: OpenAIOAuthDirectAdapter
-                        .preferredAuthPath(
-                            dataRoot: dataRoot,
-                            allowSharedFallbacks: false,
-                            defaultRoot: dataRoot
-                        )
-                        .deletingLastPathComponent(),
+                    codexHome: OpenAIOAuthDirectAdapter.codexChildHome(dataRoot: dataRoot),
                     dataRoot: dataRoot,
                     controllerModel: controllerModel
                 )

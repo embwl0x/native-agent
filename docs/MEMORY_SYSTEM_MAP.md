@@ -35,8 +35,8 @@ Read the page for the current arguments and applicable action warnings.
 | `MemoryV2/MemoryStorage+Migrations.swift`, `MemoryStorage+Codecs.swift`, `MemoryStorage+Integrity.swift` | Schema, checked decoding and semantic integrity of the same store. |
 | `MemoryV2/MemoryStorage+Proposals.swift`, `MemoryStorage+Tombstones.swift` | Proposal acceptance/rejection and suppression of rejected or forgotten content. |
 | `MemoryV2/MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | Cached recall candidates, vector and lexical scoring. |
-| `MemoryV2/MemoryV2+AdaptivePromoter.swift` | Calls the shared interpretation, screens candidates and stages fact/moment proposals. |
-| `ChatTurnRuntime/MindMemoryManager.swift` | One model interpretation returning memories, a possible moment, affect and a caring judgment. |
+| `MemoryV2/MemoryV2+AdaptivePromoter.swift` | Applies `AfterTurnNoveltyGate.swift` before the shared interpretation, screens candidates and stages fact/moment proposals. |
+| `ChatTurnRuntime/MindMemoryManager.swift` | At most one shared model interpretation after the novelty gate, returning memories, a possible moment, affect and a caring judgment. |
 | `KnowledgeGraph/KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: ordered per-memory entity, edge and support projection into the shared SQLite database. |
 | `ContextFlow/NativeMemoryContextProjection.swift` | Compiles eligible memory records into selectable context atoms. |
 | `MemoryV2/MemoryV2+ConsolidationGate.swift` | Builds and stages a candidate, then reconciles approved application and derived projections. |
@@ -58,7 +58,10 @@ refused save is not a remembered fact.
 
 ### The memory-manager lane
 
-`AdaptiveMemoryPromoter` invokes `MindMemoryManager.interpret` with the
+`AdaptiveMemoryPromoter` applies `AfterTurnNoveltyGate.swift` first. A skip
+makes no interpretation call, records `noveltySkipReason` and finishes the
+deferred cognition turn with `noveltySkipped=true`. Otherwise it invokes
+`MindMemoryManager.interpret` at most once with the
 incoming message, available reply, bounded existing/pending memories and the
 speaker's name. Bridge peers are named as peers; `bot-` sessions are skipped.
 The model uses the Memory route when separately configured, otherwise Chat.
@@ -179,6 +182,16 @@ for its automatic recall block.
 surface; both explicit recall and automatic projection consume that policy.
 `ContextBudgetPolicy` sizes the turn's memory/context allowance, while
 `ContextSelectionContracts.swift` owns selector limits.
+
+`NativeMemoryContextProjection` marks `moment`, `relationship` and
+`lesson_origin` atoms as personal memories. With the default
+`personalRecallFloor` of 0.20, they leave ordinary competition: the selector
+chooses one personal memory or none by query cosine lift above that memory's
+own baseline (its mean cosine to ordinary memory atoms in the generation).
+The chosen row consumes the existing memory-row and character budget, subject
+to the same eligibility and disclosure checks. A floor of zero restores
+ordinary competition. See [personality-ablation.md](personality-ablation.md)
+for the mechanism checklist.
 
 `ContextFlow/NativeContextMemoryProvenance.swift` attaches selected atom-to-record
 identity to the exact prepared turn and its generation lease without changing

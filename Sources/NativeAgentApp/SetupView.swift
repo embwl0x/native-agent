@@ -6,12 +6,13 @@
 // same storage the old Settings controls wrote — the Subconscious master and
 // Fluid Context (SlimSettingsView ▸ Advanced ▸ Subconscious), the moments lane
 // switch (MomentsLaneSetting), the agent's hour (StudioWanderLane.enabledDefaultsKey),
-// the Mac Integration permission store, and the Trust presets. Nothing on the
+// and the Mac Integration permission store. Nothing on the
 // top half of this page names an internal: no "Subconscious", no "Fluid
 // Context", no "organism", no "YOLO". User, 2026-09-04: the features those
 // words stood for are cards further down this page now, said in plain words.
 
 import SwiftUI
+import AppToolRuntime
 import Context
 import ContextFlow
 import MacIntegration
@@ -22,60 +23,24 @@ import ProviderRouting
 import BackgroundLoops
 import Cognition
 
-// MARK: - Routes
+// MARK: - Links to the rail
 
-/// Everything Setup can push. Typed so a row cannot keep a valid-looking
-/// destination while the view it opens drifts elsewhere.
-enum SetupRoute: Hashable, Sendable {
-    /// Where the reflection mind and the hour's mind went when Setup was cut
-    /// down to one. Nothing was deleted: both pickers live here now.
-    case minds
-    case providers
-    case telegram
-    case pairDevice
-    case macIntegration
-    case trust
-    case personality
-    case connectors
-    case capabilities
-    case knowledgeGraph
-    case dreams
-    case diagnostics
-    case inboxPolicy
-    case mcp
-    case skillsAndTools
-    /// The remaining existing settings sections — devices, embeddings/memory
-    /// mode, chat compaction, global shortcut, updates, help, about — reused
-    /// exactly as they are rather than rewritten.
-}
-
-extension SetupRoute {
-    /// What the page is called when you are standing on it. One spelling for
-    /// the row that opens it and the title at the top of it.
-    var displayName: String {
-        switch self {
-        case .minds: "\(AgentVoice.live.possessive) minds"
-        case .providers: "Providers"
-        case .telegram: "Telegram"
-        case .pairDevice: "iPhone"
-        case .macIntegration: "Mac integration"
-        case .trust: "Trust"
-        case .personality: "Personality"
-        case .connectors: "Connectors"
-        case .capabilities: "Capabilities"
-        case .knowledgeGraph: "Knowledge graph"
-        case .dreams: "Dreams"
-        case .diagnostics: "Diagnostics"
-        case .inboxPolicy: "Notifications"
-        case .mcp: "MCP"
-        case .skillsAndTools: "Skills & tools"
+/// Settings opens the rail's own pages; it never pushes a copy of one. Simple
+/// and Agent view have no rail, so a link lands in Advanced, as Simple's
+/// "More settings…" does.
+@MainActor
+enum SettingsLink {
+    static func open(_ item: SidebarItem, tab: String? = nil) {
+        let mode = SimpleViewMode.resolved(UserDefaults.standard.string(forKey: SimpleViewMode.key) ?? "")
+        if mode != SimpleViewMode.advanced {
+            UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key)
         }
+        NativeAgentAppCoordinator.shared.request(.sidebar(item))
+        // The route lands on the page's first tab, synchronously, so the tab
+        // is chosen after it.
+        if let tab { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(item)) }
     }
-
-    /// What the page is FOR, in plain words. The Advanced list's second line;
-    /// no internals, no jargon.
 }
-
 
 /// THE HOUSE, WORN FROM THE OUTSIDE. Every page behind Advanced is the page it
 /// always was — none of their internals are rewritten here. This puts the room
@@ -156,8 +121,11 @@ struct ShellPageFrame<Content: View>: View {
                 // The header's 20pt gap, as a soft edge scrolled rows fade
                 // across rather than a line that slices them.
                 .aliveTopDissolve(alive ? 20 : 0)
+                .pageScrollColumn()
+                // A page pushed inside a tab draws its own actions.
+                .environment(\.shellTabRowHostsActions, false)
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, NativeAgentSpacing.pageInset)
         .padding(.top, alive && !showsBack ? TodayMetrics.topPadding : 20)
         .onPreferenceChange(AlivePageLineKey.self) { aliveLine = $0 }
         .frame(maxWidth: wide ? .infinity : TodayMetrics.contentWidth, alignment: .leading)
@@ -176,47 +144,6 @@ struct ShellPageFrame<Content: View>: View {
         .navigationTitle(title)
         .navigationBarBackButtonHidden(true)
         .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
-    }
-}
-
-struct SetupRouteView: View {
-    let route: SetupRoute
-    /// What the back row says. The page one step down the stack, so a page
-    /// opened from Advanced says "Advanced" and one opened from Setup says
-    /// "Settings" — the word always names where back actually lands.
-    var backLabel: String = "Settings"
-    @State private var skillsSection: SkillsToolsSection = .skills
-
-    var body: some View {
-        ShellPageFrame(title: route.displayName, backLabel: backLabel, alive: route == .inboxPolicy || Self.aliveRoutes.contains(route)) {
-            page
-        }
-    }
-
-    /// The settings-type pages rebuilt in the Alive style (2026-09-23).
-    private static let aliveRoutes: Set<SetupRoute> = [
-        .providers, .trust, .personality, .connectors, .capabilities, .diagnostics, .minds,
-    ]
-
-    @ViewBuilder
-    private var page: some View {
-        switch route {
-        case .minds: SetupMindsView()
-        case .providers: ProviderSettingsView()
-        case .telegram: TelegramView()
-        case .pairDevice: MacPairingView()
-        case .macIntegration: MacIntegrationView()
-        case .trust: TrustCenterView()
-        case .personality: PersonalityView()
-        case .connectors: ConnectorsView()
-        case .capabilities: CapabilitiesView()
-        case .knowledgeGraph: KnowledgeGraphView()
-        case .dreams: DreamsView()
-        case .diagnostics: DiagnosticsView()
-        case .inboxPolicy: InboxSettingsView()
-        case .mcp: MCPHubView()
-        case .skillsAndTools: SkillsToolsView(selection: $skillsSection)
-        }
     }
 }
 
@@ -259,133 +186,99 @@ struct SetupView: View {
     @State private var macPermissions: [String: MacIntegrationPermission] = [:]
     @State private var macPermissionsLoaded = false
     @State private var macPermissionsUnavailable = false
-    @State private var applyingPosture = false
-    @State private var confirmEverything = false
     /// Every sentence on this page is built out of this: the agent's name,
     /// never a gender.
     private var voice: AgentVoice {
         AgentVoice(name: appModel.agentDisplayName)
     }
 
-    // THE STACK OWNS ITS PATH. Do not bind one here.
-    //
-    // Crash 2026-09-03, four EXC_BREAKPOINTs on the same page (last:
-    // NativeAgentApp-2026-09-03-191023.ips). Every report is the same stack:
-    // `NavigationColumnState.boundPathChange(to:environment:)` →
-    // `swift_unexpectedError`, under `NavigationAuthority.flushRequestQueue`.
-    // `boundPathChange` only exists when the path is BOUND. With a binding,
-    // SwiftUI flushes a queued request (every `NavigationLink(value:)`, every
-    // `dismiss()`) against whatever the path holds NOW, and when the program
-    // has written that path in the same cycle the write-back throws inside
-    // SwiftUI's own `try!` — nothing in app code can catch it. Guarding the
-    // writes (47b4efba) narrowed the window; it did not close it.
-    //
-    // Unbound, that code path does not run at all. The price is that no one
-    // can write the path, so every push on this page is a NavigationLink
-    // back is `dismiss()`, and reset-to-root is a remount — ContentView
-    // hangs `.id(settingsRootRouteVersion)` on this view.
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                // Alive glass (2026-09-23): the page's sections, each ONE
-                // group card of rows under an eyebrow, where every setting
-                // used to be its own card.
-                VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-                    AlivePageHeader(
-                        title: appModel.agentDisplayName,
-                        line: "Four things make up who I am. Everything else I carry is below."
-                    )
-                    .accessibilityElement(children: .combine)
-                    if let innerLifeError {
-                        Text(innerLifeError)
-                            .font(ShellType.labelMedium)
-                            .foregroundStyle(.orange)
-                            .textSelection(.enabled)
-                            .padding(.top, 8)
-                    }
-                    section("Four things") { fourThings }
-                    // User, 2026-09-05: the everyday controls come first; the
-                    // fourteen feature switches sit below them.
-                    section("And the rest") {
-                        postureRow
-                        mindRow
-                        // User's call, 2026-09-02: the switch a person flips
-                        // most sits above the connection rows.
-                        appearanceRow
-                        // User, 2026-09-04: no All settings door. What lived
-                        // there is here, as rows (SetupRestRows).
-                        SetupRestRows(part: .everyday)
-                    }
-                    section("Connections") { connectionRows }
-                    SetupRestRows(part: .app)
-                    // User, 2026-09-04: "a switch for each of her features,
-                    // all here, simple." One row per feature, wired to the
-                    // key the feature actually reads (SetupFeatureRows).
-                    SetupFeatureRows()
+        ScrollView {
+            // Alive glass (2026-09-23): the page's sections, each ONE
+            // group card of rows under an eyebrow, where every setting
+            // used to be its own card.
+            VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                AlivePageHeader(
+                    title: "Settings",
+                    line: "These make up who I am. Everything else I carry is below."
+                )
+                .accessibilityElement(children: .combine)
+                if let innerLifeError {
+                    Text(innerLifeError)
+                        .font(ShellType.labelMedium)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                        .padding(.top, 8)
                 }
-                .padding(.horizontal, 20)
-                .padding(.top, TodayMetrics.topPadding)
-                .padding(.bottom, 32)
-                .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
-                .frame(maxWidth: .infinity)
-            }
-            .navigationTitle("Settings")
-            // Coming back from Providers or minds is when a recovery lands.
-            .liveOnAppear { Task { await refreshInnerLifeStatus() } }
-            // A lane switched below (reflection, moods) moves the runtime, and
-            // the runtime says so: re-read the status on every change.
-            .liveTask {
-                let changes = await appModel.engine.cognitionView.changes()
-                for await _ in changes {
-                    guard !Task.isCancelled else { return }
-                    await refreshInnerLifeStatus()
+                section("Who I am") { fourThings }
+                // User, 2026-09-05: the everyday controls come first; the
+                // fourteen feature switches sit below them.
+                // The trust level and the chat model are the composer's
+                // and the rail's (Trust, Providers); Telegram, iPhone and
+                // Senses are rail tabs. Settings does not copy them.
+                section("And the rest") {
+                    appearanceRow
+                    // User, 2026-09-04: no All settings door. What lived
+                    // there is here, as rows (SetupRestRows).
+                    SetupRestRows(part: .everyday)
                 }
+                SetupRestRows(part: .app)
+                // User, 2026-09-04: "a switch for each of her features,
+                // all here, simple." One row per feature, wired to the
+                // key the feature actually reads (SetupFeatureRows). The
+                // inner life's master heads its own card.
+                SetupFeatureRows { innerLifeControls }
             }
-            // The registration sits at the root and is unconditional, so a
-            // link anywhere in the stack always finds its destination.
-            .navigationDestination(for: SetupRoute.self) { route in
-                SetupRouteView(route: route)
+            .padding(.top, TodayMetrics.topPadding)
+            .padding(.bottom, 32)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        // The shared page column, as Today and every framed page.
+        .pageScrollColumn()
+        .padding(.horizontal, 20)
+        .frame(maxWidth: TodayMetrics.contentWidth, maxHeight: .infinity, alignment: .top)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .navigationTitle("Settings")
+        // Coming back from Providers or minds is when a recovery lands.
+        .liveOnAppear { Task { await refreshInnerLifeStatus() } }
+        // A lane switched below (reflection, moods) moves the runtime, and
+        // the runtime says so: re-read the status on every change.
+        .liveTask {
+            let changes = await appModel.engine.cognitionView.changes()
+            for await _ in changes {
+                guard !Task.isCancelled else { return }
+                await refreshInnerLifeStatus()
             }
         }
         .liveTask {
-            appModel.engine.sync.observeStatus()
             await refreshMacPermissions()
-            // LIVE STATE, NOT DEFAULTS. Nothing on this page was pulling
-            // Telegram's status, so the tile rendered the `false` default while
-            // the bot was up. `.settings` is the sidebar item whose refresh
-            // fetches `engine.telegram.load()` (AppModel+ChatSessions), and the
-            // trust policy is fetched here too — without it `liveAccessMode`
-            // falls back to the `chatFileAccess` default and the posture
-            // control shows a grant the policy may not actually hold.
+            // LIVE STATE, NOT DEFAULTS: `.settings` is the sidebar item whose
+            // refresh this page's rows read (AppModel+ChatSessions).
             await appModel.refreshForSidebarItem(.settings)
-            // A swallowed failure here left the PREVIOUS policy on screen — the
-            // posture control would show a grant the policy may not hold, and
+            // The dream, REM and memory switches read the trust policy. A
+            // swallowed failure here left the PREVIOUS policy on screen and
             // nothing said so. Say so.
             do {
                 appModel.engine.trust.policy = try await appModel.engine.trust.load()
             } catch {
                 innerLifeError = "I couldn't read the trust policy just now, so what this page shows may be out of date."
             }
-            // Ungated: the providers list may be populated but `chatProvider`
-            // stale, and this is the call that re-reads providers/active.json.
-            await appModel.loadProvidersForChat()
         }
+        // A screenshot's offscreen copy reads the Mac grants too (a read,
+        // counted so the capture waits), instead of drawing "Checking…".
+        .quietReadTask(live: false) { await refreshMacPermissions() }
     }
 
     // MARK: Header
 
     private func section<Rows: View>(_ title: String, @ViewBuilder rows: () -> Rows) -> some View {
-        SetupSection(title: title, rows: rows)
+        AdvancedSection(title: title, content: rows)
     }
 
     // MARK: The four things
 
     @ViewBuilder
     private var fourThings: some View {
-        DisclosureGroup("Mind diagnostics") {
-            innerLifeControls
-        }
-
         SetupSwitchCard(
             title: "Moments I keep",
             sentence: "Small things that happened between us. I pick which stay.",
@@ -419,7 +312,8 @@ struct SetupView: View {
         // User, 2026-09-04: this was a switch bound to a constant. Each
         // capability is its own grant and macOS asks again on first use,
         // so there is nothing one switch could honestly do. The card
-        // says what is granted and opens the page where the grants are.
+        // says what is granted and opens the rail's Trust ▸ Mac
+        // integration, where the grants are.
         SetupInfoCard(
             title: "Use my Mac",
             detail: macPermissionsUnavailable
@@ -429,7 +323,7 @@ struct SetupView: View {
                         ? "On — macOS still asks for each app."
                         : "Off. Choose what I may reach.")
                     : "Checking…",
-            route: .macIntegration
+            open: { SettingsLink.open(.macIntegration) }
         )
     }
 
@@ -443,8 +337,8 @@ struct SetupView: View {
             ),
             disabled: savingInnerLife
         ) {
-            // ONE MIND ON THIS PAGE. The reflection-mind picker moved to
-            // Advanced ▸ minds (SetupMindsView); this card is a switch.
+            // NO MIND ON THIS PAGE. The reflection-mind picker is on
+            // Personality ▸ My minds (SetupMindsView); this card is a switch.
             innerLifeStatus
         }
     }
@@ -462,16 +356,16 @@ struct SetupView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(status.text)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(innerLifeStatusColor(status.tone))
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("setup.innerLife.status")
                     Spacer(minLength: 8)
                     switch status.recovery {
                     case .configureProvider:
-                        NavigationLink("Set up a connection", value: SetupRoute.providers)
+                        Button("Set up a connection") { SettingsLink.open(.providers) }
                     case .selectModel:
-                        NavigationLink("Choose my reflection mind", value: SetupRoute.minds)
+                        Button("Choose my reflection mind") { SettingsLink.open(.personality, tab: "minds") }
                     case .reapply:
                         Button("Enable again") { Task { await setInnerLife(true) } }
                             .disabled(savingInnerLife)
@@ -484,7 +378,7 @@ struct SetupView: View {
                 .controlSize(.small)
                 if let detail = status.detail {
                     Text(detail)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
@@ -509,126 +403,6 @@ struct SetupView: View {
 
     private var anyMacCapabilityEnabled: Bool {
         macPermissions.values.contains { $0.read || $0.write }
-    }
-
-    // MARK: Posture
-
-    private var postureRow: some View {
-        let live = SetupPosture.resolve(
-            accessMode: liveAccessMode,
-            outsideWorkspaceDefault: appModel.engine.trust.policy?.filePolicy?.outsideWorkspaceDefault
-        )
-        // The control is always on the page. Full Mac is not one of these three
-        // words, so it selects the nearest (Trusted) and says underneath what is
-        // actually granted rather than hiding the control behind a link.
-        return VStack(alignment: .leading, spacing: 6) {
-            SetupRow(
-                title: "What I do without asking",
-                detail: live?.sentence(voice)
-                    ?? "More than any of these: I have full run of this Mac right now."
-            ) {
-                Picker("What I do without asking", selection: Binding(
-                    get: { live ?? .trusted },
-                    set: { posture in
-                        // `live` is optional, so at Full Mac every segment —
-                        // Trusted included — differs from it and applies.
-                        guard posture != live else { return }
-                        // The one segment that is one click from full run
-                        // of the Mac asks first.
-                        if posture == .everything {
-                            confirmEverything = true
-                        } else {
-                            Task { await applyPosture(posture) }
-                        }
-                    }
-                )) {
-                    ForEach(SetupPosture.allCases) { posture in
-                        Text(posture.title).tag(posture)
-                    }
-                }
-                .pickerStyle(.segmented)
-                // The selected segment wears the haze, like the switches
-                // above (User, 2026-09-23: system blue clashed with it).
-                .hazeTinted(.segments)
-                .labelsHidden()
-                .fixedSize()
-                .confirmationDialog(
-                    "Turn on Full Mac?",
-                    isPresented: $confirmEverything,
-                    titleVisibility: .visible
-                ) {
-                    Button("Turn on Full Mac", role: .destructive) {
-                        // The dialog IS the confirmation; without the flag
-                        // the apply asked for it again and did nothing.
-                        Task { await applyPosture(.everything, confirmed: true) }
-                    }
-                    Button("Not now", role: .cancel) {}
-                } message: {
-                    Text("I will be able to change anything on this Mac without asking. You can pick another level any time.")
-                }
-                .disabled(applyingPosture)
-            }
-            if live == nil {
-                Text("Choosing a level replaces the current permissions. Review the details on the Trust page.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    private var liveAccessMode: String {
-        if let policy = appModel.engine.trust.policy {
-            return AppModel.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
-        }
-        return AppModel.normalizedAgentAccessMode(appModel.chatFileAccess)
-    }
-
-    @MainActor
-    private func applyPosture(_ posture: SetupPosture, confirmed: Bool = false) async {
-        applyingPosture = true
-        defer { applyingPosture = false }
-        let outcome = await TrustPolicyPresetAction.apply(
-            posture.preset, appModel: appModel, fullMacConfirmed: confirmed
-        )
-        appModel.statusText = TrustPolicyPresetActionPresentation.statusText(for: outcome)
-    }
-
-    // MARK: The one mind
-
-    /// ONE MIND, ONE ROW. This replaces the old Provider tile (whose summary
-    /// string was the thing truncating mid-word) and is the only model choice
-    /// on this page. It drives the primary chat provider — the same
-    /// `configureSurfaceSelection` transaction the chat brain bar uses.
-    private var mindRow: some View {
-        SetupRow(
-            title: "I think with",
-            detail: "The mind behind every reply in Chat."
-        ) {
-            SetupChatMindPicker()
-        }
-    }
-
-    // MARK: Telegram / iPhone
-
-    @ViewBuilder
-    private var connectionRows: some View {
-        SetupInfoCard(
-            title: "Telegram",
-            // The live status, not the launch-time default: `engine.telegram.status`
-            // is what the Settings refresh actually fetches.
-            detail: telegramConnected ? "Connected" : "Not set up",
-            route: .telegram
-        )
-        SetupInfoCard(
-            title: "iPhone",
-            detail: appModel.engine.sync.phones.contains { $0.status == .paired } ? "Paired" : "Not paired",
-            route: .pairDevice
-        )
-    }
-
-    private var telegramConnected: Bool {
-        appModel.engine.telegram.status?.tokenConfigured ?? appModel.telegramTokenConfigured
     }
 
     private var appearanceRow: some View {
@@ -688,25 +462,6 @@ enum SetupMetrics {
     static let rowContentHeight: CGFloat = 50
 }
 
-/// An eyebrow and ONE group card holding the section's rows, hairlines
-/// between them (Alive glass, 2026-09-23). Rows carry no chrome of their own.
-struct SetupSection<Rows: View>: View {
-    let title: String
-    let rows: Rows
-
-    init(title: String, @ViewBuilder rows: () -> Rows) {
-        self.title = title
-        self.rows = rows()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(title)
-            AliveGroupCard { rows }
-        }
-    }
-}
-
 /// THE ONE ROW SHAPE on the settings pages: a 14pt medium title, one 12pt
 /// secondary sentence (two lines at most), and the control on the right.
 struct SetupRow<Control: View>: View {
@@ -731,18 +486,18 @@ struct SetupRowText: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
-                .font(.system(size: 14, weight: .medium))
+                .font(ShellType.rowTitle)
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
             Text(detail)
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .lineLimit(2)
                 .truncationMode(.tail)
                 .multilineTextAlignment(.leading)
         }
-        .frame(height: SetupMetrics.rowContentHeight, alignment: .leading)
+        .frame(minHeight: SetupMetrics.rowContentHeight, alignment: .leading)
     }
 }
 
@@ -753,10 +508,6 @@ struct SetupSwitchCard<Detail: View>: View {
     let sentence: String
     @Binding var isOn: Bool
     var disabled: Bool = false
-    /// Where the card LEADS, if it leads anywhere. A card with a route has no
-    /// setting of its own: its switch is a NavigationLink to this page, which is how a card can navigate on a stack that owns its
-    /// own path (see `SetupView.body`).
-    var route: SetupRoute? = nil
     @ViewBuilder var detail: Detail
 
     init(
@@ -764,14 +515,12 @@ struct SetupSwitchCard<Detail: View>: View {
         sentence: String,
         isOn: Binding<Bool>,
         disabled: Bool = false,
-        route: SetupRoute? = nil,
         @ViewBuilder detail: () -> Detail = { EmptyView() }
     ) {
         self.title = title
         self.sentence = sentence
         self._isOn = isOn
         self.disabled = disabled
-        self.route = route
         self.detail = detail()
     }
 
@@ -781,17 +530,7 @@ struct SetupSwitchCard<Detail: View>: View {
                 // The fixed box every row shares.
                 SetupRowText(title: title, detail: sentence)
                 Spacer(minLength: 12)
-                if let route {
-                    // Same switch, same hit target, but it TRAVELS: the
-                    // toggle is only the face, the link takes the click.
-                    NavigationLink(value: route) {
-                        switchFace.allowsHitTesting(false)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(disabled)
-                } else {
-                    switchFace
-                }
+                switchFace
             }
             detail
         }
@@ -813,11 +552,11 @@ struct SetupSwitchCard<Detail: View>: View {
 struct SetupInfoCard: View {
     let title: String
     let detail: String
-    /// The page the card opens. A value, not a closure: see `SetupView.body`.
-    let route: SetupRoute
+    /// Opens the rail page the card is about (`SettingsLink`).
+    let open: () -> Void
 
     var body: some View {
-        NavigationLink(value: route) {
+        Button(action: open) {
             SetupRow(title: title, detail: detail) {
                 Image(systemName: "chevron.right")
                     .font(ShellType.captionSemibold)
@@ -884,6 +623,13 @@ struct ProviderThenModelPicker: View {
 
     private var selectedProvider: Provider? {
         visibleProviders.first(where: { $0.id == currentProviderID })
+    }
+
+    /// "Anthropic (OAuth / Setup-Token)" is a wiring detail, not a name. The
+    /// parenthetical is dropped so the row reads "Anthropic · Opus 5".
+    static func plainProviderName(_ displayName: String) -> String {
+        guard let open = displayName.range(of: " (") else { return displayName }
+        return String(displayName[..<open.lowerBound])
     }
 
     private var visibleModels: [Model] {
@@ -954,136 +700,6 @@ struct ProviderThenModelPicker: View {
     }
 }
 
-// MARK: - The one mind
-
-/// "<name> thinks with" — one picker, one row, plain words. Writes the primary
-/// chat selection through `configureSurfaceSelection`, under the same save
-/// gate as the composer's model picker.
-struct SetupChatMindPicker: View {
-    private struct Choice: Identifiable, Equatable {
-        let id: String
-        let providerID: String
-        let modelID: String
-        let label: String
-        let ready: Bool
-        /// Carried so a model change can reconcile effort and Fast the way
-        /// the chat brain bar does; nil means "unknown, keep what is set".
-        var supportedEfforts: [String]? = nil
-        var supportsFast: Bool? = nil
-    }
-
-    @Environment(AppModel.self) private var appModel
-    @State private var saving = false
-    @State private var pendingProviderID: String?
-    @State private var pendingModelID: String?
-    @State private var errorMessage: String?
-
-    var body: some View {
-        VStack(alignment: .trailing, spacing: 4) {
-            if providers.isEmpty {
-                Text("Connect a provider first.")
-                    .font(ShellType.labelMedium)
-                    .foregroundStyle(.orange)
-            } else {
-                ProviderThenModelPicker(
-                    providers: providers,
-                    currentProviderID: pendingProviderID ?? appModel.chatProvider,
-                    currentModelID: pendingModelID ?? appModel.chatModel,
-                    disabled: saving || appModel.isSavingChatBrain
-                ) { provider, model in
-                    pendingProviderID = provider.id
-                    pendingModelID = model.id
-                    Task {
-                        await save(Choice(
-                            id: choiceID(provider.id, model.id),
-                            providerID: provider.id,
-                            modelID: model.id,
-                            label: "\(provider.name) · \(model.name)",
-                            ready: provider.ready,
-                            supportedEfforts: model.supportedEfforts,
-                            supportsFast: model.supportsFast
-                        ))
-                    }
-                }
-            }
-            if let errorMessage {
-                Text(errorMessage).font(.caption).foregroundStyle(.orange)
-            }
-        }
-    }
-
-    private var providers: [ProviderThenModelPicker.Provider] {
-        appModel.engine.providers.connections.map { provider in
-            ProviderThenModelPicker.Provider(
-                id: provider.provider_id,
-                name: Self.plainProviderName(provider.display_name),
-                ready: provider.auth_status.state == "ready",
-                models: provider.models.map {
-                    ProviderThenModelPicker.Model(
-                        id: $0.id,
-                        name: $0.name,
-                        supportedEfforts: $0.supported_reasoning_efforts,
-                        supportsFast: $0.supports_fast
-                    )
-                }
-            )
-        }
-    }
-
-    /// "Anthropic (OAuth / Setup-Token)" is a wiring detail, not a name. The
-    /// parenthetical is dropped so the row reads "Anthropic · Opus 5".
-    static func plainProviderName(_ displayName: String) -> String {
-        guard let open = displayName.range(of: " (") else { return displayName }
-        return String(displayName[..<open.lowerBound])
-    }
-
-    private var currentChoiceID: String {
-        choiceID(appModel.chatProvider, appModel.chatModel)
-    }
-
-    private func choiceID(_ providerID: String, _ modelID: String) -> String {
-        providerID + "\u{1f}" + modelID
-    }
-
-    @MainActor
-    private func save(_ choice: Choice) async {
-        defer {
-            pendingProviderID = nil
-            pendingModelID = nil
-        }
-        guard !appModel.isSavingChatBrain else {
-            errorMessage = "A model change is still saving."
-            return
-        }
-        saving = true
-        appModel.chatBrainSaveGeneration &+= 1
-        appModel.isSavingChatBrain = true
-        defer {
-            saving = false
-            appModel.isSavingChatBrain = false
-        }
-        var effort = appModel.chatReasoningEffort
-        if let efforts = choice.supportedEfforts, !efforts.isEmpty,
-           !efforts.contains(effort) {
-            effort = efforts.contains("high") ? "high" : efforts[0]
-        }
-        let fast = choice.supportsFast != false && appModel.chatFastMode
-        do {
-            let response = try await appModel.configureSurfaceSelection(
-                surface: "chat", providerID: choice.providerID, model: choice.modelID,
-                reasoningEffort: effort, serviceTier: fast ? "priority" : "default"
-            )
-            let canonical = response.current.chat
-            appModel.chatModel = canonical.model
-            appModel.chatReasoningEffort = canonical.reasoningEffort
-            appModel.chatFastMode = canonical.serviceTier == "priority"
-            errorMessage = nil
-        } catch {
-            errorMessage = "That mind could not be saved: \(error.localizedDescription)"
-        }
-    }
-}
-
 // MARK: - Reflection model picker
 
 /// The same reflection selection the Subconscious section owns: it writes
@@ -1120,7 +736,7 @@ struct SetupReflectionModelPicker: View {
                     providers: appModel.engine.providers.connections.map { provider in
                         ProviderThenModelPicker.Provider(
                             id: provider.provider_id,
-                            name: SetupChatMindPicker.plainProviderName(provider.display_name),
+                            name: ProviderThenModelPicker.plainProviderName(provider.display_name),
                             ready: provider.auth_status.state == "ready",
                             models: provider.models.map { ProviderThenModelPicker.Model(id: $0.id, name: $0.name) }
                         )
@@ -1173,7 +789,7 @@ struct SetupReflectionModelPicker: View {
             reflectionModel = ""
             reflectionProvider = ""
             loaded = false
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingError.message(error, action: "load the mind settings")
         }
     }
 
@@ -1192,7 +808,7 @@ struct SetupReflectionModelPicker: View {
             )
             await load()
         } catch {
-            errorMessage = "That mind could not be saved: \(error.localizedDescription)"
+            errorMessage = UserFacingError.message(error, action: "save that mind")
         }
         pendingProviderID = nil
         pendingModelID = nil
@@ -1299,7 +915,7 @@ struct SetupStudioWanderPicker: View {
             loaded = true
         } catch {
             loaded = false
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingError.message(error, action: "load the mind settings")
         }
     }
 
@@ -1326,17 +942,17 @@ struct SetupStudioWanderPicker: View {
             appModel.statusText = "Memory and mind → \(model) saved"
         } catch {
             await load()
-            errorMessage = "The mind for my hour could not be saved: \(error.localizedDescription)"
+            errorMessage = UserFacingError.message(error, action: "save the mind for my hour")
         }
     }
 }
 
 // MARK: - Minds (Advanced)
 
-/// WHERE THE OTHER TWO MINDS WENT. Setup shows one mind — the chat one. The
-/// reflection mind and the hour's mind are still exactly the pickers they were
-/// (`SetupReflectionModelPicker`, `SetupStudioWanderPicker`), writing the same
-/// storage; they are simply not on the simple page any more.
+/// WHERE THE MINDS ARE: Personality ▸ My minds. The chat mind is the
+/// composer's and Providers'. The reflection mind and the hour's mind are
+/// still exactly the pickers they were (`SetupReflectionModelPicker`,
+/// `SetupStudioWanderPicker`), writing the same storage.
 struct SetupMindsView: View {
     @AppStorage("cognitiveSubstrateEnabled") private var subconsciousEnabled = true
     @AppStorage(StudioWanderLane.enabledDefaultsKey) private var studioWanderEnabled = false
@@ -1344,8 +960,9 @@ struct SetupMindsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-                SetupKitSection(
-                    label: "The mind I reflect with",
+                AdvancedSection(
+                    title: "The mind I reflect with",
+                    card: .single,
                     note: subconsciousEnabled
                         ? "Used by my inner life, between conversations."
                         : "My inner life is off, so nothing reflects with this yet."
@@ -1353,8 +970,9 @@ struct SetupMindsView: View {
                     SetupReflectionModelPicker()
                 }
 
-                SetupKitSection(
-                    label: "\(AgentVoice.live.possessive) hour",
+                AdvancedSection(
+                    title: "\(AgentVoice.live.possessive) hour",
+                    card: .single,
                     note: studioWanderEnabled
                         ? "The provider and model for Memory and mind, including reflection and my daily hour."
                         : "The provider and model for Memory and mind, including reflection. My daily hour is off."
@@ -1366,35 +984,6 @@ struct SetupMindsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("\(AgentVoice.live.possessive) minds")
-    }
-}
-
-/// An eyebrow, one card of controls, and the quiet line under it — the shape
-/// every group on an Advanced page takes.
-private struct SetupKitSection<Content: View>: View {
-    let label: String
-    var note: String?
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(label)
-
-            AliveGroupCard {
-                VStack(alignment: .leading, spacing: 12) {
-                    content
-                }
-            }
-
-            if let note {
-                Text(note)
-                    .font(.system(size: 12))
-                    // Secondary, not tertiary: tertiary fails where the haze peaks.
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 2)
-            }
-        }
     }
 }
 

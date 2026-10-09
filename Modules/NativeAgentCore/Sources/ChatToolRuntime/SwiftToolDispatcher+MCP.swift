@@ -120,14 +120,22 @@ extension SwiftToolDispatcher {
         // MCP servers with strict schemas (additionalProperties: false)
         // reject calls carrying unknown keys.
         let forwarded = Self.forwardedMCPArguments(input)
+        let read = !MCPToolBridge.riskRequiresApproval(effectiveRisk)
         do {
             let result = try await dispatcher.callToolLive(
                 forServer: serverId, toolName: toolName, arguments: .object(forwarded)
             )
-            return Self.explainedMCPFailure(result, serverId: serverId, toolName: toolName)
+            return Self.explainedMCPFailure(result, serverId: serverId, toolName: toolName, read: read)
         } catch {
             if let result = Self.localMCPFailure(error, serverId: serverId, toolName: toolName, endpoint: server.endpoint) {
                 return result
+            }
+            if read {
+                return .object([
+                    "status": .string("failed"), "effects": .string("none"),
+                    "error": .string(ChatToolOutcome.errorMessage(error)),
+                    "message": .string("MCP \(serverId)/\(toolName) failed: \(ChatToolOutcome.errorMessage(error)) \(Self.readFailureNextStep)"),
+                ])
             }
             return .object([
                 "status": .string("failed"),
@@ -137,9 +145,13 @@ extension SwiftToolDispatcher {
         }
     }
 
-    static func explainedMCPFailure(_ result: JSONValue, serverId: String, toolName: String) -> JSONValue {
+    /// A tool whose effect is a read changed nothing when it failed.
+    static let readFailureNextStep = "Nothing changed (it only reads); retry it or try another way."
+
+    static func explainedMCPFailure(_ result: JSONValue, serverId: String, toolName: String, read: Bool) -> JSONValue {
         guard MCPInvocationOutcome.classify(response: result).providerToolResultIsError,
               case .object(var outer) = result else { return result }
+        if read { outer["effects"] = .string("none") }
         let payload: [String: JSONValue]
         if case .object(let nested)? = outer["result"] { payload = nested }
         else { payload = outer }
@@ -153,20 +165,7 @@ extension SwiftToolDispatcher {
                 return false
             }
         }
-        if hasOwnWords(outer) || hasOwnWords(payload) { return result }
-        if serverId == "searxng-local", toolName == "fetch",
-           payload["reason"] == .string("unsupported_content_type") {
-            var isPDF = false
-            if case .object(let coverage)? = payload["coverage"],
-               case .string(let contentType)? = coverage["content_type"] {
-                isPDF = contentType.split(separator: ";").first?
-                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "application/pdf"
-            }
-            outer["message"] = .string(isPDF
-                ? "That URL is a PDF (unsupported content type); fetch reads HTML and text only."
-                : "That URL has an unsupported content type; fetch reads HTML and text only.")
-            return .object(outer)
-        }
+        if hasOwnWords(outer) || hasOwnWords(payload) { return .object(outer) }
         func hasReadableText(_ value: JSONValue?) -> Bool {
             switch value {
             case .string(let words):
@@ -179,7 +178,8 @@ extension SwiftToolDispatcher {
             default: return false
             }
         }
-        let nextStep = "outcome unknown — inspect before retry. Check the server's original result and current state before another call."
+        let nextStep = read ? Self.readFailureNextStep
+            : "outcome unknown — inspect before retry. Check the server's original result and current state before another call."
         if !hasReadableText(payload["content"]), !hasReadableText(payload["detail"]) {
             outer["message"] = .string("MCP \(serverId)/\(toolName) reported an error: \(nextStep)")
         } else if case .string(let code)? = outer["message"] ?? payload["message"],
@@ -192,8 +192,6 @@ extension SwiftToolDispatcher {
     }
 
     static func localMCPFailure(_ error: Error, serverId: String, toolName: String, endpoint: String?) -> JSONValue? {
-        // The built-in fetch reads its argument URL directly, without contacting SearXNG.
-        if serverId == "searxng-local", toolName == "fetch" { return nil }
         let address: String
         if case ResearchClientError.localServerNotRunning(let url) = error {
             address = url

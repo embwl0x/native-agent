@@ -139,7 +139,7 @@ enum PersonalityStarterCreateAction {
             }
             return .created
         } catch {
-            return .failed(error.localizedDescription)
+            return .failed(UserFacingError.message(error, action: "create the personality docs"))
         }
     }
 }
@@ -148,6 +148,8 @@ struct PersonalityView: View {
     @Environment(AppModel.self) private var appModel
     @State private var draft = PersonalityProfile.defaultProfile
     @State private var isLoadingProfile = true
+    @State private var profileReadCompleted = false
+    @State private var profileReadInFlight = false
     @State private var documentDraftState = PersonalityDocumentDraftState()
     @State private var personalityDocDraft = ""
 
@@ -190,7 +192,7 @@ struct PersonalityView: View {
 
     private var pageBody: some View {
         Group {
-            if isLoadingProfile {
+            if isLoadingProfile && !profileReadCompleted && documentDraftState.selectedDocumentID.isEmpty {
                 Text("Reading the saved profile.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
@@ -209,7 +211,7 @@ struct PersonalityView: View {
                             // which must NOT masquerade as "no persona yet" —
                             // a live persona would see a false Create card
                             // (gpt-5.5 review LOW, 2026-07-03). Fail loud.
-                            PersonalityKitSection(label: "Persona unavailable") {
+                            AdvancedSection(title: "Persona unavailable", card: .single) {
                                 Text(detail)
                                     .font(ShellType.label)
                                     .foregroundStyle(NativeAgentShell.trouble)
@@ -236,8 +238,9 @@ struct PersonalityView: View {
     // MARK: starter — the only thing a new user sees
 
     private var starterPanel: some View {
-        PersonalityKitSection(
-            label: "Create the agent",
+        AdvancedSection(
+            title: "Create the agent",
+            card: .single,
             note: "Everything here can grow and change later."
         ) {
             Text("Name the agent. Add a few things about who the agent should be, if you want.")
@@ -300,24 +303,31 @@ struct PersonalityView: View {
     // MARK: identity — the one live profile field
 
     private var identityPanel: some View {
-        PersonalityKitSection(
-            label: "Name",
+        AdvancedSection(
+            title: "Name",
+            card: .single,
             note: "The name shown across the app and in chat."
         ) {
             TextField("Name", text: $draft.name)
                 .textFieldStyle(.roundedBorder)
+                .disabled(isLoadingProfile)
 
             HStack(spacing: 8) {
-                Button("Save name") {
+                Button(isSavingName ? "Saving name…" : "Save name") {
                     Task { await saveName() }
                 }
                 // A name-only save cannot overwrite an unrelated stale profile
                 // draft, but it still needs a successfully loaded profile to
                 // prove this is an edit rather than an accidental initialization.
-                .disabled(appModel.personality == nil || isSavingName
+                .disabled(appModel.personality == nil || isSavingName || isLoadingProfile
                     || draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                Button("Reload") {
+                if isSavingName { ProgressView().controlSize(.small) }
+                Button(isLoadingProfile ? "Reloading…" : "Reload") {
                     Task { await loadProfile(forceRefresh: true) }
+                }
+                .disabled(isLoadingProfile || isReloadingDocuments)
+                if isLoadingProfile {
+                    ProgressView().controlSize(.small)
                 }
                 Spacer(minLength: 8)
                 if let nameSaveFeedback {
@@ -358,8 +368,9 @@ struct PersonalityView: View {
     // MARK: documents — the persona itself
 
     private var docsPanel: some View {
-        PersonalityKitSection(
-            label: "Persona documents",
+        AdvancedSection(
+            title: "Persona documents",
+            card: .single,
             note: "These documents guide my identity, expression, and choices. Choose a purpose to read the document or edit it where allowed."
         ) {
             Picker("Document", selection: documentPickerSelection) {
@@ -389,7 +400,7 @@ struct PersonalityView: View {
             .help(selectedPersonalityDocIsMemoryOwnedUser ? PersonalityDocHelpCopy.memoryOwnedDocument : "")
 
             HStack(spacing: 8) {
-                Button("Save document") {
+                Button(selectedDocumentSaving ? "Saving document…" : "Save document") {
                     let docId = documentDraftState.selectedDocumentID
                     let content = personalityDocDraft
                     guard let revision = documentDraftState.beginSave(documentID: docId, content: content) else { return }
@@ -405,14 +416,15 @@ struct PersonalityView: View {
                     }
                 }
                 .disabled(documentDraftState.selectedDocumentID.isEmpty || selectedPersonalityDocIsMemoryOwnedUser
-                    || documentDraftState.savingRevisions[documentDraftState.selectedDocumentID] != nil)
+                    || selectedDocumentSaving || isLoadingProfile)
+                if selectedDocumentSaving { ProgressView().controlSize(.small) }
 
                 Button(isReloadingDocuments ? "Reloading…" : "Reload documents") {
                     Task {
                         await reloadDocuments()
                     }
                 }
-                .disabled(isReloadingDocuments)
+                .disabled(isReloadingDocuments || isLoadingProfile)
 
                 if let path = selectedPersonalityDoc?.path {
                     Text(path)
@@ -448,7 +460,15 @@ struct PersonalityView: View {
 
     @MainActor
     private func loadProfile(forceRefresh: Bool) async {
+        guard !profileReadInFlight, !isReloadingDocuments else { return }
+        profileReadInFlight = true
         isLoadingProfile = true
+        defer {
+            isLoadingProfile = false
+            profileReadInFlight = false
+            profileReadCompleted = true
+        }
+        syncPersonalityDocDraft()
         if forceRefresh || appModel.personality == nil {
             await appModel.refreshForSidebarItem(.personality)
         }
@@ -459,7 +479,6 @@ struct PersonalityView: View {
         await reloadDocuments()
         draft = appModel.personality ?? .defaultProfile
         syncPersonalityDocDraft()
-        isLoadingProfile = false
     }
 
     private var selectedPersonalityDoc: PersonalityDoc? {
@@ -481,6 +500,10 @@ struct PersonalityView: View {
 
     private var selectedPersonalityDocIsMemoryOwnedUser: Bool {
         selectedPersonalityDoc?.id.uppercased() == "USER"
+    }
+
+    private var selectedDocumentSaving: Bool {
+        documentDraftState.savingRevisions[documentDraftState.selectedDocumentID] != nil
     }
 
     private func syncPersonalityDocDraft() {
@@ -606,38 +629,6 @@ private struct PersonalityNameSaveFeedback {
     }
 }
 
-/// An eyebrow, one card of controls, and the quiet line under it — the shape
-/// every group on an Advanced page takes.
-private struct PersonalityKitSection<Content: View>: View {
-    let label: String
-    var note: String?
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        // Alive glass (2026-09-23): the eyebrow and card Today and the Desk wear.
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(label)
-
-            VStack(alignment: .leading, spacing: 12) {
-                content
-            }
-            .padding(.horizontal, AliveMetrics.rowInsetH)
-            .padding(.vertical, 16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .aliveCard()
-
-            if let note {
-                Text(note)
-                    .font(.system(size: 12))
-                    // Secondary, not tertiary: tertiary fails where the haze peaks.
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 2)
-            }
-        }
-    }
-}
-
 /// Evaluation-only fault boundary for the starter panel's second, durable
 /// write. It is nil in ordinary app operation, so it cannot alter production
 /// behavior unless an executable evaluation explicitly installs it.
@@ -694,7 +685,7 @@ struct PersonalityDocumentPurposeDetail: View {
                 .fixedSize(horizontal: false, vertical: true)
             Text(filename)
                 .font(ShellType.caption.monospaced())
-                .foregroundStyle(NativeAgentShell.secondary)
+                .foregroundStyle(NativeAgentShell.text.opacity(0.85))
         }
     }
 }

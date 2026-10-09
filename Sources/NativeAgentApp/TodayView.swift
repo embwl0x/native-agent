@@ -106,13 +106,13 @@ enum TodayPalette {
 enum TodayMetrics {
     static let contentWidth: CGFloat = 920
     static let cardRadius: CGFloat = 12
-    /// The timeline's time column, fixed. Wide enough for "10:53–11:55 am"
-    /// at 12pt: a folded row says its span, and the mockup's 64pt only held
-    /// a single clock.
-    static let timeColumnWidth: CGFloat = 98
+    /// The timeline's time column, fixed. Wide enough for "11:50 AM – 1:10 PM"
+    /// at 12pt and a gap before the ring: a folded row says its span, and the
+    /// mockup's 64pt only held a single clock.
+    static let timeColumnWidth: CGFloat = 122
     static let rowSpacing: CGFloat = 10
     static let sectionSpacing: CGFloat = 20
-    static let topPadding: CGFloat = 36
+    static let topPadding = NativeAgentSpacing.pageTop
     /// How many recent sessions are scanned for today's recollection. Bounded
     /// because each scan reads one transcript off disk.
     static let sessionsScanned = 8
@@ -284,22 +284,22 @@ enum TodayWords {
         bounded(plain(text), limit: limit)
     }
 
-    /// `3:02` / `10:53` — the mockup's time column, twelve-hour and unadorned
-    /// so it fits the 40pt gutter in every locale.
+    /// The Mac's own short time ("4:30 AM" in a US locale), in the display
+    /// zone: the one clock every User-facing time wears.
     static func clock(_ date: Date, calendar: Calendar = DisplayTimeZone.calendar) -> String {
-        let parts = calendar.dateComponents([.hour, .minute], from: date)
-        let hour = parts.hour ?? 0
-        let minute = parts.minute ?? 0
-        let twelve = hour % 12 == 0 ? 12 : hour % 12
-        return "\(twelve):\(minute < 10 ? "0" : "")\(minute) \(hour < 12 ? "am" : "pm")"
+        var style = Date.FormatStyle(date: .omitted, time: .shortened)
+        style.timeZone = calendar.timeZone
+        return date.formatted(style)
     }
 
-    /// "5:40–5:45 am" when both ends share a period, else "11:50 am–1:10 pm".
+    /// The system's own interval: "5:40 – 5:45 AM" when both ends share a
+    /// period, else "11:50 AM – 1:10 PM".
     static func clockSpan(_ start: Date, _ end: Date, calendar: Calendar = DisplayTimeZone.calendar) -> String {
-        let a = clock(start, calendar: calendar), b = clock(end, calendar: calendar)
-        if a == b { return a }
-        let sameHalf = a.suffix(2) == b.suffix(2)
-        return sameHalf ? "\(a.dropLast(3))–\(b)" : "\(a)–\(b)"
+        guard clock(start, calendar: calendar) != clock(end, calendar: calendar), start < end else {
+            return clock(start, calendar: calendar)
+        }
+        let style = Date.IntervalFormatStyle(date: .omitted, time: .shortened, timeZone: calendar.timeZone)
+        return (start..<end).formatted(style)
     }
 
     /// "once", "twice", "three times".
@@ -390,13 +390,24 @@ enum TodayWords {
     static func parseTimestamp(_ raw: String?) -> Date? {
         guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: text) { return date }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: text)
+        isoLock.lock(); defer { isoLock.unlock() }
+        if let date = fractionalISO.date(from: text) { return date }
+        return plainISO.date(from: text)
     }
+
+    // Built once: a pair per parse per row showed up on every redraw. Used
+    // only under `isoLock`, since the parse is callable off the main actor.
+    private static let isoLock = NSLock()
+    nonisolated(unsafe) private static let fractionalISO: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    nonisolated(unsafe) private static let plainISO: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
 }
 
 // MARK: - The dream digest
@@ -574,8 +585,8 @@ struct TodaySnapshot: Sendable, Equatable {
             if !TodayWords.firstSentence(newest.text).isEmpty {
                 snapshot.recollection = TodayRow(
                     id: "recollection:\(newest.rowId ?? newest.sessionId)",
-                    title: "I wrote a conversation recollection",
-                    line: "A summary of earlier conversation.",
+                    title: "I wrote down what we talked about",
+                    line: "A note to myself, so I remember it later.",
                     at: at
                 )
             }
@@ -610,6 +621,15 @@ enum WaitingOnYou {
 
     static func onDesk(_ appModel: AppModel) -> Int {
         max(0, (appModel.ownerWaitingCount ?? 0) - approvals(appModel).count)
+    }
+
+    /// `onDesk` split into Desk items and notes; nil when the overview could
+    /// not say, or when something else (a run waiting on a decision) is
+    /// among them.
+    static func split(_ appModel: AppModel) -> (items: Int, notes: Int)? {
+        guard let kinds = appModel.ownerWaitingKinds else { return nil }
+        let items = kinds[.desk] ?? 0, notes = kinds[.inbox] ?? 0
+        return items + notes == onDesk(appModel) ? (items, notes) : nil
     }
 }
 
@@ -679,9 +699,11 @@ enum TodayCollaboration {
 
 struct TodayView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @State private var snapshot = TodaySnapshot.empty
+    @State private var laneReadCount = 0
     @State private var collaborationMessages: [String: [ChatMessage]] = [:]
     @State private var dreamUnavailable = false
     @State private var openedNote: InboxItemRecord?
@@ -699,10 +721,16 @@ struct TodayView: View {
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
                 AlivePageHeader(title: "Today", line: headerLine)
 
+                PageReadStatus(
+                    isReading: isReading,
+                    text: isReading ? (snapshot.loaded ? "Refreshing today…" : "Reading today…") : nil
+                )
+
                 if hasWaiting {
                     TodayWaitingCard(
                         approvals: WaitingOnYou.approvals(appModel),
                         deskCount: WaitingOnYou.onDesk(appModel),
+                        split: WaitingOnYou.split(appModel),
                         onOpenApprovals: { sheet = .approvals }
                     )
                 }
@@ -712,7 +740,9 @@ struct TodayView: View {
                 if let earlierNotesLine {
                     VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
                         Button(earlierNotesLine + (earlierOpen ? " · Hide" : " · Show")) {
-                            earlierOpen.toggle()
+                            withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)) {
+                                earlierOpen.toggle()
+                            }
                         }
                         .buttonStyle(.plain)
                         .font(ShellType.labelMedium)
@@ -724,6 +754,7 @@ struct TodayView: View {
                                     TodayEarlierNoteRow(note: note) { openedNote = note.newest }
                                 }
                             }
+                            .transition(NativeAgentMotion.arrivalFade)
                         }
                     }
                 }
@@ -769,22 +800,16 @@ struct TodayView: View {
                         .font(ShellType.labelMedium)
                         .foregroundStyle(NativeAgentShell.secondary)
                 }
-
-                if let trouble = providerTroubleLine {
-                    Text(trouble)
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .padding(.top, 4)
-                        .accessibilityIdentifier("today.provider-trouble")
-                }
             }
-            .padding(.horizontal, 20)
             .padding(.top, TodayMetrics.topPadding)
-            .motionArrival(when: snapshot.loaded)
             .padding(.bottom, 32)
-            .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        // The shared page column (`ShellPageFrame`): the scroll view is the
+        // column, so its rows end where every other page's rows end.
+        .pageScrollColumn()
+        .padding(.horizontal, 20)
+        .frame(maxWidth: TodayMetrics.contentWidth, maxHeight: .infinity, alignment: .top)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // The same detail surface the Activity page opens, with its own
         // read/action behaviour — an older note is opened here, not retold.
@@ -1199,25 +1224,15 @@ struct TodayView: View {
         return rows.filter { !$0.id.hasPrefix(Self.claudeJobRowPrefix) } + folded
     }
 
-    // MARK: the one grey line
-
-    /// Machinery, said once, in plain words — and only while it is ACTUALLY
-    /// broken. `provider_vitals` writes a `degraded` row at severity
-    /// "important" and supersedes it with an "info" recovery row, so an open
-    /// important row is the live trouble. The detailed cards stay on the
-    /// classic Activity page and in Diagnostics.
-    private var providerTroubleLine: String? {
-        let degraded = appModel.engine.inbox.items.contains {
-            $0.source.lowercased() == "provider_vitals"
-                && $0.isActivityPending
-                && $0.severity.lowercased() == "important"
-        }
-        return degraded ? "One of my connections is slow today." : nil
-    }
-
     // MARK: loading
 
+    private var isReading: Bool {
+        !snapshot.loaded || laneReadCount > 0 || appModel.panelRefreshCounts[.activity, default: 0] > 0
+    }
+
     private func loadHerLanes() async {
+        laneReadCount += 1
+        defer { laneReadCount -= 1 }
         let sessionIDs = appModel.engine.transcripts.sessions
             .filter { $0.archived != true }
             .sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
@@ -1345,8 +1360,25 @@ struct TodayWaitingCard: View {
     let approvals: [ApprovalRecord]
     /// Desk items waiting on him; one row that opens the Desk.
     var deskCount = 0
+    /// `deskCount` as Desk items and notes; nil when it is not only those.
+    var split: (items: Int, notes: Int)? = nil
     /// The full request behind an approval, and the decisions already made.
     var onOpenApprovals: (() -> Void)? = nil
+
+    /// Says what the count holds: Desk items and notes by name, or just
+    /// "things" when it holds anything else or could not be told apart.
+    private var deskLine: String {
+        func counted(_ n: Int, _ one: String, _ many: String) -> String {
+            "\(DeskPageWords.spelledLower(n)) \(n == 1 ? one : many)"
+        }
+        let needs = deskCount == 1 ? "needs" : "need"
+        guard let (items, notes) = split else {
+            return TodayWords.capitalizedFirst("\(counted(deskCount, "thing", "things")) \(needs) your answer.")
+        }
+        let parts = [items > 0 ? counted(items, "Desk item", "Desk items") : nil,
+                     notes > 0 ? counted(notes, "note", "notes") : nil].compactMap { $0 }
+        return TodayWords.capitalizedFirst("\(parts.joined(separator: " and ")) \(needs) your answer.")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
@@ -1359,9 +1391,7 @@ struct TodayWaitingCard: View {
                 if deskCount > 0 {
                     HStack(alignment: .center, spacing: 12) {
                         AliveWaitingDot()
-                        Text(deskCount == 1
-                             ? "One thing on the Desk needs your answer."
-                             : "\(DeskPageWords.spelled(deskCount)) things on the Desk need your answer.")
+                        Text(deskLine)
                             .font(.system(size: 15, weight: .medium))
                             .foregroundStyle(NativeAgentShell.text)
                             .lineLimit(1)
@@ -1594,6 +1624,8 @@ struct TodayTimelineRow: View {
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
+                    // Never touching the ring.
+                    .padding(.trailing, 8)
                     .frame(width: TodayMetrics.timeColumnWidth, alignment: .leading)
                     .padding(.top, 1)
                 Circle()
@@ -1661,7 +1693,7 @@ struct TodayTimelineRow: View {
                 }
                 .padding(.top, 10)
                 .padding(.leading, TodayMetrics.timeColumnWidth + Self.dotSize + Self.textLead)
-                .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+                .transition(NativeAgentMotion.arrivalFade)
             }
         }
         .padding(.vertical, 10)
@@ -1675,7 +1707,7 @@ struct TodayTimelineRow: View {
     private func toggle() {
         guard foldable else { onOpen?(); return }
         withAnimation(NativeAgentMotion.respecting(
-            NativeAgentMotion.quick, reduceMotion: reduceMotion
+            NativeAgentMotion.arrive, reduceMotion: reduceMotion
         )) { isOpen.toggle() }
     }
 }

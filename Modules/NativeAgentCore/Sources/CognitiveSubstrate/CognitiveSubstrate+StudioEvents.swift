@@ -211,7 +211,7 @@ public actor StudioJournalCognitiveBus {
         guard let sink else {
             if !warnedAboutMissingSink {
                 warnedAboutMissingSink = true
-                NSLog(
+                nativeLog(
                     "[studio] journal entry %@ filed with no cognitive sink installed — "
                         + "the entry is durable, but nothing put it on the bus. "
                         + "Install StudioJournalCognitiveBus at startup.",

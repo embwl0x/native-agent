@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import SlackConnector
 import TrustCenter
 
 /// Local connector credential revocation and registry updates. OAuth token
@@ -51,8 +52,10 @@ public final class SwiftNativeConnectorAuthClient: ConnectorAuthClient {
     }
 
     private func hasUsableToken(_ provider: String) -> Bool {
-        tokenPaths(provider).contains { path in
-            guard let data = try? Data(contentsOf: path),
+        // Slack's token is in Keychain, not its files (SlackCredentials).
+        if provider.lowercased() == "slack" { return (try? SlackCredentials.read(.bot, dataRoot: root)) != nil }
+        return tokenPaths(provider).contains { path in
+            guard let data = try? ConnectorCredentialFile.read(at: path),
                   case .object(let object) = try? JSONValue.parse(data) else {
                 return false
             }
@@ -73,6 +76,7 @@ public final class SwiftNativeConnectorAuthClient: ConnectorAuthClient {
         guard Self.knownProviders.contains(provider) else {
             throw ConnectorAuthError.unknownProvider(provider)
         }
+        if provider == "slack" { try SlackCredentials.recoverPendingSave(dataRoot: root) }
         try await updateRegistry(provider: provider, connected: false)
 
         return .object([
@@ -103,6 +107,7 @@ public final class SwiftNativeConnectorAuthClient: ConnectorAuthClient {
     private func updateRegistry(provider: String, connected: Bool) async throws {
         // A credential effect alone is not confirmation of the registry change.
         try await persistence.withFileLock(connectorsPath) { [self] in
+            try SlackCredentials.recoverPendingSave(dataRoot: root)
             // 2026-09-06: this operation only updates an existing registry.
             // Missing or damaged bytes are never permission to replace it with an empty array.
             let raw = try JSONValue.parse(Data(contentsOf: connectorsPath))
@@ -139,14 +144,17 @@ public final class SwiftNativeConnectorAuthClient: ConnectorAuthClient {
             let paths = Array(Set(tokenPaths(provider))).sorted { $0.path < $1.path }
             try await withCredentialLocks(paths[...]) {
                 for path in paths {
-                    _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path)
+                    _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path, resolveSecrets: connected)
                 }
                 try await self.persistence.writeJSON(updated, to: self.connectorsPath)
                 if !connected {
+                    // Keep the reference file and registry locks until its
+                    // Keychain grant is removed; unlinking first loses the reference.
+                    if provider == "slack" { try SlackCredentials.delete(dataRoot: self.root) }
                     // All saved inputs have passed validation and the durable
                     // disabled row exists before the first destructive step.
                     for path in paths where FileManager.default.fileExists(atPath: path.path) {
-                        try FileManager.default.removeItem(at: path)
+                        try ConnectorCredentialFile.remove(at: path)
                     }
                 }
             }

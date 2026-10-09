@@ -69,7 +69,10 @@ Cancellation of that work is not proof that its effects stopped or rolled back.
 timeout and 600-second wall timeout. Environment settings
 `NATIVE_AGENT_PROVIDER_STREAM_IDLE_TIMEOUT_SEC` and
 `NATIVE_AGENT_PROVIDER_STREAM_WALL_TIMEOUT_SEC` override them; values are
-bounded to 0–86,400 seconds, with zero disabling that timeout.
+bounded to 0–86,400 seconds, with zero disabling that timeout. Background
+calls use the same settings. Idle time is wire activity (headers, SSE
+comments, events); a cut is the typed `ProviderFailure.noReply`, and every
+stream failure's `Diagnostic` records whether the provider admitted the request.
 
 `ProviderRouting/LLMClient+Real.swift` wraps streams with the guard and uses
 `withCompletionWall` for buffered calls. `ProviderRecoveryPolicy.callWallSeconds`
@@ -85,7 +88,12 @@ live prose. `ProviderRouting/ProviderRecoveryPolicy.swift` classifies failures;
 its `ChatTurnRuntime` extension supplies turn-error replay restrictions.
 
 Network failures and rate limits can retry in place: up to ten attempts per
-call and twenty recoveries per turn. Backoff is 1, 2, 4, 8, 15, then 30 seconds;
+call and twenty recoveries per turn. Once the provider admitted a request (a
+2xx response body began), a cut where it never said no (idle or wall,
+connection loss, truncation) is not re-issued before visible prose: the turn
+ends (a guard cut reads "No reply from <provider> in N s (M events)") and the
+person can say continue. An explicit provider error event (overloaded, rate
+limit) said it did not generate and is retried as before. Backoff is 1, 2, 4, 8, 15, then 30 seconds;
 a longer provider `Retry-After` wins. The loop refuses a wait that would consume
 the remaining budget. Provider overload has a separate pre-output ladder in
 `LLMClient+Real.swift`; exhaustion there vetoes outer retries.

@@ -663,7 +663,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     }
 
     public nonisolated static func defaultTraceFailureLogger(_ message: String) {
-        NSLog("%@", message)
+        nativeLog("%@", message)
     }
 
     /// Test seam — invalidate the listServers cache so a fixture change
@@ -776,7 +776,6 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
            case .string(let s) = cfg["searxng_base_url"] ?? .null {
             searxngURL = s
         }
-        let hasSearx = !searxngURL.isEmpty
 
         // Mirrors the retired daemon. createdAt/updatedAt use
         // now_iso() (= isoTimestamp here); since the daemon overwrites these
@@ -800,9 +799,10 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             "name": .string("SearXNG Local Search"),
             "transport": .string("http"),
             "endpoint": .string(searxngURL),
-            "status": .string(hasSearx ? "ready" : "needs_setup"),
-            "healthStatus": .string(hasSearx ? "ok" : "needs_setup"),
-            "toolCount": .int(hasSearx ? 2 : 0),
+            // General search does not depend on the optional category backend.
+            "status": .string("ready"),
+            "healthStatus": .string("unmeasured"),
+            "toolCount": .int(1),
             "resourceCount": .int(0),
             "riskClass": .string("network_read"),
             "createdAt": .string(stamp),

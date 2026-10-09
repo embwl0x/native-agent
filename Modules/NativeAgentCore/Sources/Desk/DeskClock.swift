@@ -48,9 +48,9 @@ public enum DeskClock {
             return dayFormatter.string(from: date)
         }
 
-        func parsesDay(_ value: String) -> Bool {
+        func dayDate(from value: String) -> Date? {
             lock.lock(); defer { lock.unlock() }
-            return dayFormatter.date(from: value) != nil
+            return dayFormatter.date(from: value)
         }
     }
 
@@ -119,6 +119,11 @@ public enum DeskClock {
         formatters.date(from: s)
     }
 
+    /// Parse a bare `yyyy-MM-dd` UTC day stamp (its midnight).
+    public static func parseDay(_ s: String) -> Date? {
+        formatters.dayDate(from: s)
+    }
+
     /// True when `s` parses as a calendar date — either a bare `yyyy-MM-dd` day
     /// stamp (the felt-salience / reservation day form) or a full ISO timestamp.
     /// Used by dossier structural validation: an unparseable date can't stand as
@@ -126,7 +131,7 @@ public enum DeskClock {
     public static func isParseableDate(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return false }
-        if formatters.parsesDay(t) { return true }
+        if formatters.dayDate(from: t) != nil { return true }
         return parseISO(t) != nil
     }
 
@@ -135,7 +140,7 @@ public enum DeskClock {
     /// bare day vs its midnight ISO form. nil for an unparseable string.
     public static func normalizedDay(_ s: String) -> String? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if formatters.parsesDay(t) { return t }   // already a bare UTC day
+        if formatters.dayDate(from: t) != nil { return t }   // already a bare UTC day
         if let d = parseISO(t) { return dayStamp(d) }
         return nil
     }

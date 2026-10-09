@@ -1,5 +1,6 @@
 import Foundation
 import ChatOrchestration
+import Cognition
 
 /// The chat and tool clients an engine root builds for its agent contacts.
 public protocol AgentContactClients: Sendable {
@@ -16,6 +17,8 @@ public protocol AgentContactClients: Sendable {
     func bridgeToolDispatchClient(fileAccess: String, verifiedSessionId: String?) -> any ToolDispatchClient
     /// Phase 5 E1: her reach wake's answer, to the mind that offered it.
     func deliverReach(reply: String, itemID: String, turnID: String) async
+    /// Her body's runtime changes, provider call outcomes among them (nil without a body).
+    func cognitionChanges() async -> AsyncStream<NativeCognitionRuntimeChange>?
 }
 
 /// One engine root's agent contacts: the retained A2A tasks every peer door
@@ -44,8 +47,8 @@ public final class AgentContacts: Sendable {
     public init(dataRoot: URL, clients: any AgentContactClients, completionSender: any AgentBridgeCompletionSending) {
         let dot = ChatGPTDotConversation(dataRoot: dataRoot, clients: clients)
         self.dot = dot
-        ChatGPTDotIPCTransport.installConversation { root, peer, messages, sent in
-            try await dot.conversation(root: root, peer: peer, messages: messages, sent: sent)
+        ChatGPTDotIPCTransport.installConversation { root, peer, messages, sent, window in
+            try await dot.conversation(root: root, peer: peer, messages: messages, sent: sent, window: window)
         }
         ContactThread.installWriter { root, entry in
             guard root.standardizedFileURL == dataRoot.standardizedFileURL else {
@@ -71,7 +74,7 @@ public final class AgentContacts: Sendable {
                 let iso = ISO8601DateFormatter()
                 iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                 _ = try await ChatPersistenceContext.$importedMessageCreatedAt.withValue(iso.string(from: at)) {
-                    try await request.enqueue(on: clients.bridgeChatClient())
+                    try await request.enqueue(on: clients.bridgeChatClient(), awaitingConsumption: false)
                 }
             }
         }

@@ -1,37 +1,29 @@
 import SwiftUI
 import AppKit
 
-/// The panel every page still reaches for: an eyebrow over one card. The
-/// material slab and the tinted accent border it used to draw were the second
-/// plate on a page that already sits on the sheet, so both are gone. `tint` and
-/// `systemImage` stay in the signature — dozens of call sites pass them — but
-/// neither paints anything now (advanced-page kit, 2026-09-03).
+/// The panel every page still reaches for: an eyebrow over one card, the
+/// kit's (`aliveCard`). `tint` and `systemImage` stay in the signature —
+/// dozens of call sites pass them — but neither paints anything now
+/// (advanced-page kit, 2026-09-03).
 struct NativePanel<Content: View>: View {
     var title: String?
     var systemImage: String?
     var tint: Color? = nil
+    var contentInsets = EdgeInsets(top: NativeAgentSpacing.lg, leading: NativeAgentSpacing.lg,
+                                  bottom: NativeAgentSpacing.lg, trailing: NativeAgentSpacing.lg)
     @ViewBuilder var content: () -> Content
-    @Environment(\.aliveCards) private var aliveCards
 
     var body: some View {
-        VStack(alignment: .leading, spacing: aliveCards ? AliveMetrics.eyebrowGap : NativeAgentSpacing.md) {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
             if let title {
-                if aliveCards {
-                    AliveEyebrow(title)
-                } else {
-                    Text(title.uppercased())
-                        .font(ShellType.labelSemibold)
-                        .tracking(0.6)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                AliveEyebrow(title)
             }
             VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                 content()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(NativeAgentSpacing.lg)
-            .modifier(SharedCardFill())
+            .padding(contentInsets)
+            .aliveCard()
         }
         // Keep each card's controls in a semantic group. Flattening a whole
         // settings page makes SwiftUI repeatedly order unrelated descendants
@@ -68,59 +60,12 @@ struct InfoPill: View {
     }
 }
 
-/// A settings eyebrow and its rows on one card.
-struct SettingsCardSection<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-    @Environment(\.aliveCards) private var aliveCards
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: aliveCards ? AliveMetrics.eyebrowGap : 8) {
-            if aliveCards {
-                AliveEyebrow(title)
-            } else {
-                Text(title)
-                    .font(ShellType.labelSemibold)
-                    .textCase(.uppercase)
-                    .kerning(0.6)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .padding(.horizontal, 2)
-            }
-            VStack(alignment: .leading, spacing: 12) { content }
-                .padding(16)
-                .settingsCardSurface()
-        }
-    }
-}
-
-/// The settings card's fill and rim, or the alive card inside a page that
-/// asked for it (`aliveCards`).
-private struct SharedCardFill: ViewModifier {
-    @Environment(\.aliveCards) private var aliveCards
-
-    func body(content: Content) -> some View {
-        if aliveCards {
-            content.aliveCard()
-        } else {
-            content
-                .background(
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                        .fill(TodayPalette.cardFill)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-                )
-        }
-    }
-}
-
 extension View {
-    /// The shared settings card surface; callers own content and padding.
+    /// The kit's card on a settings section; callers own content and padding.
     func settingsCardSurface() -> some View {
         self
             .frame(maxWidth: .infinity, alignment: .leading)
-            .modifier(SharedCardFill())
+            .aliveCard()
             .accessibilityElement(children: .contain)
     }
 
@@ -136,6 +81,40 @@ extension View {
             .background(color.opacity(0.16), in: Capsule())
             .foregroundStyle(color)
     }
+
+    func houseInset<S: Shape>(in shape: S) -> some View {
+        modifier(HouseInset(shape: shape))
+    }
+
+    func houseSheet() -> some View {
+        background {
+            ShellSheet()
+                .overlay { WindowHaze() }
+                .houseSurface(in: ConcentricRectangle())
+        }
+        .presentationBackground(.clear)
+        .environment(\.houseGlassEnclosed, true)
+    }
+}
+
+private struct HouseGlassEnclosedKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var houseGlassEnclosed: Bool {
+        get { self[HouseGlassEnclosedKey.self] }
+        set { self[HouseGlassEnclosedKey.self] = newValue }
+    }
+}
+
+private struct HouseInset<S: Shape>: ViewModifier {
+    let shape: S
+    @Environment(\.houseGlassEnclosed) private var enclosed
+
+    func body(content: Content) -> some View {
+        if enclosed { content } else { content.houseSurface(in: shape) }
+    }
 }
 
 struct InlineStatusDot: View {
@@ -148,41 +127,77 @@ struct InlineStatusDot: View {
     }
 }
 
-// PATCH-2026-05-07: ui-polish — Design system primitives (GlassCard, PulsingDot, Shimmer, GradientText, AuroraBackground)
+enum HouseGlass {
+    /// User's clear glass, shared by every authored plate: a dark tint on the
+    /// dark room. On the light room that same black tint read as a grey slab
+    /// (User, 2026-10-09: "washed-out grey"), so light gets a white tint — a
+    /// lifted frosted plate, not a shadow. One dynamic colour, every site.
+    static let plate: Glass = .clear.tint(plateTint)
+    private static let plateTint = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor.black.withAlphaComponent(0.28)
+            : NSColor.white.withAlphaComponent(0.58)
+    })
+}
 
-/// Neutral material card with an optional semantic or identity edge.
+extension View {
+    func houseSurface<S: Shape>(in shape: S, interactive: Bool = false) -> some View {
+        modifier(HouseSurface(shape: shape, interactive: interactive))
+    }
+}
+
+private struct HouseSurface<S: Shape>: ViewModifier {
+    let shape: S
+    let interactive: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    func body(content: Content) -> some View {
+        let opaque = reduceTransparency || quietOffscreenRead
+        content
+            .background {
+                if opaque { shape.fill(TodayPalette.cardFill) }
+            }
+            .glassEffect(opaque ? .identity : HouseGlass.plate.interactive(interactive), in: shape)
+            .overlay {
+                if opaque || contrast == .increased {
+                    shape.stroke(opaque ? TodayPalette.cardStroke : Color(nsColor: .separatorColor), lineWidth: 1)
+                        .clipShape(shape)
+                        .allowsHitTesting(false)
+                }
+            }
+            .environment(\.houseGlassEnclosed, true)
+    }
+}
+
+// PATCH-2026-05-07: ui-polish — Design system primitives (GlassCard, PulsingDot, Shimmer, GradientText)
+
+/// House glass card with an optional accessibility state edge. Chrome
+/// only: the chat turn card floating over the transcript and the detached
+/// panels' classic composer. Content cards wear `aliveCard`.
 struct GlassCard<Content: View>: View {
     var tint: Color? = nil
-    /// Rows inside scrolling Lists render material instead of live glass —
-    /// per-row glassEffect is a scroll-perf hazard (gpt-5.5 MED, InboxView).
-    var scrollRow: Bool = false
-    /// Clear-glass variant for cards that FLOAT OVER live content (the chat
-    /// turn card): regular glass reads near-opaque over a dark transcript and
-    /// buries the text beneath (User, 2026-08-20). Reduce-transparency still
-    /// gets the fully opaque fallback — that setting is a request for MORE
-    /// opacity, never less.
-    var lightweight: Bool = false
     @ViewBuilder var content: () -> Content
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     var body: some View {
+        // A quiet screenshot draws the opaque fill too: tinted glass drawn
+        // into a bitmap blanks the whole capture.
+        let opaque = reduceTransparency || quietOffscreenRead
         let edgeColor = tint ?? Color.primary
         let edgeOpacity = tint != nil
             ? (colorSchemeContrast == .increased ? 0.72 : 0.34)
             : (colorSchemeContrast == .increased ? 0.28 : 0.10)
 
-        // Liquid Feel W2 (2026-08-16): GlassCard renders REAL Liquid Glass on
-        // the macOS 26 floor — every card in the app upgrades through this one
-        // seam. Reduce-transparency keeps the opaque fallback.
-        if reduceTransparency || scrollRow {
+        if opaque {
             content()
                 .padding(NativeAgentLayout.cardPadding)
                 .background {
                     RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                        .fill(reduceTransparency
-                            ? AnyShapeStyle(Color(nsColor: .controlBackgroundColor))
-                            : AnyShapeStyle(.thinMaterial))
+                        .fill(Color(nsColor: .controlBackgroundColor))
                 }
                 .overlay {
                     RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
@@ -194,20 +209,7 @@ struct GlassCard<Content: View>: View {
         } else {
             content()
                 .padding(NativeAgentLayout.cardPadding)
-                .glassEffect(
-                    {
-                        let base: Glass = lightweight ? .clear : .regular
-                        return tint.map { base.tint($0.opacity(0.12)) } ?? base
-                    }(),
-                    in: RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                        .strokeBorder(
-                            edgeColor.opacity(edgeOpacity * 0.6),
-                            lineWidth: colorSchemeContrast == .increased ? 1 : 0.75
-                        )
-                }
+                .houseSurface(in: RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous))
         }
     }
 }
@@ -277,38 +279,6 @@ extension View {
     func appShimmer() -> some View { modifier(Shimmer()) }
 }
 
-/// Identity text that keeps the historical color-list API while rendering solid.
-struct GradientText: View {
-    let text: String
-    let colors: [Color]
-    let font: Font
-
-    var body: some View {
-        Text(text).font(font)
-            .foregroundStyle(colors.first ?? NativeAgentBrand.accentDeep)
-    }
-}
-
-/// Static neutral background with a restrained identity tint.
-struct AuroraBackground: View {
-    let colors: [Color]
-    var animates: Bool = false
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
-
-    var body: some View {
-        let identityTint = colors.first ?? NativeAgentBrand.accent
-        let tintOpacity = colorSchemeContrast == .increased
-            ? 0.02
-            : (colorScheme == .dark ? 0.05 : 0.035)
-
-        ZStack {
-            Color(nsColor: .windowBackgroundColor)
-            identityTint.opacity(tintOpacity)
-        }
-    }
-}
-
 // MARK: - The shell (ui-simplify 2026-09-02, Lane A)
 
 /// The room's palette. Warm dark by default, warm light behind the same names,
@@ -325,9 +295,11 @@ enum NativeAgentShell {
     // one small step DARKER than `TodayPalette.cardFill`, so a card still reads
     // as a card by lightness (dark rooms elevate with light, not shadow) and
     // the room stops swinging from brown to green as the desktop moves under it.
-    static let room       = dynamic(dark: 0x12161F, light: 0xF4F3F0)
-    static let rail       = dynamic(dark: 0x121315, light: 0xECEBE7)
-    static let list       = dynamic(dark: 0x17181B, light: 0xF1F0EC)
+    // 2026-10-09: the light room steps up toward paper (F4F3F0 read as grey
+    // under the coat); rail and list sit one step either side of it, as in dark.
+    static let room       = dynamic(dark: 0x12161F, light: 0xF7F6F3)
+    static let rail       = dynamic(dark: 0x121315, light: 0xF3F2EF)
+    static let list       = dynamic(dark: 0x17181B, light: 0xF5F4F1)
     // 2026-09-10, User: the two form panels were the only opaque cards in the app
     // and read as brown slabs against every other glass card. They use the
     // shared glass card again; the readable secondary text from the same pass stays.
@@ -353,7 +325,7 @@ enum NativeAgentShell {
     // on the room (2026-09-03).
     static let calm       = dynamic(dark: 0x34C759, light: 0x136224)
 
-    /// The one soft fill (user bubbles, rail selection, chips). Reads as 8%
+    /// The one soft fill (rail selection, chips). Reads as 8%
     /// white on the warm dark and 8% ink on the warm light.
     // User, 2026-09-03: light reads flat on glass, so the fills and hairline
     // carry a step more contrast there than in dark.
@@ -472,26 +444,11 @@ struct ShellLamp: View {
     }
 }
 
-/// The shell's type ramp. One modular scale, major third (1.25) from a 16pt
-/// body — methods-grids-and-type §11: 16 ÷ 1.25 = 12.8 → 13, ÷ 1.25 = 10.24 →
-/// 10; 16 × 1.25 = 20, × 1.25 = 25. Five steps and nothing between them, so
-/// the 11 / 12 / 14 / 15 / 17 / 28 / 30 the shell had collected have one place
-/// each to land.
-///
-/// Rules: body is regular, titles are semibold, no Light/Thin/Ultralight, and
-/// no manual `.tracking` — the system applies its own per-size tracking and an
-/// override fights it. 10 is the HIG floor and is for timestamps and counters
-/// only; it must still clear 4.5:1, which means the `tertiary` token, never
-/// SwiftUI's hierarchical `.tertiary` over glass.
-/// 2026-09-17: the ramp stays on `Font.system`. Making it follow the system's
-/// Text size needs `Font.custom(_:size:relativeTo:)` — the SDK has no
-/// `Font.system(size:relativeTo:)` — and the only families that spell the
-/// system face for it are private (`.AppleSystemUIFont` and its Monospaced and
-/// Rounded siblings). AppKit guarantees weight matching through
-/// `systemFont(ofSize:weight:)`, not through a weight trait applied to a
-/// private family, so that ramp would not be the same type it is today. The
-/// scaling this app can honestly do is in the BOXES: the pane widths and the
-/// inline-card control sizes are `@ScaledMetric`.
+/// Shared page and shell roles: 11 metadata, 13 detail, 14 rows, 16 chat,
+/// 20 detail headings and the approved 44 serif page door. Older display
+/// and native control styles remain for surfaces outside the page kit.
+/// Meaningful small text uses secondary ink over glass. The ramp uses
+/// `Font.system` at the declared sizes; it has no text-size multiplier.
 enum ShellType {
     // 10 measured 1.95:1 on the fold count in dark and 2.44 in light; 11 at
     // the secondary colour clears it (critique finding 5).
@@ -500,30 +457,37 @@ enum ShellType {
     static let bodySize: CGFloat = 16
     static let titleSize: CGFloat = 20
     static let displaySize: CGFloat = 25
+    static let pageTitleSize: CGFloat = 44
 
-    /// 10 — timestamps, counters. The floor.
     /// Codes and paths, and nothing else: keys, ids, file paths. Never for a
     /// label that happens to be short.
     static let code = Font.system(size: labelSize, design: .monospaced)
     static let caption = Font.system(size: captionSize)
     static let captionMedium = Font.system(size: captionSize, weight: .medium)
     static let captionSemibold = Font.system(size: captionSize, weight: .semibold)
+    static let captionCode = Font.system(size: captionSize, design: .monospaced)
+    static let captionCodeSemibold = Font.system(size: captionSize, weight: .semibold, design: .monospaced)
     /// 13 — list subtitle, rail words, tool rows, meta lines, buttons.
     static let label = Font.system(size: labelSize)
     static let labelMedium = Font.system(size: labelSize, weight: .medium)
-    /// The rail's word. User, 2026-09-04: a half step above label so twelve
-    /// words read at a glance; the rail is the one place off the ramp.
+    /// 14 — rail words and row titles, a step above their detail.
     static let railSize: CGFloat = 14
     static let rail = Font.system(size: railSize, weight: .medium)
     static let labelSemibold = Font.system(size: labelSize, weight: .semibold)
+    /// The shared settings and content row: 14 medium over 13 regular.
+    static let rowTitle = Font.system(size: railSize, weight: .medium)
+    static let rowDetailSize = labelSize
+    static let rowDetail = label
+    static let pageSentence = Font.system(size: railSize)
+    static let pageTitle = Font.system(size: pageTitleSize, design: .serif)
     /// 16 — body, list row title, card headline.
     static let body = Font.system(size: bodySize)
     static let bodyMedium = Font.system(size: bodySize, weight: .medium)
     static let bodySemibold = Font.system(size: bodySize, weight: .semibold)
-    /// 20 — every column header: "Chat" is a word not a title, but "Agent"
-    /// and "Conversations" are the same rank and now wear the same face.
+    static let columnTitle = bodySemibold
+    /// 20 — subordinate page and detail headings.
     static let title = Font.system(size: titleSize, weight: .semibold)
-    /// 25 — page titles: Today, Desk, Memories, Setup, the empty room.
+    /// Legacy rounded display for onboarding and older empty states.
     static let display = Font.system(size: displaySize, weight: .semibold, design: .rounded)
 }
 
@@ -571,7 +535,10 @@ enum NativeAgentShellLayout {
         // an 18-point R-B swing across one page. Heavier, the room reads as the
         // room and the desktop is a movement in it, which is the bleed User
         // wanted without the colour cast he rejected.
-        return dark ? 0.74 : 0.5
+        // 2026-10-09: light at 0.5 over the whitened material was a mid grey
+        // that changed with the desktop; the heavier coat makes the light room
+        // one colour too, and the bleed stays a movement in it.
+        return dark ? 0.74 : 0.66
     }
     /// Agent, 2026-09-02: the title bar was a painted strip sitting on top of
     /// three glass columns, so the top-left read as two objects — system
@@ -582,6 +549,8 @@ enum NativeAgentShellLayout {
     /// title bar used to occupy, given back as a safe-area inset so the header
     /// row and the rail's first item do not move up under the lights.
     static let titleBarInset: CGFloat = 28
+    /// The two chat column headings share the slim header's top inset.
+    static let columnHeaderTopInset: CGFloat = 6
     /// The list column, edge to edge. The source used to say 264 while the
     /// view rendered 288 (the 264 was the content inside a 12pt pad); source
     /// and pixels now agree on the measured number.
@@ -599,6 +568,7 @@ enum NativeAgentShellLayout {
     // Notion runs at the same body size. The column is that measure plus the
     // room's own gutter on each side, so the composer's inner edges and the
     // last word of a reply share one right edge.
+    // The one chat width.
     static let roomColumn: CGFloat = 740
     static let replyMaxWidth: CGFloat = 708
     /// The gutter inside the room column: header, transcript and working card
@@ -628,13 +598,19 @@ enum NativeAgentShellLayout {
     static let railPlateInset: CGFloat = 10
     /// 16pt body at 1.6 line height → 9.6pt of extra leading.
     static let replyLineSpacing: CGFloat = 8
-    /// Agent, 2026-09-02: the per-message action bar used to float over the
-    /// top of the bubble and land on the first line of the message above it.
-    /// It now sits in its own strip UNDER the message. The strip is reserved
-    /// whether or not the pointer is there, so hover stays layout-neutral
-    /// (the 2026-07-25 "scrolls up when I move to the composer" rule). The
-    /// height is the bar's own: 22pt buttons inside 4pt of vertical padding.
+    /// The per-message action bar's height: 22pt buttons inside 4pt of
+    /// vertical padding. Fluid glass A2: it is an overlay on the message's
+    /// bottom edge and reserves nothing, so hover stays layout-neutral (the
+    /// 2026-07-25 rule) without a 30pt strip under every bubble.
     static let hoverBarStrip: CGFloat = 30
+    /// How far the hover bar reaches up over its own message's bottom edge;
+    /// the rest hangs into the gap below, clear of the words (Agent,
+    /// 2026-09-02: it must never land on text).
+    static let hoverBarOverlap: CGFloat = 6
+    /// Fluid glass A2: the one gap between transcript items — message and
+    /// message, message and activity row, row and row. Every item carries a
+    /// few points of its own vertical padding, so words sit ~24pt apart.
+    static let transcriptGap: CGFloat = 16
     /// Breathing room between the last line of the transcript and the top of
     /// the floating composer.
     static let composerClearanceMargin: CGFloat = 12

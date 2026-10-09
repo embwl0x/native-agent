@@ -3,6 +3,9 @@ import Foundation
 public struct MacChatStreamCompletion: Sendable {
     public let sessionId: String?
     public let text: String
+    /// Where `text`'s working commentary ends, when the core's final reply is
+    /// the text and it said so.
+    public var workingCommentaryCharacters: Int? = nil
 }
 
 public enum MacChatStreamExit: Sendable {
@@ -31,12 +34,16 @@ public extension MacChatTurnPresentationPort {
         await metaBox.waitForProducerTermination()
         guard macChatTurns.taskGenerations[sessionId] == generation else { return nil }
         let final = metaBox.finalResponse()
-        let text = final.map(\.reply)
+        let reply = final.map(\.reply)
             .flatMap { value -> String? in
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
                 return trimmed.isEmpty ? nil : value
-            } ?? streamedText
-        return MacChatStreamCompletion(sessionId: final?.sessionId, text: text)
+            }
+        return MacChatStreamCompletion(
+            sessionId: final?.sessionId,
+            text: reply ?? streamedText,
+            workingCommentaryCharacters: reply == nil ? nil : final?.workingCommentaryCharacters
+        )
     }
 
     /// A cancelled consumer still joins persistence. This deliberately does
@@ -83,7 +90,7 @@ public extension MacChatTurnPresentationPort {
         to sid: String,
         turnId: String
     ) async {
-        migrateQueuedChatTurns(from: requestSessionId, to: sid)
+        await migrateQueuedChatTurns(from: requestSessionId, to: sid)
         if macChatTurns.streamingSessions.contains(requestSessionId) {
             macChatTurns.streamingSessions.remove(requestSessionId)
             macChatTurns.streamingSessions.insert(sid)

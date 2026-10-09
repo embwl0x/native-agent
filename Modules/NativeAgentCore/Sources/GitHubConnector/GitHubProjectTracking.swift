@@ -16,10 +16,13 @@ public extension GitHubConnectorActions {
         var params = ["q": query, "page": String(page), "per_page": String(perPage)]
         if let sort = normalized(input["sort"]) { params["sort"] = sort }
         if let order = normalized(input["order"] ?? input["direction"]) { params["order"] = order }
-        let result = try await call(path: "search/issues", params: params, dataRoot: dataRoot)
-        let projection = GitHubToolProjection.searchResult(result, limit: perPage)
+        let repositories = normalized(input["type"]) == "repositories"
+        let result = try await call(path: repositories ? "search/repositories" : "search/issues", params: params, dataRoot: dataRoot)
+        let projection = repositories ? GitHubToolProjection.repositorySearchResult(result, limit: perPage)
+            : GitHubToolProjection.searchResult(result, limit: perPage)
         return envelope("github.search", fields: [
-            "query": .string(query), "page": .int(Int64(page)), "perPage": .int(Int64(perPage)),
+            "query": .string(query), "type": .string(repositories ? "repositories" : "issues"),
+            "page": .int(Int64(page)), "perPage": .int(Int64(perPage)),
             "result": JSONValue(fromFoundation: projection),
         ])
     }
@@ -90,9 +93,11 @@ public extension GitHubConnectorActions {
             path: "repos/\(repo)/pulls/\(number)/reviews", dataRoot: dataRoot
         )
         let commits = try await call(path: "repos/\(repo)/pulls/\(number)/commits", params: ["per_page": String(limit)], dataRoot: dataRoot)
+        let projection = GitHubToolProjection.pullRequest(pull)
         var fields: [String: JSONValue] = [
             "repository": .string(repo), "number": .int(Int64(number)),
-            "pullRequest": JSONValue(fromFoundation: GitHubToolProjection.pullRequest(pull)),
+            "brief": JSONValue(fromFoundation: projection.filter { ["number", "title", "state", "body", "body_truncated"].contains($0.key) }),
+            "pullRequest": JSONValue(fromFoundation: projection),
             "reviews": JSONValue(fromFoundation: GitHubToolProjection.reviews(reviews, limit: limit).rows),
             "commits": JSONValue(fromFoundation: GitHubToolProjection.commits(commits, limit: limit).rows),
             "reviewState": .string(derivedReviewState(reviews)),
@@ -266,8 +271,26 @@ public extension GitHubConnectorActions {
         let persist = bool(input["persist"]) ?? true
         let project = normalized(input["project"]) ?? suppliedQuery ?? resolved.first!.name
         let timing = trackingTiming(input: input)
-        let priorRepositoryCount = (try? GitHubProjectTracker.loadConfig(dataRoot: dataRoot).repositories.count) ?? 0
-        if persist {
+        let priorConfig = try? GitHubProjectTracker.loadConfig(dataRoot: dataRoot)
+        let prior = priorConfig?.repositories ?? []
+        let priorRepositoryCount = prior.count
+        let known = Set(prior.map { $0.fullName.lowercased() })
+        // "Track X" adds X to what is already tracked, keeping that list's
+        // project, scope and timing. Only replace:true replaces the list.
+        let merging = persist && bool(input["replace"]) != true && priorConfig != nil && !prior.isEmpty
+        var saved = resolved
+        if merging, let priorConfig {
+            saved = prior + resolved.filter { !known.contains($0.fullName.lowercased()) }
+            try await GitHubProjectTracker.saveConfig(
+                TrackingConfig(
+                    version: 2, project: priorConfig.project, mode: priorConfig.mode,
+                    contributorLogin: priorConfig.contributorLogin, discoveryQuery: priorConfig.discoveryQuery,
+                    repositories: saved, refreshIntervalMinutes: priorConfig.refreshIntervalMinutes,
+                    staleAfterHours: priorConfig.staleAfterHours, updatedAt: DeskClock.nowISO()
+                ),
+                dataRoot: dataRoot
+            )
+        } else if persist {
             try await GitHubProjectTracker.saveConfig(
                 TrackingConfig(
                     version: 2,
@@ -284,13 +307,25 @@ public extension GitHubConnectorActions {
             )
         }
         var fields: [String: JSONValue] = [
-            "persisted": .bool(persist), "project": .string(project),
-            "mode": .string(mode.rawValue),
-            "count": .int(Int64(resolved.count)),
-            "replacedRepositoryCount": .int(Int64(persist ? priorRepositoryCount : 0)),
-            "repositories": .array(resolved.map(\.json)),
+            "persisted": .bool(persist), "project": .string(merging ? priorConfig?.project ?? project : project),
+            "mode": .string(merging ? priorConfig?.mode.rawValue ?? mode.rawValue : mode.rawValue),
+            "count": .int(Int64(saved.count)),
+            "replacedRepositoryCount": .int(Int64(persist && !merging ? priorRepositoryCount : 0)),
+            "addedRepositoryCount": .int(Int64(merging ? saved.count - priorRepositoryCount : 0)),
+            "repositories": .array(saved.map(\.json)),
         ]
-        if let contributorLogin { fields["contributorLogin"] = .string(contributorLogin) }
+        if let contributorLogin, !merging { fields["contributorLogin"] = .string(contributorLogin) }
+        if merging, let priorConfig {
+            fields["refreshIntervalMinutes"] = .int(Int64(priorConfig.refreshIntervalMinutes))
+            fields["staleAfterHours"] = .int(Int64(priorConfig.staleAfterHours))
+            fields["note"] = .string("Added to the existing tracked list; its project, scope and timing were kept (requested project/mode/timing ignored). replace:true replaces the list.")
+            // Same repo name under another owner is usually the wrong one.
+            let twins = resolved.compactMap { new in prior.first { $0.name.caseInsensitiveCompare(new.name) == .orderedSame
+                && $0.fullName.caseInsensitiveCompare(new.fullName) != .orderedSame }.map { "\(new.fullName) (already tracking \($0.fullName))" } }
+            if !twins.isEmpty {
+                fields["same_name_warning"] = .string("Added a repo whose name matches one already tracked under another owner: " + twins.joined(separator: "; ") + ". If the owner's own repo was meant, it was already tracked.")
+            }
+        }
         return envelope("github.discover_tracking", fields: fields)
     }
 
@@ -845,11 +880,11 @@ private enum GitHubProjectTracker {
         previous: TrackingSnapshot?
     ) async throws -> TrackingSnapshot {
         var previousReviewThreads: [String: [GitHubCommandReviewThreadEvidence]] = Dictionary(
-            uniqueKeysWithValues: (previous?.entities ?? []).compactMap { entity -> (String, [GitHubCommandReviewThreadEvidence])? in
+            (previous?.entities ?? []).compactMap { entity -> (String, [GitHubCommandReviewThreadEvidence])? in
                 guard let threads = entity.commandObservation?.reviewThreads else { return nil }
                 return (GitHubCommandObservation.itemId(repository: entity.repo, number: entity.number), threads)
-            }
-        )
+            },
+            uniquingKeysWith: { first, _ in first })
         // Callback verification writes fresher thread evidence into the command
         // store between snapshot refreshes. Seeding generation reconciliation
         // from the snapshot alone would replay a stale generation after a
@@ -894,7 +929,7 @@ private enum GitHubProjectTracker {
         // Refresh cost scales with churn, not tracked count: carried-forward items
         // skipped every per-item detail call this cycle. Recorded so wall-time
         // drops are attributable and no silent cap hides skipped work.
-        NSLog(
+        nativeLog(
             "[github-tracking] refresh %@: detail-fetched=%d carried-forward=%d entities=%d",
             config.project, built.detailFetched, built.carriedForward, built.entities.count
         )
@@ -903,7 +938,7 @@ private enum GitHubProjectTracker {
         // forward inside the builders, so the snapshot below is complete —
         // this line is what makes the degradation attributable in the log.
         if built.pass.isPartial {
-            NSLog(
+            nativeLog(
                 "[github-tracking] refresh %@ PARTIAL: completed=%d failed=%@ budget-skipped=%@",
                 config.project,
                 built.pass.completed.count,
@@ -954,7 +989,7 @@ private enum GitHubProjectTracker {
             return observation
         }
         _ = try await commandStore.observe(observations)
-        let old = Dictionary(uniqueKeysWithValues: (previous?.entities ?? []).map { ($0.key, $0.signature) })
+        let old = Dictionary((previous?.entities ?? []).map { ($0.key, $0.signature) }, uniquingKeysWith: { first, _ in first })
         let changed = sortedEntities.filter { old[$0.key] != nil && old[$0.key] != $0.signature }.map(\.key)
         let fresh = sortedEntities.filter { old[$0.key] == nil && $0.state == "open" }.map(\.key)
         let desk = try await upsertDesk(
@@ -1063,7 +1098,7 @@ private enum GitHubProjectTracker {
                 dataRoot: dataRoot
             )
         } catch {
-            NSLog("[github-tracking] review-thread evidence failed, preserving observations: %@", error.localizedDescription)
+            nativeLog("[github-tracking] review-thread evidence failed, preserving observations: %@", error.localizedDescription)
             evidence = [:]
             for repository in Set(detailedPullRequests.map(\.repository)) {
                 pass.failed.append((repo: repository, error: error.localizedDescription))
@@ -1093,7 +1128,7 @@ private enum GitHubProjectTracker {
                 pass.failed.append((repo: pullRequest.repository, error: error.localizedDescription))
                 // One unreachable PR is not a reason to lose the pass. Its prior
                 // row (if any) is carried forward with the rest below.
-                NSLog(
+                nativeLog(
                     "[github-tracking] detail fetch failed %@#%d: %@",
                     pullRequest.repository, pullRequest.number, error.localizedDescription
                 )
@@ -1153,7 +1188,7 @@ private enum GitHubProjectTracker {
                 dataRoot: dataRoot
             )
         } catch {
-            NSLog("[github-tracking] mergeability evidence failed, preserving prior: %@", error.localizedDescription)
+            nativeLog("[github-tracking] mergeability evidence failed, preserving prior: %@", error.localizedDescription)
             mergeability = [:]
         }
         var detailedPullRequests = repositoryRows.flatMap { entry in
@@ -1192,7 +1227,7 @@ private enum GitHubProjectTracker {
                 dataRoot: dataRoot
             )
         } catch {
-            NSLog("[github-tracking] review-thread evidence failed, preserving observations: %@", error.localizedDescription)
+            nativeLog("[github-tracking] review-thread evidence failed, preserving observations: %@", error.localizedDescription)
             evidence = [:]
         }
         // W6/L4-03 phase 2 — the detail fan-out, the expensive half. Same
@@ -1332,7 +1367,7 @@ private enum GitHubProjectTracker {
                 entities.append(entity)
             } catch {
                 unsettled.append(prior)
-                NSLog(
+                nativeLog(
                     "[github-tracking] closure settle failed %@#%d: %@",
                     prior.repo, prior.number, error.localizedDescription
                 )
@@ -1834,7 +1869,7 @@ private enum GitHubProjectTracker {
         do {
             _ = try await cadenceStore.recordObservations(fingerprintsByRef, at: now)
         } catch {
-            NSLog("[desk-observe] cadence batch record failed: \(error)")
+            nativeLog("[desk-observe] cadence batch record failed: \(error)")
         }
 
         do {
@@ -1842,9 +1877,9 @@ private enum GitHubProjectTracker {
             let verdict = DeskObservationEvaluator.evaluate(state, observations: observations, now: now)
             guard !verdict.isEmpty else { return }
             let outcome = try await DeskObservationApplier.apply(verdict, to: store)
-            NSLog("[desk-observe] \(outcome.summary)")
+            nativeLog("[desk-observe] \(outcome.summary)")
         } catch {
-            NSLog("[desk-observe] reconciliation failed: \(error)")
+            nativeLog("[desk-observe] reconciliation failed: \(error)")
         }
     }
 
@@ -1924,7 +1959,7 @@ private extension GitHubConnectorActions {
         return numbers
     }
 
-    static func envelope(_ action: String, fields: [String: JSONValue]) -> JSONValue {
+    internal static func envelope(_ action: String, fields: [String: JSONValue]) -> JSONValue {
         var object: [String: JSONValue] = [
             "actionId": .string(action), "connectorId": .string("github"),
             "ok": .bool(true), "status": .string("completed"),
@@ -1940,7 +1975,8 @@ private extension GitHubConnectorActions {
 
     static func repository(_ input: [String: JSONValue]) throws -> String {
         let input = input.filter { $0.value != .null && $0.value != .string("") }
-        let owner = normalized(input["owner"])
+        // A bare repo name is the signed-in account's own repo unless an owner is given.
+        let owner = normalized(input["owner"]) ?? signedInLogin()
         // The handles other GitHub results show: an html_url, or owner/name#12.
         func name(_ raw: String) throws -> String {
             if raw.lowercased().hasPrefix("http") { return try repositoryIdentity(["repo": .string(raw)]).fullName }
@@ -1971,7 +2007,12 @@ private extension GitHubConnectorActions {
     }
 
     static func canonicalRepository(_ raw: String) throws -> String {
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // github.com/owner/name and its https:// form name the same repo.
+        for prefix in ["https://", "http://", "www.", "github.com/"] where value.lowercased().hasPrefix(prefix) {
+            value = String(value.dropFirst(prefix.count))
+        }
+        if value.lowercased().hasSuffix(".git") { value = String(value.dropLast(4)) }
         let parts = value.split(separator: "/", omittingEmptySubsequences: true)
         guard parts.count == 2, parts.allSatisfy({ !$0.isEmpty }) else { throw GitHubConnectorError.invalidInput("GitHub repository must be owner/name.") }
         return "\(parts[0])/\(parts[1])"

@@ -22,8 +22,8 @@ import PersistenceCore
 //    of them. `advanceCursorOnly` seeding: when no cursor exists, the first tick
 //    writes the cursor and files NOTHING, and says so in its outcome.
 //
-// 2. RE-FIRING THE SAME CARD. The cursor carries a bounded per-store set of
-//    already-carded job ids alongside the `last_seen` stamp. A job is carded at
+// 2. RE-FIRING THE SAME CARD. The cursor carries exact per-store handled
+//    identities and delivery versions. A job is carded at
 //    most once, and the id set is only mutated after the card WRITE SUCCEEDED —
 //    a failed inbox write leaves the job un-carded so the next tick retries.
 //    This mirrors `fileLoopFailureNotice`'s error-signature contract; the job
@@ -48,12 +48,6 @@ import PersistenceCore
 
 /// One store read: the readable jobs AND whether every configured store
 /// actually answered.
-///
-/// 2026-09-06: the loop used to take the array alone, which cannot tell an
-/// EMPTY store from one whose directory (or one job file inside it) could not
-/// be read. A job that vanishes that way is not carded — and if a newer sibling
-/// settles in the same tick, `last_seen` advances past the missing job, so when
-/// it becomes readable again it is rejected as older and never speaks at all.
 public struct DelegationJobsRead: Sendable, Equatable {
     public var jobs: [DelegationJobSnapshot]
     /// False when a store directory, job file, or ledger line could not be read
@@ -88,6 +82,7 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
     public var completedAt: String?
     /// "delivered" | "lost" | "unknown" | nil.
     public var deliveryOutcome: String?
+    public var deliveryReceiptVersion: String?
     /// Only set when the record ITSELF asserts it (claude's `deliveryLost`).
     public var deliveryLost: Bool?
     public var completionTextHead: String?
@@ -124,6 +119,7 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         runStatus: String? = nil,
         completedAt: String? = nil,
         deliveryOutcome: String? = nil,
+        deliveryReceiptVersion: String? = nil,
         deliveryLost: Bool? = nil,
         completionTextHead: String? = nil,
         recoveryNote: String? = nil,
@@ -144,6 +140,7 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         self.runStatus = runStatus
         self.completedAt = completedAt
         self.deliveryOutcome = deliveryOutcome
+        self.deliveryReceiptVersion = deliveryReceiptVersion
         self.deliveryLost = deliveryLost
         self.completionTextHead = completionTextHead
         self.recoveryNote = recoveryNote
@@ -782,18 +779,14 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
 
 // MARK: - Durable cursor
 
-/// Per-store "everything terminal at or before this point has been handled"
-/// marker, plus the bounded set of job ids already carded.
-///
-/// Both halves are load-bearing and neither is sufficient alone: the stamp
-/// bounds the work (and survives id-set eviction), while the id set catches the
-/// records that carry no completion stamp and the equal-timestamp boundary.
+/// Exact handled identities; completion timestamps never prove receipt arrival.
 public struct DelegationOutcomeCursor: Sendable, Equatable {
     public struct StoreCursor: Sendable, Equatable {
-        /// Newest completion stamp already handled. `nil` means unseeded.
-        public var lastSeen: Date?
-        /// Job ids already carded, newest-last. Bounded by `cardedIDLimit`.
+        /// Upgrade-only boundary for history older cursors no longer retained by id.
+        var legacyLastSeen: Date?
+        /// Job ids already carded, newest-last. Retained while receipts can reappear.
         public var cardedIDs: [String]
+        public var deliveryReceiptVersions: [String: String] = [:]
         /// The outcome each id was carded UNDER (raw `DelegationOutcome`), so a
         /// job that later presents a more alarming outcome is carded again.
         /// Ids recorded before this field existed have no entry and never
@@ -804,10 +797,9 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         /// a later stall can speak again.
         public var announcedStallIDs: [String]
 
-        public init(lastSeen: Date? = nil, cardedIDs: [String] = [],
+        public init(cardedIDs: [String] = [],
                     cardedOutcomes: [String: String] = [:],
                     announcedStallIDs: [String] = []) {
-            self.lastSeen = lastSeen
             self.cardedIDs = cardedIDs
             self.cardedOutcomes = cardedOutcomes
             self.announcedStallIDs = announcedStallIDs
@@ -826,30 +818,22 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         self.codexBacklogKey = codexBacklogKey
     }
 
-    /// How many carded ids each store retains. Chosen well above the live store
-    /// sizes (22 claude jobs at HEAD) so eviction is not the normal path; the
-    /// `lastSeen` stamp is what keeps correctness once eviction does happen.
+    /// Bounds reversible liveness warnings, not terminal receipt identities.
     public static let cardedIDLimit = 500
 
     public func store(_ source: String) -> StoreCursor {
         stores[source] ?? StoreCursor()
     }
 
-    public mutating func record(source: String, id: String, stamp: Date?,
-                                outcome: DelegationOutcome? = nil) {
+    public mutating func record(source: String, id: String,
+                                outcome: DelegationOutcome? = nil,
+                                deliveryReceiptVersion: String? = nil) {
         var cursor = store(source)
         if !cursor.cardedIDs.contains(id) {
             cursor.cardedIDs.append(id)
-            if cursor.cardedIDs.count > Self.cardedIDLimit {
-                let evicted = cursor.cardedIDs.prefix(cursor.cardedIDs.count - Self.cardedIDLimit)
-                for old in evicted { cursor.cardedOutcomes.removeValue(forKey: old) }
-                cursor.cardedIDs.removeFirst(evicted.count)
-            }
         }
+        if let deliveryReceiptVersion { cursor.deliveryReceiptVersions[id] = deliveryReceiptVersion }
         if let outcome { cursor.cardedOutcomes[id] = outcome.rawValue }
-        if let stamp, stamp > (cursor.lastSeen ?? Date.distantPast) {
-            cursor.lastSeen = stamp
-        }
         stores[source] = cursor
     }
 
@@ -879,36 +863,48 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
     // MARK: Codable-by-hand (the on-disk shape is snake_case JSON, and a
     // Codable synthesis would silently rename the keys if a field is renamed).
 
-    public static func load(from url: URL) -> DelegationOutcomeCursor? {
-        guard let data = try? Data(contentsOf: url),
-              let parsed = try? JSONValue.parse(data),
+    public static func load(from url: URL) throws -> DelegationOutcomeCursor? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        let parsed = try JSONValue.parse(data)
+        guard
               case .object(let root) = parsed,
-              case .object(let stores)? = root["stores"] else { return nil }
+              root["version"] == .int(1),
+              case .object(let stores)? = root["stores"] else { throw CocoaError(.fileReadCorruptFile) }
+        func strings(_ value: JSONValue?) throws -> [String] {
+            guard let value else { return [] }
+            guard case .array(let values) = value else { throw CocoaError(.fileReadCorruptFile) }
+            return try values.map {
+                guard case .string(let string) = $0, !string.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+                return string
+            }
+        }
+        func dictionary(_ value: JSONValue?) throws -> [String: String] {
+            guard let value else { return [:] }
+            guard case .object(let values) = value else { throw CocoaError(.fileReadCorruptFile) }
+            return try values.mapValues {
+                guard case .string(let string) = $0 else { throw CocoaError(.fileReadCorruptFile) }
+                return string
+            }
+        }
         var result = DelegationOutcomeCursor()
         for (source, value) in stores {
-            guard case .object(let obj) = value else { continue }
+            guard case .object(let obj) = value else { throw CocoaError(.fileReadCorruptFile) }
             var cursor = StoreCursor()
-            if case .string(let iso)? = obj["last_seen"] { cursor.lastSeen = parseISO(iso) }
-            if case .array(let ids)? = obj["carded_ids"] {
-                cursor.cardedIDs = ids.compactMap {
-                    if case .string(let s) = $0 { return s }
-                    return nil
-                }
+            if let value = obj["last_seen"] {
+                guard case .string(let iso) = value, let date = parseISO(iso) else { throw CocoaError(.fileReadCorruptFile) }
+                cursor.legacyLastSeen = date
             }
-            if case .object(let outcomes)? = obj["carded_outcomes"] {
-                for (id, v) in outcomes {
-                    if case .string(let s) = v { cursor.cardedOutcomes[id] = s }
-                }
-            }
-            if case .array(let ids)? = obj["announced_stall_ids"] {
-                cursor.announcedStallIDs = ids.compactMap {
-                    if case .string(let s) = $0 { return s }
-                    return nil
-                }
-            }
+            cursor.cardedIDs = try strings(obj["carded_ids"])
+            cursor.cardedOutcomes = try dictionary(obj["carded_outcomes"])
+            guard cursor.cardedOutcomes.values.allSatisfy({ DelegationOutcome(rawValue: $0) != nil })
+            else { throw CocoaError(.fileReadCorruptFile) }
+            cursor.deliveryReceiptVersions = try dictionary(obj["delivery_receipt_versions"])
+            cursor.announcedStallIDs = try strings(obj["announced_stall_ids"])
             result.stores[source] = cursor
         }
-        if case .string(let key)? = root["codex_undelivered_backlog"], !key.isEmpty {
+        if let value = root["codex_undelivered_backlog"] {
+            guard case .string(let key) = value, !key.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
             result.codexBacklogKey = key
         }
         return result
@@ -920,13 +916,14 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
             var obj: [String: JSONValue] = [
                 "carded_ids": .array(cursor.cardedIDs.map { .string($0) }),
             ]
-            if let lastSeen = cursor.lastSeen {
-                obj["last_seen"] = .string(Self.formatISO(lastSeen))
-            }
+            if let boundary = cursor.legacyLastSeen { obj["last_seen"] = .string(Self.formatISO(boundary)) }
             if !cursor.cardedOutcomes.isEmpty {
                 var outcomes: [String: JSONValue] = [:]
                 for (id, raw) in cursor.cardedOutcomes { outcomes[id] = .string(raw) }
                 obj["carded_outcomes"] = .object(outcomes)
+            }
+            if !cursor.deliveryReceiptVersions.isEmpty {
+                obj["delivery_receipt_versions"] = .object(cursor.deliveryReceiptVersions.mapValues { .string($0) })
             }
             if !cursor.announcedStallIDs.isEmpty {
                 obj["announced_stall_ids"] = .array(
@@ -993,6 +990,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
     /// near-term rerun instead of letting the remainder wait for the next store
     /// event or the six-hour sweep.
     private let reportDeferral: @Sendable (Bool) async -> Void
+    private let readHandledOutcomes: @Sendable () async throws -> Set<String>
     private let cursorPath: URL
     private let clock: @Sendable () -> Date
 
@@ -1001,35 +999,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
     /// a hundred rows into the inbox at once. Never silent — the tick outcome
     /// names the remainder (`no_silent_caps`).
     public static let maxCardsPerTick = 10
-    /// A Codex delivery receipt is appended after the runner completion time
-    /// it carries. A cross-job timestamp cursor can therefore already be ahead
-    /// of a newly visible receipt. Exact unhandled receipt identity wins over
-    /// that timestamp for one bounded recent window; this repairs races and
-    /// upgrades without turning installation into an unbounded history replay.
-    public static let recentCodexReceiptReconciliationWindow: TimeInterval = 24 * 60 * 60
-
-    /// Reader that cannot report an unreadable store: every read is taken as
-    /// complete. Kept for callers whose source genuinely has no availability
-    /// half; production uses the `readJobsWithAvailability` initializer.
-    public init(
-        interval: TimeInterval = 5 * 60,
-        cursorPath: URL,
-        clock: @escaping @Sendable () -> Date = { Date() },
-        readJobs: @escaping @Sendable () async -> [DelegationJobSnapshot],
-        fileCard: @escaping @Sendable (DelegationOutcomeCard) async -> Bool,
-        observeTransition: @escaping @Sendable (DelegationJobSnapshot) async -> Bool = { _ in true }
-    ) {
-        self.init(
-            interval: interval,
-            cursorPath: cursorPath,
-            clock: clock,
-            readJobsWithAvailability: {
-                DelegationJobsRead(jobs: await readJobs(), allStoresReadable: true)
-            },
-            fileCard: fileCard,
-            observeTransition: observeTransition
-        )
-    }
 
     public init(
         interval: TimeInterval = 5 * 60,
@@ -1038,7 +1007,8 @@ public struct DelegationOutcomeLoop: LoopRunner {
         readJobsWithAvailability: @escaping @Sendable () async -> DelegationJobsRead,
         fileCard: @escaping @Sendable (DelegationOutcomeCard) async -> Bool,
         observeTransition: @escaping @Sendable (DelegationJobSnapshot) async -> Bool = { _ in true },
-        reportDeferral: @escaping @Sendable (Bool) async -> Void = { _ in }
+        reportDeferral: @escaping @Sendable (Bool) async -> Void = { _ in },
+        readHandledOutcomes: @escaping @Sendable () async throws -> Set<String> = { throw CocoaError(.fileReadCorruptFile) }
     ) {
         self.interval = interval
         self.cursorPath = cursorPath
@@ -1047,6 +1017,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         self.fileCard = fileCard
         self.observeTransition = observeTransition
         self.reportDeferral = reportDeferral
+        self.readHandledOutcomes = readHandledOutcomes
     }
 
     /// Conventional cursor location under a data root.
@@ -1060,59 +1031,73 @@ public struct DelegationOutcomeLoop: LoopRunner {
         let now = clock()
         let read = await readJobs()
         let jobs = read.jobs
-        // 2026-09-06: an incomplete read must not settle the timestamp half of
-        // the cursor. The id half still records what WAS carded (so nothing
-        // cards twice), but `last_seen` stays put: an unreadable job carries no
-        // stamp we can compare, and advancing past it would reject it forever.
         let stampsMayAdvance = read.allStoresReadable
-        if !stampsMayAdvance {
-            FileHandle.standardError.write(Data(("DelegationOutcomeLoop: a delegation store was "
-                + "unreadable this tick; holding the outcome cursor's last_seen so no unreadable "
-                + "job ages out\n").utf8))
-        }
-        func settledStamp(_ job: DelegationJobSnapshot) -> Date? {
-            stampsMayAdvance ? job.completionStamp : nil
-        }
         let unreadableStoreError = "a delegation store (directory, job file, or delivery "
-            + "ledger line) could not be read this tick; the outcome cursor's last_seen was "
-            + "held so an unreadable job cannot be skipped permanently"
+            + "ledger line) could not be read this tick; repair its storage and retry outcome reconciliation"
         let terminal = jobs.filter { $0.isTerminal }
         let wasSeeded: Bool
         let seedResult: String?
+        var recoveryNote: String?
 
-        // FIRST RUN: seed terminal history and file no historical outcome
-        // cards. A currently stalled OPEN job is a live condition rather than
-        // history, so the liveness pass below may still speak on this tick. A
-        // cursor file that EXISTS but fails to parse is not a first run — it
-        // means outcomes since the last good cursor are being skipped, so that
-        // case must be named, never laundered into an ordinary seed (sweep
-        // 2026-08-21).
+        // Only absent storage seeds history. Corruption reconciles actual
+        // notification identities and downstream settlement before replacement.
         var cursor: DelegationOutcomeCursor
-        if let loaded = DelegationOutcomeCursor.load(from: cursorPath) {
-            cursor = loaded
-            wasSeeded = false
-            seedResult = nil
-        } else {
-            let corrupt = FileManager.default.fileExists(atPath: cursorPath.path)
-            var seeded = DelegationOutcomeCursor()
-            for job in terminal {
-                // The outcome is recorded at seed time too: a seeded job whose
-                // outcome later WORSENS (a reply preserved after the seed) is a
-                // new event, not history, and re-cards like any other.
-                seeded.record(source: job.source, id: job.id, stamp: settledStamp(job),
-                              outcome: job.terminalOutcome)
-            }
-            cursor = seeded
-            wasSeeded = true
-            if corrupt {
-                seedResult =
-                    "RECOVERED corrupt delegation outcome cursor at \(cursorPath.lastPathComponent): "
-                    + "reseeded over \(terminal.count) terminal job(s) — any outcomes since the last "
-                    + "good cursor were skipped without cards"
+        do {
+            if let loaded = try DelegationOutcomeCursor.load(from: cursorPath) {
+                cursor = loaded
+                wasSeeded = false
+                seedResult = nil
             } else {
-                seedResult =
-                    "seeded delegation outcome cursor over \(terminal.count) pre-existing terminal job(s); no outcome cards filed"
+                guard stampsMayAdvance else { return .failed(error: unreadableStoreError) }
+                cursor = DelegationOutcomeCursor()
+                for job in terminal {
+                    cursor.record(source: job.source, id: job.id,
+                                  outcome: job.terminalOutcome, deliveryReceiptVersion: job.deliveryReceiptVersion)
+                }
+                wasSeeded = true
+                seedResult = "seeded delegation outcome cursor over \(terminal.count) pre-existing terminal job(s); no outcome cards filed"
             }
+        } catch {
+            guard stampsMayAdvance else { return .failed(error: unreadableStoreError) }
+            do {
+                let handled = try await readHandledOutcomes()
+                cursor = DelegationOutcomeCursor()
+                for job in terminal {
+                    guard let outcome = job.terminalOutcome,
+                          handled.contains("\(job.source):\(job.id):\(outcome.rawValue)") else { continue }
+                    guard await observeTransition(job) else {
+                        return .failed(error: "corrupt delegation cursor preserved; canonical outcome settlement failed for \(job.source):\(job.id)")
+                    }
+                    cursor.record(source: job.source, id: job.id, outcome: outcome)
+                }
+                let backup = cursorPath.appendingPathExtension("corrupt.\(UUID().uuidString)")
+                try FileManager.default.copyItem(at: cursorPath, to: backup)
+                recoveryNote = "corrupt delegation cursor preserved at \(backup.lastPathComponent); rebuilt from canonical notification and settlement identities; unseen outcomes remain pending"
+                wasSeeded = false
+                seedResult = nil
+            } catch {
+                return .failed(error: "delegation outcome cursor unavailable and preserved; restore readable cursor or canonical notifications before retrying: \(error.localizedDescription)")
+            }
+        }
+
+        if stampsMayAdvance {
+            for job in terminal {
+                guard let boundary = cursor.store(job.source).legacyLastSeen,
+                      let completed = job.completionStamp, completed <= boundary else { continue }
+                // A reply arriving after the old completion boundary is new evidence.
+                if let version = job.deliveryReceiptVersion {
+                    guard let arrival = DelegationOutcomeCursor.parseISO(String(version.prefix { $0 != "|" })),
+                          arrival <= boundary else { continue }
+                }
+                if !cursor.store(job.source).cardedIDs.contains(job.id) {
+                    cursor.record(source: job.source, id: job.id, outcome: job.terminalOutcome,
+                                  deliveryReceiptVersion: job.deliveryReceiptVersion)
+                } else if let version = job.deliveryReceiptVersion,
+                          cursor.store(job.source).deliveryReceiptVersions[job.id] == nil {
+                    cursor.stores[job.source]?.deliveryReceiptVersions[job.id] = version
+                }
+            }
+            for source in cursor.stores.keys { cursor.stores[source]?.legacyLastSeen = nil }
         }
 
         // Stuck liveness is not a terminal outcome. It gets its own reversible
@@ -1156,6 +1141,8 @@ public struct DelegationOutcomeLoop: LoopRunner {
         let pending = terminal.filter { job in
             let store = cursor.store(job.source)
             if store.cardedIDs.contains(job.id) {
+                if let version = job.deliveryReceiptVersion,
+                   store.deliveryReceiptVersions[job.id] != version { return true }
                 // Already carded. It cards AGAIN only when the outcome it now
                 // presents is more alarming than the one it was carded under
                 // (finished → unconfirmed once the codex reply is preserved).
@@ -1164,17 +1151,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 guard let recorded = cursor.cardedOutcome(source: job.source, id: job.id),
                       let current = job.terminalOutcome else { return false }
                 return current.alarmRank > recorded.alarmRank
-            }
-            if job.source == "codex", job.deliveryOutcome == "delivered",
-               let stamp = job.completionStamp,
-               stamp >= now.addingTimeInterval(-Self.recentCodexReceiptReconciliationWindow) {
-                return true
-            }
-            // A job whose completion predates the cursor was already handled in
-            // an earlier tick (or by the seed) and has simply aged out of the
-            // id set. Not new.
-            if let stamp = job.completionStamp, let lastSeen = store.lastSeen, stamp <= lastSeen {
-                return false
             }
             return true
         }
@@ -1197,15 +1173,12 @@ public struct DelegationOutcomeLoop: LoopRunner {
         for job in batch {
             guard let card = DelegationOutcomeCard.make(from: job, now: now) else { continue }
             if await fileCard(card), await observeTransition(job) {
-                cursor.record(source: job.source, id: job.id, stamp: settledStamp(job),
-                              outcome: card.outcome)
+                cursor.record(source: job.source, id: job.id,
+                              outcome: card.outcome, deliveryReceiptVersion: job.deliveryReceiptVersion)
                 cursor.clearStallAnnouncement(source: job.source, id: job.id)
                 filed += 1
             } else {
-                // Contiguous settlement: stop at the first failed card. If a
-                // newer job were recorded after this failure, `lastSeen` would
-                // advance past the older row and the timestamp filter could
-                // hide it forever on the next tick.
+                // Stop on failed settlement; exact identity remains pending.
                 failed += 1
                 break
             }
@@ -1251,13 +1224,14 @@ public struct DelegationOutcomeLoop: LoopRunner {
 
         if pending.isEmpty && backlogNote == nil && livenessPending.isEmpty {
             await reportDeferral(false)
-            if wasSeeded {
+            if wasSeeded || recoveryNote != nil {
                 do {
                     try cursor.write(to: cursorPath)
                 } catch {
                     return .failed(error: "delegation outcome cursor seed failed: \(error)")
                 }
                 guard stampsMayAdvance else { return .failed(error: unreadableStoreError) }
+                if let recoveryNote { return .failed(error: recoveryNote) }
                 return .completed(result: seedResult)
             }
             guard stampsMayAdvance else { return .failed(error: unreadableStoreError) }
@@ -1290,6 +1264,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         }
 
         var result = "filed \(filed) delegation outcome card(s)"
+        if let recoveryNote { result += "; \(recoveryNote)" }
         if livenessFiled > 0 { result += "; filed \(livenessFiled) delegation liveness card(s)" }
         if let seedResult { result += "; \(seedResult)" }
         if writeFailures > 0 {
@@ -1302,7 +1277,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         // transitions are the work this loop exists to do; reporting the tick
         // as `.completed` kept the loop's own health surface green while
         // delegated outcomes silently went nowhere.
-        if writeFailures > 0 {
+        if writeFailures > 0 || recoveryNote != nil {
             return .failed(error: result)
         }
         if !stampsMayAdvance {

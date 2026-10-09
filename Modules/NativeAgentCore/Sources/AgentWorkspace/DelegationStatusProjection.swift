@@ -108,6 +108,9 @@ final class DelegationDeliveryCache: @unchecked Sendable {
         }
         snapshot.availability.readableRecords += 1
         for row in DelegationStatusProjector.projectCodexDeliveries(now: .distantPast, objects: [object]) {
+            if let previous = snapshot.byID[row.id], previous.deliveryOutcome == "delivered",
+               previous.recordedThreadID == row.recordedThreadID,
+               previous.recordedTurnID == row.recordedTurnID, row.deliveryOutcome != "delivered" { continue }
             snapshot.byID[row.id] = row
             if row.deliveryOutcome == "delivered" { snapshot.deliveredIDs.insert(row.id) }
         }
@@ -279,6 +282,7 @@ public struct DelegationJobProjection: Sendable, Equatable {
     public var deliveryOutcome: String?
     /// Allowlisted machine reason only; never raw helper errors or prose.
     public var deliveryReason: String? = nil
+    public var onwardDelivery: JSONValue? = nil
     /// First 200 characters of the completion text, when the record carries it.
     ///
     /// Absent on most claude rows BY DESIGN: the runner nulls completionText
@@ -293,6 +297,7 @@ public struct DelegationJobProjection: Sendable, Equatable {
     public var executionError: String? = nil
     /// Identifies the evidence being projected, not another execution.
     public var recordKind: String? = nil
+    public var deliveryReceiptVersion: String? = nil
     /// Contract/build identity stamped by the NativeAgent runtime that
     /// originated this wake. Absence means a legacy/unversioned producer.
     public var producerSchemaVersion: Int? = nil
@@ -352,6 +357,7 @@ public struct DelegationJobProjection: Sendable, Equatable {
         obj["accepted_message_ids"] = .array(acceptedMessageIDs.sorted().map(JSONValue.string))
         put("delivery_outcome", deliveryOutcome)
         put("delivery_reason", deliveryReason)
+        if let onwardDelivery { obj["onward_delivery"] = onwardDelivery }
         put("producer_source_revision", producerSourceRevision)
         if let producerSchemaVersion {
             obj["producer_schema_version"] = .int(Int64(producerSchemaVersion))
@@ -539,6 +545,24 @@ public struct DelegationStatusProjector: Sendable {
         sources.append(claude.availability)
         for (url, object) in claude.objects {
             if let row = Self.projectClaude(url: url, now: now, object: object) { rows.append(row) }
+        }
+        // A live-session reply has a linked receipt, but no wake job. Exact
+        // reads must include that receipt without inventing a runner.
+        if let messageID, agent == nil || agent == "claude",
+           !rows.contains(where: { $0.acceptedMessageIDs.contains(messageID) }) {
+            let replies = claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent("claude-replies.jsonl")
+            if let text = Self.requestTexts(inbox: replies, ids: [messageID], field: "replyTextHead")[messageID] {
+                let stamp = Self.requestTexts(inbox: replies, ids: [messageID], field: "createdAt")[messageID]
+                var row = DelegationJobProjection(id: messageID, acceptedMessageIDs: [messageID],
+                    agentReplyTextHead: text, source: "claude", agent: "claude", topicSlug: nil,
+                    deskHandle: nil, state: "replied", status: "replied", runStatus: nil, createdAt: nil,
+                    claimedAt: nil, startedAt: nil, lastLiveness: nil, completedAt: stamp, elapsedSeconds: nil,
+                    stalled: false, stallBasis: .terminal, deliveryLost: nil, deliveryOutcome: nil,
+                    completionTextHead: nil, recordKind: "linked_reply")
+                row.recencyKey = Self.date(stamp)
+                rows.append(row)
+                sources.append(DelegationSourceAvailability(source: "claude_replies", agent: "claude", readableRecords: 1))
+            }
         }
         var codexRows: [String: DelegationJobProjection] = [:]
         for (directory, source, undelivered) in [
@@ -988,15 +1012,25 @@ public struct DelegationStatusProjector: Sendable {
             let completedAt = string(turnResult, "completedAt") ?? string(delivery, "createdAt")
             let bridgeStatus = string(bridge, "status")
             let replyStatus = string(bridge, "replyStatus")
-            let outcome: String? = switch (bridgeStatus, replyStatus) {
-            case ("delivered", _), (_, "ok"): "delivered"
-            case ("failed", _), (_, "failed"): "lost"
-            case (.some, _), (_, .some): "unknown"
+            // Older receipts have no explicit persistence flag, but retain
+            // the chat return and its separate notification settlement.
+            var completionDelivery: [String: JSONValue] = [:]
+            if case .object(let value)? = bridge["completionDelivery"] { completionDelivery = value }
+            let persisted = bool(bridge, "replyPersisted") == true
+                || (string(bridge, "nativeAgentReplyPreview")?.isEmpty == false
+                    && string(bridge, "nativeAgentSessionId") != nil
+                    && string(bridge, "nativeAgentSessionId") == string(delivery, "sessionId")
+                    && string(completionDelivery, "surface") != nil
+                    && string(completionDelivery, "surface") != "caller-result")
+            let outcome: String? = switch (persisted, bridgeStatus, replyStatus) {
+            case (true, _, _), (_, "delivered", _), (_, _, "ok"): "delivered"
+            // A failed POST or notification proves neither transcript absence
+            // nor a delivery deadline. Keep uncertainty instead of minting loss.
+            case (_, .some, _), (_, _, .some): "unknown"
             default: nil
             }
             let effectiveState: String = switch outcome {
             case "delivered": "settled"
-            case "lost": "delivery_failed"
             case "unknown": "delivery_unknown"
             default: "execution_completed"
             }
@@ -1021,7 +1055,7 @@ public struct DelegationStatusProjector: Sendable {
                     elapsedSeconds: nil,
                     stalled: runStatus == "stalled" || runStatus == "failed_hung",
                     stallBasis: runStatus == "stalled" || runStatus == "failed_hung" ? .recordedStall : .terminal,
-                    deliveryLost: outcome == "lost" ? true : nil,
+                    deliveryLost: nil,
                     deliveryOutcome: outcome,
                     completionTextHead: head(completion),
                     producerSchemaVersion: nil,
@@ -1034,6 +1068,12 @@ public struct DelegationStatusProjector: Sendable {
                 row.noWorkObserved = bool(turnResult, "noWorkObserved")
                 if case .object(let recovery)? = turnResult["hangRecovery"] { row.recoveryStatus = string(recovery, "status") }
                 row.recordKind = "delivery_receipt"
+                row.deliveryReceiptVersion = [string(delivery, "createdAt"),
+                    string(delivery, "threadId"), string(delivery, "turnId"),
+                    bridgeStatus, replyStatus].map { $0 ?? "" }.joined(separator: "|")
+                if persisted, bridgeStatus != "delivered", replyStatus != "ok" {
+                    row.deliveryReceiptVersion = (row.deliveryReceiptVersion ?? "") + "|reply_persisted"
+                }
                 row.agentReplyTextHead = head(string(turnResult, "messagePreview"))
                 Self.retainReply(string(turnResult, "agentReplyText") ?? string(turnResult, "messagePreview"),
                     truncated: bool(turnResult, "agentReplyTruncated") ?? true, in: &row)
@@ -1073,11 +1113,17 @@ public struct DelegationStatusProjector: Sendable {
         var bridge: [String: JSONValue] = [:]
         if case .object(let value)? = job["bridge"] { bridge = value }
         let bridgeStatus = string(bridge, "status")
-        let delivery: String? = switch bridgeStatus {
-        case "delivered", "dry_run": "delivered"
-        case "failed": "lost"
-        case "unknown": "unknown"
-        case "blocked": "blocked"
+        // These statuses follow Agent's completed turn; they describe her
+        // answer's onward delivery, not receipt of the agent's completion.
+        let received = int(bridge, "httpStatus") == 200 && string(payload, "sessionId") != nil
+            && string(bridge, "nativeAgentSessionId") == string(payload, "sessionId")
+            && ["ok", "delivery_failed_pre_dispatch", "delivery_rejected", "delivery_lifecycle_unavailable",
+                "delivery_in_progress", "outcome_unknown", "completion_already_settled"].contains(string(bridge, "replyStatus") ?? "")
+        let delivery: String? = switch (received, bridgeStatus) {
+        case (true, _), (_, "delivered"), (_, "dry_run"): "delivered"
+        case (_, "failed"): "lost"
+        case (_, "unknown"): "unknown"
+        case (_, "blocked"): "blocked"
         default: nil
         }
         let retained = string(job, "completionText")
@@ -1101,7 +1147,7 @@ public struct DelegationStatusProjector: Sendable {
             elapsedSeconds: elapsed,
             stalled: stalled,
             stallBasis: basis,
-            deliveryLost: bridgeStatus == "failed" ? true : nil,
+            deliveryLost: delivery == "lost" ? true : nil,
             deliveryOutcome: delivery,
             completionTextHead: head(retained),
             producerSchemaVersion: int(payload, "producerSchemaVersion"),
@@ -1109,6 +1155,9 @@ public struct DelegationStatusProjector: Sendable {
             stallDeadline: stallDeadline
         )
         row.recencyKey = firstDate(completedAt, liveness, startedAt, createdAt)
+        if case .object(let onward)? = bridge["completionDelivery"] {
+            row.onwardDelivery = .object(onward.filter { ["status", "reason", "surface", "delivery"].contains($0.key) })
+        }
         Self.retainReply(string(job, "reply"), truncated: false, in: &row)
         row.acceptedMessageIDs = Set([Self.recordedLookupID(job["messageId"])].compactMap { $0 })
         // What was sent, and why a failed run failed (a provider's error, else the runner's reason).
@@ -1264,7 +1313,7 @@ public struct DelegationStatusProjector: Sendable {
 
     static func head(_ text: String?) -> String? {
         guard let text, !text.isEmpty else { return nil }
-        guard text.count > completionTextHeadLimit else { return text }
+        guard longer(text, than: completionTextHeadLimit) else { return text }
         // 2026-09-22: a cut head ends on a word and carries "…", which is how
         // readers tell a cut reply from a short one.
         var cut = text.prefix(completionTextHeadLimit - 1)
@@ -1272,6 +1321,12 @@ public struct DelegationStatusProjector: Sendable {
             cut = cut[..<space]
         }
         return String(cut).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+
+    /// `text.count > limit` without counting a whole long reply's characters:
+    /// every delivery row asks, and replies run to many kilobytes.
+    static func longer(_ text: String, than limit: Int) -> Bool {
+        text.index(text.startIndex, offsetBy: limit, limitedBy: text.endIndex).map { $0 < text.endIndex } ?? false
     }
 
     static func string(_ obj: [String: JSONValue], _ key: String) -> String? {
@@ -1321,12 +1376,15 @@ public struct DelegationStatusProjector: Sendable {
     /// record still parses.
     static func date(_ iso: String?) -> Date? {
         guard let iso, !iso.isEmpty else { return nil }
+        isoLock.lock(); defer { isoLock.unlock() }
         if let d = withFraction.date(from: iso) { return d }
         return plainISO.date(from: iso)
     }
 
-    // ISO8601DateFormatter is documented thread-safe; configured once, never
-    // mutated. Building two per date call dominated each projection.
+    // Configured once, never mutated, and only used under `isoLock`: reads
+    // run from several tasks at once. Building two per date call dominated
+    // each projection.
+    private static let isoLock = NSLock()
     nonisolated(unsafe) private static let withFraction: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1347,7 +1405,7 @@ public struct DelegationStatusProjector: Sendable {
         guard let text, !text.isEmpty else { return }
         row.agentReplyText = String(text.prefix(6000))
         row.agentReplyTextHead = head(text)
-        row.agentReplyTruncated = truncated || text.count > 6000
+        row.agentReplyTruncated = truncated || longer(text, than: 6000)
     }
 
     static func firstDate(_ candidates: String?...) -> Date? {

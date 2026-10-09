@@ -157,6 +157,7 @@ public enum ContextAtomKind: String, Codable, CaseIterable, Sendable {
     case memory
     case procedure
     case evidence
+    case news
     case project
     case capability
     case runtimeTruth = "runtime_truth"

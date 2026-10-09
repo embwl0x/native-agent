@@ -47,7 +47,7 @@ enum QuietChatSessionVerbs {
             let changed = appModel.activeChatSessionId != session.id
             await appModel.selectChatSession(session.row)
             guard appModel.activeChatSessionId == session.id else {
-                return failure("show_failed", "The window did not switch: \(appModel.statusText)", session)
+                return failure("show_failed", "The window did not switch: \(appModel.statusForAgent)", session)
             }
             return ok(session, changed: changed, "\(session.title) is now the conversation the chat page shows.")
         case "rename":
@@ -55,7 +55,7 @@ enum QuietChatSessionVerbs {
             guard !title.isEmpty else { return failure("missing_title", "Pass the new name in title.", session) }
             await appModel.renameChatSession(id: session.id, title: title)
             let now = appModel.engine.transcripts.sessions.first { $0.id == session.id }
-            guard let now, now.title == title else { return failure("rename_failed", appModel.statusText, session) }
+            guard let now, now.title == title else { return failure("rename_failed", appModel.statusForAgent, session) }
             return ok(ChatSessionRef(row: now), changed: session.title != title, "Renamed from \(session.title) to \(title).")
         case "pin":
             let was = MacPinnedChatSessionStore.load().contains(session.id)
@@ -79,14 +79,14 @@ enum QuietChatSessionVerbs {
         case "clear":
             // /clear's own call, on the conversation named.
             let result = await appModel.clearActiveChatMessages(sessionId: session.id)
-            guard result.succeeded else { return failure("clear_failed", result.userMessage, session) }
+            guard result.succeeded else { return failure("clear_failed", result.agentMessage, session) }
             HarnessDecidedRow.post(requester: "Full Mac", tool: "chat.clear \(session.id)",
                                    sessionID: AppToolExecutor.inputString(input["__session_id"]),
                                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             return ok(session, changed: true, "Every message in \(session.title) is gone for good.")
         case "archive":
             let result = await appModel.archiveActiveChat(sessionId: session.id)
-            guard result.succeeded else { return failure("archive_failed", result.userMessage, session) }
+            guard result.succeeded else { return failure("archive_failed", result.agentMessage, session) }
             return ok(session, changed: true, "\(session.title) is archived.")
         case "stop":
             guard isRunning(session.id, appModel) else {
@@ -161,8 +161,8 @@ enum QuietChatSessionVerbs {
         if !reachesUser, ["show", "detach", "close_window"].contains(verb) {
             return .failure(Refusal(json: failure(
                 "users_screen",
-                "\(verb) moves User's screen, and he did not start this turn. Ask him first, "
-                + "or tell him where it is (\(session.title), session_id \(session.id)) and let him open it.",
+                "\(verb) moves the person's screen, and they did not start this turn. Ask them first, "
+                + "or tell them where it is (\(session.title), session_id \(session.id)) and let them open it.",
                 session
             )))
         }
@@ -172,8 +172,8 @@ enum QuietChatSessionVerbs {
         if !reachesUser, (["stop", "archive", "regenerate", "clear"].contains(verb) || interruptsReply), userIsIn(session.id, appModel) {
             return .failure(Refusal(json: failure(
                 "user_is_in_it",
-                "User is in \(session.title) (on screen or in its own window), and he did not start this turn. "
-                + "Ask him first, or leave it to him.",
+                "The person is in \(session.title) (on screen or in its own window), and they did not start this turn. "
+                + "Ask them first, or leave it to them.",
                 session
             )))
         }
@@ -195,28 +195,36 @@ enum QuietChatSessionVerbs {
     @MainActor
     private static func list(_ input: [String: JSONValue], appModel: AppModel) async -> JSONValue {
         let archived = AppToolExecutor.inputString(input["archived"])?.lowercased() == "true"
+        let pinned = Set(MacPinnedChatSessionStore.load())
+        let pinnedOnly: Bool? = if case .bool(let value)? = input["pinned"] { value } else { nil }
         var rows = appModel.engine.transcripts.sessions
         if archived {
             do { rows = try await appModel.engine.transcripts.listArchived() } catch {
                 return AppToolExecutor.failure("list_failed", "The conversation list didn't read (\(error.localizedDescription)). Try again.")
             }
         }
-        rows = rows.filter { ($0.archived == true) == archived }
+        let query = AppToolExecutor.inputString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        rows = rows.filter { ($0.archived == true) == archived && (pinnedOnly == nil || pinned.contains($0.id) == pinnedOnly)
+            && (query.isEmpty || BridgeRoutingPrefix.stripping($0.title).localizedCaseInsensitiveContains(query)) }
             .sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
         let offset = min(rows.count, max(0, AppToolExecutor.inputString(input["offset"]).flatMap { Int($0) } ?? 0))
         let page = rows.dropFirst(offset).prefix(20)
-        let pinned = Set(MacPinnedChatSessionStore.load())
         let next = offset + page.count
         return .object([
             "status": .string("ok"),
             "conversations": .array(page.map { row in .object([
-                "session_id": .string(row.id), "title": .string(row.title),
+                "session_id": .string(row.id), "title": .string(BridgeRoutingPrefix.stripping(row.title)),
                 "last_active": .string(row.updatedAt ?? row.createdAt),
+                "message_count": row.messageCount.map { .int(Int64($0)) } ?? .null,
+                "created_at": .string(row.createdAt),
+                "first_message_at": row.firstMessageAt.map(JSONValue.string) ?? .null,
+                "last_message_at": row.lastMessageAt.map(JSONValue.string) ?? .null,
                 "pinned": .bool(pinned.contains(row.id)), "running": .bool(isRunning(row.id, appModel)),
                 "archived": .bool(row.archived == true),
             ]) }),
             "offset": .int(Int64(offset)), "total": .int(Int64(rows.count)),
             "next_offset": next < rows.count ? .int(Int64(next)) : .null,
+            "note": .string("Message count is the indexed transcript count, which can shrink after compaction. Message times are conversational message stamps; null means not recorded. created_at is session creation and last_active is index activity, not message time."),
         ])
     }
 
@@ -226,16 +234,16 @@ enum QuietChatSessionVerbs {
     private static func newChat(title: String, appModel: AppModel) async -> JSONValue {
         let row: ChatSessionRow
         do {
-            row = try await appModel.chatSessionTransactions.create(store: appModel.engine.transcripts)
+            row = try await appModel.chatSessionTransactions.create(store: appModel.engine.transcripts,
+                                                                  title: title.isEmpty ? "New Chat" : title)
             appModel.engine.transcripts.setMessages([], for: row.id)
             appModel.engine.transcripts.sessions = try await appModel.engine.transcripts.list()
         } catch {
             return AppToolExecutor.failure("new_failed", "New chat failed: \(error.localizedDescription)")
         }
-        if !title.isEmpty { await appModel.renameChatSession(id: row.id, title: title) }
         appModel.publishChatSnapshot()
-        let session = ChatSessionRef(row: appModel.engine.transcripts.sessions.first { $0.id == row.id } ?? row)
-        return ok(session, changed: true, "Started \(session.title), not shown: User's screen stays where it is.")
+        let session = ChatSessionRef(row: row)
+        return ok(session, changed: true, "Started \(session.title), not shown: the person's screen stays where it is.")
     }
 
     /// The chat on screen, or one open in its own window.
@@ -286,6 +294,14 @@ enum QuietChatSessionVerbs {
         ) else {
             return failure("not_retryable", "The last reply in \(session.title) is not one Try again can re-run.", session)
         }
+        // The same gate the person's Retry asks. She cannot answer the
+        // confirmation for them, so a re-run that could repeat a real action
+        // is refused here and named.
+        if let gate = ChatTurnFailure.retryNeedsConfirmation(for: last, in: messages) {
+            return failure("needs_confirmation", gate.line(model: nil) + " "
+                + "Ask the person before starting it over, or send a message that continues from where it stopped.",
+                session)
+        }
         if snapshot.inputHadAttachments {
             return failure("needs_attachment", "The question behind that reply had a file, and saved rows keep only its summary. "
                 + "Send the question again with the file attached (chat.send with attachments).", session)
@@ -329,7 +345,7 @@ enum QuietChatSessionVerbs {
                 return failure("unknown_turn", "No queued turn \(turnId) in \(session.title); verb queue lists them.", session)
             }
             if busy {
-                appModel.steerQueuedChatTurn(turnId, sessionId: session.id)
+                appModel.sendQueuedChatTurnNow(turnId, sessionId: session.id)
                 return listing("Stopped the reply in progress; \(turnId) runs next.", changed: true)
             }
             appModel.resumeQueuedChatTurns(sessionId: session.id, startingWith: turnId)
@@ -355,7 +371,7 @@ enum QuietChatSessionVerbs {
                 "turn_id": .string(turn.id),
                 "preview": .string(turn.preview),
                 "attachments": .int(Int64(turn.attachments.count)),
-                "from": .string(turn.origin == nil ? "user" : "you"),
+                "from": .string(turn.origin == nil ? "owner" : "you"),
             ])
         }
     }
@@ -368,7 +384,7 @@ enum QuietChatSessionVerbs {
     struct ChatSessionRef {
         let row: ChatSessionRow
         var id: String { row.id }
-        var title: String { row.title }
+        var title: String { BridgeRoutingPrefix.stripping(row.title) }
     }
     typealias ChatSessionRow = NativeAgentShared.ChatSession
 
@@ -376,11 +392,13 @@ enum QuietChatSessionVerbs {
         let json: JSONValue
     }
 
-    /// An id, an exact title, or nothing for the conversation on screen.
+    /// An id, an exact title, or nothing: "this chat" is the conversation the
+    /// request came from (bridge, phone, Telegram), else the one on screen.
     @MainActor
     static func resolve(_ raw: String, appModel: AppModel) -> Result<ChatSessionRef, Refusal> {
         let sessions = appModel.engine.transcripts.sessions
-        let wanted = raw.isEmpty ? appModel.activeChatSessionId : raw
+        let asking = ChatToolSessionContext.verifiedSessionId.flatMap { id in sessions.contains { $0.id == id } ? id : nil }
+        let wanted = raw.isEmpty ? (asking ?? appModel.activeChatSessionId) : raw
         guard !wanted.isEmpty else {
             return .failure(Refusal(json: AppToolExecutor.failure(
                 "no_conversation", "No conversation is on screen. Pass session_id; chat.list lists them."
@@ -409,7 +427,7 @@ enum QuietChatSessionVerbs {
             "session_id": .string(session.id),
             "title": .string(session.title),
             "detail": .string(detail),
-            "note": .string("Done in process through the same action User's control takes; no click was synthesized."),
+            "note": .string("Done in process through the same action the person's control takes; no click was synthesized."),
         ])
     }
 

@@ -56,10 +56,10 @@ public func withCKTimeout<T: Sendable>(
     case .success(let value):
         return value
     case .failure(let error):
-        NSLog("[ck-landmine] \(label) failed: \(error)")
+        nativeLog("[ck-landmine] \(label) failed: \(error)")
         return nil
     case .timedOut:
-        NSLog("[ck-landmine] \(label) timed out after \(formatCKTimeoutSeconds(seconds)); cloudd unhealthy?")
+        nativeLog("[ck-landmine] \(label) timed out after \(formatCKTimeoutSeconds(seconds)); cloudd unhealthy?")
         return nil
     case .cancelled:
         return nil

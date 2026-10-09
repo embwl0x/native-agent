@@ -43,7 +43,7 @@ enum InboxPushNotifier {
                 ]
             )
         } catch {
-            NSLog("[InboxPushNotifier] push failed item=%@ source=%@: %@", itemId, source, error.localizedDescription)
+            nativeLog("[InboxPushNotifier] push failed item=%@ source=%@: %@", itemId, source, error.localizedDescription)
         }
     }
 

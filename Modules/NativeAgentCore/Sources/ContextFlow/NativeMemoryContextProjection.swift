@@ -231,9 +231,10 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     var projectionIdentifier: String { Self.owner }
     var invalidationNamespaces: Set<String> { ["memory-v2"] }
     let invalidationSourceURL: URL?
+    private let dataRoot: URL
 
     // v3: creation time is separate from update freshness for memory age tags.
-    private static let schemaVersion = "memory-context-projection-v3"
+    private static let schemaVersion = "memory-context-projection-v4"
     private let memory: any NativeMemoryContextProjectionMemory
     let limits: NativeMemoryContextProjectionLimits
     private let provenanceIndex: MemoryAtomRecordIndex?
@@ -247,6 +248,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
         self.memory = memory
         self.limits = limits
         self.provenanceIndex = provenanceIndex
+        self.dataRoot = dataRoot
         self.invalidationSourceURL = dataRoot.appendingPathComponent("memory/memory.sqlite")
             .standardizedFileURL
     }
@@ -258,7 +260,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
 
         let listed = try await memory.listContextProjectionRecords()
         let active = listed.filter(Self.isActive)
-        let prepared = Self.prepareUnique(active, limits: limits)
+        let prepared = Self.prepareUnique(active, limits: limits, dataRoot: dataRoot)
             .sorted { $0.recordID < $1.recordID }
         let selected = Array(prepared.prefix(limits.maximumRecords))
         let selectedIDs = Set(selected.map(\.sourceID))
@@ -424,7 +426,8 @@ private extension NativeMemoryContextProjection {
 
     static func prepareUnique(
         _ records: [NativeMemoryProjectionRecord],
-        limits: NativeMemoryContextProjectionLimits
+        limits: NativeMemoryContextProjectionLimits,
+        dataRoot: URL
     ) -> [PreparedRecord] {
         let grouped = Dictionary(grouping: records, by: { normalizedID($0.id) })
         return grouped.keys.sorted().compactMap { key in
@@ -433,13 +436,14 @@ private extension NativeMemoryContextProjection {
                   group.count == 1 else {
                 return nil
             }
-            return prepare(group[0], limits: limits)
+            return prepare(group[0], limits: limits, dataRoot: dataRoot)
         }
     }
 
     static func prepare(
         _ record: NativeMemoryProjectionRecord,
-        limits: NativeMemoryContextProjectionLimits
+        limits: NativeMemoryContextProjectionLimits,
+        dataRoot: URL
     ) -> PreparedRecord? {
         let recordID = normalizedID(record.id)
         guard !recordID.isEmpty,
@@ -552,6 +556,9 @@ private extension NativeMemoryContextProjection {
             id: locatorDigest,
             label: record.memoryKind ?? record.layer ?? "memory"
         )]
+        for source in MemoryDataProvenance.sources(in: record.extras, dataRoot: dataRoot) {
+            entities.append(ContextEntity(kind: "untrusted_source", id: ContextStableID.digest(parts: [source]), label: source))
+        }
         entities.append(ContextEntity(
             kind: "memory_authority",
             id: correction ? "correction" : (pinned ? "pinned" : "adaptive"),
@@ -603,6 +610,7 @@ private extension NativeMemoryContextProjection {
             record.observedAt ?? "",
             canonicalJSONString(record.evidence) ?? "",
             canonicalJSONString(objectValue(record.extras, key: "context_topics")) ?? "",
+            canonicalJSONString(.object(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot))) ?? "",
         ] + (body == embeddingText ? [] : [embeddingText]))
 
         return PreparedRecord(
@@ -734,6 +742,7 @@ private extension NativeMemoryContextProjection {
     static func presentationBody(
         _ text: String, record: NativeMemoryProjectionRecord, maximumUTF8Bytes: Int
     ) -> String {
+        let warning = MemorySenseProvenance.warning(in: record.extras)
         let fields = [
             ("valid_from", record.validFrom),
             ("valid_to", record.validTo),
@@ -745,9 +754,10 @@ private extension NativeMemoryContextProjection {
                   !NativeContextProjectionText.containsDisallowedControl(value), parseDate(value) != nil else { return nil }
             return "\(key)=\(value)"
         }
-        guard !fields.isEmpty else { return text }
-        let prefix = "[Recorded dates; not a live-status check; observed_at is evidence time: "
-            + fields.joined(separator: "; ") + "]\n"
+        guard !fields.isEmpty || warning != nil else { return text }
+        let prefix = (warning.map { "[\($0)]\n" } ?? "")
+            + (fields.isEmpty ? "" : "[Recorded dates; not a live-status check; observed_at is evidence time: "
+                + fields.joined(separator: "; ") + "]\n")
         if prefix.utf8.count + text.utf8.count <= maximumUTF8Bytes {
             return prefix + text
         }
@@ -777,15 +787,6 @@ private extension NativeMemoryContextProjection {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return encoder
-    }
-
-    static func parseDate(_ raw: String?) -> Date? {
-        guard let raw else { return nil }
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
     }
 
     static func finite(_ value: Double?) -> Double? {
@@ -824,4 +825,24 @@ extension NativeMemoryContextProjection {
     static func normalizedRecordID(_ value: String) -> String {
         normalizedID(value)
     }
+
+    /// Shared by the knowledge-graph projection too. Two formatters for the
+    /// process: a pass over every memory used to build two per memory.
+    /// Reconciliations can overlap, so the formatters are used under a lock.
+    static func parseDate(_ raw: String?) -> Date? {
+        guard let raw else { return nil }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        isoLock.lock(); defer { isoLock.unlock() }
+        return fractionalISO.date(from: value) ?? plainISO.date(from: value)
+    }
+
+    private static let isoLock = NSLock()
+    // Only touched under `isoLock`.
+    nonisolated(unsafe) private static let fractionalISO: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    nonisolated(unsafe) private static let plainISO = ISO8601DateFormatter()
 }

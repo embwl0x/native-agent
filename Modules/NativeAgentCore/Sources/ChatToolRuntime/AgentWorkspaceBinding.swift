@@ -4,6 +4,8 @@ import PersistenceCore
 import MacIntegration
 import ToolRegistry
 import TrustCenter
+import XConnector
+import SlackConnector
 
 package enum ChatWorkspaceBinding {
     package static let ports = AgentWorkspacePorts.Binding(conversations: Conversations(), tools: Tools())
@@ -14,9 +16,13 @@ package enum ChatWorkspaceBinding {
         }
     }
 
-    package static func glance(dataRoot: URL, scope: String, turn: Date?) async -> String? {
+    package static func currentPlace(dataRoot: URL, scope: String) async -> String? {
+        await AgentWorkspaceNavigation.shared.currentPlace(dataRoot: dataRoot, scope: scope)
+    }
+
+    package static func glance(dataRoot: URL, scope: String, turn: Date?, includingMoments: Bool = true) async -> String? {
         await AgentWorkspacePorts.$binding.withValue(ports) {
-            await HerScreen.glance(dataRoot: dataRoot, scope: scope, turn: turn)
+            await HerScreen.glance(dataRoot: dataRoot, scope: scope, turn: turn, includingMoments: includingMoments)
         }
     }
 
@@ -69,5 +75,28 @@ package enum ChatWorkspaceBinding {
         func withWebScheme(_ value: String) -> String { SwiftToolDispatcher.withWebScheme(value) }
         func builderSourceRepoRoot(dataRoot: URL) -> URL? { SwiftToolDispatcher.builderSourceRepoRoot(dataRoot: dataRoot) }
         var listedPeerState: String { AgentPeerContactState.listed.rawValue }
+        func unreadyTools(dataRoot: URL) -> [String: String] {
+            var tools: [String: String] = [:]
+            for (id, label, names) in [
+                ("gmail", "Gmail", ["gmail_search", "gmail_read"]),
+                ("calendar", "Google Calendar", ["google_calendar_calendars", "google_calendar_list",
+                    "google_calendar_read", "google_calendar_free_busy", "google_calendar_send_invitations"]),
+                ("notion", "Notion", ["notion_search", "notion_read_page"])
+            ] where !SwiftToolDispatcher.cloudConnectorConnected(id, root: dataRoot) {
+                // Apple Mail already reads Gmail accounts added to Mail; only this API route is off (10-09).
+                let note = id == "gmail" ? "Gmail API connector not signed in (Settings > Connectors); Gmail accounts in Apple Mail are read by mail.* already."
+                    : "The owner must sign in to \(label) in Settings > Connectors."
+                for name in names { tools[name] = note }
+            }
+            if (try? XConnectorActions.credentialStatus(dataRoot: dataRoot))?.configured != true {
+                for name in ["x_status", "x_me", "x_search", "x_timeline", "x_user_tweets"] {
+                    tools[name] = "The owner must sign in to X in Settings > Connectors."
+                }
+            }
+            if !SlackConnectorActions.canSearch(dataRoot: dataRoot) {
+                tools["slack_search_messages"] = "Slack search needs a user token with search:read. The owner must sign in to Slack in Settings > Connectors."
+            }
+            return tools
+        }
     }
 }

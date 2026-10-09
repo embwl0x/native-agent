@@ -6,7 +6,7 @@ import PersistenceCore
 enum AgentWorkspaceApps {
     static let destinations: [AgentWorkspaceDestination] = [
         .init(id: "computer", title: "Computer", summary: "Look at the Mac, select a current control, and act on it.", tool: "screen", input: ["structured": .bool(true)], tools: ["screen", "go", "act", "wait"]),
-        .init(id: "browser", title: "Browser", summary: "Your conversation's browser tab, with page controls ready to select.", tool: "browser.chrome_status", tools: ["browser.chrome_snapshot", "browser.chrome_acquire", "browser.chrome_navigate"]),
+        .init(id: "browser", title: "Browser", summary: "Your conversation's browser tab, with page controls ready to select.", tool: "browser.chrome_status", tools: ["browser.chrome_snapshot", "browser.chrome_navigate"]),
         // The environment resolves this destination to the canonical workspace
         // root. A relative dot can mean a source checkout on developer installs.
         .init(id: "files", title: "Files", summary: "Browse the workspace and open its documents.", tool: "list_dir", input: ["path": .string("$workspace"), "max_entries": .int(12)], tools: ["list_dir", "read_file", "write_file"]),
@@ -38,20 +38,14 @@ enum AgentWorkspaceApps {
             return .init(label: "Go to a website address in my tab",
                 action: .perform(tool: tool, input: [:], title: "Go to a website address", textField: "url", isEffect: true), needsText: true)
         }
-        guard tool == "browser.chrome_acquire" else { return nil }
-        return .init(
-            label: "Open a website in a new tab",
-            action: .perform(tool: tool, input: ["mode": .string("create")], title: "Open a website in a new tab", textField: "initial_url", isEffect: true),
-            needsText: true
-        )
+        return nil
     }
 
     static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
         switch tool {
         case "list_dir": return directory(input: input, result: result)
         case "browser.chrome_status":
-            let row = object(result)
-            var actions = quickAction(tool: "browser.chrome_acquire").map { [$0] } ?? []
+            let actions = quickAction(tool: "browser.chrome_navigate").map { [$0] } ?? []
             return .init(title: "Browser", content: result, items: [], actions: actions)
         case "browser.chrome_snapshot": return browser(input: input, result: result)
         case "screen": return computer(input: input, result: result)
@@ -201,14 +195,14 @@ enum AgentWorkspaceApps {
     private static func browser(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
         let row = object(result)
         guard row["ok"] != .bool(false), row["error"] == nil,
-              let snapshot = string(row["snapshotId"]), let lease = string(row["leaseId"]),
+              let snapshot = string(row["snapshotId"]),
               let sequence = integer(row["userSequence"]), sequence >= 0,
               let tab = integer(row["tabId"]), tab >= 0,
               case .array(let nodes)? = row["nodes"] else {
-            // Recovery stays with the exact selected lease. Never fall back to
+            // Recovery stays with the exact selected tab. Never fall back to
             // whichever tab happens to be current after a refused/stale read.
-            let retry: [AgentWorkspaceButton] = string(input["lease_id"]).map { lease in
-                var arguments: [String: JSONValue] = ["lease_id": .string(lease), "max_nodes": .int(80), "max_text_chars": .int(10000)]
+            let retry: [AgentWorkspaceButton] = integer(input["tab_id"]).map { tab in
+                var arguments: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
                 if input["scope"] == .string("main_content") { arguments["scope"] = .string("main_content") }
                 return [readButton("Read this page again", tool: "browser.chrome_snapshot", input: arguments)]
             } ?? []
@@ -220,7 +214,8 @@ enum AgentWorkspaceApps {
                   node["visible"] == .bool(true), case .object(let states)? = node["states"],
                   states["disabled"] == .bool(false), states["blockedByModal"] != .bool(true),
                   case .array(let available)? = node["actions"] else { continue }
-            let bound: [String: JSONValue] = ["lease_id": .string(lease), "expected_user_sequence": .int(sequence), "snapshot_id": .string(snapshot), "node_id": .string(id)]
+            let number = id.hasPrefix("n") ? String(id.dropFirst()) : id
+            let bound: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": .int(sequence), "snapshot_id": .string(snapshot), "node_id": .string(number)]
             let name = string(node["name"]) ?? string(node["text"]) ?? "Page control"
             var buttons: [AgentWorkspaceButton] = []
             if available.contains(.string("click")) {
@@ -248,7 +243,7 @@ enum AgentWorkspaceApps {
             metadata["workspace_state"] = .string("loading")
             metadata["workspace_detail"] = .string("This is the page observed while it is still loading. Read page again for more; opening the tab is not proof that search results or replies have finished loading.")
         }
-        var current: [String: JSONValue] = ["lease_id": .string(lease), "max_nodes": .int(80), "max_text_chars": .int(10000)]
+        var current: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
         let reading = object(row["reading"] ?? .null)
         let mainContent = reading["scope"] == .string("main_content")
         if mainContent { current["scope"] = .string("main_content") }
@@ -263,9 +258,9 @@ enum AgentWorkspaceApps {
             var main = current; main["scope"] = .string("main_content")
             readingActions.append(readButton("Read main content", tool: "browser.chrome_snapshot", input: main))
         }
-        let navigation: [String: JSONValue] = ["lease_id": .string(lease), "expected_user_sequence": .int(sequence)]
+        let navigation: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": .int(sequence)]
         // Page scrolling deliberately omits node/snapshot IDs; the owner binds
-        // the exact lease and refuses a changed user sequence. These are effects
+        // the exact tab and refuses a changed user sequence. These are effects
         // even though they only move the viewport, so Back never scrolls again.
         let pageDown = navigation.merging(["delta_x": .int(0), "delta_y": .int(700)]) { _, new in new }
         let pageUp = navigation.merging(["delta_x": .int(0), "delta_y": .int(-700)]) { _, new in new }

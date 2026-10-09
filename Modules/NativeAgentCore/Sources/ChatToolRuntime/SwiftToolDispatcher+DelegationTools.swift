@@ -137,8 +137,8 @@ extension SwiftToolDispatcher {
     }
 
     private static func invalidDelegationMessageLookup() -> JSONValue {
-        .object(["status": .string("failed"), "reason": .string("delegation_message_id_invalid"),
-                 "note": .string("Pass the exact messageId returned by a builder message, at most 160 characters. Omit, null, or empty lists bridge jobs. This is an identifier, never a path; no work was started.")])
+        .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("delegation_message_id_invalid"),
+                 "message": .string("Pass the exact messageId returned by a builder message, at most 160 characters. Omit, null, or empty lists bridge jobs. This is an identifier, never a path; no work was started.")])
     }
 
     private func inspectRetainedSwarm(input: [String: JSONValue]) -> JSONValue {

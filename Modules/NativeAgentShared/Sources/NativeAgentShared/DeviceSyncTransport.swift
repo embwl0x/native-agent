@@ -81,6 +81,16 @@ public enum NADeviceSyncRecordType {
     public static let status = "NAStatus"
 }
 
+/// The Mac's presence beat. The Mac publishes snapshots only when something
+/// changes, so a quiet Mac said nothing for minutes and the phone read that
+/// as unreachable. The Mac rewrites one record every `beat`; nothing pushes
+/// it, the phone reads it when it opens. The phone counts the Mac as here
+/// while the newest Mac record it has seen is younger than `phoneWindow`.
+public enum NAMacPresence {
+    public static let beat: TimeInterval = 120
+    public static let phoneWindow: TimeInterval = 300
+}
+
 /// Cross-device proof that the iOS peer successfully installed the exact
 /// Apple-presented CloudKit notification subscription expected by this build.
 ///
@@ -155,6 +165,21 @@ public enum NAChatMessageCodec {
     /// also duplicates a few query fields, so reserve 224 KiB for those fields
     /// and CloudKit record overhead instead of relying on a server rejection.
     public static let maxCloudKitRecordValueBytes = 800 * 1024
+    /// Larger signed chat envelopes travel as encrypted assets, bounded below
+    /// CloudKit's asset ceiling. Individual files retain the shared chat cap.
+    public static let maxAssetPayloadBytes = 48 * 1024 * 1024
+
+    public static func usesAsset(_ fields: NAChatMessageFields) -> Bool {
+        recordValueBytes(fields) > maxCloudKitRecordValueBytes
+    }
+
+    public static func recordValueBytes(_ fields: NAChatMessageFields) -> Int {
+        fields.payloadJSON.utf8.count + fields.recordName.utf8.count + fields.text.utf8.count
+            + (fields.sessionId?.utf8.count ?? 0) + fields.senderDevice.utf8.count
+            + (fields.kind?.utf8.count ?? 0) + (fields.notificationTitle?.utf8.count ?? 0)
+            + (fields.notificationScreen?.utf8.count ?? 0) + (fields.notificationEventID?.utf8.count ?? 0)
+            + 4_096
+    }
 
     /// Direction a message travels, derived from its sender. "mac" → mac2ios,
     /// anything else (e.g. "ios") → ios2mac.
@@ -184,10 +209,14 @@ public enum NAChatMessageCodec {
             + (message.metadata?["userInfo.eventId"]?.utf8.count ?? 0)
             + 4_096
         let projectedRecordBytes = data.count + projectedScalarBytes
-        guard projectedRecordBytes <= maxCloudKitRecordValueBytes else {
+        let assetEligible = message.attachments?.isEmpty == false
+            && message.attachments?.allSatisfy({ $0.byteSize > 0 && $0.byteSize <= ChatAttachmentTypeResolver.fileByteLimit }) == true
+        guard projectedScalarBytes <= maxCloudKitRecordValueBytes,
+              projectedRecordBytes <= maxCloudKitRecordValueBytes || (assetEligible && data.count <= maxAssetPayloadBytes) else {
             throw DeviceSyncError.payloadTooLarge(
                 actualBytes: projectedRecordBytes,
-                maximumBytes: maxCloudKitRecordValueBytes
+                maximumBytes: assetEligible && projectedScalarBytes <= maxCloudKitRecordValueBytes
+                    ? maxAssetPayloadBytes : maxCloudKitRecordValueBytes
             )
         }
         return NAChatMessageFields(
@@ -289,6 +318,19 @@ public enum DeviceSyncError: Error, LocalizedError, Sendable {
     case payloadTooLarge(actualBytes: Int, maximumBytes: Int)
     case transient(message: String)
     case underlying(message: String)
+
+    public var snapshotRecoveryMessage: String {
+        switch self {
+        case .account, .unauthorized:
+            return DeviceSyncAccountFailure.macMessage + "."
+        case .quotaExceeded:
+            return "Free some iCloud storage, then check Connection in Settings."
+        case .transient, .conflict:
+            return "The Mac will try again on its next update; keep NativeAgent open."
+        case .notConfigured, .payloadTooLarge, .underlying:
+            return "Open Connection in Settings to check the Mac link."
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -396,6 +438,12 @@ public protocol DeviceSyncTransport: Sendable {
     /// readable pairing record return nil via the default.
     func peekPairingSecret() async -> Data?
 
+    /// Rewrite the Mac's presence record (`NAMacPresence`). Never pushed.
+    func setPresence(pairingSecret: Data) async throws
+
+    /// When the Mac last rewrote its presence record, or nil if unknown.
+    func peerPresence(pairingSecret: Data) async -> Date?
+
     /// Pull the peer's status singletons now; returns the number of handlers fired.
     @discardableResult
     func drainStatus() async -> Int
@@ -433,7 +481,7 @@ public extension DeviceSyncTransport {
     func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async {
         await observeStatus(key: key) { value in
             guard await onApply(value) else {
-                NSLog(
+                nativeLog(
                     "[device-sync] status %@ was NOT applied and this transport cannot redeliver it — the value is lost",
                     key
                 )
@@ -449,6 +497,8 @@ public extension DeviceSyncTransport {
     @discardableResult func drainPairing() async -> Bool { false }
     func peekPairingSecret() async -> Data? { nil }
     @discardableResult func drainStatus() async -> Int { 0 }
+    func setPresence(pairingSecret: Data) async throws {}
+    func peerPresence(pairingSecret: Data) async -> Date? { nil }
     @discardableResult func sweepExpiredRecords() async -> Int { 0 }
 }
 

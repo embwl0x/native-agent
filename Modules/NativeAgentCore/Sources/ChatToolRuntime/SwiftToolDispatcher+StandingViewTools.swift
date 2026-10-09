@@ -258,6 +258,7 @@ extension SwiftToolDispatcher {
     ) -> JSONValue {
         .object([
             "status": .string("refused"),
+            "effects": .string("none"),
             "tool": .string(tool),
             "reason": .string(reason),
             "spoken": .string(spoken),

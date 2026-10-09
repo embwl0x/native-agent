@@ -219,6 +219,8 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     /// True when this entry answered a message to the helper (bot_ask), not a
     /// run of its brief. Nil on entries written before 2026-09-23.
     public var asked: Bool? = nil
+    public var conditionMet: Bool? = nil
+    public var conditionNotificationTitle: String? = nil
     public var actualReply: String { reply ?? findings }
     public var runtimeStatus: BotRunStatus { status ?? (runHealth == .failed ? .failed : runHealth == .partial ? .interrupted : .completed) }
 

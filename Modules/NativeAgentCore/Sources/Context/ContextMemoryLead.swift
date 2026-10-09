@@ -89,6 +89,15 @@ public struct ContextRenderClock: Sendable, Equatable {
 /// for anything older than yesterday the tag cannot change within a calendar
 /// day, so the rendered lead is stable turn to turn.
 public enum ContextMemoryLead {
+    public static func untrustedSources(for draft: ContextAtomDraft) -> [String] {
+        var sources = draft.entities.filter { $0.kind == "untrusted_source" }.map(\.label)
+        if let label = draft.entities.first(where: { $0.kind == "untrusted_sources" })?.label,
+           let saved = try? JSONDecoder().decode([String].self, from: Data(label.utf8)) {
+            for source in saved where !sources.contains(source) { sources.append(source) }
+        }
+        return sources.filter { !$0.isEmpty }
+    }
+
     /// Entity kind the memory projection uses for a record's provenance blob.
     public static let provenanceEntityKind = "provenance"
 
@@ -100,10 +109,10 @@ public enum ContextMemoryLead {
 
     // MARK: Facts carried from the compiled atom onto the packet item
 
-    /// The record's own time, as the projection recorded it. Memory atoms only:
+    /// The record's own time, as the projection recorded it. Memory and correction atoms:
     /// persona docs and instructions are not episodes and take no age tag.
     public static func recordedAt(for draft: ContextAtomDraft) -> Date? {
-        guard draft.kind == .memory else { return nil }
+        guard draft.kind == .memory || draft.kind == .correction else { return nil }
         return draft.freshness.createdAt
     }
 
@@ -124,7 +133,7 @@ public enum ContextMemoryLead {
     /// The name is also re-validated here: anything with a delimiter, bracket,
     /// or control character is dropped rather than shown.
     public static func provenance(for draft: ContextAtomDraft) -> ContextMemoryProvenance? {
-        guard draft.kind == .memory else { return nil }
+        guard draft.kind == .memory || draft.kind == .correction else { return nil }
         guard let label = draft.entities.first(where: { $0.kind == provenanceEntityKind })?.label,
               !label.isEmpty else { return nil }
         var rawKind: String?
@@ -198,7 +207,7 @@ public enum ContextMemoryLead {
     }
 
     /// The rendered memory line: age in front, provenance behind, the atom's
-    /// own text (whole body or lead) untouched in between. Non-memory atoms and
+    /// own text (whole body or lead) untouched in between. Other atom kinds and
     /// atoms carrying neither fact render byte-identically to before.
     /// An `.unstamped` clock renders provenance but no age: a render with no
     /// turn behind it says nothing about time rather than guessing.

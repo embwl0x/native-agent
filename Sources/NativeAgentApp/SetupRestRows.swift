@@ -57,6 +57,7 @@ struct SetupRestRows: View {
             // card takes each one as its own row.
             hazeRow
             shortcutRow
+            shotgunShortcutRow
             compactionRow
         case .app:
             appSection
@@ -64,7 +65,7 @@ struct SetupRestRows: View {
     }
 
     private var appSection: some View {
-        SetupSection(title: "Updates and help") {
+        AdvancedSection(title: "Updates and help") {
             updatesRow
             helpRow
             aboutRow
@@ -88,7 +89,7 @@ struct SetupRestRows: View {
     private var hazeRow: some View {
         SetupRestCard(
             title: "Haze",
-            detail: "The colour of the soft light drifting behind the window.",
+            detail: "The color of the soft light drifting behind the window.",
             identifier: "setup.rest.haze"
         ) {
             HazeSwatches()
@@ -116,6 +117,35 @@ struct SetupRestRows: View {
                     GlobalHotkeyManager.shared.setEnabled(newValue)
                 }
                 .accessibilityLabel("Global shortcut")
+        }
+    }
+
+    // MARK: Shotgun shortcut
+
+    @AppStorage(ShotgunShortcut.storageKey) private var shotgunShortcut = ShotgunShortcut.optionSpace.rawValue
+
+    /// The key that shows or hides Shotgun (Shotgun.swift). A few fixed
+    /// choices, since launchers and other AI apps often own ⌥Space.
+    private var shotgunShortcutRow: some View {
+        let taken = ShotgunController.shared.shortcutTaken
+        return SetupRestCard(
+            title: "Shotgun shortcut",
+            detail: taken.map { "\($0.title) is taken by another app. Pick another, or use View ▸ Show Shotgun." }
+                ?? "Shows or hides Shotgun, the small chat this window steps aside into.",
+            identifier: "setup.rest.shotgunShortcut"
+        ) {
+            Picker("Shotgun shortcut", selection: Binding(
+                get: { ShotgunShortcut(rawValue: shotgunShortcut) ?? .optionSpace },
+                set: { shortcut in
+                    shotgunShortcut = shortcut.rawValue
+                    ShotgunController.shared.applyShortcut()
+                }
+            )) {
+                ForEach(ShotgunShortcut.allCases) { Text($0.title).tag($0) }
+            }
+            .labelsHidden()
+            .fixedSize()
+            .accessibilityLabel("Shotgun shortcut")
         }
     }
 
@@ -275,7 +305,7 @@ struct SetupRestRows: View {
             }
             if let detail = state.detail {
                 Text(detail)
-                    .font(.system(size: 12))
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.trouble)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)

@@ -57,6 +57,7 @@ extension BackgroundLoopsAssembly {
         }
         let dueJobRunner = SchedulerDueJobRunner(root: standardized)
         let runDueJobs: @Sendable () async -> [String]
+        let shutdownJobs: @Sendable () async -> Void
         let schedulerActivityFailure: @Sendable () async -> String?
         let nextJobDeadline: @Sendable (Date) async -> Date?
         if isLiveRoot {
@@ -67,16 +68,7 @@ extension BackgroundLoopsAssembly {
             // without this gate.
             let bots = BotRunnerScheduler(dataRoot: standardized,
                 session: NativeAgentEngine.live.standingBotSession(),
-                isAutonomyEnabled: { await unattendedWorkAllowed(dataRoot: standardized) },
-                conditionMet: { bot, entry in
-                    // The Bots editor's "Tell me if", judged true by the run:
-                    // the person asked to hear this, through the one router.
-                    _ = try? await AttentionRouter.shared.route(
-                        eventId: "bot_condition:\(entry.id.uuidString)", importance: .requestedResult,
-                        title: NativeAppSecretRedactor.redactText(String("\(bot.name): \(bot.notificationCondition ?? "")".prefix(160))),
-                        body: NativeAppSecretRedactor.redactText(String(entry.headline.prefix(500))),
-                        userInfo: ["screen": "activity", "source": "bot_condition", "botId": bot.id.uuidString])
-                })
+                isAutonomyEnabled: { await unattendedWorkAllowed(dataRoot: standardized) })
             let work = TriggerSchedulerBackgroundWork.makeJobWork(
                 runDueJobs: { await dueJobRunner.runDueJobs(maxJobs: $0) },
                 activityFailure: { await dueJobRunner.activityFeedError },
@@ -85,6 +77,7 @@ extension BackgroundLoopsAssembly {
                 continuations: makeDeskContinuationScheduler(dataRoot: standardized)
             )
             runDueJobs = work.runDueJobs
+            shutdownJobs = work.shutdown
             schedulerActivityFailure = work.activityFailure
             nextJobDeadline = work.nextDeadline
         } else {
@@ -92,6 +85,7 @@ extension BackgroundLoopsAssembly {
             // connector, provider, and sync owners. Secondary/test roots may
             // inspect their own files but never borrow those live effects.
             runDueJobs = { [] }
+            shutdownJobs = {}
             schedulerActivityFailure = { nil }
             nextJobDeadline = { _ in nil }
         }
@@ -113,6 +107,7 @@ extension BackgroundLoopsAssembly {
             schedulerJobsPath: dueJobRunner.jobsPath,
             triggerScheduler: native,
             runDueJobs: runDueJobs,
+            shutdownJobs: shutdownJobs,
             schedulerActivityFailure: schedulerActivityFailure,
             nextSchedulerJobDeadline: nextJobDeadline,
             mirrorFire: mirror

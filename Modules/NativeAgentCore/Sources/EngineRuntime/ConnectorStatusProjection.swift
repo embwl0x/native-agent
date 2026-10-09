@@ -286,6 +286,8 @@ public enum ConnectorStatusProjection {
     }
 
     public static func oauthConnectorTokenExists(oauthId: String, root: URL) -> Bool {
+        // Slack's token is in Keychain, not its files (SlackCredentials).
+        if oauthId == "slack" { return (try? SlackCredentials.read(.bot, dataRoot: root)) != nil }
         let pkce = root
             .appendingPathComponent("connectors", isDirectory: true)
             .appendingPathComponent(oauthId, isDirectory: true)
@@ -294,7 +296,7 @@ public enum ConnectorStatusProjection {
             .appendingPathComponent("oauth_tokens", isDirectory: true)
             .appendingPathComponent("\(oauthId).json")
         return [pkce, mirror].contains { path in
-            guard let data = try? Data(contentsOf: path),
+            guard let data = try? ConnectorCredentialFile.read(at: path),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return false
             }
@@ -318,7 +320,7 @@ public enum ConnectorStatusProjection {
             .appendingPathComponent("connectors", isDirectory: true)
             .appendingPathComponent(oauthId, isDirectory: true)
             .appendingPathComponent("oauth_app.json")
-        guard let data = try? Data(contentsOf: path),
+        guard let data = try? ConnectorCredentialFile.read(at: path),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let clientId = object["client_id"] as? String else {
             return false

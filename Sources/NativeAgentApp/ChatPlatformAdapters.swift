@@ -17,67 +17,84 @@ import CoreSpotlight
 import CloudKit
 #endif
 
-struct DropZoneView: NSViewRepresentable {
-    var onDrop: ([NSItemProvider]) -> Void
-    var onToast: ((String) -> Void)? = nil
+/// The whole room accepts attachments, including its scrollback and composer.
+/// A neutral, stationary outline is also quiet with Reduce Motion enabled.
+struct ChatAttachmentDropTarget: ViewModifier {
+    var isEnabled = true
+    var contentTypes = ChatComposerSupport.attachmentContentTypes
+    var onDrop: ([NSItemProvider]) -> Bool
+    @State private var isTargeted = false
 
-    func makeNSView(context: Context) -> DropNSView {
-        let v = DropNSView()
-        v.onDrop = onDrop
-        v.onToast = onToast
-        return v
-    }
-
-    func updateNSView(_ nsView: DropNSView, context: Context) {
-        nsView.onDrop = onDrop
-        nsView.onToast = onToast
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .onDrop(
+                of: isEnabled ? contentTypes : [],
+                isTargeted: $isTargeted
+            ) { providers in
+                guard isEnabled else { return false }
+                return onDrop(providers)
+            }
+            .overlay {
+                if isEnabled && isTargeted {
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(NativeAgentShell.softFill)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(NativeAgentShell.secondary.opacity(0.45), lineWidth: 1)
+                        }
+                        .padding(4)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                        .transaction { $0.animation = nil }
+                }
+            }
     }
 }
 
-final class DropNSView: NSView {
-    var onDrop: (([NSItemProvider]) -> Void)?
-    var onToast: ((String) -> Void)?
+/// The native field editor can handle Command-V before SwiftUI's paste command.
+/// Intercept attachments only while this composer's editor owns the keyboard;
+/// ordinary text paste keeps the native selection and undo behavior.
+struct ChatAttachmentPasteHandler: NSViewRepresentable {
+    var isFocused: Bool
+    var onPaste: ([NSItemProvider]) -> Void
+    @Environment(\.isEnabled) private var isEnabled
 
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        registerForDraggedTypes([.fileURL, .tiff, .png])
+    func makeNSView(context: Context) -> PasteView { PasteView() }
+
+    func updateNSView(_ view: PasteView, context: Context) {
+        view.active = isFocused && isEnabled
+        view.onPaste = onPaste
     }
 
-    required init?(coder: NSCoder) { super.init(coder: coder) }
+    static func dismantleNSView(_ view: PasteView, coordinator: ()) { view.stop() }
 
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
-    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+    final class PasteView: NSView {
+        var active = false
+        var onPaste: (([NSItemProvider]) -> Void)?
+        private var monitor: Any?
 
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let pb = sender.draggingPasteboard
-        var providers: [NSItemProvider] = []
-        // File URLs
-        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
-            for url in urls {
-                let provider = NSItemProvider()
-                provider.registerFileRepresentation(forTypeIdentifier: UTType.fileURL.identifier, fileOptions: [], visibility: .all) { completion in
-                    completion(url, false, nil)
-                    return nil
-                }
-                providers.append(provider)
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            stop()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, active, !isHiddenOrHasHiddenAncestor,
+                      event.window === window,
+                      event.charactersIgnoringModifiers?.lowercased() == "v",
+                      event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+                      window?.firstResponder is NSTextView else { return event }
+                let providers = ChatComposerSupport.clipboardAttachmentProviders()
+                guard !providers.isEmpty else { return event }
+                onPaste?(providers)
+                return nil
             }
         }
-        // Images via TIFF — B.1: check raw TIFF size before converting
-        if let tiff = pb.data(forType: .tiff) {
-            if tiff.count > 10 * 1024 * 1024 {
-                DispatchQueue.main.async { self.onToast?("Image too large (limit: 10 MB)") }
-            } else if let rep = NSBitmapImageRep(data: tiff),
-                      let png = rep.representation(using: .png, properties: [:]) {
-                let provider = NSItemProvider()
-                provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
-                    completion(png, nil)
-                    return nil
-                }
-                providers.append(provider)
-            }
+
+        func stop() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
         }
-        if !providers.isEmpty { onDrop?(providers) }
-        return !providers.isEmpty
     }
 }
 
@@ -147,45 +164,6 @@ final class ScrollWheelNSView: NSView {
             self.monitor = nil
         }
     }
-}
-
-// PATCH-2026-05-06: multimodal-ui — paste image from clipboard helper.
-// Updated 2026-05-09: also accept native PNG / JPEG types from the clipboard, not
-// just TIFF. Many apps (Safari, screenshot tool with newer macOS) put PNG on
-// the clipboard directly, and the old TIFF-only path returned nil silently.
-func pasteImageFromClipboard() -> MultimodalAttachment? {
-    let pb = NSPasteboard.general
-    let limit = 10 * 1024 * 1024
-    // 1. PNG (most common on modern macOS)
-    if let png = pb.data(forType: .png), png.count <= limit {
-        return MultimodalAttachment(type: "image", base64: png.base64EncodedString(), mime: "image/png", byteSize: png.count)
-    }
-    // 2. TIFF — convert to PNG for transport
-    if let tiff = pb.data(forType: .tiff), tiff.count <= limit,
-       let rep = NSBitmapImageRep(data: tiff),
-       let png = rep.representation(using: .png, properties: [:]),
-       png.count <= limit {
-        return MultimodalAttachment(type: "image", base64: png.base64EncodedString(), mime: "image/png", byteSize: png.count)
-    }
-    // 3. Any other image-coerced data via NSImage
-    if let imageData = pb.data(forType: NSPasteboard.PasteboardType("public.image")),
-       imageData.count <= limit,
-       let img = NSImage(data: imageData),
-       let tiff = img.tiffRepresentation,
-       let rep = NSBitmapImageRep(data: tiff),
-       let png = rep.representation(using: .png, properties: [:]),
-       png.count <= limit {
-        return MultimodalAttachment(type: "image", base64: png.base64EncodedString(), mime: "image/png", byteSize: png.count)
-    }
-    return nil
-}
-
-/// Returns true iff the clipboard appears to contain an image NativeAgent can paste.
-func clipboardHasImage() -> Bool {
-    let pb = NSPasteboard.general
-    return pb.data(forType: .png) != nil
-        || pb.data(forType: .tiff) != nil
-        || pb.data(forType: NSPasteboard.PasteboardType("public.image")) != nil
 }
 
 func modelOptions(from catalog: ModelCatalogResponse?, current: String, limit: Int = 80) -> [ModelCatalogItem] {

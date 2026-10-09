@@ -63,9 +63,9 @@ through a separate admission callback. The implementation lives in
 | Working attention | `ContinuityField.swift` bounds nodes, decays activation and spreads associations. `CognitiveSubstrate+Workspace.swift` selects a bounded set, inhibits redundant candidates and records selection reasons. This internal cognitive workspace is a read model. |
 | Affect | `CognitiveSubstrate+Affect.swift` updates and analytically decays arousal, uncertainty, task pressure and social warmth. |
 | Mood and disposition | `CognitiveSubstrate+Mood.swift` derives mood from tagged nodes and current affect; a persisted disposition adds a slower undertone. |
-| Personality dynamics | `PersonalityDynamicsConfiguration.swift` holds numeric rates, thresholds and cadence; selected trait dials adjust earned warmth, delivery brevity and play weight. It does not supply persona prose. |
+| Personality dynamics | `PersonalityDynamicsConfiguration.swift` holds numeric rates, thresholds and cadence; warmth maps to `feltWarmthEarnedSpan` and humor to `playModeWeight`. Other trait prose remains separate from these numeric mappings. |
 | Thought seeds and rumination | `CognitiveSubstrate+ThoughtSeeds.swift` merges, decays and ranks seeds. `+Rumination.swift` carries unresolved pressure and release bookkeeping. |
-| Standing views | `CognitiveSubstrate+StandingViews.swift` owns proposed, held, active and retired states. It caps held and active views at five each; proposed views at twelve. |
+| Standing views | `CognitiveSubstrate+StandingViews.swift` owns proposed, held, active, opinion, interest and retired states. Held and active are capped at five each; proposed at twelve. `CognitiveSubstrate+Opinions.swift` adds separate caps of eight opinions and five interests. |
 | Replay | `Cognition/NativeCognitionRuntime+Replay.swift` reads Dream diary and REM proposal records. `CognitiveSubstrate+Replay.swift` integrates bounded references and developmental lineage with deduplication and checked persistence. |
 | Reflection | `CognitiveSubstrate+Reflection.swift` plans and records bounded reflection; `Cognition/NativeCognitionRuntime+Reflection.swift` owns provider execution and its result. |
 
@@ -134,6 +134,27 @@ exploration**. `BackgroundLoops/StudioWanderLane.swift`
 enforces explicit enablement, the Subconscious master, and onboarding clearance
 for public-safe builds in `resolveInstallation`.
 
+### Opinions and interests
+
+Under `personality.views_experiment`, a proposed claim with reasons and a
+stated condition for changing it can become an opinion after at least two
+independent occurrences. Those occurrences must come from different days
+and nonoverlapping source material; untrusted-peer-fed reflections do not
+count. The current reflection must be one of the occurrences. Age invites
+reconsideration rather than changing a stance. Revision requires evidence or
+an argument and retains the replaced stance and its evidence.
+
+Their opt-in hour can record an interest as an open question. It does not require
+the opinion recurrence threshold. Returning to the topic refreshes its weight
+and can keep the earlier question; otherwise its weight fades. It is not a
+Desk item. Opinions and sufficiently weighted interests can join the capsule's
+held tier only while the experiment and relevance ranking are enabled and the
+current message is relevant. They do not become active/held views or shape
+pursuits or reach merely by entering this presentation tier.
+
+These are implemented mechanisms, not evidence of improved personality or
+judgment. The bridge's narrower standing-view list below remains unchanged.
+
 ## Reading and acting on them state
 
 Agent reaches this through them one `app` tool:
@@ -158,8 +179,8 @@ infer it from a view's strength or the capsule's wording.
 Bridge clients use `GET /standing_views` and `POST /standing_views/resolve`,
 implemented in `Sources/NativeAgentApp/ClaudeBridge+StandingViews.swift`.
 GET returns a `standingViews` array of `{id,status,body}` records, ordered
-active, held, proposed, with body previews capped at 80 characters; retired
-views are omitted. POST accepts `{id,action}`, where action is
+active, held, proposed, with body previews capped at 80 characters; opinions,
+interests and retired views are omitted. POST accepts `{id,action}`, where action is
 `approve | reject | retire`. Approve/reject require proposed status; retire
 requires active/held. Invalid status transitions return 409 with
 `not_awaiting_review` for approve/reject or `not_leaning` for retire.

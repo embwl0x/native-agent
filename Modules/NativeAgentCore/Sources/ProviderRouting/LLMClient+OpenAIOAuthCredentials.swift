@@ -355,6 +355,90 @@ extension OpenAIOAuthDirectAdapter {
         }
     }
 
+    // MARK: - Codex child home
+
+    /// CODEX_HOME for every Codex child the app runs on its own ChatGPT sign-in
+    /// (the `codex` chat provider, swarm workers, the workshop planner, image
+    /// generation). It holds an access-only copy of `<root>/codex_home/auth.json`,
+    /// so the app stays the only refresher. 2026-10-07: the Codex CLI rewrites
+    /// auth.json from a typed struct when it refreshes, which drops the refresh
+    /// binding (the 10-06 17 h outage class), and it rotates the single-use
+    /// refresh token behind the app's back.
+    public static func codexChildHome(dataRoot: URL) -> URL {
+        dataRoot.standardizedFileURL.appendingPathComponent("codex_child_home", isDirectory: true)
+    }
+
+    /// The child home that mirrors `authPath`, or nil when `authPath` is not an
+    /// app-owned `<root>/codex_home/auth.json`.
+    public static func codexChildHome(mirroring authPath: URL) -> URL? {
+        let home = authPath.standardizedFileURL.deletingLastPathComponent()
+        guard authPath.lastPathComponent == "auth.json",
+              home.lastPathComponent == "codex_home",
+              !isUserCodexPath(authPath) else { return nil }
+        return codexChildHome(dataRoot: home.deletingLastPathComponent())
+    }
+
+    /// `<home>/auth.json` once its real path is proven to sit directly in the
+    /// data root, apart from `codex_home` and ~/.codex. A symlinked child home
+    /// or auth.json pointing anywhere else is refused, never followed.
+    private static func checkedCodexChildAuthPath(home: URL) throws -> URL {
+        let root = home.standardizedFileURL.deletingLastPathComponent()
+        let realRoot = root.resolvingSymlinksInPath().standardizedFileURL
+        let realHome = home.resolvingSymlinksInPath().standardizedFileURL
+        let auth = home.appendingPathComponent("auth.json")
+        let realAuth = auth.resolvingSymlinksInPath().standardizedFileURL
+        let realAppHome = root.appendingPathComponent("codex_home", isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard realHome.path == realRoot.appendingPathComponent("codex_child_home").path,
+              realAuth.path == realHome.appendingPathComponent("auth.json").path,
+              realHome.path != realAppHome.path,
+              !isUserCodexPath(realHome), !isUserCodexPath(realAuth) else {
+            throw LLMError.underlying(message: "Codex child credential path leaves the data root; refusing to write it.")
+        }
+        return auth
+    }
+
+    /// Write the child copy of the credential bytes just written to `authPath`:
+    /// the same tokens with an empty refresh token. Caller holds `authPath`'s
+    /// `CredentialFileLock`.
+    static func writeCodexChildCopy(_ bytes: Data, of authPath: URL) throws {
+        guard let home = codexChildHome(mirroring: authPath) else { return }
+        guard let blob = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              let tokens = blob["tokens"] as? [String: Any] else {
+            throw LLMError.notConfigured(provider: "openai_oauth_direct")
+        }
+        var childTokens: [String: Any] = ["refresh_token": ""]
+        for key in ["id_token", "access_token", "account_id"] {
+            if let value = tokens[key] { childTokens[key] = value }
+        }
+        let copy: [String: Any] = [
+            "auth_mode": blob["auth_mode"] ?? "chatgpt",
+            "OPENAI_API_KEY": NSNull(),
+            "tokens": childTokens,
+            "last_refresh": blob["last_refresh"] ?? NSNull(),
+        ]
+        try writeAuthBytesAtomically(
+            JSONSerialization.data(withJSONObject: copy, options: [.prettyPrinted, .sortedKeys]),
+            to: checkedCodexChildAuthPath(home: home)
+        )
+    }
+
+    /// Bring the child copy in line with the app credential at `authPath`, or
+    /// remove it when the app is signed out.
+    static func syncCodexChildCopy(from authPath: URL) throws {
+        guard let home = codexChildHome(mirroring: authPath) else { return }
+        try CredentialFileLock.withLock(authPath) {
+            if FileManager.default.fileExists(atPath: authPath.path) {
+                try writeCodexChildCopy(Data(contentsOf: authPath), of: authPath)
+            } else {
+                let copy = try checkedCodexChildAuthPath(home: home)
+                if FileManager.default.fileExists(atPath: copy.path) {
+                    try FileManager.default.removeItem(at: copy)
+                }
+            }
+        }
+    }
+
     /// Decode the (unverified) payload of a JWT. Mirrors `_jwt_payload`
     /// at L375-L385. We only use this to read claims for account_id + exp —
     /// the JWT is still server-side validated on every API call.

@@ -31,7 +31,7 @@ extension HerScreen {
     /// Words people use for a place under another name.
     static let familyAliases: [String: String] = [
         "bots": "helpers", "bot": "helpers", "twitter": "x",
-        "stocks": "markets", "notifications": "notify", "health": "status", "doctor": "status",
+        "stocks": "markets", "notifications": "notify", "health": "status",
     ]
 
     /// Home's PLACES row for this slice's families; the other slices' families
@@ -114,7 +114,7 @@ extension HerScreen {
     /// The doctor check as a room: the overall word, then what is not ok first.
     static func coreProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
         guard tool == "app", input["item"] == .string("doctor"), case .object(let read) = result,
-              case .object(let row)? = read["item"] else { return nil }
+              case .object(let row)? = read["item"], row["checks"] != nil else { return nil }
         func text(_ value: JSONValue?) -> String? { if case .string(let s)? = value, !s.isEmpty { return s }; return nil }
         let checks: [[String: JSONValue]] = { if case .array(let list)? = row["checks"] { return list.compactMap { if case .object(let o) = $0 { o } else { nil } } }; return [] }()
         let bad = checks.filter { text($0["status"]) != "ok" }
@@ -124,6 +124,7 @@ extension HerScreen {
                                content: .object(["summary": check["detail"] ?? .null]), actions: [])
         }
         return .init(title: "Doctor", content: .object(["status": .string("ok"),
-            "message": .string("Overall \(overall): \(checks.count - bad.count) of \(checks.count) checks ok.")]), items: items, actions: [])
+            "message": .string("Last report · Overall \(overall): \(checks.count - bad.count) of \(checks.count) checks ok.")]), items: items,
+            actions: [.init(label: "Refresh report", action: .open(.record(tool: tool, input: input, title: "Doctor")))])
     }
 }

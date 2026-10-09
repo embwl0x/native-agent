@@ -20,7 +20,7 @@
 // (a) be distinctive enough not to over-match other rows and (b) SURVIVE
 // the pending wave-1 `memory.repair` cards — for the 5 daemon-era truncated
 // rows the substring lives in the prefix that the LLM-suggested completion
-// keeps (see MemoryRepairOneShot.truncatedRowSuggestedCompletions).
+// keeps in the approved repair payload.
 //
 // OVERRIDE: <dataRoot>/memory/probes/probe_set.json replaces the built-ins
 // when present and valid, so the user/Agent can evolve the probe set without a

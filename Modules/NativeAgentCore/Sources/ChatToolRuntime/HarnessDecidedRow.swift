@@ -1,4 +1,5 @@
 import Foundation
+import ChatTurnContracts
 import NotificationInbox
 import PersistenceCore
 import PersonaEngine
@@ -9,8 +10,8 @@ import PersonaEngine
 /// what she decided. The detail is the session the decision happened in.
 /// Written off the gate's path: the call it records never waits on the inbox.
 public enum HarnessDecidedRow {
-    public static func post(requester: String, tool: String, sessionID: String?, dataRoot: URL) {
-        Task.detached { _ = await record(requester: requester, tool: tool, sessionID: sessionID, dataRoot: dataRoot) }
+    public static func post(requester: String, tool: String, sessionID: String?, dataRoot: URL, ran: Bool = false) {
+        Task { _ = await record(requester: requester, tool: tool, sessionID: sessionID, dataRoot: dataRoot, ran: ran) }
     }
 
     /// The same row, written before it returns, for a call whose own receipt
@@ -18,10 +19,11 @@ public enum HarnessDecidedRow {
     /// Nil when the inbox did not write. A decision after the open row was
     /// archived starts a new row, never vanishing into the archived one.
     public static func record(
-        requester: String, tool: String, sessionID: String?, dataRoot: URL
+        requester: String, tool: String, sessionID: String?, dataRoot: URL, ran: Bool = false
     ) async -> (id: String, decisions: Int)? {
+        guard !PeerDataTaint.trustedTurn, !PeerDataTaint.ownerTrusts(requester) else { return nil }
         let key = "harness_decided.\(requester).\(tool)"
-        let title = "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) decided: \(requester) → \(tool)"
+        let title = "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) \(ran ? "ran" : "allowed"): \(requester) → \(tool)"
         let id = key + "." + UUID().uuidString.prefix(8).lowercased()
         let row: JSONValue = .object([
             "id": .string(id),

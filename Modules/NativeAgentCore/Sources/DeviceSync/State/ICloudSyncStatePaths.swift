@@ -12,11 +12,16 @@ public struct ICloudBridgeHealthSnapshot: Sendable {
     public let transport: Transport
     public let health: Health
     public let documentsURL: URL?
+    public let sendMeasured: Bool
+    public let sendFailures: [String: Health]
 
-    public init(transport: Transport, health: Health, documentsURL: URL? = nil) {
+    public init(transport: Transport, health: Health, documentsURL: URL? = nil,
+                sendMeasured: Bool = false, sendFailures: [String: Health] = [:]) {
         self.transport = transport
         self.health = health
         self.documentsURL = documentsURL
+        self.sendMeasured = sendMeasured
+        self.sendFailures = sendFailures
     }
 }
 

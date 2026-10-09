@@ -432,7 +432,7 @@ public enum DeskObservationEvaluator {
         // Build those indexes once: filtering/copying the full board for every
         // fingerprint made connector settlement quadratic in board size.
         let sortedItems = state.items.sorted { $0.handle < $1.handle }
-        let itemByHandle = Dictionary(uniqueKeysWithValues: state.items.map { ($0.handle, $0) })
+        let itemByHandle = Dictionary(state.items.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
 
         var autoResolves: [DeskAutoResolve] = []
         var drifts: [DeskDrift] = []

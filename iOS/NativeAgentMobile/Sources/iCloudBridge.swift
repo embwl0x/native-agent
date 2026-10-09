@@ -188,6 +188,18 @@ final class iCloudBridge: ObservableObject {
         lastMacConfirmationAt = timestamp
     }
 
+    /// Reads the Mac's presence beat (nothing pushes it) into the confirmation.
+    func readMacPresence() async {
+        guard pairingStore?.isRepairingConnection != true,
+              let secret = pairingStore?.iCloudPairingSecret else { return }
+        let generation = setupGeneration
+        if let seen = await deviceTransport?.peerPresence(pairingSecret: secret),
+           setupGeneration == generation, pairingStore?.iCloudPairingSecret == secret,
+           pairingStore?.isRepairingConnection != true {
+            recordMacConfirmation(at: seen)
+        }
+    }
+
     func clearMacConfirmationForConnectionRepair() {
         lastMacConfirmationAt = nil
     }
@@ -225,6 +237,7 @@ final class iCloudBridge: ObservableObject {
     // KVS/ubiquity path runs unchanged.
     private var deviceTransport: DeviceSyncTransport?
     var usesCloudKitDeviceTransport: Bool { deviceTransport != nil }
+    var onTransportSucceeded: (() -> Void)?
     // CK-3c: single-flight guard for the transport drain (APNs push + observe
     // re-drains coalesce; per-message delivery is already atomic in the transport).
     private var deviceDrainInFlight = false
@@ -463,6 +476,9 @@ final class iCloudBridge: ObservableObject {
             resolvedProductionTransport = false
         }
         guard let transport = deviceTransport else { return }
+        (transport as? CloudKitDeviceTransport)?.useAssetSecret { [weak self] in
+            await self?.pairingSecretForPhoneRequests
+        }
         let generation = setupGeneration
         (transport as? CloudKitDeviceTransport)?.observeAccountFailures { [weak self] failure in
             guard await self?.setupGeneration == generation else { return }
@@ -529,6 +545,11 @@ final class iCloudBridge: ObservableObject {
             )
         }
         Task {
+            // Nothing pushes the Mac's presence beat; read it once now.
+            guard self.setupGeneration == generation else { return }
+            await self.readMacPresence()
+        }
+        Task {
             for group in NAMobileSnapshotGroup.allCases {
                 // 2026-09-06: `onApply` — the transport claims this generation
                 // only once the files are on disk. A failed apply leaves the
@@ -561,6 +582,8 @@ final class iCloudBridge: ObservableObject {
                 ready: ready && transport.presentsVisualNotifications,
                 using: transport
             )
+            // Nothing pushes the Mac's presence beat; it is read on opening.
+            if self.pairingStore?.isPaired == true { await self.readMacPresence() }
             if self.pairingStore?.isPaired != true {
                 let pairingApplied = await transport.drainPairing()
                 // A message held before the pairing secret was committed cannot
@@ -667,9 +690,8 @@ final class iCloudBridge: ObservableObject {
         // CK-3b: CloudKit transport path. The signed BridgeMessage rides verbatim
         // in the record's payloadJSON (lossless — signature preserved), so the Mac
         // side verifies with the same secret exactly as on the Drive path. Large
-        // attachments still ride inline here; CKAsset migration is the deferred
-        // follow-up (#7) — an oversized send surfaces loud, it doesn't corrupt the
-        // legacy path.
+        // attachment envelopes use the transport's encrypted CKAsset path when
+        // they exceed the inline record budget. The same signature is verified.
         if let ck = deviceTransport {
             do {
                 try await ck.send(msg)
@@ -681,6 +703,7 @@ final class iCloudBridge: ObservableObject {
             }
             lastSyncAt = Date()
             syncStatus = "Sending via CloudKit"
+            onTransportSucceeded?()
             return msg
         }
 
@@ -1107,6 +1130,7 @@ final class iCloudBridge: ObservableObject {
         if case .failure(.account(let failure), _) = result {
             recordAccountFailure(failure)
         }
+        if case .success = result { onTransportSucceeded?() }
         let dispatched = result.dispatchedCount
         if dispatched > 0 { NADeviceSyncRecoveryBudget.didApplyData?() }
         guard NADeviceSyncRecoveryBudget.hasTime else { return dispatched > 0 }

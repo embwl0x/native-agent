@@ -360,7 +360,8 @@ public enum PeerTurnEffectPolicy {
         tool: String,
         input: [String: JSONValue],
         peer: PeerIdentity,
-        readPeerData: Bool = false
+        readPeerData: Bool = false,
+        person: String? = nil
     ) -> String? {
         guard normalized(tool) == "commit_memory" else { return nil }
         let who = peer.display
@@ -379,6 +380,7 @@ public enum PeerTurnEffectPolicy {
                 + "note about it, but a peer cannot speak for the person. Set "
                 + "provenance=\"told\" and provenance_by=\"\(who)\", so the note "
                 + "records what \(who) reported rather than established fact."
+                + (person.map { " What \($0) said is provenance=\"told\", provenance_by=\"\($0)\"." } ?? "")
         }
         let by = string(input["provenance_by"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -386,6 +388,9 @@ public enum PeerTurnEffectPolicy {
             return "Set provenance_by=\"\(who)\" — provenance=\"told\" without "
                 + "who told you is the part that makes the note honest."
         }
+        // A turn the person started on his own door: he may be who told her,
+        // even after she read a peer (User, 10-03 hit). Nil on any other turn.
+        if let person, by.lowercased() == person.lowercased() { return nil }
         let accepted = peer.acceptedAttributions
         // Nothing attested: an honest attribution is the most this turn can
         // ask for, so any non-empty name passes rather than blocking her note.

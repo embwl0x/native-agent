@@ -139,7 +139,7 @@ extension AppModel {
             // Re-read regardless: the switch must show the store's truth, not
             // the click's optimism.
             await refreshSchedulerJobs()
-            return .failed(error.localizedDescription)
+            return .failed(UserFacingError.cause(error, action: "change that job"))
         }
     }
 
@@ -195,7 +195,7 @@ extension AppModel {
             statusText = outcome.message
             return outcome
         } catch {
-            let outcome = NightlyReflectionJobOutcome.failed(error.localizedDescription)
+            let outcome = NightlyReflectionJobOutcome.failed(UserFacingError.cause(error, action: "add nightly reflection"))
             statusText = outcome.message
             return outcome
         }
@@ -208,7 +208,7 @@ extension AppModel {
             statusText = NewDeskTaskPresentation.successStatus
             await refreshAll()
         } catch {
-            statusText = NewDeskTaskPresentation.failureStatus(error.localizedDescription)
+            setFailureStatus(NewDeskTaskPresentation.failureStatus(UserFacingError.cause(error, action: "create the Desk task")), cause: error)
         }
     }
 
@@ -231,7 +231,7 @@ extension AppModel {
             let savedPolicy = try await client.postTrustWrite(body: [WorkshopPolicyBlockVocabulary.wireKey: patch])
             applySavedTrustPolicy(savedPolicy, status: "Desk execution policy saved")
         } catch {
-            statusText = "Desk execution policy save failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "save the Desk execution policy")
         }
     }
 
@@ -253,7 +253,7 @@ extension AppModel {
             await refreshAll()
             return true
         } catch {
-            recordTrustActionFailure("Trust save failed: \(error.localizedDescription)")
+            recordTrustActionFailure(UserFacingError.message(error, action: "save trust settings"), cause: error)
             return false
         }
     }
@@ -268,7 +268,7 @@ extension AppModel {
             )
             applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
         } catch {
-            recordTrustActionFailure("Memory policy save failed: \(error.localizedDescription)")
+            recordTrustActionFailure(UserFacingError.message(error, action: "save the memory policy"), cause: error)
         }
     }
 
@@ -284,7 +284,7 @@ extension AppModel {
             // became unreadable between the UI read and this mutation. Do not
             // leave a stale OpenAI-voice grant available to playback.
             engine.trust.policy = nil
-            recordTrustActionFailure("Multimodal policy save failed: \(error.localizedDescription)")
+            recordTrustActionFailure(UserFacingError.message(error, action: "save the multimodal policy"), cause: error)
             return false
         }
     }
@@ -309,7 +309,7 @@ extension AppModel {
             applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
             return true
         } catch {
-            recordTrustActionFailure("Memory policy save failed: \(error.localizedDescription)")
+            recordTrustActionFailure(UserFacingError.message(error, action: "save the memory policy"), cause: error)
             return false
         }
     }
@@ -320,7 +320,7 @@ extension AppModel {
             let savedPolicy = try await client.saveEnableAutonomy(enabled)
             applySavedTrustPolicy(savedPolicy, status: enabled ? "Autonomy enabled" : "Autonomy disabled")
         } catch {
-            recordTrustActionFailure("Autonomy save failed: \(error.localizedDescription)")
+            recordTrustActionFailure(UserFacingError.message(error, action: "save autonomy"), cause: error)
         }
     }
 
@@ -334,7 +334,7 @@ extension AppModel {
             )
             await NativeAgentEngine.live.chrome.reconcilePolicy()
         } catch {
-            recordTrustActionFailure("Chrome control save failed: \(error.localizedDescription)")
+            recordTrustActionFailure(UserFacingError.message(error, action: "save Chrome control"), cause: error)
         }
     }
 
@@ -345,7 +345,7 @@ extension AppModel {
             applySavedTrustPolicy(savedPolicy, status: enabled ? "Everything paused" : "Pause lifted")
             return true
         } catch {
-            recordTrustActionFailure("Pause everything save failed: \(error.localizedDescription)")
+            recordTrustActionFailure(UserFacingError.message(error, action: "save Pause everything"), cause: error)
             return false
         }
     }
@@ -360,7 +360,7 @@ extension AppModel {
             chatFileAccess = Self.normalizedAgentAccessMode(mode)
             return true
         } catch {
-            recordTrustActionFailure("Agent access save failed: \(error.localizedDescription)")
+            recordTrustActionFailure(UserFacingError.message(error, action: "save agent access"), cause: error)
             return false
         }
     }
@@ -374,8 +374,9 @@ extension AppModel {
         }
     }
 
-    func recordTrustActionFailure(_ message: String) {
+    func recordTrustActionFailure(_ message: String, cause: Error? = nil) {
         statusText = message
+        statusCause = cause?.localizedDescription
         trustCenterActionOutcome = .failed(message)
     }
 
@@ -452,8 +453,8 @@ extension AppModel {
             policySimulation = try await client.simulatePolicy(action: action, path: path)
             statusText = "Policy simulation complete"
         } catch {
-            policySimulationFailure = error.localizedDescription
-            statusText = "Policy simulation failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "run the policy simulation")
+            policySimulationFailure = statusText
         }
     }
 
@@ -462,21 +463,24 @@ extension AppModel {
     @discardableResult
     func createBackup(reason: String) async -> BackupRecord? {
         let receipt: String
+        var cause: String?
         var created: BackupRecord?
         do {
             let backup = try await client.createBackup(reason: reason)
             created = backup
             receipt = "Backup created at \(backup.createdAt): \(backup.reason)"
         } catch {
-            receipt = "Backup failed: \(error.localizedDescription)"
+            receipt = UserFacingError.message(error, action: "make a backup")
+            cause = error.localizedDescription
         }
-        await refreshBackupList(preserving: receipt)
+        await refreshBackupList(preserving: receipt, cause: cause)
         return created
     }
 
     @MainActor
     func restoreBackup(_ backup: BackupRecord) async {
         let receipt: String
+        var cause: String?
         do {
             let result = try await client.restoreBackup(id: backup.id)
             if result.requiresRestart {
@@ -488,18 +492,22 @@ extension AppModel {
             let restoredDescription = scopes.isEmpty ? "no matching data scopes" : scopes.joined(separator: ", ")
             receipt = "Restore completed at \(result.restoredAt): \"\(backup.reason)\" from \(backup.createdAt). Safety backup created first. Restored: \(restoredDescription)."
         } catch {
-            receipt = "Restore failed for \"\(backup.reason)\" from \(backup.createdAt): \(error.localizedDescription)"
+            receipt = "Restore failed for \"\(backup.reason)\" from \(backup.createdAt). "
+                + UserFacingError.cause(error, action: "restore that backup")
+            cause = error.localizedDescription
         }
-        await refreshBackupList(preserving: receipt)
+        await refreshBackupList(preserving: receipt, cause: cause)
     }
 
     @MainActor
-    private func refreshBackupList(preserving receipt: String) async {
+    private func refreshBackupList(preserving receipt: String, cause: String? = nil) async {
         do {
             engine.trust.backups = try await engine.trust.listBackups()
             statusText = receipt
+            statusCause = cause
         } catch {
-            statusText = "\(receipt) Backup list refresh failed: \(error.localizedDescription)"
+            statusText = "\(receipt) " + UserFacingError.message(error, action: "refresh the backup list")
+            statusCause = [cause, error.localizedDescription].compactMap { $0 }.joined(separator: "; ")
         }
     }
 

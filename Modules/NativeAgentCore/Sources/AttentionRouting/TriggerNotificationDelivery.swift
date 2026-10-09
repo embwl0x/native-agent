@@ -42,13 +42,13 @@ public enum TriggerNotificationDelivery {
         // fix, and at-most-once means it would never self-heal.
         switch await TriggerNotificationInbox.mirrorCardIntoRealInbox(card, triggerName: note.triggerName) {
         case .failed:
-            NSLog("trigger_notify: suppressing push for %@ — no knock without a card", note.triggerName)
+            nativeLog("trigger_notify: suppressing push for %@ — no knock without a card", note.triggerName)
             return .null
         case .duplicate(let existingId):
             // The atomic check found an active equivalent card a concurrent
             // fire landed first. No new card → no knock; non-null delivery so
             // the scheduler records the fire as handled and never re-mirrors.
-            NSLog("trigger_notify: %@ deduped at the mirror against active card %@ — no push",
+            nativeLog("trigger_notify: %@ deduped at the mirror against active card %@ — no push",
                   note.triggerName, existingId)
             return .object([
                 "delivered": .bool(false),
@@ -99,7 +99,7 @@ public enum TriggerNotificationDelivery {
                 // reached him. Reporting it as delivered was the lying signal.
                 let projection = outcome.deliveryProjection
                 if !projection.reachedAChannel {
-                    NSLog("trigger_notify: %@ mirrored but no channel accepted the knock (%@)",
+                    nativeLog("trigger_notify: %@ mirrored but no channel accepted the knock (%@)",
                           note.triggerName, projection.rawValue)
                 }
                 // `delivered` is the router's own projection, not "no failure
@@ -123,7 +123,7 @@ public enum TriggerNotificationDelivery {
             }
             return .object(receipt.deliveryFields())
         } catch {
-            NSLog("trigger_notify: paired-device push failed for \(note.triggerName): \(error)")
+            nativeLog("trigger_notify: paired-device push failed for \(note.triggerName): \(error)")
             // Partial outcome, NOT .null (gpt-5.5 review, 2026-07-09): the card
             // IS in the real inbox — only the knock failed. `.null` from this
             // notifier means "card never landed" and makes the scheduler leave

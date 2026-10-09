@@ -7,6 +7,7 @@ installation.
 ## Official links
 
 - Product/download page: **https://nativeagent.app**
+- Current Mac release: **https://github.com/embwl0x/native-agent/releases/latest**
 - Support and issue form:
   **https://github.com/embwl0x/native-agent/issues/new/choose**
 - Privacy policy: **https://nativeagent.app/privacy**
@@ -39,7 +40,7 @@ switching to another runtime.
 
 ## Install the Mac app
 
-1. Download the current notarized disk image from the official product page.
+1. Download the current notarized disk image from the [latest GitHub release](https://github.com/embwl0x/native-agent/releases/latest).
 2. Open the disk image and drag NativeAgent into Applications.
 3. Launch NativeAgent from Applications. Enter your name and the agent's name;
    the overview is optional.
@@ -47,7 +48,7 @@ switching to another runtime.
    open **Providers** on the Advanced rail.
 5. Choose access in **Trust**; individual services are under **Mac integration**.
 
-If macOS blocks the app, confirm the file came from the official download page
+If macOS blocks the app, confirm the file came from the official GitHub release
 and that the release is signed and notarized. Do not bypass Gatekeeper for an
 unknown or modified download.
 
@@ -86,7 +87,11 @@ iPhone and iPad updates are delivered by the App Store or TestFlight.
 - Confirm iCloud is available on both devices.
 - Pull to refresh, or use **More → Settings → Check for Mac updates** when the
   iCloud connection is available. Otherwise follow **Connection setup help**.
-- Confirm the pairing version matches and re-pair if the Mac key changed.
+- For recovery, open **More → Settings → Connection → Diagnostics → Repair connection**.
+  This reconciles pending actions, removes the phone's local pairing key,
+  clears connection delivery history, and opens pairing setup. It does not
+  erase conversations or Mac data. Depending on connection state, **Pair with Mac**,
+  **Set up Mac connection**, or **Connection setup help** may also appear.
 - Allow time for iCloud delivery after reconnecting from an offline state.
 
 ### A mobile action is waiting
@@ -102,7 +107,7 @@ is still pending.
 - Confirm pairing is active and the Mac reports the phone as reachable.
 - Check Focus, notification summary, lock-screen preview, and time-sensitive
   notification settings.
-- **More → Settings → Push deliveries** shows the phone's recent push receipts.
+- **More → Settings → Recent pushes** shows the phone's recent push receipts.
 - A push is only a wake/delivery signal; durable iCloud state still needs to
   reach the phone.
 
@@ -150,8 +155,9 @@ files, or unredacted support archives. Security vulnerabilities should follow
 
 Before destructive cleanup, export any work the user wants to keep.
 
-- On mobile, use **More → Settings → Connection diagnostics → Replace pairing…**
-  and confirm **Re-pair**, then delete the app to remove its local app container.
+- On mobile, delete the app to remove its local app container. **Repair connection**
+  is a recovery action, not a general data-removal control; it removes the local
+  pairing key and opens pairing setup, without deleting Mac or iCloud data.
 - On Mac, quit NativeAgent before removing its Application Support data and
   workspace.
 - Remove NativeAgent data from iCloud and device backups through the applicable

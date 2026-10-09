@@ -2,6 +2,7 @@ import TrustPersistence
 import Foundation
 import Observation
 import Darwin
+import os
 import AppKit
 @preconcurrency import EventKit
 import SwiftUI
@@ -101,7 +102,6 @@ struct NativeClient: Sendable {
         _ timeout: TimeInterval
     ) async throws -> (status: Int32, stdout: String, stderr: String)
 
-    var baseURL: String
     /// Native readers normally use the process data root. The explicit root is
     /// the same canonical store boundary, used by isolated app integration
     /// tests and never by a second in-memory store.
@@ -178,10 +178,9 @@ struct NativeClient: Sendable {
 
 
 
-    static func privacyCategories(
-        dataRoot: URL,
-        includeInventory: Bool = true
-    ) -> [PrivacyCategory] {
+    /// Each folder walked now: a whole data root takes seconds, so the page
+    /// asks off the main actor and shows the map when the walk lands.
+    static func privacyCategories(dataRoot: URL) -> [PrivacyCategory] {
         struct Spec {
             var id: String
             var title: String
@@ -209,6 +208,8 @@ struct NativeClient: Sendable {
             Spec(id: "connectors", title: "Connectors", relativePath: "connectors", detail: "connector registry, workspace records, and action receipts", exportable: true),
             Spec(id: "oauth_tokens", title: "OAuth Tokens", relativePath: "oauth_tokens", detail: "connector OAuth token material", exportable: false),
             Spec(id: "secrets", title: "Secrets", relativePath: "secrets", detail: "secret-bearing local runtime state", exportable: false),
+            Spec(id: "sense_ledger", title: "Sense Wall Ledger", relativePath: "senses/ledger", detail: "private local wall history and growth needs — never exported, backed up, shared, or synced", exportable: false),
+            Spec(id: "sense_news", title: "Unread Sense News", relativePath: "senses/news", detail: "private pending news and delivery deduplication — never exported, backed up, shared, or synced", exportable: false),
             Spec(id: "providers", title: "Providers", relativePath: "providers", detail: "provider auth/configuration state", exportable: false),
             Spec(id: "codex_home", title: "Codex Home", relativePath: "codex_home", detail: "app-owned Codex auth and session files", exportable: false),
             Spec(id: "tools", title: "Tools", relativePath: "tools", detail: "tool registry, runtime receipts, proposals, and quarantine state", exportable: true),
@@ -227,13 +228,16 @@ struct NativeClient: Sendable {
             Spec(id: "crash_reports", title: "Crash Reports", relativePath: "crash_reports", detail: "submitted crash report payloads", exportable: false),
         ]
         return specs.map { spec in
-            let path = dataRoot.appendingPathComponent(spec.relativePath)
-            let inventory = includeInventory ? "; \(privacyItemSummary(path))" : ""
+            // The persona lives where the app reads it: beside a checkout's
+            // data/, not inside it (`defaultPersonaRoot`).
+            let path = spec.id == "persona"
+                ? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
+                : dataRoot.appendingPathComponent(spec.relativePath)
             return PrivacyCategory(
                 id: spec.id,
                 title: spec.title,
                 path: path.path,
-                contains: "\(spec.detail)\(inventory)",
+                contains: "\(spec.detail); \(privacyItemSummary(path))",
                 exportable: spec.exportable
             )
         }
@@ -247,7 +251,7 @@ struct NativeClient: Sendable {
         }
         if !isDirectory.boolValue {
             let bytes = (try? fm.attributesOfItem(atPath: path.path)[.size] as? NSNumber)?.int64Value ?? 0
-            return "1 file, \(bytes) bytes"
+            return "1 file, \(sized(bytes))"
         }
         guard let enumerator = fm.enumerator(
             at: path,
@@ -266,9 +270,14 @@ struct NativeClient: Sendable {
             bytes += Int64(values?.fileSize ?? 0)
         }
         if files >= 10_000 {
-            return "10,000+ files, \(bytes) bytes scanned"
+            return "10,000+ files, \(sized(bytes)) scanned"
         }
-        return "\(files) file\(files == 1 ? "" : "s"), \(bytes) bytes"
+        return "\(files.formatted()) file\(files == 1 ? "" : "s"), \(sized(bytes))"
+    }
+
+    /// "47 MB": the Mac's own file sizes, not raw bytes.
+    private static func sized(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     static func nativeRouteMissing(path: String, method: String) -> NSError {

@@ -34,6 +34,11 @@ import PersistenceCore
 public enum MacMenuBar {
     /// Named levels in a path. `File › Export › PDF…` is three.
     public static let maxPathDepth = 3
+    /// Named levels a FIND or a press walks. A bare name is unique only when
+    /// the walk saw every item, and real apps nest to five (TextEdit's
+    /// Format › Text › Writing Direction › …, Chrome, Xcode); measured 10-07
+    /// at 50–510 ms for a whole menu bar. Listings keep `maxPathDepth`.
+    public static let findPathDepth = 5
     /// Leaves returned by one read.
     public static let maxItems = 160
     /// Children considered under any one menu. A menu with more than this is
@@ -115,7 +120,8 @@ public enum MacMenuBar {
         source: any MacAXElementSource,
         pid: Int32,
         top: String? = nil,
-        until stop: ((Item) -> Bool)? = nil
+        until stop: ((Item) -> Bool)? = nil,
+        depth: Int = maxPathDepth
     ) -> Reading {
         guard pid != getpid() else {
             return Reading(items: [], truncated: false, unavailable: "self_process")
@@ -186,7 +192,7 @@ public enum MacMenuBar {
                         done = true
                         return
                     }
-                    if let submenu, names.count < maxPathDepth {
+                    if let submenu, names.count < depth {
                         descend(
                             submenu.element,
                             titles: names,

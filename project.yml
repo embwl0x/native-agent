@@ -100,6 +100,19 @@ targets:
     settings:
       ENABLE_HARDENED_RUNTIME: YES
 
+  NativeAgentSenseHost:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/NativeAgentSenseHost
+        type: syncedFolder
+    dependencies:
+      - package: NativeAgentCore
+        product: Senses
+    settings:
+      ENABLE_HARDENED_RUNTIME: YES
+      CODE_SIGN_ENTITLEMENTS: Config/NativeAgentSenseHost.entitlements
+
   nativeagent-link:
     type: tool
     platform: macOS
@@ -171,7 +184,12 @@ targets:
         type: syncedFolder
       - path: Resources/AppIcon.icns
         buildPhase: resources
+      - path: Resources/Senses
+        type: folder
+        buildPhase: resources
       - path: docs/licenses/A2A-gRPC-NOTICES.txt
+        buildPhase: resources
+      - path: docs/licenses/Codex-LICENSE.txt
         buildPhase: resources
       - path: Extensions/NativeAgentChrome/manifest.json
         buildPhase:
@@ -192,6 +210,10 @@ targets:
         copy:
           destination: executables
       - target: nativeagent-link
+        embed: true
+        copy:
+          destination: executables
+      - target: NativeAgentSenseHost
         embed: true
         copy:
           destination: executables
@@ -227,6 +249,7 @@ targets:
           - GrokLink
           - Desk
           - Studio
+          - Senses
           - TurnTrace
           - Transcripts
           - Procedures
@@ -238,6 +261,7 @@ targets:
           - TriggerScheduler
           - SchedulerExecution
           - StandingBots
+          - SwarmRuns
           - WorkshopExecution
           - NotificationInbox
           - Research
@@ -296,6 +320,7 @@ targets:
         CFBundleShortVersionString: "0.0.0-dev"
         NativeAgentSourceRevision: unknown
         NativeAgentSourceDirty: false
+        NativeAgentSourceContentID: unknown
         NativeAgentMacBundleID: $(NATIVEAGENT_MAC_BUNDLE_ID)
         NativeAgentMacAppGroupID: $(NATIVEAGENT_MAC_APP_GROUP_ID)
         NativeAgentICloudContainerID: $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
@@ -323,6 +348,7 @@ targets:
         NSRemindersUsageDescription: NativeAgent uses reminders access for assistant briefings and user-approved watch jobs.
         NSRemindersFullAccessUsageDescription: NativeAgent uses reminders access to read due reminders for assistant briefings and user-approved watch jobs.
         NSContactsUsageDescription: NativeAgent uses Contacts so the assistant can look up people you ask about and (with the Contacts write toggle on) create or update contacts on your behalf.
+        NSPhotoLibraryUsageDescription: NativeAgent reads Photos library counts and asset metadata when you ask.
         NSMicrophoneUsageDescription: NativeAgent uses your microphone for voice input.
         NSSpeechRecognitionUsageDescription: NativeAgent uses speech recognition to transcribe your voice.
         NSLocalNetworkUsageDescription: NativeAgent uses the local network to connect the Mac app and trusted companion devices.
@@ -336,6 +362,21 @@ targets:
           - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).self_improvement_sweep
     postBuildScripts:
       # Runs before Xcode's CodeSign step, so everything here is sealed.
+      - name: Embed pinned Codex search executable
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          slices=()
+          for arch in $ARCHS; do
+            slices+=("$(bash "$SRCROOT/script/fetch_codex.sh" "$arch")")
+          done
+          out="$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH/codex"
+          if [[ ${#slices[@]} -eq 1 ]]; then
+            cp "${slices[0]}" "$out"
+          else
+            lipo -create "${slices[@]}" -output "$out"
+          fi
+          chmod 755 "$out"
       - name: Stamp version, source identity, REPO_PATH, embedding model
         basedOnDependencyAnalysis: false
         inputFiles:
@@ -353,9 +394,18 @@ targets:
           if [[ -n "$(git -C "$SRCROOT" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
             dirty=true; suffix=".dirty"
           fi
+          # Hash the working source tree without staging the user's changes.
+          source_index="$(mktemp "$TARGET_TEMP_DIR/nativeagent-source.XXXXXX")"
+          trap 'rm -f "$source_index"' EXIT
+          rm -f "$source_index"
+          GIT_INDEX_FILE="$source_index" git -C "$SRCROOT" read-tree --empty
+          git -C "$SRCROOT" ls-files --cached --others --exclude-standard --deduplicate -z \
+            | GIT_INDEX_FILE="$source_index" git -C "$SRCROOT" update-index --add --remove -z --stdin
+          content_id="$(GIT_INDEX_FILE="$source_index" git -C "$SRCROOT" write-tree)"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" \
             -c "Set :CFBundleShortVersionString ${NATIVEAGENT_BUILD_SHORT_VERSION:-$version-dev.$sha$suffix}" \
             -c "Set :NativeAgentSourceRevision $revision" \
+            -c "Set :NativeAgentSourceContentID $content_id" \
             -c "Set :NativeAgentSourceDirty $dirty" "$plist"
           cp "$SRCROOT/VERSION" "$res/VERSION"
           printf '%s\n' "$revision" > "$res/VERSION_SHA"

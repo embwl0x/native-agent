@@ -632,8 +632,32 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
         // the two reads all mean "a writer was mid-update / freshness not
         // provable" -> return nil so the caller fails closed/retries later.
         let seq1 = try await improvementsCommitSeqLocal()
-        // Never written (a fresh install): nothing to straddle, so an empty store is verified empty.
-        if seq1 == 0, try await listImprovementsLocal().isEmpty, try await improvementsCommitSeqLocal() == 0 { return [] }
+        // No marker: only the retired daemon stamped one. Swift writers
+        // replace runs.json atomically under its path lock, so with no
+        // seqlock writer the store is quiescent and its read is verified.
+        // Verified only when every row decodes; a dropped row is named.
+        if seq1 == 0 {
+            let path = dataRoot.appendingPathComponent("improvements/runs.json")
+            guard case .array(let rows) = try await persistence.readJSON(path, ifMissing: .array([])) else {
+                throw SelfImprovementError.unavailable("improvements/runs.json is not an array of runs.")
+            }
+            var runs: [ImprovementRun] = []
+            var undecodable: [Int] = []
+            for (index, row) in rows.enumerated() {
+                if let data = try? JSONEncoder().encode(row),
+                   let run = try? JSONDecoder().decode(ImprovementRun.self, from: data) {
+                    runs.append(run)
+                } else {
+                    undecodable.append(index + 1)
+                }
+            }
+            guard undecodable.isEmpty else {
+                let named = undecodable.prefix(5).map(String.init).joined(separator: ", ")
+                throw SelfImprovementError.unavailable(
+                    "improvements/runs.json row(s) \(named)\(undecodable.count > 5 ? ", …" : "") of \(rows.count) do not decode.")
+            }
+            return try await improvementsCommitSeqLocal() == 0 ? runs.reversed() : nil
+        }
         guard seq1 >= 2, seq1 % 2 == 0 else { return nil }
         let runs = try await listImprovementsLocal()
         let seq2 = try await improvementsCommitSeqLocal()

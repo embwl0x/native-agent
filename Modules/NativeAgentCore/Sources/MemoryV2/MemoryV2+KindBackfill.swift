@@ -135,7 +135,7 @@ public enum MemoryKindBackfill {
         do {
             pending = try await listPendingBackfills()
         } catch {
-            NSLog("[kindBackfill] dedupe scan failed: \(String(describing: error))")
+            nativeLog("[kindBackfill] dedupe scan failed: \(String(describing: error))")
             return nil
         }
         if let existing = pending.first(where: { payloadKind($0.payload) == payloadKindValue }) {
@@ -145,7 +145,7 @@ public enum MemoryKindBackfill {
                 writeStamp(approvalId: existing.id, dataRoot: dataRoot)
                 return existing.id
             } catch {
-                NSLog("[kindBackfill] card ensure failed: \(String(describing: error))")
+                nativeLog("[kindBackfill] card ensure failed: \(String(describing: error))")
                 return nil
             }
         }
@@ -157,7 +157,7 @@ public enum MemoryKindBackfill {
             guard !candidates.isEmpty else { return nil }
             rows = await classify(rows: candidates, classifier: classifier)
         } catch {
-            NSLog("[kindBackfill] detection failed: \(String(describing: error))")
+            nativeLog("[kindBackfill] detection failed: \(String(describing: error))")
             return nil
         }
         guard !rows.isEmpty else { return nil }
@@ -183,7 +183,7 @@ public enum MemoryKindBackfill {
             writeStamp(approvalId: approvalId, dataRoot: dataRoot)
             return approvalId
         } catch {
-            NSLog("[kindBackfill] stage failed: \(String(describing: error))")
+            nativeLog("[kindBackfill] stage failed: \(String(describing: error))")
             return nil
         }
     }
@@ -355,7 +355,7 @@ public enum MemoryKindBackfill {
                 at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
             try stamp.serializedData(pretty: true).write(to: path, options: .atomic)
         } catch {
-            NSLog("[kindBackfill] stamp write failed: \(String(describing: error))")
+            nativeLog("[kindBackfill] stamp write failed: \(String(describing: error))")
         }
     }
 

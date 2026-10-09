@@ -7,6 +7,9 @@ import ApprovalInbox
 /// Browser operation orchestration. The canonical reducer remains the sole
 /// owner of persisted transitions and derived native-action receipts.
 public struct BrowserActionRoutes: Sendable {
+    /// The read door retains this exact capture before disposable artifacts
+    /// can expire. It never needs another visible read to recover the evidence.
+    @TaskLocal public static var retainRead: (@Sendable (BrowserVisibleCapture) -> Void)?
     let effects: any BrowserRouteEffects
 
     public init(effects: any BrowserRouteEffects) {
@@ -284,7 +287,7 @@ public struct BrowserActionRoutes: Sendable {
         } catch {
             // Mirror the self_improvement pattern: never leave an approved
             // record without an execution annotation when the executor threw.
-            NSLog("[approvals] browser run failed for \(approval.id): \(error)")
+            nativeLog("[approvals] browser run failed for \(approval.id): \(error)")
             try? await effects.annotateApprovalExecution(
                 id: approval.id,
                 executedAction: .object([
@@ -381,6 +384,28 @@ public struct BrowserActionRoutes: Sendable {
         )
     }
 
+    private static func canReadVisiblePage(_ url: URL?) -> Bool {
+        ["http", "https"].contains(url?.scheme?.lowercased() ?? "")
+    }
+
+    @MainActor
+    public func visibleBrowserStatus(_ status: JSONValue) throws -> JSONValue {
+        guard case .object(var fields) = status else {
+            throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
+                NSLocalizedDescriptionKey: "Browser status is not an object"
+            ])
+        }
+        let current = effects.currentURL()
+        let url = current.flatMap { URL(string: $0) }
+        let readable = Self.canReadVisiblePage(url)
+        fields["current_url"] = current.map(JSONValue.string) ?? .null
+        fields["url_scheme"] = url?.scheme.map { .string($0.lowercased()) } ?? .null
+        fields["readable"] = .object(["browser.text": .bool(readable),
+            "browser.links": .bool(readable), "browser.screenshot": .bool(readable)])
+        fields["read_note"] = .string("Page reads require an HTTP(S) page. Preview app {action:\"browser.open\",args:{url:\"<http/https URL>\"},preview:true} first, then open the page if authorized.")
+        return .object(fields)
+    }
+
     @MainActor
     public func captureCurrentVisibleBrowser(
         readText: Bool,
@@ -392,10 +417,9 @@ public struct BrowserActionRoutes: Sendable {
         defer { effects.releaseBrowser(runID: runID) }
         guard let current = effects.currentURL(),
               let url = URL(string: current),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
+              Self.canReadVisiblePage(url) else {
             throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Visible browser is not on an http/https page"
+                NSLocalizedDescriptionKey: "Visible browser is not on an http/https page. Preview app {action:\"browser.open\",args:{url:\"<http/https URL>\"},preview:true} first, then open the page if authorized."
             ])
         }
         let nav = BrowserNavigationResult(url: current, title: "", httpStatus: nil)

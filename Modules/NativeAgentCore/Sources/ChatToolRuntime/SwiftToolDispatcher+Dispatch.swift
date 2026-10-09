@@ -20,6 +20,9 @@ import SwarmRuns
 import MacIntegration
 import ToolExecution
 import Skills
+import Studio
+import Senses
+import Research
 
 // 2026-09-18: strict providers fill unused optionals with null. Normalize from
 // the native schema before approval and execution, including nested objects;
@@ -32,8 +35,9 @@ public enum ToolArguments {
     /// the model reads.
     static let positiveOnly: [String: Set<String>] = [
         "mail_list_recent": ["message_id", "position"], "mail_mark_read": ["message_id", "position"],
+        "mail_save_attachment": ["message_id", "position", "index"],
         "mail_archive": ["message_id", "position"], "mail_delete": ["message_id", "position"],
-        "mail_reply": ["message_id", "position"], "messages_recent_threads": ["before_message_id"],
+        "mail_reply": ["message_id", "position"], "mail_draft": ["message_id", "position"], "messages_recent_threads": ["before_message_id"],
     ]
 
     public static func normalized(_ input: [String: JSONValue], schema: JSONValue, positiveOnly: Set<String> = []) -> [String: JSONValue] {
@@ -136,6 +140,7 @@ public extension ToolDispatchClient {
         if let current = ToolArguments.current, current.tool == identity, current.input == input { return try await body(input) }
         let schemas = try await listAvailableToolSchemas()
         let canonical = ToolNameAliases.canonical(tool) { name in schemas.contains { $0.name == name } }
+        let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, input))
         let schema = schemas.first { $0.name == canonical || $0.name.replacingOccurrences(of: ".", with: "_") == canonical }
         let normalized = schema.flatMap { try? JSONValue.parse($0.parametersJSON) }
             .map { ToolArguments.normalized(input, schema: $0, positiveOnly: ToolArguments.positiveOnly[canonical] ?? []) } ?? input
@@ -210,6 +215,7 @@ extension SwiftToolDispatcher {
             input["__session_id"] = .string(taskSession)
         }
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
+        if let refusal = sendInstructionRefusal(tool: tool, input: input) { return refusal }
         if ToolCallParser.isIgnorableToolName(tool) {
             return .object([
                 "status": .string("ignored"),
@@ -220,7 +226,9 @@ extension SwiftToolDispatcher {
         if !usesCanonicalBody, Self.canonicalBodyOnlyToolNames.contains(tool) {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("canonical_body_unavailable"),
+                "detail": .string("\(tool) is not available in this context, so nothing ran."),
                 "tool": .string(tool),
             ])
         }
@@ -231,7 +239,9 @@ extension SwiftToolDispatcher {
            !Self.extractSessionId(from: input).isEmpty {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("legacy_mac_tool_internal_only"),
+                "detail": .string("\(tool) is internal now, so nothing ran. Use one of \(Self.fourVerbToolNames.joined(separator: ", ")) instead."),
                 "tool": .string(tool),
                 "replacement": .array(Self.fourVerbToolNames.map { .string($0) }),
             ])
@@ -242,9 +252,21 @@ extension SwiftToolDispatcher {
         }
         // A contributed tool runs in its owner's executor.
         if let appTools, executorOwnedToolNames.contains(tool) {
+            if tool == "app" {
+                return try await AppDoorReentry.$validate.withValue({ name, arguments in
+                    if let refusal = await self.preApprovalRefusal(tool: name, input: arguments, surface: surface) { return refusal }
+                    return await self.fileReadPreviewRefusal(tool: name, input: arguments, surface: surface)
+                }) {
+                    try await appTools.execute(tool: tool, input: input, surface: surface)
+                }
+            }
             return try await appTools.execute(tool: tool, input: input, surface: surface)
         }
         switch tool {
+        case "maps_search":
+            return try await impl_maps_search(input: input)
+        case "maps_route":
+            return try await impl_maps_route(input: input)
         case "read_page":
             guard case .string(let raw)? = input["url"], case let url = Self.withWebScheme(raw),
                   let parsed = URL(string: url),
@@ -252,7 +274,41 @@ extension SwiftToolDispatcher {
                   parsed.host?.isEmpty == false, parsed.user == nil, parsed.password == nil else {
                 throw AutonomyGateError.toolDenied(reason: "read_page requires a public http(s) URL.")
             }
-            return try await pageReader.fetchURL(url).toJSON()
+            let fetched: JSONValue
+            do { fetched = try await self.pageReader.fetchURL(url).toJSON() }
+            catch ResearchClientError.httpStatus(let status) {
+                return .object(["status": .string("failed"), "http_status": .int(Int64(status)),
+                    "url": .string(url), "effects": .string("none"),
+                    "message": .string("HTTP \(status) refused this public read.")])
+            }
+            if case .object(let fields) = fetched {
+                let text: String = if case .string(let value)? = fields["text"] { value } else { "" }
+                if fields["untrusted_remote_data"] == .bool(true) || !text.isEmpty {
+                    PeerDataTaint.markConsumed(peer: "web content", line: text, attested: false)
+                }
+            }
+            let observedURL: String = if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"],
+                case .string(let finalURL)? = coverage["final_url"] { finalURL } else { url }
+            let corner = SenseCorner.site(host: URL(string: observedURL)?.host?.lowercased() ?? parsed.host!.lowercased())
+            var senseInput = input
+            senseInput["__sense_action"] = .string("web.read")
+            let result = try await SenseDoor.read(corner: corner, address: observedURL, input: senseInput,
+                scope: ChatToolSessionContext.verifiedSessionId ?? "",
+                nativeCorner: .stream(id: "web"),
+                raw: { fetched },
+                material: { document in
+                    guard case .object(let fields) = document, fields["status"] != .string("failed") else {
+                        throw SenseFailure(code: "source_unavailable", message: "The original reader refused this read.")
+                    }
+                    return .pageSnapshot(document)
+                })
+            if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"], coverage["thin_page"] == .bool(true) {
+                let continuation: [String: JSONValue] = ["reason": .string("thin_page"), "hint": coverage["hint"] ?? .null,
+                    "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("chrome.navigate"), "args": .object(["url": .string(observedURL)])])])]
+                if case .object(let output) = result { return .object(output.merging(continuation) { _, next in next }) }
+                if case .string(let text) = result { return .string(text + "\n" + (try JSONValue.object(continuation).serialize(pretty: false))) }
+            }
+            return result
         // The three basic file tools, when Full Mac file access is off. A path
         // the workspace lane cannot reach is not a fact to report in prose —
         // it is one switch away, and asking for it is the honest move.
@@ -280,12 +336,12 @@ extension SwiftToolDispatcher {
                 ) else { throw error }
                 return need
             }
-        case "write_file":
+        case "write_file", "move_file", "copy_file", "trash_file":
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return try await impl_local_connector_tool(tool: tool, input: input, surface: surface)
             }
             do {
-                return try await impl_trusted_write_file(input: input)
+                return try await impl_trusted_file_mutation(tool: tool, input: input)
             } catch {
                 guard let need = fileOpsNeedEnvelope(
                     tool: tool, mode: .write, path: jsonString(input["path"]), error: error
@@ -359,7 +415,7 @@ extension SwiftToolDispatcher {
             // The outer verified-session facade consumes this preparation;
             // Core alone never turns a button into an ungated nested action.
             return .object(["status": .string("prepared"), "execution": .string("requires_workspace_runtime")])
-        case "work_context": return try await impl_work_context(input: input)
+        case "work_context": return try await impl_work_context(input: input, surface: surface)
         case "artifact_find": return try await impl_artifact_find(input: input)
         case "session_search": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "read_chat_message": return try await impl_read_chat_message(input: input, invokedAs: tool)
@@ -542,6 +598,10 @@ extension SwiftToolDispatcher {
             return try await GitHubConnectorActions.status(input: input, dataRoot: dataRoot)
         case "github_list_repos":
             return try await GitHubConnectorActions.listRepos(input: input, dataRoot: dataRoot)
+        case "github_list_runs":
+            return try await GitHubConnectorActions.listRuns(input: input, dataRoot: dataRoot)
+        case "github_run_jobs":
+            return try await GitHubConnectorActions.runJobs(input: input, dataRoot: dataRoot)
         case "github_list_notifications":
             return try await GitHubConnectorActions.listNotifications(input: input, dataRoot: dataRoot)
         case "github_get_repository":
@@ -593,7 +653,7 @@ extension SwiftToolDispatcher {
                 dataRoot: dataRoot
             )
         case "agentmail_list":
-            return await AgentMailActions.listRecent(input: input, dataRoot: dataRoot)
+            return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: await AgentMailActions.listRecent(input: input, dataRoot: dataRoot), dataRoot: dataRoot)
         case "agentmail_read":
             return await AgentMailActions.readMessage(input: input, dataRoot: dataRoot)
         case "agentmail_send":
@@ -611,7 +671,12 @@ extension SwiftToolDispatcher {
                 dataRoot: dataRoot
             )
         case "image_generate":
-            return Self.studioImageInvitation(await impl_image_generate(input: input, surface: surface))
+            // Each image is also a Make version: a new ref, or `__make_ref`'s
+            // when the Make view's Try again runs the same prompt again.
+            return Self.studioImageInvitation(MakeStudio.registerGenerated(
+                await impl_image_generate(input: input, surface: surface),
+                prompt: jsonString(input["prompt"]) ?? jsonString(input["description"]) ?? "",
+                ref: jsonString(input["__make_ref"]), dataRoot: dataRoot))
         // ── Mac integration chat tools (2026-06-07) ──
         // Each tool is permission-gated through MacIntegrationPermissionStore.
         // The real backend (EventKit / UserNotifications / Spotlight) is
@@ -754,6 +819,20 @@ extension SwiftToolDispatcher {
                 input: input,
                 run: { bridge, input in try await bridge.contactsCreateOrUpdate(input: input) }
             )
+        case "mail_save_attachment":
+            return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface, integration: MacIntegrationID.mail, mode: .read,
+                fixHint: "Toggle Read ON for Mail in Settings → Mac Integration.", input: AgentWorkspace.bindMail(input, dataRoot: dataRoot),
+                run: { bridge, input in
+                    if let error = input["binding_error"] { return .object(["status": .string("failed"), "message": error]) }
+                    let attachment = try await bridge.mailAttachment(input: input)
+                    var fileInput = input
+                    fileInput["path"] = input["destination"] ?? .string("~/Downloads")
+                    if await self.fullMacToolAccess(surface: surface).fileOpsAllowed {
+                        return try await self.impl_local_connector_tool(tool: tool, input: fileInput, surface: surface, attachment: attachment)
+                    }
+                    return try await self.impl_trusted_file_mutation(tool: tool, input: fileInput, attachment: attachment)
+                })
         case "mail_list_recent":
             let inbox = try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
@@ -764,28 +843,32 @@ extension SwiftToolDispatcher {
                 run: { bridge, input in try await bridge.mailListRecent(input: input) }
             )
             HerMailStatus.shared.note(inbox) // home's mail count, no read of its own
-            return inbox
+            return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: inbox, dataRoot: dataRoot)
         case "mail_read_batch", "mail_triage_batch":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: tool == "mail_read_batch" ? .read : .write,
                 fixHint: "Grant Mail access for the selected batch.",
-                input: AgentWorkspace.bindMailBatch(input, dataRoot: dataRoot),
+                input: AgentWorkspace.bindMail(input, dataRoot: dataRoot),
                 run: { bridge, input in
                     if tool == "mail_read_batch" { return try await bridge.mailReadBatch(input: input) }
                     return try await bridge.mailTriageBatch(input: input)
                 }
             )
-        case "mail_search":
-            return try await dispatchMacIntegrationTool(
+        case "mail_search", "mail_senders":
+            let result = try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .read,
                 fixHint: "Toggle Read ON for Mail in Settings → Mac Integration.",
                 input: input,
-                run: { bridge, input in try await bridge.mailSearch(input: input) }
+                run: { bridge, input in
+                    if tool == "mail_senders" { return try await bridge.mailSenders(input: input) }
+                    return try await bridge.mailSearch(input: input)
+                }
             )
+            return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: result, dataRoot: dataRoot)
         case "mail_send":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
@@ -879,14 +962,20 @@ extension SwiftToolDispatcher {
                 input: input,
                 run: { bridge, input in try await bridge.calendarDeleteEvent(input: input) }
             )
-        case "mac_reminders_create":
+        case "mac_reminders_create", "mac_reminders_list_rename", "mac_reminders_list_create":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .write,
                 fixHint: "Toggle Write ON for Reminders in Settings → Mac Integration.",
                 input: input,
-                run: { bridge, input in try await bridge.remindersCreate(input: input) }
+                run: { bridge, input in
+                    switch tool {
+                    case "mac_reminders_list_rename": return try await bridge.remindersListRename(input: input)
+                    case "mac_reminders_list_create": return try await bridge.remindersListCreate(input: input)
+                    default: return try await bridge.remindersCreate(input: input)
+                    }
+                }
             )
         case "mac_reminders_complete":
             return try await dispatchMacIntegrationTool(
@@ -933,23 +1022,26 @@ extension SwiftToolDispatcher {
                 input: input,
                 run: { bridge, input in try await bridge.mailDelete(input: input) }
             )
-        case "mail_reply":
+        case "mail_reply", "mail_draft":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
                 fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
                 input: input,
-                run: { bridge, input in try await bridge.mailReply(input: input) }
+                run: { bridge, input in
+                    if tool == "mail_draft" { return try await bridge.mailDraft(input: input) }
+                    return try await bridge.mailReply(input: input)
+                }
             )
-        case "notes_update":
+        case "notes_update", "notes_delete":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.notes,
                 mode: .write,
                 fixHint: "Toggle Write ON for Notes in Settings → Mac Integration.",
                 input: input,
-                run: { bridge, input in try await bridge.notesUpdate(input: input) }
+                run: { bridge, input in try await bridge.notesModify(input: input, deleting: tool == "notes_delete") }
             )
         case "music_search_library":
             return try await dispatchMacIntegrationTool(
@@ -1037,6 +1129,8 @@ extension SwiftToolDispatcher {
                 input: input,
                 run: { bridge, input in try await bridge.schedulerUpdateJob(input: input) }
             )
+        case "mac_screenshot_save":
+            return try await impl_mac_screenshot_save(input: input, surface: surface)
         case let name where Self.fullMacFileToolNames.contains(name):
             return try await impl_local_connector_tool(tool: name, input: input, surface: surface)
         case let name where Self.fullMacSystemToolNames.contains(name):
@@ -1112,6 +1206,7 @@ extension SwiftToolDispatcher {
                 guard let fingerprint = registryToolFingerprint(tool), !fingerprint.isEmpty else {
                     return .object([
                         "status": .string("failed"),
+                        "effects": .string("none"),
                         "reason": .string("unsigned_tool"),
                         "tool": .string(tool),
                         "fix": .string("Tool '\(tool)' has no codeFingerprint in registry.json or its active manifest. Re-promote it so the promote engine stamps one."),
@@ -1148,7 +1243,17 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
             .first { !$0.isEmpty }
         if let taskSession { input["__session_id"] = .string(taskSession) }
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
+        if let refusal = sendInstructionRefusal(tool: tool, input: input) { return refusal }
         if let refusal = await argumentRefusal(tool: tool, input: input) { return refusal }
+        if ["studio_canon_resolve", "hold_view", "release_view"].contains(tool),
+           case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(dispatchSurface: surface) {
+            return .object(["status": .string("refused"), "refusal": .string(refusal.rawValue),
+                "reason": .string("\(tool): \(refusal.spoken). It is done from inside your own conversation, in your own turn.")])
+        }
+        if tool == "studio_shelf_set" {
+            let result = await impl_studio_shelf(input: input, surface: surface, set: true, preview: true)
+            if case .object(let fields) = result, fields["status"] != .string("would") { return result }
+        }
         if let refusal = agentHostSetupRefusal(tool: tool, input: input) { return refusal }
         if let refusal = await standingBotsArgumentRefusal(tool: tool, input: input) { return refusal }
         return nil
@@ -1228,6 +1333,16 @@ extension SwiftToolDispatcher: PureToolArgumentValidating {
             return await (appTools as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
         }
         if tool == "apply_patch" { return Self.applyPatchArgumentRefusal(input: input) }
+        if ["mail_mark_read", "mail_archive", "mail_delete", "mail_reply", "mail_draft"].contains(tool),
+           !(tool == "mail_mark_read" && input["messages"] != nil), !(tool == "mail_draft" && input["to"] != nil) {
+            let hasLocator = ["message_id", "expected_message_id"].contains { input[$0] != nil && input[$0] != .null }
+            let subject = if case .string(let text)? = input["subject"] { text } else { "" }
+            if hasLocator ? MailReadLocator.parse(input) == nil : subject.isEmpty {
+                return ChatToolOutcome.failure(error: ToolFailureError(
+                    "Use message_id with a nonempty expected_message_id from the same read, or a subject.",
+                    argumentPath: "$.expected_message_id", accepted: "An observed exact Mail locator, or subject matching.", effects: .none), tool: tool)
+            }
+        }
         return await (macIntegrationBridge as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
     }
 }

@@ -19,27 +19,24 @@ struct AgentScreenView: View {
     var body: some View {
         let scope = appModel.activeChatSessionId
         ShellFrame {
-            EmptyView()
+            // Every room in the Mac's own sidebar list (User 09-27: all
+            // controls native), so none hides past the window's edge the way
+            // the old capsule strip let them.
+            List(HerScreenPreview.tabs, id: \.self,
+                 selection: Binding<String?>(get: { room }, set: { if let next = $0 { room = next } })) { name in
+                Text(name).font(ShellType.label)
+            }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+            .contentMargins(.top, 12, for: .scrollContent)
+            .padding(.top, NativeAgentShellLayout.titleBarInset)
+            .frame(width: 200)
+            .overlay(alignment: .trailing) {
+                Rectangle().fill(NativeAgentShell.hairline).frame(width: 1).allowsHitTesting(false)
+            }
+            .accessibilityLabel("Rooms")
         } detail: {
             VStack(alignment: .leading, spacing: 10) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 2) {
-                        ForEach(HerScreenPreview.tabs, id: \.self) { name in
-                            let selected = room == name
-                            Button { room = name } label: {
-                                Text(name)
-                                    .font(ShellType.captionMedium)
-                                    .foregroundStyle(selected ? NativeAgentShell.text : NativeAgentShell.secondary)
-                                    .padding(.horizontal, 10)
-                                    .frame(height: 20)
-                                    .background { if selected { Capsule().fill(NativeAgentShell.softFill) } }
-                                    .contentShape(Capsule())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
-                        }
-                    }
-                }
                 ScrollView {
                     Text(pane)
                         .font(.system(size: ShellType.captionSize, design: .monospaced))

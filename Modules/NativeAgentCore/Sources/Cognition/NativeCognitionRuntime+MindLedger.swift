@@ -17,13 +17,13 @@ import Studio
 import TurnTrace
 
 extension NativeCognitionRuntime {
-    /// The `mind.why` rows of today and yesterday, newest first.
+    /// Why and terminal rows of today and yesterday, newest first.
     private static func whyEvents(dataRoot: URL) async -> [TurnTraceEvent] {
         let reader = TurnTraceRecentReader(dataRootOverride: dataRoot)
         var events: [TurnTraceEvent] = []
         for day in [Date(), Date().addingTimeInterval(-86_400)] {
             guard let snapshot = try? await reader.read(now: day) else { continue }
-            events += snapshot.events.filter { $0.kind == "mind.why" }
+            events += snapshot.events.filter { $0.kind == "mind.why" || $0.kind == "turn.terminal" }
         }
         return events.sorted { $0.ts > $1.ts }
     }
@@ -52,22 +52,33 @@ extension NativeCognitionRuntime {
                 && $0.destinationId == destination && $0.threadId == thread
         }
         let wanted = turn?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Phase 5 D (Agent): the latest turn, the current one included — its
-        // memory row is written when its context is built, before the cue
-        // row lands at delivery. Defaulting to the newest CUE row answered
-        // for the previous exchange.
-        guard let target = (wanted?.isEmpty == false ? wanted : nil) ?? events.first?.turnId else {
-            return .object(["status": .string("empty"),
-                            "detail": .string("No why record is available in this conversation.")])
+        var recent: [String] = []
+        for event in events where event.kind == "mind.why" && !recent.contains(event.turnId) {
+            recent.append(event.turnId)
+            if recent.count == 5 { break }
+        }
+        let completed = events.first {
+            guard $0.kind == "turn.terminal", $0.turnId != TurnTraceContext.turnId,
+                  case .object(let payload) = $0.payload else { return false }
+            return payload["status"] == .string("completed")
+        }
+        guard let target = (wanted?.isEmpty == false ? wanted : nil) ?? completed?.turnId else {
+            return .object(["status": .string("unavailable"),
+                            "detail": .string("No completed turn is recorded in this conversation. Pass turn explicitly to read its record."),
+                            "recent_turns": .array(recent.map { .string($0) })])
         }
         var rows: [(event: TurnTraceEvent, payload: JSONValue)] = []
-        for event in events where event.turnId == target {
+        for event in events where event.kind == "mind.why" && event.turnId == target {
             if let payload = await disclosedWhyPayload(event.payload, surface: surface) {
                 rows.append((event, payload))
             }
         }
         var out: [String: JSONValue] = ["status": .string(rows.isEmpty ? "empty" : "ok"), "turn": .string(target)]
-        if rows.isEmpty { out["detail"] = .string("No why record is available in this conversation.") }
+        if rows.isEmpty {
+            out["detail"] = .string(target == TurnTraceContext.turnId
+                ? "No why record is available for this turn yet. Its cue record lands at delivery; pass this turn explicitly after it finishes."
+                : "No why record is available for the requested turn in this conversation.")
+        }
         for row in rows where out[Self.lane(row.event)] == nil {
             out[Self.lane(row.event)] = row.payload
             out["at"] = out["at"] ?? .string(ISO8601DateFormatter().string(from: row.event.ts))
@@ -79,11 +90,6 @@ extension NativeCognitionRuntime {
         } else if !rows.isEmpty {
             out["personal"] = .object(["pick": .null, "detail": .string(
                 "No personal memory is available for this turn.")])
-        }
-        var recent: [String] = []
-        for event in events where !recent.contains(event.turnId) {
-            recent.append(event.turnId)
-            if recent.count == 5 { break }
         }
         out["recent_turns"] = .array(recent.map { .string($0) })
         return .object(out)

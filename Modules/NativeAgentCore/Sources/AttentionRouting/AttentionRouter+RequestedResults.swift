@@ -3,6 +3,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import DeviceSync
+import StandingBots
 
 extension AttentionRouter {
     /// Publication edges and the existing sync integrity pass retry only the
@@ -12,15 +13,25 @@ extension AttentionRouter {
         guard !resultScanInFlight else { return }
         resultScanInFlight = true
         defer { resultScanInFlight = false }
+        let shelf = ShelfStore(dataRoot: dataRoot)
+        var storageFailure: Error?
+        var helpers: [ShelfEntry] = []
+        do { helpers = try shelf.pendingConditionNotifications() }
+        catch { storageFailure = error }
         let directory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: directory.path) else { return }
-        let paths = try FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: [.contentModificationDateKey]
-        ).filter { $0.pathExtension == "jsonl" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        var paths: [URL] = []
+        do {
+            if FileManager.default.fileExists(atPath: directory.path) {
+                paths = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
+                    .filter { $0.pathExtension == "jsonl" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+            }
+        } catch { storageFailure = storageFailure ?? error }
         var retained: [URL: Date] = [:]
         var deliveries: [(URL, JSONValue, [String: JSONValue])] = []
         for path in paths {
-            let modified = try path.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            let modified: Date?
+            do { modified = try path.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
+            catch { storageFailure = storageFailure ?? error; continue }
             if let modified, settledResultFiles[path] == modified {
                 retained[path] = modified
                 continue
@@ -28,7 +39,8 @@ extension AttentionRouter {
             let rows: [JSONValue]
             do { rows = try await SwiftNativePersistenceCore().readJSONL(path) }
             catch {
-                NSLog("requested_result: transcript unavailable, retained for retry: %@", error.localizedDescription)
+                nativeLog("requested_result: transcript unavailable, retained for retry: %@", error.localizedDescription)
+                storageFailure = storageFailure ?? error
                 continue
             }
             var pending = false
@@ -42,22 +54,44 @@ extension AttentionRouter {
             if !pending, let modified { retained[path] = modified }
         }
         settledResultFiles = retained
-        guard !deliveries.isEmpty else { resultRetryOffset = 0; return }
+        let total = deliveries.count + helpers.count
+        guard total > 0 else {
+            resultRetryOffset = 0
+            if let storageFailure { throw storageFailure }
+            return
+        }
         // Three attempts per pass, rotating so one outage cannot starve later
         // results. Restart reconstructs this bounded work from the same rows.
-        let start = resultRetryOffset % deliveries.count
-        let count = min(3, deliveries.count)
+        let start = resultRetryOffset % total
+        let count = min(3, total)
         for offset in 0..<count {
-            let (path, row, intent) = deliveries[(start + offset) % deliveries.count]
+            let index = (start + offset) % total
             do {
-                if try await deliverRequestedResult(row: row, intent: intent) {
-                    try await Self.acknowledgeResult(intent, at: path)
+                if index < deliveries.count {
+                    let (path, row, intent) = deliveries[index]
+                    if try await deliverRequestedResult(row: row, intent: intent) {
+                        try await Self.acknowledgeResult(intent, at: path)
+                    }
+                } else {
+                    let entry = helpers[index - deliveries.count]
+                    guard let title = entry.conditionNotificationTitle else {
+                        throw StandingBotsError.corruptStore("condition notification title unavailable")
+                    }
+                    let outcome = try await route(
+                        eventId: "bot_condition:\(entry.id.uuidString)", importance: .requestedResult,
+                        title: TurnSecretRedactor.redactDisplayText(String(title.prefix(160))),
+                        body: TurnSecretRedactor.redactDisplayText(String(entry.headline.prefix(500))),
+                        userInfo: ["screen": "activity", "source": "bot_condition", "botId": entry.botId.uuidString])
+                    if outcome.deliveryProjection.reachedAChannel || outcome.deliveryProjection == .previouslyHandled {
+                        try shelf.acknowledge(readerId: ShelfStore.conditionNotificationReaderID, entryIds: [entry.id])
+                    }
                 }
             } catch {
-                NSLog("requested_result: delivery remains pending: %@", error.localizedDescription)
+                nativeLog("requested_result: delivery remains pending: %@", error.localizedDescription)
             }
         }
         resultRetryOffset = start + count
+        if let storageFailure { throw storageFailure }
     }
 
     /// Completion transport uses the same intent and identity as publication.

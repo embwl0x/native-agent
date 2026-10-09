@@ -75,13 +75,6 @@ extension ChatStore {
             return
         }
 
-        let timedOutUserCandidates: [String: ChatMessage] = Dictionary(
-            uniqueKeysWithValues: timedOutPendingIds.keys.compactMap { pendingId -> (String, ChatMessage)? in
-                guard let uid = pendingSendArgs[pendingId]?.appendedUserId,
-                      let msg = messages.first(where: { $0.id == uid }) else { return nil }
-                return (pendingId, msg)
-            }
-        )
         let merged = mergedMacMessagesPreservingPending(macMessages)
         guard merged != messages else {
             // 2026-09-06: the rows did not change but the watermark did, and
@@ -94,39 +87,6 @@ extension ChatStore {
         }
         if merged != messages {
             messages = merged
-        }
-        // A late reply can arrive via the snapshot after its bubble timed out.
-        // Require positive user-anchor + following-assistant evidence.
-        var resolvedBySnapshot: [(pendingId: String, placeholderId: UUID)] = []
-        var stateOnlyGC: [(pendingId: String, placeholderId: UUID)] = []
-        for (pendingId, placeholderId) in timedOutPendingIds {
-            if let userMsg = timedOutUserCandidates[pendingId],
-               let anchor = indexOfUserOccurrence(userMsg, in: macMessages),
-               macMessages[(anchor + 1)...].contains(where: { $0.role == .assistant && !$0.text.isEmpty }) {
-                resolvedBySnapshot.append((pendingId, placeholderId))
-            } else if !messages.contains(where: { $0.id == placeholderId }) {
-                stateOnlyGC.append((pendingId, placeholderId))
-            }
-        }
-        for (pendingId, placeholderId) in resolvedBySnapshot + stateOnlyGC {
-            timedOutPendingIds.removeValue(forKey: pendingId)
-            pendingSendArgs.removeValue(forKey: pendingId)
-            retriedSignatureCorrelations.remove(pendingId)
-            streamingHintsByMessageId.removeValue(forKey: placeholderId)
-            markICloudReplyResolved(pendingId)
-        }
-        if !resolvedBySnapshot.isEmpty {
-            for (_, placeholderId) in resolvedBySnapshot {
-                if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
-                    messages.remove(at: idx)
-                }
-            }
-            requestScrollToBottom()
-            iOSSystemToastCenter.shared.push(info: "Reply arrived")
-        }
-        if !(resolvedBySnapshot.isEmpty && stateOnlyGC.isEmpty),
-           pendingICloudPlaceholders.isEmpty, timedOutPendingIds.isEmpty {
-            isLoading = false
         }
         persistMessages()
     }

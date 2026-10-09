@@ -110,13 +110,12 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     }
 
     private struct ProviderTokens {
-        var read = 0
-        var created = 0
-        var uncached = 0
+        var read: Int?
+        var total = 0
 
-        var total: Int { read + created + uncached }
         var hitPercent: Double? {
-            total > 0 ? Double(read) / Double(total) * 100 : nil
+            guard let read, total > 0 else { return nil }
+            return Double(read) / Double(total) * 100
         }
     }
 
@@ -183,10 +182,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     v1CallCount += 1
                     return
                 default:
-                    // Pre-shapeVersion rows and non-Anthropic lanes that never
-                    // carry the field. Counted, not judged.
+                    // Automatic-cache lanes need usage counters, not Anthropic's shape receipt.
                     unshapedCallCount += 1
-                    return
+                    if provider.lowercased().contains("anthropic") { return }
                 }
 
                 guard !row.turnId.isEmpty else { return }
@@ -293,9 +291,10 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     continue
                 }
                 var tokens = providerTokens[call.provider] ?? ProviderTokens()
-                tokens.read += call.cacheRead ?? 0
-                tokens.created += call.cacheCreation ?? 0
-                tokens.uncached += call.inputTokens
+                if let read = call.cacheRead { tokens.read = (tokens.read ?? 0) + read }
+                tokens.total += LLMUsage(inputTokens: call.inputTokens,
+                    cacheReadInputTokens: call.cacheRead,
+                    cacheCreationInputTokens: call.cacheCreation).logicalInputTokens(provider: call.provider) ?? 0
                 providerTokens[call.provider] = tokens
             }
         }
@@ -303,7 +302,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         // Sessions, each in turn order.
         var sessions: [String: [TurnObservation]] = [:]
         for observation in v2FirstCalls.values {
-            sessions[observation.sessionId, default: []].append(observation)
+            sessions[observation.provider + "|" + observation.sessionId, default: []].append(observation)
         }
         for key in sessions.keys {
             sessions[key]?.sort { $0.at < $1.at }
@@ -336,6 +335,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 if let chars = turn.volatileChars { volatileSamples.append(chars) }
                 // The first turn of a session HAS no prefix to reuse.
                 guard index > 0 else { continue }
+                if turn.cacheRead == nil { unjudgedFirstCalls += 1 }
+                // Automatic prefix caching promises neither a hit on each turn nor a creation receipt.
+                guard turn.provider.lowercased().contains("anthropic") else { continue }
                 let previous = turns[index - 1]
                 let toolsChanged: Bool = {
                     guard let now = turn.toolFingerprint, let before = previous.toolFingerprint
@@ -367,9 +369,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                         coldTurns.append(turn.turnId)
                         violated = true
                     }
-                } else {
-                    // No cacheReadInputTokens field at all: unjudged, NOT zero.
-                    unjudgedFirstCalls += 1
                 }
 
                 // (b) prefix stability. The invariant is that this turn's
@@ -412,35 +411,35 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             $0 + max(0, $1 - toleratedPerSessionDay)
         }
 
-        // (e) per-provider hit rate over the v2 rows only — mixing the v1 era
-        // into this ratio would describe neither shape honestly.
+        // (e) per-provider hit rate, excluding the legacy Anthropic shape.
         var providerLines: [String] = []
         var anthropicBelowFloor: [String] = []
         for (provider, tokens) in providerTokens.sorted(by: { $0.key < $1.key }) {
             guard let hit = tokens.hitPercent else {
-                providerLines.append("\(provider)=no tokens reported")
+                providerLines.append("\(provider)=cache usage unreported")
                 continue
             }
-            providerLines.append(String(format: "%@=%.0f%%", provider, hit))
-            if provider.lowercased().contains("anthropic"), hit < minimumAnthropicHitPercent {
+            providerLines.append(String(format: "%@=%.1f%%", provider, hit))
+            let turns = v2FirstCalls.values.filter { $0.provider == provider }.count
+            if provider.lowercased().contains("anthropic"), turns >= minimumHitRateTurns, hit < minimumAnthropicHitPercent {
                 anthropicBelowFloor.append(String(format: "%@ (%.0f%%)", provider, hit))
             }
         }
 
         var parts: [String] = []
         parts.append(
-            "\(window.describedAs): \(v2FirstCalls.count) v2Prefix turn(s) across"
+            "\(window.describedAs): \(v2FirstCalls.count) eligible chat turn(s) across"
                 + " \(sessions.count) session(s) over \(summary.daysPresent.count) trace day(s)"
         )
         parts.append(
             coldTurns.isEmpty
-                ? "0 cold non-first turns"
-                : "\(coldTurns.count) non-first turn(s) read 0 cache tokens"
+                ? "0 cold non-first Anthropic turns"
+                : "\(coldTurns.count) non-first Anthropic turn(s) read 0 cache tokens"
                     + " (\(nameTurns(coldTurns)))"
         )
         parts.append(
             driftTurns.isEmpty
-                ? "prefix fingerprint stable across consecutive turns"
+                ? "no unexplained Anthropic prefix fingerprint changes"
                 : "\(driftTurns.count) unexplained prefix fingerprint change(s)"
                     + " (\(nameTurns(driftTurns)))"
         )
@@ -456,16 +455,15 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     + " cache tokens (\(named)\(overflow > 0 ? ", +\(overflow) more" : ""))"
             )
         } else {
-            parts.append("no non-first turn rebuilt the prefix")
+            parts.append("no non-first Anthropic turn rebuilt the prefix")
         }
         parts.append(volatileLine(volatileSamples))
         parts.append(shapeLine)
         parts.append("\(explainedMidTurnMisses) mid-turn cache misses explained by changed tools or stable instructions (excluded from the cache reuse rate)")
         if !providerLines.isEmpty {
             parts.append(
-                "cache hit% by provider over v2 rows: " + providerLines.joined(separator: ", ")
-                    + " (the per-turn volatile block is uncached BY DESIGN, so 100% is not"
-                    + " the target)"
+                "cache hit% by provider over eligible rows: " + providerLines.joined(separator: ", ")
+                    + " (OpenAI: cached/input, automatic prefix caching; Anthropic: read/(uncached+read+created), explicit breakpoints; 100% is not the target)"
                     + (v2FirstCalls.count < minimumHitRateTurns
                         ? " — below the \(minimumHitRateTurns)-turn floor, so the rate is"
                             + " MEASURED but NOT judged"
@@ -498,7 +496,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             repair = "The v2 prefix is not being reused. Check that the identity block is still"
                 + " a strict prefix of the stable block and that only one cache breakpoint sits"
                 + " at the end of the stable mass (v2Prefix)."
-        } else if !anthropicBelowFloor.isEmpty, v2FirstCalls.count >= minimumHitRateTurns {
+        } else if !anthropicBelowFloor.isEmpty {
             status = "warn"
             parts.append(
                 "Anthropic lane(s) below the \(Int(minimumAnthropicHitPercent))% floor:"

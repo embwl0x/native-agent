@@ -117,7 +117,10 @@ public struct AbandonedTurnReconciler: Sendable {
                 return Outcome(acceptedScanned: 0, reconciled: [], tooRecentToJudge: 0)
             }
             for line in handle.split(separator: "\n", omittingEmptySubsequences: true) {
-                guard let data = String(line).data(using: .utf8),
+                // Most rows are a turn's steps. Only a row naming a lifecycle
+                // kind can matter, so only those are parsed.
+                guard Self.lifecycleKinds.contains(where: { line.utf8.firstRange(of: $0.utf8) != nil }),
+                      let data = String(line).data(using: .utf8),
                       let value = try? JSONValue.parse(data),
                       case .object(let row) = value,
                       case .string(let kind)? = row["kind"],
@@ -263,6 +266,8 @@ public struct AbandonedTurnReconciler: Sendable {
         )
     }
 
+    private static let lifecycleKinds = ["turn.accepted", "turn.terminal", "turn.cancelled", "turn.failed"]
+
     /// Day-offsets from `today` this sweep reads (0 = today), oldest offset
     /// last. Ordinarily `dayWindow` days ending today; after a gap it reaches
     /// back to the last swept day so a turn abandoned outside the ordinary
@@ -304,7 +309,7 @@ public struct AbandonedTurnReconciler: Sendable {
               let value = try? JSONValue.parse(Data(raw.utf8)),
               case .object(let obj) = value,
               case .string(let day)? = obj["lastSweptDay"],
-              let last = TurnTracePersistLane.dayFormatter.date(from: day) else { return nil }
+              let last = TurnTracePersistLane.day(from: day) else { return nil }
         return last
     }
 
@@ -318,7 +323,7 @@ public struct AbandonedTurnReconciler: Sendable {
         return entries
             .filter { $0.pathExtension == "jsonl" }
             .compactMap {
-                TurnTracePersistLane.dayFormatter.date(
+                TurnTracePersistLane.day(
                     from: $0.deletingPathExtension().lastPathComponent
                 )
             }
@@ -331,7 +336,7 @@ public struct AbandonedTurnReconciler: Sendable {
     /// ledger file.
     static let dayCalendar: Calendar = {
         var calendar = Calendar.current
-        calendar.timeZone = TurnTracePersistLane.dayFormatter.timeZone
+        calendar.timeZone = TurnTracePersistLane.dayTimeZone
         return calendar
     }()
 
@@ -344,7 +349,7 @@ public struct AbandonedTurnReconciler: Sendable {
     private func writeCursor(day date: Date) {
         let dir = cursorPath.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let day = TurnTracePersistLane.dayFormatter.string(from: date)
+        let day = TurnTracePersistLane.dayString(from: date)
         try? Data("{\"lastSweptDay\":\"\(day)\"}".utf8).write(to: cursorPath, options: .atomic)
     }
 

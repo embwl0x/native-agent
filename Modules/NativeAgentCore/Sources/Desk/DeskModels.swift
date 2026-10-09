@@ -602,6 +602,7 @@ public struct PromotionDossier: Sendable, Equatable {
 // counter that could drift.
 
 public enum DeskWorkDisposition: String, Sendable, Equatable {
+    case unstarted
     case progress
     case goalSatisfied = "goal_satisfied"
     case blocked
@@ -686,6 +687,7 @@ public struct DeskWorkAttempt: Sendable, Equatable {
     public var receipt: String?
     public var completedAt: String?
     public var receiptHandedOff: Bool
+    public var disposition: DeskWorkDisposition?
 
     public init(
         attemptId: String,
@@ -695,7 +697,8 @@ public struct DeskWorkAttempt: Sendable, Equatable {
         reservedAt: String,
         receipt: String? = nil,
         completedAt: String? = nil,
-        receiptHandedOff: Bool = false
+        receiptHandedOff: Bool = false,
+        disposition: DeskWorkDisposition? = nil
     ) {
         self.attemptId = attemptId
         self.lane = lane
@@ -705,6 +708,7 @@ public struct DeskWorkAttempt: Sendable, Equatable {
         self.receipt = receipt
         self.completedAt = completedAt
         self.receiptHandedOff = receiptHandedOff
+        self.disposition = disposition
     }
 
     public func toJSON() -> JSONValue {
@@ -718,6 +722,7 @@ public struct DeskWorkAttempt: Sendable, Equatable {
         if let receipt, !receipt.isEmpty { object["receipt"] = .string(receipt) }
         if let completedAt, !completedAt.isEmpty { object["completedAt"] = .string(completedAt) }
         if receiptHandedOff { object["receiptHandedOff"] = .bool(true) }
+        if let disposition { object["disposition"] = .string(disposition.rawValue) }
         return .object(object)
     }
 
@@ -740,7 +745,8 @@ public struct DeskWorkAttempt: Sendable, Equatable {
             reservedAt: reservedAt,
             receipt: jsonString(object, "receipt"),
             completedAt: jsonString(object, "completedAt"),
-            receiptHandedOff: object["receiptHandedOff"] == .bool(true)
+            receiptHandedOff: object["receiptHandedOff"] == .bool(true),
+            disposition: jsonString(object, "disposition").flatMap(DeskWorkDisposition.init(rawValue:))
         )
     }
 }
@@ -772,10 +778,10 @@ public struct Pursuit: Sendable, Equatable {
     public var reservations: [WorkReservation]
     public var retiredSessionsByDay: [String: Int]
     public var retiredSessions: Int { retiredSessionsByDay.values.reduce(0, +) }
-    public var sessionsUsed: Int { retiredSessions + reservations.count }
+    public var sessionsUsed: Int { retiredSessions + reservations.filter { $0.disposition != .unstarted }.count }
 
     public func workSessions(on day: String) -> Int {
-        (retiredSessionsByDay[day] ?? 0) + reservations.filter { $0.day == day }.count
+        (retiredSessionsByDay[day] ?? 0) + reservations.filter { $0.day == day && $0.disposition != .unstarted }.count
     }
 
     public init(
@@ -1324,10 +1330,10 @@ public struct DeskState: Sendable, Equatable {
         } else {
             self.workSlotsByDay = [:]
             for item in items {
-                for reservation in item.pursuit?.reservations ?? [] {
+                for reservation in item.pursuit?.reservations ?? [] where reservation.disposition != .unstarted {
                     chargeWorkSlot(handle: item.handle, day: reservation.day, id: reservation.reservationId)
                 }
-                for attempt in item.workAttempts {
+                for attempt in item.workAttempts where attempt.disposition != .unstarted {
                     chargeWorkSlot(handle: item.handle, day: attempt.day, id: attempt.attemptId)
                 }
             }
@@ -1346,11 +1352,19 @@ public struct DeskState: Sendable, Equatable {
 
     public func hasWorkSlot(handle: String, id: String) -> Bool {
         workSlotsByDay.values.contains { $0[handle]?.contains(id) == true }
+            || items.contains { item in
+                item.handle == handle && (item.pursuit?.reservations.contains { $0.reservationId == id } == true
+                    || item.workAttempts.contains { $0.attemptId == id })
+            }
     }
 
     mutating func chargeWorkSlot(handle: String, day: String, id: String) {
-        guard !hasWorkSlot(handle: handle, day: day, id: id) else { return }
+        guard !workSlotsByDay.values.contains(where: { $0[handle]?.contains(id) == true }) else { return }
         workSlotsByDay[day, default: [:]][handle, default: []].append(id)
+    }
+
+    mutating func releaseWorkSlot(handle: String, day: String, id: String) {
+        workSlotsByDay[day]?[handle]?.removeAll { $0 == id }
     }
 
     public var topLevel: [DeskItem] { items.filter { $0.parent == nil } }
@@ -1406,15 +1420,15 @@ public struct DeskState: Sendable, Equatable {
         }
         let state = DeskState(items: items, generatedTs: generatedTs, workSlotsByDay: workSlotsByDay)
         for item in items {
-            for reservation in item.pursuit?.reservations ?? [] {
+            for reservation in item.pursuit?.reservations ?? [] where reservation.disposition != .unstarted {
                 guard state.hasWorkSlot(handle: item.handle, day: reservation.day, id: reservation.reservationId) else { return nil }
             }
-            for attempt in item.workAttempts {
+            for attempt in item.workAttempts where attempt.disposition != .unstarted {
                 guard state.hasWorkSlot(handle: item.handle, day: attempt.day, id: attempt.attemptId) else { return nil }
             }
             if let pursuit = item.pursuit {
                 for (day, count) in pursuit.retiredSessionsByDay {
-                    let liveCount = pursuit.reservations.filter { $0.day == day }.count
+                    let liveCount = pursuit.reservations.filter { $0.day == day && $0.disposition != .unstarted }.count
                     let slots = state.workSessions(on: day, handle: item.handle)
                     let ledgerDay = DeskClock.parseISO(generatedTs).map(DeskClock.dayStamp)
                     // Historical charges may have been pruned; retained receipts still require their slots above.

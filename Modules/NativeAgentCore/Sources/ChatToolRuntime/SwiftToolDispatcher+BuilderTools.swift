@@ -717,10 +717,10 @@ extension SwiftToolDispatcher {
             try data.write(to: auditURL)
             let pruneResult = pruneBuilderAuditsIfNeeded(in: auditDir, keeping: builderAuditRetentionLimit)
             if pruneResult.removedCount > 0 {
-                NSLog("SwiftToolDispatcher.builder_audit: pruned %d older audit file(s)", pruneResult.removedCount)
+                nativeLog("SwiftToolDispatcher.builder_audit: pruned %d older audit file(s)", pruneResult.removedCount)
             }
             if let pruneError = pruneResult.error {
-                NSLog("SwiftToolDispatcher.builder_audit: %@", pruneError)
+                nativeLog("SwiftToolDispatcher.builder_audit: %@", pruneError)
             }
             return (auditURL, pruneResult.error)
         } catch {
@@ -1227,6 +1227,7 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string(toolName),
                 "reason": .string("cwd_invalid_or_outside_workspace"),
+                "detail": .string("cwd is not an existing folder this tool may work in; use one inside workspace_root. Nothing ran."),
                 "cwd_requested": .string(cwd),
                 "workspace_root": .string(builderWorkspaceRoot(dataRoot: dataRoot).path),
                 "source_checkout_available": .bool(builderSourceRepoRoot(dataRoot: dataRoot) != nil),
@@ -1603,6 +1604,7 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string(tool),
                 "reason": .string("invalid_configuration"),
+                "detail": .string("configuration must be debug or release."),
                 "configuration": .string(raw),
                 "expected": .string("debug or release"),
             ]))
@@ -1624,6 +1626,7 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string("shell"),
                 "reason": .string("missing_cmd"),
+                "detail": .string("Pass the command to run as cmd, a non-empty string."),
             ])
         }
         let cwd = builderResolveCwd(input, dataRoot: dataRoot)
@@ -1653,6 +1656,7 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string("bash"),
                 "reason": .string("missing_cmd"),
+                "detail": .string("Pass the command to run as cmd, a non-empty string."),
             ])
         }
         let cwd = builderResolveCwd(input, dataRoot: dataRoot)
@@ -1742,6 +1746,7 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string("apply_patch"),
                 "reason": .string("missing_patch"),
+                "detail": .string("Pass the unified diff to apply as patch, a non-empty string."),
             ])
         }
         if patch.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("*** Begin Patch") {
@@ -1751,7 +1756,14 @@ extension SwiftToolDispatcher {
                 "tool": .string("apply_patch"),
                 "reason": .string("codex_apply_patch_format_not_supported"),
                 "detail": .string("NativeAgent chat apply_patch accepts unified diffs. Codex *** Begin Patch format is not interpreted by the app runtime."),
-                "fix": .string("Retry with a unified diff, or use write_file for a complete-file replacement."),
+                "fix": .string("Retry with files.patch using relative a/ and b/ paths and cwd set to their directory. Replace the example's path, old/new lines and hunk ranges with the actual edit; include \\ No newline at end of file only after lines that lack a final newline."),
+                "example_call": .object([
+                    "action": .string("files.patch"),
+                    "args": .object([
+                        "cwd": .string("/absolute/path/to/repo"),
+                        "patch": .string("--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"),
+                    ]),
+                ]),
             ])
         }
         let contextPatch = builderParseRangeLessUnifiedPatch(patch)
@@ -2003,6 +2015,7 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string("swift_build"),
                 "reason": .string("product_and_target_are_mutually_exclusive"),
+                "detail": .string("Pass product or target, not both."),
             ])
         }
 
@@ -2105,6 +2118,7 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string("install_app"),
                 "reason": .string("script_missing"),
+                "detail": .string("The install script is missing at script_path, so nothing ran."),
                 "script_path": .string(script.path),
                 "runId": .string(runId),
                 "audit_path": .string(auditURL.path),

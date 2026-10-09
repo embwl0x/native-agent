@@ -21,7 +21,7 @@ public struct AgentConversationLive: Codable, Sendable, Equatable {
     public var messageID: String?
     /// acp, a2a, command, desktop, claude, codex, omp, …
     public var lane: String
-    /// working (the agent is on it), waiting (handed off, no live channel), finished.
+    /// working (the agent is on it), waiting (handed off, no live channel), finished, failed.
     public var state: String
     /// The lane supplies partial text; false means only the working signal is real.
     public var streams: Bool
@@ -131,7 +131,7 @@ public actor AgentConversationLiveHub {
         edit(target, now: true) { live in
             live.state = state
             if let note { live.note = note }
-            if state == "finished" { live.finishedAt = Date() }
+            if ["finished", "failed"].contains(state) { live.finishedAt = Date() }
         }
     }
 
@@ -245,7 +245,7 @@ public struct AgentConversationLiveStore: Sendable {
                 } else { row = nil }
                 if let row, (live.operationID != nil && live.operationID != row.operationID)
                     || !["sending", "waiting"].contains(row.phase) {
-                    live.state = "finished"
+                    if live.state != "failed" { live.state = "finished" }
                     live.finishedAt = live.finishedAt ?? row.updatedAt
                     rows[key] = live
                 }
@@ -283,6 +283,8 @@ extension AgentConversationLive {
         let who = name ?? "The agent"
         fields["detail"] = .string(state == "finished"
             ? "\(who) finished; its answer arrives through the conversation."
+            : state == "failed"
+            ? note ?? "\(who)'s reply failed."
             : streams
             ? "Partial text so far. The reply is not finished; the final answer replaces it."
             : state == "waiting"

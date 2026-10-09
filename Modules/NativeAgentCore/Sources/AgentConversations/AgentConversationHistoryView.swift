@@ -87,6 +87,7 @@ enum AgentConversationHistoryView {
                 value["reply"] = .string(full ? reply : String(reply.prefix(800)))
                 value["reply_truncated"] = .bool(item.replyTruncated || (!full && reply.count > 800))
             } else if let answerNote { value["reply_state"] = .string(answerNote)
+            } else if item.status == "no_reply_expired" { value["reply_state"] = .string("no_reply_expired")
             } else if state == "no_reply" { value["reply_state"] = .string("No reply came for this message.")
             } else { value["reply_state"] = .string("No reply retained for this exchange; status alone is not an answer.") }
             return .object(value)

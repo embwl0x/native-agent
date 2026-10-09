@@ -2,6 +2,7 @@ import AppIntents
 import Foundation
 import NativeAgentCore
 import ChatOrchestration
+import MacControl
 import PersonaEngine
 import Transcripts
 
@@ -81,8 +82,7 @@ struct AskResidentAgentIntent: AppIntent {
 }
 
 private func intentClient() -> NativeClient {
-    let base = NativeBaseURLDefaults.read()
-    return NativeClient(baseURL: base)
+    NativeClient()
 }
 
 struct NativeAgentStatusIntent: AppIntent {
@@ -145,14 +145,18 @@ struct NativeAgentChatIntent: AppIntent {
         _ = try? await ConversationAnchor.publish(
             sessionId: sessionID, source: "siri", conversationKind: .direct
         )
-        let reply = try await TurnAdmission.shared.run(sessionID: sessionID) {
-            try await intentClient().chat(
-                message: message,
-                sessionId: sessionID,
-                model: model,
-                reasoningEffort: reasoningEffort,
-                fileAccess: fileAccess
-            )
+        // Where User was when he said "take over", before the session queue.
+        let takeover = await MacWorkContinuation.admit(message)
+        let reply = try await MacWorkContinuation.$current.withValue(takeover) {
+            try await TurnAdmission.shared.run(sessionID: sessionID) {
+                try await intentClient().chat(
+                    message: message,
+                    sessionId: sessionID,
+                    model: model,
+                    reasoningEffort: reasoningEffort,
+                    fileAccess: fileAccess
+                )
+            }
         }
         return reply.output
     }

@@ -36,7 +36,7 @@ extension SwiftToolDispatcher {
     static let builtInToolNames: [String] = [
         "agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel",
         "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
-        "read_page", "read_file", "list_dir", "write_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
+        "read_page", "maps_route", "maps_search", "read_file", "list_dir", "write_file", "move_file", "copy_file", "trash_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
         "search_chat_history", "session_search", "workspace", "work_context", "artifact_find",
         "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
         "agent_introspect", "daemon_introspect",
@@ -64,6 +64,7 @@ extension SwiftToolDispatcher {
         "notion_status", "notion_search", "notion_read_page",
         // GitHub — PAT-backed tools. Repo visibility writes are confirm-gated.
         "github_status", "github_list_repos", "github_list_notifications", "github_get_repository",
+        "github_list_runs", "github_run_jobs",
         "github_read_repository_content", "github_list_commits", "github_list_issues",
         "github_search", "github_list_pull_requests", "github_get_issue",
         "github_get_pull_request", "github_pull_request_files", "github_pull_request_activity",
@@ -88,7 +89,7 @@ extension SwiftToolDispatcher {
         // (mail/messages/notes send + contacts create) — the user wants explicit toggle
         // in Settings → Mac Integration before she can send anything.
         "contacts_search", "contacts_create_or_update",
-        "mail_list_recent", "mail_read_batch", "mail_triage_batch", "mail_search", "mail_send",
+        "mail_list_recent", "mail_read_batch", "mail_triage_batch", "mail_search", "mail_senders", "mail_send", "mail_save_attachment",
         "messages_recent_threads", "messages_send",
         "notes_search", "notes_create",
         "music_now_playing", "music_control",
@@ -97,8 +98,9 @@ extension SwiftToolDispatcher {
         // now has tools behind it. Sensitive writes stay default-OFF per the
         // existing matrix.
         "mac_calendar_create_event", "mac_calendar_modify_event", "mac_calendar_delete_event", "mac_reminders_create", "mac_reminders_complete", "mac_reminders_delete",
-        "mail_mark_read", "mail_archive", "mail_delete", "mail_reply",
-        "notes_update",
+        "mac_reminders_list_rename", "mac_reminders_list_create",
+        "mail_mark_read", "mail_archive", "mail_delete", "mail_reply", "mail_draft",
+        "notes_update", "notes_delete",
         "music_search_library", "music_list_library", "music_list_playlists",
         "contacts_delete",
         "scheduler_list_jobs", "scheduler_create_job",
@@ -205,7 +207,7 @@ extension SwiftToolDispatcher {
 
     /// The WRITE half of the Full-Mac file surface — mutates the filesystem.
     static let fullMacWriteFileToolNames: [String] = [
-        "write_file",
+        "write_file", "move_file", "copy_file", "trash_file", "mac_screenshot_save", "mail_save_attachment",
     ]
 
     /// Swift-implemented builder/file tools exposed only when Trust Center's
@@ -216,7 +218,7 @@ extension SwiftToolDispatcher {
         fullMacReadOnlyFileToolNames + fullMacWriteFileToolNames
 
     package static let fullMacSystemToolNames: [String] = [
-        "system_info", "remote_node_list",
+        "system_info", "mac_volume", "mac_media", "remote_node_list",
     ]
 
 
@@ -483,69 +485,30 @@ extension SwiftToolDispatcher {
     }
 
     private static let standardFileToolNames: Set<String> = [
-        "read_file", "list_dir", "write_file",
+        "read_file", "list_dir", "write_file", "move_file", "copy_file", "trash_file", "mail_save_attachment",
     ]
 
     private static let macIntegrationToolNames: Set<String> = [
         "mac_calendar_list_upcoming", "mac_calendar_calendars", "mac_calendar_free_busy", "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mac_reminders_update",
         "mac_notify", "mobile_notify", "phone_request", "mac_spotlight_search",
         "contacts_search", "contacts_create_or_update", "mail_list_recent",
-        "mail_read_batch", "mail_triage_batch", "mail_search", "mail_send", "messages_recent_threads", "messages_send",
+        "mail_read_batch", "mail_triage_batch", "mail_search", "mail_senders", "mail_send", "messages_recent_threads", "messages_send",
         "notes_search", "notes_create", "music_now_playing", "music_control",
         "mac_calendar_create_event", "mac_calendar_modify_event", "mac_calendar_delete_event",
         "mac_reminders_create", "mac_reminders_complete", "mac_reminders_delete", "mail_mark_read",
-        "mail_archive", "mail_delete", "mail_reply", "notes_update",
+        "mac_reminders_list_rename", "mac_reminders_list_create",
+        "mail_archive", "mail_delete", "mail_reply", "mail_draft", "notes_update", "notes_delete",
         "music_search_library", "music_list_library", "music_list_playlists",
         "contacts_delete", "scheduler_list_jobs", "scheduler_create_job",
         "scheduler_cancel_job", "scheduler_delete_job", "scheduler_pause_job",
         "scheduler_resume_job", "scheduler_update_job",
     ]
 
-    /// The intentionally broad core category is still an explicit registry,
-    /// not a fallback. `catalogRegisteredToolNames` is derived from the real
-    /// dispatch lists, so adding a case there without adding it here (or to a
-    /// specialised set above) is observable to the coverage eval.
-    private static let coreCatalogToolNames: Set<String> = [
-        "agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel",
-        "read_page",
-        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
-        "tool_result_page", "request_interaction",
-        "list_skills", "read_skill", "save_skill", "recall_memory",
-        "recall_search", "commit_memory", "search_kg", "search_chat_history",
-        "session_search", "workspace", "work_context", "artifact_find", "get_persona_doc", "persona_read", "persona_write",
-        "persona_append_section", "agent_introspect", "inner_state", "daemon_introspect",
-        "context_lookup", "context_expand", "scratchpad_read",
-        "recent_trace_summary", "time_now", "claude_message",
-        "codex_message", "invoke_codex", "omp_message", "agent_swarm",
-        "market_status", "market_watchlists", "tradingview_watchlist", "market_quote",
-        "x_status", "x_me", "x_search", "x_timeline", "x_user_tweets",
-        "gmail_status", "gmail_search", "gmail_read", "google_calendar_status",
-        "google_calendar_list", "google_calendar_calendars", "google_calendar_free_busy", "google_calendar_read", "google_calendar_send_invitations", "notion_status", "notion_search", "notion_read_page",
-        "github_status", "github_list_repos", "github_list_notifications",
-        "github_get_repository", "github_read_repository_content", "github_list_commits",
-        "github_list_issues", "github_search", "github_list_pull_requests",
-        "github_get_issue", "github_get_pull_request", "github_pull_request_files",
-        "github_pull_request_activity", "github_discover_tracking", "github_project_digest",
-        "github_mutate", "github_set_repo_visibility", "slack_status",
-        "slack_list_channels", "slack_search_messages", "slack_post_message",
-        "agentmail_list", "agentmail_read", "agentmail_send", "image_generate",
-        "workshop_submit", "workshop_status", "task_ledger_post", "task_ledger_list",
-        // Activity history is a Trust Center-gated local query; it belongs in
-        // the reviewed core/runtime bucket, never an implicit catalog fallback.
-        "delegation_status", "activity_query", "desk_read", "desk_add_item", "desk_set_status",
-        "desk_update_item", "desk_note", "desk_add_ref", "desk_set_cadence",
-        "desk_set_notify", "desk_close", "desk_archive", "desk_blocked_on",
-        "desk_defer", "desk_breakdown", "desk_nag_control", "desk_open_pursuit",
-        "desk_work_log",
-        "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
-        "studio_journal_amend",
-        "studio_shelf_read", "studio_shelf_set",
-        "dream_diary_read",
-        "studio_canon", "studio_canon_resolve",
-        "hold_view", "release_view",
-        "memory_moments_pending", "memory_moment_review",
-        "forget_memory", "rebuild_knowledge_graph",
-        "read_chat_message",
-    ]
+    /// Core membership comes only from reviewed built-ins and the separately
+    /// registered activity query, never from arbitrary runtime names.
+    private static let coreCatalogToolNames = Set(builtInToolNames)
+        .subtracting(standardFileToolNames)
+        .subtracting(macIntegrationToolNames)
+        .union(activityQueryToolNames)
 
 }

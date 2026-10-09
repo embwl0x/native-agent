@@ -46,9 +46,9 @@ package enum ChatTranscriptEvidenceRendering {
             let bounded = String(raw.prefix(8_001))
             if bounded.count <= 8_000,
                let value = try? JSONValue.parse(Data(bounded.utf8)),
-               case .object(let object) = value,
-               case .string? = object["status"] {
-                resultClass = ChatToolOutcome.exactResultClass(value)
+               case .object(let object) = value {
+                resultClass = ChatToolOutcome.recordedResultClass(value)
+                    ?? (string(object["status"]) != nil ? ChatToolOutcome.exactResultClass(value) : nil)
             } else {
                 resultClass = nil
             }

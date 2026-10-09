@@ -84,6 +84,46 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         }
     }
 
+    /// APNs answered 410 for this token: Apple last confirmed it dead at
+    /// `unregisteredAt`. Under the registration lock, remove only that alert
+    /// token (the entry's work-activity state stays), and only where it was
+    /// registered before that moment: a phone that re-registered the same
+    /// token since keeps it. A live phone re-registers on launch.
+    static func prunePushToken(_ token: String, unregisteredAt: Date, dataRoot: URL) async throws {
+        let notifications = dataRoot.appendingPathComponent("notifications", isDirectory: true)
+        let path = notifications.appendingPathComponent("push_tokens.json")
+        let legacyPath = dataRoot
+            .appendingPathComponent("mobile_push", isDirectory: true)
+            .appendingPathComponent("tokens.json")
+        let persistence = SwiftNativePersistenceCore()
+        @Sendable func registeredBefore(_ stamp: JSONValue?) -> Bool {
+            guard let text = jsonString(stamp), let date = ISO8601DateFormatter().date(from: text) else { return false }
+            return date < unregisteredAt
+        }
+        try await persistence.withFileLock(notifications.appendingPathComponent("push-token-registration")) {
+            var root = try readObjectStore(path)
+            let rows = try readArrayStore(legacyPath)
+            var rootChanged = false
+            for (deviceID, value) in root {
+                guard case .object(var entry) = value, jsonString(entry["token"]) == token,
+                      registeredBefore(entry["lastSeen"]) else { continue }
+                entry.removeValue(forKey: "token")
+                root[deviceID] = .object(entry)
+                rootChanged = true
+            }
+            let keptRows = rows.filter { value in
+                guard case .object(let row) = value else { return true }
+                return !(jsonString(row["token"]) == token && registeredBefore(row["updatedAt"]))
+            }
+            if rootChanged {
+                try await persistence.writeJSON(.object(root), to: path)
+            }
+            if keptRows.count != rows.count {
+                try await persistence.writeJSON(.array(keptRows), to: legacyPath)
+            }
+        }
+    }
+
     private static func readObjectStore(_ path: URL) throws -> [String: JSONValue] {
         guard FileManager.default.fileExists(atPath: path.path) else { return [:] }
         let value = try JSONValue.parse(Data(contentsOf: path))
@@ -319,7 +359,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         )
         guard case .ready(let request) = preparation else {
             if case .rejected(let reason) = preparation {
-                NSLog("[iCloudBridge] APNS chat reply notification refused: %@", reason)
+                nativeLog("[iCloudBridge] APNS chat reply notification refused: %@", reason)
             }
             return false
         }
@@ -329,11 +369,11 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         let outcome = Self.iCloudReplyPushNotificationOutcome(providerResult: providerResult)
         switch outcome {
         case .providerAccepted:
-            NSLog("[iCloudBridge] APNS chat reply notification provider-accepted correlation=%@", correlationID)
+            nativeLog("[iCloudBridge] APNS chat reply notification provider-accepted correlation=%@", correlationID)
             return true
         case .providerNotAccepted(let reason):
             await failDeliveryPrediction(eventID: request.eventID, source: "icloud_chat_reply")
-            NSLog("[iCloudBridge] APNS chat reply notification not accepted correlation=%@: %@",
+            nativeLog("[iCloudBridge] APNS chat reply notification not accepted correlation=%@: %@",
                   correlationID, reason)
             return false
         }

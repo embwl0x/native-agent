@@ -7,6 +7,7 @@ import PersistenceCore
 package enum AgentWorkspaceReadiness {
     struct Snapshot: Sendable {
         let permissions: MacIntegrationPermissionReadiness?
+        let unready: [String: String]
     }
 
     @TaskLocal static var snapshot: Snapshot?
@@ -17,8 +18,17 @@ package enum AgentWorkspaceReadiness {
     package static func withSnapshot<T: Sendable>(dataRoot: URL,
         operation: @Sendable () async throws -> T) async rethrows -> T {
         let permissions = try? await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()
-        return try await $snapshot.withValue(Snapshot(permissions: permissions), operation: operation)
+        let unready = unreadyTools(dataRoot: dataRoot)
+        return try await $snapshot.withValue(Snapshot(permissions: permissions, unready: unready), operation: operation)
     }
+
+    /// The tool port's saved service blockers, shared with discovery.
+    package static func unreadyTools(dataRoot: URL) -> [String: String] {
+        AgentWorkspacePorts.binding?.tools.unreadyTools(dataRoot: dataRoot) ?? [:]
+    }
+
+    /// False for a tool whose service cannot work yet (not connected); not a permission.
+    static func ready(tool name: String) -> Bool { snapshot?.unready[name] == nil }
 
     static func allows(tool name: String) -> Bool {
         guard let gate = AgentWorkspacePorts.current.tools.macIntegrationGate(name)
@@ -40,6 +50,8 @@ package enum AgentWorkspaceReadiness {
         var hidden = 0
         func buttons(_ buttons: [AgentWorkspaceButton]) -> [AgentWorkspaceButton] {
             buttons.filter { button in
+                // Not set up yet: not offered, and not counted as turned off.
+                guard tool(button.action).map({ ready(tool: $0) }) ?? true else { return false }
                 let allowed = allows(button.action)
                 if !allowed { hidden += 1 }
                 return allowed

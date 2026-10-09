@@ -20,8 +20,12 @@ extension AppModel {
     /// streamed yet. A retry resets the streamed length, so a retried turn
     /// reads as thinking again until its new text arrives.
     var isThinkingBeforeReply: Bool {
-        guard isBusy || isChatStreaming else { return false }
-        guard let lifecycle = engine.turns.lifecycle(for: activeChatSessionId) else { return true }
+        isThinkingBeforeReply(for: activeChatSessionId)
+    }
+
+    func isThinkingBeforeReply(for sessionId: String) -> Bool {
+        guard engine.turns.isBusy(sessionId) || engine.turns.isStreaming(sessionId) else { return false }
+        guard let lifecycle = engine.turns.lifecycle(for: sessionId) else { return true }
         return !lifecycle.presentation.isTerminal && lifecycle.presentation.streamedTextLength == 0
     }
 }
@@ -33,6 +37,11 @@ struct ThinkingGlow: View {
     enum Kind { case shimmer, rim }
     let kind: Kind
     let cornerRadius: CGFloat
+    /// Detached composers supply their session; other surfaces follow the open chat.
+    var sessionId: String? = nil
+    /// Lit for the whole turn (thinking, tools and replying) until it
+    /// settles, not only before the reply: Simple's name card (User, 10-04).
+    var wholeTurn = false
     /// Absent in snapshots and panels without the model: then it never shows.
     @Environment(AppModel.self) private var appModel: AppModel?
 
@@ -40,7 +49,12 @@ struct ThinkingGlow: View {
         ThinkingGlowLayer(
             kind: kind,
             cornerRadius: cornerRadius,
-            thinking: appModel?.isThinkingBeforeReply ?? false
+            thinking: appModel.map { model in
+                let sessionId = sessionId ?? model.activeChatSessionId
+                return wholeTurn
+                    ? model.engine.turns.isBusy(sessionId) || model.engine.turns.isStreaming(sessionId)
+                    : model.isThinkingBeforeReply(for: sessionId)
+            } ?? false
         )
     }
 }

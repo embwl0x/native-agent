@@ -11,6 +11,7 @@ extension SwiftToolDispatcher {
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("missing_text"),
                 "fix": .string("omp_message requires a non-empty 'text' parameter."),
             ])
@@ -150,7 +151,9 @@ extension SwiftToolDispatcher {
         guard appendResult.status != "conflict" else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("message_id_conflict"),
+                "detail": .string("That message_id already names a different message, so nothing was queued. Use a new message_id, or omit it."),
                 "messageId": .string(messageId),
             ])
         }
@@ -204,7 +207,14 @@ extension SwiftToolDispatcher {
         }
         // A wake that failed admitted nothing to act on the row; "queued" would
         // tell her the answer is coming (the Claude lane already says so).
-        if Self.claudeReceiptStatus(response["wakeup"]) == "failed" { response["status"] = .string("failed") }
+        if Self.claudeReceiptStatus(response["wakeup"]) == "failed" {
+            response["status"] = .string("failed")
+            // The wake's own reason is the failure's, not the queued receipt's promise.
+            let wakeup = response["wakeup"] ?? .null
+            if let why = Self.stringField("fix", in: wakeup) ?? Self.stringField("message", in: wakeup) ?? Self.stringField("detail", in: wakeup) {
+                response["detail"] = .string(why)
+            }
+        }
         Self.markWakeStartedNothing(&response, agent: "OMP", dataRoot: dataRoot)
         return .object(response)
     }

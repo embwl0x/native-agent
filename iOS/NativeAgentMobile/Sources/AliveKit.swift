@@ -95,6 +95,10 @@ enum AlivePalette {
     // User 09-27: all native — the system label colours.
     static let text = Color(uiColor: .label)
     static let secondary = Color(uiColor: .secondaryLabel)
+    /// User's own lines in chat: the label colour, lighter. `secondary` (a grey
+    /// at 60%) measured 3.1:1 on the light haze; this is about 6:1 in both
+    /// appearances and still reads quieter than her words.
+    static let ownLine = text.opacity(0.64)
     /// The card fill: 6% white in dark; in light a translucent warm cream, so
     /// the haze reads through instead of a stark white slab.
     static let fill = tint(dark: UIColor.white.withAlphaComponent(0.06),
@@ -1437,7 +1441,7 @@ private struct AliveGlass<S: Shape>: ViewModifier {
     }
 
     private var glass: Glass {
-        var glass = Glass.regular
+        var glass = NativeAgentMobileTheme.plateGlass
         if let tint { glass = glass.tint(tint) }
         return interactive ? glass.interactive() : glass
     }

@@ -31,9 +31,6 @@ public protocol CognitionHost: Sendable {
         eventId: String, title: String, body: String, reason: String,
         userInfo: [String: String], at date: Date
     ) async throws -> String?
-    /// Phase 5 E1: her message to User's Telegram DM when `sessionId` is bound
-    /// to it (the approval cards' owner rule). nil: not his Telegram DM.
-    func sendToOwnerTelegram(sessionId: String, text: String, dataRoot: URL) async -> Bool?
     /// Publishes the Mac's snapshots to the phone.
     func writeSyncSnapshots() async
     /// The shared background LLM client; nil cognition binds the root's own owner.

@@ -118,7 +118,8 @@ enum AgentContactRuntime {
             + (plain.isEmpty ? "Please read the attached content." : AgentBridgeSurface.quotingImpersonation(plain))
         return TurnRequest(message: text, sessionID: principal.storedConversation(context), attachments: attachments,
                            surface: principal.surface, envelope: envelope, replyRoute: route,
-                           origin: ChatMessageOrigin(surface: "agent-bridge", agent: "agent", authored: .agent, replyTo: originID))
+                           origin: ChatMessageOrigin(surface: "agent-bridge", agent: "agent", authored: .agent, replyTo: originID),
+                           queryUserMessage: plain)
     }
 
     static func run(_ turn: AgentContactTurn, client: SwiftNativeChatOrchestrationClient, dataRoot: URL,
@@ -186,7 +187,8 @@ enum AgentContactRuntime {
                         await execution.waitForProducerTermination()
                         try Task.checkCancellation()
                         guard let final, failure == nil else {
-                            return AgentContactOutcome(state: waiting ? .inputRequired : .failed, parts: [],
+                            return AgentContactOutcome(state: waiting ? .inputRequired : .failed,
+                                parts: try final.map { try outputParts($0, taskID: turn.taskID, dataRoot: dataRoot) } ?? [],
                                 detail: waiting ? "Waiting for the person" : (failure ?? "The reply ended without a finished result") + ". Work: " + (ranPartly ? "ran partly." : "outcome unknown."))
                         }
                         let parts = try outputParts(final, taskID: turn.taskID, dataRoot: dataRoot)

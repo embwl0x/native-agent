@@ -64,16 +64,17 @@ public enum MacChatStreamAdapter {
 
         private let lock = NSLock()
         private let producerCompletion = ProducerCompletion()
-        private var _final: (reply: String, sessionId: String?)?
+        private var _final: (reply: String, sessionId: String?, workingCommentaryCharacters: Int?)?
         private var _terminalEvidence: StreamTerminalEvidence?
-        /// The core's final result: its reply, and the session the turn ran on.
-        public func recordFinalResponse(reply: String, sessionId: String?) {
+        /// The core's final result: its reply, the session the turn ran on,
+        /// and where the reply's working commentary ends.
+        public func recordFinalResponse(reply: String, sessionId: String?, workingCommentaryCharacters: Int? = nil) {
             lock.lock()
-            _final = (reply, sessionId)
+            _final = (reply, sessionId, workingCommentaryCharacters)
             _terminalEvidence = .finalResponse
             lock.unlock()
         }
-        public func finalResponse() -> (reply: String, sessionId: String?)? {
+        public func finalResponse() -> (reply: String, sessionId: String?, workingCommentaryCharacters: Int?)? {
             lock.lock()
             defer { lock.unlock() }
             return _final
@@ -118,28 +119,6 @@ public enum MacChatStreamAdapter {
         public var producerHasFinished: Bool { producerCompletion.isResolved }
     }
 
-    // Slow-network advisory (2026-06-14): the chatStream watchdog and the
-    // delta-consumer share this flag across two Tasks; it MUST be lock-guarded
-    // (not a bare captured var) to satisfy Swift 6 data-race checking.
-    public final class FirstTokenFlag: @unchecked Sendable {
-        public init() {}
-        private let lock = NSLock()
-        private var v = false
-        public func mark() { lock.lock(); v = true; lock.unlock() }
-        public func seen() -> Bool { lock.lock(); defer { lock.unlock() }; return v }
-    }
-
-    // Advisory toast delay for a slow-but-alive connection: if no token has
-    // arrived within 10s, tell the user the network looks slow. Purely
-    // advisory — it NEVER cancels the stream, so a slow-but-alive reply (e.g. an
-    // extended-thinking model still reasoning) still renders when it lands. We
-    // deliberately do NOT add a tight pre-first-token *cancel* clock: this layer
-    // only sees content chunks, not SSE keep-alive pings, so it can't tell a
-    // dead socket from a thinking model — any cancel fast enough to be useful
-    // would clip legitimate high-reasoning replies. The hard bounds stay
-    // URLSession's transport timeout + ProviderStreamGuard's 90s idle clock.
-    public static let slowNetworkAdvisoryDelayNanos: UInt64 = 10_000_000_000
-
     // PATCH-2026-05-06: hotpath-4 streaming chat — yields delta strings via AsyncThrowingStream, done event carries metadata
     // PATCH-2026-05-06: multimodal-ui Sprint 3 — added attachments param
     // S.5: onMetadata replaced by lock-guarded MetaBox; caller reads metadata after stream exhaustion.
@@ -173,43 +152,12 @@ public enum MacChatStreamAdapter {
                 // remote turn.
                 await MacScreenPreviewBus.$publish.withValue(onScreenPreview) {
                 let swiftExecution = makeExecution()
-                // Slow-turn advisory (2026-06-14): if no token arrives within
-                // ~10s, post a non-cancelling "still working" notice on the live
-                // turn-notice bus. This NEVER interrupts the stream — a slow-but-
-                // alive reply (incl. an extended-thinking model reasoning for a
-                // while before its first token, or a long tool loop) still
-                // renders when it lands. Cancelled on first delta and on every
-                // stream exit so it can't fire after a fast reply or leak a
-                // timer. Wording is deliberately neutral: at 10s this layer
-                // can't tell a slow network from deep reasoning, so it must not
-                // falsely blame the network.
-                let firstToken = FirstTokenFlag()
-                let slowWatch = Task {
-                    try? await Task.sleep(nanoseconds: Self.slowNetworkAdvisoryDelayNanos)
-                    guard !Task.isCancelled, !firstToken.seen() else { return }
-                    await onTurnActivity(
-                        MacChatTurnActivityBoundary.notice(
-                            kind: "slow_turn",
-                            text: "Still working on it - a complex reply can take a moment.",
-                            identity: activityIdentity,
-                            at: Date()
-                        )
-                    )
-                }
-                // Belt-and-suspenders: guarantee the advisory timer is cancelled
-                // when the producer unwinds for ANY reason — including outer
-                // stream cancellation (Stop) observed mid-await — so it can never
-                // post after the turn ends. The explicit cancels below stop it
-                // promptly on the first delta; this is the catch-all.
-                defer { slowWatch.cancel() }
                 await withTaskCancellationHandler {
                     await Self.bridgeChatStreamEvents(
                         swiftExecution.events,
                         sessionId: sessionId,
                         activityIdentity: activityIdentity,
                         metaBox: metaBox,
-                        firstToken: firstToken,
-                        cancelSlowWatch: { slowWatch.cancel() },
                         onTurnActivity: onTurnActivity,
                         continuation: continuation
                     )
@@ -235,8 +183,6 @@ public enum MacChatStreamAdapter {
         sessionId: String?,
         activityIdentity: MacChatTurnIdentity,
         metaBox: MetaBox,
-        firstToken: FirstTokenFlag,
-        cancelSlowWatch: @escaping @Sendable () -> Void,
         onTurnActivity: @escaping @Sendable (MacChatTurnActivity) async -> Void,
         continuation: AsyncThrowingStream<MacChatStreamUpdate, Error>.Continuation
     ) async {
@@ -252,12 +198,6 @@ public enum MacChatStreamAdapter {
                 }
                 switch event {
                 case .delta(let text):
-                    // Empty liveness deltas must not suppress the existing slow
-                    // advisory; only user-visible text is a first token.
-                    if !text.isEmpty {
-                        firstToken.mark()
-                        cancelSlowWatch()
-                    }
                     continuation.yield(.text(text))
                 case .replyTextSettled(let settled):
                     continuation.yield(.replyTextSettled(settled))
@@ -273,10 +213,10 @@ public enum MacChatStreamAdapter {
                 case .final(let result):
                     metaBox.recordFinalResponse(
                         reply: result.reply,
-                        sessionId: sessionId.flatMap { $0.isEmpty ? nil : $0 }
+                        sessionId: sessionId.flatMap { $0.isEmpty ? nil : $0 },
+                        workingCommentaryCharacters: result.workingCommentaryCharacters
                     )
                 case .error(let message):
-                    cancelSlowWatch()
                     metaBox.recordExplicitStreamError(message)
                     let error = NSError(
                         domain: "NativeAgentStream",
@@ -288,10 +228,8 @@ public enum MacChatStreamAdapter {
                 }
             }
             try Task.checkCancellation()
-            cancelSlowWatch()
             if terminalError == nil { continuation.finish() }
         } catch {
-            cancelSlowWatch()
             if Task.isCancelled || error is CancellationError {
                 // Typed, observed at this adapter's own boundary — not parsed
                 // from provider text.

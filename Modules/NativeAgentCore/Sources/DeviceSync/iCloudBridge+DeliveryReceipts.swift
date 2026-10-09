@@ -301,14 +301,14 @@ extension iCloudBridge {
         }
         do {
             try fm.moveItem(at: path, to: destination)
-            NSLog(
+            nativeLog(
                 "[iCloudBridge] chat delivery receipts self-healed (%@); damaged store preserved at %@",
                 reason,
                 destination.lastPathComponent
             )
             return true
         } catch {
-            NSLog(
+            nativeLog(
                 "[iCloudBridge] chat delivery receipts damaged (%@) but could not be preserved aside: %@",
                 reason,
                 error.localizedDescription

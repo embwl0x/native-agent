@@ -20,6 +20,19 @@ package actor MCPToolCatalogWarmer {
     static let rearmInterval: TimeInterval = 300
     /// Hard ceiling on one sweep. A wedged server gets cancelled, not waited on.
     static let sweepDeadline: TimeInterval = 30
+    /// Launch is already busy: the first sweep starts no sooner than this long
+    /// after the process did. A kick before then schedules that one sweep.
+    static let launchDelay: TimeInterval = 60
+
+    /// When this process started, from the kernel's own record.
+    static let processStartedAt: Date = {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return Date() }
+        let started = info.kp_proc.p_un.__p_starttime
+        return Date(timeIntervalSince1970: TimeInterval(started.tv_sec) + TimeInterval(started.tv_usec) / 1_000_000)
+    }()
 
     private let sweep: Sweep
     private let clock: @Sendable () -> Date
@@ -27,6 +40,8 @@ package actor MCPToolCatalogWarmer {
     private let sweepDeadline: TimeInterval
     private var lastStartedAt: Date?
     private var inFlight = false
+    private let firstSweepAt: Date
+    private var firstSweepScheduled = false
     /// Test seam: sweeps that ran to completion (or were deadline-cancelled).
     private(set) var finishedSweeps = 0
 
@@ -34,12 +49,14 @@ package actor MCPToolCatalogWarmer {
         sweep: @escaping Sweep = MCPToolCatalogWarmer.liveSweep,
         clock: @escaping @Sendable () -> Date = { Date() },
         rearmInterval: TimeInterval = MCPToolCatalogWarmer.rearmInterval,
-        sweepDeadline: TimeInterval = MCPToolCatalogWarmer.sweepDeadline
+        sweepDeadline: TimeInterval = MCPToolCatalogWarmer.sweepDeadline,
+        firstSweepAt: Date = MCPToolCatalogWarmer.processStartedAt.addingTimeInterval(MCPToolCatalogWarmer.launchDelay)
     ) {
         self.sweep = sweep
         self.clock = clock
         self.rearmInterval = rearmInterval
         self.sweepDeadline = sweepDeadline
+        self.firstSweepAt = firstSweepAt
     }
 
     static let liveSweep: Sweep = { root in
@@ -60,6 +77,17 @@ package actor MCPToolCatalogWarmer {
     func kickIfDue(dataRoot: URL) async -> Bool {
         guard !inFlight else { return false }
         let now = clock()
+        if lastStartedAt == nil, now < firstSweepAt {
+            if !firstSweepScheduled {
+                firstSweepScheduled = true
+                let wait = firstSweepAt.timeIntervalSince(now)
+                Task { [self] in
+                    try? await Task.sleep(for: .seconds(wait))
+                    await kickIfDue(dataRoot: dataRoot)
+                }
+            }
+            return false
+        }
         if let last = lastStartedAt, now.timeIntervalSince(last) < rearmInterval {
             return false
         }

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 
 /// 2026-09-18 WHY: adapters translate wire evidence once; recovery and surfaces
 /// consume a failure, never adapter wording. Cancellation is not a failure.
@@ -9,6 +10,9 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     case overloaded
     case contextTooLong
     case network
+    /// The stream guard cut a request after its idle or wall time. `events`
+    /// counts wire activity; admission rides on the `Diagnostic`.
+    case noReply(provider: String, seconds: Int, events: Int)
     case refused
     case malformedResponse
     case routingUnavailable
@@ -22,6 +26,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         case .overloaded: return "The model is busy; try again in a moment."
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
         case .network: return "The connection was interrupted; check your internet connection and try again."
+        case .noReply(let provider, let seconds, let events):
+            return "No reply from \(provider) in \(seconds) s (\(events) events). Say continue to pick it up."
         case .refused: return "The model turned this request down. Try again, or pick another model in Settings."
         case .malformedResponse: return "The model returned an unreadable response; try again."
         case .routingUnavailable: return "Your model settings could not be loaded; check your model connection in Settings."
@@ -195,8 +201,13 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return nil
     }
 
-    static func normalize(_ error: Error) -> Error {
+    /// `admitted`: the provider had begun a response for this request.
+    static func normalize(_ error: Error, admitted: Bool = false) -> Error {
         if error is CancellationError || (error as? URLError)?.code == .cancelled { return CancellationError() }
+        if admitted, let diagnostic = error as? Diagnostic {
+            return Diagnostic(cause: diagnostic.cause, detail: diagnostic.detail,
+                              deadlineExpired: diagnostic.deadlineExpired, admitted: true)
+        }
         if error is any ProviderFailureWrapping { return error }
         // Output truncation carries partial prose; routing/configuration failures
         // retain their repair identity rather than becoming a transport failure.
@@ -207,7 +218,74 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
             default: break
             }
         }
-        return LLMError.failure(classify(error) ?? .malformedResponse)
+        let nsError = error as NSError
+        return Diagnostic(cause: classify(error) ?? .malformedResponse,
+                          detail: diagnosticDescription(error),
+                          deadlineExpired: nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorTimedOut,
+                          admitted: admitted)
+    }
+
+    /// Whether this failure forbids sending the same request again.
+    public static func forbidsResend(_ error: Error) -> Bool {
+        if let diagnostic = error as? Diagnostic { return diagnostic.forbidsResend }
+        if let wrapper = error as? any ProviderFailureWrapping { return forbidsResend(wrapper.providerFailureCause) }
+        return false
+    }
+
+    /// Retain transport evidence while people and retry policy still consume
+    /// the same typed category. Redact before it can reach durable diagnostics.
+    public struct Diagnostic: Error, LocalizedError, Sendable, ProviderFailureWrapping {
+        public let cause: ProviderFailure
+        public let detail: String
+        public let deadlineExpired: Bool
+        /// The provider began a response for this request.
+        public let admitted: Bool
+        public init(cause: ProviderFailure, detail: String, deadlineExpired: Bool = false, admitted: Bool = false) {
+            self.cause = cause
+            self.detail = String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
+            self.deadlineExpired = deadlineExpired
+            self.admitted = admitted
+        }
+        public var errorDescription: String? { cause.errorDescription }
+        public var providerFailureCause: Error { cause }
+        public var permitsWholeTurnRetry: Bool { !forbidsResend }
+        /// Admitted, then cut without the provider saying no (idle or wall,
+        /// connection loss, truncation): it may still be generating, and a
+        /// second copy is a second generation of one turn. An explicit error
+        /// event (overloaded, rate limit) said it did not generate.
+        public var forbidsResend: Bool {
+            guard admitted else { return false }
+            if case .noReply = cause { return true }
+            return cause == .network
+        }
+    }
+
+    public static func diagnosticDescription(_ error: Error) -> String {
+        if let error = error as? Diagnostic { return error.detail }
+        if let wrapper = error as? any ProviderFailureWrapping {
+            return diagnosticDescription(wrapper.providerFailureCause)
+        }
+        let detail: String
+        if let error = error as? LLMError {
+            switch error {
+            case .transient(let message), .underlying(let message),
+                 .providerError(let message), .streamTruncated(let message): detail = message
+            case .invalidResponse(let status): detail = "HTTP \(status)"
+            case .authRejected(let provider, let message): detail = "\(provider): \(message ?? "authentication rejected")"
+            // Never the partial reply itself: it can echo prompt or source text.
+            case .outputLengthLimit(let partial): detail = "output length limit after \(partial.utf8.count) bytes"
+            default: detail = String(describing: error)
+            }
+        } else {
+            let ns = error as NSError
+            detail = "\(ns.domain) code=\(ns.code): \(ns.localizedDescription)"
+        }
+        return String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
+    }
+
+    static func wireError(_ object: [String: Any]) -> Diagnostic {
+        let detail = wireDetail(object)
+        return Diagnostic(cause: wire(detail), detail: detail)
     }
 }
 

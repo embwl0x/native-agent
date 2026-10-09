@@ -371,7 +371,8 @@ struct DoctorView: View {
             // Background-loop health (2026-07-16): github_tracking failed every
             // tick for 4 days with zero surfacing. Rule + receipt parsing live
             // in DoctorLoopHealth (pure, unit-tested); this is display only.
-            NativePanel(title: "Background tasks", systemImage: "arrow.triangle.2.circlepath", tint: loopPanelTint) {
+            NativePanel(title: "Background tasks", systemImage: "arrow.triangle.2.circlepath", tint: loopPanelTint,
+                        contentInsets: Self.panelInsets) {
                 if loopVerdicts.isEmpty {
                     Text("Background tasks have not started yet.")
                         .font(NativeAgentFont.body)
@@ -472,17 +473,15 @@ struct DoctorView: View {
                     .accessibilityIdentifier("doctor.report.footer")
                 }
             } else {
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "Health checks",
-                    detail: "Repair checks the app, model connections, web search, Telegram, conversations, tools, and background work, and fixes what is broken.",
-                    systemImage: "cross.case"
+                    detail: "Repair checks the app, model connections, web search, Telegram, conversations, tools, and background work, and fixes what is broken."
                 )
             }
         }
         // No inset of its own: the page frame's column is the edge, as on
         // every alive page.
         .navigationTitle("Health checks")
-        .motionArrival(when: appModel.engine.doctor.report != nil)
         .task {
             await appModel.refreshLiveDoctorCoverage()
         }
@@ -513,12 +512,16 @@ struct DoctorView: View {
 
     // UI-2: the page's new lead. Plain sentence + plain counts; the raw report
     // status word and check tally live one disclosure down.
+    private static let panelInsets = EdgeInsets(top: AliveMetrics.rowInsetV, leading: AliveMetrics.rowInsetH,
+                                               bottom: AliveMetrics.rowInsetV, trailing: AliveMetrics.rowInsetH)
+
     @ViewBuilder
     private var healthSummaryPanel: some View {
         NativePanel(
             title: "Overall health",
             systemImage: "heart.text.square",
-            tint: DoctorPlainCopy.tint(for: checkSummary)
+            tint: DoctorPlainCopy.tint(for: checkSummary),
+            contentInsets: Self.panelInsets
         ) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline) {

@@ -16,7 +16,7 @@ extension AppModel {
     }
 
     func hasAnyUsableProvider() -> Bool {
-        AppModel.hasAnyUsableProvider(dataRoot: PersistenceCore.defaultDataRoot())
+        AppModel.hasAnyUsableProvider(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
     }
 
     /// Use the same credential admission as provider routing, without catalog discovery.

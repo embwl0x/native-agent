@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import PersistenceCore
 import NativeAgentShared
 
@@ -41,6 +42,48 @@ public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatabl
 /// prevents read failures and malformed rows from being collapsed into an
 /// empty index and overwritten by the next surface that creates a session.
 public enum ChatSessionIndexFile {
+    private static let pendingSyncLock = NSLock()
+    nonisolated(unsafe) private static var pendingSyncs: [String: Int] = [:]
+
+    /// An overlapping sync may observe another writer's bytes. Keep its
+    /// transcript hot until every admitted writer has finished its own index
+    /// commit; after a crash, the persisted exact-version guard takes over.
+    public static func beginTranscriptIndexSync(at path: URL) {
+        pendingSyncLock.lock()
+        defer { pendingSyncLock.unlock() }
+        pendingSyncs[path.standardizedFileURL.path, default: 0] += 1
+    }
+
+    public static func endTranscriptIndexSync(at path: URL) {
+        pendingSyncLock.lock()
+        defer { pendingSyncLock.unlock() }
+        let key = path.standardizedFileURL.path
+        if let count = pendingSyncs[key], count > 1 { pendingSyncs[key] = count - 1 }
+        else { pendingSyncs.removeValue(forKey: key) }
+    }
+
+    public static func hasPendingTranscriptIndexSync(at path: URL) -> Bool {
+        pendingSyncLock.lock()
+        defer { pendingSyncLock.unlock() }
+        return pendingSyncs[path.standardizedFileURL.path] != nil
+    }
+
+    /// Exact filesystem version acknowledged while holding the transcript lock.
+    /// Integer seconds/nanoseconds avoid ISO8601 millisecond rounding; inode
+    /// and size also distinguish atomic replacements and same-clock appends.
+    public static let acknowledgedTranscriptKey = "acknowledgedTranscriptVersion"
+
+    public static func transcriptVersion(at path: URL) -> JSONValue? {
+        var info = stat()
+        guard lstat(path.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
+        return .object([
+            "seconds": .int(Int64(info.st_mtimespec.tv_sec)),
+            "nanoseconds": .int(Int64(info.st_mtimespec.tv_nsec)),
+            "bytes": .int(info.st_size),
+            "inode": .string(String(info.st_ino)),
+        ])
+    }
+
     /// Unknown or mixed participants stay unavailable. Legacy transcripts are
     /// not relabeled from their latest turn; only a new conversation binds.
     public static func recordContinuityParticipant(
@@ -234,6 +277,8 @@ public extension ChatSession {
             modelId: try string("modelId"),
             transcriptGeneration: try int(ChatSessionIndexFile.transcriptGenerationKey)
         )
+        firstMessageAt = try string("firstMessageAt")
+        lastMessageAt = try string("lastMessageAt")
     }
 }
 

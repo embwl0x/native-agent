@@ -10,6 +10,115 @@ import MCPDispatcher
 import ProviderRouting
 import TrustCenter
 
+
+/// One provider assembly for resident turns and background body work. Routing,
+/// credentials, account catalogs and adapter transports have exactly one owner.
+public func makeResidentProviderLLMClient(
+    dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    providersRoot: URL? = nil,
+    router suppliedRouter: (any ProviderRoutingProtocol)? = nil,
+    lifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
+    codexAdapterFactory: (@Sendable ([String: String]?) -> any LLMAdapter)? = nil,
+    streamGuard: ProviderStreamGuardConfig = .fromEnvironment()
+) -> any LLMClient {
+    let credentialRoot = providersRoot?.standardizedFileURL
+    let router = suppliedRouter ?? SwiftNativeProviderRouting(dataRoot: credentialRoot ?? dataRoot)
+    let usesCanonicalBody = credentialRoot != nil
+        || dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
+    let llm: any LLMClient
+    if usesCanonicalBody {
+        let telemetryRoot: URL? = credentialRoot == nil ? nil : dataRoot
+        let stallSession = streamGuard.wallTimeout == 0 ? ProviderStreamGuard.stallOnlySession : nil
+        // User, 2026-09-06: readiness ("codex is signed in") is decided from the
+        // app's OWN credential resolution
+        // (`OpenAIOAuthDirectAdapter.preferredAuthPath`), but the child got no
+        // CODEX_HOME unless a `credentialRoot` was injected — so on the default
+        // root the CLI went and used whatever `~/.codex` or ambient CODEX_HOME
+        // it found, which is a different account from the one the badge
+        // validated (and the one the app deliberately gates behind CLI-adoption
+        // consent). Whenever the app has resolved a usable credential, the
+        // child is pointed at exactly that location.
+        // The merge sits on `augmentedProcessEnvironment` because an injected
+        // environment REPLACES the adapter's PATH repair, and a GUI-launched
+        // app's PATH cannot find `codex`.
+        // The child runs on the app credential's access-only copy
+        // (`codexChildHome`), never the app's own file; an adopted ~/.codex is
+        // the CLI's own and stays as it is.
+        let codexEnvironment: [String: String]? = {
+            if let root = credentialRoot {
+                return CodexAdapter.augmentedProcessEnvironment().merging([
+                    "CODEX_HOME": OpenAIOAuthDirectAdapter.codexChildHome(dataRoot: root).path,
+                    "NATIVE_AGENT_DATA_ROOT": root.path,
+                ]) { _, bound in bound }
+            }
+            let resolved = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot)
+            guard OpenAIOAuthDirectAdapter.hasUsableTokens(at: resolved) else { return nil }
+            return CodexAdapter.augmentedProcessEnvironment().merging([
+                "CODEX_HOME": (OpenAIOAuthDirectAdapter.codexChildHome(mirroring: resolved)
+                    ?? resolved.deletingLastPathComponent()).path,
+            ]) { _, bound in bound }
+        }()
+        llm = SwiftNativeLLMClient(
+            router: router,
+            // Codex child processes read CODEX_HOME / NATIVE_AGENT_DATA_ROOT; bind
+            // both to the credential root so a secondary runtime never reads (or
+            // refreshes) the operator's personal ~/.codex. (gpt-5.5 BLOCKING.)
+            codex: codexAdapterFactory?(codexEnvironment)
+                ?? CodexAdapter(processEnvironmentOverride: codexEnvironment),
+            anthropic: AnthropicAdapter(
+                session: stallSession ?? .shared,
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            openAI: OpenAIAdapter(
+                session: stallSession ?? .shared,
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            openAIOAuthDirect: OpenAIOAuthDirectAdapter(
+                session: stallSession ?? OpenAIOAuthDirectAdapter.productionSession,
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
+                session: stallSession ?? AnthropicOAuthDirectAdapter.productionSession,
+                authPathOverride: credentialRoot.map {
+                    $0.appendingPathComponent("providers", isDirectory: true)
+                        .appendingPathComponent("anthropic_oauth_direct.json")
+                },
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            xaiOAuthDirect: XAIOAuthDirectAdapter(
+                session: stallSession ?? .shared,
+                tokenPathOverride: credentialRoot.map {
+                    XAIOAuthDirectAdapter.tokenPath(dataRoot: $0)
+                },
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            moonshot: MoonshotAdapter(
+                session: stallSession ?? .shared,
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            kimiCode: AnthropicAdapter.kimiCode(
+                session: stallSession ?? .shared,
+                dataRootOverride: credentialRoot,
+                telemetryDataRootOverride: telemetryRoot
+            ),
+            openRouter: OpenRouterAdapter(session: stallSession ?? .shared, dataRootOverride: credentialRoot),
+            streamGuardConfig: streamGuard,
+            lifecycleObserver: lifecycleObserver,
+            moonshotCatalogDataRoot: credentialRoot ?? PersistenceCore.defaultDataRoot()
+        )
+    } else {
+        // None of the default adapters has a complete credential-root seam.
+        // Construct none of them: an injected secondary/test body must never
+        // consume User's API keys, OAuth state, Codex home, or provider traces.
+        llm = AlternateRootUnavailableChatLLMClient()
+    }
+    return llm
+}
+
 private struct AlternateRootUnavailableChatLLMClient: LLMClient {
     private func unavailable() -> NSError {
         NSError(
@@ -244,7 +353,7 @@ public func makeGatedToolDispatchClient(
         // machinery at all). See PeerDataTaint.
         dispatcher = ChatToolDispatchTracer(
             inner: PeerDataTaintDispatcher(
-                inner: dispatcher, peerStore: AgentPeerStore(dataRoot: dataRoot)
+                inner: dispatcher, peerStore: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot
             ),
             dataRoot: dataRoot
         )
@@ -381,86 +490,8 @@ private func makeDefaultChatOrchestrationClient(
     // that root for credential resolution, while its TELEMETRY root stays on
     // `dataRoot` — reads from the named credential root, writes into the
     // caller's own (disposable) body.
-    let usesCanonicalBody = credentialRoot != nil
-        || dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
-    let llm: any LLMClient
-    if usesCanonicalBody {
-        let telemetryRoot: URL? = credentialRoot == nil ? nil : dataRoot
-        // User, 2026-09-06: readiness ("codex is signed in") is decided from the
-        // app's OWN credential resolution
-        // (`OpenAIOAuthDirectAdapter.preferredAuthPath`), but the child got no
-        // CODEX_HOME unless a `credentialRoot` was injected — so on the default
-        // root the CLI went and used whatever `~/.codex` or ambient CODEX_HOME
-        // it found, which is a different account from the one the badge
-        // validated (and the one the app deliberately gates behind CLI-adoption
-        // consent). Whenever the app has resolved a usable credential, the
-        // child is pointed at exactly that location.
-        // The merge sits on `augmentedProcessEnvironment` because an injected
-        // environment REPLACES the adapter's PATH repair, and a GUI-launched
-        // app's PATH cannot find `codex`.
-        let codexEnvironment: [String: String]? = {
-            if let root = credentialRoot {
-                return CodexAdapter.augmentedProcessEnvironment().merging([
-                    "CODEX_HOME": root.appendingPathComponent("codex_home", isDirectory: true).path,
-                    "NATIVE_AGENT_DATA_ROOT": root.path,
-                ]) { _, bound in bound }
-            }
-            let resolved = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot)
-            guard OpenAIOAuthDirectAdapter.hasUsableTokens(at: resolved) else { return nil }
-            return CodexAdapter.augmentedProcessEnvironment().merging([
-                "CODEX_HOME": resolved.deletingLastPathComponent().path,
-            ]) { _, bound in bound }
-        }()
-        llm = SwiftNativeLLMClient(
-            router: router,
-            // Codex child processes read CODEX_HOME / NATIVE_AGENT_DATA_ROOT; bind
-            // both to the credential root so a secondary runtime never reads (or
-            // refreshes) the operator's personal ~/.codex. (gpt-5.5 BLOCKING.)
-            codex: codexAdapterFactory?(codexEnvironment)
-                ?? CodexAdapter(processEnvironmentOverride: codexEnvironment),
-            anthropic: AnthropicAdapter(
-                dataRootOverride: credentialRoot,
-                telemetryDataRootOverride: telemetryRoot
-            ),
-            openAI: OpenAIAdapter(
-                dataRootOverride: credentialRoot,
-                telemetryDataRootOverride: telemetryRoot
-            ),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(
-                dataRootOverride: credentialRoot,
-                telemetryDataRootOverride: telemetryRoot
-            ),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
-                authPathOverride: credentialRoot.map {
-                    $0.appendingPathComponent("providers", isDirectory: true)
-                        .appendingPathComponent("anthropic_oauth_direct.json")
-                },
-                telemetryDataRootOverride: telemetryRoot
-            ),
-            xaiOAuthDirect: XAIOAuthDirectAdapter(
-                tokenPathOverride: credentialRoot.map {
-                    XAIOAuthDirectAdapter.tokenPath(dataRoot: $0)
-                },
-                telemetryDataRootOverride: telemetryRoot
-            ),
-            moonshot: MoonshotAdapter(
-                dataRootOverride: credentialRoot,
-                telemetryDataRootOverride: telemetryRoot
-            ),
-            kimiCode: AnthropicAdapter.kimiCode(
-                dataRootOverride: credentialRoot,
-                telemetryDataRootOverride: telemetryRoot
-            ),
-            openRouter: OpenRouterAdapter(dataRootOverride: credentialRoot),
-            lifecycleObserver: providerLifecycleObserver,
-            moonshotCatalogDataRoot: credentialRoot ?? PersistenceCore.defaultDataRoot()
-        )
-    } else {
-        // None of the default adapters has a complete credential-root seam.
-        // Construct none of them: an injected secondary/test body must never
-        // consume User's API keys, OAuth state, Codex home, or provider traces.
-        llm = AlternateRootUnavailableChatLLMClient()
-    }
+    let llm = makeResidentProviderLLMClient(dataRoot: dataRoot, providersRoot: providersRoot,
+        router: router, lifecycleObserver: providerLifecycleObserver, codexAdapterFactory: codexAdapterFactory)
     // Swift-native cutover/fix-memory-wiring: route recall through SwiftNativeMemoryV2.shared
     // (SQLite-backed MemoryStorage) instead of the legacy JSONL store. Same
     // SQLite db the rest of MemoryV2 — UserMDGenerator, consolidation, proposal
@@ -656,7 +687,9 @@ private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting,
             assistantMessage: assistantMessage,
             toolEvidence: toolEvidence,
             sessionId: sessionId,
-            surface: surface
+            surface: surface,
+            standingAgentName: StandingBotContinuity.currentBot?.name,
+            turnId: TurnTraceContext.turnId
         )
         let staged = observation.proposals
         var telemetry = MemoryPromotionTelemetry(
@@ -671,6 +704,7 @@ private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting,
         telemetry.pendingCorrectionCount = observation.pendingCorrectionCount
         telemetry.failedCorrectionCount = observation.failedCorrectionCount
         telemetry.noveltySkipReason = observation.noveltySkipReason
+        telemetry.failure = observation.extraction.failure
         return telemetry
     }
 }

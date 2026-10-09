@@ -672,9 +672,11 @@ public actor ContextSQLiteStore {
             let receiptIDs = try String.fetchAll(
                 db,
                 sql: """
-                SELECT id FROM context_receipts
-                ORDER BY created_at DESC, id ASC
-                LIMIT -1 OFFSET ?
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY kind ORDER BY created_at DESC, id ASC
+                    ) AS rank FROM context_receipts
+                ) WHERE rank > ?
                 """,
                 arguments: [boundedReceiptLimit]
             )
@@ -941,6 +943,12 @@ public actor ContextSQLiteStore {
                 );
                 CREATE INDEX idx_context_feedback_events_sequence
                     ON context_feedback_events(sequence);
+                """)
+        }
+        migrator.registerMigration("context_receipt_kind_retention_v3") { db in
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_context_receipts_kind_created_id
+                    ON context_receipts(kind, created_at DESC, id ASC);
                 """)
         }
         return migrator
@@ -1210,14 +1218,15 @@ public actor ContextSQLiteStore {
             ]
         )
         // Turn receipts must stay bounded even when no source changes trigger
-        // generation pruning. Retention is part of the receipt transaction.
+        // generation pruning. Retention is part of the receipt transaction,
+        // one ring per kind so prewarm churn never evicts turn selections.
         try db.execute(sql: """
             DELETE FROM context_receipts WHERE id IN (
-                SELECT id FROM context_receipts
+                SELECT id FROM context_receipts WHERE kind = ?
                 ORDER BY created_at DESC, id ASC
                 LIMIT -1 OFFSET 10000
             )
-            """)
+            """, arguments: [receipt.kind.rawValue])
     }
 
     private static func unusedVersionKeys(

@@ -85,6 +85,7 @@ public enum MacTransientMenus {
                     var result: [String: JSONValue] = [
                         "role": .string("AXMenuItem"), "enabled": .bool(item.enabled),
                         "frame": item.frame?.toJSON() ?? .null,
+                        "actions": .array(item.actions.map { .string($0) }),
                     ]
                     if let title = item.title ?? item.value, !title.isEmpty {
                         result["label"] = MacScreenViewTextRedaction.redactedLegendString(title, valueChars: 200)

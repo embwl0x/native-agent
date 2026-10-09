@@ -12,31 +12,6 @@ import ProviderRouting
 
 @MainActor
 struct MacSyncActionRouter {
-    struct MacIntegrationPermissionRequest: Equatable, Sendable {
-        let id: String
-        let read: Bool
-        let write: Bool
-    }
-
-    nonisolated static func macIntegrationPermissionRequest(
-        from payload: [String: String]
-    ) -> MacIntegrationPermissionRequest? {
-        let id = (payload["id"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        func exactBool(_ key: String) -> Bool? {
-            switch (payload[key] ?? "").lowercased() {
-            case "true": return true
-            case "false": return false
-            default: return nil
-            }
-        }
-        guard MacIntegrationID.all.contains(id),
-              let read = exactBool("read"),
-              let write = exactBool("write") else {
-            return nil
-        }
-        return MacIntegrationPermissionRequest(id: id, read: read, write: write)
-    }
-
     struct SurfaceSelection: Equatable, Sendable {
         let surface: String
         let providerID: String
@@ -207,9 +182,9 @@ struct MacSyncActionRouter {
     func dispatch(_ action: InboxAction) async -> [String: String] {
         let requiresDevice = action.action.hasPrefix("approve") || action.action.hasPrefix("reject")
             || ["create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job", "cancel_scheduler_job"].contains(action.action)
-            || ["cancelApproval", "inboxAction", "set_mac_integration_permission", "set_trust_policy", "pairDevice", "set_telegram_settings", "disconnect_telegram"].contains(action.action)
+            || ["cancelApproval", "inboxAction", "app_settings", "app_setting_set", "chat_history_page", "set_trust_policy", "pairDevice", "disconnect_telegram", "set_telegram_settings", "set_mac_integration_permission"].contains(action.action)
             || ["get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread", "send_agent_message"].contains(action.action)
-            || ["configure_provider_secret", "start_provider_sign_in"].contains(action.action)
+            || ["configure_provider_secret", "start_provider_sign_in", "interaction_action"].contains(action.action)
         if let message = sync.pairedPhones.authorize(action, requiresPairing: requiresDevice) {
             sync.engine.syncError = message
             return ["status": "error", "ok": "false", "code": "device_not_verified", "message": message]
@@ -248,10 +223,6 @@ struct MacSyncActionRouter {
             return response
         }
 
-        if let denial = iCloudActionDenial(action) {
-            return observed(["status": "error", "message": denial])
-        }
-
         let api = sync.host
 
         do {
@@ -260,7 +231,32 @@ struct MacSyncActionRouter {
             case "create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job", "cancel_scheduler_job": return observed(try await schedulerAction(action.action, payload: payload))
             case "get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread", "send_agent_message": return observed(try await helpersAction(action.action, payload: payload))
             case "set_connector_enabled", "disconnect_connector": return observed(try await connectorAction(action))
-            case "set_telegram_settings", "disconnect_telegram": return await telegramAction(action)
+            case "disconnect_telegram", "set_telegram_settings": return await telegramAction(action)
+            case "chat_history_page": return observed(try await chatHistoryPage(action))
+            case "set_mac_integration_permission":
+                guard let id = payload["id"], MacIntegrationID.all.contains(id),
+                      let read = payload["read"], ["true", "false"].contains(read),
+                      let write = payload["write"], ["true", "false"].contains(write) else {
+                    return observed(["status": "error", "ok": "false",
+                                     "message": "A known integration id and exact read/write booleans are required."])
+                }
+                let axes = (read == "true" && MacIntegrationID.supportsRead(id) ? ["read"] : [])
+                    + (write == "true" && MacIntegrationID.supportsWrite(id) ? ["write"] : [])
+                let row = try await api.setAppSetting(id: "trust.mac_integration_\(id)",
+                    value: axes.isEmpty ? "off" : axes.joined(separator: "_"),
+                    actionID: action.msgId, clientID: action.clientId)
+                return observed(["status": "ok", "ok": "true", "id": id,
+                    "read": String(row.value == "read" || row.value == "read_write"),
+                    "write": String(row.value == "write" || row.value == "read_write")])
+            case "app_settings":
+                let rows = try await api.appSettings()
+                return observed(["status": "ok", "ok": "true",
+                                 "settings": String(decoding: try JSONEncoder().encode(rows), as: UTF8.self)])
+            case "app_setting_set":
+                let row = try await api.setAppSetting(id: payload["id"] ?? "", value: payload["value"] ?? "",
+                                                      actionID: action.msgId, clientID: action.clientId)
+                return observed(["status": "ok", "ok": "true",
+                                 "setting": String(decoding: try JSONEncoder().encode(row), as: UTF8.self)])
             case "pairDevice":
                 return ["status": "ok", "ok": "true", "message": "This phone is paired."]
             case "createDeskItem":
@@ -414,11 +410,26 @@ struct MacSyncActionRouter {
                 )
                 return observed(approvalActionResponse(approvalRecordToDict(row), approvalId: approvalId, fallbackStatus: "canceled"))
 
+            case "interaction_action":
+                guard action.payload.count == 1,
+                      let sealed = action.payload[SecretActionEnvelope.field],
+                      let encodedSecret = try PairingSecretManager.existingSecretBase64(),
+                      let secret = Data(base64Encoded: encodedSecret) else {
+                    return ["status": "error", "message": "Could not decrypt the card answer. Check pairing and try again."]
+                }
+                let fields = try SecretActionEnvelope.open(sealed, secret: secret,
+                    actionID: action.msgId, actionName: action.action)
+                return try await api.interactionAction(payload: fields, actionID: action.msgId, clientID: action.clientId)
+
             case "inboxAction":
                 let itemId = payload["itemId"] ?? payload["id"] ?? ""
                 let actionId = payload["actionId"] ?? payload["action"] ?? "act"
                 guard !itemId.isEmpty else { return ["status": "error", "message": "Missing inbox item id"] }
                 guard !actionId.isEmpty else { return ["status": "error", "message": "Missing inbox action"] }
+                if itemId.hasPrefix("interaction:"), actionId == "act" {
+                    return try await api.interactionAction(payload: ["action": "open", "itemID": itemId],
+                        actionID: action.msgId, clientID: action.clientId)
+                }
                 let nativeActions: Set<String> = ["read", "archive", "dismiss", "act", "reply", "approve", "reject", "repair", "open_approvals"]
                 let normalizedAction = actionId == "deny" ? "reject" : actionId
                 let endpointAction = nativeActions.contains(normalizedAction)
@@ -752,36 +763,6 @@ struct MacSyncActionRouter {
                     serviceTier: preference.serviceTier
                 ))
 
-            case "set_mac_integration_permission":
-                guard let request = Self.macIntegrationPermissionRequest(from: payload) else {
-                    return observed([
-                        "status": "error",
-                        "ok": "false",
-                        "code": "invalid_mac_integration_permission",
-                        "message": "A known integration id and exact read/write booleans are required.",
-                    ])
-                }
-                let recovered = try await MacIntegrationPermissionStore.shared.setWithReceipt(
-                    integrationId: request.id,
-                    read: request.read,
-                    write: request.write,
-                    actionID: action.msgId,
-                    surface: "ios_icloud",
-                    provenance: .signedIOS(clientID: action.clientId)
-                )
-                sync.macIntegrationPermissions.push(
-                    id: request.id,
-                    read: recovered.read,
-                    write: recovered.write
-                )
-                return observed([
-                    "status": "ok",
-                    "ok": "true",
-                    "id": request.id,
-                    "read": String(recovered.read),
-                    "write": String(recovered.write),
-                ])
-
             case "mac_control":
                 return try await api.remoteMacControl(payload: payload)
 
@@ -796,15 +777,6 @@ struct MacSyncActionRouter {
             ])
         } catch {
             return observed(["status": "error", "message": error.localizedDescription])
-        }
-    }
-
-    private func iCloudActionDenial(_ action: InboxAction) -> String? {
-        switch action.action {
-        case "permissionPolicy":
-            return "Permission policy changes must be run locally on the Mac."
-        default:
-            return nil
         }
     }
 

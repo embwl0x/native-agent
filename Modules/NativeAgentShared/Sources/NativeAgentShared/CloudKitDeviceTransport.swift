@@ -109,12 +109,12 @@ private func withDeviceCKTimeout<T: Sendable>(
         switch first {
         case .success(let value): return value
         case .failure(let error):
-            NSLog("[ck-device] \(label) failed: \(error)"); return nil
+            nativeLog("[ck-device] \(label) failed: \(error)"); return nil
         case .failureError(let error):
             await onFailure?(error)
-            NSLog("[ck-device] \(label) failed: \(error)"); return nil
+            nativeLog("[ck-device] \(label) failed: \(error)"); return nil
         case .timedOut:
-            NSLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
+            nativeLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
             return nil
         case .cancelled:
             return nil
@@ -164,7 +164,7 @@ private func withDeviceCKTimeoutThrowing<T: Sendable>(
             throw e
         case .failure(let msg): throw DeviceSyncError.transient(message: msg)
         case .timedOut:
-            NSLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
+            nativeLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
             throw DeviceCKLandmineTimeout(label: label, seconds: seconds)
         case .cancelled:
             throw CancellationError()
@@ -221,20 +221,30 @@ final class DeviceCKPullPageHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var items: [NAChatMessageFields] = []
     private var firstError: Error?
+    private var payloadError: DeviceSyncError?
     func add(_ r: NAChatMessageFields) { lock.lock(); items.append(r); lock.unlock() }
     func fail(_ error: Error) {
         lock.lock(); defer { lock.unlock() }
         if firstError == nil { firstError = error }
     }
-    func snapshot() throws -> [NAChatMessageFields] {
+    func failPayload(_ error: DeviceSyncError) {
+        lock.lock(); defer { lock.unlock() }
+        if payloadError == nil { payloadError = error }
+    }
+    func snapshot() throws -> (records: [NAChatMessageFields], payloadError: DeviceSyncError?) {
         lock.lock(); defer { lock.unlock() }
         if let firstError { throw firstError }
-        return items
+        return (items, payloadError)
     }
 }
 
+private struct DeviceCKPullResult: Sendable {
+    var records: [(fields: NAChatMessageFields, modDate: Date?)] = []
+    var payloadError: DeviceSyncError?
+}
+
 private struct DeviceCKPullCheckpoint {
-    var records: [(fields: NAChatMessageFields, modDate: Date?)]
+    var result: DeviceCKPullResult
     var cursor: CKQueryOperation.Cursor
 }
 
@@ -258,10 +268,11 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     private let lock = NSLock()
     private var incomingHandler: (@Sendable (BridgeMessage) async -> Bool)?
-    private var cancellationAdmission: (@Sendable (BridgeMessage) async -> Bool)?
-    private var cancellationDrainInFlight = false
+    private var controlAdmission: (@Sendable (BridgeMessage) async -> Bool)?
+    private var controlDrainInFlight = false
     private var pairingHandler: (@Sendable (Data) async -> Bool)?
-    private var statusWrites: [String: Task<Void, Error>] = [:]
+    private var statusWrites: [String: Task<Void, Never>] = [:]
+    private var pendingStatusWrites: [String: (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)] = [:]
     private var statusHandlers: [String: @Sendable (String, Date?) async -> Bool] = [:]
     private var lastPullDate: Date?
     private var lastPullCursorPersistenceAt: Date?
@@ -320,6 +331,49 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private var seenMessageIDsOrdered: [String] = []
     private let seenMessageIDsCap = 2000
     private var accountFailureHandler: (@Sendable (DeviceSyncAccountFailure) async -> Void)?
+    private var assetSecretProvider: (@Sendable () async -> Data?)?
+
+    public func useAssetSecret(_ provider: @escaping @Sendable () async -> Data?) {
+        lock.lock(); defer { lock.unlock() }
+        assetSecretProvider = provider
+    }
+
+    private func loadAssetSecretProvider() -> (@Sendable () async -> Data?)? {
+        lock.lock(); defer { lock.unlock() }
+        return assetSecretProvider
+    }
+
+    private static func assetContext(recordName: String, direction: String) -> Data {
+        Data("NativeAgent.chat.asset.v1:\(recordName):\(direction)".utf8)
+    }
+
+    private static func assetKey(_ secret: Data) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: secret),
+            salt: Data("NativeAgent.chat.asset.v1".utf8), info: Data("aes-256-gcm".utf8), outputByteCount: 32)
+    }
+
+    private static func payload(in record: CKRecord, secret: Data?) throws -> String {
+        if let asset = record["payloadAsset"] as? CKAsset {
+            guard let url = asset.fileURL, let secret,
+                  secret.count == 32,
+                  let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                  size <= NAChatMessageCodec.maxAssetPayloadBytes + 64 else {
+                throw DeviceSyncError.underlying(message: "The encrypted chat attachment is unavailable. Check pairing and retry delivery.")
+            }
+            let box = try AES.GCM.SealedBox(combined: Data(contentsOf: url))
+            let bytes = try AES.GCM.open(box, using: assetKey(secret),
+                authenticating: assetContext(recordName: record.recordID.recordName, direction: (record["direction"] as? String) ?? ""))
+            guard bytes.count <= NAChatMessageCodec.maxAssetPayloadBytes,
+                  let text = String(data: bytes, encoding: .utf8) else {
+                throw DeviceSyncError.underlying(message: "The encrypted chat attachment is malformed.")
+            }
+            return text
+        }
+        guard let text = record["payloadJSON"] as? String, !text.isEmpty else {
+            throw DeviceSyncError.underlying(message: "The chat payload is missing.")
+        }
+        return text
+    }
 
     public func observeAccountFailures(_ handler: @escaping @Sendable (DeviceSyncAccountFailure) async -> Void) {
         lock.lock(); defer { lock.unlock() }
@@ -410,16 +464,59 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
         let fields = try NAChatMessageCodec.encode(message)
         let recordType = Self.recordType(for: fields)
+        let usesAsset = NAChatMessageCodec.usesAsset(fields)
+        var assetURL: URL?
+        var legacyFields: NAChatMessageFields?
+        if usesAsset {
+            guard let secret = await loadAssetSecretProvider()?(), secret.count == 32 else {
+                throw DeviceSyncError.underlying(message: "Pairing is required to encrypt this attachment.")
+            }
+            // 0.5.1 reads only payloadJSON, then claims the record. Give that
+            // phone a signed reading copy while newer peers decrypt the asset.
+            if fields.direction == NAChatDirection.mac2ios.rawValue {
+                var text = message.text
+                while true {
+                    let notice = "\n\nThe image is on the Mac."
+                        + (text == message.text ? "" : "\nThe rest of the reply is on the Mac.")
+                    let preview = try BridgeMessage.make(id: message.id, sender: message.sender,
+                        text: text + notice, sessionID: message.sessionID, correlationID: message.correlationID,
+                        metadata: message.metadata, timestamp: message.timestamp).signed(with: secret)
+                    do {
+                        legacyFields = try NAChatMessageCodec.encode(preview)
+                        break
+                    } catch DeviceSyncError.payloadTooLarge(_, _) where !text.isEmpty {
+                        text = String(text.prefix(text.count / 2))
+                    }
+                }
+            }
+            let box = try AES.GCM.seal(Data(fields.payloadJSON.utf8), using: Self.assetKey(secret),
+                authenticating: Self.assetContext(recordName: fields.recordName, direction: fields.direction))
+            guard let bytes = box.combined else { throw DeviceSyncError.underlying(message: "Attachment encryption failed.") }
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("nativeagent-chat-\(UUID().uuidString).sealed")
+            do {
+                try bytes.write(to: url, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            } catch {
+                try? FileManager.default.removeItem(at: url)
+                throw error
+            }
+            assetURL = url
+        }
+        let preparedAssetURL = assetURL
+        let preparedLegacyFields = legacyFields
         do {
             try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send", onFailure: accountFailureReporter) {
+                defer { if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) } }
                 let ck = CKRecord(
                     recordType: recordType,
                     recordID: CKRecord.ID(recordName: fields.recordName)
                 )
                 ck["direction"] = fields.direction as CKRecordValue
                 if let s = fields.sessionId { ck["sessionId"] = s as CKRecordValue }
-                ck["text"] = fields.text as CKRecordValue
-                ck["payloadJSON"] = fields.payloadJSON as CKRecordValue
+                ck["text"] = (preparedLegacyFields?.text ?? fields.text) as CKRecordValue
+                if let preparedAssetURL { ck["payloadAsset"] = CKAsset(fileURL: preparedAssetURL) }
+                if let preparedLegacyFields { ck["payloadJSON"] = preparedLegacyFields.payloadJSON as CKRecordValue }
+                else if preparedAssetURL == nil { ck["payloadJSON"] = fields.payloadJSON as CKRecordValue }
                 ck["createdAt"] = fields.createdAt as CKRecordValue
                 ck["senderDevice"] = fields.senderDevice as CKRecordValue
                 if let k = fields.kind { ck["kind"] = k as CKRecordValue }
@@ -493,12 +590,13 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     }
 
     private func existingMessageRecordMatches(_ fields: NAChatMessageFields) async -> Bool {
-        await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof", onFailure: accountFailureReporter) {
+        let secret = await loadAssetSecretProvider()?()
+        return await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof", onFailure: accountFailureReporter) {
             let record = try await self.database.record(
                 for: CKRecord.ID(recordName: fields.recordName)
             )
             return NAChatMessageCodec.isExactIdempotentReplay(
-                existingPayloadJSON: record["payloadJSON"] as? String,
+                existingPayloadJSON: try Self.payload(in: record, secret: secret),
                 existingDirection: record["direction"] as? String,
                 intended: fields
             )
@@ -509,7 +607,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     public func observeIncoming(_ onMessage: @escaping @Sendable (BridgeMessage) async -> Bool) async {
         guard configured else {
-            NSLog("[ck-device] observeIncoming: CloudKit entitlement absent — not subscribing (notConfigured). Legacy transport should own delivery.")
+            nativeLog("[ck-device] observeIncoming: CloudKit entitlement absent — not subscribing (notConfigured). Legacy transport should own delivery.")
             return
         }
         setIncomingHandler(onMessage)  // last registration wins (single forwarder)
@@ -531,7 +629,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             // Fail loud (no-silent-fallbacks): a failed subscription means no
             // live push wakeups — the drain still works when polled, but callers
             // must not describe the visual route as eligible.
-            NSLog("[ck-device] subscription registration FAILED (no live push): \(error)")
+            nativeLog("[ck-device] subscription registration FAILED (no live push): \(error)")
             devicePushLog.error("Chat subscription failed role=\(self.role.rawValue, privacy: .public): \(String(describing: error), privacy: .private)")
             return false
         }
@@ -547,7 +645,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         // CK-3c: serialize via SYNC lock helpers (the codebase keeps every NSLock
         // use in a synchronous scope — never held across an await). The body's own
         // fine-grained locking still works since the slot flag isn't held here.
-        guard beginDrainOrCoalesce() else { return .skipped(await drainIncomingCancellations()) }
+        guard beginDrainOrCoalesce() else { return .skipped(await drainIncomingControls()) }
         var total = 0
         var outcome: DeviceSyncDrainResult = .skipped(0)
         while true {
@@ -588,7 +686,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         let queryStartedAt = Date()
 
         let inbound = role.inboundDirection.rawValue
-        let fetched: [(fields: NAChatMessageFields, modDate: Date?)]
+        let fetched: DeviceCKPullResult
         do {
             var records = try await pull(
                 recordType: NADeviceSyncRecordType.chatMessage,
@@ -596,37 +694,37 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 inboundDirection: inbound
             )
             if role == .ios {
-                records += try await pull(
+                let notifications = try await pull(
                     recordType: NADeviceSyncRecordType.notification,
                     since: since,
                     inboundDirection: inbound
                 )
+                records.records += notifications.records
+                records.payloadError = records.payloadError ?? notifications.payloadError
             }
             fetched = records
         } catch {
-            NSLog("[ck-device] drainIncoming pull failed: \(error)")
+            nativeLog("[ck-device] drainIncoming pull failed: \(error)")
             return .failure(Self.mapError(error))
         }
 
-        return .success(await deliverIncoming(fetched, since: since, queryStartedAt: queryStartedAt))
+        let dispatched = await deliverIncoming(fetched.records, since: since, queryStartedAt: queryStartedAt,
+                                               advanceCursor: fetched.payloadError == nil)
+        if let error = fetched.payloadError { return .failure(error, dispatched: dispatched) }
+        return .success(dispatched)
     }
 
-    func deliverIncoming(_ fetched: [(fields: NAChatMessageFields, modDate: Date?)], since: Date?, queryStartedAt: Date) async -> Int {
+    func deliverIncoming(_ fetched: [(fields: NAChatMessageFields, modDate: Date?)], since: Date?, queryStartedAt: Date,
+                         advanceCursor: Bool = true) async -> Int {
         guard let handler = loadHandlerAndCursor().0 else { return 0 }
         let inbound = role.inboundDirection.rawValue
         // Deliver in chronological order — CloudKit query order is undefined.
         // Sort ascending by server modDate, then createdAt, then id.
-        let sorted = fetched.sorted { a, b in
-            let am = a.modDate ?? .distantPast, bm = b.modDate ?? .distantPast
-            if am != bm { return am < bm }
-            if a.fields.createdAt != b.fields.createdAt { return a.fields.createdAt < b.fields.createdAt }
-            return a.fields.recordName < b.fields.recordName
-        }
+        let sorted = Self.orderedIncoming(fetched)
 
-        // Stops in this very batch must reach the run registry before awaiting
-        // a chat. The registry retains a scoped Stop during run acceptance.
-        guard let cancellations = await deliverCancellations(fetched) else { return 0 }
-        var dispatched = cancellations
+        // Controls in this batch must reach their owners before awaiting chat.
+        guard let controls = await deliverControls(sorted) else { return 0 }
+        var dispatched = controls
         // The cursor may only advance to the last point BEFORE the first
         // UNDELIVERED inbound record — a rejected message must never be skipped.
         // Delivered / already-seen / not-for-us records advance it; the first
@@ -636,7 +734,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         for item in sorted {
             // A concurrent cancellation has not yet earned acknowledgement.
             // Never advance the ordinary cursor past its temporary claim.
-            if isCancellationDrainInFlight() { halted = true; break }
+            if isControlDrainInFlight() { halted = true; break }
             if !NADeviceSyncRecoveryBudget.hasTime { halted = true; break }
             if halted && role != .ios { break }
             let m = item.modDate
@@ -653,7 +751,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 continue
             }
             guard let message = try? NAChatMessageCodec.decode(item.fields) else {
-                NSLog("[ck-device] drainIncoming: undecodable payload for \(id)")
+                nativeLog("[ck-device] drainIncoming: undecodable payload for \(id)")
                 if !halted, let m { cursorAdvance = m }    // poison — keep it claimed, pass
                 continue
             }
@@ -668,12 +766,12 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 // row unclaimed and the cursor pinned, but deliver later replies.
             }
         }
-        if isCancellationDrainInFlight() { halted = true }
+        if isControlDrainInFlight() { halted = true }
         // Keep a sliding 30s overlap (matches the memory framework). An idle
         // successful query must still move an established cursor forward;
         // otherwise a quiet bridge re-queries from the date of its last record
         // forever. A halted delivery never advances past the rejected row.
-        if let nextCursor = Self.nextPullCursor(
+        if advanceCursor, let nextCursor = Self.nextPullCursor(
             previousCursor: since,
             queryStartedAt: queryStartedAt,
             safeRecordDate: cursorAdvance,
@@ -687,65 +785,79 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return dispatched
     }
 
-    /// Mac-only admission; the bridge authenticates run-scoped Stops and handoffs.
+    private static func orderedIncoming(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) -> [(fields: NAChatMessageFields, modDate: Date?)] {
+        records.sorted { a, b in
+            let am = a.modDate ?? .distantPast, bm = b.modDate ?? .distantPast
+            if am != bm { return am < bm }
+            if a.fields.createdAt != b.fields.createdAt { return a.fields.createdAt < b.fields.createdAt }
+            return a.fields.recordName < b.fields.recordName
+        }
+    }
+
+    /// Mac-only admission; the bridge authenticates phone actions and handoffs.
     /// Ordinary chat delivery and its terminal receipt retain their original owner.
-    public func setCancellationAdmission(_ admission: @escaping @Sendable (BridgeMessage) async -> Bool) {
+    public func setControlAdmission(_ admission: @escaping @Sendable (BridgeMessage) async -> Bool) {
         lock.lock(); defer { lock.unlock() }
-        cancellationAdmission = admission
+        controlAdmission = admission
     }
 
     @discardableResult
-    public func drainIncomingCancellations() async -> Int {
+    public func drainIncomingControls() async -> Int {
         guard configured, role == .mac, NADeviceSyncRecoveryBudget.hasTime,
-              loadCancellationAdmission() != nil, beginCancellationDrain() else { return 0 }
-        defer { endCancellationDrain() }
+              loadControlAdmission() != nil, beginControlDrain() else { return 0 }
+        defer { endControlDrain() }
         let (_, since) = loadHandlerAndCursor()
         do {
             let records = try await pull(recordType: NADeviceSyncRecordType.chatMessage,
                                          since: since, inboundDirection: role.inboundDirection.rawValue)
-            return await deliverAdmittedCancellations(records)
+            if let error = records.payloadError { nativeLog("[ck-device] cancellation payload failed: %@", error.localizedDescription) }
+            return await deliverAdmittedControls(Self.orderedIncoming(records.records))
         } catch {
-            NSLog("[ck-device] cancellation pull failed: \(error)")
+            nativeLog("[ck-device] cancellation pull failed: \(error)")
             return 0
         }
     }
 
-    private func isCancellationDrainInFlight() -> Bool {
+    private func isControlDrainInFlight() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return cancellationDrainInFlight
+        return controlDrainInFlight
     }
 
-    private func beginCancellationDrain() -> Bool {
+    private func beginControlDrain() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !cancellationDrainInFlight else { return false }
-        cancellationDrainInFlight = true
+        guard !controlDrainInFlight else { return false }
+        controlDrainInFlight = true
         return true
     }
 
-    private func endCancellationDrain() {
+    private func endControlDrain() {
         lock.lock(); defer { lock.unlock() }
-        cancellationDrainInFlight = false
+        controlDrainInFlight = false
     }
 
-    private func loadCancellationAdmission() -> (@Sendable (BridgeMessage) async -> Bool)? {
+    private func loadControlAdmission() -> (@Sendable (BridgeMessage) async -> Bool)? {
         lock.lock(); defer { lock.unlock() }
-        return cancellationAdmission
+        return controlAdmission
     }
 
-    func deliverCancellations(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) async -> Int? {
-        guard role == .mac, loadCancellationAdmission() != nil else { return 0 }
-        guard beginCancellationDrain() else { return nil }
-        defer { endCancellationDrain() }
-        return await deliverAdmittedCancellations(records)
+    func deliverControls(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) async -> Int? {
+        guard role == .mac, loadControlAdmission() != nil else { return 0 }
+        guard beginControlDrain() else { return nil }
+        defer { endControlDrain() }
+        return await deliverAdmittedControls(records)
     }
 
-    private func deliverAdmittedCancellations(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) async -> Int {
-        guard let admission = loadCancellationAdmission(),
+    private func deliverAdmittedControls(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) async -> Int {
+        guard let admission = loadControlAdmission(),
               let handler = loadHandlerAndCursor().0 else { return 0 }
         var delivered = 0
         for record in records {
             guard NADeviceSyncRecoveryBudget.hasTime else { break }
+            // A record this Mac already took is never admitted again, so skip
+            // its decode and signature check: a pinned cursor re-pulls the
+            // same rows every drain (perf sweep 2026-10-05).
             guard record.fields.direction == role.inboundDirection.rawValue,
+                  !isSeen(Self.deliveryClaimKey(record.fields)),
                   let message = try? NAChatMessageCodec.decode(record.fields),
                   await admission(message), claimIfUnseen(Self.deliveryClaimKey(record.fields)) else { continue }
             if await handler(message) {
@@ -852,17 +964,15 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             if outcome.deleteTimedOut { timedOut = true }
         }
         setRetentionBacklog(backlog)
-        // 2026-09-06: a delete batch that timed out may still have been applied
-        // by the server — the timeout is on OUR wait, not on the operation. Say
-        // the count is unknown rather than logging a confident zero.
+        // Cancellation cannot prove the server rejected a timed-out batch.
         if timedOut {
-            NSLog(
+            nativeLog(
                 "[ck-device] retention sweep: %d confirmed deletion(s) before %@, plus a batch whose delete timed out — that batch's count is unknown",
                 deleted,
                 "\(cutoff)"
             )
         } else {
-            NSLog(
+            nativeLog(
                 "[ck-device] retention sweep deleted %d record(s) modified before %@",
                 deleted,
                 "\(cutoff)"
@@ -922,7 +1032,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 )
             }
         } catch {
-            NSLog("[ck-device] retention sweep query failed for %@: %@", recordType, String(describing: error))
+            nativeLog("[ck-device] retention sweep query failed for %@: %@", recordType, String(describing: error))
             // A stored cursor can go stale on the server; keeping it would make
             // every later sweep fail the same way. Drop it and walk again from
             // the oldest record next time.
@@ -964,12 +1074,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 try await self.performModifyRecords(op)
             }
         } catch is DeviceCKLandmineTimeout {
-            // 2026-09-06: the timeout is on our WAIT, not on the operation —
-            // cloudd may well apply the delete after we stop listening. Report
-            // the batch as unknown; counting it as zero deletions understated
-            // the sweep and, before the page-based backlog signal, also lied
-            // about whether there was still a backlog.
-            NSLog(
+            // Keep the batch count unknown until server acceptance is proven.
+            nativeLog(
                 "[ck-device] retention sweep delete batch of %d timed out for %@; the server may still have applied it — count unknown",
                 names.count,
                 recordType
@@ -977,7 +1083,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             outcome.deleteTimedOut = true
             return outcome
         } catch {
-            NSLog("[ck-device] retention sweep delete failed for %@: %@", recordType, String(describing: error))
+            nativeLog("[ck-device] retention sweep delete failed for %@: %@", recordType, String(describing: error))
             return outcome
         }
         outcome.deleted = names.count
@@ -1021,7 +1127,14 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         if let resumeCursor {
             op = CKQueryOperation(cursor: resumeCursor)
         } else {
-            let query = CKQuery(recordType: recordType, predicate: NSPredicate(value: true))
+            // 2026-10-07: TRUEPREDICATE needs a queryable recordName, which the
+            // deployed NANotification type lacks ("Field 'recordName' is not
+            // marked queryable", every sweep). Filter on the indexed direction
+            // the pull already uses; every record carries one of the two.
+            let query = CKQuery(recordType: recordType, predicate: NSPredicate(
+                format: "direction IN %@",
+                [NAChatDirection.mac2ios.rawValue, NAChatDirection.ios2mac.rawValue]
+            ))
             query.sortDescriptors = [
                 NSSortDescriptor(key: orderByServerModDate ? "modificationDate" : "createdAt", ascending: true)
             ]
@@ -1051,7 +1164,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 case .failure(let err):
                     if carriesSortDescriptor,
                        orderByServerModDate,
-                       (err as? CKError)?.code == .invalidArguments {
+                       Self.rejectsServerModDateSort(err) {
                         cont.resume(throwing: DeviceCKUnsortableField())
                     } else {
                         cont.resume(throwing: Self.mapError(err))
@@ -1060,6 +1173,16 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             }
             self.database.add(op)
         }
+    }
+
+    /// 2026-10-07: only a rejection that names the server-date field means the
+    /// sort index is missing. Any other `.invalidArguments` (the sweep's
+    /// non-queryable recordName was one) must not latch that type into the
+    /// createdAt order for the rest of the process.
+    static func rejectsServerModDateSort(_ error: Error) -> Bool {
+        guard (error as? CKError)?.code == .invalidArguments else { return false }
+        let text = String(describing: error)
+        return text.contains("modTime") || text.contains("modificationDate")
     }
 
     // MARK: pairing
@@ -1092,7 +1215,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     public func observePairing(onChange: @escaping @Sendable (Data) async -> Bool) async {
         guard configured else {
-            NSLog("[ck-device] observePairing: CloudKit entitlement absent — not subscribing (notConfigured).")
+            nativeLog("[ck-device] observePairing: CloudKit entitlement absent — not subscribing (notConfigured).")
             return
         }
         setPairingHandler(onChange)  // last registration wins (single forwarder)
@@ -1103,7 +1226,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         do {
             try await subscribeToPairingChanges()
         } catch {
-            NSLog("[ck-device] observePairing: subscription registration FAILED (no live push): \(error)")
+            nativeLog("[ck-device] observePairing: subscription registration FAILED (no live push): \(error)")
         }
         await drainPairing()
     }
@@ -1158,43 +1281,114 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         let updatedAt = isoNow()
         // The lane belongs to the actual CloudKit completion, not the caller's
         // bounded wait. A timed-out write must settle before a successor starts.
-        let write = enqueueStatusWrite(key: key) {
-                let ck = CKRecord(
-                    recordType: recordType,
-                    recordID: CKRecord.ID(recordName: recordName)
-                )
-                ck["key"] = key as CKRecordValue
-                ck["value"] = value as CKRecordValue
-                ck["role"] = self.role.rawValue as CKRecordValue
-                ck["updatedAt"] = updatedAt as CKRecordValue
-                let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
-                op.savePolicy = .changedKeys
-                op.qualityOfService = .utility
-                try await self.performModifyRecords(op)
-        }
         do {
             // 2026-10-04: a cold-launch status write measured 4.6 s and landed; 3 s called it failed.
             try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 15, onFailure: accountFailureReporter) {
-                try await write.value
+                try await self.enqueueStatusWrite(key: key) {
+                    let ck = CKRecord(
+                        recordType: recordType,
+                        recordID: CKRecord.ID(recordName: recordName)
+                    )
+                    ck["key"] = key as CKRecordValue
+                    ck["value"] = value as CKRecordValue
+                    ck["role"] = self.role.rawValue as CKRecordValue
+                    ck["updatedAt"] = updatedAt as CKRecordValue
+                    let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
+                    op.savePolicy = .changedKeys
+                    op.qualityOfService = .utility
+                    try await self.performModifyRecords(op)
+                }
             }
         } catch is DeviceCKLandmineTimeout {
             throw DeviceSyncError.transient(message: "CloudKit setStatus timed out")
         }
     }
 
+    // MARK: presence
+
+    /// One fixed record per pairing, updated in place. It rides the NANotification type
+    /// because that type's subscription fires on CREATION only: an update
+    /// wakes nobody, so the beat costs the phone no push. It has no
+    /// `direction`, so the incoming pull never returns it, and it is modified
+    /// every beat, so the retention sweep never reaches it. A type of its own
+    /// would need a production schema deploy.
+    private static func presenceRecordName(pairingSecret: Data) -> String {
+        let identity = HMAC<SHA256>.authenticationCode(for: Data("NativeAgent.presence.identity.v1".utf8),
+                                                     using: SymmetricKey(data: pairingSecret))
+        return "presence.mac." + identity.map { String(format: "%02x", $0) }.joined()
+    }
+
+    public func setPresence(pairingSecret: Data) async throws {
+        guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
+        guard pairingSecret.count == 32 else { throw DeviceSyncError.notConfigured }
+        let recordName = Self.presenceRecordName(pairingSecret: pairingSecret)
+        do {
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setPresence", seconds: 15, onFailure: accountFailureReporter) {
+                try await self.enqueueStatusWrite(key: recordName) {
+                    let timestamp = self.isoNow()
+                    let ck = CKRecord(
+                        recordType: NADeviceSyncRecordType.notification,
+                        recordID: CKRecord.ID(recordName: recordName)
+                    )
+                    ck["kind"] = "presence" as CKRecordValue
+                    ck["createdAt"] = timestamp as CKRecordValue
+                    let signature = HMAC<SHA256>.authenticationCode(for: Data("\(recordName):\(timestamp)".utf8),
+                                                                  using: SymmetricKey(data: pairingSecret))
+                    ck["payloadJSON"] = Data(signature).base64EncodedString() as CKRecordValue
+                    let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
+                    op.savePolicy = .changedKeys
+                    op.qualityOfService = .utility
+                    try await self.performModifyRecords(op)
+                }
+            }
+        } catch is DeviceCKLandmineTimeout {
+            throw DeviceSyncError.transient(message: "CloudKit setPresence timed out")
+        }
+    }
+
+    public func peerPresence(pairingSecret: Data) async -> Date? {
+        guard configured else { return nil }  // crash-guard: record(for:) touches CKContainer
+        guard pairingSecret.count == 32 else { return nil }
+        let recordName = Self.presenceRecordName(pairingSecret: pairingSecret)
+        return await withDeviceCKTimeout("CloudKitDeviceTransport.peerPresence", seconds: 3, onFailure: accountFailureReporter) {
+            let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
+            guard record["kind"] as? String == "presence",
+                  let timestamp = record["createdAt"] as? String,
+                  let encoded = record["payloadJSON"] as? String, let signature = Data(base64Encoded: encoded),
+                  HMAC<SHA256>.isValidAuthenticationCode(signature, authenticating: Data("\(recordName):\(timestamp)".utf8),
+                                                       using: SymmetricKey(data: pairingSecret)) else { return nil }
+            // The signature authenticates the beat; CloudKit dates its freshness.
+            return record.modificationDate
+        } ?? nil
+    }
+
     private func enqueueStatusWrite(
         key: String,
         work: @escaping @Sendable () async throws -> Void
-    ) -> Task<Void, Error> {
-        lock.lock()
-        defer { lock.unlock() }
-        let previous = statusWrites[key]
-        let write = Task.detached(priority: .utility) {
-            _ = await previous?.result
-            try await work()
+    ) async throws {
+        try await withCheckedThrowingContinuation { (completion: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            defer { lock.unlock() }
+            // Keep one operation and the latest replacement. Each caller owns
+            // its result, including a value displaced before it reached the wire.
+            pendingStatusWrites.removeValue(forKey: key)?.completion.resume(
+                throwing: DeviceSyncError.transient(message: "CloudKit status write was superseded before sending."))
+            pendingStatusWrites[key] = (work, completion)
+            guard statusWrites[key] == nil else { return }
+            statusWrites[key] = Task.detached(priority: .utility) {
+                while let pending = self.nextStatusWrite(key: key) {
+                    do { try await pending.work(); pending.completion.resume() }
+                    catch { pending.completion.resume(throwing: error) }
+                }
+            }
         }
-        statusWrites[key] = write
-        return write
+    }
+
+    private func nextStatusWrite(key: String) -> (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)? {
+        lock.lock(); defer { lock.unlock() }
+        let work = pendingStatusWrites.removeValue(forKey: key)
+        if work == nil { statusWrites.removeValue(forKey: key) }
+        return work
     }
 
     public func observeStatus(key: String, onChange: @escaping @Sendable (String) async -> Void) async {
@@ -1216,7 +1410,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     public func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async {
         guard configured else {
-            NSLog("[ck-device] observeStatus: CloudKit entitlement absent — not subscribing (notConfigured).")
+            nativeLog("[ck-device] observeStatus: CloudKit entitlement absent — not subscribing (notConfigured).")
             return
         }
         setStatusHandler(key: key, onApply)
@@ -1226,7 +1420,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         do {
             try await subscribeToStatusChanges()
         } catch {
-            NSLog("[ck-device] observeStatus: subscription registration FAILED (no live push): \(error)")
+            nativeLog("[ck-device] observeStatus: subscription registration FAILED (no live push): \(error)")
         }
         await drainStatus()
     }
@@ -1469,7 +1663,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             let zoneMatches = (existing as? CKQuerySubscription)?.zoneID
                 == (subscription as? CKQuerySubscription)?.zoneID
             devicePushLog.notice("Subscription repair role=\(self.role.rawValue, privacy: .public) id=\(id, privacy: .public) zoneMatches=\(zoneMatches)")
-            NSLog("[ck-device] repairing stale subscription shape for \(id)")
+            nativeLog("[ck-device] repairing stale subscription shape for \(id)")
         } catch let error as CKError where error.code == .unknownItem {
             // Absent is the only state that authorizes a create attempt.
         } catch {
@@ -1576,7 +1770,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         recordType: String,
         since: Date?,
         inboundDirection: String
-    ) async throws -> [(fields: NAChatMessageFields, modDate: Date?)] {
+    ) async throws -> DeviceCKPullResult {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
         do {
             return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull", onFailure: accountFailureReporter) {
@@ -1589,7 +1783,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                             orderByServerModDate: true
                         )
                     } catch is DeviceCKUnsortableField {
-                        NSLog("[ck-device] pull: %@ has no sortable ___modTime index; falling back to createdAt order", recordType)
+                        nativeLog("[ck-device] pull: %@ has no sortable ___modTime index; falling back to createdAt order", recordType)
                         self.markServerModDateSortRejected(recordType: recordType)
                     }
                 }
@@ -1610,7 +1804,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         since: Date?,
         inboundDirection: String,
         orderByServerModDate: Bool
-    ) async throws -> [(fields: NAChatMessageFields, modDate: Date?)] {
+    ) async throws -> DeviceCKPullResult {
         let query = CKQuery(
             recordType: recordType,
             predicate: Self.makePullPredicate(inboundDirection: inboundDirection)
@@ -1618,11 +1812,12 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         query.sortDescriptors = [
             NSSortDescriptor(key: orderByServerModDate ? "modificationDate" : "createdAt", ascending: false)
         ]
+        let assetSecret = await loadAssetSecretProvider()?()
 
         let checkpointKey = recordType + ":" + inboundDirection
         let owner = UUID()
         let checkpoint = orderByServerModDate ? nil : beginFallbackPull(checkpointKey, owner: owner)
-        var combined = checkpoint?.records ?? []
+        var combined = checkpoint?.result ?? DeviceCKPullResult()
         var nextCursor = checkpoint?.cursor
         var firstPage = checkpoint == nil
 
@@ -1640,7 +1835,10 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 break
             }
             op.qualityOfService = .userInitiated
-            op.resultsLimit = 200
+            // The container cannot filter by the watermark, so every poll's
+            // first page is fetched whole; a quiet poll's first page almost
+            // always reaches it. Keep that page small; a burst pages on at 200.
+            op.resultsLimit = carriesSortDescriptor && orderByServerModDate ? 25 : 200
 
             let holder = DeviceCKPullPageHolder()
             let modHolder = DeviceCKModDateHolder()
@@ -1649,21 +1847,29 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 case .failure(let error):
                     holder.fail(error)
                 case .success(let ck):
-                    let fields = NAChatMessageFields(
-                        recordName: ck.recordID.recordName,
-                        direction: (ck["direction"] as? String) ?? "",
-                        sessionId: ck["sessionId"] as? String,
-                        text: (ck["text"] as? String) ?? "",
-                        payloadJSON: (ck["payloadJSON"] as? String) ?? "",
-                        createdAt: (ck["createdAt"] as? String) ?? "",
-                        senderDevice: (ck["senderDevice"] as? String) ?? "",
-                        kind: ck["kind"] as? String,
-                        notificationTitle: ck["notificationTitle"] as? String,
-                        notificationScreen: ck["notificationScreen"] as? String,
-                        notificationEventID: ck["notificationEventId"] as? String
-                    )
-                    holder.add(fields)
-                    modHolder.set(fields.recordName, ck.modificationDate)
+                    modHolder.set(ck.recordID.recordName, ck.modificationDate)
+                    // Old records are paging evidence, not delivery candidates.
+                    // A previous pairing key must not be needed to pass them.
+                    if let since, let date = ck.modificationDate, date <= since { return }
+                    do {
+                        let fields = NAChatMessageFields(
+                            recordName: ck.recordID.recordName,
+                            direction: (ck["direction"] as? String) ?? "",
+                            sessionId: ck["sessionId"] as? String,
+                            text: (ck["text"] as? String) ?? "",
+                            payloadJSON: try Self.payload(in: ck, secret: assetSecret),
+                            createdAt: (ck["createdAt"] as? String) ?? "",
+                            senderDevice: (ck["senderDevice"] as? String) ?? "",
+                            kind: ck["kind"] as? String,
+                            notificationTitle: ck["notificationTitle"] as? String,
+                            notificationScreen: ck["notificationScreen"] as? String,
+                            notificationEventID: ck["notificationEventId"] as? String
+                        )
+                        holder.add(fields)
+                    } catch {
+                        nativeLog("[ck-device] chat payload unavailable for %@: %@", ck.recordID.recordName, error.localizedDescription)
+                        holder.failPayload(Self.mapError(error))
+                    }
                 }
             }
 
@@ -1671,13 +1877,14 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             // MemoryV2's fix): never mutate the captured `nextCursor` from
             // inside the @Sendable queryResultBlock — that was a real
             // callback data race.
-            let page: (records: [NAChatMessageFields], cursor: CKQueryOperation.Cursor?) =
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [NAChatMessageFields], cursor: CKQueryOperation.Cursor?), Error>) in
+            let page: (records: [NAChatMessageFields], payloadError: DeviceSyncError?, cursor: CKQueryOperation.Cursor?) =
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [NAChatMessageFields], payloadError: DeviceSyncError?, cursor: CKQueryOperation.Cursor?), Error>) in
                     op.queryResultBlock = { result in
                         switch result {
                         case .success(let cursor):
                             do {
-                                cont.resume(returning: (try holder.snapshot(), cursor))
+                                let snapshot = try holder.snapshot()
+                                cont.resume(returning: (snapshot.records, snapshot.payloadError, cursor))
                             } catch {
                                 cont.resume(throwing: Self.mapError(error))
                             }
@@ -1698,7 +1905,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                             // restarts the pull from it.
                             if carriesSortDescriptor,
                                orderByServerModDate,
-                               (err as? CKError)?.code == .invalidArguments {
+                               Self.rejectsServerModDateSort(err) {
                                 cont.resume(throwing: DeviceCKUnsortableField())
                             } else {
                                 cont.resume(throwing: Self.mapError(err))
@@ -1709,17 +1916,18 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 }
             guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
             for f in page.records {
-                combined.append((f, modHolder.get(f.recordName)))
+                combined.records.append((f, modHolder.get(f.recordName)))
             }
+            combined.payloadError = combined.payloadError ?? page.payloadError
             let crossedWatermark = Self.pullPageCrossesWatermark(
                 orderByServerModDate: orderByServerModDate,
                 since: since,
-                modificationDates: page.records.map { modHolder.get($0.recordName) }
+                modificationDates: modHolder.dates()
             )
             nextCursor = crossedWatermark ? nil : page.cursor
             if !orderByServerModDate {
                 saveFallbackPull(nextCursor.map {
-                    DeviceCKPullCheckpoint(records: combined, cursor: $0)
+                    DeviceCKPullCheckpoint(result: combined, cursor: $0)
                 }, key: checkpointKey, owner: owner)
             }
         } while nextCursor != nil
@@ -1855,6 +2063,11 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// Atomic check-and-claim: inserts `id` into the seen set and returns true
     /// iff it was newly claimed. Prevents two concurrent drains from both
     /// delivering the same message id (the check + insert are one locked op).
+    private func isSeen(_ id: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return seenMessageIDs.contains(id)
+    }
+
     private func claimIfUnseen(_ id: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return claimWhileLocked(id)
@@ -1862,7 +2075,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     private func claimForSerialDrain(_ id: String) -> Bool? {
         lock.lock(); defer { lock.unlock() }
-        guard !cancellationDrainInFlight else { return nil }
+        guard !controlDrainInFlight else { return nil }
         return claimWhileLocked(id)
     }
 
@@ -1908,15 +2121,19 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     }
 
     private func performModifyRecords(_ op: CKModifyRecordsOperation) async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            op.modifyRecordsResultBlock = { result in
-                switch result {
-                case .success: cont.resume()
-                case .failure(let err): cont.resume(throwing: Self.mapError(err))
+        op.configuration.timeoutIntervalForResource = 15
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                op.modifyRecordsResultBlock = { result in
+                    switch result {
+                    case .success: cont.resume()
+                    case .failure(let err): cont.resume(throwing: Self.mapError(err))
+                    }
                 }
+                self.database.add(op)
+                if Task.isCancelled { op.cancel() }
             }
-            self.database.add(op)
-        }
+        } onCancel: { op.cancel() }
     }
 
     private static func mapError(_ err: Error) -> DeviceSyncError {
@@ -1994,11 +2211,11 @@ public extension DeviceSyncTransportResolver {
     ) -> DeviceSyncTransport? {
         guard resolvedKind(environment: environment) == .cloudkit else { return nil }
         guard hasEntitlement() else {
-            NSLog("[ck-device] NATIVE_AGENT_DEVICE_SYNC=cloudkit but the CloudKit entitlement is ABSENT — staying on the legacy KVS/ubiquity transport (no CKContainer is touched). This is the 2026-06-03 launch-crash guard.")
+            nativeLog("[ck-device] NATIVE_AGENT_DEVICE_SYNC=cloudkit but the CloudKit entitlement is ABSENT — staying on the legacy KVS/ubiquity transport (no CKContainer is touched). This is the 2026-06-03 launch-crash guard.")
             return nil
         }
         guard grantsContainer(containerIdentifier) else {
-            NSLog("[ck-device] CloudKit service is granted but the exact container '\(containerIdentifier)' is absent — refusing to construct CKContainer and staying on the legacy transport.")
+            nativeLog("[ck-device] CloudKit service is granted but the exact container '\(containerIdentifier)' is absent — refusing to construct CKContainer and staying on the legacy transport.")
             return nil
         }
         return CloudKitDeviceTransport(
@@ -2016,8 +2233,9 @@ private struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
 private final class DeviceCKModDateHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var map: [String: Date?] = [:]
-    func set(_ id: String, _ date: Date?) { lock.lock(); map[id] = date; lock.unlock() }
+    func set(_ id: String, _ date: Date?) { lock.lock(); map.updateValue(date, forKey: id); lock.unlock() }
     func get(_ id: String) -> Date? { lock.lock(); defer { lock.unlock() }; return map[id] ?? nil }
+    func dates() -> [Date?] { lock.lock(); defer { lock.unlock() }; return Array(map.values) }
 }
 
 #endif

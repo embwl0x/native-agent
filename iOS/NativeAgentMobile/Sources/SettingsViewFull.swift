@@ -1,5 +1,7 @@
-// PATCH-2026-05-19: ui-pull-together SettingsViewFull — app/device settings only.
-// Personality, Trust, Providers, and Connectors are first-class More links.
+// PATCH-2026-05-19: ui-pull-together SettingsViewFull — app/device settings.
+// Personality, Trust and Connectors are first-class More links.
+// 2026-10-07: the one Settings door — Telegram, Providers and every setting
+// the Mac sends (`MobileAppSettingsSections`) live here, not as More rows.
 import SwiftUI
 import Combine
 import NativeAgentShared
@@ -30,6 +32,7 @@ enum SettingsLegalLinksPresentation {
 // MARK: - Settings View
 
 struct SettingsViewFull: View {
+    var opensConnection = false
     @EnvironmentObject private var pairingStore: PairingStore
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @StateObject private var store = SettingsStore()
@@ -41,7 +44,15 @@ struct SettingsViewFull: View {
     @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
 
     var body: some View {
-        AlivePage(title: "Settings", line: "This iPhone and its link to the Mac.") {
+        ScrollViewReader { proxy in
+            settingsPage.onAppear {
+                if opensConnection { proxy.scrollTo("connection", anchor: .top) }
+            }
+        }
+    }
+
+    private var settingsPage: some View {
+        AlivePage(title: "Settings", line: "This iPhone, its link to the Mac, and the Mac's own settings.") {
             AliveSection("Appearance") {
                 MobileAdaptiveRow(spacing: 12) {
                     Text("Color scheme").foregroundStyle(AlivePalette.text)
@@ -99,7 +110,13 @@ struct SettingsViewFull: View {
                 }
             }
 
-            connectionGroup
+            connectionGroup.id("connection")
+            AliveSection("On your Mac") {
+                macLink("Telegram", "Telegram settings on your Mac") { TelegramView() }
+                AliveDivider()
+                macLink("Providers", "The models I think with") { ProviderSettingsView() }
+            }
+            MobileAppSettingsSections()
             PhonePlacesSettings()
             AliveSection("Live Activities") {
                 Toggle("Show task names on the Lock Screen", isOn: Binding(
@@ -142,11 +159,15 @@ struct SettingsViewFull: View {
         .macSyncErrorBanner()
         .task {
             pushReceipts = PushReceiptLedger.load()
+            async let macSettings: Void = MobileAppSettingsStore.shared.refresh()
             await store.refresh()
+            await macSettings
         }
         .refreshable {
             pushReceipts = PushReceiptLedger.load()
+            async let macSettings: Void = MobileAppSettingsStore.shared.refresh()
             await store.refresh()
+            await macSettings
         }
         .onReceive(
             NotificationCenter.default.publisher(for: PushReceiptLedger.didChange)
@@ -177,6 +198,14 @@ struct SettingsViewFull: View {
                 iOSSystemToastBar(center: iOSSystemToastCenter.shared)
             }
         }
+    }
+
+    private func macLink<Destination: View>(_ title: String, _ detail: String,
+                                            @ViewBuilder destination: @escaping () -> Destination) -> some View {
+        NavigationLink(destination: destination) {
+            AliveRow(title, detail: detail) { AliveChevron() }
+        }
+        .aliveRowButtonStyle()
     }
 
     private var connectionGroup: some View {

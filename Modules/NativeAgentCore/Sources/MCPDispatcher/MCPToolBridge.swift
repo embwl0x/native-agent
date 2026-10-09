@@ -135,27 +135,25 @@ public enum MCPToolBridge {
                 )
                 continue
             }
-            for t in tools {
+            // web.read is the one page reader; an older catalog's SearXNG
+            // `fetch` row is not advertised.
+            for t in tools where !(serverId == "searxng-local" && t.name == "fetch") {
                 let bridged = "mcp__\(serverId)__\(t.name)"
                 // The built-in server's own words ("Search SearXNG") never say
                 // "web", so a "web search" query scored it zero.
                 var description = t.description
-                if serverId == "searxng-local" {
-                    switch t.name {
-                    case "search": description = "Search the web and news: Codex web search for general queries, SearXNG for code-shaped ones; use categories=news and time_range=day|week|month (SearXNG) for recent results. Returns titles, URLs and snippets, the route that ran and its time."
-                    case "fetch": description = "Fetch and read a web page by URL and return its extracted text."
-                    default: break
-                    }
+                if serverId == "searxng-local", t.name == "search" {
+                    description = "Search the web: Codex web search answers first, SearXNG is the fallback. categories=news (or it, science) searches SearXNG first; time_range=day|week|month|year asks for recent pages. Returns titles, URLs and snippets, the route that ran and its time."
                 }
                 var inputSchema = t.inputSchema
                 if serverId == "searxng-local", t.name == "search",
                    case .object(var schema)? = inputSchema {
                     if case .object(var properties)? = schema["properties"] {
                         properties["categories"] = .object(["type": .string("string"),
-                            "description": .string("Optional SearXNG category, such as news, general, it or science.")])
+                            "description": .string("Optional SearXNG category, such as news, it or science; searches SearXNG first.")])
                         properties["time_range"] = .object(["type": .string("string"),
                             "enum": .array([.string("day"), .string("week"), .string("month"), .string("year")]),
-                            "description": .string("Optional SearXNG time range for recent results.")])
+                            "description": .string("Optional recency: pages from the past day, week, month or year.")])
                         schema["properties"] = .object(properties)
                         inputSchema = .object(schema)
                     }

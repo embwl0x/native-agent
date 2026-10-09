@@ -6,6 +6,30 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.6.0 — more of the Mac, on any model (2026-10-09)
+
+### One door
+- Every page and action usable on a lighter model: pages state their actions, arguments and version; find follows intent (read / open / send); previews check without acting; versions guard the next step; long results continue; model use is readable by model, day or surface.
+
+### Everyday
+- Weather (current, hourly, days, sunrise/sunset), nearby places, driving and walking routes; Photos counts and recent items; Reminders lists; calendar ranges in local time.
+- Mail at scale: index reads, bodies from disk, search by sender/date/unread/category/attachments, oldest-unread, sender counts, attachments listed and saved, drafts stay unsent. Messages history across conversations.
+- GitHub Actions runs and failed steps, repository search, links as names, tracking adds instead of replacing. Stock, index and currency quotes with source and time.
+
+### Chrome and the Mac
+- Chrome history without the extension; page media play/pause/seek with verified playback; the agent's own tab group, per-conversation tabs, honest tab ownership.
+- Mac actions name what they reached, refuse approximate targets, report changed targets and unconfirmed results; visible-row reads of big lists; direct volume, mute and Now Playing; app versions, updates, uptime, processes, network, disk; files and notes to Trash / Recently Deleted.
+
+### Senses
+- Word, Excel, PowerPoint, Pages, Numbers, EPUB and rich text read as pages; sense.make lets the agent make or repair a reader mid-conversation, try it, keep it, roll it back.
+
+### Chat, phone, Telegram
+- Work pane (Steps, Screen, Make) beside chat; streamed formatted replies; queued messages and steering survive restarts; compaction keeps originals readable; command palette.
+- iPhone follows the whole shared conversation and live turns, sends files, answers cards, reads and changes Mac settings. Telegram cards answered anywhere lose their buttons and show the outcome.
+
+### Look and care
+- Light mode: paper room, frosted plates, pale haze. Backups cover archives, Senses and Make. Doctor brings sign-in and permission needs to chat.
+
 ## 0.5.1 — the chat keeps its room (2026-10-04)
 
 - Send while busy shows the queued message with Steer and Remove again.
@@ -14,19 +38,19 @@ Reverse-chronological. Each phase: 1–2 lines.
 - Full Mac keeps the agent's Mac control across restarts; its own canon decisions stay its own.
 - Mac-started replies reach Telegram and the phone silently; CloudKit status writes tolerate a slow first write.
 
-## 0.5.0 — one brain, their own person (2026-10-04)
+## 0.5.0 — one brain, a personality of its own (2026-10-04)
 
 ### One door
 - One always-on tool to read, do, find and script the whole app; fewer round trips, lower cost.
 
 ### Skills
-- Script skills they writes and runs in one step, with hand-back before anything they shouldn't do alone; one lifecycle for skills and their tools (add, upgrade with rollback, retire unused, archived stays findable); quiet suggestions from repeated work; zero model tokens, capped storage.
+- Script skills the agent writes and runs in one step, with hand-back before any step needing separate action; one lifecycle for skills and authored tools (add, upgrade with rollback, retire unused, archived stays findable); quiet suggestions from repeated work; zero model tokens, capped storage.
 
 ### Trust and approvals
-- Agents switched on in Trust count as you (no approvals); every approval pops up as a card in your chat (Mac, iPhone, Telegram), including ones raised elsewhere.
+- Verified agents switched on in Trust carry your authority and skip extra peer approvals. Full Mac provides persistent full autonomy for ordinary Trust checks; explicit blocks and protected exceptions remain, including owner approval for macOS privacy permission resets. Required approvals appear as cards in your chat (Mac, iPhone, Telegram), including ones raised elsewhere.
 
 ### Personality
-- One feeling or none per turn; dream carry-forward as a dream; "since we last talked"; lessons keep their moment; personal memory lane; opinions and interests of them own; they can reach out first (once a day at most); mind.why, reject and undo.
+- One feeling or none per turn; dream carry-forward as a dream; "since we last talked"; lessons keep their moment; personal memory lane; the agent's own opinions and interests; the agent can reach out first (once a day at most); mind.why, reject and undo.
 
 ### Hardening
 - Three full Sol sweeps over every section: secrets redaction, provenance, crash traps, permission gaps, truthful status text; truthful agents list; no false "access expired".

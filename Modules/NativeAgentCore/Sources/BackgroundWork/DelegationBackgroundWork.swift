@@ -138,7 +138,39 @@ public struct DelegationBackgroundWork: Sendable {
                 }
                 return await recordBoundDelegationSettlement(dataRoot: dataRoot, job: job)
             },
-            reportDeferral: { deferred in await deferral.record(deferred) }
+            reportDeferral: { deferred in await deferral.record(deferred) },
+            readHandledOutcomes: {
+                let inbox = LiveNotificationInbox.livePath(dataRoot: dataRoot)
+                var handled = Set<String>()
+                for path in [inbox, LiveNotificationInbox.archivePath(forInbox: inbox)] {
+                    let lines = try InboxRewriteGuard.readLines(path)
+                    guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: path),
+                          lines.allSatisfy({ line in
+                              if line.raw.isEmpty { return true }
+                              if case .object? = line.row { return true }
+                              return false
+                          }) else {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    for line in lines {
+                        guard case .object(let row)? = line.row,
+                              row["source"] == .string("delegation_outcome") else { continue }
+                        if case .string(let signature)? = row["error_signature"] { handled.insert(signature) }
+                        if case .array(let occurrences)? = row["absorbed_occurrence_ids"] {
+                            for case .string(let id) in occurrences where id.hasPrefix("delegation-outcome:") {
+                                handled.insert("\(id.dropFirst("delegation-outcome:".count)):succeeded")
+                            }
+                        }
+                        if case .array(let jobs)? = row["adverse_jobs"] {
+                            for case .string(let job) in jobs {
+                                let parts = job.split(separator: "|", maxSplits: 1)
+                                if parts.count == 2 { handled.insert("\(parts[1]):\(parts[0])") }
+                            }
+                        }
+                    }
+                }
+                return handled
+            }
         )
         return DelegationOutcomeEventRunner(
             underlying: underlying,
@@ -153,7 +185,6 @@ public struct DelegationBackgroundWork: Sendable {
                 root.appendingPathComponent("codex-nativeagent-bridge/reply-deliveries.jsonl"),
                 root.appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true),
                 AgentConversationStore(dataRoot: dataRoot).fileURL,
-                ChatGPTDotIPCTransport.recentSendFile(dataRoot),
                 dataRoot.appendingPathComponent("bots/run-queue.json"),
                 dataRoot.appendingPathComponent("bots/shelf-index.json"),
                 // A new arrival books her wake (ResidentWake.nextDeadline).
@@ -179,6 +210,7 @@ public struct DelegationBackgroundWork: Sendable {
             runStatus: row.runStatus,
             completedAt: row.completedAt,
             deliveryOutcome: row.deliveryOutcome,
+            deliveryReceiptVersion: row.deliveryReceiptVersion,
             deliveryLost: row.deliveryLost,
             completionTextHead: row.completionTextHead,
             recoveryNote: row.recoveryNote,
@@ -274,7 +306,6 @@ public struct DelegationBackgroundWork: Sendable {
                         // and a genuinely new job still bumps the rollup.
                         occurrenceID: card.cardId
                     )
-                await port.retryRequestedResults(dataRoot: dataRoot)
                 return true
             } catch {
                 FileHandle.standardError.write(Data(
@@ -592,6 +623,8 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
             ))
         }
         let outcome = await underlying.tickOutcome()
+        do { try await port.retryRequestedResults(dataRoot: dataRoot) }
+        catch { return .failed(error: "Requested result notifications could not be reconciled: \(error.localizedDescription)") }
         do {
             try await port.reconcileAgentConversations()
         } catch is CancellationError {

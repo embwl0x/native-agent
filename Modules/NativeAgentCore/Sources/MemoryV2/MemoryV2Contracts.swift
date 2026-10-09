@@ -9,17 +9,20 @@ public struct MemoryV2RecallRequest: Sendable, Codable, Equatable {
     public var topK: Int
     public var persona: String?
     public var surface: String?
+    public var requiresRelevance: Bool?
 
     public init(
         text: String,
         topK: Int = 10,
         persona: String? = nil,
-        surface: String? = nil
+        surface: String? = nil,
+        requiresRelevance: Bool? = nil
     ) {
         self.text = text
         self.topK = topK
         self.persona = persona
         self.surface = surface
+        self.requiresRelevance = requiresRelevance
     }
 }
 
@@ -37,16 +40,19 @@ public struct MemoryV2RecallResponse: Sendable, Equatable {
     public var scored: [ScoredMemoryRecord]
     public var total: Int
     public var disclosureFilteredCount: Int
+    public var timings: [String: Double]
     public init(
         hits: [MemoryRecallHit],
         scored: [ScoredMemoryRecord],
         total: Int,
-        disclosureFilteredCount: Int = 0
+        disclosureFilteredCount: Int = 0,
+        timings: [String: Double] = [:]
     ) {
         self.hits = hits
         self.scored = scored
         self.total = total
         self.disclosureFilteredCount = disclosureFilteredCount
+        self.timings = timings
     }
 }
 
@@ -126,8 +132,9 @@ public enum MemoryPatchContract {
     /// and no UI path patches it.
     public static let untypedPassthroughKeys: Set<String> = [
         "pinned", "tags", "importance", "recall_count",
-        "source_history", "duplicate_occurrences", "owner_restored",
+        "source_history", "duplicate_occurrences", "owner_restored", "untrusted_sources", "peer_data_sources", "peer_sources",
     ]
+
 }
 
 // MARK: - MemoryStorageProtocol (the m1 seam)
@@ -366,6 +373,7 @@ public protocol KeywordRecallStorageProtocol: MemoryStorageProtocol {
         persona: String?
     ) async throws -> [ScoredMemoryRecord]
 }
+
 
 /// Exact canonical lookup for supported stores only. No list-all fallback:
 /// disclosure/lifecycle/quality remain enforced by the MemoryV2 read boundary.

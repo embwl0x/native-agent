@@ -219,6 +219,7 @@ public struct MacScreenViewMark: Sendable, Equatable {
     public let frame: MacAXFrame
     public let path: [Int]
     public let actions: [String]
+    public let settableAttributes: [String]
     /// W3.5-FIX-R4 — the secret-naming ancestor GROUPS this control sits
     /// inside, resolved at capture time from the same window's node set. A form
     /// captions its CVV box by ENCLOSING it, not by sitting left of it, and the
@@ -240,6 +241,7 @@ public struct MacScreenViewMark: Sendable, Equatable {
         frame: MacAXFrame,
         path: [Int],
         actions: [String] = [],
+        settableAttributes: [String] = [],
         enclosingCaption: MacScreenViewTextRedaction.EnclosingCaptionKinds = .none,
         labelRedaction: JSONValue? = nil,
         valueRedaction: JSONValue? = nil
@@ -255,6 +257,7 @@ public struct MacScreenViewMark: Sendable, Equatable {
         self.frame = frame
         self.path = path
         self.actions = actions
+        self.settableAttributes = settableAttributes
         self.enclosingCaption = enclosingCaption
         self.labelRedaction = labelRedaction
         self.valueRedaction = valueRedaction
@@ -276,6 +279,7 @@ public struct MacScreenViewMark: Sendable, Equatable {
             "frame": frame.toJSON(),
             "path": .array(path.map { .int(Int64($0)) }),
             "actions": .array(actions.map { .string($0) }),
+            "settable_attributes": .array(settableAttributes.map { .string($0) }),
         ]
         if let subrole { object["subrole"] = .string(subrole) }
         if let label {
@@ -666,7 +670,8 @@ public enum MacScreenViewBuilder {
     public static func select(
         nodes: [MacAXNode],
         geometry: MacScreenViewGeometry,
-        maxMarks: Int = hardMaxMarks
+        maxMarks: Int = hardMaxMarks,
+        settableAttributes: (MacAXNode) -> [String] = { _ in [] }
     ) -> Selection {
         let cap = max(1, min(maxMarks, hardMaxMarks))
         var candidates: [(frame: MacAXFrame, node: MacAXNode)] = []
@@ -734,6 +739,7 @@ public enum MacScreenViewBuilder {
                 frame: candidate.frame,
                 path: candidate.node.path,
                 actions: attributes.actions,
+                settableAttributes: settableAttributes(candidate.node),
                 enclosingCaption: enclosing,
                 labelRedaction: redaction(label, under: nil),
                 valueRedaction: redaction(attributes.value, under: label)

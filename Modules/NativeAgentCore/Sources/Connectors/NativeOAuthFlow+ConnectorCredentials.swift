@@ -76,7 +76,7 @@ extension NativeOAuthFlow {
         let persistence = SwiftNativePersistenceCore()
         do {
             try await persistence.withFileLock(path) {
-                _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path)
+                _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path, resolveSecrets: false)
                 var object: [String: Any] = [
                     "client_id": clientId,
                     "connector_id": config.connectorId,
@@ -86,7 +86,7 @@ extension NativeOAuthFlow {
                 if !clientSecret.isEmpty {
                     object["client_secret"] = clientSecret
                 }
-                try NativeOAuthSupport.writeJSONObject(object, to: path)
+                try ConnectorCredentialFile.write(JSONSerialization.data(withJSONObject: object), to: path)
                 try FileManager.default.setAttributes(
                     [.posixPermissions: 0o600],
                     ofItemAtPath: path.path
@@ -144,12 +144,12 @@ extension NativeOAuthFlow {
         do {
             try await markOAuthConnectorConnected("notion", dataRoot: dataRoot) {
                 try await persistence.withFileLock(path) {
-                    _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path)
-                    try NativeOAuthSupport.writeJSONObject([
+                    _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path, resolveSecrets: false)
+                    try ConnectorCredentialFile.write(JSONSerialization.data(withJSONObject: [
                         "access_token": token,
                         "token_type": "Bearer",
                         "validated_at": NativeOAuthSupport.isoBasic(Date()),
-                    ], to: path)
+                    ]), to: path)
                     try FileManager.default.setAttributes(
                         [.posixPermissions: 0o600],
                         ofItemAtPath: path.path

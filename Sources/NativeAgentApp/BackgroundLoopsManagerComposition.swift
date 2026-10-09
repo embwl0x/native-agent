@@ -3,9 +3,11 @@
 import Foundation
 import NativeAgentCore
 import BackgroundLoops
+import DoctorChecks
 import MemoryV2
 import NotificationInbox
 import PersistenceCore
+import Privacy
 
 // MARK: - BackgroundLoopsManager
 //
@@ -79,7 +81,7 @@ public actor BackgroundLoopsManager {
         },
         runAutoDoctorAtLaunch: @escaping @Sendable () -> Bool = {
             let config = NativeClient.readAutoDoctorConfig(dataRoot: PersistenceCore.defaultDataRoot())
-            return (config.enabled ?? true) && (config.runOnStartup ?? false)
+            return (config.enabled ?? true) && (config.runOnStartup ?? true)
         },
         // A4.8a: injectable so tests can suppress the fire-and-forget launch
         // heartbeat tick below — its unstructured Task raced the ownership
@@ -121,6 +123,7 @@ public actor BackgroundLoopsManager {
         }
         let didStart = await coreManager.start(loops: loops)
         guard didStart else { return }
+        Task { await NativeClient().wakeDoctorForPendingTransitions() }
         // Heartbeat's periodic cadence is intentionally low-noise (twice
         // daily), but the status receipt should refresh after app restart.
         // Run a best-effort one-shot off the actor path so an anomalous
@@ -128,10 +131,10 @@ public actor BackgroundLoopsManager {
         if runHeartbeatAtLaunch() {
             Task { await coreManager.runTickOnce(loopId: "heartbeat") }
         }
-        // Auto-Doctor remains weekly and disabled-at-launch by default. When
-        // the user explicitly enables the saved launch affordance, route the
-        // one-shot through Core's existing single-flight owner instead of
-        // changing every scheduler loop to tick immediately.
+        // Doctor repairs at launch (and on any ok→adverse reading, see
+        // getHealthCard) besides its weekly sweep. Route the one-shot through
+        // Core's existing single-flight owner instead of changing every
+        // scheduler loop to tick immediately.
         if runAutoDoctorAtLaunch() {
             Task { await coreManager.runTickOnce(loopId: "doctor_auto_run") }
         }
@@ -151,23 +154,23 @@ public actor BackgroundLoopsManager {
             .appendingPathComponent("inbox.jsonl")
         let cardId = "loop-failure:\(loopId)"
         let now = ISO8601DateFormatter().string(from: Date())
-        let summary = "Background loop \"\(loopId)\" started failing."
+        // User, 2026-10-07: what is wrong in plain words and the fix that fits
+        // it — the raw error stays in the receipt and on Doctor's loop row.
+        let summary = "\(loopId) keeps failing (\(loopFailureCause(error))). "
+            + loopFailureRemedy(loopId: loopId, error: error)
         // W1(c) upgrade campaign (L4-01): the card is sticky. A dismissed
         // card for the SAME failing condition stays dismissed and never
         // re-pushes; a genuinely NEW error class resurrects it. The signature
         // is the error head, not the full text (timestamps/addresses churn).
         let errorSignature = String(error.prefix(200))
-        let detail = "The \"\(loopId)\" background loop transitioned from healthy to "
-            + "failing. Latest error:\n\n\(String(error.prefix(1_500)))\n\n"
-            + "It will keep retrying on its normal cadence; this card updates in place."
         let card: JSONValue = .object([
             "id": .string(cardId),
             "created_at": .string(now),
             "source": .string("background_loop"),
             "severity": .string("actionable"),
-            "title": .string("A background loop is failing"),
-            "summary": .string(String(summary.prefix(500))),
-            "detail": .string(detail),
+            "title": .string("\(loopId) keeps failing"),
+            "summary": .string(summary),
+            "detail": .string(summary),
             "related_mission_id": .null,
             "related_approval_id": .null,
             "related_paths": .array([]),
@@ -243,8 +246,8 @@ public actor BackgroundLoopsManager {
             await InboxPushNotifier.notifyIfAttentionWorthy(
                 dataRoot: dataRoot,
                 itemId: cardId,
-                title: "A background loop is failing",
-                summary: String(summary.prefix(500)),
+                title: "\(loopId) keeps failing",
+                summary: summary,
                 source: "background_loop",
                 severity: "actionable"
             )
@@ -252,6 +255,53 @@ public actor BackgroundLoopsManager {
             FileHandle.standardError.write(Data(
                 "BackgroundLoopsManager: loop-failure notice upsert failed for \(loopId): \(error)\n".utf8))
         }
+    }
+
+    /// The error as one plain clause: the human text out of an NSError dump
+    /// (`Error Domain=X Code=N "text" UserInfo={…}`, quotes escaped or not),
+    /// first line, redacted.
+    nonisolated static func loopFailureCause(_ error: String) -> String {
+        if isTelegramTokenRejected(error) { return "Telegram rejected the bot token" }
+        var text = NativeAppSecretRedactor.redactText(error)
+        if let match = text.range(of: #"Code=-?\d+ \\?"[^"\\]+"#, options: .regularExpression),
+           let quote = text[match].firstIndex(of: "\"") {
+            text = String(text[text.index(after: quote)..<match.upperBound])
+        }
+        text = text.components(separatedBy: " UserInfo=")[0]
+            .components(separatedBy: .newlines)[0]
+            .trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: ".")))
+        if text.hasPrefix("timeout after ") {
+            return "a run did not finish within its \(text.dropFirst("timeout after ".count)) limit"
+        }
+        return text.isEmpty ? "it reported no reason" : String(text.prefix(160))
+    }
+
+    /// Telegram answers a bad bot token with 401, which the poll reports as
+    /// `TelegramBotError.notConfigured` ("Telegram long poll: notConfigured").
+    nonisolated static func isTelegramTokenRejected(_ error: String) -> Bool {
+        error.lowercased().contains("telegram") && error.contains("notConfigured")
+    }
+
+    /// Only fixes that are real. Network weather never reaches the card (the
+    /// scheduler drops it).
+    nonisolated static func loopFailureRemedy(loopId: String, error: String) -> String {
+        loopSettingFix(loopId: loopId, error: error)?.step ?? "No setting fixes this; it needs a code fix."
+    }
+
+    /// The setting that fixes a loop's failure, and whether it is a sign-in or
+    /// a permission; nil when no setting does. The failure card and Doctor's
+    /// loop row both read it, so they never disagree.
+    nonisolated static func loopSettingFix(loopId: String, error: String) -> (step: String, ask: DoctorAskKind?)? {
+        let e = error.lowercased()
+        if loopId == "offdisk_backup", e.contains("icloud drive") { return (DoctorLoopHealth.iCloudDriveStep, .permission) }
+        if loopId == "telegram_poll", isTelegramTokenRejected(error) || e.contains("unauthoriz") || e.contains("token") {
+            return ("Open Connectors → Telegram and reconnect the bot token.", .signIn)
+        }
+        if loopId == "slack_socket_mode", e.contains("auth") || e.contains("token") {
+            return ("Open Connectors → Slack and reconnect the workspace token.", .signIn)
+        }
+        if e.contains("no space left") { return ("Free disk space on this Mac.", nil) }
+        return nil
     }
 
     /// A real healthy tick retires the matching failure card. Automatic
@@ -264,7 +314,7 @@ public actor BackgroundLoopsManager {
         healthyAt: Date,
         now: Date = Date()
     ) async -> Bool {
-        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
         let stamp = ISO8601DateFormatter().string(from: now)
         do {
             _ = try await inbox.archiveActive(

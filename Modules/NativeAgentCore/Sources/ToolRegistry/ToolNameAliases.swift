@@ -45,8 +45,8 @@ public enum ToolNameAliases {
         "browser.chrome_setup": ["browser_chrome_setup"],
         "browser.chrome_status": ["browser_chrome_status"],
     ].merging(Dictionary(uniqueKeysWithValues: [
-        "acquire", "renew", "navigate", "snapshot", "click", "fill", "type", "select",
-        "keypress", "set_checked", "double_click", "drag", "wait", "scroll", "release",
+        "close_tab", "navigate", "snapshot", "click", "fill", "type", "select",
+        "keypress", "set_checked", "double_click", "drag", "wait", "scroll", "media",
     ].map { verb in
         ("browser.chrome_\(verb)", ["browser_chrome_\(verb)", "chrome.\(verb)", "chrome_\(verb)"])
     })) { $0 + $1 }
@@ -67,7 +67,8 @@ public enum ToolNameAliases {
         "craft_run",
     ]
     /// Retired action ids → the retired tool each ran; a call answers as `appCall` translates it.
-    public static let retiredActions = ["claude.message": "claude_message", "craft.run": "craft_run"]
+    public static let retiredActions = ["claude.message": "claude_message", "craft.run": "craft_run",
+                                        "mac.screen": "screen", "mac.activity_query": "activity_query", "persona": "get_persona_doc"]
     public static let retiredAppToolHint = "Use app — {} is your home and every page."
 
     /// One-door phase 2 step 7 (User 10-02): `workspace` is `app`'s home, and
@@ -89,7 +90,7 @@ public enum ToolNameAliases {
         for (tool, id) in foldedEntries.map({ ($0.key, $0.value) })
             + chromeVerbs.map({ ("browser.chrome_\($0)", "chrome.\($0)") }) {
             if let kept = out[tool] {
-                NSLog("ToolNameAliases: %@ is folded twice; its first action, %@, is kept", tool, kept)
+                nativeLog("ToolNameAliases: %@ is folded twice; its first action, %@, is kept", tool, kept)
             } else {
                 out[tool] = id
             }
@@ -137,9 +138,10 @@ public enum ToolNameAliases {
         // Step 4, integrations (User 10-02): Mail, Gmail and AgentMail; Calendar
         // and Google Calendar; Reminders, Notes, Contacts, Messages; the
         // connectors; notifications, the phone and images.
-        "mail_list_recent": "mail.recent", "mail_read_batch": "mail.read", "mail_search": "mail.search",
+        "mail_list_recent": "mail.recent", "mail_read_batch": "mail.read", "mail_search": "mail.search", "mail_senders": "mail.senders",
+        "mail_save_attachment": "mail.save_attachment",
         "mail_triage_batch": "mail.triage", "mail_mark_read": "mail.mark_read", "mail_archive": "mail.archive",
-        "mail_delete": "mail.delete", "mail_send": "mail.send", "mail_reply": "mail.reply",
+        "mail_delete": "mail.delete", "mail_send": "mail.send", "mail_reply": "mail.reply", "mail_draft": "mail.draft",
         "agentmail_list": "agentmail.list", "agentmail_read": "agentmail.read", "agentmail_send": "agentmail.send",
         "gmail_status": "gmail.status", "gmail_search": "gmail.search", "gmail_read": "gmail.read",
         "mac_calendar_list_upcoming": "calendar.upcoming", "mac_calendar_calendars": "calendar.calendars",
@@ -152,11 +154,13 @@ public enum ToolNameAliases {
         "mac_reminders_read": "reminders.read", "mac_reminders_create": "reminders.create",
         "mac_reminders_update": "reminders.update", "mac_reminders_complete": "reminders.complete",
         "mac_reminders_delete": "reminders.delete",
-        "notes_search": "notes.search", "notes_create": "notes.create", "notes_update": "notes.update",
+        "mac_reminders_list_rename": "reminders.list_rename", "mac_reminders_list_create": "reminders.list_create",
+        "notes_search": "notes.search", "notes_create": "notes.create", "notes_update": "notes.update", "notes_delete": "notes.delete",
         "contacts_search": "contacts.search", "contacts_create_or_update": "contacts.save",
         "contacts_delete": "contacts.delete",
         "messages_recent_threads": "messages.recent", "messages_send": "messages.send",
         "github_status": "github.status", "github_list_repos": "github.repos",
+        "github_list_runs": "github.runs", "github_run_jobs": "github.run_jobs",
         "github_list_notifications": "github.notifications", "github_get_repository": "github.repo",
         "github_read_repository_content": "github.content", "github_list_commits": "github.commits",
         "github_list_issues": "github.issues", "github_search": "github.search",
@@ -176,9 +180,9 @@ public enum ToolNameAliases {
         "image_generate": "image.generate",
         // Step 5 (User 10-02): files, shell, the web, the browser, chat search
         // and result paging. session_search is search_chat_history's alias and
-        // folds with it; SearXNG's two tools are the web's search and fetch.
+        // folds with it; SearXNG's search is the web's search.
         "read_file": "files.read", "list_dir": "files.list", "file_excerpt": "files.excerpt", "grep": "files.grep",
-        "write_file": "files.write", "apply_patch": "files.patch", "mac_spotlight_search": "files.spotlight",
+        "write_file": "files.write", "move_file": "files.move", "copy_file": "files.copy", "trash_file": "files.trash", "apply_patch": "files.patch", "mac_spotlight_search": "files.spotlight",
         "shell": "shell.run", "bash": "shell.bash", "git": "git.run", "git_status": "git.status",
         "git_diff": "git.diff", "git_log": "git.log", "repo_dirty_summary": "git.summary",
         "swift_build": "swift.build", "swift_test": "swift.test",
@@ -186,7 +190,9 @@ public enum ToolNameAliases {
         "restart_app": "app.restart", "install_app": "app.install",
         "evolution_propose": "evolution.propose", "evolution_status": "evolution.status",
         "evolution_withdraw": "evolution.withdraw", "self_install": "evolution.install",
-        "read_page": "web.read", "mcp__searxng-local__search": "web.search", "mcp__searxng-local__fetch": "web.fetch",
+        "read_page": "web.read", "mcp__searxng-local__search": "web.search",
+        "maps_route": "maps.route",
+        "maps_search": "maps.search",
         "browser.status": "browser.status", "browser.open_url": "browser.open", "browser.read_text": "browser.text",
         "browser.read_links": "browser.links", "browser.screenshot": "browser.screenshot",
         "browser.chrome_setup": "chrome.setup", "browser.chrome_status": "chrome.status",
@@ -198,8 +204,9 @@ public enum ToolNameAliases {
         // (a setup card, a document by what it was for) and the Desk.
         "screen": "mac.look", "act": "mac.act", "go": "mac.go", "wait": "mac.wait", "read": "mac.read",
         "menu": "mac.menu", "menu_press": "mac.menu_press", "clipboard_read": "mac.clipboard_read",
-        "clipboard_write": "mac.clipboard_write", "system_info": "mac.system_info", "activity_query": "mac.activity",
-        "music_now_playing": "music.now_playing", "music_control": "music.control",
+        "clipboard_write": "mac.clipboard_write", "system_info": "mac.system_info", "mac_volume": "mac.volume", "activity_query": "mac.activity",
+        "mac_screenshot_save": "mac.screenshot_save",
+        "music_now_playing": "music.now_playing", "music_control": "music.control", "mac_media": "mac.media",
         "music_search_library": "music.search", "music_list_library": "music.library",
         "music_list_playlists": "music.playlists",
         "context_lookup": "capabilities.lookup", "request_interaction": "card.request",
@@ -207,9 +214,83 @@ public enum ToolNameAliases {
     ]
     public static let foldedActionIDs = Set(foldedTools.values)
 
-    /// Chrome's verbs on her leased tab: `browser.chrome_<verb>` is `chrome.<verb>`.
-    public static let chromeVerbs = ["acquire", "renew", "navigate", "snapshot", "click", "fill", "type", "select",
-                              "keypress", "set_checked", "double_click", "drag", "wait", "scroll", "release"]
+    /// A folded tool's arguments the door names otherwise, tool → its own
+    /// name → the door's: one name per concept across `app` (limit is how
+    /// many, path is where, agent is who).
+    public static let doorArgNames: [String: [String: String]] = [
+        "list_dir": ["max_entries": "limit"], "grep": ["max_results": "limit"], "file_excerpt": ["max_lines": "limit"],
+        "git_status": ["cwd": "path"], "git_log": ["cwd": "path"], "git_diff": ["cwd": "path", "path": "file"],
+        "repo_dirty_summary": ["cwd": "path", "log_limit": "limit"],
+        "agent_connect": ["name": "agent"],
+        "x_search": ["max": "limit"], "x_timeline": ["max": "limit"], "x_user_tweets": ["max": "limit"],
+        "slack_search_messages": ["count": "limit"],
+    ]
+
+    private static let argAliases: [String: [String: String]] = [
+        "*": ["max_rows": "max_nodes", "max_results": "limit"],
+        "agent.swarm": ["prompt": "objective", "timeout_seconds": "timeoutSeconds"],
+        "desk.close": ["outcome": "outcome_summary"],
+        "agent.read": ["id": "message_id"], "skill.run": ["input": "args"],
+        "x.search": ["max_results": "limit"], "x.timeline": ["max_results": "limit"], "x.user_tweets": ["max_results": "limit"],
+    ]
+
+    private static func argumentNames(_ tool: String, _ input: [String: JSONValue]) -> [String: String] {
+        let action = appAction(tool) ?? tool
+        var names = argAliases[action] ?? [:]
+        if action == "agent.swarm", case .int? = input["workers"] { names["workers"] = "agentCount" }
+        if action == "agent.jobs" { names["id"] = input["agent"] == .string("swarm") ? "run_id" : "message_id" }
+        return names
+    }
+
+    /// Repair only one possible spelling; conflicting names stay for validation.
+    public static func argumentName(_ name: String, tool: String, input: [String: JSONValue], known: Set<String>) -> String? {
+        let declared = argumentNames(tool, input)
+        let aliases = known.contains(name) ? declared : declared.merging(doorArgNames[tool] ?? [:]) { first, _ in first }
+        if let alias = aliases[name] { return known.contains(alias) ? alias : nil }
+        guard !known.contains(name) else { return nil }
+        if let alias = argAliases["*"]?[name] { return known.contains(alias) ? alias : nil }
+        func stem(_ text: String) -> String { text.lowercased().split(separator: "_").map { $0.hasSuffix("s") ? String($0.dropLast()) : String($0) }.joined(separator: "_") }
+        let matches = known.filter { candidate in
+            if stem(name) == stem(candidate) || name == "id" && candidate.hasSuffix("_id") { return true }
+            let a = Array(name.lowercased()), b = Array(candidate.lowercased())
+            guard min(a.count, b.count) >= 4, abs(a.count - b.count) <= 1 else { return false }
+            var row = Array(0...b.count)
+            for (i, character) in a.enumerated() {
+                var next = [i + 1]
+                for (j, other) in b.enumerated() { next.append(min(next[j] + 1, row[j + 1] + 1, row[j] + (character == other ? 0 : 1))) }
+                row = next
+            }
+            return row[b.count] <= 1
+        }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    /// A folded tool's input with its arguments by the door's names.
+    public static func doorArgs(_ tool: String, _ input: [String: JSONValue]) -> [String: JSONValue] {
+        renamed(renamed(input, doorArgNames[tool] ?? [:]), argumentNames(tool, input))
+    }
+
+    /// Door args with the folded tool's own names.
+    public static func hostArgs(_ tool: String, _ args: [String: JSONValue]) -> [String: JSONValue] {
+        renamed(renamed(args, argumentNames(tool, args)), Dictionary(uniqueKeysWithValues: (doorArgNames[tool] ?? [:]).map { ($0.value, $0.key) }))
+    }
+
+    private static func renamed(_ fields: [String: JSONValue], _ names: [String: String]) -> [String: JSONValue] {
+        guard !names.isEmpty else { return fields }
+        var result: [String: JSONValue] = [:]
+        for key in fields.keys.sorted() {
+            let name = names[key] ?? key
+            // Keep conflicting spellings visible for validation, never pick one arbitrarily.
+            if name != key, let existing = fields[name], names[name] == nil, existing != .null, existing != fields[key] {
+                result[key] = fields[key]
+            } else if fields[key] != .null || result[name] == nil { result[name] = fields[key] }
+        }
+        return result
+    }
+
+    /// Chrome's verbs on her own tab: `browser.chrome_<verb>` is `chrome.<verb>`.
+    public static let chromeVerbs = ["close_tab", "navigate", "snapshot", "click", "fill", "type", "select",
+                              "keypress", "set_checked", "double_click", "drag", "wait", "scroll", "media", "reload_extension"]
 
     /// An MCP server's tool as the action that runs it: `mcp__<server>__<tool>`
     /// is `mcp.<server>.<tool>`, generated from the server's own tool list.
@@ -242,6 +323,24 @@ public enum ToolNameAliases {
     /// The action a folded tool is: its registry id, or an MCP tool's generated one.
     public static func appAction(_ tool: String) -> String? { foldedTools[tool] ?? mcpAction(tool) }
 
+    /// Free text in the action slot can only discover, never execute a guessed action.
+    public static func appFindQuery(_ input: [String: JSONValue]) -> String? {
+        // {action:"find", args:{query:…}} is the same discovery (10-08).
+        if case .string(let raw)? = input["action"], raw.trimmingCharacters(in: .whitespaces).lowercased() == "find",
+           case .object(let args)? = input["args"], case .string(let query)? = args["query"] ?? args["find"],
+           !query.trimmingCharacters(in: .whitespaces).isEmpty {
+            return query.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard case .string(let raw)? = input["action"],
+              ["find", "page", "item", "script"].allSatisfy({ input[$0] == nil || input[$0] == .null || input[$0] == .string("") }),
+              input["args"] == nil || input["args"] == .null || input["args"] == .object([:]) else { return nil }
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = ["app.find=", "find="].first { text.lowercased().hasPrefix($0) }
+        guard prefix != nil || text.contains(where: \.isWhitespace) else { return nil }
+        let query = prefix.map { String(text.dropFirst($0.count)).trimmingCharacters(in: .whitespacesAndNewlines) } ?? text
+        return query.isEmpty ? nil : query
+    }
+
     /// A name the model no longer calls: a folded tool, a merged one
     /// (`workspace`, `tool_catalog`) or a retired one.
     public static func isAppDoorName(_ tool: String) -> Bool {
@@ -255,11 +354,13 @@ public enum ToolNameAliases {
     }
 
     /// The tool a call ran: an `app` call of a folded action is that tool,
-    /// and a home name that messages someone (`claude.say`) is agent_message,
+    /// and a home name that messages someone (`claude.say`), as item or
+    /// given as an action (the door opens it as the item), is agent_message,
     /// so its send is held, owed and counted like one.
     public static func ranTool(_ name: String, input: [String: JSONValue]) -> String {
-        if name == "app", input["action"] == nil, case .string(let item)? = input["item"],
-           item.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasSuffix(".say") {
+        if name == "app", case .string(let item)? = input["action"] ?? input["item"],
+           item.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasSuffix(".say"),
+           mcpTool(item) == nil, authoredTool(item) == nil {
             let page = (input["page"].flatMap { if case .string(let text) = $0 { text } else { nil } } ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if page.isEmpty || page == "home" { return "agent_message" }
@@ -269,10 +370,11 @@ public enum ToolNameAliases {
         return foldedTools.filter { $0.value == id }.keys.sorted().first ?? mcpTool(action) ?? authoredTool(action) ?? name
     }
 
-    /// The input a call ran with: a folded `app` action's args.
+    /// The input a call ran with: a folded `app` action's args, by the tool's own names.
     public static func ranInput(_ name: String, input: [String: JSONValue]) -> [String: JSONValue] {
-        guard ranTool(name, input: input) != name else { return input }
-        if case .object(let args)? = input["args"] { return args }
+        let tool = ranTool(name, input: input)
+        guard tool != name else { return input }
+        if case .object(let args)? = input["args"] { return hostArgs(tool, args) }
         return [:]
     }
 
@@ -306,7 +408,7 @@ public enum ToolNameAliases {
         let args = input.filter { !$0.key.hasPrefix("__") }
         if name == "workspace" {
             if case .string(let item)? = args["action"] {
-                let extra = args.filter { ["text", "fields"].contains($0.key) && $0.value != .null }
+                let extra = args.filter { ["text", "fields", "conversation"].contains($0.key) && $0.value != .null }
                 return extra.isEmpty ? ["item": .string(item)] : ["item": .string(item), "args": .object(extra)]
             }
             if case .string(let query)? = args["query"] { return ["page": .string("home"), "find": .string(query)] }
@@ -318,13 +420,14 @@ public enum ToolNameAliases {
         }
         if name == "invoke_claude" || name == "claude_message" {
             var call: [String: JSONValue] = ["item": .string("claude.say")]
-            if let text = args["text"] { call["args"] = .object(["text": text]) }
+            let extra = args.filter { ["text", "conversation"].contains($0.key) && $0.value != .null }
+            if !extra.isEmpty { call["args"] = .object(extra) }
             return call
         }
         // Its arguments were a hard-coded method's; a skill takes its own.
         if name == "craft_run" { return ["action": .string("skill.run")] }
         guard let id = appAction(name) else { return nil }
-        return args.isEmpty ? ["action": .string(id)] : ["action": .string(id), "args": .object(args)]
+        return args.isEmpty ? ["action": .string(id)] : ["action": .string(id), "args": .object(doorArgs(name, args))]
     }
 
     /// The answer to a call of a folded tool by its old name: the same call,
@@ -419,19 +522,23 @@ public enum ToolNameAliases {
 /// results arrive in the order their calls did, per name.
 public final class ShownToolNames: @unchecked Sendable {
     private let lock = NSLock()
-    private var pending: [String: [String]] = [:]
+    private var pending: [String: [(name: String, seq: Int)]] = [:]
+    private var sequence = 0
 
     public init() {}
 
-    public func use(_ name: String, input: JSONValue) -> (name: String, input: JSONValue) {
+    public func use(_ name: String, input: JSONValue) -> (name: String, input: JSONValue, seq: Int) {
         let call = ToolNameAliases.shown(name, input: input)
-        lock.withLock { pending[name, default: []].append(call.name) }
-        return call
+        return lock.withLock {
+            sequence += 1
+            pending[name, default: []].append((call.name, sequence))
+            return (call.name, call.input, sequence)
+        }
     }
 
-    public func result(_ name: String) -> String {
+    public func result(_ name: String) -> (name: String, seq: Int?) {
         lock.withLock {
-            guard var queue = pending[name], !queue.isEmpty else { return name }
+            guard var queue = pending[name], !queue.isEmpty else { return (name, nil) }
             let shown = queue.removeFirst()
             pending[name] = queue
             return shown

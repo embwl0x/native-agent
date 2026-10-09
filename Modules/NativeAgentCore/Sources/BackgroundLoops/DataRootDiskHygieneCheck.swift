@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import DoctorChecks
 
 /// One oversized file the disk-hygiene scan found.
 public struct DiskHygieneOffender: Sendable, Equatable {
@@ -32,7 +33,9 @@ public struct DiskHygieneReport: Sendable, Equatable {
     public let largeDirectories: [DiskHygieneOffender]
     /// Total bytes of every regular file walked (bounded by `maxDepth`).
     public let totalBytes: Int64
-    /// Whether `totalBytes` exceeded `totalThreshold`.
+    public let staticModelBytes: Int64
+    public var dynamicBytes: Int64 { totalBytes - staticModelBytes }
+    /// Whether dynamic bytes exceeded `totalThreshold`.
     public let totalOverBudget: Bool
     /// True when the walk hit its file budget and stopped early — totals and
     /// offenders may UNDERCOUNT. Surfaced in the notice so a truncated scan
@@ -44,6 +47,8 @@ public struct DiskHygieneReport: Sendable, Equatable {
     /// budget): a future deep dynamic store past the depth bound is visible as
     /// "unscanned" here rather than silently invisible (A5.1, W5#P1-1).
     public let depthTruncated: Bool
+    /// A directory or required file attribute could not be read.
+    public let readFailed: Bool
 
     /// True when the scan found anything worth a notification.
     public var tripped: Bool {
@@ -56,14 +61,18 @@ public struct DiskHygieneReport: Sendable, Equatable {
         totalOverBudget: Bool,
         truncated: Bool = false,
         depthTruncated: Bool = false,
-        largeDirectories: [DiskHygieneOffender] = []
+        readFailed: Bool = false,
+        largeDirectories: [DiskHygieneOffender] = [],
+        staticModelBytes: Int64 = 0
     ) {
         self.largeFiles = largeFiles
         self.largeDirectories = largeDirectories
         self.totalBytes = totalBytes
+        self.staticModelBytes = staticModelBytes
         self.totalOverBudget = totalOverBudget
         self.truncated = truncated
         self.depthTruncated = depthTruncated
+        self.readFailed = readFailed
     }
 }
 
@@ -128,10 +137,18 @@ public enum DataRootDiskHygiene {
     ) -> DiskHygieneReport {
         let fm = FileManager.default
         var total: Int64 = 0
+        var staticModelBytes: Int64 = 0
+        let staticFiles: Set<String>
+        do { staticFiles = try CoreMLEmbedderCheck.installedModelStorageFiles(dataRoot: dataRoot) }
+        catch {
+            nativeLog("Disk hygiene: installed model assets unavailable for accounting: %@", String(describing: error))
+            staticFiles = []
+        }
         var offenders: [DiskHygieneOffender] = []
         var scanned = 0
         var truncated = false
         var depthTruncated = false
+        var readFailed = false
         /// relative path → subtree bytes, for every directory descended into.
         var directoryBytes: [String: Int64] = [:]
         /// Relative paths of directories holding an over-threshold descendant,
@@ -155,20 +172,21 @@ public enum DataRootDiskHygiene {
                     }
                 }
             }
-            guard !truncated,
-                  let entries = try? fm.contentsOfDirectory(
+            guard !truncated else { return subtree }
+            guard let entries = try? fm.contentsOfDirectory(
                 at: dir,
                 includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey],
                 options: []
-            ) else { return subtree }
+            ) else { readFailed = true; return subtree }
             for entry in entries {
                 scanned += 1
                 if scanned > maxScannedEntries { truncated = true; return subtree }
-                let values = try? entry.resourceValues(forKeys: [
+                guard let values = try? entry.resourceValues(forKeys: [
                     .isDirectoryKey, .isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey,
-                ])
-                if values?.isSymbolicLink == true { continue }
-                if values?.isDirectory == true {
+                ]), values.isSymbolicLink != nil, values.isDirectory != nil,
+                    values.isRegularFile != nil else { readFailed = true; continue }
+                if values.isSymbolicLink == true { continue }
+                if values.isDirectory == true {
                     if depth < maxDepth {
                         subtree += walk(entry, depth: depth + 1)
                     } else {
@@ -179,9 +197,14 @@ public enum DataRootDiskHygiene {
                     }
                     continue
                 }
-                if values?.isRegularFile == true {
-                    let size = Int64(values?.fileSize ?? 0)
+                if values.isRegularFile == true {
+                    guard let fileSize = values.fileSize else { readFailed = true; continue }
+                    let size = Int64(fileSize)
                     total += size
+                    if staticFiles.contains(entry.standardizedFileURL.path) {
+                        staticModelBytes += size
+                        continue
+                    }
                     subtree += size
                     if size > singleFileThreshold {
                         offenders.append(DiskHygieneOffender(
@@ -194,8 +217,13 @@ public enum DataRootDiskHygiene {
             return subtree
         }
 
-        if fm.fileExists(atPath: dataRoot.path) {
+        do {
+            _ = try fm.attributesOfItem(atPath: dataRoot.path)
             walk(dataRoot, depth: 0)
+        } catch CocoaError.fileReadNoSuchFile {
+            // A missing data root has no storage to scan.
+        } catch {
+            readFailed = true
         }
         offenders.sort { $0.sizeBytes > $1.sizeBytes }
         let directoryOffenders = directoryBytes
@@ -215,10 +243,12 @@ public enum DataRootDiskHygiene {
         return DiskHygieneReport(
             largeFiles: offenders,
             totalBytes: total,
-            totalOverBudget: total > totalThreshold,
+            totalOverBudget: total - staticModelBytes > totalThreshold,
             truncated: truncated,
             depthTruncated: depthTruncated,
-            largeDirectories: directoryOffenders
+            readFailed: readFailed,
+            largeDirectories: directoryOffenders,
+            staticModelBytes: staticModelBytes
         )
     }
 
@@ -471,10 +501,13 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
             totalThreshold: totalThreshold,
             directoryThreshold: directoryThreshold
         )
-        // A clean scan filed no card and changed nothing. It is a healthy
-        // observation, not work — reporting it `.completed` kept the dormancy
-        // clock fresh on a lane that has never had anything to do.
+        // A complete clean scan retires a stale notice, preserving its history.
+        // It remains a healthy observation rather than new background work.
         guard report.tripped else {
+            guard await fileNotice(report) else {
+                await rollback()
+                return .failed(error: "disk hygiene notice delivery failed; reservation rolled back")
+            }
             return .skipped(reason: "disk clean (\(DataRootDiskHygiene.humanSize(report.totalBytes)))"
                 + (report.truncated ? " [scan truncated at file budget]" : "")
                 + (report.depthTruncated ? " [depth-truncated: a store past maxDepth is unscanned]" : ""))

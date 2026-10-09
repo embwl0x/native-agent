@@ -82,7 +82,7 @@ extension AppModel {
         do {
             return .success(try await operation(trimmed))
         } catch {
-            statusText = "Research failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "run that research")
             return .failure(.requestFailed(error.localizedDescription))
         }
     }
@@ -165,24 +165,8 @@ extension AppModel {
         }
     }
 
-    /// The compact Capabilities panel keeps its own visible receipt rather
-    /// than implying an outcome from the list refresh or global status text.
-    @MainActor
-    func resolveCapabilitiesApprovalInbox(_ approval: ApprovalRecord, decision: String) async {
-        capabilitiesApprovalInboxOutcome = nil
-        let result = await resolveApprovalOnce(id: approval.id, decision: decision)
-        capabilitiesApprovalInboxOutcome = result
-        statusText = result.visibleMessage
-        switch result {
-        case .applied, .noOpAlreadyResolved:
-            await refreshAll()
-        case .noOpInFlight, .unavailable:
-            break
-        }
-    }
-
-    /// Coalesce simultaneous decisions from the compact Capabilities card,
-    /// the full Approvals screen, and any mounted inline control. The second
+    /// Coalesce simultaneous decisions from the full Approvals screen and
+    /// any mounted inline control. The second
     /// caller is deliberately typed as a no-op rather than issuing another
     /// resolve request whose post-resolution effect could run twice.
     @MainActor
@@ -235,10 +219,10 @@ extension AppModel {
             statusText = "Loaded MCP details for \(server.name)"
         } catch {
             guard selectedMCPServerId == pendingId else { return }
-            mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+            mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
             mcpResources = []
-            mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
-            statusText = "MCP details failed: \(error.localizedDescription)"
+            mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
+            setFailureStatus(error, action: "load MCP details")
         }
     }
 
@@ -263,7 +247,7 @@ extension AppModel {
             } catch {
                 fetchedTools = nil
                 if selectedMCPServerId == pendingId {
-                    mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                    mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
                 }
             }
             if selectedMCPServerId == pendingId {
@@ -276,7 +260,7 @@ extension AppModel {
                 fetchedResources = nil
                 if selectedMCPServerId == pendingId {
                     mcpResources = []
-                    mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                    mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
                 }
             }
             // Sessions are server-list-wide, safe to apply unconditionally.
@@ -304,7 +288,7 @@ extension AppModel {
             statusText = disabledFeature ?? "MCP warm disabled"
         } catch {
             guard selectedMCPServerId == pendingId else { return }
-            statusText = "MCP warm failed: \(error.localizedDescription)"
+            setFailureStatus("Warming the MCP server failed. " + UserFacingError.cause(error, action: "warm the MCP server"), cause: error)
         }
     }
 
@@ -328,7 +312,7 @@ extension AppModel {
             }
         } catch {
             guard selectedMCPServerId == pendingId else { return }
-            statusText = "MCP restart failed: \(error.localizedDescription)"
+            setFailureStatus("Restarting the MCP server failed. " + UserFacingError.cause(error, action: "restart the MCP server"), cause: error)
         }
     }
 
@@ -354,15 +338,15 @@ extension AppModel {
             }
         } catch let err as NSError where AppModel.isNotImplemented(err) {
             guard selectedMCPServerId == pendingId else { return }
-            mcpToolReadState = .unavailable(String(err.localizedDescription.prefix(240)))
-            mcpResourceReadState = .unavailable(String(err.localizedDescription.prefix(240)))
+            mcpToolReadState = .unavailable(UserFacingError.cause(err, action: "read the MCP tools"))
+            mcpResourceReadState = .unavailable(UserFacingError.cause(err, action: "read the MCP resources"))
             disabledFeature = AppModel.disabledBadge(for: "MCP cache refresh", error: err)
             statusText = disabledFeature ?? "MCP cache refresh disabled"
         } catch {
             guard selectedMCPServerId == pendingId else { return }
-            mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
-            mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
-            statusText = "MCP cache refresh failed: \(error.localizedDescription)"
+            mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
+            mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
+            setFailureStatus("Refreshing the MCP cache failed. " + UserFacingError.cause(error, action: "refresh the MCP cache"), cause: error)
         }
     }
 
@@ -386,7 +370,7 @@ extension AppModel {
             mcpConsent = (try? await client.getMCPConsent()) ?? mcpConsent
             statusText = "MCP consent granted (\(granted.risk ?? "unknown"))"
         } catch {
-            statusText = "MCP consent failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "grant that MCP consent")
         }
     }
 
@@ -397,7 +381,7 @@ extension AppModel {
             mcpConsent = (try? await client.getMCPConsent()) ?? mcpConsent
             statusText = "MCP consent revoked"
         } catch {
-            statusText = "MCP revoke failed: \(error.localizedDescription)"
+            setFailureStatus("Revoking MCP consent failed. " + UserFacingError.cause(error, action: "revoke MCP consent"), cause: error)
         }
     }
 
@@ -413,8 +397,8 @@ extension AppModel {
             statusText = "MCP \(tool.name): \(latestMCPCall?.status ?? "done")"
             await refreshAll()
         } catch {
-            mcpRecentCallState = .latestAttemptFailed(String(error.localizedDescription.prefix(240)))
-            statusText = "MCP call failed: \(error.localizedDescription)"
+            mcpRecentCallState = .latestAttemptFailed(UserFacingError.cause(error, action: "call that MCP tool"))
+            setFailureStatus(error, action: "call that MCP tool")
         }
     }
 
@@ -443,8 +427,8 @@ extension AppModel {
             statusText = "MCP \(tool.name): \(latestMCPCall?.status ?? "done")"
             await refreshAll()
         } catch {
-            mcpRecentCallState = .latestAttemptFailed(String(error.localizedDescription.prefix(240)))
-            statusText = "MCP call failed: \(error.localizedDescription)"
+            mcpRecentCallState = .latestAttemptFailed(UserFacingError.cause(error, action: "call that MCP tool"))
+            setFailureStatus(error, action: "call that MCP tool")
         }
     }
 

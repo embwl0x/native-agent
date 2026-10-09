@@ -177,6 +177,12 @@ extension AppModel {
     @MainActor
     @discardableResult
     func refreshForSidebarItem(_ item: SidebarItem) async -> PanelRefreshStatus {
+        panelRefreshCounts[item, default: 0] += 1
+        defer {
+            let remaining = panelRefreshCounts[item, default: 1] - 1
+            if remaining == 0 { panelRefreshCounts.removeValue(forKey: item) }
+            else { panelRefreshCounts[item] = remaining }
+        }
         let api = client
         let memory = engine.memory
         let approvalStore = engine.approvals
@@ -225,7 +231,7 @@ extension AppModel {
             // those screens had been visited. Load it once here; the name is
             // the profile's, never a literal.
             if personality == nil {
-                personality = fresh("personality profile", try? await api.getPersonality()) ?? personality
+                if let next = fresh("personality profile", try? await api.getPersonality()), next != personality { personality = next }
                 teachMemoryHygieneName()
             }
         case .legacyWorkshop:
@@ -278,17 +284,15 @@ extension AppModel {
             agentGraph = fresh("agent graph", agentGraphRow) ?? agentGraph
             graphEntities = fresh("graph entities", graphRows) ?? graphEntities
             graphStatus = fresh("graph status", graphStatusRow) ?? graphStatus
-            personality = fresh("personality", personalityRow) ?? personality
+            if let next = fresh("personality", personalityRow), next != personality { personality = next }
             teachMemoryHygieneName()
-            engine.trust.policy = fresh("trust policy", trustRow) ?? engine.trust.policy
+            if let next = fresh("trust policy", trustRow), next != engine.trust.policy { engine.trust.policy = next }
         case .settingsHub, .settings, .connectors, .providers, .telegram, .inboxPolicy, .macIntegration:
             async let nextConfig = try? api.getConfig()
-            async let nextPrivacyMap = try? api.getPrivacyMap()
             async let nextTelegramStatus = try? engine.telegram.load(manager: api.backgroundLoopsManager.coreManager)
             async let nextConnectors = try? api.getConnectors()
-            let (configRow, privacyRow, telegramRow, connectorRows) = await (
+            let (configRow, telegramRow, connectorRows) = await (
                 nextConfig,
-                nextPrivacyMap,
                 nextTelegramStatus,
                 nextConnectors
             )
@@ -296,7 +300,6 @@ extension AppModel {
                 engine.providers.codexAuth = config.codexAuth
                 _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
             }
-            privacyMap = fresh("privacy map", privacyRow) ?? privacyMap
             engine.telegram.status = fresh("telegram status", telegramRow) ?? engine.telegram.status
             connectors = fresh("connectors", connectorRows) ?? connectors
             if item == .connectors {
@@ -319,7 +322,7 @@ extension AppModel {
                 nextPromotionCandidates,
                 nextPromotionPending
             )
-            approvalStore.records = fresh("approvals", approvalRows) ?? approvalStore.records
+            if let next = fresh("approvals", approvalRows), next != approvalStore.records { approvalStore.records = next }
             inbox.items = fresh("inbox", inboxRows) ?? inbox.items
             memory.proposals = fresh("memory proposals", proposalRows) ?? memory.proposals
             improvementSummary = fresh("improvement summary", improvementRow) ?? improvementSummary
@@ -415,7 +418,7 @@ extension AppModel {
             skills = fresh("skills", skillRows) ?? skills
             toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
             engine.trust.capabilitySummary = fresh("capability summary", capabilityRow) ?? engine.trust.capabilitySummary
-            approvalStore.records = fresh("approvals", approvalRows) ?? approvalStore.records
+            if let next = fresh("approvals", approvalRows), next != approvalStore.records { approvalStore.records = next }
             workflows = fresh("workflows", workflowRows) ?? workflows
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
             engine.tools.mcpSessions = fresh("mcp sessions", mcpSessionRows) ?? engine.tools.mcpSessions
@@ -477,7 +480,7 @@ extension AppModel {
             // The Dreams tab fetches its diary itself; refresh the trust policy
             // here so the REM toggle (trainingPolicy.rem_cycle_enabled) reflects
             // current state on tab entry.
-            engine.trust.policy = fresh("trust policy", try? await engine.trust.load()) ?? engine.trust.policy
+            if let next = fresh("trust policy", try? await engine.trust.load()), next != engine.trust.policy { engine.trust.policy = next }
         case .cognition:
             performedRead = false
         case .skills, .skillLifecycle:
@@ -526,7 +529,7 @@ extension AppModel {
                 nextCompiled,
                 nextGrowth
             )
-            personality = fresh("personality", personalityRow) ?? personality
+            if let next = fresh("personality", personalityRow), next != personality { personality = next }
             teachMemoryHygieneName()
             if let docsResponse = fresh("personality docs", docsResponse) {
                 personalityDocs = docsResponse.docs
@@ -535,19 +538,16 @@ extension AppModel {
             personalityGrowth = fresh("personality growth", growthRow) ?? personalityGrowth
         case .trust:
             async let nextTrust = try? engine.trust.load()
-            async let nextPrivacy = try? api.getPrivacyMap()
             async let nextConnectors = try? api.getConnectors()
             async let nextWorkspaces = try? api.getWorkspaces()
             async let nextBackups = try? engine.trust.listBackups()
-            let (trustRow, privacyRow, connectorRows, workspaceRows, backupRows) = await (
+            let (trustRow, connectorRows, workspaceRows, backupRows) = await (
                 nextTrust,
-                nextPrivacy,
                 nextConnectors,
                 nextWorkspaces,
                 nextBackups
             )
-            engine.trust.policy = fresh("trust policy", trustRow) ?? engine.trust.policy
-            privacyMap = fresh("privacy map", privacyRow) ?? privacyMap
+            if let next = fresh("trust policy", trustRow), next != engine.trust.policy { engine.trust.policy = next }
             connectors = fresh("connectors", connectorRows) ?? connectors
             workspaces = fresh("workspaces", workspaceRows) ?? workspaces
             engine.trust.backups = fresh("backups", backupRows) ?? engine.trust.backups
@@ -574,7 +574,7 @@ extension AppModel {
             toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
             connectorActionRegistry = fresh("connector actions", connectorRows) ?? connectorActionRegistry
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
-            engine.trust.policy = fresh("trust policy", trustPolicyRow) ?? engine.trust.policy
+            if let next = fresh("trust policy", trustPolicyRow), next != engine.trust.policy { engine.trust.policy = next }
             if !(await toolStore.refreshCatalog()) {
                 failedEndpoints.append("tool catalog")
             }
@@ -618,7 +618,7 @@ extension AppModel {
                     fetchedTools = nil
                     failedEndpoints.append("mcp tools")
                     if selectedMCPServerId == pendingId {
-                        mcpToolReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                        mcpToolReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP tools"))
                     }
                 }
                 if selectedMCPServerId == pendingId {
@@ -631,7 +631,7 @@ extension AppModel {
                     fetchedResources = nil
                     failedEndpoints.append("mcp resources")
                     if selectedMCPServerId == pendingId {
-                        mcpResourceReadState = .unavailable(String(error.localizedDescription.prefix(240)))
+                        mcpResourceReadState = .unavailable(UserFacingError.cause(error, action: "read the MCP resources"))
                     }
                 }
                 if selectedMCPServerId == pendingId {
@@ -765,6 +765,13 @@ extension AppModel {
         fetched ?? previous
     }
 
+    /// The privacy map, walked now off the main actor (seconds for a whole
+    /// data root). Trust asks for it whenever it shows the map.
+    func refreshPrivacyMap() async {
+        let api = client
+        privacyMap = await Task.detached(priority: .utility) { try? await api.getPrivacyMap() }.value ?? privacyMap
+    }
+
     /// One user-facing sentence naming what could not be reached and how old
     /// the displayed data is, or nil when the last refresh was clean.
     @MainActor
@@ -773,7 +780,11 @@ extension AppModel {
         // Endpoint names are internal vocabulary; the user-facing sentence
         // stays plain (same rule as DetachedChatLoadFailureCopy).
         guard let lastSuccess = status.lastSuccessAt else {
-            return "Nothing has loaded yet this session. Check your connection."
+            // The provider reads failing with none connected is that cause;
+            // anything else failed for its own reason, which is not named here.
+            return Set(status.failedEndpoints).isSubset(of: ["providers", "model catalog"]) && !hasAnyUsableProvider()
+                ? "Nothing has loaded yet this session: no AI provider is connected. Connect one in Providers."
+                : "Nothing has loaded yet this session: the last read failed."
         }
         let age = Self.approximateAgeDescription(since: lastSuccess, now: status.lastAttemptAt)
         return "Showing data from \(age) — some information couldn't be refreshed."
@@ -1110,7 +1121,7 @@ extension AppModel {
             markChatSidebarLoadSucceeded()
         } catch {
             chatStateLoadFailed = true
-            statusText = "Chat load failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "load your chats")
         }
     }
 
@@ -1128,7 +1139,7 @@ extension AppModel {
             } catch {
                 // Don't swallow this. A failed post-turn refresh leaves optimistic
                 // bubble ids on screen; saying nothing is the same lie M12 is about.
-                statusText = "Chat refresh failed: \(error.localizedDescription)"
+                setFailureStatus(error, action: "refresh your chats")
                 return
             }
         }
@@ -1328,7 +1339,7 @@ extension AppModel {
             statusText = "New chat session ready"
             publishChatSnapshot()
         } catch {
-            statusText = "New chat failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "start a new chat")
         }
     }
 
@@ -1344,4 +1355,108 @@ extension AppModel {
     // embeddings-backend toggle. The Settings page's memory rows
     // (SetupFeatureRows) consume these (can't reach `client` directly
     // because it's private).
+}
+
+/// User, 2026-10-07: a turn from Telegram, the phone or a bridge into the open
+/// conversation showed his message, then nothing, then the whole reply. Every
+/// door fires the same trace milestones as a Mac turn, so this reads them into
+/// the same lifecycle the card, the thinking glow and Work read. Display only:
+/// no task, no Stop, no durable receipt, and a Mac turn in the session always
+/// wins. It keeps every session's open turn, seeded from the persisted trace
+/// when it starts, so a turn already running when a chat is opened or
+/// returned to shows too.
+@MainActor
+final class OtherDoorTurns {
+    static let shared = OtherDoorTurns()
+    /// Each session's other-door turn that began and has not ended.
+    private var open: [String: MacChatTurnLifecycleState] = [:]
+    private var started = false
+    /// A start this old with no end in the trace is a turn that died
+    /// unrecorded, not one still working.
+    static let seedWindow: TimeInterval = 30 * 60
+    /// Her words reaching the surface: movement, and the card reads "replying".
+    private static let outputKinds: Set<String> = [
+        TurnLifecycleMilestone.providerFirstDelta.rawValue,
+        TurnLifecycleMilestone.surfaceOutputEnqueued.rawValue,
+        TurnLifecycleMilestone.surfaceFirstRender.rawValue,
+    ]
+
+    func start(_ appModel: AppModel) {
+        guard !started else { return }
+        started = true
+        Task { await run(appModel) }
+    }
+
+    /// Puts the session's open turn on its card, unless a Mac turn holds it.
+    func show(_ sessionId: String, _ appModel: AppModel) {
+        guard let state = open[sessionId] else { return }
+        let turns = appModel.engine.turns
+        if let held = turns.lifecycle(for: sessionId), held.identity.turnId != state.identity.turnId,
+           !held.presentation.isTerminal { return }
+        turns.lifecycleBySession[sessionId] = state
+    }
+
+    private func run(_ appModel: AppModel) async {
+        let subscription = await TurnTraceBus.shared.subscribe(capacity: 256)
+        let reader = TurnTraceRecentReader(dataRootOverride: appModel.engine.turns.dataRoot)
+        let yesterday = (try? await reader.read(now: Date().addingTimeInterval(-86400)))?.events ?? []
+        let today = (try? await reader.read())?.events ?? []
+        for event in (yesterday + today).sorted(by: { $0.ts < $1.ts })
+        where Date().timeIntervalSince(event.ts) < Self.seedWindow {
+            _ = reduce(event, appModel)
+        }
+        for sessionId in open.keys { show(sessionId, appModel) }
+        for await event in subscription.stream {
+            guard let sessionId = event.sessionId, let ended = reduce(event, appModel) else { continue }
+            if ended {
+                // A refresh that started while the card was up is dropped by
+                // its lifecycle guard; this one lands the reply.
+                await appModel.refreshChatMessagesAfterTurn(sessionId: sessionId)
+            } else {
+                show(sessionId, appModel)
+            }
+        }
+    }
+
+    /// Folds one event in: nil when it is not an other-door turn's, else
+    /// whether that turn ended.
+    private func reduce(_ event: TurnTraceEvent, _ appModel: AppModel) -> Bool? {
+        guard let sessionId = event.sessionId else { return nil }
+        let turns = appModel.engine.turns
+        let identity = MacChatTurnIdentity(sessionId: sessionId, turnId: event.turnId)
+        if event.kind == TurnLifecycleMilestone.turnAccepted.rawValue {
+            guard open[sessionId]?.identity != identity,
+                  !turns.busySessions.contains(sessionId),
+                  turns.activeTurnIDsBySession[sessionId] != event.turnId,
+                  turns.lifecycle(for: sessionId)?.identity.turnId != event.turnId
+            else { return nil }
+            open[sessionId] = MacChatTurnLifecycleState(identity: identity, startedAt: event.ts)
+            return false
+        }
+        guard let state = open[sessionId], state.identity == identity else { return nil }
+        let kind: MacChatTurnLifecycleInput.Kind
+        switch event.kind {
+        case "tool.dispatch":
+            var action: String?
+            if case .object(let payload) = event.payload, payload["phase"] == .string("begin"),
+               case .string(let name)? = payload["shown"] ?? payload["name"] {
+                action = ToolActivityPresentation.progress(name)
+            }
+            kind = .working(action: action)
+        case let output where Self.outputKinds.contains(output):
+            kind = .streamProgress(accumulatedUTF16Length: state.presentation.streamedTextLength + 1)
+        case "turn.terminal", "turn.cancelled", "turn.failed":
+            open[sessionId] = nil
+            if turns.lifecycle(for: sessionId)?.identity == identity {
+                turns.lifecycleBySession.removeValue(forKey: sessionId)
+            }
+            return true
+        default:
+            return nil
+        }
+        open[sessionId] = MacChatTurnLifecycleReducer.reduce(
+            state, input: MacChatTurnLifecycleInput(identity: identity, kind: kind, occurredAt: event.ts)
+        )
+        return false
+    }
 }

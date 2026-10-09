@@ -128,10 +128,18 @@ struct ChatMessageRecord: Identifiable, Codable, Hashable {
     // reads them back so refreshChatHistory rebuilds messages with their
     // attachments instead of dropping them on reload.
     var metadata: ChatMessageRecordMetadata? = nil
+    var interactionJSON: String? = nil
+    var interactionDescriptorJSON: String? = nil
+    var interactionSessionID: String? = nil
 }
 
 struct ChatMessageRecordMetadata: Codable, Hashable {
     var attachments: [PersistedAttachmentRecord]? = nil
+    var completionState: String? = nil
+    var failureWork: String? = nil
+    var error: String? = nil
+    var partial: Bool? = nil
+    var cancelled: Bool? = nil
 }
 
 struct PersistedAttachmentRecord: Codable, Hashable {
@@ -155,6 +163,8 @@ struct ChatTranscriptSnapshot: Identifiable, Codable, Hashable, Sendable {
     /// clock. Absent on pre-2026-09-06 Mac builds, and then an empty row stays
     /// inert.
     var transcriptGeneration: Int? = nil
+    /// The Mac holds rows older than this window. Absent on older Mac builds.
+    var hasOlder: Bool? = nil
 }
 
 // MARK: - Turn Inspector W4 — iOS decode-side summary models

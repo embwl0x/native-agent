@@ -13,12 +13,9 @@ import ProviderRouting
 /// registry is wired in Swift. The LLM call goes through the in-app
 /// `SwiftNativeLLMClient`: one checked routing snapshot admits the complete
 /// executions provider/model/effort/tier tuple, and the task-local admission is
-/// passed through `LLMClient.complete(prompt:system:model:surface:)`. Timeout enforcement (60s in
-/// the planner caller) lives inside `runCodex` via `withThrowingTaskGroup`.
-/// Any LLM throw, any router throw, any timeout is wrapped as
-/// `WorkshopExecutionError.plannerFailure(...)` so the outer `planWorkshopExecution` stub
-/// fallback path is hit — byte-for-byte parity with the Python broad-except
-/// at the retired daemon. The surface is carried through the final client call
+/// passed through `LLMClient.complete(prompt:system:model:surface:)`. Model calls
+/// await provider/transport termination or caller cancellation, without an
+/// elapsed-time cut. The surface is carried through the final client call
 /// so active-provider selection and the surface's Think/Fast controls cannot
 /// fall back to chat. CancellationError propagates distinctly from WorkshopExecutionError
 /// so a cancelled submit() never lands a stub.
@@ -76,9 +73,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         processEnvironment: [String: String] = ProcessInfo.processInfo.environment,
         defaultDataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [String: String] {
-        let codexHome = dataRoot
-            .appendingPathComponent("codex_home", isDirectory: true)
-            .standardizedFileURL
+        let codexHome = OpenAIOAuthDirectAdapter.codexChildHome(dataRoot: dataRoot)
         var environment: [String: String]
         if dataRoot.standardizedFileURL == defaultDataRoot.standardizedFileURL {
             environment = processEnvironment
@@ -112,36 +107,43 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             router: rootedRouter,
             codex: CodexAdapter(processEnvironmentOverride: codexEnvironment),
             anthropic: AnthropicAdapter(
+                session: ProviderStreamGuard.stallOnlySession,
                 dataRootOverride: dataRoot,
                 telemetryDataRootOverride: dataRoot
             ),
             openAI: OpenAIAdapter(
+                session: ProviderStreamGuard.stallOnlySession,
                 dataRootOverride: dataRoot,
                 telemetryDataRootOverride: dataRoot
             ),
             openAIOAuthDirect: OpenAIOAuthDirectAdapter(
+                session: ProviderStreamGuard.stallOnlySession,
                 authPathOverride: dataRoot
                     .appendingPathComponent("codex_home", isDirectory: true)
                     .appendingPathComponent("auth.json"),
                 telemetryDataRootOverride: dataRoot
             ),
             anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
+                session: ProviderStreamGuard.stallOnlySession,
                 authPathOverride: providers.appendingPathComponent("anthropic_oauth_direct.json"),
                 telemetryDataRootOverride: dataRoot
             ),
             xaiOAuthDirect: XAIOAuthDirectAdapter(
+                session: ProviderStreamGuard.stallOnlySession,
                 tokenPathOverride: XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot),
                 telemetryDataRootOverride: dataRoot
             ),
             moonshot: MoonshotAdapter(
+                session: ProviderStreamGuard.stallOnlySession,
                 dataRootOverride: dataRoot,
                 telemetryDataRootOverride: dataRoot
             ),
             kimiCode: AnthropicAdapter.kimiCode(
+                session: ProviderStreamGuard.stallOnlySession,
                 dataRootOverride: dataRoot,
                 telemetryDataRootOverride: dataRoot
             ),
-            openRouter: OpenRouterAdapter(dataRootOverride: dataRoot),
+            openRouter: OpenRouterAdapter(session: ProviderStreamGuard.stallOnlySession, dataRootOverride: dataRoot),
             lifecycleObserver: lifecycleObserver,
             moonshotCatalogDataRoot: dataRoot
         )
@@ -188,14 +190,14 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         self.llm = llm ?? SwiftNativeLLMClient(
             router: resolvedRouter,
             codex: CodexAdapter(),
-            anthropic: AnthropicAdapter(),
-            openAI: OpenAIAdapter(),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(),
-            xaiOAuthDirect: XAIOAuthDirectAdapter(),
-            moonshot: MoonshotAdapter(),
-            kimiCode: AnthropicAdapter.kimiCode(),
-            openRouter: OpenRouterAdapter(),
+            anthropic: AnthropicAdapter(session: ProviderStreamGuard.stallOnlySession),
+            openAI: OpenAIAdapter(session: ProviderStreamGuard.stallOnlySession),
+            openAIOAuthDirect: OpenAIOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
+            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
+            xaiOAuthDirect: XAIOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
+            moonshot: MoonshotAdapter(session: ProviderStreamGuard.stallOnlySession),
+            kimiCode: AnthropicAdapter.kimiCode(session: ProviderStreamGuard.stallOnlySession),
+            openRouter: OpenRouterAdapter(session: ProviderStreamGuard.stallOnlySession),
             lifecycleObserver: lifecycleObserver
         )
     }
@@ -253,7 +255,6 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         try Task.checkCancellation()
         let modelForCall = resolvedModel
         let localLLM = llm
-        let timeoutNs = UInt64(max(0, timeoutSeconds)) * 1_000_000_000
         // Runs-ledger row per LLM run (Runs UI + iOS runs snapshot): this is
         // the Swift heir of the daemon's run_codex, which was the original
         // writer of <dataRoot>/runs/runs.json. Success and failure both land a
@@ -264,8 +265,8 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             try await LLMCallContext.$providerId.withValue(resolvedProvider) {
             try await LLMCallContext.$reasoningEffort.withValue(resolvedEffort) {
             try await LLMCallContext.$serviceTier.withValue(resolvedTier) {
-            try await withThrowingTaskGroup(of: String.self) { group in
-                group.addTask {
+            // The compatibility timeout argument cannot establish a stall.
+            // Provider/transport completion and caller cancellation own this call.
                     // Python's _plan_mission does NOT pass a system prompt; the
                     // planner instructions are embedded in `prompt`.
                     if let rootedTraceDataRoot = runLedgerDataRoot {
@@ -286,17 +287,6 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
                         model: modelForCall,
                         surface: routingSurface
                     )
-                }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: timeoutNs)
-                    throw WorkshopExecutionError.plannerFailure("timeout after \(timeoutSeconds)s")
-                }
-                guard let first = try await group.next() else {
-                    throw WorkshopExecutionError.plannerFailure("empty result")
-                }
-                group.cancelAll()
-                return first
-            }
             }
             }
             }

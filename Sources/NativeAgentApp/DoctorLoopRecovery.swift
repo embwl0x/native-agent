@@ -62,14 +62,17 @@ enum DoctorLoopRecovery {
             let interval = configured[id] ?? status?.interval ?? 300
             let detail = "Configured interval: \(Int(interval)) seconds. "
                 + NativeAppSecretRedactor.redactText(String(state.prefix(700))) + lastFailure
+            let action = humanAction(loopID: id, status: status, managerRunning: managerRunning)
+            let waiting = pending.contains(id) && status?.running == true && status?.lastError == nil
             return CheckResult(
                 id: checkPrefix + id,
                 title: "Background loop: \(id)",
                 status: level == .ok ? "ok" : level == .fail ? "fail" : "warn",
                 detail: detail,
-                human_action: level == .ok ? nil : pending.contains(id) && status?.running == true && status?.lastError == nil
+                human_action: level == .ok ? nil : waiting
                     ? "Wait for \(id)'s next successful run, then run Diagnostics → Doctor again."
-                    : humanAction(loopID: id, status: status, managerRunning: managerRunning)
+                    : action.step,
+                ask: level == .ok || waiting ? nil : action.ask
             )
         }
     }
@@ -125,29 +128,23 @@ enum DoctorLoopRecovery {
         }
     }
 
+    /// The step for User, and whether it is a sign-in or permission. A loop
+    /// failing for no named reason has no step: its detail says what failed.
     private static func humanAction(
         loopID: String, status: LoopStatus?, managerRunning: Bool
-    ) -> String {
-        let reason = [status?.lastError, status?.lastResult]
-            .compactMap { $0 }.joined(separator: " ").lowercased()
-        if loopID == "offdisk_backup", reason.contains("icloud drive") {
-            return DoctorLoopHealth.iCloudDriveStep
-        }
-        if loopID == "telegram_poll", reason.contains("unauthoriz") || reason.contains("token") {
-            return "Open Connectors → Telegram, reconnect the bot token, then run Doctor again."
-        }
-        if loopID == "slack_socket_mode", reason.contains("auth") || reason.contains("token") {
-            return "Open Connectors → Slack, reconnect the workspace token, then run Doctor again."
-        }
+    ) -> (step: String?, ask: DoctorAskKind?) {
+        let failure = [status?.lastError, status?.lastResult].compactMap { $0 }.joined(separator: " ")
+        if let fix = BackgroundLoopsManager.loopSettingFix(loopId: loopID, error: failure) { return (fix.step, fix.ask) }
+        let reason = failure.lowercased()
         if reason.contains("network") || reason.contains("offline") || reason.contains("timed out") {
-            return "Connect this Mac to the internet, then run Diagnostics → Doctor again."
+            return ("Connect this Mac to the internet, then run Diagnostics → Doctor again.", nil)
         }
         if managerRunning, NativeAppBackgroundLoopsManager.hotReloadableLoopIDs.contains(loopID) {
-            return "Open Diagnostics → Doctor and press Repair to restart \(loopID)'s registration."
+            return ("Open Diagnostics → Doctor and press Repair to restart \(loopID)'s registration.", nil)
         }
         if status?.running != true {
-            return "Quit and reopen NativeAgent to restart background scheduling for \(loopID)."
+            return ("Quit and reopen NativeAgent to restart background scheduling for \(loopID).", nil)
         }
-        return "Open Diagnostics → Doctor, copy \(loopID)'s status detail, and send it to support."
+        return (nil, nil)
     }
 }

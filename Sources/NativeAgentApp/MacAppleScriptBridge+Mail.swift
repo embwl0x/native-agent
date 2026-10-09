@@ -12,11 +12,11 @@ extension MacAppleScriptBridge {
         try await mailWorkspaceRead(input: input)
     }
 
-    /// Search mailbox pages by subject/sender fragment. Input: "query" (required),
-    /// "limit" (default 10, max 50).
+    /// Search mailbox pages by subject/sender fragments (OR) and index filters.
     /// Returns: same shape as mailListRecent.
     public static func mailSearch(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let query = inputString(input["query"]), !query.isEmpty else {
+        let query = inputStringArray(input["query"]).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard (input["query"] == nil || !query.isEmpty), query.allSatisfy({ !$0.isEmpty }) else {
             return failedEnvelope(integration: "mail", reason: "missing_query")
         }
         return try await mailWorkspaceRead(input: input, query: query)
@@ -26,6 +26,10 @@ extension MacAppleScriptBridge {
     /// Optional: "cc", "bcc".
     /// Returns: {status, action: "sent", to, subject}.
     public static func mailSend(input: [String: JSONValue]) async throws -> JSONValue {
+        try await mailCompose(input: input, send: true)
+    }
+
+    private static func mailCompose(input: [String: JSONValue], send: Bool) async throws -> JSONValue {
         let toList = inputStringArray(input["to"])
         guard !toList.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_to")
@@ -56,6 +60,14 @@ extension MacAppleScriptBridge {
             recipientLines.append("make new bcc recipient at end of bcc recipients with properties {address:\"\(e)\"}")
         }
         let recipientsBlock = recipientLines.joined(separator: "\n            ")
+        let finish = send ? """
+            set sendOK to send newMsg
+            if sendOK is true then return "sent"
+            return "refused"
+            """ : """
+            save newMsg
+            return "draft|" & ((id of newMsg) as text)
+            """
 
         let source = """
         tell application "Mail"
@@ -63,20 +75,18 @@ extension MacAppleScriptBridge {
             tell newMsg
                 \(recipientsBlock)
             end tell
-            set sendOK to send newMsg
-            if sendOK is true then
-                return "sent"
-            end if
-            return "refused"
+            \(finish)
         end tell
         """
         do {
-            // 2026-09-06: Mail's `send` returns a boolean and this discarded it,
-            // so a message Mail refused (no account able to send from, offline
-            // outbox rejection) was reported to the operator as sent.
             let raw = try await runAppleScript(source).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard raw == "sent" else {
-                return failedEnvelope(integration: "mail", reason: "mail_refused_send")
+            if !send, raw.hasPrefix("draft|"), !raw.dropFirst(6).isEmpty {
+                return .object(["status": .string("completed"), "action": .string("draft_saved"),
+                    "saved_in": .string("Apple Mail → Drafts"), "draft_id": .string(String(raw.dropFirst(6))),
+                    "to": .array(toList.map(JSONValue.string)), "subject": .string(subject)])
+            }
+            guard send, raw == "sent" else {
+                return failedEnvelope(integration: "mail", reason: send ? "mail_refused_send" : "draft_save_unconfirmed")
             }
             return .object([
                 "status": .string("completed"),
@@ -96,8 +106,10 @@ extension MacAppleScriptBridge {
     /// One bounded job over selected identities. Keep completed receipts when
     /// cancellation or an uncertain script stops the remaining work; never replay.
     static func mailBatch(input: [String: JSONValue], effects: Bool) async -> JSONValue {
-        guard Set(input.keys).subtracting(["__session_id"]) == ["items"], case .array(let items)? = input["items"],
-              (1...10).contains(items.count) else {
+        let markReadOnly = effects && input["messages"] != nil
+        let key = markReadOnly ? "messages" : "items"
+        guard Set(input.keys).subtracting(["__session_id"]) == [key], case .array(let items)? = input[key],
+              (1...(markReadOnly ? 50 : 10)).contains(items.count) else {
             return failedEnvelope(integration: "mail", reason: "invalid_mail_batch")
         }
         let deadline = Date().addingTimeInterval(45)
@@ -108,6 +120,15 @@ extension MacAppleScriptBridge {
             var receipt: [String: JSONValue] = ["index": .int(Int64(index))]
             guard case .object(var row) = item else {
                 receipt["status"] = .string("failed"); receipt["reason"] = .string("invalid_message_locator")
+                receipts.append(.object(receipt)); continue
+            }
+            if markReadOnly {
+                row = row.filter { identityKeys.contains($0.key) && $0.key != "name" }
+                row["mark_read"] = .bool(true)
+            }
+            if let bindingError = row["binding_error"] {
+                receipt["status"] = .string("failed"); receipt["reason"] = .string("invalid_mail_batch_item")
+                receipt["detail"] = bindingError
                 receipts.append(.object(receipt)); continue
             }
             if !effects, row["expected_message_id"] == nil { row["expected_message_id"] = .string("") }
@@ -171,6 +192,11 @@ extension MacAppleScriptBridge {
                     : states.contains(.string("completed")) ? "partial" : "failed")
             } else {
                 do {
+                    let local = mailLocalRead(row, batch: true)
+                    if let body = local.row {
+                        receipt.merge(body) { _, new in new }; receipt["status"] = .string("completed")
+                        receipts.append(.object(receipt)); continue
+                    }
                     let raw = try await runAppleScript(mailWorkspaceScript(input: row, batch: true))
                     let messages = parseMailWorkspaceRecords(raw, detail: true)
                     if let setup = readSetupEnvelope(raw: raw, integration: "mail"), case .object(let result) = setup {
@@ -179,6 +205,7 @@ extension MacAppleScriptBridge {
                         receipt["status"] = .string("failed"); receipt["reason"] = .string("message_changed_or_moved_refresh_inbox")
                     } else if messages.count == 1, case .object(let body) = messages[0] {
                         receipt.merge(body) { _, new in new }; receipt["status"] = .string("completed")
+                        receipt["attachments_status"] = .string(local.attachments)
                     } else {
                         receipt["status"] = .string("failed"); receipt["reason"] = .string("invalid_mail_read_receipt")
                     }
@@ -284,7 +311,8 @@ extension MacAppleScriptBridge {
     /// matches are refused, never all moved (2026-09-24).
     /// Returns: {status, action, matched_count, subject}.
     public static func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue {
-        await mailManage(input: input, action: "marked_read", single: false, body: """
+        if input["messages"] != nil { return await mailBatch(input: input, effects: true) }
+        return await mailManage(input: input, action: "marked_read", single: false, body: """
             repeat with msg in hits
                 set read status of msg to true
             end repeat
@@ -535,6 +563,15 @@ extension MacAppleScriptBridge {
     /// default false).
     /// Returns: {status, action: "sent_reply", subject}.
     public static func mailReply(input: [String: JSONValue]) async throws -> JSONValue {
+        try await mailRespond(input: input, send: true)
+    }
+
+    public static func mailDraft(input: [String: JSONValue]) async throws -> JSONValue {
+        if input["to"] != nil { return try await mailCompose(input: input, send: false) }
+        return try await mailRespond(input: input, send: false)
+    }
+
+    private static func mailRespond(input: [String: JSONValue], send: Bool) async throws -> JSONValue {
         let exact = mailExactLocator(input)
         if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
         let subject = inputString(input["subject"]) ?? ""
@@ -557,6 +594,14 @@ extension MacAppleScriptBridge {
         let whereClause = exact.map { "id is \($0.id)" } ?? Self.mailMatchWhereClause(subjectAS: subjectAS, sender: sender)
         let identityCheck = exact.map { mailIdentityCheck($0, list: "hits", fail: "-2") } ?? ""
         let replyAllPhrase = replyAll ? "with reply to all" : "without reply to all"
+        let finish = send ? """
+            set sendOK to send replyMsg
+            if sendOK is true then return "1"
+            return "-1"
+            """ : """
+            save replyMsg
+            return "draft|" & ((id of replyMsg) as text)
+            """
         let source = """
         tell application "Mail"
             \(mailAccountScope(exact?.account))
@@ -570,20 +615,18 @@ extension MacAppleScriptBridge {
             set replyMsg to reply originalMsg opening window false \(replyAllPhrase)
             tell replyMsg
                 set content to "\(bodyAS)"
-                set sendOK to send
             end tell
-            if sendOK is true then
-                return "1"
-            end if
-            return "-1"
+            \(finish)
         end tell
         """
         do {
-            // 2026-09-06: `send` returns a boolean and the reply path discarded
-            // it too, so "1" meant only "a matching message was found", never
-            // "Mail sent it". -1 is now Mail's own refusal.
-            let raw = try await runAppleScript(source)
-            let code = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            let raw = try await runAppleScript(source).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !send, raw.hasPrefix("draft|"), !raw.dropFirst(6).isEmpty {
+                return .object(["status": .string("completed"), "action": .string("draft_saved"),
+                    "saved_in": .string("Apple Mail → Drafts"), "draft_id": .string(String(raw.dropFirst(6))),
+                    "subject": .string(subject), "account": exact?.account.map(JSONValue.string) ?? .null])
+            }
+            let code = Int(raw) ?? 0
             if code == -2 { return failedEnvelope(integration: "mail", reason: "message_changed_or_ambiguous_refresh_inbox") }
             if code < 0 {
                 return failedEnvelope(integration: "mail", reason: "mail_refused_send")
@@ -591,6 +634,7 @@ extension MacAppleScriptBridge {
             if code == 0 {
                 return failedEnvelope(integration: "mail", reason: "no_matching_message")
             }
+            guard send else { return failedEnvelope(integration: "mail", reason: "draft_save_unconfirmed") }
             return .object([
                 "status": .string("completed"),
                 "action": .string("sent_reply"),

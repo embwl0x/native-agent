@@ -45,7 +45,7 @@ import DeviceSync
 @MainActor
 @Observable
 final class AppModel: Sendable {
-    /// Global toast/status surface. Views overlay SystemToastBar(center:) and
+    /// Global toast/status surface. ContentView draws it in the one NoticeLane and
     /// any code path can call appModel.systemToasts.push(...).
     let systemToasts = SystemToastCenter()
     private var iCloudAccountToastID: UUID?
@@ -102,11 +102,7 @@ final class AppModel: Sendable {
     // computed properties — `@Observable` only tracks STORED properties so
     // SwiftUI bindings never propagated and onChange never fired. Converted
     // to stored with `didSet` UserDefaults persistence so settings panels
-    // (Telegram, SearXNG, native runtime setting) actually save when toggled.
-    private(set) var nativeBaseURL: String = NativeBaseURLDefaults.read() {
-        didSet { NativeBaseURLDefaults.write(nativeBaseURL) }
-    }
-
+    // (Telegram and SearXNG) actually save when toggled.
     var searxngBaseURL: String = UserDefaults.standard.string(forKey: "searxngBaseURL") ?? "" {
         didSet { UserDefaults.standard.set(searxngBaseURL, forKey: "searxngBaseURL") }
     }
@@ -186,7 +182,7 @@ final class AppModel: Sendable {
             }
             telegramModel = ""
             telegramReasoningEffort = ""
-            statusText = error.localizedDescription
+            setFailureStatus(error, action: "read the model choices")
         }
     }
 
@@ -214,6 +210,9 @@ final class AppModel: Sendable {
     /// and rail dot, the Simple card and the widget read it. Nil while part of
     /// the overview could not be read.
     var ownerWaitingCount: Int?
+    /// Those rows counted by kind (Desk item, note, approval, run), so
+    /// Today's card can name them. Nil when the count is nil or capped.
+    var ownerWaitingKinds: [WorkOverviewReference.Kind: Int]?
     var telegramEnabled = false
     var isSavingTelegram = false
     /// The Telegram settings surface owns this receipt. `statusText` remains
@@ -270,6 +269,8 @@ final class AppModel: Sendable {
     /// Last refresh outcome per sidebar panel. Written only by
     /// `refreshForSidebarItem`; read by views via `panelStaleNotice(for:)`.
     var panelRefreshStatus: [SidebarItem: PanelRefreshStatus] = [:]
+    /// Pending scoped reads, counted so overlapping readers keep their signal.
+    var panelRefreshCounts: [SidebarItem: Int] = [:]
     /// Small always-visible readers have lifecycles independent of the full
     /// Chat/Activity panels. Keep their freshness separate so one successful
     /// badge poll cannot erase a stale full-panel warning (or vice versa).
@@ -365,9 +366,6 @@ final class AppModel: Sendable {
     /// who asked for the opposite one, so a Deny pressed over a running Approve
     /// silently reported "approved".
     var approvalResolutionDecisions: [String: String] = [:]
-    /// Last compact-Capabilities approval action outcome. This is a UI receipt
-    /// only; ApprovalInbox remains the terminal-decision authority.
-    var capabilitiesApprovalInboxOutcome: CapabilitiesApprovalInboxResolution?
     var mcpServers: [MCPServerRecord] = []
     var mcpConsent: [MCPConsentRecord] = []
     var mcpTools: [MCPToolRecord] = []
@@ -462,15 +460,21 @@ final class AppModel: Sendable {
     enum ChatBrainSaveResult: Equatable, Sendable {
         case unchanged(ChatBrainSelection)
         case saved(ChatBrainSelection)
-        case failed(message: String, rolledBackTo: ChatBrainSelection?)
+        case failed(message: String, rolledBackTo: ChatBrainSelection?, cause: String? = nil)
 
         var userMessage: String {
             switch self {
             case .unchanged(let selection), .saved(let selection):
                 return "Chat brain saved: \(selection.model) / \(selection.reasoningEffort)\(selection.fastMode ? " / Fast" : "")"
-            case .failed(let message, _):
-                return "Chat brain save failed: \(message)"
+            case .failed(let message, _, _):
+                return "Couldn't save the model choice. \(message)"
             }
+        }
+
+        /// What the agent's tool result says: the same line plus the raw cause.
+        var agentMessage: String {
+            if case .failed(_, _, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
+            return userMessage
         }
     }
 
@@ -496,13 +500,36 @@ final class AppModel: Sendable {
     var chatProvider: String = UserDefaults.standard.string(forKey: "chatProvider") ?? "openai_oauth_direct" {
         didSet { UserDefaults.standard.set(chatProvider, forKey: "chatProvider") }
     }
-    var statusText: String = "Not checked"
+    var statusText: String = "Not checked" {
+        didSet { statusCause = nil }
+    }
+    /// The raw error behind a failure `statusText` names in plain words. User's
+    /// screen shows `statusText` only; the agent's tool results read
+    /// `statusForAgent`, which keeps the cause she needs to act on.
+    var statusCause: String?
+    var statusForAgent: String {
+        UserFacingError.forAgent(statusText, cause: statusCause)
+    }
+
+    /// A failure on the status line: the plain line for User, the raw cause
+    /// kept for the agent.
+    func setFailureStatus(_ error: Error, action: String) {
+        setFailureStatus(UserFacingError.message(error, action: action), cause: error)
+    }
+
+    func setFailureStatus(_ line: String, cause error: Error) {
+        statusText = line
+        statusCause = error.localizedDescription
+    }
     /// The Desk item a notification click asked for, waiting for the Desk page
     /// to be able to show it. A click names the handle before the page is
     /// mounted or its rows are read, so the handle is stored rather than
     /// broadcast: DeskPageView takes it once its load has landed and clears it,
     /// so the click always opens the item instead of firing into no subscriber.
     var pendingDeskHandle: String?
+    /// True while the Desk page is on screen. ⌘K there opens the one palette
+    /// with the Desk's rows and verbs, so ContentView leaves the press to it.
+    var deskHoldsCommandPalette = false
     /// Bounded, non-transient receipts for mutations initiated from Tools.
     /// Unlike `statusText`, repeated identical failures remain distinct rows.
     var toolOperationStatusReceipts: [ToolOperationStatusReceipt] = []
@@ -555,7 +582,7 @@ final class AppModel: Sendable {
     /// post-stash awaits, the drain sees `last.role == "assistant"`, and
     /// silently suppresses the error.
     var chatPersona: String = {
-        let saved = UserDefaults.standard.string(forKey: "chatPersona")
+        let saved = PersonaSelection.current()
         return NativeChatTurnOptions.normalizedPickerPersona(saved)
     }() {
         didSet {
@@ -564,7 +591,7 @@ final class AppModel: Sendable {
                 chatPersona = normalized
                 return
             }
-            UserDefaults.standard.set(normalized, forKey: "chatPersona")
+            PersonaSelection.select(normalized)
             Task {
                 await NativeAgentEngine.live.contextFlow.personaPickerDidChange()
             }
@@ -795,7 +822,6 @@ final class AppModel: Sendable {
 
     var client: NativeClient {
         NativeClient(
-            baseURL: nativeBaseURL,
             dataRootOverride: dataRootOverride,
             backgroundLoopsManager: backgroundLoopsManager
         )

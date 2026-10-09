@@ -40,7 +40,7 @@ struct CognitionObservatoryAffectPresentation: Equatable, Sendable {
             return
         }
         guard configuration.enabled else {
-            state = .disabled("Background thinking is off, so there are no mood signals.")
+            state = .disabled("My inner life is off, so there are no mood signals.")
             axes = []
             return
         }

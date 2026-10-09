@@ -586,9 +586,9 @@ private struct KGEntityDetailSheet: View {
         }
         let neighborIDs = Set(incidentEdges.flatMap { [$0.from, $0.to] })
             .subtracting([entity.id])
-        let neighborMap = Dictionary(uniqueKeysWithValues: snapshot.entities
+        let neighborMap = Dictionary(snapshot.entities
             .filter { neighborIDs.contains($0.id) }
-            .map { ($0.id, $0) })
+            .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         neighbors = KGNeighborsResponse(
             entity: match,
             edges: incidentEdges,

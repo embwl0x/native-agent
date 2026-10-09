@@ -12,12 +12,27 @@ public enum TurnDeadline {
         seconds: TimeInterval,
         _ work: @escaping @Sendable () async throws -> T
     ) async -> T? {
-        if Task.isCancelled { return nil }
-        let child = Task { try? await work() }
+        try? await withThrowingDeadline(seconds: seconds, work)
+    }
+
+    public struct DeadlineExceeded: Error, LocalizedError, Sendable {
+        public var errorDescription: String? { "The operation exceeded its deadline." }
+    }
+
+    /// Preserve provider/storage errors separately from deadline expiry and Stop.
+    public static func withThrowingDeadline<T: Sendable>(
+        seconds: TimeInterval,
+        _ work: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try Task.checkCancellation()
+        let child = Task { () -> Result<T, Error> in
+            do { return .success(try await work()) }
+            catch { return .failure(error) }
+        }
         let sleeper = Task { try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
-        let once = ContinuationOnce<T>()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+        let once = ContinuationOnce<Result<T, Error>>()
+        let result = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Result<T, Error>, Never>) in
                 once.install(continuation)
                 Task {
                     let value = await child.value
@@ -35,7 +50,7 @@ public enum TurnDeadline {
                     // dispatch that ran out its ceiling was reported as a user
                     // Stop (ToolLoop `runSingleDispatch`) and Workshop turned
                     // the same race into `.failed` instead of a deadline.
-                    once.resume(nil)
+                    once.resume(.failure(DeadlineExceeded()))
                     child.cancel()
                 }
             }
@@ -43,10 +58,11 @@ public enum TurnDeadline {
             // A Stop must return NOW, even if the provider ignores its
             // cancellation (Codex review 2026-09-05: it used to wait for
             // the child to finish).
+            once.resume(.failure(CancellationError()))
             child.cancel()
             sleeper.cancel()
-            once.resume(nil)
         }
+        return try result.get()
     }
 
     /// Resume-once gate for the racers above. Resuming before the
@@ -54,19 +70,19 @@ public enum TurnDeadline {
     /// cancellation that lands first still resolves the wait.
     private final class ContinuationOnce<T: Sendable>: @unchecked Sendable {
         private let lock = NSLock()
-        private var continuation: CheckedContinuation<T?, Never>?
+        private var continuation: CheckedContinuation<T, Never>?
         private var pending: (value: T?, resolved: Bool) = (nil, false)
-        func install(_ continuation: CheckedContinuation<T?, Never>) {
+        func install(_ continuation: CheckedContinuation<T, Never>) {
             lock.lock()
             if pending.resolved {
                 lock.unlock()
-                continuation.resume(returning: pending.value)
+                continuation.resume(returning: pending.value!)
                 return
             }
             self.continuation = continuation
             lock.unlock()
         }
-        func resume(_ value: T?) {
+        func resume(_ value: T) {
             lock.lock()
             guard !pending.resolved else { lock.unlock(); return }
             pending = (value, true)

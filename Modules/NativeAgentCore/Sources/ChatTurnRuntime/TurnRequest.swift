@@ -3,6 +3,10 @@ import CognitiveSubstrate
 import NativeAgentCore
 import TrustCenter
 
+enum TurnRelevanceContext {
+    @TaskLocal static var queryUserMessage: String?
+}
+
 /// Everything one ingress decides about a turn, in one value: what was said,
 /// where it goes, who sent it, and the per-turn facts the engine reads from
 /// task-locals. An ingress fills this in and hands it to the binder; it never
@@ -14,6 +18,8 @@ import TrustCenter
 /// an inherited one, as an explicit `withValue(nil)` does.
 public struct TurnRequest: Sendable {
     public var message: String
+    /// Transport-authored relevance payload; never extracted from message text.
+    public var queryUserMessage: String??
     public var sessionID: String?
     public var model: String
     public var reasoningEffort: String
@@ -66,9 +72,11 @@ public struct TurnRequest: Sendable {
         pinnedRunID: String?? = nil,
         codexCompletion: CodexCompletionTranscriptBinding?? = nil,
         replacementAssistantMessageID: String?? = nil,
-        serviceTier: String?? = nil
+        serviceTier: String?? = nil,
+        queryUserMessage: String?? = nil
     ) {
         self.message = message
+        self.queryUserMessage = queryUserMessage
         self.sessionID = sessionID
         self.model = model
         self.reasoningEffort = reasoningEffort
@@ -145,8 +153,10 @@ public struct TurnRequest: Sendable {
                                 try await Self.bound(ChatPersistenceContext.$codexCompletionBinding, codexCompletion) {
                                     try await Self.bound(ChatPersistenceContext.$replacementAssistantMessageID, replacementAssistantMessageID) {
                                         try await Self.bound(LLMCallContext.$serviceTier, serviceTier) {
-                                            guard let replyRoute else { return try await operation() }
-                                            return try await ChatToolSessionContext.withReplyRoute(replyRoute, operation: operation)
+                                            try await Self.bound(TurnRelevanceContext.$queryUserMessage, queryUserMessage) {
+                                                guard let replyRoute else { return try await operation() }
+                                                return try await ChatToolSessionContext.withReplyRoute(replyRoute, operation: operation)
+                                            }
                                         }
                                     }
                                 }
@@ -161,7 +171,8 @@ public struct TurnRequest: Sendable {
     /// Durably append the user row under this request's bindings.
     public func enqueue(
         on client: any ChatOrchestrationClient,
-        mechanicalRow: CognitiveMechanicalRowKind? = nil
+        mechanicalRow: CognitiveMechanicalRowKind? = nil,
+        awaitingConsumption: Bool = true
     ) async throws -> EnqueuedUserMessage {
         try await bind {
             try await client.enqueueUserMessage(
@@ -170,7 +181,8 @@ public struct TurnRequest: Sendable {
                 persona: persona,
                 surface: surface,
                 attachments: attachments,
-                mechanicalRow: mechanicalRow
+                mechanicalRow: mechanicalRow,
+                awaitingConsumption: awaitingConsumption
             )
         }
     }
@@ -213,6 +225,7 @@ public struct TurnRequest: Sendable {
 /// completion deduplication keep their own owners.
 public actor TurnAdmission {
     public static let shared = TurnAdmission()
+    @TaskLocal public static var token: UUID?
 
     public init() {}
 
@@ -235,10 +248,12 @@ public actor TurnAdmission {
         try await acquire(sessionID, id: id)
         do {
             try Task.checkCancellation()
-            let result = try await operation()
+            let result = try await Self.$token.withValue(id, operation: operation)
+            await ChatTurnSteering.shared.closeTurn(sessionId: sessionID, token: id)
             await release(sessionID, id: id)
             return result
         } catch {
+            await ChatTurnSteering.shared.closeTurn(sessionId: sessionID, token: id)
             await release(sessionID, id: id)
             throw error
         }

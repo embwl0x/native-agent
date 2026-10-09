@@ -882,16 +882,30 @@ enum SchedulerJobNormalizer {
         // schedule resolution.
         var schedule: [String: JSONValue]
         let scheduleShapes = "schedule must be an ISO-8601 datetime string or an object with type 'once' and at, type 'every' and an interval, or type 'hourly', 'daily', 'weekly', 'monthly', or 'cron'; alternatively supply interval_seconds or run_at"
-        switch body["schedule"] {
-        case .object(let raw):
-            schedule = raw
-        case .string(let raw):
-            let at = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard parseISO(at) != nil else {
-                throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
+        switch (body["in_minutes"], body["schedule"]) {
+        case (let minutes?, _) where minutes != .null:
+            guard [body["schedule"], body["interval_seconds"], body["intervalSeconds"],
+                   payload["interval_seconds"], body["run_at"], body["runAt"], body["nextRunAt"]]
+                .allSatisfy({ $0 == nil || $0 == .null }) else {
+                throw TriggerSchedulerError.schedulerInvalid("Supply in_minutes alone, not with another schedule, interval or run time.")
             }
-            schedule = ["type": .string("once"), "at": .string(at)]
-        case nil, .null?:
+            schedule = try onceInMinutes(minutes, now: now)
+        case (_, .object(let raw)):
+            schedule = raw
+        case (_, .string(let raw)):
+            let at = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            let words = at.lowercased().split(whereSeparator: { $0.isWhitespace })
+            if words.first == "in" {
+                guard words.count == 3, ["minute", "minutes"].contains(words[2]),
+                      let minutes = Double(words[1]) else {
+                    throw TriggerSchedulerError.schedulerInvalid("Relative schedule must say 'in N minutes', with a positive number of minutes.")
+                }
+                schedule = try onceInMinutes(.double(minutes), now: now)
+            } else {
+                guard parseISO(at) != nil else { throw TriggerSchedulerError.schedulerInvalid(scheduleShapes) }
+                schedule = ["type": .string("once"), "at": .string(at)]
+            }
+        case (_, nil), (_, .null?):
             let hasInterval = [body["interval_seconds"], body["intervalSeconds"], payload["interval_seconds"]]
                 .contains(where: { $0.map(truthy) == true })
             let hasRunAt = [body["run_at"], body["runAt"], body["nextRunAt"]]
@@ -910,6 +924,10 @@ enum SchedulerJobNormalizer {
 
         let typeLower = (string(schedule["type"]) ?? string(schedule["kind"]) ?? "every")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["hourly", "daily", "weekly", "monthly", "cron"].contains(typeLower),
+           string(schedule["timezone"] ?? schedule["tz"])?.isEmpty != false {
+            schedule["timezone"] = .string(TimeZone.current.identifier)
+        }
         if typeLower == "every" {
             interval = try everyInterval(schedule, default: interval)
             schedule["seconds"] = .int(Int64(interval))
@@ -1116,6 +1134,21 @@ enum SchedulerJobNormalizer {
     /// _scheduler_schedule_from_legacy_body (L43217)
     ///   raw_run_at = body.run_at or body.runAt or body.nextRunAt    (Python `or`)
     ///   one_shot   = bool(body.get("one_shot", body.get("oneShot", False)))
+    private static func onceInMinutes(_ value: JSONValue, now: @Sendable () -> Date) throws -> [String: JSONValue] {
+        let minutes: Double
+        switch value {
+        case .int(let number): minutes = Double(number)
+        case .double(let number): minutes = number
+        default: throw TriggerSchedulerError.schedulerInvalid("in_minutes must be a positive number.")
+        }
+        guard minutes.isFinite, minutes > 0 else {
+            throw TriggerSchedulerError.schedulerInvalid("in_minutes must be a positive finite number.")
+        }
+        let epoch = now().timeIntervalSince1970 + minutes * 60
+        _ = try checkedEpoch(epoch)
+        return ["type": .string("once"), "at": .double(epoch)]
+    }
+
     static func scheduleFromLegacyBody(_ body: [String: JSONValue], interval: Int) -> [String: JSONValue] {
         let rawRunAt = pyOr(body["run_at"], body["runAt"], body["nextRunAt"])
         // nested get-defaults: one_shot present? else oneShot present? else False.
@@ -1626,6 +1659,13 @@ enum SchedulerJobNormalizer {
     /// metadata pass through untouched.
     static func decorateNextRunAt(_ row: JSONValue) -> JSONValue {
         guard case .object(var d) = row else { return row }
+        if case .object(let schedule)? = d["schedule"],
+           let zone = string(schedule["timezone"] ?? schedule["tz"]), !zone.isEmpty {
+            d["mac_timezone"] = .string(TimeZone.current.identifier)
+            if zone != TimeZone.current.identifier {
+                d["timezone_warning"] = .string("Schedule time zone \(zone) differs from this Mac's current zone \(TimeZone.current.identifier). Saved timing was not changed.")
+            }
+        }
         // Older one-off and calendar rows retained the default hourly interval.
         let calendarTypes: Set<String> = ["once", "hourly", "daily", "weekly", "monthly", "cron"]
         let scheduleType: String? = {

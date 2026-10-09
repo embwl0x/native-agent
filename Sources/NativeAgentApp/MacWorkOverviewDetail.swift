@@ -77,7 +77,7 @@ struct MacWorkOverviewDetail: View {
                     if let reason = board.executions.unavailableReason { error = reason }
                     execution = board.executions.items.first { $0.id == row.reference.id }
                 }
-            } catch { self.error = error.localizedDescription }
+            } catch { self.error = UserFacingError.message(error, action: "load this item") }
             loaded = true
         }
     }
@@ -93,7 +93,7 @@ struct MacWorkOverviewDetail: View {
                     self.execution = try await appModel.client.rejectStep(executionId: execution.id, stepId: execution.currentStepId)
                 }
                 onDone()
-            } catch { self.error = error.localizedDescription }
+            } catch { self.error = UserFacingError.message(error, action: "\(approve ? "approve" : "reject") that step") }
         }
     }
 }

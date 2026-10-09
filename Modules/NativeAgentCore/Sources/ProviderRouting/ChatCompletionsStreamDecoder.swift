@@ -112,12 +112,7 @@ public struct ChatCompletionsStreamDecoder {
         // Root error frame FIRST: it carries no `choices`, so a bare delta
         // guard swallows it (the B2 bug). Throw the provider's own message,
         // loud, before anything else touches the frame.
-        if let errObj = root["error"] as? [String: Any] {
-            throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj)))
-        }
-        if root["error"] is String {
-            throw LLMError.failure(.wire(ProviderFailure.wireDetail(root)))
-        }
+        try throwIfChatCompletionsProviderError(root)
         // Usage rides either the dedicated final empty-choices frame or the
         // last delta frame itself — capture it wherever it appears.
         if let usageObj = root["usage"] as? [String: Any] {
@@ -127,6 +122,7 @@ public struct ChatCompletionsStreamDecoder {
               let choice = choices.first else {
             return frame
         }
+        try throwIfChatCompletionsProviderError(choice)
         frame.finishReason = choice["finish_reason"] as? String
         if frame.finishReason == "length" { reachedLengthLimit = true }
         guard let delta = choice["delta"] as? [String: Any] else {
@@ -306,18 +302,31 @@ extension Result where Failure == Error {
     }
 }
 
+/// Both completion lanes reject provider errors before reading message/delta,
+/// including errors carried by a choice rather than the root envelope.
+private func throwIfChatCompletionsProviderError(_ object: [String: Any]) throws {
+    if let error = object["error"] as? [String: Any] {
+        throw ProviderFailure.wireError(error)
+    }
+    if object["error"] is String {
+        throw ProviderFailure.wireError(object)
+    }
+    if object["finish_reason"] as? String == "error" {
+        throw ProviderFailure.Diagnostic(cause: .overloaded,
+            detail: "Provider ended this completion with finish_reason=error but supplied no error details. Check provider status before trying again.")
+    }
+}
+
 /// Shared non-streaming envelope validation. A length terminal never exposes
 /// the associated tool batch, even when its fragments happen to parse.
 func chatCompletionsMessage(_ root: [String: Any], status: Int) throws -> [String: Any] {
-    if let error = root["error"] as? [String: Any] {
-        throw LLMError.failure(.wire(ProviderFailure.wireDetail(error)))
-    }
-    if root["error"] is String {
-        throw LLMError.failure(.wire(ProviderFailure.wireDetail(root)))
-    }
+    try throwIfChatCompletionsProviderError(root)
     guard let choices = root["choices"] as? [[String: Any]],
-          let first = choices.first,
-          let message = first["message"] as? [String: Any] else {
+          let first = choices.first else {
+        throw LLMError.invalidResponse(status: status)
+    }
+    try throwIfChatCompletionsProviderError(first)
+    guard let message = first["message"] as? [String: Any] else {
         throw LLMError.invalidResponse(status: status)
     }
     if first["finish_reason"] as? String == "length" {
@@ -447,7 +456,14 @@ func mapTransportError(_ error: Error, fallback: @autoclosure () -> LLMError) ->
     if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled {
         return CancellationError()
     }
-    if let failure = ProviderFailure.classify(error) { return LLMError.failure(failure) }
+    if error is any ProviderFailureWrapping { return error }
+    if let failure = ProviderFailure.classify(error) {
+        return ProviderFailure.Diagnostic(
+            cause: failure,
+            detail: ProviderFailure.diagnosticDescription(error),
+            deadlineExpired: nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorTimedOut
+        )
+    }
     return ProviderFailure.normalize(fallback())
 }
 
@@ -459,11 +475,12 @@ func throwIfChatCompletionsError(
     response: URLResponse? = nil
 ) throws {
     guard !(200..<300).contains(status) else { return }
-    throw LLMError.failure(.http(
+    let detail = ProviderFailure.wireDetail(data)
+    throw ProviderFailure.Diagnostic(cause: .http(
         status: status,
-        detail: ProviderFailure.wireDetail(data),
+        detail: detail,
         retryAfter: parseRetryAfterSeconds(from: response)
-    ))
+    ), detail: "HTTP \(status): \(detail)")
 }
 
 /// Parse an HTTP `Retry-After` header into whole seconds (A3.4). Accepts the
@@ -521,7 +538,7 @@ extension AsyncThrowingStream where Element == LLMMessageStreamEvent, Failure ==
                             // String streams use an empty delta for activity without
                             // reply text, so the outer idle guard stays informed.
                             continuation.yield("")
-                        case .toolCall, .replyTextSettled:
+                        case .toolCall, .replyTextSettled, .toolBoundary:
                             continue
                         }
                     }

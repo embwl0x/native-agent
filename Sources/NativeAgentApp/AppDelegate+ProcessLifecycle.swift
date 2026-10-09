@@ -67,11 +67,11 @@ extension AppDelegate {
         }
         _ = semaphore.wait(timeout: .now() + 2.5)
         guard activationBox.value != nil else {
-            NSLog("[launch] existing pid wedged — cannot evict (kernel UE state); user must reboot")
+            nativeLog("[launch] existing pid wedged — cannot evict (kernel UE state); user must reboot")
             Self.presentSingleInstanceWedgedAlert(pid: existingPID)
             return false
         }
-        NSLog("[launch] another NativeAgent instance is already running (pid=\(existing.processIdentifier)); activating it and exiting duplicate")
+        nativeLog("[launch] another NativeAgent instance is already running (pid=\(existing.processIdentifier)); activating it and exiting duplicate")
         return false
     }
 
@@ -87,7 +87,7 @@ extension AppDelegate {
 
     @MainActor
     static func presentPublicReleaseDataRootError(_ detail: String) {
-        NSLog("[paths] refusing to start NativeAgent after public-release data preparation failure: \(detail)")
+        nativeLog("[paths] refusing to start NativeAgent after public-release data preparation failure: \(detail)")
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "NativeAgent could not prepare a clean data directory."
@@ -99,11 +99,11 @@ extension AppDelegate {
 
     @MainActor
     static func presentBackupRestoreError(_ detail: String) {
-        NSLog("[backup-restore] refusing to start after staged restore failure: \(detail)")
+        nativeLog("[backup-restore] refusing to start after staged restore failure: \(detail)")
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "NativeAgent could not safely finish the backup restore."
-        alert.informativeText = "NativeAgent stopped before opening live state. If recovery is incomplete, the preserved safety rollback will resume on the next launch.\n\n\(detail)"
+        alert.informativeText = "NativeAgent stopped before opening live state. If recovery is incomplete, the preserved safety rollback will resume on the next launch. The details are in the log."
         alert.alertStyle = .critical
         alert.runModal()
         NSApp.terminate(nil)
@@ -114,7 +114,7 @@ extension AppDelegate {
     /// agent. Returns true to continue.
     @MainActor
     static func confirmLaunchWithMissingRoots(_ missing: [String]) -> Bool {
-        NSLog("[paths] launch roots missing: %@", missing.joined(separator: " | "))
+        nativeLog("[paths] launch roots missing: %@", missing.joined(separator: " | "))
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.alertStyle = .critical

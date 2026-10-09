@@ -584,6 +584,7 @@ enum ProviderToolResultProjection {
         fields["original_characters"] = .int(Int64(content.count))
         fields["original_bytes"] = .int(Int64(content.utf8.count))
         fields["full_result_retained"] = .bool(recovery != nil)
+        fields["retention_reason"] = .string(recovery == nil ? "retention_unavailable" : "response_exceeds_inline_limit")
         // Home's controls must remain usable even when a page's reading
         // evidence is paged. Preserve the exact live controls, never reconstruct
         // or replay them from retained content. The full result remains paged.

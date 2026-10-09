@@ -154,11 +154,11 @@ extension AgentWorkspaceNavigation {
             target = location
         }
         if case .record("browser.chrome_snapshot", let arguments, _)? = target, let value {
-            // Navigation may have changed the URL on an existing lease. The
+            // Navigation may have changed the URL on an existing tab. The
             // final observation belongs to the fresh owner snapshot, never its
-            // previous lease-to-bookmark association.
+            // previous tab-to-bookmark association.
             guard case .object(let page) = value, page["ok"] != .bool(false), page["error"] == nil,
-                  page["status"] != .string("readback_unavailable"), page["leaseId"] == arguments["lease_id"],
+                  page["status"] != .string("readback_unavailable"), page["tabId"] == arguments["tab_id"],
                   case .string(let url)? = page["url"], case .string(let title)? = page["title"] else { return }
             target = .browserBookmark(url: url, title: title.isEmpty ? url : title,
                 tabID: { if case .int(let id)? = page["tabId"] { return id }; return nil }())

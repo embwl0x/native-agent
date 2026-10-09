@@ -16,7 +16,7 @@ struct AgentWorkspaceDestination: Sendable {
     var searchLabel: String? = nil
 }
 
-enum AgentWorkspaceEnvironment {
+package enum AgentWorkspaceEnvironment {
     static var destinations: [AgentWorkspaceDestination] {
         AgentWorkspaceKnowledge.destinations + AgentWorkspaceApps.destinations + AgentWorkspaceActivity.destinations + AgentWorkspaceBuild.destinations + HerScreen.commsDestinations
             + AgentWorkspaceLife.destinations + HerScreen.coreDestinations + [
@@ -28,7 +28,7 @@ enum AgentWorkspaceEnvironment {
         ]
     }
 
-    static var readTools: Set<String> {
+    package static var readTools: Set<String> {
         AgentWorkspaceKnowledge.readTools.union(AgentWorkspaceApps.readTools).union(AgentWorkspaceActivity.readTools).union(AgentWorkspaceBuild.readTools).union(HerScreen.commsReadTools)
             .union(AgentWorkspaceLife.readTools).union(HerScreen.coreReadTools)
             .union(["work_context", "artifact_find", "read_chat_message", "chat_conversations", "read_file", "agent_contacts", "agent_read", "inner_state", "agent_introspect", "context_lookup", "time_now", "search_chat_history"])
@@ -78,8 +78,8 @@ enum AgentWorkspaceEnvironment {
         if tool == "google_calendar_send_invitations", let calendarID = input["calendar_id"], let eventID = input["event_id"] {
             return .record(tool: "google_calendar_read", input: ["calendar_id": calendarID, "event_id": eventID], title: "Meeting")
         }
-        if tool.hasPrefix("browser.chrome_"), case .string(let lease)? = input["lease_id"] {
-            return .record(tool: "browser.chrome_snapshot", input: ["lease_id": .string(lease), "max_nodes": .int(80), "max_text_chars": .int(10000)], title: "Selected browser page")
+        if tool.hasPrefix("browser.chrome_"), case .int(let tab)? = input["tab_id"] {
+            return .record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)], title: "Selected browser page")
         }
         if ["desk_note", "desk_update_item", "desk_set_status", "desk_add_ref"].contains(tool), let handle = input["handle"] {
             return .record(tool: "desk_read", input: ["handle": handle, "structured": .bool(true)], title: "Updated work")
@@ -112,13 +112,13 @@ enum AgentWorkspaceEnvironment {
         case .browserBookmark(let url, let title, let tabID):
             var actions: [AgentWorkspaceButton] = [
                 .init(label: "Read current source", action: .open(.record(tool: "read_page", input: ["url": .string(url)], title: title))),
-                .init(label: "Open in a new background tab", action: .perform(tool: "browser.chrome_acquire", input: ["mode": .string("create"), "url": .string(url)], title: title, textField: nil, isEffect: true))
+                .init(label: "Open in my browser tab", action: .perform(tool: "browser.chrome_navigate", input: ["url": .string(url)], title: title, textField: nil, isEffect: true))
             ]
             if tabID != nil { actions.insert(.init(label: "Return to this browser tab", action: AgentWorkspaceNavigation.windowAction(location)), at: 0) }
             return .init(title: title, content: .object(["status": .string("saved_reference"),
                 "url": .string(url), "message": .string(tabID == nil
-                    ? "Saved page address without a recorded tab identity. Read the source or explicitly open a new background tab; no current page evidence was restored."
-                    : "Saved tab reference, not live page evidence. Selecting this window checks its exact tab, URL and title through the browser owner before obtaining fresh controls. A missing or changed tab is refused; no substitute tab is opened.")]), items: [], actions: actions)
+                    ? "Saved page address without a recorded tab identity. Read the source or open it in my browser tab; no current page evidence was restored."
+                    : "Saved tab reference, not live page evidence. Selecting this window reads that tab only while it is still mine. A missing tab or one the owner has taken over is refused.")]), items: [], actions: actions)
         case .area(let id):
             guard let place = destinations.first(where: { $0.id == id }) else { return nil }
             if id == "today" { return try await AgentWorkspaceActivity.today(perform: perform) }
@@ -219,8 +219,8 @@ enum AgentWorkspaceEnvironment {
                 }
             }
             if tool.hasPrefix("browser.chrome_"), case .object(let receipt) = value,
-               case .string(let lease)? = receipt["leaseId"] {
-                projection.actions.insert(.init(label: "Read this browser page", action: .open(.record(tool: "browser.chrome_snapshot", input: ["lease_id": .string(lease), "max_nodes": .int(80), "max_text_chars": .int(10_000)], title: "Browser page"))), at: 0)
+               receipt["tabClosed"] != .bool(true), case .int(let tab)? = receipt["tabId"] {
+                projection.actions.insert(.init(label: "Read this browser page", action: .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10_000)], title: "Browser page"))), at: 0)
             }
             return projection
         case .page(let source, let page):
@@ -230,7 +230,7 @@ enum AgentWorkspaceEnvironment {
                 let value: JSONValue
                 switch source {
                 case .record(let tool, var input, _):
-                    guard readTools.contains(tool) else { return nil }
+                    guard readTools.contains(tool) || (tool == "app" && input["action"] == nil && input["script"] == nil) else { return nil }
                     if tool == "desk_read" { input["structured"] = .bool(true) }
                     value = try await perform(tool, input)
                 case .work(let query): value = try await perform("work_context", ["query": .string(query)])

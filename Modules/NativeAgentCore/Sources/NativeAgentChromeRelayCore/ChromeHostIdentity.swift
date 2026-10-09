@@ -11,7 +11,7 @@ import Security
 /// read off disk itself. Both tests pass for a same-user process that simply
 /// LAUNCHES the bundled relay with pipes of its own: it is the right
 /// executable, and the token is a file it can read. It then owns the channel,
-/// leases and all, and displaces the one Chrome was using.
+/// tabs and all, and displaces the one Chrome was using.
 ///
 /// The missing fact on both sides is the relay's PARENT. Chrome launches the
 /// host itself, so a relay whose parent is not a browser was not launched by
@@ -85,36 +85,63 @@ public enum ChromeHostIdentity {
         return pid_t(info.pbi_ppid)
     }
 
-    /// Basic validation only: the code directory, its seal over the executable
-    /// and the signature chain — not every resource inside a browser's several
-    /// hundred megabytes. The identifier and the anchor both live in the code
-    /// directory, which is what the requirement reads.
-    private static var validationFlags: SecCSFlags {
-        SecCSFlags(rawValue: kSecCSBasicValidateOnly)
-    }
+    /// Dynamic validation of the running process: the kernel's code-signing
+    /// state for its code plus the requirement (identifier, anchor, team). That
+    /// never hashes the browser's resources on disk. macOS 27 rejects
+    /// kSecCSBasicValidateOnly for a running guest (-67070, "invalid or
+    /// inappropriate API flags"), which refused every real Chrome launch.
+    private static var validationFlags: SecCSFlags { [] }
 
     /// The signing identifier of the running Chromium-family browser, or nil
     /// when the executable is not one: unsigned, re-signed by somebody who is
     /// not the vendor, tampered with since it was signed, an identifier this
     /// build does not list, or simply a different program.
+    public struct SigningFailure: Error, LocalizedError, Sendable {
+        public let check: String
+        public let status: OSStatus
+        public var errorDescription: String? {
+            "\(check) failed (OSStatus \(status)): \(SecCopyErrorMessageString(status, nil) as String? ?? "unknown Security error")."
+        }
+    }
+
     public static func browserSigningIdentifier(forProcess pid: pid_t) -> String? {
-        guard pid > 0 else { return nil }
+        try? checkedBrowserSigningIdentifier(forProcess: pid)
+    }
+
+    /// Both launch preflight and the relay use this exact running-code check.
+    /// Preserve the failing API and its status, rather than collapsing it to nil.
+    public static func checkedBrowserSigningIdentifier(forProcess pid: pid_t) throws -> String {
+        func requireSuccess(_ status: OSStatus, _ check: String) throws {
+            guard status == errSecSuccess else { throw SigningFailure(check: check, status: status) }
+        }
         var code: SecCode?
         let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
-        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code)
-                == errSecSuccess, let code else { return nil }
-        // Check the kernel's running code, never the replaceable executable
-        // path. Matching each requirement also gives the sealed identifier.
-        for identifier in browserSigningIdentifiers {
-            let text = "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(browserSigningTeams[identifier]!)\""
-            var requirement: SecRequirement?
-            guard SecRequirementCreateWithString(text as CFString, [], &requirement)
-                    == errSecSuccess, let requirement else { return nil }
-            if SecCodeCheckValidity(code, validationFlags, requirement) == errSecSuccess {
-                return identifier
-            }
+        try requireSuccess(SecCodeCopyGuestWithAttributes(nil, attributes, [], &code), "SecCodeCopyGuestWithAttributes")
+        guard let code else { throw SigningFailure(check: "running code identity", status: errSecCSNoSuchCode) }
+        try requireSuccess(SecCodeCheckValidity(code, validationFlags, nil), "SecCodeCheckValidity (running browser)")
+        var staticCode: SecStaticCode?
+        try requireSuccess(SecCodeCopyStaticCode(code, [], &staticCode), "SecCodeCopyStaticCode (running browser)")
+        guard let staticCode else { throw SigningFailure(check: "running browser signing information", status: errSecCSNoSuchCode) }
+        var information: CFDictionary?
+        try requireSuccess(SecCodeCopySigningInformation(staticCode, [], &information), "SecCodeCopySigningInformation")
+        guard let identifier = (information as? [String: Any])?[kSecCodeInfoIdentifier as String] as? String,
+              let team = browserSigningTeams[identifier] else {
+            throw SigningFailure(check: "browser signing identifier admission", status: errSecCSReqFailed)
         }
-        return nil
+        let text = "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(team)\""
+        var requirement: SecRequirement?
+        try requireSuccess(SecRequirementCreateWithString(text as CFString, [], &requirement), "SecRequirementCreateWithString (browser vendor)")
+        try requireSuccess(SecCodeCheckValidity(code, validationFlags, requirement), "SecCodeCheckValidity (browser vendor \(identifier))")
+        return identifier
+    }
+
+    /// Kernel process birth stamp prevents a reused PID reviving an old refusal.
+    public static func processBirthStamp(_ pid: pid_t) -> UInt64? {
+        var info = proc_bsdinfo()
+        let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
+        let read = withUnsafeMutablePointer(to: &info) { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, $0, expected) }
+        guard read == expected else { return nil }
+        return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
     }
 
     public static func isBrowserProcess(_ pid: pid_t) -> Bool {
@@ -205,5 +232,63 @@ public enum ChromeHostIdentity {
         let contents = macOSDirectory.deletingLastPathComponent()
         guard contents.lastPathComponent == "Contents" else { return false }
         return contents.deletingLastPathComponent().pathExtension == "app"
+    }
+}
+
+/// The relay's last refusal, beside the socket. Evidence is current only for
+/// the same living browser process, until a newer relay greeting succeeds.
+public struct ChromeRelayRefusal: Codable, Sendable {
+    public enum Scope: String, Codable, Sendable { case browser, listener }
+    public let scope: Scope
+    public let check: String
+    public let osStatus: Int32?
+    public let reason: String
+    public let browserPID: pid_t
+    public let browserBirthStamp: UInt64?
+    public let recordedAt: Date
+
+    public init(scope: Scope, check: String, osStatus: Int32?, reason: String, browserPID: pid_t) {
+        self.scope = scope
+        self.check = check
+        self.osStatus = osStatus
+        self.reason = reason
+        self.browserPID = browserPID
+        self.browserBirthStamp = ChromeHostIdentity.processBirthStamp(browserPID)
+        self.recordedAt = Date()
+    }
+
+    public static func path(socketPath: String) -> String { socketPath + ".relay-refusal.json" }
+
+    public func write(socketPath: String) throws {
+        try Self.writePrivate(JSONEncoder().encode(self), path: Self.path(socketPath: socketPath))
+    }
+
+    public static func read(socketPath: String) throws -> Self? {
+        let path = Self.path(socketPath: socketPath)
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else {
+            if errno == ENOENT { return nil }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_uid == getuid(),
+              info.st_mode & S_IFMT == S_IFREG, info.st_mode & 0o777 == 0o600,
+              info.st_size <= 16_384 else {
+            throw NSError(domain: "ChromeRelayRefusal", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Chrome relay refusal record is not an owned 0600 regular file of bounded size."])
+        }
+        return try JSONDecoder().decode(Self.self, from: FileHandle(fileDescriptor: fd, closeOnDealloc: false).readToEnd() ?? Data())
+    }
+
+    /// Create with 0600 before any bytes become visible; rename never follows
+    /// an existing destination symlink. Also used by app connection facts.
+    public static func writePrivate(_ data: Data, path: String) throws {
+        let temporary = path + "." + UUID().uuidString + ".tmp"
+        let fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { close(fd); unlink(temporary) }
+        try FileHandle(fileDescriptor: fd, closeOnDealloc: false).write(contentsOf: data)
+        guard rename(temporary, path) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
     }
 }

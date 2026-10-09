@@ -103,20 +103,6 @@ extension AppModel {
         )
     }
 
-    func postContextFeedback(
-        messageId: String,
-        sessionId: String,
-        rating: String,
-        persona: String
-    ) async throws {
-        try await client.postContextFeedback(
-            messageId: messageId,
-            sessionId: sessionId,
-            rating: rating,
-            persona: persona
-        )
-    }
-
     func dispatchToolData(tool: String, inputData: Data, sessionId: String?) async throws -> DispatchResult {
         try await client.dispatchToolData(tool: tool, inputData: inputData, sessionId: sessionId)
     }
@@ -370,7 +356,7 @@ extension AppModel {
     /// The provider sheet's Remove the key, which provider.disconnect runs
     /// too: the registry row, then the sign-in. `detail` is the sheet's status
     /// line; `ok` false claims no removal.
-    func disconnectProvider(_ id: String) async -> (ok: Bool, detail: String) {
+    func disconnectProvider(_ id: String) async -> (ok: Bool, detail: String, cause: String?) {
         do {
             _ = try await clearProvider(id)
             // User, 2026-09-06: for an OAuth provider the credential does not
@@ -387,7 +373,7 @@ extension AppModel {
             if ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].contains(oauthID),
                !clearedOAuth {
                 _ = await loadProvidersForChat()
-                return (false, "Clear failed: the OAuth credential could not be removed.")
+                return (false, "Clear failed: the OAuth credential could not be removed.", nil)
             }
             // The shared ~/.codex/auth.json belongs to the Codex CLI and is
             // never deleted here, so say so rather than claiming a removal
@@ -404,9 +390,9 @@ extension AppModel {
             // parent ProviderSettingsView and the chat brain bar reflect the
             // new auth_status (needs_key / needs_oauth) immediately.
             _ = await loadProvidersForChat()
-            return (true, detail)
+            return (true, detail, nil)
         } catch {
-            return (false, "Clear failed: \(error.localizedDescription)")
+            return (false, UserFacingError.message(error, action: "remove the sign-in"), error.localizedDescription)
         }
     }
 

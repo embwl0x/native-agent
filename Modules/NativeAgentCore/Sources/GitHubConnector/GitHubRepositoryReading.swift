@@ -6,6 +6,85 @@ import PersistenceCore
 /// API path so a repository URL does not require a browser round-trip merely
 /// to learn its README, root layout, or recent history.
 public extension GitHubConnectorActions {
+    static func listRuns(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
+        let limit = clamp(int(input["limit"], default: 10), min: 1, max: 30)
+        let status = normalized(input["status"]) ?? "all"
+        guard ["failure", "success", "in_progress", "all"].contains(status) else {
+            throw GitHubConnectorError.invalidInput("GitHub run status must be failure, success, in_progress, or all.")
+        }
+        let branch = try repositoryRef(input["branch"])
+        let repo = normalized(input["repo"]) == nil ? nil : try repositoryIdentity(input).fullName
+        guard repo != nil || status == "all" || status == "failure" else {
+            throw GitHubConnectorError.invalidInput("Provide repo to list successful or in-progress runs; without repo, this read lists failures in up to five recently pushed owned repositories.")
+        }
+        let filter = repo == nil ? "failure" : status
+        return try await withResolvedToken(dataRoot: dataRoot) {
+            let repos: [String]
+            var reposTruncated = false
+            if let repo {
+                repos = [repo]
+            } else {
+                let response = try await callWithResponse(path: "user/repos", params: [
+                    "affiliation": "owner", "sort": "pushed", "direction": "desc", "per_page": "5",
+                ], dataRoot: dataRoot)
+                guard let rows = response.value as? [[String: Any]] else {
+                    throw GitHubConnectorError.invalidResponse("repository listing was not an array of objects")
+                }
+                repos = try rows.prefix(5).map { row in
+                    guard let name = row["full_name"] as? String else {
+                        throw GitHubConnectorError.invalidResponse("repository listing omitted full_name")
+                    }
+                    return try repositoryIdentity(["repo": .string(name)]).fullName
+                }
+                reposTruncated = response.response.value(forHTTPHeaderField: "Link")?.contains("rel=\"next\"") ?? false
+            }
+            var params = ["per_page": String(limit)]
+            if filter != "all" { params["status"] = filter }
+            if let branch { params["branch"] = branch }
+            var runs: [[String: Any]] = [], coverage: [[String: Any]] = []
+            for repository in repos {
+                guard let response = try await call(path: "repos/\(repository)/actions/runs", params: params, dataRoot: dataRoot) as? [String: Any],
+                      let rows = response["workflow_runs"] as? [[String: Any]], let total = response["total_count"] as? Int else {
+                    throw GitHubConnectorError.invalidResponse("workflow runs omitted workflow_runs or total_count")
+                }
+                runs += rows.prefix(limit).map { row in
+                    var projected = GitHubToolProjection.workflowRun(row)
+                    projected["repository"] = repository
+                    return projected
+                }
+                coverage.append(["repository": repository, "total_count": total, "returned_count": min(rows.count, limit), "results_truncated": total > min(rows.count, limit)])
+            }
+            runs.sort { ($0["created_at"] as? String ?? "") > ($1["created_at"] as? String ?? "") }
+            return envelope("github.runs", fields: [
+                "scope": .string(repo == nil ? "recently_pushed_owned_repositories" : "repository"),
+                "run_status": .string(filter), "branch": branch.map(JSONValue.string) ?? .null,
+                "count": .int(Int64(min(runs.count, limit))), "limit": .int(Int64(limit)),
+                "repositoriesTruncated": .bool(reposTruncated),
+                "resultsTruncated": .bool(runs.count > limit || coverage.contains { $0["results_truncated"] as? Bool == true }),
+                "coverage": JSONValue(fromFoundation: coverage),
+                "runs": JSONValue(fromFoundation: Array(runs.prefix(limit))),
+            ])
+        }
+    }
+
+    static func runJobs(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let repo = try repositoryIdentity(input).fullName
+        let runID = int(input["run_id"], default: 0)
+        guard runID > 0 else { throw GitHubConnectorError.invalidInput("GitHub run jobs requires a positive run_id from github.runs.") }
+        guard let response = try await call(path: "repos/\(repo)/actions/runs/\(runID)/jobs", params: ["per_page": "100", "filter": "latest"], dataRoot: dataRoot) as? [String: Any],
+              let jobs = response["jobs"] as? [[String: Any]], let total = response["total_count"] as? Int else {
+            throw GitHubConnectorError.invalidResponse("workflow jobs omitted jobs or total_count")
+        }
+        let failed = jobs.prefix(100).filter { $0["conclusion"] as? String == "failure" }
+        return envelope("github.run_jobs", fields: [
+            "repository": .string(repo), "run_id": .int(Int64(runID)),
+            "totalJobs": .int(Int64(total)), "inspectedJobs": .int(Int64(min(jobs.count, 100))),
+            "resultsTruncated": .bool(total > min(jobs.count, 100) || failed.count > 30),
+            "failedJobs": JSONValue(fromFoundation: failed.prefix(30).map(GitHubToolProjection.failedJob)),
+        ])
+    }
+
     static func listNotifications(
         input: [String: JSONValue],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -335,12 +414,9 @@ extension GitHubConnectorActions {
         guard let raw = normalized(raw) else { return nil }
         let path = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         if path.isEmpty || path == "." { return nil }
-        guard path.count <= 1_000,
-              !path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
-              !path.split(separator: "/", omittingEmptySubsequences: false).contains(where: {
-                  $0 == "." || $0 == ".." || $0.isEmpty
-              }) else {
-            throw GitHubConnectorError.invalidInput("path must be repository-relative, for example Sources/main.swift; use / for the root. Empty segments and . or .. segments are not supported.")
+        guard path.count <= 1_000, path.rangeOfCharacter(from: .controlCharacters) == nil,
+              !path.components(separatedBy: "/").contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else {
+            throw GitHubConnectorError.invalidInput("path must be repository-relative, for example Sources/main.swift; use / for the root. Empty segments and . or .. segments are not supported. Received: \(String(reflecting: String(raw.prefix(200))))")
         }
         return path
     }
@@ -348,12 +424,12 @@ extension GitHubConnectorActions {
     static func repositoryRef(_ raw: JSONValue?) throws -> String? {
         guard let value = normalized(raw) else { return nil }
         guard value.count <= 250,
-              !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              value.rangeOfCharacter(from: .controlCharacters) == nil,
               !value.contains(".."),
               !value.contains("\\"),
               !value.contains("~"),
               !value.contains("^") else {
-            throw GitHubConnectorError.invalidInput("GitHub repository ref is invalid.")
+            throw GitHubConnectorError.invalidInput("GitHub repository ref is invalid. Received: \(String(reflecting: String(value.prefix(200))))")
         }
         return value
     }

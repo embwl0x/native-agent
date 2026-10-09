@@ -195,14 +195,18 @@ public enum CodexCompletionTranscriptEvidence {
             let effort: String?
             if case .string(let value)? = binding["reasoningEffort"] { effort = value }
             else { effort = nil }
-            matches.append(ChatResponse(
+            var response = ChatResponse(
                 runId: runId,
                 model: model,
                 reasoningEffort: effort,
                 output: content,
                 sessionId: sessionId,
                 attachments: attachments.isEmpty ? nil : attachments
-            ))
+            )
+            if case .string(let state)? = metadata["terminalState"] {
+                response.terminalState = TurnEngineResult.TerminalState(rawValue: state)
+            }
+            matches.append(response)
         }
         guard matches.count <= 1 else { throw RecoveryError.ambiguousBinding }
         return matches.first
@@ -258,7 +262,7 @@ extension SwiftNativeChatOrchestrationClient {
         userText: String,
         onNotice: (@Sendable (String, String) async -> Void)?
     ) async {
-        NSLog("%@: transcript write FAILED for %@: %@",
+        nativeLog("%@: transcript write FAILED for %@: %@",
               label, path.lastPathComponent, String(describing: error))
         let emit = onNotice ?? ToolNoticeBus.emit
         await emit?("transcript_write_failed", userText)
@@ -282,9 +286,9 @@ extension SwiftNativeChatOrchestrationClient {
         outcomeContext: TurnContext? = nil,
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
         onNotice: @escaping @Sendable (String, String) async -> Void
-    ) async {
-        guard !text.isEmpty || !attachments.isEmpty else { return }
-        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return }
+    ) async -> String? {
+        guard !text.isEmpty || !attachments.isEmpty else { return nil }
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return nil }
         let messageSource = Self.messageSource(for: source)
         let path = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
@@ -308,6 +312,9 @@ extension SwiftNativeChatOrchestrationClient {
             "partial": .bool(true),
             "envelope": TurnEnvelope.current(surface: messageSource).persistedMetadata(),
         ]
+        if !cancelled, let failure {
+            partialMetadata["error"] = .string(ProviderFailure.report(failure)?.personDescription ?? "The reply could not be completed.")
+        }
         if !attachments.isEmpty {
             partialMetadata["attachments"] = .array(attachments.map { attachment in
                 var item: [String: JSONValue] = [
@@ -351,6 +358,8 @@ extension SwiftNativeChatOrchestrationClient {
         // Under the transcript's sidecar lock: compaction + the async distiller
         // do locked read-modify-rewrite of this file; an unlocked append racing
         // that rewrite would be silently dropped by the atomic rename.
+        ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
+        defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
         do {
             try await persistence.withFileLock(path) {
                 // FAST PATH, deliberately (sweep R4 item 4). This row is a
@@ -371,7 +380,7 @@ extension SwiftNativeChatOrchestrationClient {
                 userText: "Couldn't save this turn's partial reply - it may be missing when the conversation reloads.",
                 onNotice: onNotice
             )
-            return
+            return nil
         }
         do {
             try await syncSessionIndex(
@@ -393,6 +402,7 @@ extension SwiftNativeChatOrchestrationClient {
             )
         }
         NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: sessionId)
+        return visibleText
     }
 
     /// Persist a role="tool" message capturing one tool dispatch (name,
@@ -516,6 +526,27 @@ extension SwiftNativeChatOrchestrationClient {
                     String(SessionHistoryPromptRenderer.receiptValue(effects).prefix(512))
                 ))
             }
+        }
+        let evidenceJSON = Self.injectionRedactedResultJSON(
+            tool: ranTool,
+            json: Self.screenViewRedactedResultJSON(tool: ranTool, json: resultSummary)
+        )
+        if let result = try? JSONValue.parse(Data(evidenceJSON.utf8)) {
+            var call = toolName
+            if toolName == "app" {
+                if case .string(let action)? = canonicalRiskInput["action"] { call += " " + action }
+                else if canonicalRiskInput["script"] != nil { call += " script" }
+                else if case .string(let page)? = canonicalRiskInput["page"] { call += " page=" + page }
+                else if case .string(let find)? = canonicalRiskInput["find"] { call += " find=" + find }
+                else if case .string(let item)? = canonicalRiskInput["item"] { call += " item=" + item }
+            }
+            var evidence = SessionHistoryPromptRenderer.receiptEvidence(call: call, result: result)
+            if call == "app script", case .object(var fields) = evidence {
+                fields["peer_sources"] = .array((PeerDataTaint.current?.checkpointSources ?? [])
+                    .map { .string(ChatSecretRedactor.redactText($0)) })
+                evidence = .object(SessionHistoryPromptRenderer.restoringReceiptBoundaries(fields))
+            }
+            metadata["receiptEvidence"] = evidence
         }
         if let raisedInteraction {
             // The runtime owns identity and the continuation record, never the
@@ -872,6 +903,8 @@ extension SwiftNativeChatOrchestrationClient {
             iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             return iso.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
         }
+        ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
+        defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
         let changed: (count: Int, last: JSONValue?) = try await persistence.withFileLock(path) {
             var rows: [JSONValue] = []
             if FileManager.default.fileExists(atPath: path.path) {
@@ -920,7 +953,8 @@ extension SwiftNativeChatOrchestrationClient {
         // Set by a caller that is enqueueing MACHINE text on the user row — the
         // bridge's transport notices, a bot's composed brief. The user row is
         // the one place a templated line can pass for something User said.
-        mechanicalRow: CognitiveMechanicalRowKind? = nil
+        mechanicalRow: CognitiveMechanicalRowKind? = nil,
+        awaitingConsumption: Bool = true
     ) async throws -> EnqueuedUserMessage {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
@@ -936,18 +970,38 @@ extension SwiftNativeChatOrchestrationClient {
             attachments: attachments,
             persona: persona,
             source: surface,
-            mechanicalRow: mechanicalRow
+            mechanicalRow: mechanicalRow,
+            awaitingConsumption: awaitingConsumption
         )
         return EnqueuedUserMessage(sessionId: resolvedSession, runId: runId)
     }
 
+    /// Admission makes only this pre-appended input available to future prompts.
+    func consumeEnqueuedMessage(sessionId: String, runId: String) async throws {
+        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
+        try await persistence.withFileLock(path) {
+            var (rows, report) = try await self.persistence.readJSONLReporting(path)
+            guard report.isClean else {
+                throw ChatOrchestrationError.underlying("Queued input cannot be consumed until its transcript is repaired")
+            }
+            for index in rows.indices {
+                guard case .object(var row) = rows[index], row["role"] == .string("user"),
+                      row["runId"] == .string(runId), case .object(var metadata)? = row["metadata"],
+                      metadata.removeValue(forKey: "awaitingConsumption") == .bool(true) else { continue }
+                row["metadata"] = .object(metadata)
+                rows[index] = .object(row)
+                try Self.writeJSONLAtomically(rows, to: path)
+                return
+            }
+        }
+    }
+
     /// A handoff is recorded without constructing a provider turn.
-    public func recordControlHandoff(message: String, reply: String, sessionId: String, surface: String) async throws {
-        let runId = UUID().uuidString
+    public func recordControlHandoff(message: String, reply: String, sessionId: String, surface: String, runId: String = UUID().uuidString) async throws {
         try await appendMessage(sessionId: sessionId, role: "user", content: message,
                                 runId: runId, attachments: [], source: surface)
         try await appendMessage(sessionId: sessionId, role: "assistant", content: reply,
-                                runId: runId, attachments: [], source: surface)
+                                runId: runId, attachments: [], source: surface, canonicalAssistantCompletion: true)
     }
 
     /// A manual command receipt uses the same durable transcript and index writer.
@@ -976,7 +1030,7 @@ extension SwiftNativeChatOrchestrationClient {
                 dataRoot: dataRoot, persistence: persistence
             )
             guard committed else { throw error }
-            NSLog("Steering message committed; transcript bookkeeping failed: \(error)")
+            nativeLog("Steering message committed; transcript bookkeeping failed: \(error)")
             return try afterTurnOrigin(sessionId: resolvedSession, runId: runId)
         }
     }
@@ -1030,6 +1084,7 @@ extension SwiftNativeChatOrchestrationClient {
         responseOutcomeStatus: String? = nil,
         providerRefusal: Bool = false,
         providerRefusalDraft: Bool = false,
+        failureWork: String? = nil,
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
         expectedLastMessageID: String? = nil,
         // PROVENANCE, not prose: the templated writer that produced this row
@@ -1042,6 +1097,7 @@ extension SwiftNativeChatOrchestrationClient {
         agentConversationSendByPerson: Bool = false,
         answerFor: String? = nil,
         proactiveSpeechIdempotencyKey: String? = nil,
+        awaitingConsumption: Bool = false,
         messageId: String = UUID().uuidString
     ) async throws -> AfterTurnOrigin? {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
@@ -1091,15 +1147,17 @@ extension SwiftNativeChatOrchestrationClient {
         ]
         if let runId { record["runId"] = .string(runId) }
         var metadata: [String: JSONValue] = [:]
+        if awaitingConsumption { metadata["awaitingConsumption"] = .bool(true) }
         if let proactiveSpeechIdempotencyKey {
             metadata["proactiveSpeechIdempotencyKey"] = .string(proactiveSpeechIdempotencyKey)
         }
-        if canonicalAssistantCompletion, role == "assistant", let completion = outcomeResult?.completionState {
-            metadata["completionState"] = .string(completion == .completed ? "completed" : "incomplete")
+        if canonicalAssistantCompletion, role == "assistant" {
+            metadata["completionState"] = .string(outcomeResult?.completionState == .incomplete ? "incomplete" : "completed")
         }
         if let agentConversationSendID { metadata["dotClientUserMessageID"] = .string(agentConversationSendID) }
         if agentConversationSendByPerson { metadata["byPerson"] = .bool(true) }
         if let answerFor { metadata["answerFor"] = .string(answerFor) }
+        if let failureWork, role == "assistant" { metadata["failureWork"] = .string(failureWork) }
         if let requestedResultIntent { metadata["resultDelivery"] = requestedResultIntent }
         if !attachments.isEmpty {
             // Stash attachment metadata (not bytes) so a future consolidation
@@ -1137,6 +1195,9 @@ extension SwiftNativeChatOrchestrationClient {
         }
         if providerRefusal { metadata["provider_refusal"] = .bool(true) }
         if providerRefusalDraft { metadata["provider_refusal_draft"] = .bool(true) }
+        if let sources = PeerDataTaint.current?.checkpointSources, !sources.isEmpty {
+            metadata["untrusted_sources"] = .array(sources.map(JSONValue.string))
+        }
         // Session provenance (658.14). Durable, out-of-band origin marking for
         // messages that did NOT come from the human at this Mac. Only the user
         // row carries it: an assistant row is hers by construction, and
@@ -1251,6 +1312,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
         if role == "assistant", let result = outcomeResult {
             metadata["completionState"] = .string(result.completionState == .incomplete ? "incomplete" : "completed")
+            metadata["terminalState"] = .string(result.resolvedTerminalReason(dataRoot: dataRoot).state.rawValue)
             let writtenFiles = ChatWrittenFileArtifacts.files(from: result.toolDispatches)
             if !writtenFiles.isEmpty {
                 metadata["outputFiles"] = .array(writtenFiles.map(\.reference))
@@ -1271,6 +1333,8 @@ extension SwiftNativeChatOrchestrationClient {
         // locked rewrite dropping a concurrent append. (Immutable binding: a
         // @Sendable closure cannot capture the mutable `record`.)
         let messageRow: JSONValue = .object(record)
+        ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
+        defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
         // Line-count bookkeeping happens INSIDE this lock, on purpose. Both
         // branches below know exactly how many rows the transcript holds when
         // they commit — the append branch adds one line to whatever was there,
@@ -1384,7 +1448,7 @@ extension SwiftNativeChatOrchestrationClient {
             } catch {
                 // The user row is already durable state. Reaction learning is
                 // additive evidence and cannot roll the user's message back.
-                NSLog("OutcomeFeedbackStore: continuation receipt failed: \(error)")
+                nativeLog("OutcomeFeedbackStore: continuation receipt failed: \(error)")
             }
         }
         // This receipt means exactly one thing: the locked canonical transcript
@@ -1557,6 +1621,9 @@ extension SwiftNativeChatOrchestrationClient {
             responseOutcomeStatus: "failed",
             providerRefusal: report?.cause == .refused,
             providerRefusalDraft: canDraft,
+            // What had run when it broke, so the failure card can say whether
+            // Retry is safe. Without a typed report nothing proves it was.
+            failureWork: (report?.work ?? .outcomeUnknown).rawValue,
             outcomeInterventionAssignment: outcomeInterventionAssignment,
             // This sentence is the machine reporting that it broke, filed on
             // her row because a transcript has nowhere else to put it. She did
@@ -1660,6 +1727,9 @@ extension SwiftNativeChatOrchestrationClient {
             config: autocompactionConfig,
             now: clock
         )
+        let transcript = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
+        ChatSessionIndexFile.beginTranscriptIndexSync(at: transcript)
+        defer { ChatSessionIndexFile.endTranscriptIndexSync(at: transcript) }
         let outcome = try await compactor.compactIfNeeded(
             sessionId: sessionId,
             model: model,
@@ -1681,7 +1751,6 @@ extension SwiftNativeChatOrchestrationClient {
         // via a non-nil summaryRowId/backupPath). Never delays or fails the turn;
         // any distiller failure leaves the mechanical summary standing.
         if autocompactionConfig.distillEnabled,
-           outcome.compacted,
            let rowId = outcome.summaryRowId,
            let backupPath = outcome.backupPath {
             let dataRoot = self.dataRoot   // let/Sendable — nonisolated capture
@@ -2212,7 +2281,7 @@ extension SwiftNativeChatOrchestrationClient {
             tool: tool,
             json: screenViewRedactedResultJSON(tool: tool, json: json)
         )
-        if let receipt = PersistedReadToolReceipt.project(
+        if let receipt = PersistedToolReceipt.project(
             tool: tool, json: safeResult, maximumCharacters: persistedToolResultMaximumCharacters
         ) { return receipt }
         return boundedRedactedToolReceipt(
@@ -2375,10 +2444,12 @@ extension SwiftNativeChatOrchestrationClient {
             // EARLIER count over the index. Measured here, the last writer to
             // hold this lock always measures a transcript that already contains
             // every row committed before it, so the index cannot go backwards.
-            let messageCount = ChatTranscriptLineCountCache.shared.count(
-                at: messagesPath,
-                recount: Self.countJSONLLines(at:)
-            )
+            let snapshot = try await persistence.withFileLock(messagesPath) {
+                (count: ChatTranscriptLineCountCache.shared.count(
+                    at: messagesPath, recount: Self.countJSONLLines(at:)),
+                 version: ChatSessionIndexFile.transcriptVersion(at: messagesPath))
+            }
+            let messageCount = snapshot.count
             let parent = sessionsPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
@@ -2471,6 +2542,17 @@ extension SwiftNativeChatOrchestrationClient {
             }
 
             if var updated {
+                if messageCount == 1 || updated["createdAt"] == .string(timestamp) {
+                    updated["firstMessageAt"] = .string(timestamp)
+                }
+                let previous = updated["lastMessageAt"].flatMap { value -> Date? in
+                    if case .string(let stamp) = value { return Self.dateFromISO8601(stamp) }
+                    return nil
+                } ?? .distantPast
+                if (Self.dateFromISO8601(timestamp) ?? .distantPast) >= previous {
+                    updated["lastMessageAt"] = .string(timestamp)
+                }
+                updated[ChatSessionIndexFile.acknowledgedTranscriptKey] = snapshot.version
                 ChatSessionIndexFile.recordConversationChange(in: &updated, role: normalizedRole)
                 remaining.insert(updated, at: 0)
             }
@@ -2520,6 +2602,7 @@ extension SwiftNativeChatOrchestrationClient {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
         let persistence = self.persistence
+        let dataRoot = self.dataRoot
         do {
             try await persistence.withFileLock(sessionsPath) {
                 var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
@@ -2527,11 +2610,18 @@ extension SwiftNativeChatOrchestrationClient {
                     $0["id"] == .string(safeSessionId)
                 }) else { return }
                 ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
+                let messagesPath = dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl")
+                let snapshot = try await persistence.withFileLock(messagesPath) {
+                    (count: Self.countJSONLLines(at: messagesPath),
+                     version: ChatSessionIndexFile.transcriptVersion(at: messagesPath))
+                }
+                rows[index]["messageCount"] = .int(Int64(snapshot.count))
+                rows[index][ChatSessionIndexFile.acknowledgedTranscriptKey] = snapshot.version
                 let out = try ChatSessionIndexFile.serializedData(for: rows)
                 try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
             }
         } catch {
-            NSLog("ChatOrchestrationClient: transcript generation bump failed: \(error)")
+            nativeLog("ChatOrchestrationClient: transcript generation bump failed: \(error)")
         }
     }
 

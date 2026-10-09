@@ -48,6 +48,11 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     public var checkedAt: Date
     public var authenticated: Bool
     public var failureOperation: String?
+    public var brokenSince: Date?
+    public var lastGoodAt: Date?
+    public var repairAttemptedAt: Date?
+    public var repairDetail: String?
+    public var repairFor: String?
 
     public init(status: String, detail: String, checkedAt: Date, authenticated: Bool) {
         self.status = status; self.detail = detail; self.checkedAt = checkedAt; self.authenticated = authenticated
@@ -58,8 +63,25 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         guard let data = try? Data(contentsOf: url(root)) else { return [:] }
         return (try? JSONDecoder().decode([String: Self].self, from: data)) ?? [:]
     }
-    public var current: Bool { Date().timeIntervalSince(checkedAt) < 600 }
-    public var problem: String? { current && status != "ready" && status != "unchecked" ? detail : nil }
+    public var current: Bool { brokenSince != nil || status == "unverified" || Date().timeIntervalSince(checkedAt) < 600 }
+    public var word: String? {
+        guard current else { return nil }
+        let text = status.replacingOccurrences(of: "_", with: " ")
+        return text.prefix(1).uppercased() + text.dropFirst()
+    }
+    public var problem: String? {
+        current && !["ready", "live", "unchecked"].contains(status)
+            ? detail + (repairDetail.map { " " + $0 } ?? "") : nil
+    }
+
+    public var projection: JSONValue {
+        let iso = ISO8601DateFormatter()
+        return .object(["status": .string(status), "detail": .string(problem ?? detail),
+            "since": brokenSince.map { .string(iso.string(from: $0)) } ?? .null,
+            "last_good": lastGoodAt.map { .string(iso.string(from: $0)) } ?? .null,
+            "repair_at": repairAttemptedAt.map { .string(iso.string(from: $0)) } ?? .null,
+            "repair": repairDetail.map(JSONValue.string) ?? .null])
+    }
 
     /// Auth recovery clears only an auth error, not an unrelated execution failure.
     public func resolves(_ record: AgentConversationRecord) -> Bool {
@@ -82,7 +104,9 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     }
 
     public static func nextRefresh(_ root: URL, now: Date) -> Date {
-        let last = read(root).values.map(\.checkedAt).min() ?? .distantPast
+        let observations = read(root).values
+        let last = observations.filter { $0.brokenSince == nil && $0.status != "unverified" }.map(\.checkedAt).min()
+            ?? (observations.isEmpty ? .distantPast : now)
         return max(now.addingTimeInterval(30), last.addingTimeInterval(300))
     }
 }
@@ -111,7 +135,7 @@ public enum ContactReplyReads {
                 guard !rows.contains(where: { $0.session == session && $0.request == request && $0.run == run }) else { return }
                 rows.append(Read(session: session, request: request, run: run, at: Date()))
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(Array(rows.suffix(2048))), to: file)
-            } catch { NSLog("ContactReplyReads: could not retain fetch: %@", error.localizedDescription) }
+            } catch { nativeLog("ContactReplyReads: could not retain fetch: %@", error.localizedDescription) }
         }
     }
 }

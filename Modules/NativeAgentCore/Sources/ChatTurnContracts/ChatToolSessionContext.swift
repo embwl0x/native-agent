@@ -107,6 +107,17 @@ public enum ChatToolSessionContext {
 
     @TaskLocal public static var verifiedSessionId: String?
 
+    /// The current request only; history and tool results never populate this.
+    @TaskLocal public static var userText: String?
+
+    public static func forbidsSending(_ text: String) -> Bool {
+        text.range(of: #"(?i)\b(?:don['’]t\s+send|do\s+not\s+send|just\s+draft|save\s+as\s+draft|not\s+yet)\b"#,
+                   options: .regularExpression) != nil
+    }
+
+    /// Nil rejects the quote; otherwise says whether this restores her last switch change.
+    @TaskLocal public static var settingRequestEvidence: (@Sendable (String, JSONValue, JSONValue, String) async -> Bool?)?
+
     /// The filing turn's file access, bound by the gate while it files a card
     /// so the card's follow-up runs with the same hands (Wave 2 #8).
     @TaskLocal public static var fileAccess: String?

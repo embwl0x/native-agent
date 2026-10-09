@@ -35,7 +35,7 @@ struct DeskDebugPanels: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(10)
-                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                .houseInset(in: RoundedRectangle(cornerRadius: 8))
         } label: {
             Label("\(agentDisplayName)'s view (the compact projection used in context)", systemImage: "eye")
                 .font(.callout).foregroundStyle(.secondary)
@@ -59,7 +59,7 @@ struct DeskDebugPanels: View {
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
-            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+            .houseInset(in: RoundedRectangle(cornerRadius: 8))
         } label: {
             Label("All items (debug — raw records with numbers)", systemImage: "tablecells")
                 .font(.callout).foregroundStyle(.secondary)

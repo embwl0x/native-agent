@@ -671,7 +671,7 @@ extension SwiftNativeMCPDispatcher {
         guard server.id == "searxng-local" else {
             throw MCPSubprocessError.unsupportedTransport(server.transport)
         }
-        let client = makeResearchClient()
+        let client = makeResearchClient(dataRoot: root)
         switch toolName {
         case "search":
             let query = Self.stringArgument(arguments, key: "query")
@@ -680,17 +680,10 @@ extension SwiftNativeMCPDispatcher {
             }
             let categories = Self.stringArgument(arguments, key: "categories")
             let timeRange = Self.stringArgument(arguments, key: "time_range")
-            return await WebSearchRoutes.search(query: query, categories: categories, timeRange: timeRange) {
+            return await WebSearchRoutes.search(query: query, categories: categories, timeRange: timeRange, dataRoot: root) {
                 try await client.search(query: query, categories: categories.isEmpty ? nil : categories,
                                         timeRange: timeRange.isEmpty ? nil : timeRange)
             }
-        case "fetch":
-            let url = Self.stringArgument(arguments, key: "url")
-            guard !url.isEmpty else {
-                throw MCPSubprocessError.malformedResponse("fetch needs url: the page address to read.")
-            }
-            let response = try await client.fetchURL(url)
-            return Self.okMCPResult(response.toJSON())
         default:
             throw MCPSubprocessError.malformedResponse("unknown SearXNG MCP tool: \(toolName)")
         }

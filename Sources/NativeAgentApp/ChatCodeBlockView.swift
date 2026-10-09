@@ -51,14 +51,7 @@ struct ChatCodeBlockView: View {
                 .padding(.horizontal, NativeAgentSpacing.sm)
                 .padding(.vertical, NativeAgentSpacing.sm)
         }
-        .background(
-            RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                .fill(Color.primary.opacity(0.05))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.8)
-        )
+        .houseInset(in: RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous))
         .accessibilityElement(children: .contain)
     }
 }

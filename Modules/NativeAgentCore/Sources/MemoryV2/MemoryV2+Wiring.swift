@@ -49,7 +49,15 @@ extension SwiftNativeMemoryV2 {
         if case .object(let m)? = newMetadata { newMeta = m }
         let source = (newSource ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
-        var out: [String: JSONValue] = [:]
+        var out = MemorySenseProvenance.merging(existing: existing.extras, incoming: newMetadata)
+        out.merge(MemoryDataProvenance.merging(existing: existing.extras, incoming: newMetadata)) { _, value in value }
+        var peerSources: [JSONValue] = []
+        for metadata in [extras, newMeta] {
+            if case .array(let values)? = metadata["peer_data_sources"] {
+                for value in values where !peerSources.contains(value) { peerSources.append(value) }
+            }
+        }
+        if !peerSources.isEmpty { out["peer_data_sources"] = .array(Array(peerSources.prefix(8))) }
 
         // 1. Source lineage — every distinct writer of this text, oldest first,
         //    seeded from the row's own `source` so run #1 is never implied away.
@@ -114,6 +122,20 @@ extension SwiftNativeMemoryV2 {
         return out
     }
 
+    /// True when `store` would refuse this content as tombstoned — the exact
+    /// denylist hash or a paraphrase of a rejected claim. A caller retrying a
+    /// lost write asks first: a rejected claim is settled, not lost.
+    public func isTombstoned(content: String, metadata: JSONValue? = nil) async throws -> Bool {
+        let metadata = try MemorySenseProvenance.stamping(metadata)
+        let content = MemoryTextClip.memoryDisplayText(content, kind: Self.metadataKind(metadata))
+        guard !content.isEmpty else { return false }
+        try await ensureCanonicalAttachment()
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        if try await storage.isTombstoned(content: content) { return true }
+        let embedded = try await embedOneWithEpoch(content)
+        return try await storage.matchesTombstone(embedding: embedded.vector, embeddingEpoch: embedded.epoch)
+    }
+
     /// Store a new memory record. Refuses (with `.underlying("tombstoned")`) if
     /// the content matches a rejection tombstone — the denylist gate. Otherwise
     /// embeds the content, inserts into storage, and returns the resulting
@@ -125,6 +147,7 @@ extension SwiftNativeMemoryV2 {
         supersedes: [String] = [],
         id: String? = nil
     ) async throws -> MemoryRecord {
+        let metadata = MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(metadata))
         let content = MemoryTextClip.memoryDisplayText(
             content,
             kind: Self.metadataKind(metadata)
@@ -137,6 +160,7 @@ extension SwiftNativeMemoryV2 {
         ) {
             throw MemoryV2Error.underlying("not durable memory: \(reason)")
         }
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         if try await storage.isTombstoned(content: content) {
             throw MemoryV2Error.underlying("tombstoned: content matches a rejection denylist entry")
@@ -263,63 +287,10 @@ extension SwiftNativeMemoryV2 {
         return inserted
     }
 
-    /// Suggestions only: semantic proximity never retires another memory.
-    public func possibleReplacements(content: String, kind: String, surface: String?) async throws -> [MemoryRecord] {
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        try Task.checkCancellation()
-        var embedded: (vector: [Float], epoch: MemoryEmbeddingEpoch)?
-        if embedder != nil {
-            do {
-                embedded = try await embedOneWithEpoch(content)
-            } catch let error where memoryV2IsColdEmbedderFailure(error) {
-                // Match recall's cold-embedder handling; broken models still throw.
-                embedded = nil
-            }
-        }
-        try Task.checkCancellation()
-        var semantic: [ScoredMemoryRecord]?
-        if let embedded, embedded.vector.contains(where: { $0 != 0 && $0.isFinite }) {
-            if let hybrid = storage as? any HybridMemoryStorageProtocol {
-                // Empty query text disables BM25: this is a meaning threshold,
-                // not a keyword score. The existing recall recency factor can
-                // only make admission more conservative.
-                let result = try await hybrid.recallReportingKeywordFallback(
-                    embedding: embedded.vector, embeddingEpoch: embedded.epoch,
-                    queryText: "", topK: memoryStoredRowCap, persona: nil)
-                if !result.usedKeywordFallback { semantic = result.hits }
-            } else {
-                semantic = try await storage.recall(
-                    embedding: embedded.vector, embeddingEpoch: embedded.epoch,
-                    topK: memoryStoredRowCap, persona: nil)
-            }
-        }
-        try Task.checkCancellation()
-        let candidates: [ScoredMemoryRecord]
-        if let semantic {
-            candidates = semantic
-        } else {
-            // Only unavailable embeddings (including epoch mismatch) use the
-            // former lexical gate; an empty semantic answer stays empty.
-            candidates = try await storage.listMemory(kind: kind).map {
-                ScoredMemoryRecord(record: $0, score: MemoryConsolidator.lexicalJaccard(content, $0.text))
-            }
-        }
-        let threshold = semantic == nil ? 0.8 : memorySupersessionCosineFloor
-        return candidates.filter { hit in
-            let row = hit.record
-            guard (row.status ?? "active") == "active",
-                  MemoryLifecycle.isRecallEligible(row.lifecycle),
-                  (row.memoryKind ?? MemoryRecallScoring.kind(of: row.extras)) == kind,
-                  let disclosure = MemoryRecordDisclosurePolicy.classify(row),
-                  disclosure.permits(surface: surface, personaID: nil) else { return false }
-            return hit.score >= threshold
-        }.sorted { $0.score == $1.score ? $0.record.id < $1.record.id : $0.score > $1.score }
-            .prefix(3).map(\.record)
-    }
-
     /// Convenience tombstone check used by upstream filters (e.g. the chat-fact
     /// promoter) before calling `store(...)`.
     public func isRejected(content: String) async throws -> Bool {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         return try await storage.isTombstoned(content: content)
     }

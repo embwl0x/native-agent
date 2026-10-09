@@ -53,11 +53,11 @@ final class WakeResetThrottle: @unchecked Sendable {
             URLSession.shared.reset(completionHandler: completion)
         },
         resetCompleted: @escaping @Sendable () -> Void = {
-            NSLog("[wake] URLSession.shared reset after sleep")
+            nativeLog("[wake] URLSession.shared reset after sleep")
         }
     ) -> Bool {
         guard shouldFire() else {
-            NSLog("[wake] throttled — last fire was <30s ago, skipping URLSession reset")
+            nativeLog("[wake] throttled — last fire was <30s ago, skipping URLSession reset")
             return false
         }
         resetEffect(resetCompleted)
@@ -74,6 +74,8 @@ private final class NativeAgentHotkeyBootstrap {
     private var wakeObserverToken: NSObjectProtocol?
 
     func start(appModel: AppModel) {
+        // Shotgun's ⌥Space is registered here too, independent of ⌘⇧J's setting.
+        ShotgunController.shared.attach(appModel: appModel)
         let hotkeyManager = GlobalHotkeyManager.shared
         let voice = self.voice
         let voiceTurn: GlobalHotkeyVoiceTurn
@@ -208,6 +210,16 @@ enum NativeAgentAppMain {
         // any owner that can accept in-process actions. Bridge rebinds recover
         // only bridge_exec so they cannot interrupt live in-process operations.
         let dataRoot = NativeAgentPaths.dataRoot
+        // Last-gasp diagnostics only: unwinding a damaged process is best effort.
+        // Open once at startup; the handler never opens files or calls Swift.
+        let crashLog = dataRoot.appendingPathComponent("logs/crash-breadcrumbs.log")
+        do {
+            try FileManager.default.createDirectory(at: crashLog.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            CrashBreadcrumbs.install(path: crashLog.path)
+        } catch {
+            nativeLog("[crash-breadcrumbs] unavailable: %@", error.localizedDescription)
+        }
         let recoveryFinished = DispatchSemaphore(value: 0)
         let recoveryError = OSAllocatedUnfairLock<String?>(initialState: nil)
         Task.detached(priority: .userInitiated) {
@@ -215,19 +227,19 @@ enum NativeAgentAppMain {
             do {
                 let recovered = try await MacControlOperationStore(dataRoot: dataRoot)
                     .recoverInterruptedOperations()
-                NSLog("[mac-control] startup recovered interrupted operations: %d", recovered)
+                nativeLog("[mac-control] startup recovered interrupted operations: %d", recovered)
             } catch {
                 recoveryError.withLock { $0 = error.localizedDescription }
             }
         }
         recoveryFinished.wait()
         if let detail = recoveryError.withLock({ $0 }) {
-            NSLog("[mac-control] refusing startup after operation recovery failure: %@", detail)
+            nativeLog("[mac-control] refusing startup after operation recovery failure: %@", detail)
             NSApp.setActivationPolicy(.regular)
             let alert = NSAlert()
             alert.alertStyle = .critical
             alert.messageText = "NativeAgent could not recover interrupted Mac actions."
-            alert.informativeText = "NativeAgent stopped before accepting actions. \(detail)"
+            alert.informativeText = "NativeAgent stopped before accepting actions. The details are in the log."
             alert.addButton(withTitle: "Quit")
             alert.runModal()
             return
@@ -251,6 +263,8 @@ struct NativeAgentApp: App {
     @State private var appearance = AppearanceController.shared
     /// Her haze colour is the app's tint, so every native control wears it.
     @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
+    /// Whether the rail shows Helpers, so the Navigate menu's digits follow it.
+    @AppStorage(BotsShelfPreference.key) private var helpersShown = true
 
     init() {
         // User, 2026-09-03: native text on this app looked heavy next to the
@@ -269,6 +283,7 @@ struct NativeAgentApp: App {
         // callback or subprocess spawn, so this is the earliest hook.
         signal(SIGPIPE, SIG_IGN)
         AgentACPProcess.installHost(MacAgentACPProcess())
+        SensesAssembly.install(dataRoot: NativeAgentPaths.dataRoot)
 
         // User, 2026-09-13: "if you've missed anything, it needs to be up there
         // on Providers." The three Providers groups and the routed surface list
@@ -299,6 +314,12 @@ struct NativeAgentApp: App {
         // DetachedChatWindowController gets below, done here because the tools
         // can be called before any detached chat is restored.
         QuietSelfAdmin.shared.attach(appModel: appModel)
+
+        // "Take over" from the phone or Telegram reads where User was the same
+        // way the Mac chat does.
+        MacWorkContinuation.capture = { text, taskReference in
+            await appModel.captureMacWorkContinuation(text, taskReference: taskReference)
+        }
 
         // A resolved card resumes the request it suspended, and it does that
         // through the SAME model the window is bound to — the continuation
@@ -440,9 +461,6 @@ struct NativeAgentApp: App {
                     await appModel.loadChatState()
                 }
             },
-            startPermissionSync: {
-                NativeAgentEngine.liveDeviceSync.macIntegrationPermissions.startObserving()
-            },
             wireGlobalHotkey: {
                 NativeAgentHotkeyBootstrap.shared.start(appModel: appModel)
             },
@@ -475,7 +493,7 @@ struct NativeAgentApp: App {
                 // answers dark or light for both layers; "off" follows the
                 // system live. See AppearanceController.swift.
                 .preferredColorScheme(appearance.colorScheme)
-                .tint((HazeColor(rawValue: hazeRaw) ?? .defaultValue).base)
+                .tint((HazeColor(rawValue: hazeRaw) ?? .defaultValue).windowTint(dark: appearance.colorScheme == .dark))
                 .onChange(of: preferDarkAppearance, initial: true) { _, dark in
                     appearance.setPreferDark(dark)
                 }
@@ -503,6 +521,7 @@ struct NativeAgentApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             ChatFocusedCommands()
+            ShellViewCommands(appModel: appModel)
             // RELEASE-2026-05-06: "Check for Updates…" in app menu (Task 4.3)
             // A2.1 (2026-07-24): the item is always enabled and its TITLE carries the
             // truth. A disabled "Check for Updates…" is a dead affordance that explains
@@ -520,6 +539,12 @@ struct NativeAgentApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.command])
             }
+            // One Settings page: Command-comma opens the rail's Settings in
+            // the main window, not a second copy in a window of its own.
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { SettingsLink.open(.settings) }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
             // PATCH-2026-05-06: wkwebview-browser Window > Browser menu item
             CommandGroup(after: .windowList) {
                 Button("Browser") {
@@ -533,9 +558,9 @@ struct NativeAgentApp: App {
                 }
                 .keyboardShortcut("k", modifiers: .command)
                 Divider()
-                // D7: derived from SidebarItem.primaryItems so ⌘N is whatever
-                // the sidebar shows in position N. Do not hand-add entries here.
-                ForEach(NavigateMenuPresentation.entries) { entry in
+                // D7: derived from the rail's own order so ⌘N is whatever the
+                // rail shows in position N. Do not hand-add entries here.
+                ForEach(NavigateMenuPresentation.entries(helpersShown: helpersShown)) { entry in
                     Button(entry.title) {
                         NativeAgentAppCoordinator.shared.request(.sidebar(entry.item))
                     }
@@ -544,7 +569,7 @@ struct NativeAgentApp: App {
                     })
                 }
                 // Knowledge graph carries no digit: the digits belong to the
-                // sidebar's primary order.
+                // rail's order.
                 Button("Knowledge graph") { NativeAgentAppCoordinator.shared.request(.sidebar(.knowledge)) }
                 Divider()
                 Button("Approvals") { NativeAgentAppCoordinator.shared.request(.activity(.approvals)) }
@@ -552,22 +577,6 @@ struct NativeAgentApp: App {
                 Button("Inbox") { NativeAgentAppCoordinator.shared.request(.activity(.inbox)) }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
             }
-        }
-
-        // One Settings page: Command-comma opens the same SetupView the
-        // sidebar's Settings opens.
-        Settings {
-            SetupView()
-                .environment(appModel)
-                // User, 2026-09-02: never a nil scheme. AppearanceController
-                // answers dark or light for both layers; "off" follows the
-                // system live. See AppearanceController.swift.
-                .preferredColorScheme(appearance.colorScheme)
-                .tint((HazeColor(rawValue: hazeRaw) ?? .defaultValue).base)
-                .onChange(of: preferDarkAppearance, initial: true) { _, dark in
-                    appearance.setPreferDark(dark)
-                }
-                .frame(width: 760, height: 720)
         }
 
         MenuBarExtra("NativeAgent", systemImage: "brain.head.profile") {
@@ -657,7 +666,10 @@ private struct ActivityCaptureMenuBarContent: View {
         }
         Button("Activity settings…", systemImage: "gear") {
             NSApp.activate(ignoringOtherApps: true)
+            // Activity capture is on Trust's Features tab. The route lands on
+            // the page's first tab, synchronously, so the tab is chosen after.
             NativeAgentAppCoordinator.shared.request(.sidebar(.trust))
+            UserDefaults.standard.set(TrustTab.features.rawValue, forKey: ShellRailTab.storageKey(.trust))
         }
     }
 }

@@ -347,10 +347,11 @@ public final class CodexAdapter: LLMAdapter {
             executable: codexBin,
             arguments: args,
             stdin: Self.composedPrompt(system: system, prompt: prompt),
-            timeout: timeout,
+            timeout: ProviderStreamContext.stallOnly ? 0 : timeout,
             terminator: terminator,
             environment: processEnvironmentOverride
         )
+        try await Self.prepareCodexHome(invocation.environment)
         let result: CodexProcessResult
         do {
             // withTaskCancellationHandler propagates a cancelled consumer Task
@@ -394,6 +395,13 @@ public final class CodexAdapter: LLMAdapter {
                 message: "codex produced no output (exit 0, empty stdout)")
         }
         return result.stdout
+    }
+
+    /// An app child home (`OpenAIOAuthDirectAdapter.codexChildHome`) gets a
+    /// fresh access-only credential before the CLI starts on it.
+    private static func prepareCodexHome(_ environment: [String: String]?) async throws {
+        guard let home = environment?["CODEX_HOME"], !home.isEmpty else { return }
+        try await OpenAIOAuthDirectAdapter.prepareCodexChildHome(URL(fileURLWithPath: home, isDirectory: true))
     }
 
     /// A3.2: classify a non-zero Codex CLI exit from its stdout/stderr. The CLI
@@ -481,7 +489,7 @@ public final class CodexAdapter: LLMAdapter {
             executable: codexBin,
             arguments: args,
             stdin: Self.composedPrompt(system: system, prompt: prompt),
-            timeout: timeout,
+            timeout: ProviderStreamContext.stallOnly ? 0 : timeout,
             terminator: terminator,
             environment: processEnvironmentOverride
         )
@@ -491,6 +499,7 @@ public final class CodexAdapter: LLMAdapter {
                     var sawContent = false
                     do {
                         try Task.checkCancellation()
+                        try await Self.prepareCodexHome(invocation.environment)
                         let upstream = streamingRunner(invocation)
                         for try await chunk in upstream {
                             try Task.checkCancellation()
@@ -547,6 +556,11 @@ public final class CodexAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
+        let combined = await messagesPrompt(messages, model: model)
+        return try await complete(prompt: combined, system: system, model: model, tools: tools)
+    }
+
+    private func messagesPrompt(_ messages: [LLMMessage], model: String) async -> String {
         let flattened = llmCompatibilityPrompt(messages: messages) { role in
             role == .user ? "USER:" : "ASSISTANT:"
         }
@@ -561,13 +575,15 @@ public final class CodexAdapter: LLMAdapter {
                 imageCount: imageCount
             )
         }
-        return try await complete(prompt: combined, system: system, model: model, tools: tools)
+        return combined
     }
 
-    /// Codex stdout arrives near process exit (see the caveat on this type),
-    /// so the messages stream is one blocking run, heartbeating while it runs,
-    /// yielded as a single delta.
-    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .bufferedText }
+    /// Interactive messages retain their buffered contract. Stall-only authoring
+    /// streams stdout and observes real stdout/stderr activity, without a wall
+    /// or a synthetic heartbeat.
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind {
+        ProviderStreamContext.stallOnly ? .incremental : .bufferedText
+    }
 
     public func streamMessages(
         messages: [LLMMessage],
@@ -575,7 +591,23 @@ public final class CodexAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        AsyncThrowingStream { continuation in
+        if ProviderStreamContext.stallOnly {
+            return AsyncThrowingStream { continuation in
+                let task = Task {
+                    do {
+                        let prompt = await messagesPrompt(messages, model: model)
+                        for try await chunk in stream(prompt: prompt, system: system, model: model) {
+                            try Task.checkCancellation()
+                            continuation.yield(.textDelta(chunk))
+                        }
+                        try Task.checkCancellation()
+                        continuation.finish()
+                    } catch { continuation.finish(throwing: error) }
+                }
+                continuation.onTermination = { _ in task.cancel() }
+            }
+        }
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 // The run yields nothing until the CLI exits, and
                 // ProviderStreamGuard's idle clock (90s default) only advances
@@ -664,9 +696,19 @@ public final class CodexAdapter: LLMAdapter {
     /// the agent's final message, all banners go to stderr.
     private func arguments(model: String) -> [String] {
         var args: [String] = ["exec", "--color", "never", "--skip-git-repo-check"]
-        let cacheURL = CodexAccountModelCatalog.cacheCandidate(
+        if ProviderStreamContext.stallOnly {
+            args.append(contentsOf: ["-c", "model_reasoning_summary=\"auto\""])
+        }
+        var cacheURL = CodexAccountModelCatalog.cacheCandidate(
             environment: processEnvironmentOverride ?? ProcessInfo.processInfo.environment
         )
+        // A child home mirrors `<root>/codex_home`, where the app keeps the
+        // account's credential and model cache.
+        if cacheURL.deletingLastPathComponent().lastPathComponent == "codex_child_home" {
+            cacheURL = cacheURL.deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("codex_home", isDirectory: true)
+                .appendingPathComponent("models_cache.json")
+        }
         if let effort = OpenAIExecutionControls.reasoningEffort(
             model: model,
             requested: LLMCallContext.reasoningEffort,
@@ -721,6 +763,8 @@ public final class CodexAdapter: LLMAdapter {
     /// libdispatch still owns a source. The explicit readers have a bounded stop.
     public static let defaultStreamingRunner: CodexStreamingProcessRunner = { inv in
         AsyncThrowingStream { continuation in
+            let activity = ProviderStreamContext.activity
+            let admitted = ProviderStreamContext.admitted
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             proc.arguments = [inv.executable] + inv.arguments
@@ -745,6 +789,8 @@ public final class CodexAdapter: LLMAdapter {
             let stdoutReader = NonblockingPipeReader(
                 fileDescriptor: outPipe.fileHandleForReading.fileDescriptor
             ) { data in
+                // stdout carries only the model's answer: the request was admitted.
+                if !data.isEmpty { activity?(); admitted?() }
                 if let s = utf8Decoder.append(data) {
                     continuation.yield(s)
                 }
@@ -752,6 +798,7 @@ public final class CodexAdapter: LLMAdapter {
             let stderrReader = NonblockingPipeReader(
                 fileDescriptor: errPipe.fileHandleForReading.fileDescriptor
             ) { data in
+                if !data.isEmpty { activity?() }
                 stderrBuf.mutate { $0.append(data) }
             }
             stdoutReader.start()
@@ -857,6 +904,7 @@ public final class CodexAdapter: LLMAdapter {
             // full inv.timeout window. Re-check after storing the slot in case
             // the handler raced us between the two checks.
             if (finished.get() || terminating.get()) { return }
+            if inv.timeout > 0 {
             let timeoutWork = DispatchWorkItem {
                 if proc.isRunning {
                     shutdown.requestStop()
@@ -891,6 +939,7 @@ public final class CodexAdapter: LLMAdapter {
             // body cannot signal a dead process. Closing that retention window
             // requires one atomic scheduling/cancellation state transition.
             DispatchQueue.global().asyncAfter(deadline: .now() + inv.timeout, execute: timeoutWork)
+            }
             // Arm cancellation and the deadline before a full stdin pipe can
             // block. Stream construction must return without waiting on the CLI.
             DispatchQueue.global(qos: .userInitiated).async {
@@ -1015,6 +1064,7 @@ public final class CodexAdapter: LLMAdapter {
             // ends up with writers waiting on a timeout that has no thread to
             // run on.
             func armTimeout() {
+                guard inv.timeout > 0 else { return }
                 if resumed.get() { return }
                 let timeoutWork = DispatchWorkItem {
                     if proc.isRunning {

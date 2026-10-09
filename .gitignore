@@ -50,6 +50,9 @@ id_ed25519
 data/secrets/
 secrets/
 .secrets/
+senses/ledger/
+senses/news/
+chrome/lease-bindings.json
 
 # Local-only signing, release, and privacy inputs.
 local/
@@ -156,6 +159,7 @@ data.backup.*/
 
 # Large embedding model staged into release builds; never in git
 extras/embedding/
+extras/codex/
 
 # Local capture/replay leftovers from the deleted test suites (personal data; never commit)
 tests/

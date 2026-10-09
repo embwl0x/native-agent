@@ -67,7 +67,7 @@ public enum TurnTraceRetention {
         var report = TurnTraceRetentionReport()
         for entry in entries where entry.lastPathComponent.hasSuffix(".jsonl") {
             let day = entry.lastPathComponent.replacingOccurrences(of: ".jsonl", with: "")
-            guard let dayDate = dayFormatter.date(from: day) else {
+            guard let dayDate = dayLock.withLock({ dayFormatter.date(from: day) }) else {
                 // Not a date-named trace file — never guess, never delete.
                 continue
             }
@@ -91,8 +91,9 @@ public enum TurnTraceRetention {
 
     /// Mirrors `TurnTracePersistLane.dayFormatter` exactly — same locale, same
     /// local timezone, same `yyyy-MM-dd` pattern. A divergence here would either
-    /// spare files forever or delete the live day.
-    static let dayFormatter: DateFormatter = {
+    /// spare files forever or delete the live day. Only used under `dayLock`.
+    private static let dayLock = NSLock()
+    private static let dayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone.current

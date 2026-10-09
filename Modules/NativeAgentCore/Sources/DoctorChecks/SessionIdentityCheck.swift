@@ -67,9 +67,7 @@ public struct SessionIdentityCheck: DoctorCheck {
             return CheckResult(
                 id: id, title: title, status: "fail",
                 detail: "chat/sessions.json is unreadable or malformed."
-                    + " Session identity cannot be measured.",
-                repair: "Inspect data/chat/sessions.json; run Repair Safe Issues to"
-                    + " rebuild app-owned chat directories."
+                    + " Session identity cannot be measured."
             )
         }
 
@@ -107,7 +105,6 @@ public struct SessionIdentityCheck: DoctorCheck {
 
         // The §1.3 flapping detector.
         var status = "ok"
-        var repair: String? = nil
         if report.disagreeingSessionCount > 0 {
             status = "warn"
             let named = report.disagreeingSessionIds
@@ -123,13 +120,6 @@ public struct SessionIdentityCheck: DoctorCheck {
                     + (overflow > 0 ? ", +\(overflow) more" : "")
                     + ")"
             )
-            repair = "The index `source` records what a conversation IS and is stamped"
-                + " once, from its creation row. These transcripts still HOLD their"
-                + " creation row and it says a different surface, so the index and"
-                + " the transcript were written from different answers; compare"
-                + " data/chat/sessions.json with the first row of each named"
-                + " transcript in data/chat/messages. (A session whose creation row"
-                + " was compacted away is never counted here — it is unmeasured.)"
         } else {
             parts.append("0 source disagreements")
         }
@@ -149,16 +139,11 @@ public struct SessionIdentityCheck: DoctorCheck {
                     + " or over the scan budget) and therefore unjudged"
             )
             if status == "ok" { status = "warn" }
-            if repair == nil {
-                repair = "Sessions with no readable transcript were not judged for source"
-                    + " flapping. Check data/chat/messages for orphaned index rows."
-            }
         }
 
         return CheckResult(
             id: id, title: title, status: status,
-            detail: parts.joined(separator: "; ") + ".",
-            repair: repair
+            detail: parts.joined(separator: "; ") + "."
         )
     }
 }

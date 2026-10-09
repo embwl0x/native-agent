@@ -266,7 +266,7 @@ public enum XConnectorActions {
                 detail: "X is not connected. Connect X under NativeAgent Connectors before running this action."
             )
         }
-        return try Data(contentsOf: path)
+        return try ConnectorCredentialFile.read(at: path)
     }
 
     private static func loadOAuth2Token(data: Data? = nil) throws -> [String: Any] {
@@ -283,7 +283,7 @@ public enum XConnectorActions {
     static func saveOAuth2Token(_ tokens: [String: Any], to path: URL) throws {
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONSerialization.data(withJSONObject: tokens, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: path, options: .atomic)
+        try ConnectorCredentialFile.write(data, to: path)
         try? FileManager.default.setAttributes([.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: path.path)
     }
 
@@ -461,7 +461,7 @@ public enum XConnectorActions {
             let attributes = try? FileManager.default.attributesOfItem(atPath: path.path)
             let fileNumber = (attributes?[.systemFileNumber] as? NSNumber)?.uint64Value
             guard let originalFileNumber, fileNumber == originalFileNumber,
-                  (try? Data(contentsOf: path)) == originalData else {
+                  (try? ConnectorCredentialFile.read(at: path)) == originalData else {
                 throw XActionError(
                     "credentials_changed",
                     detail: "X account changed — retry the request."
@@ -590,7 +590,7 @@ public enum XConnectorActions {
         guard mode & 0o077 == 0 else {
             throw XActionError("insecure_oauth1_credentials", detail: "X OAuth1 credentials must not be group- or world-readable.")
         }
-        let data = try Data(contentsOf: path)
+        let data = try ConnectorCredentialFile.read(at: path)
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw XActionError("invalid_oauth1_credentials", detail: "X OAuth1 credentials file is not a JSON object: \(path.path)")
         }
@@ -797,6 +797,9 @@ public enum XConnectorActions {
         var obj = baseEnvelope(actionId: actionId, status: "failed")
         obj["error"] = .string(short)
         obj["detail"] = .string(detail)
+        if ["missing_access_token", "missing_refresh_token", "refresh_disabled", "refresh_rejected"].contains(short) {
+            obj["fix"] = .string("The owner must sign in to X in Settings > Connectors.")
+        }
         return XConnectorSecretRedactor.redactValue(.object(obj))
     }
 
@@ -888,7 +891,7 @@ public enum XConnectorActions {
             .appendingPathComponent("connectors", isDirectory: true)
             .appendingPathComponent("x", isDirectory: true)
             .appendingPathComponent("oauth_app.json")
-        guard let data = try? Data(contentsOf: appPath),
+        guard let data = try? ConnectorCredentialFile.read(at: appPath),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let cid = root["client_id"] as? String
         else { return nil }

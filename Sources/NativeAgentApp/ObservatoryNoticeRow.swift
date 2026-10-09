@@ -35,7 +35,7 @@ struct ObservatoryNoticeRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+        .houseInset(in: RoundedRectangle(cornerRadius: 6))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(detail.map { "\(title). \($0)" } ?? title)
     }

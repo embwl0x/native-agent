@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import NativeAgentCore
+import os
 
 /// The executable the person saw. Never resolve PATH again when sending.
 public struct AgentACPExecutable: Codable, Sendable, Equatable {
@@ -30,7 +31,11 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
               info.st_mode & 0o111 != 0 else { throw AgentACPClient.Failure.unavailable }
         try handle.seek(toOffset: 0)
         var hash = SHA256()
-        while let bytes = try handle.read(upToCount: 65536), !bytes.isEmpty { hash.update(data: bytes) }
+        // Each chunk is an autoreleased NSData: drained per chunk, a 240 MB
+        // program costs one chunk of memory, not its whole size.
+        while let bytes = try autoreleasepool(invoking: { try handle.read(upToCount: 65536) }), !bytes.isEmpty {
+            hash.update(data: bytes)
+        }
         var after = stat()
         guard fstat(handle.fileDescriptor, &after) == 0,
               info.st_size == after.st_size, info.st_mode == after.st_mode,
@@ -59,8 +64,26 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
               access(path, X_OK) == 0 else { throw AgentACPClient.Failure.executableChanged }
     }
 
+    /// For display and routing checks (`canStartTurn`, contact lists, sorts).
+    /// A program that passed a full `verify()` is not re-hashed while its file
+    /// stat is unchanged; the launch itself still runs `verify()` in full.
     public var isCurrent: Bool {
-        do { try verify(); return true } catch { return false }
+        let key = "\(path)\n\(inode)\n\(digest)"
+        let before = Self.fileStamp(path)
+        if let before, Self.verifiedStamps.withLock({ $0[key] }) == before, access(path, X_OK) == 0 { return true }
+        do { try verify() } catch { return false }
+        if let before, Self.fileStamp(path) == before { Self.verifiedStamps.withLock { $0[key] = before } }
+        return true
+    }
+
+    /// Approved program → the file stamp its last full verification passed under.
+    private static let verifiedStamps = OSAllocatedUnfairLock(initialState: [String: String]())
+
+    private static func fileStamp(_ path: String) -> String? {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return nil }
+        return "\(info.st_dev) \(info.st_ino) \(info.st_size) \(info.st_mode) "
+            + "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
     }
 
     /// A bounded --version probe, without a shell or inherited app credentials.

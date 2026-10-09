@@ -37,14 +37,21 @@ enum ProviderSettingsRefreshAction {
             var catalogError: String?
             if refreshCatalog {
                 do { catalog = try await facade.modelCatalog(refresh: true) }
-                catch { catalogError = error.localizedDescription }
+                catch { catalogError = UserFacingError.cause(error, action: "refresh the model list") }
             }
             let snapshot = try await facade.routing.checkedProviderSnapshot()
-            let providers = try ProvidersFacade.connections(from: snapshot)
+            // Off the main actor: the conversion, and one status-file read whose
+            // failed rows each check the account's key in Keychain.
+            let dataRoot = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let (providers, failedTests) = try await Task.detached(priority: .userInitiated) {
+                let providers = try ProvidersFacade.connections(from: snapshot)
+                return (providers, LLMProviderStatusFeed.failedTests(
+                    providerIDs: providers.map(\.provider_id), dataRoot: dataRoot))
+            }.value
             if catalog == nil {
                 do {
                     catalog = try await facade.modelCatalog(refresh: false, routingSnapshot: snapshot.routing)
-                } catch { catalogError = error.localizedDescription }
+                } catch { catalogError = UserFacingError.cause(error, action: "load the model list") }
             }
             let config = try ProvidersFacade.modelRoutingConfig(from: snapshot.routing)
             catalog?.current = config.current
@@ -57,15 +64,10 @@ enum ProviderSettingsRefreshAction {
                 rowSet: snapshot.rowSet,
                 activeProviders: snapshot.routing.activeProviders,
                 preferences: snapshot.routing.preferences,
-                failedTests: Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
-                    LLMProviderStatusFeed.failedTest(
-                        providerID: provider.provider_id,
-                        dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-                    ).map { (provider.provider_id, $0) }
-                })
+                failedTests: failedTests
             ))
         } catch {
-            return .failed(error.localizedDescription)
+            return .failed(UserFacingError.cause(error, action: "read the accounts"))
         }
     }
 }

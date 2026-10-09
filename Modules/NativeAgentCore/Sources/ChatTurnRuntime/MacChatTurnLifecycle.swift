@@ -2,6 +2,7 @@ import Privacy
 import Foundation
 import Darwin
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 
 /// Why a terminal phase is trustworthy. The value is deliberately closed and
@@ -385,52 +386,41 @@ public struct MacChatPersistedTurnLifecycle: Codable, Sendable, Equatable {
     }
 }
 
-public protocol MacChatTurnLifecycleStorage: Sendable {
-    func load() async throws -> [MacChatPersistedTurnLifecycle]
-    func save(_ records: [MacChatPersistedTurnLifecycle]) async throws
-}
-
-public struct MacChatTurnLifecycleFileStorage: MacChatTurnLifecycleStorage {
-    public static let maximumBytes = 512 * 1_024
-
-    private struct Envelope: Codable, Sendable {
+public struct MacChatTurnLifecycleFileStorage: Sendable {
+    public struct Envelope: Codable, Sendable {
         let schemaVersion: Int
-        let turns: [MacChatPersistedTurnLifecycle]
+        var turns: [MacChatPersistedTurnLifecycle]
+        var queuedTurns: [String: [QueuedChatTurn]]? = nil
     }
 
     public let fileURL: URL
 
     public init(fileURL: URL) { self.fileURL = fileURL }
 
-    public func load() async throws -> [MacChatPersistedTurnLifecycle] {
+    public func load() async throws -> Envelope {
         var info = stat()
         let result = fileURL.path.withCString { lstat($0, &info) }
         if result != 0 {
             guard errno == ENOENT else {
                 throw MacChatTurnLifecycleStoreError.invalidRecord
             }
-            return []
+            return Envelope(schemaVersion: 1, turns: [])
         }
         guard (info.st_mode & S_IFMT) == S_IFREG,
-              info.st_size >= 0,
-              info.st_size <= off_t(Self.maximumBytes) else {
+              info.st_size >= 0 else {
             throw MacChatTurnLifecycleStoreError.invalidRecord
         }
         let envelope = try JSONDecoder().decode(Envelope.self, from: Data(contentsOf: fileURL))
         guard envelope.schemaVersion == 1 else {
             throw MacChatTurnLifecycleStoreError.unsupportedSchema
         }
-        return envelope.turns
+        return envelope
     }
 
-    public func save(_ records: [MacChatPersistedTurnLifecycle]) async throws {
-        let envelope = Envelope(schemaVersion: 1, turns: records)
+    public func save(_ envelope: Envelope) async throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(envelope)
-        guard data.count <= Self.maximumBytes else {
-            throw MacChatTurnLifecycleStoreError.invalidRecord
-        }
         try await SwiftNativePersistenceCore().writeDataAtomicDurable(data, to: fileURL)
     }
 }
@@ -452,16 +442,11 @@ public actor MacChatTurnLifecycleStore {
             .appendingPathComponent("mac_turn_lifecycle.json")
     }
 
-    private let storage: any MacChatTurnLifecycleStorage
+    private let storage: MacChatTurnLifecycleFileStorage
     private let maximumRecords: Int
-    private var loadedRecords: [MacChatPersistedTurnLifecycle]?
+    private var loadedState: MacChatTurnLifecycleFileStorage.Envelope?
     private var mutationInProgress = false
     private var mutationWaiters: [CheckedContinuation<Void, Never>] = []
-
-    public init(storage: any MacChatTurnLifecycleStorage, maximumRecords: Int = 64) {
-        self.storage = storage
-        self.maximumRecords = max(1, maximumRecords)
-    }
 
     public init(fileURL: URL = MacChatTurnLifecycleStore.liveFileURL, maximumRecords: Int = 64) {
         storage = MacChatTurnLifecycleFileStorage(fileURL: fileURL)
@@ -552,22 +537,76 @@ public actor MacChatTurnLifecycleStore {
     }
 
     private func currentRecords() async throws -> [MacChatPersistedTurnLifecycle] {
-        if let loadedRecords { return loadedRecords }
+        try await currentState().turns
+    }
+
+    private func currentState() async throws -> MacChatTurnLifecycleFileStorage.Envelope {
+        if let loadedState { return loadedState }
         let loaded = try await storage.load()
-        guard loaded.count <= maximumRecords,
-              loaded.allSatisfy({ $0.restoredState() != nil }),
-              Set(loaded.map(\.sessionId)).count == loaded.count else {
+        guard loaded.turns.count <= maximumRecords,
+              loaded.turns.allSatisfy({ $0.restoredState() != nil }),
+              Set(loaded.turns.map(\.sessionId)).count == loaded.turns.count else {
             throw MacChatTurnLifecycleStoreError.invalidRecord
         }
-        let sorted = Self.sorted(loaded)
-        loadedRecords = sorted
-        return sorted
+        var ids = Set<String>()
+        for (session, turns) in loaded.queuedTurns ?? [:] {
+            guard NativeAgentChatSessionID.normalizedPathComponent(session) != nil,
+                  turns.allSatisfy({ NativeAgentChatSessionID.normalizedPathComponent($0.id) != nil && ids.insert($0.id).inserted }) else {
+                throw MacChatTurnLifecycleStoreError.invalidRecord
+            }
+        }
+        loadedState = loaded
+        return loaded
     }
 
     private func commit(_ records: [MacChatPersistedTurnLifecycle]) async throws {
-        let sorted = Self.sorted(records)
-        try await storage.save(sorted)
-        loadedRecords = sorted
+        var state = try await currentState()
+        state.turns = Self.sorted(records)
+        try await storage.save(state)
+        loadedState = state
+    }
+
+    public func queuedTurns() async throws -> [String: [QueuedChatTurn]] {
+        await acquireMutation()
+        defer { releaseMutation() }
+        return try await currentState().queuedTurns ?? [:]
+    }
+
+    public func saveQueuedTurns(_ turns: [String: [QueuedChatTurn]]) async throws -> [String: [QueuedChatTurn]] {
+        await acquireMutation()
+        defer { releaseMutation() }
+        var state = try await currentState()
+        var saved = turns
+        for (session, queue) in turns {
+            for (index, turn) in queue.enumerated() {
+                for (attachmentIndex, attachment) in turn.attachments.enumerated() where !attachment.base64.isEmpty {
+                    guard NativeAgentChatSessionID.normalizedPathComponent(turn.id) != nil,
+                          let bytes = Data(base64Encoded: attachment.base64) else {
+                        throw MacChatTurnLifecycleStoreError.invalidRecord
+                    }
+                    let path = storage.fileURL.deletingLastPathComponent()
+                        .appendingPathComponent("attachments/\(turn.id)/\(attachmentIndex)")
+                    try await SwiftNativePersistenceCore().writeDataAtomicDurable(bytes, to: path)
+                    saved[session]?[index].attachments[attachmentIndex].base64 = ""
+                    saved[session]?[index].attachments[attachmentIndex].path = path.path
+                }
+            }
+        }
+        state.queuedTurns = saved
+        try await storage.save(state)
+        loadedState = state
+        return saved
+    }
+
+    public func attachments(for turn: QueuedChatTurn) throws -> [NativeAgentShared.MultimodalAttachment] {
+        try turn.attachments.map { attachment in
+            var value = attachment
+            if value.base64.isEmpty {
+                guard let path = value.path else { throw MacChatTurnLifecycleStoreError.invalidRecord }
+                value.base64 = try Data(contentsOf: URL(fileURLWithPath: path)).base64EncodedString()
+            }
+            return value
+        }
     }
 
     private func acquireMutation() async {

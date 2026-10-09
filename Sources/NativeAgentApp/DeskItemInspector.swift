@@ -4,6 +4,7 @@ import Desk
 
 /// Item-level controls on the primary Desk; all writes use its tool router.
 struct DeskItemInspector: View {
+    @Environment(AppModel.self) private var appModel
     let item: DeskItem
     let items: [DeskItem]
     let plan: DeskSequencing.Plan
@@ -35,7 +36,7 @@ struct DeskItemInspector: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("\(item.alias) · \(item.kind.rawValue) · \(item.status.rawValue) · \(item.project) · \(item.origin.rawValue)")
+                    Text("\(item.alias) · \(Self.kindLabel(item.kind)) · \(item.status.displayLabel) · \(item.project) · \(originLabel)")
                         .font(.caption).foregroundStyle(.secondary)
                     Text(DeskItemPresentation.freshness(for: item, now: now).text).foregroundStyle(.secondary)
                     if let assignee = item.assignee { Text("Assigned to \(assignee)") }
@@ -113,7 +114,6 @@ struct DeskItemInspector: View {
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 12)
-        .background(.regularMaterial)
         .focusable()
         .focusEffectDisabled()
         .focused($inspectorFocused)
@@ -165,6 +165,24 @@ struct DeskItemInspector: View {
                 .disabled(isBusy)
                 .help(DeskPursuitVetoControl.help)
                 .accessibilityIdentifier("desk.pursuit.veto.\(item.handle)")
+        }
+    }
+
+    static func kindLabel(_ kind: DeskKind) -> String {
+        switch kind {
+        case .watch: "watch"
+        case .plan: "plan"
+        case .project: "project"
+        case .gh: "GitHub"
+        case .standing: "standing"
+        }
+    }
+
+    private var originLabel: String {
+        switch item.origin {
+        case .owner: "added by you"
+        case .agent: "added by \(appModel.agentDisplayName)"
+        case .system: "added automatically"
         }
     }
 

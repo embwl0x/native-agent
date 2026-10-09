@@ -9,6 +9,7 @@ import Transcripts
 import MemoryV2
 import ApprovalInbox
 import TrustCenter
+import TelegramBot
 
 private actor NativeBackupRestoreCoordinator {
     private var activeDataRoots: Set<String> = []
@@ -57,6 +58,7 @@ private struct NativeBackupRestoreIntent: Codable {
 private struct NativeValidatedBackupSnapshot {
     let id: String
     let dataDirectory: URL
+    let restorePaths: [String]
     let copied: [String]
     let files: [NativeBackupIntegrityFile]
     let links: [NativeBackupLink]
@@ -182,15 +184,20 @@ public enum TrustBackupPersistence {
                 }
                 copied.append("memory")
             }
-            for relative in ["chat/sessions.json", "chat/messages", "chat/session_state"] {
-                let source = root.appendingNativeRelativePath(relative)
-                guard Self.pathEntryExists(source) else { continue }
-                try await Self.copyLockedSnapshotItem(
-                    from: source,
-                    to: dataDir.appendingNativeRelativePath(relative),
-                    excludingSQLiteArtifacts: false
-                )
-                copied.append(relative)
+            // Retention publishes archive bytes and locators under the session index lock.
+            copied += try await SwiftNativePersistenceCore().withFileLock(Self.chatSessionIndexPath(in: root)) {
+                var paths: [String] = []
+                for relative in Self.backupRelativePaths.filter({ $0.hasPrefix("chat/") }) {
+                    let source = root.appendingNativeRelativePath(relative)
+                    guard Self.pathEntryExists(source) else { continue }
+                    try await Self.copyLockedSnapshotItem(
+                        from: source,
+                        to: dataDir.appendingNativeRelativePath(relative),
+                        excludingSQLiteArtifacts: false
+                    )
+                    paths.append(relative)
+                }
+                return paths
             }
             copied = Self.backupRelativePaths.filter { copied.contains($0) }
         }
@@ -206,6 +213,7 @@ public enum TrustBackupPersistence {
             "createdAt": .string(createdAt),
             "id": .string(id),
             "integrityVersion": .int(2),
+            "scopeVersion": .int(2),
             // An off-disk copy is never a restore target: its `data/persona` is
             // the live persona root, which a restore would write to
             // `<dataRoot>/persona` and so move Agent's persona root.
@@ -376,6 +384,8 @@ public enum TrustBackupPersistence {
         "logs", "diagnostics", "crash_reports", "ui-frames", "mobile_snapshot_cache",
         "evals", "traces", "turn_traces", "harness", "builder_audit", "memory/backups",
         "security", "secrets", "oauth_tokens", "oauth_apps", "claude-bridge", "nextgen/remote",
+        "senses/ledger",
+        "senses/news",
     ]
 
     /// `providers/` holds API keys and OAuth tokens; only its model routing goes.
@@ -412,7 +422,10 @@ public enum TrustBackupPersistence {
         if values.isDirectory == true {
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
             let children = try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil, options: [])
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                .sorted {
+                    ($0.lastPathComponent == "sessions.jsonl" ? 0 : 1, $0.lastPathComponent)
+                        < ($1.lastPathComponent == "sessions.jsonl" ? 0 : 1, $1.lastPathComponent)
+                }
             let names = Set(children.map(\.lastPathComponent))
             for child in children {
                 let name = child.lastPathComponent
@@ -446,6 +459,7 @@ public enum TrustBackupPersistence {
         // The paths the local backup copies under their writers' locks keep them.
         let locked = relative.hasPrefix("memory/") || relative == "chat/sessions.json"
             || relative.hasPrefix("chat/messages/") || relative.hasPrefix("chat/session_state/")
+            || relative.hasPrefix("chat/archive/")
         do {
             try await Self.copyLockedSnapshotFile(from: source, to: destination, locking: locked)
         } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
@@ -743,6 +757,7 @@ public enum TrustBackupPersistence {
                 "createdAt": .string(Self.nativeArtifactTimestamp()),
                 "id": .string(id),
                 "integrityVersion": .int(2),
+                "scopeVersion": .int(2),
                 "kind": .string("backup"),
                 "reason": .string("final pre-owner restore safety snapshot"),
                 "scope": .array(Self.scopeNames(for: copied).map { .string($0) }),
@@ -794,7 +809,8 @@ public enum TrustBackupPersistence {
         }
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         for child in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
-            guard !child.lastPathComponent.hasSuffix(".lock") else { continue }
+            guard !child.lastPathComponent.hasSuffix(".lock"),
+                  !(source.lastPathComponent == "senses" && ["ledger", "news"].contains(child.lastPathComponent)) else { continue }
             try Self.copyQuiescentRestoreSafetyItem(
                 from: child, to: destination.appendingPathComponent(child.lastPathComponent)
             )
@@ -874,6 +890,10 @@ public enum TrustBackupPersistence {
         guard reason.utf8.count <= 1_000, createdAt.utf8.count <= 128 else {
             throw Self.backupError(code: 422, "Backup manifest metadata exceeds its bound.")
         }
+        let scopeVersion = object["scopeVersion"] ?? .int(1)
+        guard scopeVersion == .int(1) || scopeVersion == .int(2) else {
+            throw Self.backupError(code: 422, "Backup scope version is unsupported. Update NativeAgent before restoring it.")
+        }
 
         // Older manifests have no `links`: they recorded none.
         var linkValues: [JSONValue] = []
@@ -901,7 +921,8 @@ public enum TrustBackupPersistence {
             links.append(NativeBackupLink(path: path, target: target))
         }
 
-        let allowed = Set(Self.backupRelativePaths)
+        let restorePaths = scopeVersion == .int(2) ? Self.backupRelativePaths : Self.legacyBackupRelativePaths
+        let allowed = Set(restorePaths)
         var copied: [String] = []
         var copiedSet: Set<String> = []
         for value in copiedValues {
@@ -980,6 +1001,7 @@ public enum TrustBackupPersistence {
         return NativeValidatedBackupSnapshot(
             id: id,
             dataDirectory: dataDir,
+            restorePaths: restorePaths.filter { scopeVersion == .int(2) || $0 != "chat/archive" || copiedSet.contains($0) },
             copied: copied,
             files: actualFiles,
             links: links,
@@ -1022,7 +1044,7 @@ public enum TrustBackupPersistence {
         }
         guard createdAt.utf8.count <= 128 else { return false }
 
-        let allowed = Set(Self.backupRelativePaths)
+        let allowed = Set(Self.legacyBackupRelativePaths)
         var copied: [String] = []
         var copiedSet: Set<String> = []
         for value in copiedValues {
@@ -1090,7 +1112,7 @@ public enum TrustBackupPersistence {
             requireRestorableAuthority: requireRestorableAuthority
         )
         let fm = FileManager.default
-        for rel in Self.backupRelativePaths {
+        for rel in snapshot.restorePaths {
             let source = snapshot.dataDirectory.appendingNativeRelativePath(rel)
             let destination = destinationRoot.appendingNativeRelativePath(rel)
             if Self.pathEntryExists(destination) {
@@ -1129,6 +1151,15 @@ public enum TrustBackupPersistence {
         // Prove the selected backup exactly before overlaying facts that are
         // intentionally newer than it.
         try Self.verifyAppliedSnapshot(target, destinationRoot: destinationRoot)
+        // Older local backups did not cover archives; retain their safety copy.
+        if !target.copied.contains("chat/archive"), safety.copied.contains("chat/archive") {
+            try Self.copyQuiescentRestoreSafetyItem(
+                from: safety.dataDirectory.appendingNativeRelativePath("chat/archive"),
+                to: destinationRoot.appendingNativeRelativePath("chat/archive")
+            )
+        }
+        try TelegramConfig.preserveCredential(safetyRoot: safety.dataDirectory, destinationRoot: destinationRoot)
+        try ConnectorCredentialFile.preserveCredentials(safetyRoot: safety.dataDirectory, destinationRoot: destinationRoot)
         try Self.rollTranscriptGenerationsForward(
             in: destinationRoot,
             priorGenerations: priorGenerations
@@ -1371,7 +1402,7 @@ public enum TrustBackupPersistence {
         _ snapshot: NativeValidatedBackupSnapshot,
         destinationRoot: URL
     ) throws {
-        for rel in Self.backupRelativePaths where !snapshot.copied.contains(rel) {
+        for rel in snapshot.restorePaths where !snapshot.copied.contains(rel) {
             let destination = destinationRoot.appendingNativeRelativePath(rel)
             guard !Self.pathEntryExists(destination) else {
                 throw Self.backupError(code: 500, "Restored scope contains an item absent from the selected snapshot: \(rel)")
@@ -1567,16 +1598,20 @@ public enum TrustBackupPersistence {
         ])
     }
 
-    private static let backupRelativePaths: [String] = [
+    private static let backupRelativePaths = legacyBackupRelativePaths + ["senses", "make"]
+
+    private static let legacyBackupRelativePaths: [String] = [
         "trust",
         "memory",
         "workshop",
         "chat/sessions.json",
         "chat/messages",
         "chat/session_state",
+        "chat/archive",
         "skills",
         "tools",
         "connectors",
+        "oauth_tokens/x.json",
         "scheduler/jobs.json",
         "improvements",
         "workflows",
@@ -1634,13 +1669,14 @@ public enum TrustBackupPersistence {
         let fm = FileManager.default
         let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true,
-              relative == "workshop" || relative == "workshop/github_command" else {
+              ["workshop", "workshop/github_command", "senses", "make"].contains(relative) else {
             try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.copyItem(at: source, to: destination)
             return
         }
-        if relative == "workshop/github_command" {
-            try await SwiftNativePersistenceCore().withFileLock(source.appendingPathComponent("ops.jsonl")) {
+        if relative != "workshop" {
+            let lock = relative == "make" ? source : source.appendingPathComponent(relative == "senses" ? "registry.json" : "ops.jsonl")
+            try await SwiftNativePersistenceCore().withFileLock(lock) {
                 try await Self.copyLocalSnapshotDirectory(from: source, to: destination, relative: relative)
             }
         } else {
@@ -1661,7 +1697,7 @@ public enum TrustBackupPersistence {
         try fm.createDirectory(at: destination, withIntermediateDirectories: true)
         for child in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
             let name = child.lastPathComponent
-            if relative == "workshop/github_command", name == "ops.jsonl.lock" { continue }
+            if name.hasSuffix(".lock") || (relative == "senses" && ["ledger", "news"].contains(name)) { continue }
             try await Self.copyLocalSnapshotItem(
                 from: child,
                 to: destination.appendingPathComponent(name),
@@ -1700,7 +1736,11 @@ public enum TrustBackupPersistence {
             at: source,
             includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
             options: []
-        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        ).sorted {
+            // Freeze archive locators before walking their immutable transcripts.
+            ($0.lastPathComponent == "sessions.jsonl" ? 0 : 1, $0.lastPathComponent)
+                < ($1.lastPathComponent == "sessions.jsonl" ? 0 : 1, $1.lastPathComponent)
+        }
         for child in children {
             let name = child.lastPathComponent
             if name.hasSuffix(".lock") { continue }
@@ -1898,6 +1938,9 @@ public enum TrustBackupPersistence {
     }
 
     private static func validateBackupChatSessionIndex(dataDir: URL) throws {
+        for file in try ChatSessionRetention.archivedTranscripts(dataRoot: dataDir).values.flatMap({ $0 }) {
+            try Self.requireRegularFile(file, maximumBytes: nil)
+        }
         let source = dataDir.appendingNativeRelativePath("chat/sessions.json")
         guard FileManager.default.fileExists(atPath: source.path) else { return }
         _ = try ChatSessionIndexFile.loadObjectRowsForMutation(at: source)

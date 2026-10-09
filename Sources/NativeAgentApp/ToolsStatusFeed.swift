@@ -60,11 +60,13 @@ extension AppModel {
     @MainActor
     func recordToolOperationStatus(
         _ message: String,
-        outcome: ToolOperationStatusReceipt.Outcome
+        outcome: ToolOperationStatusReceipt.Outcome,
+        cause: Error? = nil
     ) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         statusText = trimmed
+        statusCause = cause?.localizedDescription
         toolOperationStatusReceipts = ToolsStatusFeed.appending(
             message: trimmed,
             outcome: outcome,

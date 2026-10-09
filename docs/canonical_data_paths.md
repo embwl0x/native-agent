@@ -37,6 +37,7 @@ Paths below are relative to `<dataRoot>` unless stated otherwise.
 | `runs/runs.json` | Run ledger; `SwarmRuns/RunLedger.swift` |
 | `connectors/github/tracking.json` and `tracking_snapshot.json` | GitHub tracking scope and snapshot; `GitHubConnector/GitHubProjectTracking.swift` |
 | `turn_traces/<yyyy-MM-dd>.jsonl` | Daily turn diagnostics; `TurnTrace/TurnTrace.swift` |
+| `senses/ledger/walls.jsonl` and `needs.json` | Private append-only walls and compact needs checkpoint; `Senses/FileWallLedger.swift`; excluded from backups, exports, sharing and tool reads |
 
 Source paths above are under `Modules/NativeAgentCore/Sources/`.
 `MemoryV2+UserMDGen.swift` uses the supplied persona root for `USER.md`;

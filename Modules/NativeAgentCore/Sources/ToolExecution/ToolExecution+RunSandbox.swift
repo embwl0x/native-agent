@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
 /// Sandbox config for invoking a tool subprocess.
 public struct ToolRunSandbox: Sendable {
@@ -32,7 +33,7 @@ public struct ToolRunSandbox: Sendable {
             throw ToolRunError.spawnFailed("Tool declares unknown permissions")
         }
         func quoted(_ url: URL) -> String {
-            let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+            let path = MacControlGate.resolvedPath(url.path)
             return "\"" + path.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"") + "\""
         }
@@ -42,7 +43,9 @@ public struct ToolRunSandbox: Sendable {
             "(version 1)", "(allow default)",
             "(deny file-read-data)", "(deny file-write*)", "(deny network*)",
             "(deny mach-lookup)", "(deny appleevent-send)", "(deny process-exec)",
-            "(allow file-read-data \(toolchainReads) (subpath \(quoted(toolRoot))) (subpath \(quoted(scratch))) (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))",
+            // Dyld opens the root directory before finding its shared cache.
+            "(allow file-read-data \(toolchainReads) (subpath \(quoted(toolRoot))) (subpath \(quoted(scratch))) (literal \"/\") (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))",
+            "(allow file-read-data (literal \"/Library/Preferences/com.apple.dt.Xcode.plist\"))",
             "(allow file-write* (subpath \(quoted(scratch))) (literal \"/dev/null\"))",
             "(allow process-exec (literal \"/usr/bin/swift\") (literal \"/usr/bin/xcrun\") (subpath \"/Library/Developer\") (subpath \"/Applications/Xcode.app\"))",
         ]
@@ -74,11 +77,12 @@ public struct ToolRunSandbox: Sendable {
             // General file grants cannot disclose credentials or rewrite the
             // stores that own approvals, identity, and executable authority.
             let privateStores = [
-                "secrets", "credentials", "oauth_tokens", "providers", "codex_home",
+                "secrets", "credentials", "oauth_tokens", "providers", "codex_home", "codex_child_home",
                 "connectors", "telegram/config.json", "slack/config.json",
                 "tools/.manifest_signing_key", "catalog/.pack_signing_key",
                 "icloud_pairing_secret.bin", "mobile", "mobile_push", "notifications/push_tokens.json",
                 "claude", "bridge-config",
+                "senses/ledger", "senses/news",
             ]
             for path in privateStores {
                 rules.append("(deny file-read-data file-write* (subpath \(quoted(dataRoot.appendingPathComponent(path)))))")
@@ -90,6 +94,7 @@ public struct ToolRunSandbox: Sendable {
             rules.append("(deny file-write* (subpath \(quoted(personaRoot))))")
             rules.append("(deny file-write-unlink (literal \(quoted(dataRoot))))")
             rules.append("(deny file-write-unlink (literal \(quoted(dataRoot.appendingPathComponent("workflows")))))")
+            rules.append("(deny file-write-unlink (literal \(quoted(dataRoot.appendingPathComponent("senses")))))")
         }
         // The executing artifact stays immutable, including for data writers.
         rules.append("(deny file-write* (subpath \(quoted(toolRoot))))")
@@ -129,7 +134,7 @@ public enum ToolRunError: Error, LocalizedError {
     case spawnFailed(String)
     case timeout
     case outputLimitExceeded(stream: String, limitBytes: Int)
-    case nonZeroExit(code: Int32, stderr: String)
+    case nonZeroExit(code: Int32, signalled: Bool, stderr: String)
 
     public var errorDescription: String? {
         switch self {
@@ -145,8 +150,10 @@ public enum ToolRunError: Error, LocalizedError {
             return "Tool subprocess exceeded timeout and was killed"
         case .outputLimitExceeded(let stream, let limitBytes):
             return "Tool subprocess exceeded the \(limitBytes)-byte \(stream) capture limit and was killed"
-        case .nonZeroExit(let code, let stderr):
-            return "Tool subprocess exited \(code): \(stderr)"
+        case .nonZeroExit(let code, let signalled, let stderr):
+            let reason = signalled ? "terminated by signal \(code) (\(String(cString: strsignal(code))))" : "exited \(code)"
+            let detail = stderr.isEmpty ? "No stderr was captured.\(signalled ? " Inspect the macOS crash report for this subprocess." : "")" : String(stderr.prefix(4000))
+            return "Tool subprocess \(reason): \(detail)"
         }
     }
 }
@@ -249,8 +256,28 @@ public actor ToolRunSandboxRunner {
         process.environment = [
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "HOME": scratch.path, "TMPDIR": scratch.path,
+            "xcrun_db": scratch.appendingPathComponent("xcrun_db").path,
             "CLANG_MODULE_CACHE_PATH": scratch.path,
         ]
+        if executable == "/usr/bin/swift" {
+            // Resolve Apple's compiler into scratch before confining the authored code.
+            let compiler = Process()
+            compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            compiler.arguments = ["--sdk", "macosx", "--find", "swift"]
+            compiler.environment = process.environment
+            let output = Pipe()
+            compiler.standardOutput = output
+            compiler.standardError = output
+            try compiler.run()
+            let compilerPath = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            compiler.waitUntilExit()
+            guard compiler.terminationStatus == 0, compilerPath.hasPrefix("/") else {
+                throw ToolRunError.spawnFailed("Swift compiler lookup failed: \(compilerPath)")
+            }
+            process.arguments?[2] = compilerPath
+        }
+        if let dataRoot = sandbox.dataRoot { process.environment?["NATIVEAGENT_DATA_ROOT"] = dataRoot.path }
         process.currentDirectoryURL = sandbox.toolRoot
 
         let stdinPipe = Pipe()
@@ -474,7 +501,7 @@ public actor ToolRunSandboxRunner {
         let stderrData = stderrBuf.data
 
         let stdoutStr = String(data: stdoutData, encoding: .utf8) ?? ""
-        let stderrStr = String(data: stderrData, encoding: .utf8) ?? ""
+        let stderrStr = String(decoding: stderrData, as: UTF8.self)
         let exit = process.terminationStatus
         let timedOut = timedOutBox.get()
 
@@ -485,7 +512,7 @@ public actor ToolRunSandboxRunner {
         let parsed: JSONValue? = (try? JSONValue.parse(stdoutData))
 
         if exit != 0 {
-            throw ToolRunError.nonZeroExit(code: exit, stderr: stderrStr)
+            throw ToolRunError.nonZeroExit(code: exit, signalled: process.terminationReason == .uncaughtSignal, stderr: stderrStr)
         }
 
         return ToolRunResult(

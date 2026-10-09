@@ -303,7 +303,7 @@ final class DetachedChatWindowController {
             return
         }
         guard let appModel else {
-            NSLog("[DetachedChatPanel] open(%@) before attach(appModel:) — skipping", sessionId)
+            nativeLog("[DetachedChatPanel] open(%@) before attach(appModel:) — skipping", sessionId)
             return
         }
         // Validate the session still exists. A relaunch-restore for a
@@ -315,9 +315,9 @@ final class DetachedChatWindowController {
         // restoreFromPersist(after:) catches it once sessions load.
         if !appModel.engine.transcripts.sessions.contains(where: { $0.id == sessionId }) {
             if appModel.engine.transcripts.sessions.isEmpty {
-                NSLog("[DetachedChatPanel] open(%@) — sessions not loaded yet; deferring", sessionId)
+                nativeLog("[DetachedChatPanel] open(%@) — sessions not loaded yet; deferring", sessionId)
             } else {
-                NSLog("[DetachedChatPanel] open(%@) — session not found; pruning persist set", sessionId)
+                nativeLog("[DetachedChatPanel] open(%@) — session not found; pruning persist set", sessionId)
                 removeFromPersist(sessionId)
             }
             return

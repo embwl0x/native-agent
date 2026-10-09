@@ -152,11 +152,11 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             }
             // Log BOTH channel outcomes so no failure is silent (Agent review).
             if !macOK {
-                NSLog("desk_notify: Mac banner failed for \(decision.handle)")
+                nativeLog("desk_notify: Mac banner failed for \(decision.handle)")
                 failures.append("\(decision.handle) Mac banner")
             }
             if !mobileOK {
-                NSLog("desk_notify: paired-device push failed for \(decision.handle)")
+                nativeLog("desk_notify: paired-device push failed for \(decision.handle)")
                 failures.append("\(decision.handle) paired-device push")
             }
             if macOK || mobileReached { notified += 1 }
@@ -175,7 +175,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
                     _ = try await store.markNotifiedIfUnchanged(decision.handle, expectedUpdatedAt: decision.observedUpdatedAt)
                 }
             } catch {
-                NSLog("desk_notify: stamp failed for \(decision.handle): \(error) — may re-ping next tick")
+                nativeLog("desk_notify: stamp failed for \(decision.handle): \(error) — may re-ping next tick")
                 failures.append("\(decision.handle) notification stamp: \(error)")
             }
         }
@@ -246,7 +246,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             }
             action = act
         } catch {
-            NSLog("desk_notify: nag config transaction failed: \(error) — skipping delivery to avoid a re-fire")
+            nativeLog("desk_notify: nag config transaction failed: \(error) — skipping delivery to avoid a re-fire")
             failures.append("nag config transaction: \(error)")
             return 0
         }
@@ -314,11 +314,11 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             ? true
             : postNagNotification(title, body, deskHandle)
         if !macPosted {
-            NSLog("desk_notify: nag Mac banner failed for \(label)")
+            nativeLog("desk_notify: nag Mac banner failed for \(label)")
             failures.append("\(label) nag Mac banner")
         }
         if !mobileOK {
-            NSLog("desk_notify: nag paired-device push failed for \(label)")
+            nativeLog("desk_notify: nag paired-device push failed for \(label)")
             failures.append("\(label) nag paired-device push")
         }
     }

@@ -137,6 +137,9 @@ public enum MemoryMoments {
         author: String,
         slotsSpentToday: Int?,
         stagedProposalId: String?,
+        turnId: String? = nil,
+        occurredAt: Date? = nil,
+        failure: AfterTurnMemoryFailure? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
     ) async {
@@ -146,12 +149,21 @@ public enum MemoryMoments {
             "lane": .string(lane),
             "outcome": .string(outcome),
             "session": .string(String(sessionId.prefix(8))),
+            "session_id": .string(sessionId),
             "surface": .string(surface),
             "author": .string(author),
             "dailyCap": .int(Int64(dailyCap)),
         ]
         if let slotsSpentToday { row["slotsSpentToday"] = .int(Int64(slotsSpentToday)) }
         if let stagedProposalId { row["proposalId"] = .string(stagedProposalId) }
+        if let turnId { row["turn_id"] = .string(turnId) }
+        if let occurredAt { row["occurred_at"] = .string(occurredAt.ISO8601Format()) }
+        if let failure {
+            row["failure_reason"] = .string(failure.reason.rawValue)
+            row["recovery_action"] = .string(failure.recovery)
+            row["memory_model"] = failure.model.map(JSONValue.string) ?? .null
+            row["memory_surface"] = .string(failure.surface)
+        }
         let path = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("moment_receipts.jsonl")
@@ -164,7 +176,7 @@ public enum MemoryMoments {
                 logLabel: "MemoryV2.moments"
             )
         } catch {
-            NSLog("MemoryV2 moments: outcome receipt failed: %@", String(describing: error))
+            nativeLog("MemoryV2 moments: outcome receipt failed: %@", String(describing: error))
         }
     }
 
@@ -295,15 +307,24 @@ public enum MemoryMoments {
         return value
     }
 
-    /// Who was in the user seat. Deliberately BROADER than the fact lane's
-    /// `[from: <sender>, via bridge]` guard: any `[from:` prefix is a machine
-    /// seat, and mis-attributing a peer's words to the person is the one
-    /// direction that must not happen in a lane that records what someone said.
-    public static func authorTag(forUserMessage text: String) -> String {
-        (text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[from:")
-            || AdaptiveMemoryPromoter.isAgentSeatUserMessage(text))
-            ? "peer"
-            : "user"
+    /// Keep the conversation seat visible without treating acceptance as proof
+    /// that the person said it. The promoter's source names the original seat.
+    public static func recallOrigin(source: String?, metadata: JSONValue?) -> JSONValue? {
+        guard isMoment(metadata) || source?.hasPrefix("\(sourcePrefix):") == true else { return nil }
+        let sourceSession = source.flatMap {
+            $0.hasPrefix("\(sourcePrefix):") ? String($0.dropFirst(sourcePrefix.count + 1)) : nil
+        }
+        let session = sourceSession ?? metadataString(metadata, "session_id")
+        let storedAuthor = metadataString(metadata, "author")
+        let author = session?.hasPrefix("agent-") == true || session?.hasPrefix("bot-") == true
+            ? "peer" : (["peer", "user"].contains(storedAuthor ?? "") ? storedAuthor! : "unknown")
+        var origin: [String: JSONValue] = ["author": .string(author)]
+        if let session, !session.isEmpty { origin["session_id"] = .string(session) }
+        if let source, !source.isEmpty { origin["source"] = .string(source) }
+        if let surface = metadataString(metadata, "surface"), !surface.isEmpty {
+            origin["surface"] = .string(surface)
+        }
+        return .object(origin)
     }
 
     /// Calendar-day key (local zone) used by the daily cap.
@@ -540,7 +561,7 @@ public enum MemoryMoments {
             // must neither trouble nor heal (Codex review 2026-09-05).
             guard (record.status ?? "active") == "active" else { return nil }
             guard record.memoryKind == kind || isMoment(record.extras) else { return nil }
-            guard let at = parseTimestamp(record.createdAt) else { return nil }
+            guard let at = parseTimestamp(metadataString(record.extras, "observed_at") ?? record.createdAt) else { return nil }
             let text = record.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
             return Row(

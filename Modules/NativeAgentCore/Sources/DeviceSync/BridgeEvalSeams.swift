@@ -1,28 +1,7 @@
 import Foundation
 import NativeAgentShared
 
-/// Small value owners used by the bridge itself.  They deliberately keep the
-/// difficult boundaries (transport writes, restart generations, and persisted
-/// defaults) observable without making a test talk to iCloud or a live app.
-enum ICloudBridgeStatusPublication {
-    /// Returns the cache value that is safe to retain.  A failed transport write
-    /// must leave the prior value intact so the next identical projection retries.
-    static func publish(
-        key: String,
-        value: String,
-        lastPublished: String?,
-        transport: DeviceSyncTransport
-    ) async -> (succeeded: Bool, retainedValue: String?) {
-        guard value != lastPublished else { return (true, lastPublished) }
-        do {
-            try await transport.setStatus(key: key, value: value)
-            return (true, value)
-        } catch {
-            return (false, lastPublished)
-        }
-    }
-}
-
+/// Bounded, durable replay-filter state shared by bridge lifecycles.
 enum ICloudSeenIDDefaultsStore {
     static func load(defaults: UserDefaults, key: String, cap: Int) -> [String] {
         guard let stored = defaults.array(forKey: key) as? [String] else { return [] }

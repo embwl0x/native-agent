@@ -161,7 +161,10 @@ extension TelegramPollLoop {
                 context: "approval_callback_answer",
                 update: update
             )
-            if let record = try? await approvalInbox.get(parsed.command.id), record.status != "pending" {
+            // An approval that settled, or a mirrored card (not an approval
+            // record) that was just answered: its buttons are done either way.
+            let record = try? await approvalInbox.get(parsed.command.id)
+            if record == nil || record?.status != "pending" {
                 await terminalizeApprovalKeyboard(
                     chatId: parsed.chatId, messageId: parsed.messageId,
                     text: resolution.acknowledgement, update: update
@@ -187,9 +190,12 @@ extension TelegramPollLoop {
                 context: "approval_callback_error_answer",
                 update: update
             )
-            if let record = try? await approvalInbox.get(parsed.command.id), record.status != "pending" {
+            // Settled, or a card answered elsewhere already: clear stale buttons.
+            let record = try? await approvalInbox.get(parsed.command.id)
+            if record == nil || record?.status != "pending" {
                 await terminalizeApprovalKeyboard(
-                    chatId: parsed.chatId, messageId: parsed.messageId, text: reply, update: update
+                    chatId: parsed.chatId, messageId: parsed.messageId,
+                    text: record == nil ? "This card was already answered or withdrawn." : reply, update: update
                 )
             }
         }
@@ -322,8 +328,10 @@ extension TelegramPollLoop {
                     errorContext: "approval_assistant_delivery",
                     update: nil,
                     message: nil,
-                    text: nil
+                    text: nil,
+                    approvalId: approvalId
                 )
+                var answerOwed = false
                 do {
                     let progress = makeProgressSink(delivery: delivery, card: card)
                     let reply = try await runChatHandlerWithRetry(
@@ -342,12 +350,14 @@ extension TelegramPollLoop {
                     case .delivered:
                         await card.transition(.completed(summary: "Reply delivered"))
                     case .failed(let reason):
+                        answerOwed = true
                         await recordError(
                             context: "send_approval_continuation",
                             error: reason
                         )
                         await card.transition(.failed(reason: "Reply delivery failed: \(reason)"))
                     case .outcomeUnknown(let reason):
+                        answerOwed = true
                         await recordError(
                             context: "send_approval_continuation_outcome_unknown",
                             error: reason
@@ -358,16 +368,18 @@ extension TelegramPollLoop {
                     }
                 } catch is CancellationError {
                     // This task is already cancelled; run the terminal UI work in a fresh one.
-                    await Task { await card.transition(.canceled(reason: "Stopped by user")) }.value
+                    await Task {
+                        await delivery.stop()
+                        await card.transition(.canceled(reason: "Stopped by user"))
+                    }.value
                 } catch {
                     await card.transition(.failed(reason: Self.chatErrorNotice(for: error)))
                     let safeError = Self._tgRedactToken(String(describing: error))
                     let notice = "\(acknowledgement) NativeAgent could not continue the reply automatically: \(safeError)"
-                    if !(await delivery.abortDelivering(notice: notice)) {
-                        try? await sendMessage(token, destination, notice)
-                    }
+                    await delivery.stop()
+                    try? await sendMessage(token, destination, notice)
                 }
-                await finishApprovalContinuation(approvalId: approvalId)
+                if !answerOwed { await finishApprovalContinuation(approvalId: approvalId) }
             }
         if await turnCoordinator.startTrackedTurn(
             destination: destination,
@@ -390,6 +402,42 @@ extension TelegramPollLoop {
         } catch {
             await recordError(context: "approval_continuation_forget", error: String(describing: error))
         }
+    }
+
+    func retryApprovalAnswer(args: [String], update: TelegramUpdate, message: TelegramMessage, text: String) async throws -> Bool {
+        for approval in try await approvalInbox.list(filter: .resolved) {
+            guard case .object(let state)? = approval.chatContinuation,
+                  state["done"] != .bool(true), let raw = state["assistantDelivery"],
+                  let queued = state["delivery"] else { continue }
+            let continuation = try JSONDecoder().decode(TelegramPendingApprovalContinuation.self, from: queued.serializedData(pretty: false))
+            guard continuation.destination == message.destination else { continue }
+            let retained = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: raw.serializedData(pretty: false))
+            if retained.isDelivered { continue }
+            if await turnCoordinator.snapshot(destination: message.destination).isRunning {
+                await sendCommandReply("I'm still delivering that answer.", kind: "retry_busy", update: update, message: message, text: text)
+                return true
+            }
+            let key = Data(approval.id.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+            try await SwiftNativePersistenceCore().withFileLock(dataRoot.appendingPathComponent("telegram/\(key).delivery")) {
+                let current = try await approvalInbox.get(approval.id)
+                guard case .object(let state)? = current.chatContinuation,
+                      state["done"] != .bool(true), let raw = state["assistantDelivery"] else { return }
+                let saved = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: raw.serializedData(pretty: false))
+                let delivery = makeAssistantDelivery(
+                    destination: message.destination, turnId: UUID(), errorContext: "retry_approval_answer",
+                    update: nil, message: message, text: nil, approvalId: approval.id
+                )
+                switch await delivery.finalize(reply: saved.reply, savedDelivery: saved, resendUnknown: args == ["resend"]) {
+                case .delivered:
+                    await finishApprovalContinuation(approvalId: approval.id)
+                    await recordReceipt(kind: "retry_reply", update: update, message: message, text: text, reply: saved.reply)
+                case .failed(let reason), .outcomeUnknown(let reason):
+                    await sendCommandReply(reason, kind: "retry_delivery_pending", update: update, message: message, text: text)
+                }
+            }
+            return true
+        }
+        return false
     }
 
     /// Import before either shared or Telegram recovery scans the inbox, so
@@ -465,6 +513,19 @@ extension TelegramPollLoop {
                 continue
             }
             guard case .object(let state)? = approval.chatContinuation else { continue }
+            if let raw = state["assistantDelivery"] {
+                do {
+                    let saved = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: raw.serializedData(pretty: false))
+                    if saved.isDelivered {
+                        await finishApprovalContinuation(approvalId: record.approvalId)
+                    } else {
+                        try await sendMessage(token, record.destination, "I saved the approval follow-up answer. Use /retry to deliver it; if delivery was unconfirmed, use /retry resend (it may arrive twice).")
+                    }
+                } catch {
+                    await recordError(context: "approval_answer_recovery", error: String(describing: error))
+                }
+                continue
+            }
             guard state["started"] == nil else {
                 let notice = "\(record.acknowledgement) I restarted before I could write the rest of that answer — ask again if you still need it."
                 do {

@@ -20,6 +20,19 @@ public enum PeerTrust {
     /// The engine installs it; until then nothing is trusted.
     public static func install(dataRoot: URL) {
         PeerDataTaint.ownerTrusts = { ownerTrusts($0, dataRoot: dataRoot) }
+        PeerDataTaint.isAgent = { isAgent($0, dataRoot: dataRoot) }
+    }
+
+    /// Whether a latch names an agent contact: a peer handle, or any contact
+    /// name, id or lane the address book resolves.
+    static func isAgent(_ source: String, dataRoot: URL) -> Bool {
+        let key = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if key.isEmpty || key == "a remote peer" { return false }
+        if key == "another agent" { return true } // an unidentified bridge peer stays untrusted
+        if key.hasPrefix("peer:") { return true }
+        if laneHosts[key] != nil { return true }
+        guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return false }
+        return peers.contains { $0.id == key || $0.name.lowercased() == key }
     }
 
     /// Whether the steer `source` is the person's own: a contact (`peer:<id>`

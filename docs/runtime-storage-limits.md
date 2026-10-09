@@ -7,9 +7,10 @@
 |---|---|---|
 | `traces/events.jsonl` | 5,000 → 4,000 | 8 MiB → 4 MiB |
 | `activity/events.jsonl` | 5,000 → 4,000, preserving rare event kinds | No hard byte cap in this policy |
+| `telegram/receipts.jsonl`, `memory/moment_receipts.jsonl` | 5,000 → 4,000 | No hard byte cap in this policy |
 | `turn_traces/<day>.jsonl` | 20,000 retained; checked on first append and every 4,096 appends | 12 MiB → 8 MiB |
 
-Trace/activity row checks run on the first append and then every 128 appends,
+Trace/activity and Telegram/moment receipt row checks run on the first append and then every 128 appends,
 so their row triggers can overshoot by 127. The shared trace byte ceiling is
 checked on every append. An oversized incoming diagnostic row is refused;
 inherited unreadable diagnostic bytes are preserved and appends that would
@@ -24,6 +25,11 @@ screenshots. Captures share 128 MiB, 256 groups and seven days, enforced on
 writes. One artifact is limited to 16 MiB and one group to 32 MiB. Matching
 artifacts are evicted together. Unknown files and symlinks are excluded;
 downloads, generated images and user documents are outside this cache.
+
+`AppQuietToolPresentation.swift` bounds offscreen page pictures in
+`diagnostics/page_shots/` to seven days, 64 PNGs and 64 MiB on each write.
+The current delivery is protected; inline continuations own their pixel bytes.
+These are replaceable diagnostics, separate from authored images.
 
 The daily `DataRootDiskHygieneCheck` reports oversized state; it does not
 automatically delete it or enforce a global quota. Chat recovery backups have

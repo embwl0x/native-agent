@@ -1,65 +1,28 @@
-import AppKit
-import CryptoKit
 import Foundation
 import os
 import PersistenceCore
 
 public enum ChatGPTDotIPCTransport {
-    public typealias Conversation = @Sendable (URL, AgentPeerContact, [JSONValue], String?) async throws -> JSONValue
+    public typealias Conversation = @Sendable (URL, AgentPeerContact, [JSONValue], String?, [String: JSONValue]?) async throws -> JSONValue
     private static let handler = OSAllocatedUnfairLock<Conversation?>(initialState: nil)
-    private static let polled = OSAllocatedUnfairLock(initialState: [String: Date]())
-
-    public static func recentSendFile(_ root: URL) -> URL { root.appendingPathComponent("agents/dot-recent-send.json") }
-
-    public static func nextPull(dataRoot: URL, now: Date) -> Date? {
-        guard let bytes = try? Data(contentsOf: recentSendFile(dataRoot)),
-              let text = try? JSONDecoder().decode(String.self, from: bytes),
-              let sent = ISO8601DateFormatter().date(from: text),
-              now.timeIntervalSince(sent) >= 0 else { return nil }
-        // No end: Dot may research for hours. Every 30 s at first, then every 2 minutes.
-        let every: TimeInterval = now.timeIntervalSince(sent) < 600 ? 30 : 120
-        return polled.withLock { max(sent.addingTimeInterval(30), ($0[dataRoot.path] ?? sent).addingTimeInterval(every)) }
-    }
-
-    public static func takePull(dataRoot: URL, now: Date) -> Bool {
-        guard let due = nextPull(dataRoot: dataRoot, now: now), due <= now else { return false }
-        return polled.withLock {
-            guard due <= now else { return false }
-            $0[dataRoot.path] = now
-            return true
-        }
-    }
 
     public static func installConversation(_ conversation: @escaping Conversation) {
         handler.withLock { $0 = conversation }
     }
 
-    public static func conversation(_ root: URL, _ peer: AgentPeerContact, _ messages: [JSONValue], _ sent: String?) async throws -> JSONValue {
+    public static func conversation(_ root: URL, _ peer: AgentPeerContact, _ messages: [JSONValue], _ sent: String?, window: [String: JSONValue]? = nil) async throws -> JSONValue {
         guard let conversation = handler.withLock({ $0 }) else {
             return .object(["status": .string("unavailable"), "detail": .string("Dot's conversation is unavailable.")])
         }
-        return try await conversation(root, peer, messages, sent)
+        return try await conversation(root, peer, messages, sent, window)
     }
-
-    public static let updatedDetail = "ChatGPT app updated; Dot messaging needs a check"
-    private static let checked = OSAllocatedUnfairLock(initialState: (stamp: "", receipt: JSONValue.null, retryAfter: Date.distantPast))
 
     public static func owns(_ peer: AgentPeerContact) -> Bool {
         peer.transport == .mcpHost && AgentPeerStore.hostRowID(peer.endpoint) == "chatgpt-dot"
     }
 
-    public static var readiness: JSONValue {
-        let local = localState()
-        guard local.status == "not_checked" else { return unavailable(local.detail) }
-        return checked.withLock { value in
-            guard value.stamp == local.stamp,
-                  case .object(let fields) = value.receipt,
-                  fields["status"] == .string("available") || Date() < value.retryAfter else {
-                return unavailable("Dot messaging has not been checked yet.", status: "not_checked")
-            }
-            return value.receipt
-        }
-    }
+    /// Dot's state is the listener's last word, never a cached check.
+    public static var readiness: JSONValue { listener.withLock { $0.state } }
 
     public static var available: Bool {
         if case .object(let value) = readiness { return value["status"] == .string("available") }
@@ -71,50 +34,152 @@ public enum ChatGPTDotIPCTransport {
         return "In-house ChatGPT Dot · two-way"
     }
 
-    public static var stamp: String { localState().stamp }
-
-    public static func retainHandshake(_ receipt: JSONValue, stamp: String) {
-        guard !stamp.isEmpty, stamp == self.stamp else { return }
-        checked.withLock { $0 = (stamp, receipt, Date().addingTimeInterval(15)) }
-        NotificationCenter.default.post(name: didChange, object: nil)
-    }
-
     public static let didChange = Notification.Name("ChatGPTDotIPCTransport.didChange")
 
     private static func unavailable(_ detail: String, status: String = "unavailable") -> JSONValue {
         .object(["status": .string(status), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail)])
     }
 
-    private static func localState() -> (status: String, stamp: String, detail: String) {
-        let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex")
-        guard running.count == 1, let app = running.first, let url = app.bundleURL else {
-            return ("unavailable", "", "ChatGPT app isn't running; Dot messaging is unavailable.")
+    /// Dot's room is followed by one long-lived helper (`chatgpt_dot_ipc.js
+    /// listen`) for as long as ChatGPT keeps its connection. ChatGPT pushes
+    /// every change; each line the helper prints is Dot's state, with his
+    /// room when he can be followed, and his messages go to her Dot session as
+    /// they land (one that is hers wakes her). A helper that ends says why
+    /// and the next starts at once while ChatGPT runs; one that dies right
+    /// after that restart waits for ChatGPT's socket to be replaced.
+    private struct Listener {
+        var dataRoot: URL?
+        var events: FileChangeEvents?
+        var process: Process?
+        /// The helper's stdin, held open: closing it (or this app ending) ends the helper.
+        var lifeline: Pipe?
+        var socket: UInt64?
+        /// This helper is the restart after one ended, and how many lines it printed.
+        var restarted = false
+        var lines = 0
+        var state = ChatGPTDotIPCTransport.unavailable("Dot messaging has not been checked yet.", status: "not_checked")
+    }
+    private static let listener = OSAllocatedUnfairLock(uncheckedState: Listener())
+    private static let socket = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/ipc/ipc.sock")
+
+    /// Once, for the app's data root: follow Dot from now on.
+    public static func listen(dataRoot: URL) {
+        guard listener.withLock({ state -> Bool in
+            guard state.dataRoot == nil else { return false }
+            state.dataRoot = dataRoot
+            return true
+        }) else { return }
+        let events = FileChangeEvents(paths: [socket], emitInitial: true)
+        listener.withLock { $0.events = events }
+        Task.detached { for await _ in events.stream { reconnect() } }
+    }
+
+    /// Starts the listener unless one runs. Without a Dot contact there is nothing to follow.
+    public static func reconnect() { reconnect(restarted: false) }
+
+    private static func reconnect(restarted: Bool) {
+        guard let root = listener.withLock({ $0.lifeline == nil ? $0.dataRoot : nil }),
+              (try? AgentPeerStore(dataRoot: root).list().contains(where: owns)) == true else { return }
+        let environment = AgentBridgeRuntime.processEnvironment()
+        guard let helper = AgentBridgeRuntime.helperURL(named: "chatgpt_dot_ipc.js", dataRoot: root),
+              let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
+            return settle(unavailable("Dot messaging helper or Node.js is unavailable."))
         }
-        guard let infoData = try? Data(contentsOf: url.appendingPathComponent("Contents/Info.plist")),
-              let info = try? PropertyListSerialization.propertyList(from: infoData, format: nil) as? [String: Any],
-              info["CFBundleIdentifier"] as? String == "com.openai.codex" else {
-            return ("unavailable", "", updatedDetail)
+        let process = Process(), lifeline = Pipe(), output = Pipe()
+        guard listener.withLock({ state -> Bool in
+            guard state.lifeline == nil else { return false }
+            (state.process, state.lifeline, state.socket) = (process, lifeline, socketInode())
+            (state.restarted, state.lines) = (restarted, 0)
+            return true
+        }) else { return }
+        process.executableURL = node
+        process.arguments = [helper.path, "listen"]
+        process.currentDirectoryURL = root
+        process.environment = environment
+        process.standardInput = lifeline
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        let pending = OSAllocatedUnfairLock(initialState: Data())
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            let lines = pending.withLock { buffer -> [Data] in
+                buffer.append(chunk)
+                var lines: [Data] = []
+                while let end = buffer.firstIndex(of: 0x0A) {
+                    lines.append(buffer[buffer.startIndex..<end])
+                    buffer.removeSubrange(buffer.startIndex...end)
+                }
+                return lines
+            }
+            listener.withLock { if $0.lifeline === lifeline { $0.lines += lines.count } }
+            lines.forEach { receive($0, root: root) }
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                ended(lifeline)
+            }
         }
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let socket = home.appendingPathComponent(".codex/ipc/ipc.sock").path
-        guard let archive = try? FileManager.default.attributesOfItem(atPath: url.appendingPathComponent("Contents/Resources/app.asar").path),
-              let modified = archive[.modificationDate] as? Date, let size = archive[.size] as? NSNumber,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: socket),
-              let inode = attributes[.systemFileNumber] as? NSNumber,
-              let data = try? Data(contentsOf: home.appendingPathComponent(".codex/.codex-global-state.json")),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let atoms = root["electron-persisted-atom-state"] as? [String: Any],
-              let primary = atoms["primary-aeon-selection-v1"] as? [String: Any],
-              let response = primary["response"] as? [String: Any],
-              let selection = response["selection"] as? [String: Any], selection["available"] as? Bool == true,
-              let account = primary["accountId"] as? String,
-              let aeon = selection["aeon_id"] as? String, aeon.hasPrefix(account + "~"),
-              let thread = selection["thread_id"] as? String, !thread.isEmpty,
-              let room = selection["messaging_room_id"] as? String, !room.isEmpty else {
-            return ("unavailable", "", "Dot's current conversation cannot be followed.")
+        do { try process.run() } catch {
+            output.fileHandleForReading.readabilityHandler = nil
+            listener.withLock { $0.process = nil; $0.lifeline = nil }
+            settle(unavailable("Dot messaging helper or Node.js is unavailable."))
         }
-        let identity = [url.path, String(app.processIdentifier), inode.stringValue, String(modified.timeIntervalSince1970),
-            size.stringValue, account, aeon, thread, room].joined(separator: "\n")
-        return ("not_checked", SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined(), "")
+    }
+
+    private static func receive(_ line: Data, root: URL) {
+        guard case .object(var fields)? = try? JSONDecoder().decode(JSONValue.self, from: line) else { return }
+        let room = fields.removeValue(forKey: "messages")
+        settle(.object(fields))
+        guard case .array(let messages)? = room else { return }
+        Task {
+            guard let peer = try? AgentPeerStore(dataRoot: root).list().first(where: owns) else { return }
+            do {
+                _ = try await conversation(root, peer, messages, nil)
+                // A wait on Dot looks again.
+                AgentConversationRunning.shared.changed()
+            } catch {
+                nativeLog("Dot's room could not be brought into her session: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    /// The helper is gone. It said why in its last line; one that did not
+    /// stopped unexpectedly. While ChatGPT runs the next starts now, unless
+    /// this one was already that restart and died at once (its last line was
+    /// its only one): then its reason stands until ChatGPT's socket changes.
+    private static func ended(_ lifeline: Pipe) {
+        guard let (state, started, quick) = listener.withLock({ value -> (JSONValue, UInt64?, Bool)? in
+            guard value.lifeline === lifeline else { return nil }
+            (value.process, value.lifeline) = (nil, nil)
+            return (value.state, value.socket, value.restarted && value.lines <= 1)
+        }) else { return }
+        guard case .object(let fields) = state else { return }
+        if fields["status"] != .string("unavailable") {
+            settle(unavailable("Dot's listener stopped unexpectedly."))
+        }
+        guard let now = socketInode() else { return }
+        if now != started { reconnect() }
+        else if !quick, fields["reason"] != .string("app_not_running") { reconnect(restarted: true) }
+    }
+
+    private static func socketInode() -> UInt64? {
+        var info = stat()
+        return stat(socket.path, &info) == 0 ? UInt64(info.st_ino) : nil
+    }
+
+    /// A new state is news at once: the contact rows and her contact health follow it.
+    private static func settle(_ state: JSONValue) {
+        guard let root = listener.withLock({ value -> URL?? in
+            guard value.state != state else { return nil }
+            value.state = state
+            return .some(value.dataRoot)
+        }) else { return }
+        NotificationCenter.default.post(name: didChange, object: nil)
+        guard let root else { return }
+        Task.detached(priority: .utility) {
+            await AgentContactHealth.shared.refresh(dataRoot: root)
+            // Room messages a failed ingestion kept are tried again.
+            guard let peer = try? AgentPeerStore(dataRoot: root).list().first(where: owns) else { return }
+            _ = try? await conversation(root, peer, [], nil)
+        }
     }
 }

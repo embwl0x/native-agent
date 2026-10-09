@@ -185,7 +185,7 @@ final class NativeLoopbackListener: @unchecked Sendable {
     /// A taken port is said with its holder; any other error as it came.
     private func fail(_ error: Error, generation attempt: UInt64) {
         guard NativeLoopbackListenerParameters.isAddressInUse(error) else {
-            NSLog("[\(label)] listener failed: \(error)")
+            nativeLog("[\(label)] listener failed: \(error)")
             recordFailure("\(error)", generation: attempt)
             finish(generation: attempt)
             return
@@ -195,7 +195,7 @@ final class NativeLoopbackListener: @unchecked Sendable {
         finish(generation: attempt)
         Task.detached(priority: .utility) { [weak self] in
             let holder = await Self.listeningProcess(on: port) ?? "a process lsof could not name"
-            NSLog("[\(label)] port \(port) is held by \(holder); not listening")
+            nativeLog("[\(label)] port \(port) is held by \(holder); not listening")
             self?.recordFailure("port \(port) is held by \(holder)", generation: attempt)
         }
     }
@@ -216,7 +216,7 @@ final class NativeLoopbackListener: @unchecked Sendable {
         }
         self.listener = nil
         lock.unlock()
-        NSLog("[\(label)] listener was cancelled")
+        nativeLog("[\(label)] listener was cancelled")
         recordFailure("the listener was cancelled", generation: attempt)
         finish(generation: attempt)
     }

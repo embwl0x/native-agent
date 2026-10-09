@@ -215,12 +215,13 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     private func transientNetworkError(_ error: Error, endpoint: URL, operation: String) -> LLMError {
         let host = endpoint.host ?? "api.anthropic.com"
         let nsError = error as NSError
-        let timeout = Int(session.configuration.timeoutIntervalForRequest.rounded())
+        let timeout = session.configuration.timeoutIntervalForRequest
+        let timeoutNote = timeout.isFinite ? "after \(String(format: "%.0f", timeout))s" : "with the request idle limit disabled"
         if nsError.domain == NSURLErrorDomain {
             let code = URLError.Code(rawValue: nsError.code)
             switch code {
             case .timedOut:
-                return .transient(message: "anthropic_oauth_direct \(operation) timed out after \(timeout)s: \(host)")
+                return .transient(message: "anthropic_oauth_direct \(operation) timed out \(timeoutNote): \(host)")
             case .cannotConnectToHost:
                 return .transient(message: "anthropic_oauth_direct \(operation) cannot connect to \(host) (code=\(nsError.code))")
             case .networkConnectionLost:
@@ -331,6 +332,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 lastSentAccessToken = accessToken
             } catch is CancellationError { throw CancellationError() }
             catch let err as LLMError { throw err }
+            catch let err as any ProviderFailureWrapping { throw err }
             catch { throw LLMError.notConfigured(provider: "anthropic_oauth_direct") }
 
             var req = URLRequest(url: endpoint)
@@ -364,6 +366,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             let data: Data
             let response: URLResponse
             do {
+                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                 (data, response) = try await session.data(for: req)
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "completeMessages"))
@@ -430,6 +433,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 throw CancellationError()
             } catch let err as LLMError {
                 throw err
+            } catch let err as any ProviderFailureWrapping {
+                throw err
             } catch {
                 throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
             }
@@ -462,6 +467,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             let data: Data
             let response: URLResponse
             do {
+                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                 (data, response) = try await session.data(for: req)
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "complete"))
@@ -599,7 +605,9 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             let bytes: URLSession.AsyncBytes
             let response: URLResponse
             do {
+                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                 (bytes, response) = try await session.bytes(for: req)
+                if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "stream"))
             }
@@ -631,7 +639,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 switch effectiveEvent {
                 case "error":
                     let errObj = obj["error"] as? [String: Any]
-                    throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj ?? [:])))
+                    throw ProviderFailure.wireError(errObj ?? [:])
                 case "message_start":
                     let msg = obj["message"] as? [String: Any]
                     usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))
@@ -807,7 +815,9 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             let bytes: URLSession.AsyncBytes
             let response: URLResponse
             do {
+                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                 (bytes, response) = try await session.bytes(for: req)
+                if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
             }
@@ -853,7 +863,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     switch effectiveEvent {
                     case "error":
                         let errObj = obj["error"] as? [String: Any]
-                        throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj ?? [:])))
+                        throw ProviderFailure.wireError(errObj ?? [:])
                     case "message_start":
                         let msg = obj["message"] as? [String: Any]
                         usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))
@@ -937,6 +947,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                                 // sequence: a normal finish, so the calls
                                 // before it dispatch.
                                 guard runaway.toolBoundary != nil else { throw runaway.stopError }
+                                if let reason = runaway.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                                 continuation.finish()
                                 return
                             }

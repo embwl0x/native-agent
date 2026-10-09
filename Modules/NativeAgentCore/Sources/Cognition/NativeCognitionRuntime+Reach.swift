@@ -111,7 +111,7 @@ struct ReachLedger: Codable, Equatable {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(bounded), to: Self.url(root))
             return true
         } catch {
-            NSLog("reach: ledger not kept: %@", error.localizedDescription)
+            nativeLog("reach: ledger not kept: %@", error.localizedDescription)
             return false
         }
     }
@@ -455,13 +455,10 @@ extension NativeCognitionRuntime {
                     sessionId: anchor, initiative: .scheduled) {
                 case .posted, .duplicate:
                     outcome = "sent"
-                    // His conversation is his Telegram DM: her words go there
-                    // and nothing else knocks. Otherwise it is the Mac/phone
-                    // conversation, and the one knock points at it.
-                    if !reachEnabled { break }
-                    if let telegram = await host.sendToOwnerTelegram(sessionId: anchor, text: text, dataRoot: dataRoot) {
-                        if !telegram { NSLog("reach: kept in his conversation; Telegram did not take it") }
-                    } else if reachEnabled {
+                    // Her words are in his conversation; the one knock is his
+                    // phone, opening that conversation with Reply (User,
+                    // 2026-10-07: not Telegram-only).
+                    if reachEnabled {
                         knocked = (try? await host.deliverShoulderTap(
                             eventId: itemID, title: PersonaCompiler.agentDisplayName(dataRoot: dataRoot),
                             body: Reach.knockLine, reason: itemID,
@@ -472,7 +469,7 @@ extension NativeCognitionRuntime {
                 }
             } catch {
                 // "Not proven posted"; the seam rolled its own claim back.
-                NSLog("reach: not delivered: %@", error.localizedDescription)
+                nativeLog("reach: not delivered: %@", error.localizedDescription)
             }
             // One segment again: patch this row only, on a fresh read.
             ledger = ReachLedger.read(dataRoot)

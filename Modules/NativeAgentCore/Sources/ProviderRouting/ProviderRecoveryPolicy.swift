@@ -21,11 +21,11 @@ import Foundation
 /// wrapper errors ChatOrchestration owns are unwrapped by the extension in
 /// `ChatOrchestration/ProviderRecoveryPolicy.swift`.
 public enum ProviderRecoveryPolicy {
-    // Every caller gets the existing overload ladder, before output only.
-    // Preserve exhaustion across outer chat/whole-turn ladders so they cannot
-    // restart this allowance or replay output already delivered to a person.
-    private struct FinishedOverload: ProviderFailureWrapping, LocalizedError {
+    // Standalone calls retry overloads before output; turns own their reconnect
+    // ladder. Output vetoes replay without exhausting in-place continuation.
+    private struct StoppedOverload: ProviderFailureWrapping, LocalizedError {
         let providerFailureCause: Error
+        let exhausted: Bool
         var permitsWholeTurnRetry: Bool { false }
         var errorDescription: String? { ProviderFailure.overloaded.errorDescription }
     }
@@ -37,7 +37,7 @@ public enum ProviderRecoveryPolicy {
             do { return try await operation() }
             catch {
                 guard canRetryOverload(error) else { throw error }
-                guard attemptsMade < maxAttemptsPerCall else { throw finishOverload(error) }
+                guard attemptsMade < maxAttemptsPerCall else { throw stopOverload(error, exhausted: true) }
                 try await Task.sleep(for: .seconds(backoffSeconds(forRetry: attemptsMade)))
             }
         }
@@ -60,7 +60,7 @@ public enum ProviderRecoveryPolicy {
                             }
                             try Task.checkCancellation()
                         } catch {
-                            throw emittedOutput ? finishOverload(error) : error
+                            throw emittedOutput ? stopOverload(error, exhausted: false) : error
                         }
                     }
                     continuation.finish()
@@ -71,20 +71,20 @@ public enum ProviderRecoveryPolicy {
     }
 
     private static func canRetryOverload(_ error: Error) -> Bool {
-        isRecoverable(error) && ProviderFailure.classify(error) == .overloaded
+        !(error is StoppedOverload) && isRecoverable(error) && ProviderFailure.classify(error) == .overloaded
     }
 
-    private static func finishOverload(_ error: Error) -> Error {
+    static func stopOverload(_ error: Error, exhausted: Bool) -> Error {
         ProviderFailure.classify(error) == .overloaded
-            ? FinishedOverload(providerFailureCause: error) : error
+            ? StoppedOverload(providerFailureCause: error, exhausted: exhausted) : error
     }
 
     /// 1 original attempt + 9 retries for a single provider call. The shape is
     /// Claude Code's reconnect ladder on purpose (the user: it says
     /// "reconnecting, try n of 10" and keeps going): a provider blip should
     /// cost a wait, never the turn. Network failures and rate limits ride
-    /// this ladder; the shared client exhausts overloads with the same
-    /// pre-output ladder above before they reach an outer turn ladder.
+    /// this ladder alongside overloads; standalone calls use the pre-output
+    /// overload ladder above.
     public static let maxAttemptsPerCall = 10
 
     /// Ceiling on recoveries across the WHOLE turn, so a provider that drops
@@ -200,12 +200,12 @@ public enum ProviderRecoveryPolicy {
     /// 2026-09-18 WHY: one typed verdict for every adapter and surface.
     /// Model fallback is deliberately absent: the person's selection is binding.
     public static func isRecoverable(_ error: Error) -> Bool {
-        if error is FinishedOverload { return false }
+        if let stopped = error as? StoppedOverload, stopped.exhausted { return false }
         if let wrapped = error as? any ProviderFailureWrapping {
             return isRecoverable(wrapped.providerFailureCause)
         }
         switch ProviderFailure.classify(error) {
-        case .network, .overloaded, .rateLimited: return true
+        case .network, .noReply, .overloaded, .rateLimited: return true
         default: return false
         }
     }

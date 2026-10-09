@@ -5,26 +5,19 @@ import ToolRegistry
 
 /// Reads app-owned live diagnostics for Core's health-tool envelopes.
 enum AppToolHealthHost {
-    /// The Doctor page's rows. `repair` is its Repair button: the same run,
-    /// leaving the same report on the page.
+    /// Read the last report, or explicitly run checks (false) or repair (true).
     @MainActor
-    static func doctorStatus(repair: Bool) async throws -> JSONValue {
-        let report: DoctorReport
+    static func doctorStatus(repair: Bool?) async throws -> JSONValue {
         guard let appModel = QuietSelfAdmin.shared.appModel else {
-            if repair { return AppToolExecutor.unattachedFailure() }
-            return try await envelope(NativeClient(baseURL: "").runDoctor(repair: false))
+            return AppToolExecutor.unattachedFailure()
         }
-        if repair {
-            if case .unavailable(let reason) = await appModel.runDoctor(repair: true, repairScope: .button) {
-                return AppToolExecutor.failure("doctor_unavailable", "Repair did not run: \(reason) If checks were already running, do doctor.repair again once they finish.")
+        if let repair {
+            if case .unavailable(let reason) = await appModel.runDoctor(repair: repair, repairScope: .button) {
+                return AppToolExecutor.failure("doctor_unavailable", "Doctor did not run: \(reason)")
             }
-            guard let repaired = appModel.engine.doctor.report else {
-                return AppToolExecutor.failure("doctor_unavailable", "Repair ran but left no report. Read \(AppToolExecutor.doorDoctor) for the rows.")
-            }
-            report = repaired
-        } else {
-            let checks = try await NativeClient(baseURL: "").runDoctor(repair: false)
-            report = await NativeClient.mergeDoctorReport(checks, liveChecks: DoctorStatusChecks.run(appModel: appModel, repairDesk: false).checks)
+        }
+        guard let report = appModel.engine.doctor.report else {
+            return AppToolExecutor.failure("doctor_not_run", "No Doctor report yet. Run doctor.run, then read this page.")
         }
         return try await envelope(report)
     }

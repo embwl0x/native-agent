@@ -20,6 +20,15 @@ public enum ProviderStateValidation {
     }
 
     public static func credential(at path: URL) throws -> [String: Any] {
+        if path.lastPathComponent == "xai_oauth_direct.json" {
+            return try XAIOAuthCredentialStore.read(at: path)
+        }
+        return try credentialMetadata(at: path)
+    }
+
+    /// Explicit sign-in validates existing metadata without requiring the
+    /// superseded Keychain grant to remain readable.
+    public static func credentialMetadata(at path: URL) throws -> [String: Any] {
         guard let data = try dataIfPresent(at: path) else { return [:] }
         return try credential(data: data)
     }
@@ -49,6 +58,11 @@ public enum ProviderStateValidation {
         if let value = fields[ProviderAPIKeyStore.referenceField] {
             guard case .string(let reference) = value, UUID(uuidString: reference) != nil else {
                 throw invalid("provider Keychain reference must be a UUID string")
+            }
+        }
+        if let value = fields[XAIOAuthCredentialStore.referenceField] {
+            guard case .string(let reference) = value, UUID(uuidString: reference) != nil else {
+                throw invalid("xAI OAuth Keychain reference must be a UUID string")
             }
         }
         if let value = fields["OPENAI_API_KEY"], value != .null {

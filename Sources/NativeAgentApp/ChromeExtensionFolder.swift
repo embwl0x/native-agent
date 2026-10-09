@@ -78,7 +78,7 @@ enum ChromeExtensionFolder {
             return destination
         } catch {
             try? fm.removeItem(at: staging)
-            NSLog("[chrome] Could not prepare the visible extension folder: %@", error.localizedDescription)
+            nativeLog("[chrome] Could not prepare the visible extension folder: %@", error.localizedDescription)
             // The bundled folder still works through Go to Folder.
             return bundled
         }

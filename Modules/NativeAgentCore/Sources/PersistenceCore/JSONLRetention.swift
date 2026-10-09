@@ -95,7 +95,7 @@ public func enforceJSONLLineCap(
         // U5 fix-round (2026-06-11, gpt-5.5 NIT): never silent — a non-UTF8
         // feed means the cap cannot run, which the state-lifecycle rule says
         // must be visible, not a quiet `return 0`.
-        NSLog("enforceJSONLLineCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
+        nativeLog("enforceJSONLLineCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
               path.path, data.count)
         return 0
     }
@@ -138,7 +138,7 @@ func enforceJSONLKindLineCap(
     }
     let data = try Data(contentsOf: path)
     guard let text = String(data: data, encoding: .utf8) else {
-        NSLog("enforceJSONLKindLineCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
+        nativeLog("enforceJSONLKindLineCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
               path.path, data.count)
         return 0
     }
@@ -212,7 +212,7 @@ public func enforceJSONLByteCap(
         if !preserveOversizedNewestRow {
             throw JSONLPathOwnedAppendError.unreadableDiagnosticFeed(path.standardizedFileURL.path)
         }
-        NSLog("enforceJSONLByteCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
+        nativeLog("enforceJSONLByteCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
               path.path, data.count)
         return 0
     }
@@ -281,7 +281,7 @@ public func appendJSONLCapped(
     // rather than silently accepted so a stale local constant is visible.
     let policy = jsonlPathOwnedCapPolicy(for: path)
     if let policy, policy.maxLines != maxLines {
-        NSLog("%@: %@ has a path-owned cap of %d line(s) — ignoring the call site's %d",
+        nativeLog("%@: %@ has a path-owned cap of %d line(s) — ignoring the call site's %d",
               logLabel, path.lastPathComponent, policy.maxLines, maxLines)
     }
     let effectiveMaxLines = policy?.maxLines ?? maxLines
@@ -383,7 +383,7 @@ public func appendJSONLCapped(
             )
         }
         if dropped > 0 {
-            NSLog("%@: %@ cap dropped %d oldest line(s)",
+            nativeLog("%@: %@ cap dropped %d oldest line(s)",
                   logLabel, path.lastPathComponent, dropped)
         }
         if let effectiveMaxBytes, let effectiveTrimToBytes {
@@ -394,7 +394,7 @@ public func appendJSONLCapped(
                 preserveOversizedNewestRow: !diagnosticByteBound
             )
             if byteDropped > 0 {
-                NSLog("%@: %@ byte cap dropped %d oldest line(s)",
+                nativeLog("%@: %@ byte cap dropped %d oldest line(s)",
                       logLabel, path.lastPathComponent, byteDropped)
             }
         }

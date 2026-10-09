@@ -120,7 +120,7 @@ package enum AgentConversationSession {
         }
         // limit/offset page nothing on a contact's route without an exact
         // message or task; they mean "show me the recent talk" (Grok Bot, 09-24).
-        if agent.hasPrefix("peer:"), string(args["message_id"]) == nil, string(args["task_id"]) == nil {
+        if !dot, agent.hasPrefix("peer:"), string(args["message_id"]) == nil, string(args["task_id"]) == nil {
             args.removeValue(forKey: "limit"); args.removeValue(forKey: "offset")
         }
         // A built-in lane's wake names its thread by id (walk 09-25: the read
@@ -140,7 +140,8 @@ package enum AgentConversationSession {
         }
         // Exact protocol calls remain available for diagnostics and existing clients.
         let advanced: Set<String> = ["conversation_id", "message_id", "task_id", "page_size", "page_token", "context_id", "status", "history_length", "include_artifacts", "status_timestamp_after", "limit", "offset"]
-        if !dot, args.contains(where: { advanced.contains($0.key) && $0.value != .string("") }) {
+        if !dot, args.contains(where: { advanced.contains($0.key) && $0.value != .string("")
+            && !(tool == "agent_read" && label != nil && ["limit", "offset"].contains($0.key)) }) {
             guard label == nil, !fresh, historyBefore == nil, historyExchange == nil else { throw AgentConversationStore.Failure(message: "Choose either a conversation name or exact protocol identifiers, not both.") }
             return try await AgentConversationApproval.$exactProtocol.withValue(tool == "agent_message") {
                 try await perform(tool, args)
@@ -405,8 +406,14 @@ package enum AgentConversationSession {
                     return
                 }
                 $0.phase = "attention"
-                $0.receipt = .object(["status": .string("outcome_unknown"),
-                    "detail": .string("The send did not establish an outcome. The conversation was preserved; no message was resent.")])
+                if let refusal = error as? ToolFailureError, refusal.effects == .none {
+                    $0.receipt = .object(["status": .string("invalid_arguments"), "sent": .bool(false), "effects": .string("none"),
+                        "error": .string(refusal.message), "detail": .string(refusal.message),
+                        "argument_path": refusal.argumentPath.map(JSONValue.string) ?? .null, "accepted": refusal.accepted.map(JSONValue.string) ?? .null])
+                } else {
+                    $0.receipt = .object(["status": .string("outcome_unknown"),
+                        "detail": .string("The send did not establish an outcome. The conversation was preserved; no message was resent.")])
+                }
                 if owed($0) {
                     $0.deliveryState = "delivering"; $0.automaticRead = true; $0.nextReadAt = Date()
                 }
@@ -414,6 +421,7 @@ package enum AgentConversationSession {
             if let stopped, stopped.stop?.state == "stopped", !Task.isCancelled {
                 return compact(view(stopped, details: false, dataRoot: dataRoot, includeHistory: false), row: stopped)
             }
+            if var failure = error as? AgentConversationStore.Failure { failure.effects = .unknown; throw failure }
             throw error
         }
     }
@@ -428,15 +436,29 @@ package enum AgentConversationSession {
         guard let agent = string(input["agent"]) else { throw AgentConversationStore.Failure(message: "Name the contact to wait for.") }
         let pinned = named(string(input["conversation"]), agent: agent, scope: scope, dataRoot: dataRoot)
         let label = pinned.label
-        var readInput: [String: JSONValue] = ["agent": .string(agent)]
+        let exact = input.filter { ["conversation_id", "message_id", "task_id"].contains($0.key) && $0.value != .null && $0.value != .string("") }
+        let retained = exact.isEmpty ? nil : try AgentConversationStore(dataRoot: dataRoot).records().filter { row in
+            row.agent == agent && exact.allSatisfy { key, value in
+                key == "conversation_id" ? row.conversationID.map(JSONValue.string) == value : row.readInput?[key] == value
+            }
+        }.max { $0.updatedAt < $1.updatedAt }
+        var readInput = exact
+        readInput["agent"] = .string(agent)
         // The name she gave, so the read resolves to this same record.
         if let label { readInput["conversation"] = input["conversation"] ?? .string(label) }
         for key in ["session_id", "__session_id", "details"] { readInput[key] = input[key] }
+        if !exact.isEmpty, retained == nil {
+            var result = try await read("agent_read", readInput)
+            if case .object(var fields) = result { fields["wait_outcome"] = .string("not_tracked"); result = .object(fields) }
+            return result
+        }
         let asked: Double = switch input["seconds"] { case .int(let n)?: Double(n); case .double(let n)?: n; default: 60 }
         let started = Date()
         let deadline = started.addingTimeInterval(min(max(asked, 1), 300))
         if let peer = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { "peer:" + $0.id == agent }),
            ChatGPTDotIPCTransport.owns(peer) {
+            // His reply lands through the listener, which marks the change.
+            var seen = AgentConversationRunning.shared.seen
             var snapshot = try await read("agent_read", readInput)
             if isRefusal(snapshot) { return snapshot }
             var outcome = "nothing_in_flight"
@@ -449,10 +471,11 @@ package enum AgentConversationSession {
                       return false
                   }) {
                 outcome = "still_waiting"
-                let remaining = deadline.timeIntervalSinceNow
-                if remaining <= 0 { break }
-                try await Task.sleep(for: .seconds(min(2, remaining)))
                 if Date() >= deadline { break }
+                await AgentConversationRunning.shared.change(after: seen, until: deadline)
+                try Task.checkCancellation()
+                if Date() >= deadline { break }
+                seen = AgentConversationRunning.shared.seen
                 snapshot = try await read("agent_read", readInput)
                 if isRefusal(snapshot) { return snapshot }
                 outcome = "settled"
@@ -475,8 +498,9 @@ package enum AgentConversationSession {
         defer { if let watching { AgentConversationRunning.shared.unwatch(watching) } }
         while !Task.isCancelled {
             let seen = AgentConversationRunning.shared.seen
-            guard let row = try pinned.record.flatMap({ id in try store.records().first { $0.id == id } })
-                    ?? store.find(scopeSessionID: scope, agent: agent, label: label) else { outcome = "not_opened"; break }
+            guard let row = try (retained?.id ?? pinned.record).flatMap({ id in try store.records().first { $0.id == id } })
+                    ?? (retained == nil ? store.find(scopeSessionID: scope, agent: agent, label: label) : nil),
+                  retained == nil || row.operationID == retained?.operationID else { outcome = "not_opened"; break }
             latest = row
             if watching == nil { watching = row.id; AgentConversationRunning.shared.watch(row.id) }
             guard replyInFlight(row, transport, dataRoot: dataRoot) else {
@@ -814,7 +838,9 @@ package enum AgentConversationSession {
         guard case .object(let fields) = result else { return result }
         let state = string(fields["status"]) ?? "cannot_stop"
         guard ["stopped", "stopping", "cannot_stop", "not_here"].contains(state) else { return result } // refused by its gate
-        let cleared = clearQueue ? try store.clearQueued(id: row.id) : 0
+        let cleared: Int
+        do { cleared = clearQueue ? try store.clearQueued(id: row.id) : 0 }
+        catch var failure as AgentConversationStore.Failure { failure.effects = .unknown; throw failure } // the stop already went
         func answer(_ record: AgentConversationRecord, _ extra: [String: JSONValue]) -> JSONValue {
             guard case .object(var fields) = compact(view(record, details: false, dataRoot: dataRoot, includeHistory: false), row: record) else { return .object(extra) }
             fields.merge(extra) { _, new in new }
@@ -917,7 +943,7 @@ package enum AgentConversationSession {
             // The current ask's own state comes from its request id (refreshed
             // above). A late answer to a superseded ask shows here but never
             // reads as the answer to the one still waiting.
-            if !["waiting", "sending"].contains(fields["state"].flatMap { if case .string(let v) = $0 { v } else { nil } } ?? "") {
+            if fields["reply_state"] != .string("no_reply_expired"), !["waiting", "sending"].contains(fields["state"].flatMap { if case .string(let v) = $0 { v } else { nil } } ?? "") {
                 fields["state"] = .string("replied")
             }
             fields["untrusted_remote_data"] = .bool(true)
@@ -1070,11 +1096,19 @@ package enum AgentConversationSession {
     }
 
     /// One thread of a built-in lane by its id: its newest exchanges among the
-    /// lane's recent twelve (delegation_status has no conversation filter).
+    /// lane's fetched range (delegation_status has no conversation filter).
     private static func builtInThread(agent: String, conversation: String, args: [String: JSONValue], scope: String,
                                       dataRoot: URL, perform: Dispatch) async throws -> JSONValue {
+        let limit = args["limit"] ?? .int(12)
+        let offset = args["offset"] ?? .int(0)
+        guard case .int(let count) = limit, (1...12).contains(count),
+              case .int(let start) = offset, start >= 0, start <= Int64(Int.max) else {
+            throw ToolFailureError("Named coding reads take limit 1–12 and a nonnegative offset.", argumentPath: "limit/offset",
+                                   accepted: "app {action:\"agent.read\",args:{agent:\"<contact>\",conversation:\"<name>\",limit:5}}", effects: .none)
+        }
         var list = args.filter { ["agent", "session_id", "__session_id", "details"].contains($0.key) }
         list["limit"] = .int(12)
+        list["offset"] = offset
         guard case .object(var fields) = try await perform("agent_read", list) else {
             throw AgentConversationStore.Failure(message: "That conversation could not be read.")
         }
@@ -1088,7 +1122,7 @@ package enum AgentConversationSession {
         var found = false
         for key in ["exchanges", "jobs"] {
             guard case .array(let rows)? = fields[key] else { continue }
-            let kept = rows.filter(inThread)
+            let kept = Array(rows.filter(inThread).prefix(Int(count)))
             found = found || !kept.isEmpty
             fields[key] = .array(kept)
         }
@@ -1097,13 +1131,14 @@ package enum AgentConversationSession {
         if let name = threadLabel(agent: agent, conversation: conversation, scope: scope, dataRoot: dataRoot) {
             fields["conversation"] = .string(name)
         }
-        if !found {
-            fields["detail"] = .string("None of \(agent)'s twelve most recent exchanges is in that conversation. Read an older one exactly by its message_id.")
+        if !found, ["ok", "no_evidence"].contains(string(fields["status"]) ?? "") {
+            fields["detail"] = .string("None of \(agent)'s exchanges in the fetched range is in that conversation. Read another range with offset, or an exchange exactly by its message_id.")
         }
         return labelled(.object(fields), agent: agent, scope: scope, dataRoot: dataRoot)
     }
 
     package static func absorb(_ receipt: JSONValue, into row: inout AgentConversationRecord) {
+        let receipt = AgentConversationView.expiringReply(receipt)
         // A wake owns completion. A lookup before its job is visible, or
         // while its receipt is unreadable, is not a terminal no-reply result.
         if ["codex", "claude", "omp"].contains(row.agent), row.phase == "waiting",
@@ -1292,7 +1327,7 @@ package enum AgentConversationSession {
                 }
             }
         } else if let text = reply(value) { result["reply"] = .string(text) }
-        for key in ["untrusted_remote_data", "source_availability", "read_error", "completed", "terminal", "needs_input", "needs_authentication", "sent", "reason", "error", "execution_error", "reply_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages"] {
+        for key in ["reply_state", "reply_deadline", "automatic_resend", "untrusted_remote_data", "source_availability", "read_error", "completed", "terminal", "needs_input", "needs_authentication", "sent", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "reply_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages"] {
             if let field = value[key] ?? root[key] { result[key] = field }
         }
         // delegation_status.detail is a format selector ("full"), not an
@@ -1350,7 +1385,7 @@ package enum AgentConversationSession {
         // Pending approvals and uncertain/accepted sends still require recovery;
         // the adapter rechecks current authority and connection on every attempt.
         return ["reconnect_required", "unavailable", "needs_setup", "no_outbound_route",
-                "blocked", "denied", "blocked_by_trust", "busy"].contains(string(receipt["status"]) ?? "")
+                "blocked", "denied", "blocked_by_trust", "busy", "invalid_arguments"].contains(string(receipt["status"]) ?? "")
     }
     private static func isRefusal(_ receipt: JSONValue) -> Bool {
         guard case .object(let row) = receipt else { return true }

@@ -341,10 +341,11 @@ extension SwiftToolDispatcher {
         }
         if let auth = Self.loadCloudConnectorAuth(connector: "calendar", root: dataRoot),
            auth.scopes.isDisjoint(with: ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/calendar.events"]) {
-            return InlineInteractionNeed.envelope(InlineInteractionRegistry.connector("calendar",
-                why: "Reconnect Google Calendar to grant event-write access before sending invitations.", dataRoot: dataRoot))
+            return .object(["status": .string("unavailable"), "outcome": .string("unmet"),
+                "effects": .string("none"), "detail": .string("Google Calendar lacks event-write access."),
+                "fix": .string("The owner must sign in to Google Calendar in Settings > Connectors.")])
         }
-        return await cloudConnectorRead(connector: "calendar", purpose: "schedule this meeting") { token in
+        return await cloudConnectorRead(connector: "calendar") { token in
             let base = "https://www.googleapis.com/calendar/v3/calendars/\(Self.cloudPath(calendarID))/events"
             func readEvent() async throws -> [String: Any]? {
                 var request = URLRequest(url: URL(string: base + "/" + Self.cloudPath(eventID))!)
@@ -589,47 +590,24 @@ extension SwiftToolDispatcher {
     private func cloudConnectorRead(
         connector: String,
         statusRead: Bool = false,
-        purpose: String = "read this",
         operation: (String) async throws -> JSONValue
     ) async -> JSONValue {
         guard let auth = Self.loadCloudConnectorAuth(
             connector: connector,
             root: dataRoot
         ) else {
-            // The shared cloud read — Gmail, Calendar, Notion — through their
-            // one owner. `not_connected` is the single most common reason a
-            // perfectly good request cannot start, and it used to end as a
-            // sentence pointing at a settings page. It is now a Connect card
-            // beside the question that needed it.
-            let need = InlineInteractionNeed.envelope(
-                InlineInteractionRegistry.connector(
-                    connector,
-                    why: "Connect \(Self.cloudConnectorDisplayName(connector)) so I can \(purpose).",
-                    dataRoot: dataRoot
-                )
-            )
-            guard statusRead, case .object(var result) = need else { return need }
-            result["connected"] = .bool(false)
-            result["connector"] = .string(connector)
-            result["detail"] = .string("\(Self.cloudConnectorDisplayName(connector)) is not connected.")
+            var result: [String: JSONValue] = [
+                "status": .string(statusRead ? "ok" : "unavailable"),
+                "connected": .bool(false), "connector": .string(connector),
+                "effects": .string("none"),
+                "detail": .string("\(Self.cloudConnectorDisplayName(connector)) is not connected."),
+                "fix": .string("The owner must sign in to \(Self.cloudConnectorDisplayName(connector)) in Settings > Connectors."),
+            ]
+            if !statusRead {
+                result["error"] = .string("not_connected")
+                result["outcome"] = .string("unmet")
+            }
             return .object(result)
-        }
-        // A refresh that cannot be rescued ends as `reauth_required` — the
-        // saved connection is there but no longer works. That is the same
-        // need with different prose: the person reconnects the account, and
-        // the request resumes. Every other failure below (retryable
-        // transport, 429, 5xx, cancellation) is untouched and still a failure.
-        func needingReconnect(_ result: JSONValue) -> JSONValue {
-            guard case .object(let object) = result,
-                  case .string("reauth_required")? = object["error"]
-            else { return result }
-            return InlineInteractionNeed.envelope(
-                InlineInteractionRegistry.connector(
-                    connector,
-                    why: "\(Self.cloudConnectorDisplayName(connector)) needs connecting again before I can \(purpose).",
-                    dataRoot: dataRoot
-                )
-            )
         }
         do {
             return try await operation(auth.accessToken)
@@ -643,24 +621,24 @@ extension SwiftToolDispatcher {
                     rejectedAccessToken: auth.accessToken
                 )
             } catch {
-                return needingReconnect(Self.cloudReadFailure(
+                return Self.cloudReadFailure(
                     error, connector: connector,
                     reauthenticate: (error as? GoogleOAuthCredentials.RefreshError)?.requiresReauthentication == true
-                ))
+                )
             }
             do {
                 try Task.checkCancellation()
                 return try await operation(refreshed)
             } catch {
-                return needingReconnect(Self.cloudReadFailure(
+                return Self.cloudReadFailure(
                     error, connector: connector,
                     reauthenticate: (error as? CloudConnectorHTTPError)?.statusCode == 401
-                ))
+                )
             }
         } catch {
-            // Notion has no refresh: its 401 is a revoked token, so it offers Connect.
-            return needingReconnect(Self.cloudReadFailure(error, connector: connector,
-                reauthenticate: connector == "notion" && (error as? CloudConnectorHTTPError)?.statusCode == 401))
+            // Notion has no refresh: its 401 requires a new sign-in.
+            return Self.cloudReadFailure(error, connector: connector,
+                reauthenticate: connector == "notion" && (error as? CloudConnectorHTTPError)?.statusCode == 401)
         }
     }
 
@@ -683,6 +661,9 @@ extension SwiftToolDispatcher {
             "retryable": .bool(retryable),
             "detail": .string(cloudErrorDetail(error)),
         ]
+        if reauthenticate {
+            output["fix"] = .string("The owner must sign in to \(cloudConnectorDisplayName(connector)) in Settings > Connectors.")
+        }
         if let retryAfter = (error as? CloudConnectorHTTPError)?.retryAfter {
             output["retryAfter"] = .string(retryAfter)
             output["detail"] = .string("Retry-After: \(retryAfter). \(cloudErrorDetail(error))")
@@ -735,6 +716,11 @@ extension SwiftToolDispatcher {
         return object
     }
 
+    /// A saved connection the cloud reads can use (no network check).
+    static func cloudConnectorConnected(_ connector: String, root: URL) -> Bool {
+        loadCloudConnectorAuth(connector: connector, root: root) != nil
+    }
+
     private static func loadCloudConnectorAuth(
         connector: String,
         root: URL
@@ -743,7 +729,7 @@ extension SwiftToolDispatcher {
             .appendingPathComponent("connectors", isDirectory: true)
             .appendingPathComponent(connector, isDirectory: true)
             .appendingPathComponent("auth.json")
-        guard let data = try? Data(contentsOf: path),
+        guard let data = try? ConnectorCredentialFile.read(at: path),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let accessToken = cloudString(object["access_token"]),
               !accessToken.isEmpty else {

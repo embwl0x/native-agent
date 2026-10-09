@@ -7,6 +7,7 @@ import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Skills
+import Senses
 import ToolRegistry
 import TrustCenter
 
@@ -64,6 +65,10 @@ extension AppToolExecutor {
     static func skillUpkeep(root: URL) async {
         await queueSkillLines(((try? await SwiftNativeSkillsClient(root: root).upkeep(missing: { AppActions.action($0) == nil })) ?? [])
                               + ((try? await ToolRegistryActions.upkeep(dataRoot: root)) ?? []).map { ($0, []) }, root: root)
+        if let registry = SensesHub.shared.registry as? any SenseRegistryManaging {
+            do { _ = try await registry.archiveUnused(now: Date()) }
+            catch { FileHandle.standardError.write(Data("Sense upkeep: \(error)\n".utf8)) }
+        }
     }
 
     /// One quiet MY QUEUE line each for what upkeep did to skills and tools,
@@ -96,13 +101,8 @@ extension AppToolExecutor {
         return line.isEmpty ? "" : "line " + line
     }
 
-    /// Allowed though their page word is denied: provider.test only tests a
-    /// connection and changes nothing.
-    static let allowedInSkill: Set<String> = ["provider.test"]
-
     static func isDeniedInSkill(_ id: String) -> Bool {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if allowedInSkill.contains(key) { return false }
         if ToolNameAliases.authoredTool(key) != nil || ToolNameAliases.mcpTool(key) != nil
             || ToolNameAliases.foldedTools.contains(where: { $0.key.hasPrefix("mcp__") && $0.value == key }) { return true }
         if AppActions.action(key)?.read == true { return false }
@@ -140,7 +140,7 @@ extension AppToolExecutor {
     /// words are not its shape).
     static func actionPin(_ id: String) -> String {
         guard let action = AppActions.action(id) else { return "missing" }
-        let shape: JSONValue = .object([
+        var fields: [String: JSONValue] = [
             "id": .string(action.id), "page": .string(action.page), "args": .array(action.args.map(JSONValue.string)),
             "his": .bool(action.isHis), "irreversible": .bool(action.irreversible), "screen": .bool(action.screen),
             "safe": .bool(action.safe), "scriptable": .bool(action.scriptable), "read": .bool(action.read),
@@ -148,8 +148,9 @@ extension AppToolExecutor {
             "tool": .string(action.tool), "input": .object(action.input),
             "rename": .object(action.rename.mapValues(JSONValue.string)),
             "schema": AppActions.foldSchemas[action.tool].flatMap { try? JSONValue.parse($0.parametersJSON) } ?? .null,
-        ])
-        return SHA256.hash(data: (try? shape.serializedData(pretty: false)) ?? Data())
+        ]
+        if !action.readWhen.isEmpty { fields["read_when"] = .object(action.readWhen) }
+        return SHA256.hash(data: (try? JSONValue.object(fields).serializedData(pretty: false)) ?? Data())
             .map { String(format: "%02x", $0) }.joined()
     }
 
@@ -240,7 +241,9 @@ extension AppToolExecutor {
             (nil, Self.doorRefusal(reason, detail + " Nothing ran.", remedy: "none", instruction))
         }
         let entries: [InstalledSkillInventory.Entry]
-        do { entries = try InstalledSkillInventory.entries(dataRoot: root) } catch {
+        do {
+            entries = try InstalledSkillInventory.entries(dataRoot: root)
+        } catch {
             return refuse("skills_unreadable", "The skill registry didn't read (\(error.localizedDescription)).",
                           "app skill.list shows what reads now.")
         }
@@ -379,6 +382,9 @@ extension AppToolExecutor {
         // What the run says about the skill: a fault of its own (two in a row
         // retire it), the world's, or clean, a rung on the trust ladder.
         if !preview {
+            out["script_effects"] = out["effects"]
+            out["bookkeeping"] = .string("Skill lifecycle and upkeep.")
+            if out["effects"] == .string("none") { out["effects"] = .string("unknown") }
             let fault = Self.skillFault(out)
             let hash = SHA256.hash(data: (try? JSONValue.object(input).serializedData(pretty: false)) ?? Data())
                 .map { String(format: "%02x", $0) }.joined()
@@ -386,6 +392,7 @@ extension AppToolExecutor {
                 id: skill.id, runID: runID, digest: skill.digest, admission: skill.admission, fault: fault,
                 clean: fault == nil && out["status"] == .string("ok"), reason: reason.isEmpty ? Self.doorText(out["status"]) : reason,
                 step: Self.stopPlace(out), inputHash: String(hash.prefix(16))) {
+                if out["script_effects"] == .string("none") { out["effects"] = .string("occurred") }
                 out["ladder"] = .object(["clean": .int(Int64(kept.clean)), "of": .int(3)])
                 await Self.queueSkillLines(kept.signals, root: root)
                 if kept.retired {
@@ -562,7 +569,7 @@ extension AppToolExecutor {
 
     /// Whether the real call would file a card for User, read now and changing
     /// nothing: SecurityCenter's own reading of it with Trust's saved level,
-    /// the persona guard, and the peer floor on a turn a peer steered.
+    /// the persona guard, explicit card requests, and the peer floor on a turn a peer steered.
     @MainActor
     func doorWouldCard(_ action: AppAction, call: [String: JSONValue], input: [String: JSONValue], surface: String) async -> Bool {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -578,6 +585,10 @@ extension AppToolExecutor {
             personaSettingWrite: PeerTurnEffectPolicy.isPersonaSettingWrite(tool: tool, input: args),
             resolvedAutonomy: envelope.autonomyLevel,
             hasExplicitAutonomyOverride: envelope.fullMacYoloAuthority == .admitted) { return true }
+        if action.tool == "request_interaction",
+           InlineInteractionNeed.interaction(in: await SwiftToolDispatcher.requestedInteraction(input: call, dataRoot: root)) != nil {
+            return true
+        }
         let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                           peerID: ChatToolSessionContext.envelope?.verifiedUserId)
         guard !(steer.sources + steer.elevated).isEmpty else { return false }
@@ -607,7 +618,8 @@ final class SkillRunVersions: @unchecked Sendable {
 
     /// The write with the run's own version, or why it doesn't run.
     func prepare(_ call: inout [String: JSONValue], id: String) -> JSONValue? {
-        guard let action = AppActions.action(id), !action.read, !action.versionExempt else { return nil }
+        let args: [String: JSONValue] = if case .object(let args)? = call["args"] { args } else { [:] }
+        guard let action = AppActions.action(id), !action.readOnly(args: args), !action.versionExempt else { return nil }
         let given = AppToolExecutor.doorText(call["expected_version"])
         return lock.withLock { () -> JSONValue? in
             if !given.isEmpty {
@@ -684,6 +696,14 @@ enum SkillRunStore {
 
     static func file(_ id: String, root: URL) -> URL {
         SwiftNativeDeskStore.skillRunFile(id, dataRoot: root)
+    }
+
+    static func waitingIDs(root: URL) throws -> [String] {
+        let paths: [URL]
+        do { paths = try FileManager.default.contentsOfDirectory(at: file("", root: root).deletingLastPathComponent(), includingPropertiesForKeys: nil) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return [] }
+        return paths.filter { $0.lastPathComponent.range(of: "^run-[0-9a-f]{8}\\.json$", options: .regularExpression) != nil }
+            .map { $0.deletingPathExtension().lastPathComponent }.sorted()
     }
 
     static func save(_ run: [String: JSONValue], id: String, root: URL) async -> Bool {

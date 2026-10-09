@@ -5,11 +5,26 @@ import PersistenceCore
 extension MacAppleScriptBridge {
     // MARK: MESSAGES
 
-    /// AppleScript owns chat identity/participants. An exact selected chat can
-    /// additionally expose bounded local history when macOS permits that read.
+    /// Conversations from Messages' own database (chat.db, read-only), newest
+    /// first; a chat's guid is the id Messages' AppleScript sends to
+    /// (2026-10-07: all 59 chats, same order and handles). `query` keeps the
+    /// conversations whose people (name, number, email) or messages match.
+    /// An exact selected chat also exposes a bounded local history page.
     public static func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue {
         let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 30)
         let threadID = inputString(input["thread_id"])
+        guard input["unread_only"] == nil || input["unread_only"] == .bool(true) || input["unread_only"] == .bool(false),
+              input["from_me"] == nil || input["from_me"] == .bool(true) || input["from_me"] == .bool(false),
+              input["sort"] == nil || input["sort"] == .string("newest") || input["sort"] == .string("oldest_unread") else {
+            return failedEnvelope(integration: "messages", reason: "invalid_thread_filter")
+        }
+        let unreadOnly = input["unread_only"] == .bool(true)
+        let oldestUnread = input["sort"] == .string("oldest_unread")
+        guard threadID == nil || !(unreadOnly || oldestUnread) else {
+            return failedEnvelope(integration: "messages", reason: "thread_filters_require_listing")
+        }
+        let offset = threadID == nil ? clampedInt(input["offset"], defaultValue: 0, min: 0, max: 100_000) : 0
+        let query = inputString(input["query"]).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
         let before: Int64?
         if let value = input["before_message_id"] {
             guard threadID != nil, case .int(let id) = value, id > 0 else {
@@ -17,125 +32,98 @@ extension MacAppleScriptBridge {
             }
             before = id
         } else { before = nil }
-        let selection = threadID.map { "set chatList to every chat whose id is \"\(escapeForAppleScript($0))\"" }
-            ?? "set chatList to chats"
-        let source = """
-        property readDeadline : missing value
-        on checkReadDeadline()
-            if (current date) > readDeadline then error "Conversation read exceeded its bounded time budget" number -1712
-        end checkReadDeadline
-        on replaced(sourceText, needle, replacementText)
-            set oldDelimiters to AppleScript's text item delimiters
-            set AppleScript's text item delimiters to needle
-            set pieces to text items of sourceText
-            set AppleScript's text item delimiters to replacementText
-            set resultText to pieces as text
-            set AppleScript's text item delimiters to oldDelimiters
-            return resultText
-        end replaced
-        on encoded(value)
-            my checkReadDeadline()
-            set resultText to my replaced(value as text, "%", "%25")
-            set resultText to my replaced(resultText, "|", "%7C")
-            set resultText to my replaced(resultText, ":", "%3A")
-            set resultText to my replaced(resultText, ",", "%2C")
-            set resultText to my replaced(resultText, linefeed, "%0A")
-            return my replaced(resultText, return, "%0D")
-        end encoded
-        set readDeadline to (current date) + 9
-        with timeout of 4 seconds
-        tell application "Messages"
-            \(selection)
-            set output to ((count of chatList) as text) & linefeed
-            set countChat to 0
-            repeat with c in chatList
-                if countChat ≥ \(limit) then exit repeat
-                my checkReadDeadline()
-                set chatID to (id of c) as text
-                set chatName to ""
-                try
-                    set observedName to name of c
-                    if observedName is not missing value then set chatName to observedName as text
-                end try
-                set people to ""
-                repeat with p in participants of c
-                    my checkReadDeadline()
-                    set personHandle to (handle of p) as text
-                    set personName to ""
-                    try
-                        set observedName to name of p
-                        if observedName is not missing value then set personName to observedName as text
-                    end try
-                    set people to people & (my encoded(personHandle)) & ":" & (my encoded(personName)) & ","
-                end repeat
-                set output to output & (my encoded(chatID)) & "|" & (my encoded(chatName)) & "|" & people & linefeed
-                set countChat to countChat + 1
-            end repeat
-            return output
-        end tell
-        end timeout
-        """
-        do {
-            let raw = try await runAppleScript(source)
-            let lines = raw.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-            guard let first = lines.first, let total = Int(first), total >= 0 else {
-                return .object([
-                    "status": .string("failed"), "integration": .string("messages"),
-                    "reason": .string("invalid_thread_count"),
-                    "message": .string("Messages returned an unreadable conversation count. Open Messages, then retry messages_recent_threads."),
-                ])
+        if case .bool(let fromMe)? = input["from_me"] {
+            guard threadID == nil, query == nil, input["unread_only"] == nil, input["sort"] == nil,
+                  input["offset"] == nil else {
+                return .object(["status": .string("failed"), "integration": .string("messages"), "effects": .string("none"),
+                    "message": .string("from_me selects messages across all conversations. Omit thread_id, query, unread_only, sort and offset for this view.")])
             }
-            let threads = parseMessagesMetadata(lines.count > 1 ? String(lines[1]) : "")
-            if threadID != nil && threads.isEmpty {
-                return failedEnvelope(integration: "messages", reason: "thread_not_found")
+            let since: Date?
+            if case .string(let value)? = input["since"] {
+                let local = DateFormatter()
+                local.locale = Locale(identifier: "en_US_POSIX"); local.calendar = Calendar(identifier: .gregorian)
+                local.dateFormat = "yyyy-MM-dd"; local.isLenient = false
+                since = value == "this week" ? Calendar.current.dateInterval(of: .weekOfYear, for: Date())?.start
+                    : value.count == 10 ? local.date(from: value).flatMap { local.string(from: $0) == value ? $0 : nil } : ISO8601DateFormatter().date(from: value)
+            } else { since = nil }
+            guard input["since"] == nil || since.map({ abs($0.timeIntervalSinceReferenceDate * 1_000_000_000) < Double(Int64.max) }) == true else {
+                return .object(["status": .string("failed"), "integration": .string("messages"), "effects": .string("none"),
+                    "message": .string("since must be this week (start of the local calendar week), local YYYY-MM-DD, or ISO-8601 with a time zone within the Messages date range.")])
             }
-            var result: [String: JSONValue] = [
-                "status": .string("completed"), "count": .int(Int64(threads.count)),
-                "total": .int(Int64(total)), "has_more": .bool(total > threads.count),
-                "threads": .array(threads), "ordering": .string("Messages app order; recency is not provided by this interface."),
-                "history_status": .string("select_conversation"),
-                "history_note": .string("Open a conversation to read a bounded page of its local history. List previews are metadata, not an empty transcript."),
-            ]
-            if let threadID {
-                result["thread_id"] = .string(threadID)
-                let historyTask = Task.detached(priority: .utility) {
-                    MacMessagesHistory.read(threadID: threadID, limit: limit, before: before)
-                }
-                let history = await withTaskCancellationHandler {
-                    await historyTask.value
-                } onCancel: {
-                    historyTask.cancel()
-                }
-                try Task.checkCancellation()
-                result.merge(history) { _, new in new }
-            }
-            // People by their Contacts names where known; handles stay the identity.
+            let task = Task.detached(priority: .utility) { MacMessagesHistory.read(limit: limit, fromMe: fromMe, since: since) }
+            var result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+            try Task.checkCancellation()
+            result["status"] = .string(result["history_status"] == .string("available") ? "completed" : "failed")
+            result["integration"] = .string("messages")
+            result["effects"] = .string("none")
             return .object(await MacContactsAdapter.naming(result))
-        } catch let AppleScriptError.permissionDenied(app) {
-            return deniedEnvelope(integration: "messages", app: app)
-        } catch {
-            return failedEnvelope(integration: "messages", error: error)
         }
-    }
-
-    static func parseMessagesMetadata(_ raw: String) -> [JSONValue] {
-        func decoded(_ value: Substring) -> String? {
-            decodeConversationTransport(String(value))
+        guard input["since"] == nil else {
+            return .object(["status": .string("failed"), "integration": .string("messages"), "effects": .string("none"),
+                "message": .string("since requires an explicit from_me true (sent) or false (received).")])
         }
-        return raw.split(separator: "\n").compactMap { line in
-            let fields = line.split(separator: "|", omittingEmptySubsequences: false)
-            guard fields.count == 3, let id = decoded(fields[0]), !id.isEmpty,
-                  let name = decoded(fields[1]) else { return nil }
-            var participants: [JSONValue] = []
-            for record in fields[2].split(separator: ",") {
-                let pair = record.split(separator: ":", omittingEmptySubsequences: false)
-                guard pair.count == 2, let handle = decoded(pair[0]), !handle.isEmpty,
-                      let personName = decoded(pair[1]) else { return nil }
-                participants.append(.object(["handle": .string(handle), "name": .string(personName)]))
+        let words = threadID == nil ? query : nil
+        let listTask = Task.detached(priority: .utility) { MacMessagesHistory.threads(words: words, unreadOnly: unreadOnly, oldestUnread: oldestUnread) }
+        let listing = await withTaskCancellationHandler { await listTask.value } onCancel: { listTask.cancel() }
+        try Task.checkCancellation()
+        guard case .array(let all)? = listing["threads"] else {
+            return .object(["status": .string("failed"), "integration": .string("messages"),
+                "reason": listing["history_reason"] ?? .string("history_read_failed"), "effects": .string("none"),
+                "message": listing["history_note"] ?? .string("Messages' conversations could not be read; refresh to retry.")])
+        }
+        // People by their Contacts names where known (so a name finds them); handles stay the identity.
+        var rows = all
+        if case .array(let named)? = await MacContactsAdapter.naming(["threads": .array(all)])["threads"] { rows = named }
+        func strings(_ row: JSONValue) -> (id: String, texts: [String], snippet: Bool) {
+            guard case .object(let object) = row else { return ("", [], false) }
+            var texts: [String] = []
+            if case .string(let name)? = object["name"] { texts.append(name) }
+            if case .array(let people)? = object["participants"] {
+                for case .object(let person) in people {
+                    for key in ["handle", "name"] { if case .string(let value)? = person[key] { texts.append(value) } }
+                }
             }
-            return .object(["thread_id": .string(id), "handle": .string(id), "name": .string(name),
-                "participants": .array(participants)])
+            let id = if case .string(let value)? = object["thread_id"] { value } else { "" }
+            return (id, texts, object["snippet"] != nil)
         }
+        if let threadID {
+            rows = rows.filter { strings($0).id == threadID }
+            if rows.isEmpty { return failedEnvelope(integration: "messages", reason: "thread_not_found") }
+        } else if let query {
+            let digits = query.filter(\.isNumber)
+            rows = rows.filter { row in
+                let row = strings(row)
+                return row.snippet || row.texts.contains { $0.localizedCaseInsensitiveContains(query)
+                    || (digits.count >= 7 && $0.filter(\.isNumber).contains(digits)) }
+            }
+        }
+        let page = Array(rows.dropFirst(offset).prefix(limit))
+        var result: [String: JSONValue] = [
+            "status": .string("completed"), "count": .int(Int64(page.count)),
+            "total": .int(Int64(rows.count)), "has_more": .bool(offset + page.count < rows.count),
+            "threads": .array(page), "ordering": .string(oldestUnread
+                ? "Oldest unread incoming message first; each thread includes that message's date and preview."
+                : "Newest conversation first, by its last message."),
+            "history_status": .string("select_conversation"),
+            "history_note": .string("Open a conversation to read a bounded page of its local history. List previews are metadata, not an empty transcript."),
+        ]
+        if offset + page.count < rows.count { result["next_offset"] = .int(Int64(offset + page.count)) }
+        // A word search cut short by its budget says so (the room shows `note`).
+        for key in ["partial", "note", "unread_state", "unread_note"] { if let value = listing[key] { result[key] = value } }
+        if let threadID {
+            result["thread_id"] = .string(threadID)
+            let historyTask = Task.detached(priority: .utility) {
+                MacMessagesHistory.read(threadID: threadID, limit: limit, before: before)
+            }
+            let history = await withTaskCancellationHandler {
+                await historyTask.value
+            } onCancel: {
+                historyTask.cancel()
+            }
+            try Task.checkCancellation()
+            result.merge(history) { _, new in new }
+        }
+        return .object(await MacContactsAdapter.naming(result))
     }
 
     /// Send to an explicit recipient, or an exact observed chat after checking
@@ -252,6 +240,20 @@ extension MacAppleScriptBridge {
             if (count of accounts) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
             if (count of folders) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
             set hits to \(selection)
+            -- A deleted note stays readable in Recently Deleted; it is not one of User's notes (10-08).
+            set deletedIDs to {}
+            repeat with f in folders
+                try
+                    if (name of f) is "Recently Deleted" then set deletedIDs to deletedIDs & (id of notes of f)
+                end try
+            end repeat
+            if (count of deletedIDs) > 0 then
+                set keptHits to {}
+                repeat with h in hits
+                    if deletedIDs does not contain ((id of h) as string) then set end of keptHits to contents of h
+                end repeat
+                set hits to keptHits
+            end if
             set totalHits to count of hits
             set previewChars to 200
             if \(whole ? "true" : "false") or totalHits is 1 then set previewChars to 4000
@@ -265,7 +267,10 @@ extension MacAppleScriptBridge {
                 set nid to (id of n) as string
                 set nm to (name of n) as string
                 set md to (modification date of n) as string
-                set fd to (name of container of n) as string
+                set fd to ""
+                try
+                    set fd to (name of container of n) as string
+                end try
                 set fullBody to current application's NSString's stringWithString:((plaintext of n) as string)
                 set bodyTotal to (fullBody's |length|()) as integer
                 if \(offset) > bodyTotal then return "__NATIVEAGENT_NOTES_INVALID_OFFSET__"
@@ -294,7 +299,14 @@ extension MacAppleScriptBridge {
             }
             let (total, notes) = try parseNoteRecords(raw)
             if whole && notes.isEmpty { return failedEnvelope(integration: "notes", reason: "no_matching_note") }
-            var result: [String: JSONValue] = ["status": .string("completed"), "count": .int(Int64(notes.count)), "total": .int(total), "notes": .array(notes)]
+            var result: [String: JSONValue] = [
+                "status": .string("completed"), "source": .string("applescript"),
+                "access": .object([
+                    "automation": .string("confirmed"), "operation": .string("read"),
+                    "note_records": .int(Int64(notes.count)), "write": .string("not_checked"),
+                ]),
+                "count": .int(Int64(notes.count)), "total": .int(total), "notes": .array(notes),
+            ]
             if total > Int64(notes.count) { result["message"] = .string("Showing \(notes.count) of \(total); narrow with query, or read one with title.") }
             return .object(result)
         } catch let AppleScriptError.permissionDenied(app) {
@@ -361,7 +373,9 @@ extension MacAppleScriptBridge {
                 return .object([
                     "status": .string("failed"),
                     "integration": .string("notes"),
+                    "effects": .string("none"),
                     "reason": .string("folder_not_found"),
+                    "detail": .string("No Notes folder is named that, so nothing changed; use one of available_folders."),
                     "requested_folder": .string(folder),
                     "available_folders": .array(names.map { .string($0) }),
                 ])
@@ -378,11 +392,8 @@ extension MacAppleScriptBridge {
         }
     }
 
-    /// Update an existing Apple Note. Required: "title" (current note name to
-    /// find). At least one of "body" (replace), "append" (concat to existing),
-    /// or "new_title" (rename) must be provided. body + append are mutually
-    /// exclusive. Returns: {status, action: "updated", title}.
-    public static func notesUpdate(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Select one exact note for an update or reversible deletion.
+    public static func notesModify(input: [String: JSONValue], deleting: Bool) async throws -> JSONValue {
         let noteID = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let title = inputString(input["title"]) ?? ""
         guard !noteID.isEmpty || !title.isEmpty else {
@@ -391,11 +402,7 @@ extension MacAppleScriptBridge {
         let body = inputString(input["body"])
         let append = inputString(input["append"])
         let newTitle = inputString(input["new_title"])
-        // gpt-5.5 review NEEDS_FIX: schema declared rename-only valid; impl
-        // was rejecting calls without body/append. Now: at least ONE of the
-        // three mutations must be provided (body, append, OR new_title).
-        // body + append remain mutually exclusive (ambiguous semantic).
-        if body == nil && append == nil && (newTitle == nil || newTitle?.isEmpty == true) {
+        if !deleting && body == nil && append == nil && (newTitle == nil || newTitle?.isEmpty == true) {
             return failedEnvelope(integration: "notes", reason: "missing_body_append_or_new_title")
         }
         if body != nil && append != nil {
@@ -405,11 +412,10 @@ extension MacAppleScriptBridge {
         // Build the body-mutation statement (empty when neither body nor
         // append was passed — rename-only path).
         let bodyStmt: String
-        if let body = body {
-            if body.isEmpty {
-                // Notes derives its name from the first HTML line. Clearing
-                // content must keep that line, read from the exact note by ID.
-                bodyStmt = """
+        // Notes derives its name from the first HTML line, so a body write
+        // keeps that line (read from the exact note by ID) unless the new body
+        // already starts with the note's name.
+        let titleHTMLStmt = """
                 set titleHTML to ""
                 repeat with titleCharacter in characters of ((name of targetNote) as text)
                     set titleText to titleCharacter as text
@@ -422,15 +428,26 @@ extension MacAppleScriptBridge {
                     end if
                     set titleHTML to titleHTML & titleText
                 end repeat
-                set body of targetNote to "<div>" & titleHTML & "</div>"
                 """
+        if let body = body {
+            if body.isEmpty {
+                bodyStmt = titleHTMLStmt + "\nset body of targetNote to \"<div>\" & titleHTML & \"</div>\""
             } else {
+                let firstLine = escapeForAppleScript(String(body.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""))
                 let bodyAS = escapeForAppleScript(notesHTML(body))
-                bodyStmt = "set body of targetNote to \"\(bodyAS)\""
+                bodyStmt = titleHTMLStmt + """
+
+                if "\(firstLine)" is ((name of targetNote) as text) then
+                    set body of targetNote to "<div>\(bodyAS)</div>"
+                else
+                    set body of targetNote to "<div>" & titleHTML & "</div><div>\(bodyAS)</div>"
+                end if
+                """
             }
         } else if let append = append {
-            let appendAS = escapeForAppleScript(notesHTML(append))
-            bodyStmt = "set body of targetNote to ((body of targetNote) as string) & \"<br>\(appendAS)\""
+            // One new line after the existing body, however many newlines the caller added.
+            let appendAS = escapeForAppleScript(notesHTML(append.trimmingCharacters(in: .newlines)))
+            bodyStmt = "set body of targetNote to ((body of targetNote) as string) & \"<div>\(appendAS)</div>\""
         } else {
             // Rename-only path — no body mutation.
             bodyStmt = ""
@@ -449,6 +466,11 @@ extension MacAppleScriptBridge {
             if (count of hits) is 0 then return "0"
             if (count of hits) > 1 then return "-3|" & ((count of hits) as text)
             set targetNote to first item of hits
+            if \(deleting ? "true" : "false") then
+                set finalName to (name of targetNote) as text
+                delete targetNote
+                return "1|" & finalName
+            end if
             set finalName to ""
             \(bodyStmt)
             \(renameStmt)
@@ -471,7 +493,8 @@ extension MacAppleScriptBridge {
             }
             return .object([
                 "status": .string("completed"),
-                "action": .string("updated"),
+                "action": .string(deleting ? "moved_to_recently_deleted" : "updated"),
+                "recovery": deleting ? .string("Restore the note from Recently Deleted in Notes.") : .null,
                 "title": .string(parts.count > 1 && !parts[1].isEmpty ? parts[1] : (newTitle?.isEmpty == false ? newTitle! : title)),
             ])
         } catch let AppleScriptError.permissionDenied(app) {

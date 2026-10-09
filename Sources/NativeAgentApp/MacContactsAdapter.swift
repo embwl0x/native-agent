@@ -113,7 +113,12 @@ public enum MacContactsAdapter {
             ]
             if matches.isEmpty {
                 result["message"] = .string(trimmed.isEmpty ? "Nothing to search for: give part of a name, a phone number, or an email in query."
-                    : "No contact matches \"\(trimmed)\"; try part of the name, a phone number, or an email.")
+                    : "No contact matches \"\(trimmed)\"; try part of the name, a phone number, or an email. Someone who emails you often has their number and address in their mail signature.")
+                // A person missing from Contacts is often in Mail (10-08).
+                if !trimmed.isEmpty, !looksLikePhone(trimmed) {
+                    result["next_call"] = .object(["tool": .string("app"), "input": .object(["action": .string("mail.search"),
+                        "args": .object(["from": .string(trimmed), "limit": .int(3), "sort": .string("newest")])])])
+                }
             } else if matches.count > bounded.count {
                 result["message"] = .string("Showing \(bounded.count) of \(matches.count); narrow the query.")
             }
@@ -329,32 +334,33 @@ public enum MacContactsAdapter {
     /// A Messages read with people named: participants' `name` becomes the
     /// card's name, and each message gets `sender_name`. Handles are untouched.
     static func naming(_ result: [String: JSONValue]) async -> [String: JSONValue] {
-        guard await MacIntegrationPermissionStore.shared.allows(MacIntegrationID.contacts, mode: .read) else {
-            return result
-        }
-        let names = contactNames()
-        guard !names.isEmpty else { return result }
+        let names = await MacIntegrationPermissionStore.shared.allows(MacIntegrationID.contacts, mode: .read) ? contactNames() : [:]
+        // A number with no card reads as a person would write it, so a reply
+        // copies it instead of re-typing raw digits (10-08: a model swapped
+        // digits rewriting +1248… by hand).
         func name(_ handle: JSONValue?) -> String? {
             guard case .string(let raw)? = handle else { return nil }
             let key = handleKey(raw)
-            return key.isEmpty ? nil : names[key]
+            if key.isEmpty { return nil }
+            if let found = names[key] { return found }
+            let digits = raw.filter(\.isNumber)
+            guard !raw.contains("@"), digits.count == 10 || (digits.count == 11 && digits.hasPrefix("1")) else { return nil }
+            let d = Array(digits.suffix(10))
+            return "(\(String(d[0..<3]))) \(String(d[3..<6]))-\(String(d[6..<10]))"
         }
         var out = result
-        if case .array(let threads)? = result["threads"] {
-            out["threads"] = .array(threads.map { thread in
-                guard case .object(var row) = thread, case .array(let people)? = row["participants"] else { return thread }
-                row["participants"] = .array(people.map { person in
-                    guard case .object(var p) = person, let found = name(p["handle"]) else { return person }
-                    p["name"] = .string(found)
-                    return .object(p)
-                })
-                return .object(row)
-            })
-        }
-        if case .array(let messages)? = result["messages"] {
-            out["messages"] = .array(messages.map { message in
-                guard case .object(var row) = message, let found = name(row["sender"]) else { return message }
-                row["sender_name"] = .string(found)
+        for key in ["threads", "messages"] {
+            guard case .array(let rows)? = result[key] else { continue }
+            out[key] = .array(rows.map { value in
+                guard case .object(var row) = value else { return value }
+                if case .array(let people)? = row["participants"] {
+                    row["participants"] = .array(people.map { person in
+                        guard case .object(var p) = person, let found = name(p["handle"]) else { return person }
+                        p["name"] = .string(found)
+                        return .object(p)
+                    })
+                }
+                if let found = name(row["sender"]) { row["sender_name"] = .string(found) }
                 return .object(row)
             })
         }

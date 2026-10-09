@@ -37,14 +37,11 @@ public enum ContextCorrectionScope {
         }
     }
 
-    /// Which entity kind scopes THIS atom. Atom kind decides first (corrections
-    /// and relations, unchanged); otherwise an atom is studio-scoped exactly
-    /// when it carries studio endpoints of its own. Keying the studio scope on
-    /// the atom's OWN entities rather than on its kind is what keeps every
-    /// pre-existing atom of the same kind global: it supplies no `studio_work`
-    /// entity, so nothing about it changes.
+    /// Kind-scoped atoms, explicitly scoped memories, then studio endpoints.
+    /// Scope comes from the atom's own metadata, never ambient attention.
     static func scopingEntityKind(for atom: ContextAtomDraft) -> String? {
         if let byKind = scopingEntityKind(for: atom.kind) { return byKind }
+        if atom.entities.contains(where: { $0.kind == entityKind }) { return entityKind }
         return atom.entities.contains { $0.kind == studioEntityKind } ? studioEntityKind : nil
     }
 
@@ -117,33 +114,18 @@ public enum ContextCorrectionScope {
     }
 
     public static func applies(_ atom: ContextAtomDraft, message: String, recentTurns: [String]) -> Bool {
-        // Comb 3 lane 2 item 1: on 2026-09-11 at 22:13 User asked what she had
-        // been thinking and feeling and whether she had new artistic tastes, and
-        // four of the eighteen selected atoms were resident engineering work
-        // ("emit turn-dead marker on retry exhaustion", "Synthesize recommended
-        // generative UI plan", …). Backlog is not an answer to that question.
-        //
-        // Narrow on purpose, and fail-open: it needs a turn the personal
-        // predicate admits, it only touches atoms that carry an engineering
-        // entity OF THEIR OWN, and NAMING A SPECIFIC ITEM still brings it in —
-        // by its own title, never by the project label every item shares.
-        // Interpersonal material — corrections about User, how to talk to him,
-        // what he has asked for — carries none of these entities and is
-        // untouched.
+        // Backlog needs current-turn evidence on every turn, not just questions
+        // about her inner life. Attention terms and a shared project name do
+        // not make a particular engineering item relevant to casual chat.
         let isEngineering = atom.entities.contains { engineeringEntityKinds.contains($0.kind) }
-        if isEngineering, isPersonalTask(message) {
+        if isEngineering {
             let titles = atom.entities
                 .filter { engineeringTitleEntityKinds.contains($0.kind) }
-                .map(\.label)
+                .flatMap { [$0.label, $0.id] }
             return mentions(titles, message: message, recentTurns: recentTurns)
         }
-        // The two fail-open exits below now ask one more question of the atom's
-        // OWN metadata: an atom that supplies no scoping entity still stays
-        // global UNLESS its topic tags or memory-record label name the build, in
-        // which case a personal turn must name one of them — the same rule the
-        // resident projection already lives under, applied at the memory
-        // admission boundary. An atom carrying no engineering marker is
-        // untouched, so nothing that existed before this changes behaviour.
+        // An unscoped atom stays global unless its own metadata identifies
+        // engineering work. That work needs evidence from this turn too.
         guard let scopingKind = scopingEntityKind(for: atom) else {
             return engineeringTopicsApply(atom, message: message, recentTurns: recentTurns)
         }
@@ -202,15 +184,17 @@ public enum ContextCorrectionScope {
     }
 
     /// The fail-open exit, one question later: global unless this atom's own
-    /// topic tags or memory-record label name the build AND the turn is personal,
-    /// in which case the turn has to name one of those topics.
+    /// topic tags or memory-record label name the build, in which case the
+    /// current turn has to name its subject. A broad label counts only when
+    /// the memory supplies no more specific subject.
     private static func engineeringTopicsApply(
         _ atom: ContextAtomDraft, message: String, recentTurns: [String]
     ) -> Bool {
-        guard isPersonalTask(message),
-              let labels = engineeringTopicLabels(for: atom)
-        else { return true }
-        return mentions(labels, message: message, recentTurns: recentTurns)
+        guard let labels = engineeringTopicLabels(for: atom) else { return true }
+        let subjects = labels.filter {
+            !["project", "nativeagent", "codex", "worker", "workers"].contains(words($0).joined(separator: " "))
+        }
+        return mentions(subjects.isEmpty ? labels : subjects, message: message, recentTurns: recentTurns)
     }
 
     /// Does the turn NAME one of these labels, as a contiguous word run?

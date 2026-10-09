@@ -23,11 +23,11 @@ public actor DesktopAgentConversationRoute {
         try await GrokRoutineAccessibility.send(text, bot: bot)
     }
 
-    public func importGrokRoutine(peer: String, dataRoot: URL) async throws {
+    public func importGrokRoutine(peer: String, dataRoot: URL, waitForCreation: Bool) async throws {
         guard !busy else { throw GrokRoutineAccessibility.Blocker.submission }
         busy = true
         defer { busy = false }
-        try await GrokRoutineAccessibility.importRoutine(peer: peer, dataRoot: dataRoot)
+        try await GrokRoutineAccessibility.importRoutine(peer: peer, dataRoot: dataRoot, waitForCreation: waitForCreation)
     }
 
     /// Appended to every outgoing desktop message so the receiving agent knows
@@ -65,7 +65,7 @@ public actor DesktopAgentConversationRoute {
         if bundle == GrokBotRoute.bundleID {
             do {
                 let sentAt = Date()
-                try await GrokRoutineAccessibility.send(message, bot: label)
+                try await GrokRoutineAccessibility.send(message, bot: label, watchReply: true)
                 // The reply watch runs after this returns, outside `busy`
                 // (GrokDesktopReply.follow), so other desktop sends aren't held.
                 guard case .object(var fields) = Self.delivered(agent) else { return Self.delivered(agent) }
@@ -74,11 +74,9 @@ public actor DesktopAgentConversationRoute {
                     fields.removeValue(forKey: "reply_with")
                     return .object(fields)
                 }
-                fields["_grok_watch"] = .object(["chat": .string(label), "message": .string(message), "baseline": .int(Int64(sent.baseline)),
+                fields["_grok_watch"] = .object(["chat": .string(label),
                     "peer": .string(agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent),
-                    "transcript": .array([sent.transcript.minX, sent.transcript.minY, sent.transcript.width, sent.transcript.height].map { .double($0) }),
-                    "window": .array([sent.window.width, sent.window.height].map { .double($0) }),
-                    "window_id": .int(Int64(sent.windowID)),
+                    "watch_id": sent.watchID.map(JSONValue.string) ?? .null,
                     "sent_at": .double(sentAt.timeIntervalSince1970)])
                 return .object(fields)
             } catch {

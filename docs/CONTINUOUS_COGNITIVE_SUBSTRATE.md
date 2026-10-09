@@ -162,8 +162,17 @@ adds IDs for quoted source excerpts and records external material provenance.
 `NativeCognitionRuntime+Reflection.swift` executes through checked provider
 routing and records success, failure or cancellation. The reflection surface
 is `cognition_reflection`; no model is pinned by this blueprint.
-Reflection may propose a standing view. Its receipt's yield score measures
-proposal production relative to estimated cost, not improved judgment.
+Reflection may propose a standing view. With `personality.views_experiment`
+enabled, a claim with reasons and a condition for changing it can become an
+opinion after two independent occurrences on different days with nonoverlapping
+sources; untrusted-peer-fed reflections do not count. Reconsideration can
+revise it only with evidence or an argument. Their opt-in hour can separately
+record and revisit open interests. Opinions and interests have caps of eight
+and five and enter held-tier capsule presentation only under the experiment
+and relevance gates; the bridge still lists only active, held and proposed
+views. See [SUBCONSCIOUS.md](SUBCONSCIOUS.md#opinions-and-interests).
+The reflection receipt's yield score measures proposal production relative to
+estimated cost, not improved judgment or a validated personality benefit.
 
 ## 7. Inspection and authority
 

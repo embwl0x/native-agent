@@ -32,12 +32,13 @@ extension AgentConversationRecord {
 /// Where a contact's current send stands, from evidence the lanes already
 /// keep: sending → delivered → read → answered, or failed. `waiting` is a
 /// send the lane is still carrying, or one handed over whose asked-for
-/// answer is still owed. Nothing here times out.
+/// answer is still owed, until its recorded reply deadline.
 public enum AgentConversationDelivery: String, Sendable {
     case sending, waiting, delivered, read, answered, failed, notDelivered
 
     /// `read`: the recipient's inbox marked this send read.
     public static func of(_ row: AgentConversationRecord, read: Bool) -> Self {
+        if row.phase != "sending", case .object(let receipt)? = row.receipt, receipt["reply_state"] == .string("no_reply_expired") { return .failed }
         if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) { return .notDelivered }
         if row.phase == "ready", row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return .answered }
         switch row.phase {
@@ -80,6 +81,8 @@ public struct AgentConversationStore: Sendable {
 
     public struct Failure: Error, LocalizedError, Sendable {
         public let message: String
+        /// Refused before anything was sent, unless rethrown after a send.
+        public var effects: ToolFailureError.Effects = .none
         package init(message: String) { self.message = message }
         public var errorDescription: String? { message }
     }
@@ -259,18 +262,34 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// A late answer to an earlier exchange (its thread has moved on since)
-    /// lands on that exchange, never on the current one.
-    public func settleExchange(id: String, exchange: String, reply: String) throws {
+    /// The current exchange settles with its receipt; a late answer lands
+    /// on its earlier exchange, never on the current one.
+    public func settleExchange(id: String, exchange: String, reply: String?, receipt: JSONValue? = nil,
+                               firstActivity: Date? = nil) throws {
         try locked {
             var rows = try load()
             guard let i = rows.firstIndex(where: { $0.id == id }), var history = rows[i].exchanges,
-                  let j = history.firstIndex(where: { $0.id == exchange }), history[j].reply == nil else { return }
-            let text = AgentConversationExchange.clipped(reply, limit: AgentConversationExchange.textLimit)
-            history[j].reply = text.text; history[j].replyTruncated = text.truncated
-            history[j].status = "answered"; history[j].phase = "ready"; history[j].settledAt = Date()
+                  let j = history.firstIndex(where: { $0.id == exchange }) else {
+                throw Failure(message: "This conversation exchange is no longer retained; its reply was not saved.")
+            }
             let before = rows[i]
-            rows[i].exchanges = try AgentConversationExchange.bounded(history)
+            if history[j].firstActivityAt == nil { history[j].firstActivityAt = firstActivity }
+            if rows[i].operationID == exchange, let receipt {
+                rows[i].receipt = Self.cacheReceipt(receipt)
+                rows[i].phase = reply == nil ? "attention" : "ready"
+                rows[i].exchanges = history
+                try Self.absorbExchange(into: &rows[i])
+                rows[i].updatedAt = Date()
+            } else {
+                guard let reply else {
+                    throw Failure(message: "This conversation has moved on; the older result was not applied.")
+                }
+                if history[j].reply != nil { return }
+                let text = AgentConversationExchange.clipped(reply, limit: AgentConversationExchange.textLimit)
+                history[j].reply = text.text; history[j].replyTruncated = text.truncated
+                history[j].status = "answered"; history[j].phase = "ready"; history[j].settledAt = Date()
+                rows[i].exchanges = try AgentConversationExchange.bounded(history)
+            }
             try save(rows)
             noteReplies(was: before, now: rows[i])
         }
@@ -585,12 +604,28 @@ public struct AgentConversationStore: Sendable {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         let data = try Data(contentsOf: fileURL)
         guard data.count <= 50 * 1024 * 1024 else { throw Failure(message: "Saved conversations are too large to read safely.") }
-        let rows = try JSONDecoder().decode([AgentConversationRecord].self, from: data)
+        var rows = try JSONDecoder().decode([AgentConversationRecord].self, from: data)
         guard rows.count <= 512, Set(rows.map(\.id)).count == rows.count,
               rows.allSatisfy({ UUID(uuidString: $0.id) != nil && UUID(uuidString: $0.operationID) != nil && !$0.scopeSessionID.isEmpty }) else {
             throw Failure(message: "Saved conversations are unavailable; existing records were preserved.")
         }
         for row in rows { try AgentConversationExchange.validate(row.exchanges) }
+        let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        let requests = GrokRequestStore(dataRoot: root)
+        for i in rows.indices where ["sending", "waiting", "attention"].contains(rows[i].phase) {
+            // A send retains the previous receipt until dispatch settles.
+            var receipt = rows[i].phase == "sending" ? .object([:]) : rows[i].receipt ?? .object([:])
+            if rows[i].agent.hasPrefix("peer:"), case .object(let fields) = receipt, fields["reply_deadline"] == nil,
+               case .string(let id) = rows[i].readInput?["message_id"] ?? .string(rows[i].operationID),
+               FileManager.default.fileExists(atPath: requests.root.appendingPathComponent(id + ".json").path) {
+                receipt = GrokBotRoute.projection(try requests.read(id, peer: String(rows[i].agent.dropFirst(5))))
+            }
+            receipt = AgentConversationView.expiringReply(receipt)
+            if case .object(let fields) = receipt, fields["reply_state"] == .string("no_reply_expired") {
+                AgentConversationSession.absorb(receipt, into: &rows[i])
+                try Self.absorbExchange(into: &rows[i])
+            }
+        }
         return rows
     }
     private func save(_ rows: [AgentConversationRecord]) throws {
@@ -600,7 +635,11 @@ public struct AgentConversationStore: Sendable {
             throw Failure(message: "Saved conversations exceed their storage limit; existing records were preserved.")
         }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
-        if rows.contains(where: { $0.phase == "attention" }) {
+        if rows.contains(where: { row in
+            if row.phase == "attention" { return true }
+            if case .object(let receipt)? = row.receipt { return receipt["reply_state"] == .string("no_reply_expired") }
+            return false
+        }) {
             let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
             Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
         }
@@ -615,24 +654,35 @@ extension AgentConversationStore {
     /// record says only where a send of hers still stands. Nil when nothing
     /// passed. Keyed by peer id; `count` is the lines its session keeps.
     public static func lastExchanges(peers: [AgentPeerContact], records: [AgentConversationRecord],
-                                     dataRoot: URL) -> [String: (summary: String, count: Int)] {
-        var found: [String: (summary: String, count: Int)] = [:]
+                                     dataRoot: URL) -> [String: (summary: String, count: Int, replyState: JSONValue?)] {
+        var found: [String: (summary: String, count: Int, replyState: JSONValue?)] = [:]
         for peer in peers {
-            let lines = ContactThread.lines(dataRoot: dataRoot, owner: peer.id)
+            let lines: [ContactThread.Line]
+            do { lines = try ContactThread.lines(dataRoot: dataRoot, owner: peer.id) }
+            catch {
+                found[peer.id] = ("History unavailable: \(error.localizedDescription)", 0, nil)
+                continue
+            }
             guard let last = lines.last else { continue }
             let row = records.filter { $0.agent == "peer:" + peer.id }.max { $0.updatedAt < $1.updatedAt }
+            let receipt = ChatGPTDotIPCTransport.owns(peer)
+                ? AgentConversationView.dotReply(.object([:]), sentAt: last.mine ? last.at : nil) : row?.phase == "sending" ? nil : row?.receipt
             // Its exchanges are the times it spoke, not every line both sides wrote.
-            found[peer.id] = (summary(last, answering: lines.dropLast().contains(where: \.mine), row: row),
-                              lines.filter { !$0.mine }.count)
+            found[peer.id] = (summary(last, answering: lines.dropLast().contains(where: \.mine), row: row, receipt: receipt),
+                              lines.filter { !$0.mine }.count,
+                              last.mine ? receipt.flatMap { if case .object(let fields) = $0 { fields["reply_state"] } else { nil } } : nil)
         }
         return found
     }
 
-    private static func summary(_ last: ContactThread.Line, answering: Bool, row: AgentConversationRecord?) -> String {
+    private static func summary(_ last: ContactThread.Line, answering: Bool, row: AgentConversationRecord?, receipt: JSONValue?) -> String {
         let clock = DateFormatter()
         clock.dateFormat = Calendar.current.isDateInToday(last.at) ? "HH:mm" : "MMM d HH:mm"
         let when = clock.string(from: last.at)
         if !last.mine { return answering ? "last answered \(when)" : "last heard from them \(when)" }
+        if case .object(let fields)? = receipt, fields["reply_state"] == .string("no_reply_expired"),
+           case .string(let detail)? = fields["detail"] { return "last message \(when), no reply — " + detail }
+        if case .object(let fields)? = receipt, fields["status"] == .string("waiting") { return "last message \(when), reply still coming" }
         guard let row, let current = row.exchanges?.last(where: { $0.id == row.operationID }) else {
             return "last message \(when), no reply came"
         }

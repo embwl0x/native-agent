@@ -647,7 +647,7 @@ final class InlineInteractionChatBinding {
                     onlyAddingAxes: true
                 )
             } catch {
-                NSLog("[interaction] grant failed for \(capability): \(error)")
+                nativeLog("[interaction] grant failed for \(capability): \(error)")
             }
         }
         if !categories.isEmpty {
@@ -852,7 +852,7 @@ final class InlineInteractionChatBinding {
                 dataRoot: dataRoot
             )
         } catch {
-            NSLog("[interaction] complete failed for \(id): \(error)")
+            nativeLog("[interaction] complete failed for \(id): \(error)")
         }
         await refreshCurrent()
     }

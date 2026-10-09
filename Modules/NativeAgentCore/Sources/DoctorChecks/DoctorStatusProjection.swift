@@ -54,7 +54,7 @@ public enum DoctorStatusProjection {
             )
             try await SwiftNativePersistenceCore().writeJSON(payload, to: path)
         } catch {
-            NSLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
+            nativeLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
         }
     }
 

@@ -402,7 +402,7 @@ struct TrustGuardrailSummaryPanel: View {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                     Text("Live from your settings.")
                         .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     ForEach(rows) { row in
                         TrustGuardrailRowView(row: row)

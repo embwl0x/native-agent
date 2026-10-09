@@ -89,7 +89,6 @@ final class NativeAgentAppCoordinator {
 
     struct ProcessBootstrapDependencies {
         var restoreDetachedChats: () -> Void
-        var startPermissionSync: () -> Void
         var wireGlobalHotkey: () -> Void
         var warmEmbeddings: () -> Void
     }
@@ -205,7 +204,6 @@ final class NativeAgentAppCoordinator {
         didBootstrapProcessServices = true
         self.processDependencies = nil
         processDependencies.restoreDetachedChats()
-        processDependencies.startPermissionSync()
         processDependencies.wireGlobalHotkey()
         processDependencies.warmEmbeddings()
     }

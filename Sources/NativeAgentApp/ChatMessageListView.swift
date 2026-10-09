@@ -61,6 +61,8 @@ struct MessageGroup: Identifiable {
     var id: String
     var messages: [ChatMessage]
     var isToolGroup: Bool
+    /// Set when this row follows more than an hour of quiet: when it began.
+    var gapAbove: Date? = nil
 }
 
 enum ChatTranscriptWindow {
@@ -168,19 +170,8 @@ enum InlineCardMount {
 }
 
 enum ChatTranscriptPresentation {
-    static func hasVisibleText(_ text: String) -> Bool {
+    static func hasVisibleText(_ text: some StringProtocol) -> Bool {
         text.contains { !$0.isWhitespace }
-    }
-
-    static func liveToolGroupID(
-        groups: [MessageGroup],
-        isStreaming: Bool,
-        lastMessage: ChatMessage?
-    ) -> String? {
-        let assistantStarted = lastMessage?.role == "assistant"
-            && lastMessage.map { hasVisibleText($0.content) } == true
-        guard isStreaming, !assistantStarted else { return nil }
-        return groups.last(where: { $0.isToolGroup })?.id
     }
 }
 
@@ -481,7 +472,42 @@ enum MessageGrouper {
             }
         }
         flushTools()
+        // A row after an hour of quiet carries its time, so a morning message
+        // never reads as the end of last night's reply.
+        var previous: Date?
+        for index in result.indices {
+            let group = result[index]
+            let first = group.messages.first.flatMap { UserDisplayFormatters.parseISOTimestamp($0.createdAt) }
+            if let first, let previous, first.timeIntervalSince(previous) > quietGap {
+                result[index].gapAbove = first
+            }
+            previous = group.messages.last.flatMap { UserDisplayFormatters.parseISOTimestamp($0.createdAt) } ?? previous
+        }
         return result
+    }
+
+    static let quietGap: TimeInterval = 60 * 60
+}
+
+/// The one quiet line above a row that follows an hour of silence.
+private struct ChatQuietGapLine: View {
+    let date: Date
+
+    var body: some View {
+        Text(label)
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.top, NativeAgentSpacing.sm)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private var label: String {
+        let calendar = Calendar.current
+        let time = date.formatted(date: .omitted, time: .shortened)
+        if calendar.isDateInToday(date) { return "Today \(time)" }
+        if calendar.isDateInYesterday(date) { return "Yesterday \(time)" }
+        return date.formatted(date: .abbreviated, time: .shortened)
     }
 }
 
@@ -493,10 +519,8 @@ struct ChatMessageListView: View {
     // bubble takes the plain-Text branch (isLastAssistant) instead of pushing
     // transient growing prefixes through ChatMarkdownCache.
     var sessionId: String = ""
-    /// True while THIS session is streaming a turn. Sweep R4 C16: detached
-    /// panels never passed it, so `ToolCallGroup(isLive:)` defaulted to false
-    /// and a tool call that was still running rendered as a finished, static
-    /// "N tools used" summary. Callers that genuinely have no live state (the
+    /// True while THIS session is streaming a turn: the last assistant row is
+    /// then the live tail. Callers that genuinely have no live state (the
     /// default) keep the old behaviour.
     var isStreaming: Bool = false
     /// The current transcript-search result. Highlighting is projection-only;
@@ -506,6 +530,9 @@ struct ChatMessageListView: View {
     /// is motion for nothing, and the "Latest" pill leads the eye instead.
     var animatesArrival: Bool = true
     var latestRequest: Int = 0
+    /// Told whether a page anchor pins the list to an earlier page, so the
+    /// chat's re-arm knows its bottom is not the live one.
+    var onPagedBackChange: ((Bool) -> Void)? = nil
     /// 2026-09-06: the grouper cache keys on the transcript's mutation
     /// version, so the list needs the model, not just the rows it was handed.
     @Environment(AppModel.self) private var appModel
@@ -541,19 +568,21 @@ struct ChatMessageListView: View {
     /// all sit on the row the list lays out and scrolls to.
     @ViewBuilder
     private func bubbleRow(
-        _ msg: ChatMessage, lastAssistantId: String?, liveTailId: String? = nil
+        _ msg: ChatMessage, lastAssistantId: String?, tailId: String? = nil, liveTailId: String? = nil
     ) -> some View {
         Group {
-            if msg.id == liveTailId {
+            if msg.id == tailId {
                 // 2026-09-14: the ONE row a streamed chunk may re-render. It
                 // observes its own `ChatStreamingTailBox`; the parent list
                 // observes structure only, so a token lays out this bubble
                 // instead of all 300 rows. Everything below stays on the row,
                 // so the scroll target, the highlight and the entrance are
-                // exactly where they were.
+                // exactly where they were. Fluid glass A1: the tail keeps this
+                // view after the stream ends, so its settle can crossfade.
                 StreamingTailBubble(
                     message: msg,
-                    isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId
+                    isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId,
+                    isLive: msg.id == liveTailId
                 )
             } else {
                 MessageBubble(
@@ -597,22 +626,12 @@ struct ChatMessageListView: View {
         let range = windowRange(for: allGroups)
         let hidden = range.lowerBound
         let groups = Array(allGroups[range])
-        // Same rule as the main window (ChatView): the live flip-box is the LAST
-        // tool group while the session is still working and the reply text has
-        // not started arriving yet.
-        let liveToolGroupId = ChatTranscriptPresentation.liveToolGroupID(
-            groups: groups,
-            isStreaming: isStreaming,
-            lastMessage: messages.last
-        )
         // Prose first, card under it as the handle (Agent, 2026-09-13).
         // Computed once per transcript structure, never per streamed chunk.
         // The live tail: the final row, while this session is streaming into
         // it. Only that row takes the leaf-observed path.
-        let liveTailId: String? = {
-            guard isStreaming, let last = messages.last, last.role == "assistant" else { return nil }
-            return last.id
-        }()
+        let tailId = messages.last.flatMap { $0.role == "assistant" ? $0.id : nil }
+        let liveTailId = isStreaming ? tailId : nil
         let cardMount = InlineCardMount.map(
             groups: groups,
             sessionId: sessionId,
@@ -627,6 +646,9 @@ struct ChatMessageListView: View {
             }
         }
         ForEach(groups) { group in
+            if let gapAbove = group.gapAbove {
+                ChatQuietGapLine(date: gapAbove)
+            }
             if group.isToolGroup {
                 if group.messages.count == 1 {
                     let msg = group.messages[0]
@@ -665,10 +687,7 @@ struct ChatMessageListView: View {
                         InlineCardsForRow(rowID: msg.id)
                     }
                 } else {
-                    ToolCallGroup(
-                        messages: group.messages,
-                        isLive: liveToolGroupId != nil && group.id == liveToolGroupId
-                    )
+                    ToolCallGroup(messages: group.messages)
                     .transcriptLayoutProbe(rowID: group.id, kind: .toolGroup)
                     // A card belongs to the ROW whose call raised it, not to
                     // the run that row happens to be collapsed into: the need
@@ -690,17 +709,17 @@ struct ChatMessageListView: View {
                 // which is why the transcript stopped riding the stream and the
                 // working card landed under the composer.
                 if let hosted = cardMount.byHost[msg.id], !hosted.isEmpty {
-                    VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                        bubbleRow(msg, lastAssistantId: lastAssistantId, liveTailId: liveTailId)
+                    VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
+                        bubbleRow(msg, lastAssistantId: lastAssistantId, tailId: tailId, liveTailId: liveTailId)
                         // The handle, directly under what she just said: same
-                        // leading edge, one small gap, nothing that reads as an
-                        // interruption.
+                        // leading edge, the transcript's one gap, nothing that
+                        // reads as an interruption.
                         ForEach(hosted, id: \.self) { rowID in
                             InlineCardsForRow(rowID: rowID)
                         }
                     }
                 } else {
-                    bubbleRow(msg, lastAssistantId: lastAssistantId, liveTailId: liveTailId)
+                    bubbleRow(msg, lastAssistantId: lastAssistantId, tailId: tailId, liveTailId: liveTailId)
                 }
             }
         }
@@ -708,6 +727,9 @@ struct ChatMessageListView: View {
             revealedSessionId = sessionId
             pagedSearchID = highlightedMessageID
             pageAnchorID = nil
+        }
+        .onChange(of: revealedSessionId == sessionId && pageAnchorID != nil, initial: true) { _, pagedBack in
+            onPagedBackChange?(pagedBack)
         }
         if range.upperBound < allGroups.count {
             HStack {
@@ -759,7 +781,7 @@ private struct MacChatTranscriptSearchHighlight: ViewModifier {
             content
                 .overlay {
                     RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                        .strokeBorder(NativeAgentBrand.accent, lineWidth: 2)
+                        .strokeBorder(NativeAgentShell.secondary, lineWidth: 2)
                         .padding(-5)
                         .accessibilityHidden(true)
                 }
@@ -774,10 +796,6 @@ private struct MacChatTranscriptSearchHighlight: ViewModifier {
 struct ToolCallGroup: View {
     @Environment(AppModel.self) private var appModel
     var messages: [ChatMessage]
-    /// True only for the currently-streaming last group: show the live
-    /// flip-through box. Otherwise collapse to an "N tools used" summary.
-    var isLive: Bool = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // An unresolved approval must never be hidden behind a collapsed summary.
     private var hasPendingApproval: Bool {
@@ -785,12 +803,21 @@ struct ToolCallGroup: View {
     }
 
     var body: some View {
-        // 2026-09-25: each phase swaps in place, no crossfade — the live pill
-        // and the settled row sit on the same line and drew over each other.
+        // 2026-09-25: each phase swaps in place on one line that takes the new
+        // row's size, so they never overlap. An approval list leaves at once.
+        // While she works, this is the settled fold already: the turn card is
+        // the one live surface (p3-voice, 2026-10-07).
+        ChatCrossfadeStack(current: hasPendingApproval ? 0 : 1) {
+            phaseBody
+        }
+    }
+
+    @ViewBuilder
+    private var phaseBody: some View {
         if hasPendingApproval {
-            fullList.transition(.identity)
-        } else if isLive {
-            liveBox.transition(.identity)
+            fullList
+                .layoutValue(key: ChatCrossfadePhase.self, value: 0)
+                .transition(.identity)
         } else {
             // ui-simplify 2026-09-02: one quiet row for the whole turn's tool
             // traffic — tools and skills together — instead of two collapsed
@@ -807,7 +834,7 @@ struct ToolCallGroup: View {
             let rest = messages.filter {
                 PersonaWriteReceiptRow.receipt(for: $0, exemptTitle: exemptTitle) == nil
             }
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+            VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
                 if !rest.isEmpty {
                     ShellToolRow(messages: rest)
                 }
@@ -815,35 +842,13 @@ struct ToolCallGroup: View {
                     PersonaWriteReceiptRow(message: message, exemptTitle: exemptTitle)
                 }
             }
-            .transition(.identity)
+            .layoutValue(key: ChatCrossfadePhase.self, value: 1)
+            .transition(NativeAgentMotion.fadeThrough)
         }
-    }
-
-    // While she's working: one box showing the latest tool, flipping as each
-    // new one fires (instead of spanning every call out on its own line).
-    private var liveBox: some View {
-        HStack(spacing: 8) {
-            ProgressView().controlSize(.small)
-            Group {
-                if let latest = messages.last {
-                    ToolPillView(message: latest)
-                        .id(latest.id)
-                        .transition(.asymmetric(
-                            insertion: NativeAgentMotion.reveal(anchor: .bottom),
-                            removal: .identity))
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.leading, 20)
-        .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
-            value: messages.last?.id
-        )
     }
 
     private var fullList: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
             ForEach(messages) { msg in
                 if msg.metadata?.isPendingApproval == true {
                     InlineApprovalCard(message: msg)
@@ -858,7 +863,7 @@ struct ToolCallGroup: View {
 // PATCH-2026-05-09: chat-ux-polish — polished MessageBubble
 // User: purple→pink gradient, white text, rounded-right corners
 // Assistant: glass-card style, soft border, primary text
-// Hover actions: copy, regenerate (last assistant only), thumbs up/down
+// Hover actions: copy, regenerate (last assistant only), read aloud
 // chat-smoothness phase 1 (2026-06-12): finished bubbles re-parsed their
 // markdown on EVERY body re-evaluation — during streaming that's every
 // visible bubble, every coalesce tick. Parse once per content string;
@@ -877,15 +882,77 @@ final class ChatMarkdownCache: @unchecked Sendable {
             return hit
         }
         RenderAudit.bump("markdown.parse")
+        guard let parsed = Self.parse(content) else { return nil }
+        cache.insertIfAbsent(parsed, for: content)
+        return parsed
+    }
+
+    /// The parse itself, uncached. The live reply streams through this: its
+    /// last paragraph grows every frame and must not fill the cache.
+    static func parse(_ content: String) -> AttributedString? {
         guard let raw = try? AttributedString(
             markdown: content,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) else { return nil }
         // Untrusted content: drop live links for any scheme outside the
         // allowlist before the string is ever handed to a Text view.
-        let parsed = ChatLinkPolicy.sanitized(raw)
-        cache.insertIfAbsent(parsed, for: content)
-        return parsed
+        return ChatLinkPolicy.sanitized(raw)
+    }
+
+    /// What Copy puts on the clipboard: the words as the bubble draws them,
+    /// so a pasted reply carries no `**` (fenced code stays as written).
+    static func plainText(_ content: String) -> String {
+        ChatRichContentCache.blocks(content).map { block in
+            switch block {
+            case .prose(let text): attributed(text).map { String($0.characters) } ?? text
+            case .code(_, let code): code
+            }
+        }.joined(separator: "\n\n")
+    }
+}
+
+/// Wave 3 (Grok's rhythm): a blank line between paragraphs is drawn as the
+/// stream's gap (line spacing + `StreamingParagraphText.paragraphGap`) inside
+/// one `Text`, not as a whole empty line. The empty paragraph gets an exact
+/// height of `paragraphGap - lineSpacing`, so with the line spacing above and
+/// below it the break measures what the stream's stack does (measured with
+/// ImageRenderer: equal heights at spacing 8 and 2, wrapped or not); extra
+/// blank lines collapse, as they do in the stream. Cached per content and
+/// spacing, like the parse.
+enum ChatParagraphGap {
+    private static let cache = ChatContentCache<AttributedString>()
+
+    static func applied(_ parsed: AttributedString, content: String, lineSpacing: CGFloat) -> AttributedString {
+        guard content.contains("\n\n") else { return parsed }
+        let key = "\(lineSpacing)|" + content
+        if let hit = cache.lookup(key) { return hit }
+        var out = parsed
+        // Character offsets of each run of 2+ newlines, last first, so an
+        // edit never moves an offset still to be visited.
+        var runs: [(start: Int, count: Int)] = []
+        var offset = 0
+        var runStart = -1
+        for character in out.characters {
+            if character == "\n" {
+                if runStart < 0 { runStart = offset }
+            } else {
+                if runStart >= 0, offset - runStart >= 2 { runs.append((runStart, offset - runStart)) }
+                runStart = -1
+            }
+            offset += 1
+        }
+        if runStart >= 0, offset - runStart >= 2 { runs.append((runStart, offset - runStart)) }
+        let height = max(0, StreamingParagraphText.paragraphGap - lineSpacing)
+        for run in runs.reversed() {
+            let blank = out.characters.index(out.startIndex, offsetBy: run.start + 1)
+            let afterBlank = out.characters.index(after: blank)
+            if run.count > 2 {
+                out.removeSubrange(afterBlank..<out.characters.index(out.startIndex, offsetBy: run.start + run.count))
+            }
+            out[blank..<out.characters.index(after: blank)].lineHeight = .exact(points: height)
+        }
+        cache.insertIfAbsent(out, for: key)
+        return out
     }
 }
 
@@ -1082,11 +1149,34 @@ struct MessageBubble: View {
     /// True in the offscreen copy a quiet page read mounts. Nothing here is on
     /// anybody's screen, so nothing here may claim a render the person made.
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
+    @Environment(\.troubleCardOwnsRetry) private var troubleCardOwnsRetry
+    /// Set when a retry of this failed turn could repeat a real action.
+    @State private var retryConfirmation: ChatTurnFailure?
     @State private var showJSONSheet = false
     @State private var bubbleToast: String? = nil
     @State private var isHovered = false
+    /// The hover bar hangs below the row's own frame, so the pointer on it is
+    /// tracked separately.
+    @State private var isBarHovered = false
+    private var showsHoverBar: Bool { isHovered || isBarHovered }
     /// Third pass, item 3: the settled reply's working commentary starts folded.
     @State private var commentaryExpanded = false
+    /// Fluid glass A1: keeps the stream on screen for the one frame between
+    /// the turn settling and the animated swap to the settled reply.
+    @State private var holdsLive = false
+
+    /// Her reply is still arriving into this row. A turn that has reached
+    /// its terminal phase is not, even while the runtime marker lingers for
+    /// the post-turn bookkeeping: the terminal reduce clears
+    /// `replyTextSettled`, so `isStreaming` alone flipped a settled reply back
+    /// to raw text until the marker cleared.
+    private var isLiveReply: Bool {
+        guard isLastAssistant, message.role == "assistant" else { return false }
+        let sessionId = message.sessionId ?? appModel.activeChatSessionId
+        let turns = appModel.engine.turns
+        return turns.isStreaming(sessionId)
+            && turns.lifecycle(for: sessionId)?.presentation.isTerminal != true
+    }
 
     private var normalizedRole: String {
         message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1171,7 +1261,6 @@ struct MessageBubble: View {
         if isUser, isBridgeRouted, ChatShellEnvelope.isEnvelope(message.content, envelope: message.metadata?.envelope) {
             ShellEnvelopeRow(content: message.content)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 4)
         } else {
             bubbleBody
         }
@@ -1220,7 +1309,9 @@ struct MessageBubble: View {
 
                 // Message content bubble
                 VStack(alignment: seatsRight ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
-                    if hasVisibleContent {
+                    // A live reply mounts its paced text while still empty, so
+                    // the first words pace in instead of arriving as a mount.
+                    if hasVisibleContent || isLiveReply {
                         renderedMessageText
                     } else if attachments.localImages.isEmpty && attachments.chips.isEmpty {
                         Text(" ")
@@ -1241,17 +1332,10 @@ struct MessageBubble: View {
                     // draw; regular weight reads crisp without it.
                     .font(isQuietBridge ? ShellType.label : ShellType.body)
                     .textSelection(.enabled)
-                    .lineSpacing(!isUser
-                        ? NativeAgentShellLayout.replyLineSpacing
-                        : 2)
+                    .lineSpacing(bubbleLineSpacing)
                     .padding(.horizontal, bubbleHPad)
                     .padding(.vertical, seatsRight ? 12 : NativeAgentSpacing.xs)
-                    .background {
-                        if seatsRight {
-                            UnevenRoundedRectangle(cornerRadii: userCorners, style: .continuous)
-                                .fill(NativeAgentShell.softFill)
-                        }
-                    }
+                    .modifier(UserBubbleSurface(seatsRight: seatsRight, corners: userCorners))
                     // The cap comes after the fill so the bubble hugs short
                     // text; the padding is added back so long text still
                     // wraps at the same width.
@@ -1266,7 +1350,7 @@ struct MessageBubble: View {
                     .contextMenu {
                         // PATCH-2026-06-06: chat-upgrades — message-level actions
                         Button {
-                            ChatClipboard.copy(message.content)
+                            ChatClipboard.copy(ChatMarkdownCache.plainText(message.content))
                             showBubbleToast("Copied")
                         } label: { Label("Copy text", systemImage: "doc.on.doc") }
 
@@ -1285,7 +1369,7 @@ struct MessageBubble: View {
 
                         if !isUser && isLastAssistant && message.metadata?.providerRefusal != true {
                             Button {
-                                Task { await appModel.regenerateAssistantMessage(message) }
+                                requestRetry()
                             } label: {
                                 Label("Regenerate response", systemImage: "arrow.clockwise")
                             }
@@ -1295,8 +1379,7 @@ struct MessageBubble: View {
 
                         Button {
                             Task {
-                                _ = await appModel.addMemoryFact(message.content)
-                                showBubbleToast(appModel.statusText)
+                                showBubbleToast(await appModel.addMemoryFact(message.content).userMessage)
                             }
                         } label: { Label("Remember this", systemImage: "brain") }
 
@@ -1306,30 +1389,14 @@ struct MessageBubble: View {
                             Label("Show message data", systemImage: "curlybraces")
                         }
                     }
-                // Agent, 2026-09-02, named twice: the floating bar overlapped
-                // the top of the bubble and landed ON the first line of the
-                // message next to it — copy, speaker and thumbs sitting over
-                // her words. It must never cover text, so it has its own strip
-                // UNDER the message.
-                //
-                // The strip is reserved whether or not the pointer is here.
-                // That keeps hover LAYOUT-NEUTRAL (User, 2026-07-25): a row
-                // that appears on hover changes the bubble's height, and every
-                // scroll strategy shows that as a hop.
-                ZStack {
-                    if isHovered {
-                        hoverBar
-                            .accessibilityHidden(true)
-                            .transition(.opacity)
-                    }
-                }
-                .frame(height: NativeAgentShellLayout.hoverBarStrip, alignment: .center)
-
+                // The room's trouble card carries Retry for a failed turn; the
+                // bubble keeps it for a stopped turn and in detached panels.
                 if !isUser, isLastAssistant,
+                   !(troubleCardOwnsRetry && ChatShellTroubleState.isFailed(message)),
                    (message.metadata?.providerRefusalDraft == true
                     || (message.metadata?.providerRefusal != true && messageNeedsRetry)) {
                     Button {
-                        Task { await appModel.regenerateAssistantMessage(message) }
+                        requestRetry()
                     } label: {
                         Label(message.metadata?.providerRefusalDraft == true ? "Retry draft" : "Try again", systemImage: "arrow.clockwise")
                             .font(NativeAgentFont.label)
@@ -1338,38 +1405,37 @@ struct MessageBubble: View {
                     .controlSize(.small)
                 }
 
-                // Hover must be LAYOUT-NEUTRAL (User, 2026-07-25, detached-panel
-                // round 3): inserting this row on hover changed the bubble's
-                // height, and any scroll strategy shows that as a hop — the
-                // un-hover shrink was the "scrolls up when I move to the
-                // composer" bug. Zero-height frame keeps the timestamp out of
-                // layout permanently; the text overflow-draws into the
-                // inter-bubble gap (where the inserted row used to render) and
-                // only its opacity tracks hover.
-                // Agent, 2026-09-03: measured 1.86:1 on the light room —
-                // SwiftUI's hierarchical .tertiary over behind-window glass is
-                // not a colour, it is a fade, and it failed the 4.5:1 floor by
-                // a factor of 2.4. The shell's own tertiary token clears it in
-                // both appearances; 10pt (the HIG floor) is kept.
-                Text([timestamp, isUser ? nil : Self.brainLine(message.metadata)]
-                        .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
-                    .font(ShellType.caption)
-                    .lineLimit(1)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    // Yield to bubbleToast below — both draw into the same
-                    // gap, and the toast is the one the user just triggered.
-                    .opacity(isHovered && bubbleToast == nil ? 1 : 0)
-                    .frame(height: 0, alignment: .top)
-                    .allowsHitTesting(false)
-
                 // Bubble-local toast
                 if let bt = bubbleToast {
-                    Text(bt)
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.secondary)
+                    NoticePill(text: bt)
                         .transition(NativeAgentMotion.reveal())
                 }
 
+            }
+            // Hover must be LAYOUT-NEUTRAL (User, 2026-07-25): a row that
+            // appears on hover changes the bubble's height, and every scroll
+            // strategy shows that as a hop. Agent, 2026-09-02, named twice:
+            // the bar must never land on words. Fluid glass A2: so it is an
+            // overlay, not a reserved 30pt strip under every message — it
+            // fades in over this message's bottom edge (a few points of its
+            // padding) and hangs into the gap below, with the timestamp beside
+            // it. Raised over the next row while it shows (zIndex below).
+            .overlay(alignment: seatsRight ? .bottomTrailing : .bottomLeading) {
+                if showsHoverBar {
+                    HStack(spacing: NativeAgentSpacing.sm) {
+                        if seatsRight { hoverTimestamp(timestamp) }
+                        hoverBar
+                            // The bar hangs below the row's own hover region;
+                            // holding it keeps it.
+                            .onHover { hovering in
+                                withAnimation(NativeAgentMotion.quick) { isBarHovered = hovering }
+                            }
+                        if !seatsRight { hoverTimestamp(timestamp) }
+                    }
+                    .offset(y: NativeAgentShellLayout.hoverBarStrip - NativeAgentShellLayout.hoverBarOverlap)
+                    .accessibilityHidden(true)
+                    .transition(.opacity)
+                }
             }
             .frame(
                 maxWidth: NativeAgentShellLayout.roomColumn,
@@ -1379,7 +1445,8 @@ struct MessageBubble: View {
             // User, 2026-09-02: the whole column, gaps included, is the hover
             // region, so moving the pointer from the words down onto the bar
             // keeps the bar; leaving the message anywhere drops it.
-            .contentShape(Rectangle())
+            // ...and reaches down over the hanging bar, so its buttons take clicks.
+            .contentShape(HoverBarReach(below: NativeAgentShellLayout.hoverBarStrip - NativeAgentShellLayout.hoverBarOverlap))
             .onHover { hovering in
                 withAnimation(NativeAgentMotion.quick) { isHovered = hovering }
             }
@@ -1387,21 +1454,26 @@ struct MessageBubble: View {
             if !seatsRight { Spacer(minLength: 60) }
         }
         .frame(maxWidth: .infinity, alignment: seatsRight ? .trailing : .leading)
+        // The hover bar hangs over the top edge of the next row; draw this
+        // row above its neighbours while it shows.
+        .zIndex(showsHoverBar ? 1 : 0)
         .animation(NativeAgentMotion.quick, value: bubbleToast)
         .modifier(MessageBubbleAccessibilityActions(
             isUser: isUser,
             isLastAssistant: isLastAssistant && message.metadata?.providerRefusal != true,
             onCopy: {
-                ChatClipboard.copy(message.content)
+                ChatClipboard.copy(ChatMarkdownCache.plainText(message.content))
                 showBubbleToast("Copied")
             },
             onReadAloud: toggleReadAloud,
             onRegenerate: {
-                Task { await appModel.regenerateAssistantMessage(message) }
-            },
-            onFeedback: { rating in
-                postFeedback(messageId: message.id, rating: rating)
+                requestRetry()
             }
+        ))
+        .modifier(FailedTurnRetryConfirmation(
+            failure: $retryConfirmation,
+            onRetry: { Task { await appModel.regenerateAssistantMessage(message) } },
+            onContinue: { Task { await appModel.continueFailedTurn(message) } }
         ))
         .onAppear { emitFirstRenderIfNeeded() }
         .onChange(of: hasVisibleContent) { emitFirstRenderIfNeeded() }
@@ -1416,24 +1488,34 @@ struct MessageBubble: View {
         }
     }
 
-    /// The per-message actions, in their own reserved strip under the message.
+    /// When and on which brain, beside the hover bar. Agent, 2026-09-03: the
+    /// shell's secondary token, not SwiftUI's hierarchical fade, which
+    /// measured 1.86:1 on the light room. It yields to the bubble toast, the
+    /// one the person just triggered.
+    private func hoverTimestamp(_ timestamp: String) -> some View {
+        Text([timestamp, isUser ? nil : Self.brainLine(message.metadata)]
+                .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+            .font(ShellType.caption)
+            .lineLimit(1)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .opacity(bubbleToast == nil ? 1 : 0)
+            .allowsHitTesting(false)
+    }
+
+    /// The per-message actions, overlaid on the message's bottom edge.
     private var hoverBar: some View {
         BubbleHoverBar(
             message: message,
             isLastAssistant: isLastAssistant && message.metadata?.providerRefusal != true,
             onCopy: {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(message.content, forType: .string)
+                ChatClipboard.copy(ChatMarkdownCache.plainText(message.content))
                 showBubbleToast("Copied")
             },
             onRegenerate: {
-                Task { await appModel.regenerateAssistantMessage(message) }
+                requestRetry()
             },
             onReadAloud: {
                 toggleReadAloud()
-            },
-            onFeedback: { rating in
-                postFeedback(messageId: message.id, rating: rating)
             }
         )
     }
@@ -1487,22 +1569,66 @@ struct MessageBubble: View {
         // user switches back to view it.
         // Cheap row-local checks first (2026-09-22): only the tail bubble may
         // observe `streamingSessions`, or every row re-renders per turn.
-        if isLastAssistant && message.role == "assistant" && appModel.engine.turns.isStreaming(message.sessionId ?? appModel.activeChatSessionId) {
-            // Streaming stays raw: the in-flight bubble changes on every
-            // coalesce tick, so neither the block split nor the markdown parse
-            // may run here. Rich content resolves once the turn settles.
-            //
-            // User, 2026-09-13 ("still a little bumpy"): and it is greedy while
-            // it streams. Without this the bubble HUGS its text, so the row's
-            // WIDTH was re-derived from the growing string on every chunk and
-            // every stack above it re-laid out to match. Greedy inside the
-            // enclosing `replyMaxWidth` cap pins the width at
-            // min(column, cap) from the first token — the same width the
-            // settled reply wraps at — so a chunk changes the height only.
-            // Glyphs do not move when the box shrinks to hug at settle: the
-            // text is leading-aligned and there is no bubble fill on a reply.
-            StreamingParagraphText(text: displayContent)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        if isLastAssistant && message.role == "assistant" {
+            // Fluid glass A1: her last reply swaps phases in place — streamed,
+            // settled, settled with its notes folded — and each swap
+            // crossfades instead of reflowing in one frame. The stack takes
+            // the incoming phase's size, and the swap runs in one animated
+            // transaction (below), so the height eases and a transcript
+            // pinned to the bottom rides it.
+            let live = isLiveReply || holdsLive
+            let split: (commentary: String?, answer: String) = live ? (nil, "") : workingCommentarySplit
+            let phase = live ? 0 : (split.commentary == nil ? 1 : 2)
+            ChatCrossfadeStack(current: phase) {
+                if live {
+                    // Streaming skips the block split and the cache: the
+                    // in-flight bubble changes on every coalesce tick. Each
+                    // paragraph takes the settled reply's inline parse
+                    // (2026-10-07), so `**` never shows and nothing snaps
+                    // to bold at the settle.
+                    //
+                    // User, 2026-09-13 ("still a little bumpy"): and it is
+                    // greedy while it streams. Without this the bubble HUGS
+                    // its text, so the row's WIDTH was re-derived from the
+                    // growing string on every chunk and every stack above it
+                    // re-laid out to match. Greedy inside the enclosing
+                    // `replyMaxWidth` cap pins the width at min(column, cap)
+                    // from the first token — the same width the settled reply
+                    // wraps at — so a chunk changes the height only. Glyphs do
+                    // not move when the box shrinks to hug at settle: the text
+                    // is leading-aligned and there is no bubble fill on a reply.
+                    PacedStreamingText(text: displayContent, inline: ChatInlineMarkdown(ChatMarkdownCache.parse))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .layoutValue(key: ChatCrossfadePhase.self, value: 0)
+                        .transition(NativeAgentMotion.replyDissolve)
+                } else if let commentary = split.commentary {
+                    VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
+                        workingCommentaryFold(commentary)
+                        settledContent(split.answer)
+                    }
+                    .layoutValue(key: ChatCrossfadePhase.self, value: 2)
+                    .zIndex(2)
+                    .transition(NativeAgentMotion.replyDissolve)
+                } else {
+                    settledContent(split.answer)
+                        .layoutValue(key: ChatCrossfadePhase.self, value: 1)
+                        .zIndex(1)
+                        .transition(NativeAgentMotion.replyDissolve)
+                }
+            }
+            // One frame late on purpose: the settle re-renders this row still
+            // showing the stream, and the swap then runs inside
+            // `withAnimation`, which is what lets the height change ease in
+            // the rows and the scroll view around it, not only in here. The
+            // notes fold arrives in its own animated write
+            // (`setChatMessageWorkingCommentary`).
+            .onChange(of: isLiveReply, initial: true) { _, now in
+                if now {
+                    holdsLive = true
+                } else if holdsLive {
+                    withAnimation(NativeAgentMotion.arrive) { holdsLive = false }
+                }
+            }
         } else {
             // Item 3 (third conversation pass): a multi-round turn persists the
             // narration it spoke before each tool round followed by its answer.
@@ -1542,25 +1668,9 @@ struct MessageBubble: View {
 
     @ViewBuilder
     private func workingCommentaryFold(_ commentary: String) -> some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-            Button {
-                commentaryExpanded.toggle()
-            } label: {
-                HStack(spacing: NativeAgentSpacing.xs) {
-                    Image(systemName: commentaryExpanded ? "chevron.down" : "chevron.right")
-                    Text("Working notes")
-                }
-                .font(NativeAgentFont.tag)
-                .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(
-                commentaryExpanded ? "Hide working notes" : "Show working notes")
-            if commentaryExpanded {
-                proseText(commentary)
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(.secondary)
-            }
+        // Fluid glass A2: the transcript's one activity row.
+        ChatActivityRow(title: "Working notes", isExpanded: $commentaryExpanded) {
+            proseText(commentary)
         }
     }
 
@@ -1620,11 +1730,54 @@ struct MessageBubble: View {
         }
     }
 
+    private var bubbleLineSpacing: CGFloat { isUser ? 2 : NativeAgentShellLayout.replyLineSpacing }
+
+    /// Wave 3 (Grok's rhythm): paragraphs sit a line gap plus 10pt apart, not
+    /// a whole blank line apart, at the same breaks the stream splits at. Plain
+    /// prose stays ONE `Text` (the gap is drawn inside it), so a drag still
+    /// selects across paragraphs; prose with a list breaks only at the list,
+    /// each run of plain paragraphs between lists still one `Text`.
     @ViewBuilder
     private func proseRows(_ text: String) -> some View {
+        let paragraphs = StreamingParagraphText.paragraphs(text[...])
+        let rows = ChatProseListParser.rows(text)
+        if paragraphs.count > 1, rows.contains(where: { $0.marker != nil }) {
+            // One width for every list in the message, as when it was one block.
+            let markerWidth = CGFloat(rows.compactMap(\.marker).map(\.count).max() ?? 1) * 10
+            let blocks = Self.listBlocks(paragraphs)
+            VStack(alignment: .leading, spacing: bubbleLineSpacing + StreamingParagraphText.paragraphGap) {
+                ForEach(blocks.indices, id: \.self) { index in
+                    proseParagraph(blocks[index], markerWidth: markerWidth)
+                }
+            }
+        } else {
+            let markerWidth = CGFloat(rows.compactMap(\.marker).map(\.count).max() ?? 1) * 10
+            proseParagraph(text.trimmingCharacters(in: .newlines), markerWidth: markerWidth)
+        }
+    }
+
+    /// Paragraphs regrouped at list boundaries: a paragraph holding a list
+    /// stands alone; adjacent plain ones rejoin at their blank lines.
+    private static func listBlocks(_ paragraphs: [Substring]) -> [String] {
+        var blocks: [String] = []
+        var proseRun: [Substring] = []
+        for paragraph in paragraphs {
+            if ChatProseListParser.rows(String(paragraph)).contains(where: { $0.marker != nil }) {
+                if !proseRun.isEmpty { blocks.append(proseRun.joined(separator: "\n\n")) }
+                proseRun = []
+                blocks.append(String(paragraph))
+            } else {
+                proseRun.append(paragraph)
+            }
+        }
+        if !proseRun.isEmpty { blocks.append(proseRun.joined(separator: "\n\n")) }
+        return blocks
+    }
+
+    @ViewBuilder
+    private func proseParagraph(_ text: String, markerWidth: CGFloat) -> some View {
         let rows = ChatProseListParser.rows(text)
         if rows.contains(where: { $0.marker != nil }) {
-            let markerWidth = CGFloat(rows.compactMap(\.marker).map(\.count).max() ?? 1) * 10
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(rows.indices, id: \.self) { index in
                     let row = rows[index]
@@ -1650,40 +1803,25 @@ struct MessageBubble: View {
 
     @ViewBuilder
     private func inlineProseText(_ text: String) -> some View {
-        if let attributed = ChatMarkdownCache.attributed(text) {
-            Text(attributed)
+        Text(ChatParagraphGap.applied(
+            ChatMarkdownCache.attributed(text) ?? AttributedString(text),
+            content: text, lineSpacing: bubbleLineSpacing
+        ))
+    }
+
+    /// Every retry and Regenerate on this bubble asks the one gate first: a
+    /// failed turn that acted, or whose outcome is unknown, is confirmed
+    /// before it runs again.
+    private func requestRetry() {
+        if let failure = appModel.retryNeedsConfirmation(for: message) {
+            retryConfirmation = failure
         } else {
-            Text(text)
+            Task { await appModel.regenerateAssistantMessage(message) }
         }
     }
 
     private var messageNeedsRetry: Bool {
-        message.metadata?.error?.isEmpty == false
-            || message.metadata?.partial == true
-            || message.metadata?.cancelled == true
-    }
-
-    private func postFeedback(messageId: String, rating: String) {
-        // appModel.recordMessageFeedback doesn't exist yet — POST to context feedback,
-        // otherwise no-op with a toast so the UI still works.
-        let persona = appModel.chatPersona
-        Task {
-            do {
-                try await appModel
-                    .postContextFeedback(
-                        messageId: messageId,
-                        sessionId: message.sessionId ?? appModel.activeChatSessionId,
-                        rating: rating,
-                        persona: persona
-                    )
-                await MainActor.run { showBubbleToast(rating == "up" ? "Thanks for the thumbs up" : "Noted — will improve") }
-            } catch {
-                // ui-honesty 2026-06-10: nothing is stored on this path —
-                // "Feedback noted (offline mode)" claimed success while
-                // dropping the rating. Say it failed.
-                await MainActor.run { showBubbleToast("Feedback failed to send") }
-            }
-        }
+        ChatShellTroubleState.isFailed(message) || message.metadata?.cancelled == true
     }
 }
 
@@ -1709,7 +1847,6 @@ private struct MessageBubbleAccessibilityActions: ViewModifier {
     let onCopy: () -> Void
     let onReadAloud: () -> Void
     let onRegenerate: () -> Void
-    let onFeedback: (String) -> Void
 
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -1728,8 +1865,6 @@ private struct MessageBubbleAccessibilityActions: ViewModifier {
         content
             .accessibilityAction(named: "Copy message", onCopy)
             .accessibilityAction(named: "Read message aloud", onReadAloud)
-            .accessibilityAction(named: "Mark response helpful") { onFeedback("up") }
-            .accessibilityAction(named: "Mark response not helpful") { onFeedback("down") }
     }
 }
 
@@ -1779,14 +1914,7 @@ private struct MessageAttachmentChipView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
-        .background {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(Color.secondary.opacity(0.10))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8)
-        }
+        .houseInset(in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .help(attachment.path ?? displayName)
         .contextMenu {
             if let path = attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
@@ -1854,10 +1982,10 @@ private struct MessageLocalImageAttachmentView: View {
                     }
                 }
         } else if state == .loading {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.secondary.opacity(0.08))
+            Color.clear
                 .frame(width: 160, height: 120)
                 .overlay { ProgressView().controlSize(.small) }
+                .houseInset(in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         } else {
             VStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle")
@@ -1871,14 +1999,7 @@ private struct MessageLocalImageAttachmentView: View {
                     .truncationMode(.middle)
             }
             .frame(width: 160, height: 120)
-            .background {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.secondary.opacity(0.08))
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.8)
-            }
+            .houseInset(in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .accessibilityElement(children: .combine)
             .accessibilityLabel(
                 "Image attachment unavailable: "
@@ -1925,7 +2046,6 @@ private struct BubbleHoverBar: View {
     var onCopy: () -> Void
     var onRegenerate: () -> Void
     var onReadAloud: () -> Void
-    var onFeedback: (String) -> Void
 
     private var isAssistant: Bool { message.role == "assistant" }
 
@@ -1942,20 +2062,10 @@ private struct BubbleHoverBar: View {
             if isAssistant {
                 BubbleAction(icon: "speaker.wave.2", help: "Read aloud", action: onReadAloud)
             }
-
-            // Thumbs up/down — assistant messages only
-            if isAssistant {
-                BubbleAction(icon: "hand.thumbsup", help: "Good response", action: { onFeedback("up") })
-                BubbleAction(icon: "hand.thumbsdown", help: "Bad response", action: { onFeedback("down") })
-            }
         }
         .padding(.horizontal, NativeAgentSpacing.sm)
         .padding(.vertical, 4)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.control))
-        .overlay(
-            RoundedRectangle(cornerRadius: NativeAgentRadius.control)
-                .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.8)
-        )
+        .houseSurface(in: RoundedRectangle(cornerRadius: NativeAgentRadius.control))
     }
 }
 
@@ -2018,11 +2128,11 @@ private struct MessageJSONSheet: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(12)
-                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
         }
         .padding(NativeAgentSpacing.xl)
         .frame(width: 540, height: 420)
+        .houseSheet()
     }
 }
 
@@ -2043,11 +2153,28 @@ struct AdvancedTextEditor: View {
                 .frame(minHeight: minHeight, maxHeight: minHeight + 44)
                 .scrollContentBackground(.hidden)
                 .padding(6)
-                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-                }
         }
+    }
+}
+
+
+private struct UserBubbleSurface: ViewModifier {
+    let seatsRight: Bool
+    let corners: RectangleCornerRadii
+
+    func body(content: Content) -> some View {
+        if seatsRight {
+            content.houseSurface(in: UnevenRoundedRectangle(cornerRadii: corners, style: .continuous))
+        } else {
+            content
+        }
+    }
+}
+
+/// The message's hit region extended down by the distance its hover bar hangs.
+private struct HoverBarReach: Shape {
+    let below: CGFloat
+    func path(in rect: CGRect) -> Path {
+        Path(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height + max(0, below)))
     }
 }

@@ -200,19 +200,11 @@ public enum MemoryConsolidationHygiene {
                 FileHandle.standardError.write(Data(
                     "MemoryConsolidationHygiene: reconciled \(reconciled) stale kg_memory_index row(s)\n".utf8))
             }
-            // B4 (2026-08-28): the reconcile above only DELETES index rows whose
-            // memory is gone; nothing put back the rows for memories whose
-            // fire-and-forget indexing Task died with the process. That drift is
-            // stable rather than growing-and-self-healing (47 active memories on
-            // the live store), and an unindexed memory is invisible to every
-            // graph-derived surface. Runs immediately after the reconcile so the
-            // two halves of index bookkeeping share one approved cadence, and
-            // batch-capped so a large backlog drains over runs. Additive: a
-            // memory that already has a row is never touched.
-            let backfilled = try await indexer.backfillMissingMemoryIndexRows()
+            // Missing and stale fingerprints both require canonical convergence.
+            let backfilled = try await indexer.reconcileMemoryIndexFingerprints()
             if backfilled > 0 {
                 FileHandle.standardError.write(Data(
-                    "MemoryConsolidationHygiene: backfilled \(backfilled) missing kg_memory_index row(s)\n".utf8))
+                    "MemoryConsolidationHygiene: reconciled \(backfilled) canonical kg_memory_index row(s)\n".utf8))
             }
             // 2026-07-21 audit: the full KG orphan sweep fired ONLY on the
             // manual KG-maintenance button or the rare approved

@@ -20,17 +20,15 @@ import SlackBot
 enum InlineConnectorSetup {
 
     nonisolated static func fields(for connector: String) -> [InlineCardField] {
-        // Notion, Slack and Telegram write files under the data root; only
-        // GitHub's token goes to the Keychain.
         let stays = "Your key stays on this Mac. It never goes into the chat."
         switch InlineInteractionRegistry.canonicalConnectorID(connector) {
         case "telegram":
             return [
                 InlineCardField(label: "Bot token", placeholder: "123456789:ABC… from @BotFather",
                                 helper: stays, id: "token"),
-                InlineCardField(label: "Allowed chat ID (optional)", placeholder: "Numeric chat ID",
-                                helper: "Only allowed chats can message the agent. Leave blank to add one later.",
-                                isSecret: false, id: "allowed_chat_id", isOptional: true),
+                InlineCardField(label: "Allowed chat ID", placeholder: "Numeric chat ID",
+                                helper: "Send your bot a message, then open Telegram setup and use Check sender to find your ID. Only a recipient you admit can reach the agent.",
+                                isSecret: false, id: "allowed_chat_id"),
             ]
         case "notion":
             return [
@@ -137,7 +135,7 @@ enum InlineConnectorSetup {
         for value in typed where value.count >= 6 {
             logged = logged.replacingOccurrences(of: value, with: "[redacted]")
         }
-        NSLog("%@", "[inline-setup] \(service) failed: \(logged)")
+        nativeLog("%@", "[inline-setup] \(service) failed: \(logged)")
         let text = raw.lowercased()
         func has(_ words: String...) -> Bool { words.contains { text.contains($0) } }
         // App-side allowlist checks, not service text: the person can fix these.

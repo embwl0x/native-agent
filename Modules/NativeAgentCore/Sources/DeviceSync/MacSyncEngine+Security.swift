@@ -60,6 +60,14 @@ extension MacSyncEngine {
         return Data(mac).map { String(format: "%02x", $0) }.joined()
     }
 
+    func actionResponse(_ response: [String: String], for action: InboxAction) throws -> [String: String] {
+        var body = response
+        body["msgId"] = action.msgId
+        body["transactionId"] = action.transactionId ?? action.msgId
+        body["action"] = action.action
+        return try signedResponse(body)
+    }
+
     func signedResponse(_ response: [String: String]) throws -> [String: String] {
         var body = response
         body.removeValue(forKey: "signature")

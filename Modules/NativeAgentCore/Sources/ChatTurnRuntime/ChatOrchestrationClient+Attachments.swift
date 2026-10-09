@@ -84,13 +84,16 @@ extension SwiftNativeChatOrchestrationClient {
     struct TurnAttachmentInput: Sendable {
         let imageBlocks: [LLMContentBlock]
         let userMessage: String
+        let queryUserMessage: String
     }
 
     nonisolated static func turnAttachmentInput(
         message: String,
         attachments: [MultimodalAttachment],
-        dataRoot: URL
+        dataRoot: URL,
+        queryUserMessage: String? = nil
     ) throws -> TurnAttachmentInput {
+        let queryMessage = queryUserMessage ?? message
         if attachments.contains(where: {
             $0.mime.lowercased() == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 || ($0.name.map { ($0 as NSString).pathExtension.lowercased() } == "docx")
@@ -98,7 +101,7 @@ extension SwiftNativeChatOrchestrationClient {
             throw ChatOrchestrationError.underlying("DOCX attachments are not supported yet. Attach a PDF or text file instead.")
         }
         guard !attachments.isEmpty else {
-            return TurnAttachmentInput(imageBlocks: [], userMessage: message)
+            return TurnAttachmentInput(imageBlocks: [], userMessage: message, queryUserMessage: queryMessage)
         }
         var notes: [String] = []
 
@@ -126,15 +129,18 @@ extension SwiftNativeChatOrchestrationClient {
         // claims to govern plain text. PDFs and plain text share one pass so
         // they also share one per-turn character budget.
         notes.append(contentsOf: documentAttachmentNotes(
-            attachments, dataRoot: dataRoot, query: message))
+            attachments, dataRoot: dataRoot, query: queryMessage))
 
         guard !notes.isEmpty else {
-            return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: message)
+            return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: message, queryUserMessage: queryMessage)
         }
         let composed = ([message] + notes)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .joined(separator: "\n\n")
-        return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: composed)
+        let composedQuery = ([queryMessage] + notes)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n\n")
+        return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: composed, queryUserMessage: composedQuery)
     }
 
     /// Every document attachment of a turn — PDFs under "Allow PDF file

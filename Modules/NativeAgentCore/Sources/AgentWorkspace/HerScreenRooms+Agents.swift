@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import Desk
+import SwarmRuns
 
 /// Her screen, agents slice (2026-09-24, User: "get it all in her workspace").
 /// Crews (every swarm, not only a live one), delegations (the jobs Claude,
@@ -32,10 +33,11 @@ extension HerScreen {
     /// Every crew, live first, then the newest finished runs: task, state,
     /// workers, age. `crew.N` opens one (crewPage reads live and finished alike).
     static func crewsRoom(dataRoot: URL, now: Date = Date()) -> String {
-        let live = rows(dataRoot.appendingPathComponent("swarms/live.json"))
-        let runs = rows(dataRoot.appendingPathComponent("swarms/runs.json"))
+        let all: [[String: Any]]
+        do { all = try SwiftNativeSwarmRunsReader(runsPath: dataRoot.appendingPathComponent("swarms/runs.json")).readCrews() }
+        catch { return "CREWS unavailable: \(error.localizedDescription)" }
+        let live = all.filter { $0["pid"] != nil }
         let liveIDs = Set(live.compactMap { $0["id"] as? String })
-        let all = live + runs.filter { !liveIDs.contains($0["id"] as? String ?? "") }
         let lines: [String] = withNames(dataRoot) { book in
             all.prefix(10).compactMap { row -> String? in
                 guard let id = row["id"] as? String else { return nil }
@@ -97,7 +99,7 @@ extension HerScreen {
             [lines.isEmpty ? ["nothing delegated yet"] : lines,
              ["Replies come back to you by themselves; there is nothing to poll."]],
             verbs: [("job.N", "open one: what you asked, its reply, its Desk item"), ("claude / codex / omp", "that agent's conversation"),
-                    ("<agent>.say", "send it new work (text)")])
+                    ("<agent>.say", "sends it new work now; queues behind a pending reply (text)")])
     }
 
     /// A built-in lane's last exchanges both ways, from its own job records

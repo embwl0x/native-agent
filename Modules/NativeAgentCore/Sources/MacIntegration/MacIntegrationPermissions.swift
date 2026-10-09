@@ -42,6 +42,14 @@ public struct MacIntegrationPermission: Sendable, Codable, Equatable {
 public struct MacIntegrationPermissionReadiness: Sendable {
     public let operatorReadOff: Set<String>
     public let operatorWriteOff: Set<String>
+
+    public func refusal(integration: String, mode: MacIntegrationPermissionMode) -> String? {
+        guard (mode == .read ? operatorReadOff : operatorWriteOff).contains(integration) else { return nil }
+        if integration == MacIntegrationID.mail, mode == .write {
+            return "Mail Write is off by the operator's switch. I can write the draft text in chat or save it to a file. For Mail content, use mail.recent, mail.search or mail.read directly; do not open or screen-read Mail."
+        }
+        return "\(MacIntegrationID.displayName(for: integration)) \(mode.rawValue.capitalized) is off by the operator's switch; only the operator can turn it back on."
+    }
 }
 
 public struct MacIntegrationPermissionMutationProvenance: Sendable, Equatable {

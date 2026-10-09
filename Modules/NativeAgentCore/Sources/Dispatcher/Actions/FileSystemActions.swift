@@ -3,6 +3,9 @@ import CryptoKit
 import NativeAgentCore
 import MacControl
 import PersistenceCore
+import UniformTypeIdentifiers
+import CoreWLAN
+import SystemConfiguration
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -26,6 +29,45 @@ let connectorResultMaxChars = 30_000
 /// the retired daemon `_GREP_MAX_RESULTS = 50`
 let connectorGrepMaxResults = 50
 
+/// Senses request path + size through the existing read fences and verified
+/// descriptor. Ordinary file reads never bind this port.
+public enum FileReadSourceMaterial {
+    @TaskLocal public static var metadataOnly = false
+
+    /// Kinds whose format already belongs to the existing text/image reader.
+    /// The platform type graph supplies this identity; foreign binary kinds
+    /// still require the reader's content probe for a particular file.
+    public static func nativeReadableKind(_ kind: String) -> Bool {
+        VerifiedImageRead.isImagePath(URL(fileURLWithPath: "read." + kind))
+            || UTType(filenameExtension: kind)?.conforms(to: .text) == true
+    }
+
+    /// What files.read itself returns real content for: images and text, by
+    /// content. Anything else is foreign bytes to it, so a sense serves it.
+    public static func nativeReadSupported(path: String) -> Bool {
+        let path = (path as NSString).expandingTildeInPath
+        return VerifiedImageRead.isImagePath(URL(fileURLWithPath: path)) || !isBinary(path: path)
+    }
+
+    /// Binary by content, never by extension: a NUL byte or invalid UTF-8 in
+    /// the first 8 KB (a scalar cut at the sample's end is not invalid).
+    public static func isBinary(path: String) -> Bool {
+        let path = (path as NSString).expandingTildeInPath
+        // A document package (.pages, .numbers, .key, .rtfd) is foreign too.
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue { return true }
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? handle.close() }
+        let sample = (try? handle.read(upToCount: 8192)) ?? Data()
+        if sample.contains(0) { return true }
+        if String(data: sample, encoding: .utf8) != nil { return false }
+        for cut in 1...3 where sample.count > cut {
+            if String(data: sample.dropLast(cut), encoding: .utf8) != nil { return false }
+        }
+        return true
+    }
+}
+
 /// Sensitive data sub-paths under data_root that are never accessible even if a
 /// caller adds the full data_root to allowed_roots. Mirrors
 /// the retired daemon:_SENSITIVE_DATA_SUBPATHS (691).
@@ -38,9 +80,12 @@ let connectorSensitiveDataSubpaths: Set<String> = [
     "pairings",
     "providers",
     "codex_home",
+    "codex_child_home",
     "macctl_bridge.json",
     "browser_ipc.json",
     "trust_policy.json",
+    "senses/ledger",
+    "senses/news",
 ]
 
 // MARK: - Action context
@@ -217,6 +262,8 @@ enum FileSystemActions {
         let prefix = drPath.hasSuffix("/") ? drPath : drPath + "/"
         guard pPath == drPath || pPath.hasPrefix(prefix) else { return false }
         let relStr = pPath == drPath ? "" : String(pPath.dropFirst(prefix.count))
+        if relStr == "senses/ledger" || relStr.hasPrefix("senses/ledger/") { return true }
+        if relStr == "senses/news" || relStr.hasPrefix("senses/news/") { return true }
         let parts = relStr.split(separator: "/").map(String.init)
         guard let first = parts.first else { return false }
         if connectorSensitiveDataSubpaths.contains(first) { return true }
@@ -278,9 +325,10 @@ enum FileSystemActions {
         return ""
     }
 
-    static func errResult(_ message: String, code: String? = nil) -> JSONValue {
+    static func errResult(_ message: String, code: String? = nil, folder: String? = nil) -> JSONValue {
         var obj: [String: JSONValue] = ["ok": .bool(false), "error": .string(message)]
         if let code { obj["error_code"] = .string(code) }
+        if let folder { obj["folder"] = .string(folder) }
         return .object(obj)
     }
 
@@ -327,7 +375,8 @@ enum FileSystemActions {
         maxBytes: Int,
         useCompactDefault: Bool,
         offset: Int,
-        expectedVersion: String
+        expectedVersion: String,
+        preserveInvalidUTF8: Bool = false
     ) throws -> (data: Data, totalBytes: Int, version: String?, byteLimit: Int) {
         func limit(for totalBytes: Int) -> Int {
             if useCompactDefault && shouldUseCompactReadDefault(path: path, actualBytes: totalBytes) {
@@ -356,10 +405,11 @@ enum FileSystemActions {
                 throw FileReadFailure(message: "offset exceeds the file size.", code: "bad_input")
             }
             let byteLimit = limit(for: totalBytes)
+            if FileReadSourceMaterial.metadataOnly { return (Data(), totalBytes, observedVersion, byteLimit) }
             try handle.seek(toOffset: UInt64(offset))
             regularFileReadObserver?(byteLimit)
             let data = try handle.read(upToCount: byteLimit) ?? Data()
-            if offset > 0 && (data.isEmpty || data.first.map { $0 & 0xC0 == 0x80 } == true) {
+            if !preserveInvalidUTF8 && offset > 0 && (data.isEmpty || data.first.map { $0 & 0xC0 == 0x80 } == true) {
                 let prefixCount = min(offset, 3)
                 try handle.seek(toOffset: UInt64(offset - prefixCount))
                 let nearby = Array(try handle.read(upToCount: prefixCount + 4) ?? Data())
@@ -386,7 +436,8 @@ enum FileSystemActions {
             // Keep complete source scalars together across windows. Invalid
             // source bytes still use replacement decoding; an EOF fragment is
             // malformed source, whereas a window-edge fragment is not.
-            let slice = offset + data.count < totalBytes ? completeUTF8Prefix(data) : data
+            var slice = offset + data.count < totalBytes ? completeUTF8Prefix(data) : data
+            if preserveInvalidUTF8 { slice = data }
             if byteLimit > 0 && slice.isEmpty && !data.isEmpty {
                 throw FileReadFailure(message: "max_bytes cannot hold the next UTF-8 character. Use at least 4 bytes.", code: "window_too_small")
             }
@@ -465,9 +516,13 @@ enum FileSystemActions {
         let exists = FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir)
         if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found") }
         if isDir.boolValue {
+            if FileReadSourceMaterial.metadataOnly, ["pages", "numbers", "key", "rtfd"].contains(resolved.pathExtension.lowercased()) {
+                return .object(["ok": .bool(true), "path": .string(resolved.path), "bytes": .int(0)])
+            }
             let pattern = stringField(input, "match")
             guard !pattern.isEmpty else {
-                return errResult("Not a file: \(resolved.path). Pass match (e.g. \"*.png\") to read files in this folder.", code: "bad_input")
+                return errResult("Not a file: \(resolved.path). Pass match (e.g. \"*.png\") to read files in this folder.", code: "bad_input",
+                                 folder: resolved.path)
             }
             return readMatching(in: resolved, pattern: pattern, input: input, ctx)
         }
@@ -482,24 +537,46 @@ enum FileSystemActions {
         // Decode from the bytes THIS verified descriptor produces. Reopening the
         // path to decode would validate one
         // file and render another after a swap.
-        if VerifiedImageRead.isImagePath(resolved) {
-            let bytes = ((try? handle.read(upToCount: LocalToolImage.maximumBytes + 1)) ?? nil) ?? Data()
-            let image = VerifiedImageRead.deliver(data: bytes, name: resolved.lastPathComponent)
+        // Exact bytes only for an explicitly raw read of a binary file; text
+        // files keep their windows and errors unchanged.
+        let explicitlyRaw = input["raw"] == .bool(true) && FileReadSourceMaterial.isBinary(path: resolved.path)
+        if !explicitlyRaw && VerifiedImageRead.isImagePath(resolved) {
             guard offset == 0 && expectedVersion.isEmpty else {
                 return errResult("Image reads return pixels, not byte windows. Omit offset and version.", code: "bad_input")
             }
-            return image
+            if !FileReadSourceMaterial.metadataOnly {
+                let bytes = ((try? handle.read(upToCount: LocalToolImage.maximumBytes + 1)) ?? nil) ?? Data()
+                return VerifiedImageRead.deliver(data: bytes, name: resolved.lastPathComponent)
+            }
+        }
+        // A PDF or other binary read as bytes is replacement characters, not
+        // text (10-08: 150K chars of a 1099 PDF). Documents read as text through mac.read.
+        if !explicitlyRaw, !FileReadSourceMaterial.metadataOnly, FileReadSourceMaterial.isBinary(path: resolved.path) {
+            let document = ["pdf", "pages", "numbers", "key", "rtfd", "docx", "doc", "rtf"]
+                .contains(resolved.pathExtension.lowercased())
+            var refusal: [String: JSONValue] = ["ok": .bool(false), "error_code": .string("binary_file"),
+                "error": .string(document
+                    ? "\(resolved.lastPathComponent) is a document, not plain text; nothing was read. Its text comes from mac.read."
+                    : "\(resolved.lastPathComponent) is binary, not text; nothing was read. Pass raw:true for its bytes as base64.")]
+            if document {
+                refusal["next_call"] = .object(["tool": .string("app"), "input": .object([
+                    "action": .string("mac.read"), "args": .object(["path": .string(resolved.path)])])])
+            }
+            return .object(refusal)
         }
         let window: (data: Data, totalBytes: Int, version: String?, byteLimit: Int)
         do {
             window = try readFileWindow(
                 handle: handle, path: resolved, maxBytes: maxBytes, useCompactDefault: !hasExplicitMaxBytes,
-                offset: offset, expectedVersion: expectedVersion
+                offset: offset, expectedVersion: expectedVersion, preserveInvalidUTF8: explicitlyRaw
             )
         } catch let error as FileReadFailure {
             return errResult(error.message, code: error.code)
         } catch {
             return errResult("could not read file: \(error.localizedDescription)", code: "read_failed")
+        }
+        if FileReadSourceMaterial.metadataOnly {
+            return .object(["ok": .bool(true), "path": .string(resolved.path), "bytes": .int(Int64(window.totalBytes))])
         }
         let nextOffset = offset + window.data.count
         let hasMore = nextOffset < window.totalBytes
@@ -509,11 +586,22 @@ enum FileSystemActions {
             "bytes": .int(Int64(window.totalBytes)),
             "status": .string("ok"),
             "offset": .int(Int64(offset)),
+            "read_mode": .string("bytes"),
+            "max_bytes": .int(Int64(window.byteLimit)),
             "returned_bytes": .int(Int64(window.data.count)),
             "truncated": .bool(hasMore),
             "has_more": .bool(hasMore),
             "content": .string(decodeUTF8Replacing(window.data)),
         ]
+        if explicitlyRaw {
+            result["content"] = .string(window.data.base64EncodedString())
+            result["encoding"] = .string("base64")
+        }
+        // A whole-file read carries the hash a guarded replacement checks
+        // (version is the paging cursor, not this).
+        if offset == 0, !hasMore {
+            result["content_sha256"] = .string(SHA256.hash(data: window.data).map { String(format: "%02x", $0) }.joined())
+        }
         if let version = window.version {
             result["version"] = .string(version)
             if hasMore {
@@ -521,6 +609,10 @@ enum FileSystemActions {
                     "path": .string(rawPath), "offset": .int(Int64(nextOffset)),
                     "max_bytes": .int(Int64(max(4, window.byteLimit))), "version": .string(version),
                 ])
+                if explicitlyRaw, case .object(var next)? = result["next"] {
+                    next["raw"] = .bool(true)
+                    result["next"] = .object(next)
+                }
             }
         } else if hasMore {
             result["continuation_note"] = .string("Nonregular source: stable byte continuation unavailable.")
@@ -616,11 +708,15 @@ enum FileSystemActions {
             "ok": .bool(true),
             "path": .string(resolved.path),
             "start_line": .int(Int64(total > 0 ? startIdx + 1 : 1)),
+            "read_mode": .string("lines"),
             "status": .string("ok"),
             "end_line": .int(Int64(endIdx)),
             "total_lines": .int(Int64(total)),
             "excerpt": .string(window.rendered.joined(separator: "\n")),
             "truncated": .bool(endIdx < total),
+            "has_more": .bool(endIdx < total),
+            "next": endIdx < total ? .object(["path": .string(rawPath),
+                "start_line": .int(Int64(endIdx + 1)), "max_lines": .int(Int64(maxLines))]) : .null,
         ])
     }
 
@@ -686,8 +782,74 @@ enum FileSystemActions {
 
     // MARK: - write_file
 
+    static func mutationRefusal(_ resolved: URL, _ ctx: ConnectorActionContext) -> JSONValue? {
+        let allowed = allowedRoots(ctx)
+        if stringField(ctx.fileAccess, "sandbox") == "read-only" || stringField(ctx.fileAccess, "mode") == "read_only" {
+            return errResult("Sandbox is read-only — cannot write files. Request write access for this session.", code: "path_not_allowed")
+        }
+        if !allowed.isEmpty && !isWithinRoots(resolved, allowed) {
+            return errResult("Path '\(resolved.path)' is outside writable sandbox roots: \(rootsRepr(allowed))", code: "path_not_allowed")
+        }
+        if isSensitiveDataPath(resolved, ctx) {
+            return errResult("Path '\(resolved.path)' is under a sensitive data sub-tree. Use dedicated Swift runtime tools instead.", code: "path_not_allowed")
+        }
+        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolved.path) {
+            return errResult(reason, code: "path_not_allowed")
+        }
+        return nil
+    }
+
+    static func trashFile(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
+        let rawPath = stringField(input, "path")
+        guard !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return errResult("path is required", code: "bad_input")
+        }
+        let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot)
+        if let refusal = mutationRefusal(resolved, ctx) { return refusal }
+        let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path).resolvingSymlinksInPath()
+        if isWithinRoots(dataRoot, [resolved]) {
+            return errResult("Cannot trash NativeAgent's data root or a folder containing it.", code: "path_not_allowed")
+        }
+        do {
+            var destination: NSURL?
+            try FileManager.default.trashItem(at: resolved, resultingItemURL: &destination)
+            return .object(["ok": .bool(true), "status": .string("completed"),
+                "path": .string(resolved.path), "trash_path": destination?.path.map(JSONValue.string) ?? .null,
+                "message": .string("Moved to the Trash. Restore it from the Trash if needed.")])
+        } catch { return errResult(error.localizedDescription, code: "trash_failed") }
+    }
+
     /// Task-scoped observation of the opened append handle for race fixtures.
     @TaskLocal static var appendHandleOpened: (@Sendable () -> Void)?
+
+    static func transferFile(_ input: [String: JSONValue], _ ctx: ConnectorActionContext, copy: Bool) -> JSONValue {
+        let path = stringField(input, "path"), destination = stringField(input, "destination")
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return errResult("path and destination are required; destination is the complete new path, including the filename.", code: "bad_input")
+        }
+        if let overwrite = input["overwrite"], overwrite != .null {
+            guard case .bool = overwrite else { return errResult("overwrite must be true or false.", code: "bad_input") }
+        }
+        let source = resolvePath(path, repoRoot: ctx.repoRoot), target = resolvePath(destination, repoRoot: ctx.repoRoot)
+        for url in [source, target] {
+            if let refusal = mutationRefusal(url, ctx) { return refusal }
+        }
+        let dataRoot = URL(fileURLWithPath: ctx.dataRoot ?? PersistenceCore.defaultDataRoot().path).resolvingSymlinksInPath()
+        guard source != target, !isWithinRoots(target, [source]), !isWithinRoots(dataRoot, [source]) else {
+            return errResult("Cannot transfer an item onto itself, into itself, or transfer NativeAgent's data root or a folder containing it.", code: "path_not_allowed")
+        }
+        do {
+            try VerifiedPath.transfer(from: source, to: target, copy: copy, overwrite: input["overwrite"] == .bool(true))
+            return .object(["ok": .bool(true), "status": .string("completed"), "path": .string(source.path),
+                "destination": .string(target.path), "operation": .string(copy ? "copy" : "move")])
+        } catch VerifiedPath.Failure.posix(EEXIST) {
+            return errResult("Destination already exists. Choose another path or set overwrite:true only when replacement was requested.", code: "destination_exists")
+        } catch VerifiedPath.Failure.posix(EXDEV) {
+            return errResult("Move requires source and destination on the same filesystem. Copy the file explicitly before deciding whether to trash the original.", code: "cross_device_move")
+        } catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code) }
+        catch { return errResult(error.localizedDescription, code: "transfer_failed") }
+    }
 
     static func writeFile(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let rawPath = stringField(input, "path")
@@ -721,33 +883,7 @@ enum FileSystemActions {
         } else { expectedHash = nil }
 
         let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot)
-        let allowed = allowedRoots(ctx)
-        let sandbox = stringField(ctx.fileAccess, "sandbox")
-        let mode = stringField(ctx.fileAccess, "mode")
-        if sandbox == "read-only" || mode == "read_only" {
-            return errResult(
-                "Sandbox is read-only — cannot write files. Request write access for this session.",
-                code: "path_not_allowed"
-            )
-        }
-        if !allowed.isEmpty && !isWithinRoots(resolved, allowed) {
-            return errResult(
-                "Path '\(resolved.path)' is outside writable sandbox roots: \(rootsRepr(allowed))",
-                code: "path_not_allowed"
-            )
-        }
-        if isSensitiveDataPath(resolved, ctx) {
-            return errResult(
-                "Path '\(resolved.path)' is under a sensitive data sub-tree (OAuth tokens, "
-                + "pairing secrets, provider credentials, trust policy). "
-                + "Writes to these paths are not permitted via write_file. "
-                + "Use dedicated Swift runtime tools instead.",
-                code: "path_not_allowed"
-            )
-        }
-        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolved.path) {
-            return errResult(reason, code: "path_not_allowed")
-        }
+        if let refusal = mutationRefusal(resolved, ctx) { return refusal }
 
         // before_content for inline diff (only on overwrite, not append), ≤ 200 kB.
         var beforeContent: String? = nil
@@ -856,7 +992,7 @@ enum FileSystemActions {
                               fstat(currentFD, &opened) == 0,
                               fstatat(verified.fd, verified.name, &named, AT_SYMLINK_NOFOLLOW) == 0,
                               opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else {
-                            return errResult("The file changed since the revision was prepared. Read it again before revising; nothing was written.", code: "file_changed")
+                            return errResult("The file does not match expected_content_sha256 (use the content_sha256 from a whole-file read, not version). Read it again before revising; nothing was written.", code: "file_changed")
                         }
                     } catch {
                         return errResult("The original file could not be verified. Read it again before revising; nothing was written.", code: "file_changed")
@@ -892,6 +1028,7 @@ enum FileSystemActions {
     // MARK: - list_dir
 
     static func listDir(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
+        let started = ContinuousClock.now
         let rawPath = stringField(input, "path")
         if rawPath.isEmpty { return errResult("path is required", code: "bad_input") }
         let rawMe = input["max_entries"]
@@ -904,7 +1041,7 @@ enum FileSystemActions {
         if case .double(let value)? = input["offset"], Int(exactly: value) == nil {
             return errResult("offset must be a nonnegative whole entry count", code: "bad_input")
         }
-        for field in ["name_contains", "snapshot"] {
+        for field in ["name_contains", "snapshot", "sort"] {
             switch input[field] {
             case nil, .null?, .string?: break
             default: return errResult("\(field) must be a string", code: "bad_input")
@@ -914,6 +1051,13 @@ enum FileSystemActions {
             return errResult("offset must be a nonnegative integer", code: "bad_input")
         }
         let nameContains = stringField(input, "name_contains")
+        let sort = stringField(input, "sort").isEmpty ? "name" : stringField(input, "sort")
+        guard ["name", "newest", "added", "size"].contains(sort) else { return errResult("sort must be name, newest, added or size", code: "bad_input") }
+        guard let budget = safeInt(input["time_budget_seconds"], default: 5), (1...20).contains(budget) else {
+            return errResult("time_budget_seconds must be an integer from 1 to 20", code: "bad_input")
+        }
+        let deadline = started.advanced(by: .seconds(budget))
+        if sort == "size" && offset > 0 { return errResult("Narrow path for another size scan; size rankings cannot be paged across changing scans", code: "bad_input") }
         let caseSensitive: Bool
         switch input["case_sensitive"] {
         case .bool(let value)?: caseSensitive = value
@@ -954,8 +1098,12 @@ enum FileSystemActions {
         // is immediate. readdir's d_type classifies the entry without entering
         // the child mount. Unknown/symlink types are conservatively presented
         // as files; list_dir is presentation-only and must not follow them.
-        struct Entry { let name: String; let isFile: Bool }
+        struct Entry {
+            let name: String; let isFile: Bool; var modified: Date? = nil; var added: Date? = nil
+            var bytes: Int64 = 0; var complete = false
+        }
         var entries: [Entry] = []
+        var namesComplete = true
         #if canImport(Darwin)
         // Authorize, then list THAT directory: the walk re-opens each component
         // O_DIRECTORY|O_NOFOLLOW from the root and the listing runs on the
@@ -977,6 +1125,7 @@ enum FileSystemActions {
         }
         errno = 0
         while let pointer = readdir(directory) {
+            if sort == "size" && ContinuousClock.now >= deadline { namesComplete = false; errno = 0; break }
             var bytes = pointer.pointee.d_name
             let name = withUnsafePointer(to: &bytes) { tuplePointer in
                 tuplePointer.withMemoryRebound(
@@ -985,10 +1134,29 @@ enum FileSystemActions {
                 ) { String(cString: $0) }
             }
             guard name != ".", name != ".." else { continue }
-            entries.append(Entry(
-                name: name,
-                isFile: pointer.pointee.d_type != UInt8(DT_DIR)
-            ))
+            var entry = Entry(name: name, isFile: pointer.pointee.d_type != UInt8(DT_DIR))
+            // Date sorts include directories such as app bundles; metadata only,
+            // without following links. The packed buffer starts after its length.
+            if sort != "size", pointer.pointee.d_type == UInt8(DT_REG)
+                || (["newest", "added"].contains(sort) && pointer.pointee.d_type == UInt8(DT_DIR)) {
+                var attrs = attrlist()
+                attrs.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+                attrs.commonattr = UInt32(ATTR_CMN_MODTIME | ATTR_CMN_ADDEDTIME)
+                var bytes = [UInt8](repeating: 0, count: 4 + 2 * MemoryLayout<timespec>.size)
+                let status = bytes.withUnsafeMutableBytes {
+                    getattrlistat(dirfd(directory), name, &attrs, $0.baseAddress, $0.count, UInt(FSOPT_NOFOLLOW))
+                }
+                if status == 0 {
+                    bytes.withUnsafeBytes {
+                        let modified = $0.loadUnaligned(fromByteOffset: 4, as: timespec.self)
+                        let added = $0.loadUnaligned(fromByteOffset: 4 + MemoryLayout<timespec>.size, as: timespec.self)
+                        entry.modified = Date(timeIntervalSince1970: Double(modified.tv_sec) + Double(modified.tv_nsec) / 1e9)
+                        if added.tv_sec > 0 { entry.added = Date(timeIntervalSince1970: Double(added.tv_sec) + Double(added.tv_nsec) / 1e9) }
+                    }
+                }
+            }
+            entries.append(entry)
+            errno = 0
         }
         if errno != 0 {
             return errResult(String(cString: strerror(errno)))
@@ -1003,7 +1171,18 @@ enum FileSystemActions {
               beforeStat.st_ctimespec.tv_nsec == afterStat.st_ctimespec.tv_nsec else {
             return errResult("Directory changed while listing. Restart at offset 0.", code: "directory_changed")
         }
+        if sort == "size" {
+            var seen: Set<UInt64> = []
+            for index in entries.indices {
+                let size = allocatedSize(parent: dirfd(directory), name: entries[index].name,
+                    path: resolved.appendingPathComponent(entries[index].name), device: beforeStat.st_dev,
+                    deadline: deadline, context: ctx, seen: &seen)
+                entries[index].bytes = size.bytes
+                entries[index].complete = size.complete
+            }
+        }
         #else
+        if sort == "size" || sort == "added" { return errResult("Allocated disk usage and added-date ordering require macOS", code: "unavailable") }
         do {
             entries = try fm.contentsOfDirectory(atPath: resolved.path)
                 .map { Entry(name: $0, isFile: true) }
@@ -1012,13 +1191,20 @@ enum FileSystemActions {
         }
         #endif
         entries.sort { lhs, rhs in
+            if sort == "size", lhs.bytes != rhs.bytes { return lhs.bytes > rhs.bytes }
+            if sort == "newest" || sort == "added" {
+                // newest keeps "arrived most recently" (added, else modified); added is added only.
+                let left = (sort == "added" ? lhs.added : lhs.added ?? lhs.modified) ?? .distantPast
+                let right = (sort == "added" ? rhs.added : rhs.added ?? rhs.modified) ?? .distantPast
+                if left != right { return left > right }
+            }
             if lhs.isFile != rhs.isFile { return !lhs.isFile && rhs.isFile }
             return lhs.name < rhs.name
         }
         // A stateless token binds continuation to this path, filter, ordering,
         // and observed names/types. It says nothing about child file contents.
-        let fingerprintFields = [resolved.path, nameContains, caseSensitive ? "sensitive" : "insensitive"]
-            + entries.flatMap { [$0.name, $0.isFile ? "other" : "directory"] }
+        let fingerprintFields = [resolved.path, nameContains, caseSensitive ? "sensitive" : "insensitive", sort]
+            + entries.flatMap { [$0.name, $0.isFile ? "other" : "directory", String($0.modified?.timeIntervalSince1970 ?? 0), String($0.added?.timeIntervalSince1970 ?? 0)] }
         let snapshot = SHA256.hash(data: Data(fingerprintFields.joined(separator: "\0").utf8))
             .map { String(format: "%02x", $0) }.joined()
         if !expectedSnapshot.isEmpty && expectedSnapshot != snapshot {
@@ -1035,11 +1221,18 @@ enum FileSystemActions {
         let page = matches.dropFirst(start).prefix(maxEntries)
         let out = page.map { JSONValue.string($0.isFile ? $0.name : $0.name + "/") }
         let nextOffset = start + out.count
-        let hasMore = nextOffset < matches.count
+        let hasMore = nextOffset < matches.count || !namesComplete
+        let iso = ISO8601DateFormatter()
         var result: [String: JSONValue] = [
             "ok": .bool(true),
             "path": .string(resolved.path),
             "entries": .array(out),
+            "items": .array(page.map { .object(["name": .string($0.name), "is_directory": .bool(!$0.isFile),
+                "allocated_bytes": sort == "size" ? .int($0.bytes) : .null,
+                "size_complete": sort == "size" ? .bool($0.complete) : .null,
+                "modified_at": $0.modified.map { .string(iso.string(from: $0)) } ?? .null,
+                "added_at": $0.added.map { .string(iso.string(from: $0)) } ?? .null]) }),
+            "sort": .string(sort),
             "status": .string("ok"),
             "count": .int(Int64(out.count)),
             "total_visible": .int(Int64(entries.count)),
@@ -1050,12 +1243,26 @@ enum FileSystemActions {
             "snapshot": .string(snapshot),
             "truncated": .bool(hasMore),
             "has_more": .bool(hasMore),
-            "coverage": .string("Immediate child names only; no recursion, child metadata probes, or file-content search."),
+            "coverage": .string("Immediate children only; dates are read without following links. Date sorts include directory metadata. Link or unavailable dates are null and sort last. newest sorts by added_at, then modified_at when added_at is unknown; added sorts by added_at only. No recursion or file-content search."),
         ]
-        if hasMore {
+        if sort == "size" {
+            result["allocated_bytes"] = .int(entries.reduce(Int64(0)) { $0 + $1.bytes } + Int64(beforeStat.st_blocks) * 512)
+            var afterScan = stat()
+            let unchanged = fstat(dirfd(directory), &afterScan) == 0
+                && beforeStat.st_mtimespec.tv_sec == afterScan.st_mtimespec.tv_sec
+                && beforeStat.st_mtimespec.tv_nsec == afterScan.st_mtimespec.tv_nsec
+            result["size_complete"] = .bool(namesComplete && unchanged && entries.allSatisfy(\.complete))
+            result["listing_complete"] = .bool(namesComplete)
+            result["partial_paths"] = .array(entries.filter { !$0.complete }.map { .string(resolved.appendingPathComponent($0.name).path) }
+                + (namesComplete && unchanged ? [] : [.string(resolved.path)]))
+            result["coverage"] = .string("Allocated bytes observed during this scan, including hidden entries; hard links count once. Incomplete sizes are lower bounds, never totals. Partial paths include budget exhaustion, unreadable/protected descendants, changed entries or other volumes. Links and other volumes are not traversed. Metadata I/O must return before the budget can be checked; rankings cover observed bytes only. Narrow path to examine a partial folder.")
+            result["time_budget_seconds"] = .int(Int64(budget))
+        }
+        if hasMore && sort != "size" {
             result["next"] = .object([
                 "path": .string(resolved.path),
                 "name_contains": .string(nameContains),
+                "sort": .string(sort),
                 "case_sensitive": .bool(caseSensitive),
                 "max_entries": .int(Int64(maxEntries)),
                 "offset": .int(Int64(nextOffset)),
@@ -1065,9 +1272,80 @@ enum FileSystemActions {
         return .object(result)
     }
 
+    #if canImport(Darwin)
+    static func allocatedSize(parent: Int32, name: String, path: URL, device: dev_t,
+                              deadline: ContinuousClock.Instant, context: ConnectorActionContext,
+                              seen: inout Set<UInt64>) -> (bytes: Int64, complete: Bool) {
+        guard ContinuousClock.now < deadline, !isSensitiveDataPath(path, context) else { return (0, false) }
+        var info = stat()
+        guard fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) == 0, info.st_dev == device else { return (0, false) }
+        let directory = (info.st_mode & S_IFMT) == S_IFDIR
+        if !directory && info.st_nlink > 1 && !seen.insert(UInt64(info.st_ino)).inserted { return (0, true) }
+        var bytes = Int64(info.st_blocks) * 512
+        guard directory else { return (bytes, true) }
+        let fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return (bytes, false) }
+        guard let stream = fdopendir(fd) else { close(fd); return (bytes, false) }
+        defer { closedir(stream) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else { return (bytes, false) }
+        var complete = true
+        while ContinuousClock.now < deadline {
+            errno = 0
+            guard let pointer = readdir(stream) else {
+                var after = stat()
+                return (bytes, complete && errno == 0 && fstat(fd, &after) == 0
+                    && opened.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec
+                    && opened.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec)
+            }
+            var raw = pointer.pointee.d_name
+            let child = withUnsafePointer(to: &raw) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+            }
+            guard child != ".", child != ".." else { continue }
+            let size = allocatedSize(parent: fd, name: child, path: path.appendingPathComponent(child),
+                device: device, deadline: deadline, context: context, seen: &seen)
+            bytes += size.bytes
+            complete = complete && size.complete
+        }
+        return (bytes, false)
+    }
+    #endif
+
     // MARK: - system_info
 
     static func systemInfo(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
+        if let speed = input["speed_test"], speed != .null {
+            guard case .bool = speed else { return errResult("speed_test must be true or false.", code: "bad_input") }
+            guard speed != .bool(true) || ((input["app"] == nil || input["app"] == .null) && input["check_updates"] != .bool(true)) else {
+                return errResult("speed_test must be true or false and cannot combine with app or check_updates.", code: "bad_input")
+            }
+        }
+        if case .string(let name)? = input["app"] {
+            let app = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard input["check_updates"] != .bool(true) else {
+                return errResult("Use app for an installed app version or check_updates for macOS updates, separately.", code: "bad_input")
+            }
+            guard !app.isEmpty, let url = SystemAppControlAdapter.installedApplicationURL(named: app),
+                  let bundle = Bundle(url: url), let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+                  !version.isEmpty else {
+                return errResult("No readable version for that exact installed app name. Supply its exact name or full .app path.", code: "app_version_unavailable")
+            }
+            return .object(["ok": .bool(true), "status": .string("ok"), "app": .string(url.deletingPathExtension().lastPathComponent),
+                "path": .string(url.path), "version": .string(version),
+                "build": (bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String).map(JSONValue.string) ?? .null])
+        }
+        if input["check_updates"] == .bool(true) {
+            let run = runProcess("/usr/sbin/softwareupdate", ["--list"], timeout: 30, captureByteLimit: 64 * 1024)
+            guard run.launched, !run.timedOut, run.status == 0, !run.captureReadFailed,
+                  !run.stdoutTruncated, !run.stderrTruncated else {
+                return errResult(run.timedOut ? "macOS update check exceeded 30 seconds; no update status is known. Check System Settings → General → Software Update."
+                    : "macOS update check failed: \(run.stderr). Check System Settings → General → Software Update.", code: "software_update_unavailable")
+            }
+            return .object(["ok": .bool(true), "status": .string("ok"), "source": .string("softwareupdate --list"),
+                "updates": .string(run.stdout + run.stderr),
+                "scope": .string("macOS and software offered by Software Update. NativeAgent and App Store app updates are separate; check App Store → Updates for App Store apps.")])
+        }
         let version = ProcessInfo.processInfo.operatingSystemVersion
         var fields: [String: JSONValue] = [
             "macos_version": .string("\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"),
@@ -1128,11 +1406,88 @@ enum FileSystemActions {
             failures.append("memory: vm_stat failed")
         }
 
+        let processes = runProcess("/bin/ps", ["-axo", "pid=,pcpu=,rss=,comm="],
+            timeout: 5, captureByteLimit: 256 * 1024)
+        if processes.launched, processes.status == 0, !processes.timedOut,
+           !processes.stdoutTruncated, !processes.captureReadFailed {
+            let rows: [(cpu: Double, memory: Int64, row: JSONValue)] = processes.stdout.split(separator: "\n").compactMap { line in
+                let parts = line.split(maxSplits: 3, whereSeparator: { $0.isWhitespace })
+                guard parts.count == 4, let pid = Int64(parts[0]),
+                      let cpu = Double(parts[1]), cpu.isFinite, let rss = Int64(parts[2]) else { return nil }
+                return (cpu, rss, .object(["pid": .int(pid), "name": .string(String(parts[3])),
+                    "cpu_percent": .double(cpu), "resident_memory_mb": .double(Double(rss) / 1024)]))
+            }
+            fields["top_processes"] = .object([
+                "by_cpu": .array(rows.sorted { $0.cpu > $1.cpu }.prefix(5).map(\.row)),
+                "by_memory": .array(rows.sorted { $0.memory > $1.memory }.prefix(5).map(\.row)),
+                "note": .string("Top five processes per ranking from one ps read. CPU is ps's scheduler estimate; memory is resident MB. Process arguments are not read."),
+            ])
+        } else { failures.append("top_processes: ps did not return a complete bounded snapshot") }
+
         // Network: ping 8.8.8.8 → reachable bool.
+        var network: [String: JSONValue] = ["local_ip": .null, "vpn": .null]
         if let ping = runCommand("/sbin/ping", ["-c", "1", "-W", "1000", "8.8.8.8"]) {
-            fields["network"] = .object(["reachable": .bool(ping.status == 0)])
+            network["reachable"] = .bool(ping.status == 0)
         } else {
             failures.append("network: ping failed")
+        }
+        if let store = SCDynamicStoreCreate(nil, "NativeAgent system info" as CFString, nil, nil),
+           let primary = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any] {
+            network["primary_interface"] = (primary["PrimaryInterface"] as? String).map(JSONValue.string) ?? .null
+            network["router"] = (primary["Router"] as? String).map(JSONValue.string) ?? .null
+            if let interface = primary["PrimaryInterface"] as? String {
+                let addresses = ["IPv4", "IPv6"].flatMap { family -> [String] in
+                    let state = SCDynamicStoreCopyValue(store, "State:/Network/Interface/\(interface)/\(family)" as CFString) as? [String: Any]
+                    return state?["Addresses"] as? [String] ?? []
+                }
+                network["local_ip"] = .array(addresses.map(JSONValue.string))
+            }
+        }
+        let publicIP = runProcess("/usr/bin/curl", ["--silent", "--show-error", "--fail", "--connect-timeout", "2", "--max-time", "3", "https://api.ipify.org"], timeout: 5, captureByteLimit: 1024)
+        let address = publicIP.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        var ipv4 = in_addr(), ipv6 = in6_addr()
+        if publicIP.launched, publicIP.status == 0, !publicIP.timedOut, !publicIP.stdoutTruncated,
+           !publicIP.captureReadFailed, inet_pton(AF_INET, address, &ipv4) == 1 || inet_pton(AF_INET6, address, &ipv6) == 1 {
+            network["public_ip"] = .string(address)
+        } else {
+            network["public_ip"] = .null
+            failures.append("public_ip: HTTPS lookup unavailable within its 3-second limit")
+        }
+        let vpn = runProcess("/usr/sbin/scutil", ["--nc", "list"], timeout: 3, captureByteLimit: 16 * 1024)
+        if vpn.launched, vpn.status == 0, !vpn.timedOut, !vpn.stdoutTruncated, !vpn.captureReadFailed {
+            let connected = vpn.stdout.split(separator: "\n").filter { $0.contains("(Connected)") }.map { JSONValue.string(String($0)) }
+            network["vpn"] = .object(["connected": .bool(!connected.isEmpty), "services": .array(connected),
+                "source": .string("scutil --nc list"),
+                "note": .string("Connected macOS VPN services. VPN apps that do not register a network connection service may not appear; this does not prove all traffic uses a VPN.")])
+        } else { failures.append("vpn: macOS network connection services could not be read") }
+        if input["speed_test"] == .bool(true) {
+            let speed = runProcess("/usr/bin/networkQuality", ["-s", "-c", "-M", "20"], timeout: 25, captureByteLimit: 64 * 1024)
+            if speed.launched, speed.status == 0, !speed.timedOut, !speed.stdoutTruncated, !speed.captureReadFailed,
+               let measured = try? JSONValue.parse(Data(speed.stdout.utf8)), case .object = measured {
+                network["speed_test"] = .object(["source": .string("networkQuality -s -c -M 20"), "measurement": measured,
+                    "note": .string("Requested sequential upload/download measurement, limited to 20 seconds. Throughput is bits per second; responsiveness is round trips per minute. This uses internet bandwidth.")])
+            } else { failures.append("speed_test: no complete networkQuality measurement; request a new measurement when the connection is available") }
+        }
+        if let wifi = CWWiFiClient.shared().interface() {
+            let ssid = wifi.ssid()
+            network["wifi"] = .object([
+                "interface": wifi.interfaceName.map(JSONValue.string) ?? .null,
+                "power_on": .bool(wifi.powerOn()), "ssid": ssid.map(JSONValue.string) ?? .null,
+                "note": .string(ssid == nil
+                    ? "Wi-Fi SSID is unavailable: Wi-Fi may be disconnected or macOS may withhold it without Location Services access. No permission was requested."
+                    : "Current Wi-Fi SSID from CoreWLAN; primary_interface identifies the Mac's active IPv4 route."),
+            ])
+        } else { network["wifi_note"] = .string("No Wi-Fi interface is available.") }
+        fields["network"] = .object(network)
+        // Uptime and last boot, so "how long has it been on" and "when did it restart" read the same fact (10-09).
+        // kern.boottime, not systemUptime: the latter stops while the Mac sleeps.
+        var boot = timeval(), size = MemoryLayout<timeval>.stride
+        if sysctlbyname("kern.boottime", &boot, &size, nil, 0) == 0, boot.tv_sec > 0 {
+            let booted = Date(timeIntervalSince1970: TimeInterval(boot.tv_sec))
+            let bootISO = ISO8601DateFormatter()
+            bootISO.timeZone = .current
+            fields["uptime_seconds"] = .int(Int64(Date().timeIntervalSince(booted)))
+            fields["booted_at"] = .string(bootISO.string(from: booted))
         }
 
         fields["screen_lock"] = .object(["locked": .bool(MacScreenLock.isLocked())])
@@ -1511,7 +1866,10 @@ enum FileSystemActions {
         // 2026-09-06: `--no-ext-diff` / `--no-textconv` are the per-command
         // half of the exec fence; the global `-c` overrides in runGit are the
         // other half.
-        var args = ["diff", "--no-ext-diff", "--no-textconv"]
+        let since = gitSince(input)
+        if !since.isEmpty && staged { return errResult("since reads committed changes; omit staged", code: "bad_input") }
+        var args = since.isEmpty ? ["diff"] : ["log", "--since-as-filter=\(since)", "--format=commit %h %s", "--patch"]
+        args += ["--no-ext-diff", "--no-textconv"]
         if staged { args.append("--staged") }
         if !pathFilter.isEmpty { args.append(contentsOf: ["--", pathFilter]) }
 
@@ -1521,6 +1879,7 @@ enum FileSystemActions {
         return .object([
             "ok": .bool(true),
             "staged": .bool(staged),
+            "since": since.isEmpty ? .null : .string(since),
             "status": .string("ok"),
             "diff": .string(truncate(result.stdout)),
             // PARITY (gpt-5.5 review): Python `len(result.stdout)` counts Unicode
@@ -1545,22 +1904,33 @@ enum FileSystemActions {
         // Python: min(_safe_int(inp.get("limit"), default=10) or 10, 100).
         // safeInt returns nil on unparseable; `or 10` also coerces 0 → 10.
         let parsed = safeInt(input["limit"], default: 10)
-        let limit = min((parsed == nil || parsed == 0) ? 10 : parsed!, 100)
+        let limit = max(1, min((parsed == nil || parsed == 0) ? 10 : parsed!, 100))
+        let since = gitSince(input)
+        var args = ["log", "--format=%x1e%h|%an|%ai|%s", "--name-only"]
+        args.append(since.isEmpty ? "-n\(limit + 1)" : "--since-as-filter=\(since)")
+        let pathFilter = stringField(input, "path")
+        if !pathFilter.isEmpty { args += ["--", pathFilter] }
 
-        let run = runGit(["log", "-n\(limit)", "--format=%h|%an|%ai|%s"], cwd: cwd, timeout: 15, label: "git log", context: ctx)
+        let run = runGit(args, cwd: cwd, timeout: 15, label: "git log", context: ctx)
         if case .failure(let f) = run { return f }
         guard case .success(let result) = run else { return errResult("git log failed", code: "git_unavailable") }
 
         var commits: [JSONValue] = []
-        for rawLine in splitLines(result.stdout) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty { continue }
+        var files: Set<String> = []
+        let records = result.stdout.components(separatedBy: "\u{1e}").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        for record in records.prefix(since.isEmpty ? limit : records.count) {
+            let lines = splitLines(record)
+            guard let line = lines.first else { continue }
             let parts = splitN(line, separator: "|", maxSplits: 3)
+            let changed = lines.dropFirst().filter { !$0.isEmpty }
+            files.formUnion(changed)
+            if commits.count >= limit { continue }
             commits.append(.object([
                 "hash": .string(parts.count > 0 ? parts[0] : ""),
                 "author": .string(parts.count > 1 ? parts[1] : ""),
                 "date": .string(parts.count > 2 ? parts[2] : ""),
                 "subject": .string(parts.count > 3 ? parts[3] : ""),
+                "files": .array(changed.map(JSONValue.string)),
             ]))
         }
         return .object([
@@ -1568,7 +1938,19 @@ enum FileSystemActions {
             "commits": .array(commits),
             "status": .string("ok"),
             "count": .int(Int64(commits.count)),
+            "since": since.isEmpty ? .null : .string(since),
+            "files": .array(files.sorted().map(JSONValue.string)),
+            "has_more": .bool(records.count > limit),
+            "coverage": .string(since.isEmpty
+                ? "Files across returned commits only; has_more means older commit details and files were omitted. Git quotes unusual filenames."
+                : "Files across every matching commit in the period; has_more means older commit details were omitted, not their files. Git quotes unusual filenames."),
         ])
+    }
+
+    static func gitSince(_ input: [String: JSONValue]) -> String {
+        let since = stringField(input, "since").trimmingCharacters(in: .whitespacesAndNewlines)
+        return since.lowercased() == "today"
+            ? ISO8601DateFormatter().string(from: Calendar.current.startOfDay(for: Date())) : since
     }
 
     // MARK: - repo_dirty_summary
@@ -1824,7 +2206,8 @@ enum FileSystemActions {
             "(version 1)", "(allow default)",
             "(deny file-write*)", "(allow file-write* (literal \"/dev/null\"))",
             "(deny network*)", "(deny appleevent-send)", "(deny mach-lookup)",
-            "(deny process-signal)",
+            // Seatbelt names this operation `signal`, not `process-signal`.
+            "(deny signal)",
         ]
         let roots = allowedRoots(ctx)
         if !roots.isEmpty {

@@ -104,7 +104,7 @@ extension MacSyncEngine {
                 try FileManager.default.createDirectory(at: rejectedDir, withIntermediateDirectories: true)
                 try FileManager.default.moveItem(at: fileURL, to: archiveURL)
             } catch {
-                NSLog("[MacSyncEngine] Could not quarantine unauthenticated inbox file: %@", error.localizedDescription)
+                nativeLog("[MacSyncEngine] Could not quarantine unauthenticated inbox file: %@", error.localizedDescription)
             }
         }.value
     }
@@ -168,7 +168,7 @@ extension MacSyncEngine {
                 try data.write(to: coordinatedURL, options: .withoutOverwriting)
                 wrote = true
             } catch {
-                NSLog("[MacSyncEngine] Rejection ledger creation refused: %@", error.localizedDescription)
+                nativeLog("[MacSyncEngine] Rejection ledger creation refused: %@", error.localizedDescription)
             }
         }
         return wrote && error == nil
@@ -293,7 +293,7 @@ extension MacSyncEngine {
                 let responseWritten = await writeInboxResponse(response, to: responseURL)
                 guard responseWritten else {
                     syncError = "Could not write iCloud response for stale command \(staleAction.msgId); left pending for retry."
-                    NSLog("MacSyncEngine.processInboxFiles: %@", syncError ?? "")
+                    nativeLog("MacSyncEngine.processInboxFiles: %@", syncError ?? "")
                     continue
                 }
                 let msgId = staleAction.msgId
@@ -351,7 +351,7 @@ extension MacSyncEngine {
             // doesn't re-trigger on every sync cycle (infinite retrigger bug).
             guard let action = try? decoder.decode(InboxAction.self, from: data) else {
                 syncError = "Rejected inbox file \(fileURL.lastPathComponent): malformed JSON"
-                NSLog("[MacSyncEngine] Rejected malformed inbox file: \(fileURL.lastPathComponent)")
+                nativeLog("[MacSyncEngine] Rejected malformed inbox file: \(fileURL.lastPathComponent)")
                 let rejectedDir = inboxDir.appendingPathComponent("_rejected")
                 let rejectedURL = rejectedDir.appendingPathComponent(fileURL.lastPathComponent)
                 await Task.detached(priority: .utility) { [rejectedDir, fileURL, rejectedURL] in
@@ -362,7 +362,7 @@ extension MacSyncEngine {
             }
             guard let ids = InboxActionFileBoundary.validatedIDs(for: action) else {
                 syncError = "Rejected inbox file \(fileURL.lastPathComponent): invalid message identity"
-                NSLog("[MacSyncEngine] Rejected inbox file with non-UUID identity: %@", fileURL.lastPathComponent)
+                nativeLog("[MacSyncEngine] Rejected inbox file with non-UUID identity: %@", fileURL.lastPathComponent)
                 let rejectedDir = inboxDir.appendingPathComponent("_rejected")
                 let rejectedURL = rejectedDir.appendingPathComponent(fileURL.lastPathComponent)
                 await Task.detached(priority: .utility) { [rejectedDir, fileURL, rejectedURL] in
@@ -561,7 +561,7 @@ extension MacSyncEngine {
                         dataRoot: PersistenceCore.defaultDataRoot()
                     )
                 } catch {
-                    NSLog("[MacSyncEngine] could not persist signed peer evidence for %@: %@",
+                    nativeLog("[MacSyncEngine] could not persist signed peer evidence for %@: %@",
                           action.msgId, error.localizedDescription)
                 }
             }
@@ -600,11 +600,8 @@ extension MacSyncEngine {
                 }.value
                 continue
             }
-            var responseBody = await dispatchAction(action)
-            responseBody["msgId"] = action.msgId
-            responseBody["transactionId"] = transactionId
-            responseBody["action"] = action.action
-            guard let response = try? signedResponse(responseBody) else {
+            let responseBody = await dispatchAction(action)
+            guard let response = try? actionResponse(responseBody, for: action) else {
                 syncError = "Pairing secret unavailable after command \(action.msgId); command left pending without an unsigned response."
                 await writeTransaction(
                     id: transactionId,
@@ -717,7 +714,7 @@ extension MacSyncEngine {
         do {
             responseData = try JSONEncoder().encode(response)
         } catch {
-            NSLog("MacSyncEngine.writeInboxResponse: encode failed for %@: %@",
+            nativeLog("MacSyncEngine.writeInboxResponse: encode failed for %@: %@",
                   responseURL.lastPathComponent, String(describing: error))
             return false
         }
@@ -736,7 +733,7 @@ extension MacSyncEngine {
                 return decoded == response
             }.value
             if landed { return true }
-            NSLog("MacSyncEngine.writeInboxResponse: attempt %d did not land %@",
+            nativeLog("MacSyncEngine.writeInboxResponse: attempt %d did not land %@",
                   attempt, responseURL.lastPathComponent)
         }
         return false
@@ -980,7 +977,7 @@ extension MacSyncEngine {
                         dataRoot: actionStateRoot
                     )
                 } catch {
-                    NSLog("[MacSyncEngine] could not persist CloudKit action peer evidence for %@: %@",
+                    nativeLog("[MacSyncEngine] could not persist CloudKit action peer evidence for %@: %@",
                           action.msgId, error.localizedDescription)
                 }
             }
@@ -1011,11 +1008,8 @@ extension MacSyncEngine {
                 syncError = "Could not reserve CloudKit action \(action.msgId) durably; it was not run and remains unacknowledged."
                 return false
             }
-            var body = await dispatchAction(action)
-            body["msgId"] = action.msgId
-            body["transactionId"] = transactionId
-            body["action"] = action.action
-            guard let signed = try? signedResponse(body) else {
+            let body = await dispatchAction(action)
+            guard let signed = try? actionResponse(body, for: action) else {
                 syncError = "Pairing secret unavailable after CloudKit action \(action.msgId); action remains unacknowledged."
                 return false
             }

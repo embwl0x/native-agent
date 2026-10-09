@@ -89,10 +89,12 @@ public struct AgentHostRow: Sendable, Equatable {
     }
 
     public var isInstalled: Bool {
-        isInstalled(applicationExists: { id in
-            guard let urls = LSCopyApplicationURLsForBundleIdentifier(id as CFString, nil)?.takeRetainedValue() as? [URL] else { return false }
-            return urls.contains { FileManager.default.fileExists(atPath: $0.path) }
-        }, executable: AgentHostCommandLines.resolveExecutable)
+        isInstalled(applicationExists: { Self.applicationURL($0) != nil }, executable: AgentHostCommandLines.resolveExecutable)
+    }
+
+    static func applicationURL(_ id: String) -> URL? {
+        (LSCopyApplicationURLsForBundleIdentifier(id as CFString, nil)?.takeRetainedValue() as? [URL])?
+            .first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     func isInstalled(applicationExists: (String) -> Bool, executable: (String) -> String?) -> Bool {

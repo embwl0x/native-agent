@@ -16,6 +16,7 @@
 // runs on the four-verb path; this file still does no text extraction.)
 
 import Foundation
+import NativeAgentCore
 import ScreenCaptureKit
 import CoreGraphics
 #if canImport(AppKit)
@@ -97,7 +98,11 @@ public actor SwiftNativeScreenVision {
         // Configure a one-shot screenshot. `pixelFormat` is set for parity
         // with the spec; SCScreenshotManager returns a CGImage regardless of
         // pixel-format hint (the hint matters for live SCStream feeds).
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        // Shotgun is the person's window; it never shows in her captures.
+        let filter = SCContentFilter(
+            display: display,
+            excludingWindows: content.windows.filter { PersonOnlyWindows.contains(number: Int($0.windowID)) }
+        )
         let configuration = SCStreamConfiguration()
         // SCDisplay.width/height are POINTS. Configuring the output size in
         // points downsamples Retina displays to 1x; use the display mode's

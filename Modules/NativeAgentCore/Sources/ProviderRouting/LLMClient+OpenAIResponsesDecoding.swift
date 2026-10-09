@@ -255,6 +255,8 @@ extension OpenAIOAuthDirectAdapter {
             throw err
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error as any ProviderFailureWrapping {
+            throw error
         } catch {
             throw mapTransportError(error, fallback: networkError(error))
         }
@@ -280,10 +282,9 @@ extension OpenAIOAuthDirectAdapter {
             // partial as complete and persisted it. Every
             // other adapter throws streamTruncated here —
             // match the contract (audit 2026-06-09).
-            continuation.finish(throwing: LLMError.streamTruncated(
+            throw LLMError.streamTruncated(
                 message: "\(providerLabel) stream ended without terminal event"
-            ))
-            return
+            )
         }
         if let reason = incompleteReason {
             await telemetry.record(

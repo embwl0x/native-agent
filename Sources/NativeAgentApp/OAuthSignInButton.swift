@@ -17,9 +17,6 @@ import PersistenceCore
 ///   OAuthSignInButton(provider: .claude)
 struct OAuthSignInButton: View {
     let provider: OAuthProvider
-    /// Kept for source-compat with call sites that still pass the daemon
-    /// URL — IGNORED now that the flow is fully in-process.
-    var nativeBaseURL: String = ""
     var onSuccess: (() -> Void)? = nil
 
     // S.5: access AppModel so we can propagate revoke state to provider list
@@ -194,6 +191,8 @@ struct OAuthSignInButton: View {
             status = .idle
             return
         }
+        // ChatGPT and Grok finish in the browser; bring the result back to the person.
+        NSApp.activate(ignoringOtherApps: true)
         if result.ok {
             status = .complete
             // F.evalfix2/R2: render the same countdown the next refreshStatus
@@ -276,7 +275,7 @@ struct OAuthSignInButton: View {
             lastError = nil
             cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer(dataRoot: oauthDataRoot)
         } catch {
-            lastError = "Consent repair failed: \(error.localizedDescription)"
+            lastError = UserFacingError.message(error, action: "repair the consent file")
         }
     }
 

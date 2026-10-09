@@ -23,6 +23,8 @@
   <!-- TCC rejects Calendar prompts from hardened-runtime builds without this. -->
   <key>com.apple.security.personal-information.calendars</key>
   <true/>
+  <key>com.apple.security.personal-information.photos-library</key>
+  <true/>
 
   <key>com.apple.security.network.client</key>
   <true/>

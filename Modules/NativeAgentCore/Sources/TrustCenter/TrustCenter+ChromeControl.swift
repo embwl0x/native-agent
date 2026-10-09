@@ -17,7 +17,7 @@ public enum ChromeControlAuthorityError: Error, LocalizedError, Sendable, Equata
 
 extension SwiftNativeTrustCenter {
     /// Reads the checked policy generation for one Chrome effect. This is not
-    /// cached by a relay session or tab lease: every acquire, navigation,
+    /// cached by a relay session: every navigation,
     /// snapshot, click, fill, type, wait, and scroll calls this exact seam again.
     public func authorizeChromeControlEffect(tool: String = "browser.chrome", origin: SecurityOriginContext? = nil) async throws {
         let policy: [String: JSONValue]

@@ -146,7 +146,7 @@ final class PollScheduler: ObservableObject {
         }
         guard await bounded.value == nil else { return }
         work.cancel()
-        NSLog(
+        nativeLog(
             "[poll-scheduler] job %@ exceeded its %.0fs ceiling — abandoned, scheduler continuing",
             id, handlerDeadline
         )

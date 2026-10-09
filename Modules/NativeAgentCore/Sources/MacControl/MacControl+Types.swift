@@ -184,6 +184,8 @@ extension MacControlClient {
 public let macControlNativePortedActions: Set<String> = [
     "notify",
     "applescript",
+    "volume",
+    "media",
     "file/read",
     "file/write",
     "file/list",
@@ -661,6 +663,24 @@ public enum MacWakeGuard {
 /// the session flag alone never proves a password lock.
 public enum MacScreenLock {
     public static let reply = "The screen is still covered, so I can't see or use the apps underneath."
+    public static let passiveReply = "raw view · passive observation · screen covered; observation waits"
+
+    /// The same session/window evidence used by wake, without posting input.
+    public static func isCovered() -> Bool {
+        isLocked() || loginWindowUp()
+    }
+
+    private static func loginWindowUp() -> Bool {
+        #if canImport(CoreGraphics) && os(macOS)
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        return windows.contains {
+            $0[kCGWindowOwnerName as String] as? String == "loginwindow"
+                && ($0[kCGWindowLayer as String] as? Int ?? 0) >= Int(CGWindowLevelForKey(.screenSaverWindow))
+        }
+        #else
+        return false
+        #endif
+    }
 
     /// User (09-24): "the Mac is never locked, it's just a screen saver." The
     /// flag is set under both, so the reads first try the wake nudge; this
@@ -704,14 +724,7 @@ public enum MacScreenLock {
         beforeInput: @Sendable () async throws -> Void = {}
     ) async throws {
         #if canImport(CoreGraphics) && canImport(AppKit) && os(macOS)
-        func loginWindowUp() -> Bool {
-            let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
-            return windows.contains {
-                $0[kCGWindowOwnerName as String] as? String == "loginwindow"
-                    && ($0[kCGWindowLayer as String] as? Int ?? 0) >= Int(CGWindowLevelForKey(.screenSaverWindow))
-            }
-        }
-        func covered() -> Bool { isLocked() || loginWindowUp() }
+        func covered() -> Bool { isCovered() }
         func loginPasswordFocused() -> Bool {
             let system = AXUIElementCreateSystemWide()
             AXUIElementSetMessagingTimeout(system, 0.2)
@@ -953,7 +966,7 @@ public func macControlGateCategory(forAction action: String) -> String? {
     // front of her already has open. The tool layer adds the `file_ops` check
     // on top when a caller names a path of its own.
     case "read":                                          return "accessibility"
-    case "system":                                        return "system"
+    case "system", "volume", "media":                     return "system"
     case "file/read", "file/write", "file/list",
          "file/move", "file/trash":                       return "file_ops"
     case "notify":                                        return "notifications"
@@ -1122,6 +1135,9 @@ public enum MacControlSensitivePathFence {
         "Library/Application Support/NativeAgent/nextgen/remote",
         "Library/Application Support/NativeAgent/memory/vault",
         "Library/Application Support/NativeAgent/codex_home",
+        "Library/Application Support/NativeAgent/codex_child_home",
+        "Library/Application Support/NativeAgent/senses/ledger",
+        "Library/Application Support/NativeAgent/senses/news",
     ]
 
     /// Protected paths relative to the resolved NativeAgent data roots.
@@ -1139,6 +1155,9 @@ public enum MacControlSensitivePathFence {
         ["nextgen", "remote"],
         ["memory", "vault"],
         ["codex_home"],
+        ["codex_child_home"],
+        ["senses", "ledger"],
+        ["senses", "news"],
         // The model key lives beside its own logs, so the fence names the
         // file rather than the directory.
         ["jev", "credential.json"],

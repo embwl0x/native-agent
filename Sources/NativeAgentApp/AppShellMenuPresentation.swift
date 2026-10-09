@@ -1,24 +1,23 @@
 import SwiftUI
 import NativeAgentShared
 
-/// D7: the Navigate menu is a PROJECTION of the sidebar, not a second list kept
-/// by hand. The hand-kept version had drifted — it offered Personality (an
-/// Advanced tab) at ⌘5 and never mentioned Skills & Tools or Mac Integration,
-/// so the digit a person learned from the sidebar landed somewhere else.
-/// Deriving from `primaryItems` makes that class of drift unrepresentable.
+/// D7: the Navigate menu is a PROJECTION of the rail, not a second list kept
+/// by hand. It numbered `primaryItems`, which lacks the Helpers row the rail
+/// adds at six, so ⌘6–⌘9 each opened the page one below. It reads the rail's
+/// own order and words now (`BotsShelfRailProposal.ordered`).
 enum NavigateMenuPresentation {
     struct Entry: Equatable, Identifiable {
         let item: SidebarItem
-        /// ⌘1…⌘9 in sidebar order. An item past the ninth is listed WITHOUT a
+        /// ⌘1…⌘9 in rail order. An item past the ninth is listed WITHOUT a
         /// shortcut rather than with a wrong or duplicated one.
         let shortcut: Character?
 
         var id: String { item.rawValue }
-        var title: String { item.displayName }
+        var title: String { item.shellRailTitle }
     }
 
-    static var entries: [Entry] {
-        SidebarItem.primaryItems.enumerated().map { index, item in
+    static func entries(helpersShown: Bool) -> [Entry] {
+        BotsShelfRailProposal.ordered(SidebarItem.primaryItems, enabled: helpersShown).enumerated().map { index, item in
             Entry(item: item, shortcut: index < 9 ? Character("\(index + 1)") : nil)
         }
     }

@@ -110,11 +110,7 @@ public enum DeskSequencing {
     /// that day — an item parked "until 2026-08-05" is still parked during the
     /// 5th) or a full ISO timestamp.
     public static func parseDeferStamp(_ raw: String) -> Date? {
-        let day = DateFormatter()
-        day.locale = Locale(identifier: "en_US_POSIX")
-        day.timeZone = TimeZone(identifier: "UTC")
-        day.dateFormat = "yyyy-MM-dd"
-        if let d = day.date(from: raw) { return d.addingTimeInterval(86_400) }
+        if let d = DeskClock.parseDay(raw) { return d.addingTimeInterval(86_400) }
         return DeskClock.parseISO(raw)
     }
 

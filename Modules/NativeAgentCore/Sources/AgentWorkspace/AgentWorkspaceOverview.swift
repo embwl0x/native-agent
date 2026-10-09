@@ -24,10 +24,9 @@ extension AgentWorkspaceNavigation {
     /// Explicitly selecting an app window brings that app forward through the
     /// normal Mac owner. Refresh/Back/restoration remain observations only.
     static func windowAction(_ place: AgentWorkspaceLocation) -> AgentWorkspaceAction {
-        if case .browserBookmark(let url, let title, let tabID) = place, let tabID {
-            return .perform(tool: "browser.chrome_acquire", input: ["mode": .string("claim"),
-                "tab_id": .int(tabID), "expected_url": .string(url), "expected_title": .string(title)],
-                title: title, textField: nil, isEffect: true)
+        if case .browserBookmark(_, let title, let tabID) = place, let tabID {
+            return .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tabID),
+                "max_nodes": .int(80), "max_text_chars": .int(10000)], title: title))
         }
         if case .record("screen", let input, let title) = place, case .string(let app)? = input["app"] {
             return .perform(tool: "go", input: ["name": .string(app)], title: title, textField: nil, isEffect: true)
@@ -131,7 +130,7 @@ extension AgentWorkspaceNavigation {
         return lhs == rhs
     }
 
-    private static func isOverview(_ location: AgentWorkspaceLocation) -> Bool {
+    static func isOverview(_ location: AgentWorkspaceLocation) -> Bool {
         switch location {
         case .home, .openPlaces, .savedWorkspaces, .workOverview, .arrivals: return true
         case .page(let source, _): return isOverview(source)

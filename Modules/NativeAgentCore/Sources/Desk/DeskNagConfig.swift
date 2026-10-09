@@ -426,7 +426,12 @@ public struct DeskNagConfigStore: Sendable {
         try await persistence.withFileLock(configPath) {
             let current = try await loadChecked()
             let (next, value) = transform(current)
-            try await persistence.writeJSON(next.toJSON(), to: configPath)
+            // An unchanged config is not rewritten: the desk loop watches this
+            // file, and rewriting identical bytes every pass woke it again
+            // every ~2s, forever (perf sweep 2026-10-05).
+            if next != current {
+                try await persistence.writeJSON(next.toJSON(), to: configPath)
+            }
             return (next, value)
         }
     }

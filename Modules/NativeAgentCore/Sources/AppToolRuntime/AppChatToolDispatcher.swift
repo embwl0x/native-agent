@@ -33,14 +33,9 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
     /// The app's own tool executors: here only for the self-window handoff an
     /// `act`/`go`/`screen` result asks this process to finish.
     private let appTools: AppToolExecutor?
-    private let organismPostureProvider: @Sendable () async -> OrganismBehaviorPosture?
-    private let contextPrewarm: @Sendable (ContextPrewarmHintKind, String, [String]) async -> Void
     private let motorOutcomeObserver: @Sendable (ToolCausalBoundary.MotorReference) async -> Void
     private let enforceAutonomySecurity: Bool
     private let includeAppOwnedTools: Bool
-    /// Off-dispatch-path, order-preserving delivery for context prewarm hints.
-    /// One chain per dispatcher instance — see `schedulePrewarmAfterToolResult`.
-    private let prewarmRelay = SerialDetachedRelay(label: "AppChatToolDispatcher.prewarm")
 
     public init(
         inner: any ToolDispatchClient = SwiftToolDispatcher(
@@ -52,12 +47,6 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         enforceAutonomySecurity: Bool = true,
         includeAppOwnedTools: Bool = true,
         appTools: AppToolExecutor? = nil,
-        organismPostureProvider: @escaping @Sendable () async -> OrganismBehaviorPosture?,
-        contextPrewarm: @escaping @Sendable (
-            ContextPrewarmHintKind,
-            String,
-            [String]
-        ) async -> Void = { _, _, _ in },
         motorOutcomeObserver: @escaping @Sendable (ToolCausalBoundary.MotorReference) async -> Void = { _ in },
         interactions: any ToolInteractionResolving,
         platform: ChatToolPlatformPort
@@ -69,8 +58,6 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         self.enforceAutonomySecurity = enforceAutonomySecurity
         self.includeAppOwnedTools = includeAppOwnedTools
         self.appTools = appTools
-        self.organismPostureProvider = organismPostureProvider
-        self.contextPrewarm = contextPrewarm
         self.motorOutcomeObserver = motorOutcomeObserver
     }
 
@@ -120,7 +107,9 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         if !includeAppOwnedTools, ["mac_notify", "mobile_notify"].contains(tool) {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("canonical_body_unavailable"),
+                "detail": .string("Notifications are not available in this context, so nothing was sent."),
                 "tool": .string(tool),
             ])
         }
@@ -137,17 +126,6 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             input: canonicalInput,
             surface: surface
         )
-        // 2026-09-22 WHY: the posture already rides the prompt's
-        // [OrganismBehavior] block; stamping it on every result cost ~1K
-        // tokens a turn and crowded real data out of trimmed results.
-        let organismActive = await organismPostureProvider() != nil
-        schedulePrewarmAfterToolResult(
-            tool: tool,
-            input: canonicalInput,
-            result: result,
-            surface: surface,
-            organismActive: organismActive
-        )
         await observeMotorOutcomeIfNeeded(tool: tool, result: result)
         return result
     }
@@ -157,95 +135,6 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             return
         }
         await motorOutcomeObserver(reference)
-    }
-
-    /// Hand the prewarm hints for a settled tool result to the off-path relay.
-    ///
-    /// Deliberately NOT `async`: nothing on the current turn reads the prewarm
-    /// result (`NativeContextFlowRuntime.prewarm` discards the receipt), but
-    /// the work itself lowercases every atom body in the active generation on
-    /// the `ContextFlowCoordinator` actor — the same actor the NEXT turn's
-    /// `prepareTurn` has to enter. Awaiting it here charged that scan to
-    /// user-visible tool latency, once per tool call.
-    ///
-    /// The hints themselves are computed synchronously and by value, so the
-    /// planner still sees byte-identical `(kind, id, terms)` for the exact
-    /// result this call returned — a later mutation of anything can't drift
-    /// them. Only the delivery moves; ordering is preserved by the relay.
-    private func schedulePrewarmAfterToolResult(
-        tool: String,
-        input: [String: JSONValue],
-        result: JSONValue,
-        surface: String,
-        organismActive: Bool
-    ) {
-        let hints = Self.prewarmHints(
-            tool: tool,
-            input: input,
-            result: result,
-            surface: surface,
-            organismActive: organismActive
-        )
-        guard !hints.isEmpty else { return }
-        let prewarm = self.contextPrewarm
-        prewarmRelay.enqueue {
-            for hint in hints {
-                await prewarm(hint.kind, hint.id, hint.terms)
-            }
-        }
-    }
-
-    public struct ContextPrewarmHint: Sendable {
-        var kind: ContextPrewarmHintKind
-        var id: String
-        var terms: [String]
-    }
-
-    /// Pure function of the settled tool call — same inputs, same hints, in the
-    /// same order as the old inline `await` pair emitted them.
-    public static func prewarmHints(
-        tool: String,
-        input: [String: JSONValue],
-        result: JSONValue,
-        surface: String,
-        organismActive: Bool = false
-    ) -> [ContextPrewarmHint] {
-        let terms = [tool, surface]
-            + input.keys.sorted()
-            + Self.resultKeys(result)
-        let kind: ContextPrewarmHintKind
-        let id: String
-        if tool.hasPrefix("desk_") {
-            kind = .desk
-            id = "agent-desk"
-        } else if Self.fileContextTools.contains(tool) {
-            kind = .file
-            id = AppToolExecutor.inputString(input["path"]) ?? tool
-        } else {
-            kind = .toolResult
-            id = tool
-        }
-        var hints = [ContextPrewarmHint(kind: kind, id: id, terms: terms)]
-        if organismActive {
-            hints.append(ContextPrewarmHint(kind: .organism, id: "tool-posture", terms: terms))
-        }
-        return hints
-    }
-
-    /// Wait for every prewarm hint enqueued so far to reach the coordinator.
-    /// Tests and shutdown only — the dispatch path must never call this.
-    public func drainPendingContextPrewarm() async {
-        await prewarmRelay.drain()
-    }
-
-    private static let fileContextTools: Set<String> = [
-        "read_file", "list_dir", "file_excerpt", "grep", "write_file",
-        "git_status", "git_diff", "git_log", "repo_dirty_summary",
-    ]
-
-    private static func resultKeys(_ result: JSONValue) -> [String] {
-        guard case .object(let object) = result else { return [] }
-        return object.keys.sorted()
     }
 
     private func dispatchWithoutOrganismPosture(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {

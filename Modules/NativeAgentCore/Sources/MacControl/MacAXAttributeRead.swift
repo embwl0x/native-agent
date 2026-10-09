@@ -4,6 +4,16 @@ import ApplicationServices
 
 /// Nil-tolerant AX attribute copies shared by perception and actuation.
 enum MacAXAttributeRead {
+    static func prepare(_ element: AXUIElement) -> Bool {
+        guard !Task.isCancelled else { return false }
+        if let deadline = MacAXLimits.readDeadline {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return false }
+            _ = AXUIElementSetMessagingTimeout(element, Float(min(0.25, remaining)))
+        }
+        return true
+    }
+
     static func copyTextRange(_ element: AXUIElement) -> NSRange? {
         guard let raw = copyRaw(element, kAXSelectedTextRangeAttribute),
               CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
@@ -15,6 +25,8 @@ enum MacAXAttributeRead {
     }
 
     static func copyRaw(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+        guard prepare(element) else { return nil }
+        defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
         var raw: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success else { return nil }
         return raw
@@ -36,7 +48,48 @@ enum MacAXAttributeRead {
         return (raw as! AXUIElement)
     }
 
+    /// Perception and action paths share the same visible-child ordering.
+    static func childAttribute(_ element: AXUIElement) -> String {
+        guard let role = copyString(element, kAXRoleAttribute),
+              ["AXList", "AXTable", "AXOutline"].contains(role) else { return kAXChildrenAttribute }
+        guard prepare(element) else { return kAXVisibleChildrenAttribute }
+        defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
+        var names: CFArray?
+        guard AXUIElementCopyAttributeNames(element, &names) == .success,
+              let names = names as? [String] else { return kAXVisibleChildrenAttribute }
+        return [kAXVisibleRowsAttribute, kAXVisibleChildrenAttribute].first(where: names.contains)
+            ?? kAXChildrenAttribute
+    }
+
+    static func listSummary(_ element: AXUIElement, role: String) -> String? {
+        guard ["AXList", "AXTable", "AXOutline"].contains(role) else { return nil }
+        let attribute = childAttribute(element)
+        guard attribute != kAXChildrenAttribute, prepare(element) else { return nil }
+        defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
+        var visible: CFIndex = 0, total: CFIndex = 0
+        guard AXUIElementGetAttributeValueCount(element, attribute as CFString, &visible) == .success else { return nil }
+        let rows = attribute == kAXVisibleRowsAttribute
+        let kind = rows ? "rows" : "items"
+        guard AXUIElementGetAttributeValueCount(element, (rows ? kAXRowsAttribute : kAXChildrenAttribute) as CFString,
+                                               &total) == .success else {
+            return "\(visible) \(kind) on screen; total count unavailable."
+        }
+        return "\(visible) of \(total) \(kind) on screen."
+            + (total > visible ? " More \(kind) off screen." : "")
+    }
+
     static func copyElementArray(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
+        let attribute = attribute == kAXChildrenAttribute ? childAttribute(element) : attribute
+        if MacAXLimits.readDeadline != nil {
+            guard prepare(element) else { return [] }
+            defer { _ = AXUIElementSetMessagingTimeout(element, 0) }
+            var raw: CFArray?
+            guard AXUIElementCopyAttributeValues(element, attribute as CFString, 0,
+                CFIndex(MacAXLimits.deepPageMaxNodes), &raw) == .success, let raw else { return [] }
+            return (raw as [AnyObject]).compactMap { candidate in
+                CFGetTypeID(candidate) == AXUIElementGetTypeID() ? (candidate as! AXUIElement) : nil
+            }
+        }
         guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == CFArrayGetTypeID() else { return [] }
         return (raw as! CFArray as [AnyObject]).compactMap { candidate in
             guard CFGetTypeID(candidate) == AXUIElementGetTypeID() else { return nil }
@@ -47,20 +100,57 @@ enum MacAXAttributeRead {
     /// Own title/description, else — for a field or popup Cocoa names with a
     /// separate label ("Save As:", "Where:") — that label's text: its
     /// AXTitleUIElement, else the previous sibling static text ending in ":".
-    /// The ONE name rule for perception and for the act-side drift check.
+    /// The ONE identity rule for perception and the act-side drift check.
+    /// Display cleanup is opt-in; it must never remove a redaction caption.
     static func copyLabel(
         _ element: AXUIElement, role: String,
+        forDisplay: Bool = false,
         prepare: (AXUIElement) -> AXUIElement = { $0 }
     ) -> String? {
-        if let own = copyString(element, kAXTitleAttribute) ?? copyString(element, kAXDescriptionAttribute) {
-            return own
+        func isName(_ text: String) -> Bool {
+            text != role && text != MacScreenRender.kindName(role: role)
+                && text != copyString(element, kAXRoleDescriptionAttribute)
+        }
+        // Window furniture has an authoritative semantic subrole. Its help
+        // describes a gesture, not the control's name.
+        if role == kAXButtonRole,
+           let subrole = copyString(element, kAXSubroleAttribute),
+           [kAXCloseButtonSubrole, kAXMinimizeButtonSubrole, kAXZoomButtonSubrole].contains(subrole) {
+            return MacScreenRender.kindName(role: String(subrole.dropLast("Button".count)))
+        }
+        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, "AXLabel"] {
+            if let own = copyString(element, attribute), isName(own),
+               (!forDisplay && attribute != kAXDescriptionAttribute)
+                || own != copyString(element, kAXHelpAttribute) {
+                return own
+            }
         }
         let fallback = copyCaption(element, role: role, prepare: prepare)
         guard fallback == nil, hintNamedRoles.contains(role) else { return fallback }
         // Last resort for a control that names itself nowhere else: its
-        // placeholder ("Reply to Claude…") or its tooltip. Controls only — the
-        // hundreds of unnamed groups in a web page never pay the two reads.
-        return copyString(element, kAXPlaceholderValueAttribute) ?? copyString(element, kAXHelpAttribute)
+        // placeholder ("Reply to Claude…"), else — an icon-only button — the
+        // tooltip a person reads on hover. Only when nothing else names it.
+        for attribute in [kAXPlaceholderValueAttribute, kAXHelpAttribute] {
+            if let hint = copyString(element, attribute), isName(hint) { return hint }
+        }
+        return nil
+    }
+
+    static func valueState(_ element: AXUIElement, role: String) -> String? {
+        guard let raw = copyRaw(element, kAXValueAttribute) else { return nil }
+        let checkable = role == "AXCheckBox" || role == "AXRadioButton" || role == "AXSwitch"
+        let number: Int
+        if CFGetTypeID(raw) == CFBooleanGetTypeID() {
+            number = CFBooleanGetValue(raw as! CFBoolean) ? 1 : 0
+        } else if checkable, CFGetTypeID(raw) == CFNumberGetTypeID() {
+            var value = 0
+            guard CFNumberGetValue(raw as! CFNumber, .intType, &value), (0...2).contains(value) else { return nil }
+            number = value
+        } else { return nil }
+        if checkable {
+            return number == 2 ? "mixed" : number == 1 ? "checked" : "unchecked"
+        }
+        return number == 1 ? "on" : "off"
     }
 
     /// Fields that answer to their placeholder as a second name.
@@ -74,13 +164,13 @@ enum MacAXAttributeRead {
     private static func copyCaption(
         _ element: AXUIElement, role: String, prepare: (AXUIElement) -> AXUIElement
     ) -> String? {
-        guard MacPerceptionCompiler.captionedRoles.contains(role) else { return nil }
-        if let caption = copyElement(element, kAXTitleUIElementAttribute) {
+        if hintNamedRoles.contains(role), let caption = copyElement(element, kAXTitleUIElementAttribute) {
             let caption = prepare(caption)
             return MacPerceptionCompiler.captionText(
                 copyString(caption, kAXValueAttribute) ?? copyString(caption, kAXTitleAttribute)
             )
         }
+        guard MacPerceptionCompiler.captionedRoles.contains(role) else { return nil }
         guard let parent = copyElement(element, kAXParentAttribute).map(prepare) else { return nil }
         let siblings = copyElementArray(parent, kAXChildrenAttribute)
         guard let index = siblings.firstIndex(where: { CFEqual($0, element) }), index > 0 else { return nil }
@@ -92,6 +182,8 @@ enum MacAXAttributeRead {
     }
 
     static func copyActions(_ element: AXUIElement) -> [String] {
+        guard prepare(element) else { return [] }
+        defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
         var raw: CFArray?
         guard AXUIElementCopyActionNames(element, &raw) == .success, let raw else { return [] }
         return (raw as [AnyObject]).compactMap { $0 as? String }

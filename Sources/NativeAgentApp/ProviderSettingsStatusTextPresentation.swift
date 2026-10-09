@@ -30,7 +30,8 @@ enum ProviderSettingsStatusTextPresentation {
         let bounded = boundedText(normalized)
         let lower = normalized.lowercased()
 
-        if lower.contains("failed") || lower.contains("error") || lower.contains("unavailable") {
+        if lower.contains("failed") || lower.contains("error") || lower.contains("unavailable")
+            || lower.hasPrefix("couldn't") {
             return State(text: bounded.text, tone: .failure,
                          systemImage: "exclamationmark.triangle.fill", isTruncated: bounded.isTruncated)
         }

@@ -118,6 +118,19 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
         ))
     }
 
+    public func contextWindowReadout(forModel model: String, providerID: String?, dataRoot: URL) -> [String: JSONValue] {
+        let native = ProviderRouting.verifiedContextLength(forModel: model, providerID: providerID, dataRoot: dataRoot)
+        let effective = effectiveWindowTokens(nativeWindowTokens: native)
+        let custom = contextWindowMode == .custom ? thresholdTokens : nil
+        return [
+            "model": .string(model),
+            "effective_tokens": effective.map { .int(Int64($0)) } ?? .null,
+            "native_window_tokens": native.map { .int(Int64($0)) } ?? .null,
+            "custom_cap_tokens": custom.map { .int(Int64($0)) } ?? .null,
+            "summary": .string("Context window for \(model): effective \(effective.map(String.init) ?? "unknown") tokens; native \(native.map(String.init) ?? "unknown") tokens; Custom cap \(custom.map(String.init) ?? "none"). Effective context is 60% of the model's native window, capped by Custom when selected."),
+        ]
+    }
+
     /// Where she compacts: her effective window. An unknown model falls back
     /// to the saved size, the only number there is.
     public func effectiveThresholdTokens(
@@ -222,8 +235,6 @@ private struct ChatSessionCompactionTranscriptError: LocalizedError, Sendable {
 
 public struct ChatSessionAutocompactor: Sendable {
     static let maximumCompactBackups = 5
-    /// Pending work belongs to this app process; a restart cannot resume it.
-    private static let distillationProcess = UUID().uuidString
     public typealias BackupFileCopy = @Sendable (_ source: URL, _ destination: URL) throws -> Void
 
     let dataRoot: URL
@@ -294,6 +305,11 @@ public struct ChatSessionAutocompactor: Sendable {
                 trigger: trigger
             )
         }
+        let pending = config.distillEnabled
+            ? try await pendingDistillationOutcome(
+               sessionId: sessionId, messagesPath: messagesPath,
+               trigger: trigger, sourceBytes: sourceBytesBefore
+            ) : nil
 
         let modelThresholdTokens = config.effectiveThresholdTokens(
             forModel: model,
@@ -305,6 +321,7 @@ public struct ChatSessionAutocompactor: Sendable {
         let divisor = Self.tokenDivisor(forModel: model)
         if !force,
            Double(sourceBytesBefore) < Double(effectiveThresholdTokens) * divisor {
+            if let pending { return pending }
             return skipped(
                 sessionId: sessionId,
                 reason: "below threshold by file size",
@@ -314,15 +331,13 @@ public struct ChatSessionAutocompactor: Sendable {
             )
         }
 
-        if keepTailFixed {
-            try await settleOrphanedPendingSummaries(sessionId: sessionId, messagesPath: messagesPath)
-        }
         return try await persistence.withFileLock(messagesPath) {
             let rows = try await readJSONLHonest(messagesPath, context: "autocompact")
             let before = rows.count
             let transcriptChars = Self.transcriptCharacterCount(rows)
             let estimatedTokens = max(0, Int((Double(transcriptChars) / divisor).rounded()))
             guard force || estimatedTokens >= effectiveThresholdTokens else {
+                if let pending { return pending }
                 return skipped(
                     sessionId: sessionId,
                     reason: "below threshold",
@@ -342,6 +357,7 @@ public struct ChatSessionAutocompactor: Sendable {
                     replaceCount: Self.fixedKeepTailReplacementCount(rows: rows, keepCount: config.keepCount)
                 )
                 : Self.replacementCount(
+                    sessionId: sessionId,
                     rows: rows,
                     keepCount: config.keepCount,
                     thresholdTokens: effectiveThresholdTokens,
@@ -367,6 +383,7 @@ public struct ChatSessionAutocompactor: Sendable {
             // one. Skip honestly instead of churning the transcript.
             if replaceCount < candidateReplaceCount,
                !Self.containsRawTurn(Array(rows.prefix(replaceCount))) {
+                if let pending { return pending }
                 return skipped(
                     sessionId: sessionId,
                     reason: "clamped by dream consolidation mark",
@@ -380,6 +397,7 @@ public struct ChatSessionAutocompactor: Sendable {
                 )
             }
             guard replaceCount > 0 else {
+                if let pending { return pending }
                 return skipped(
                     sessionId: sessionId,
                     reason: "not enough messages to compact",
@@ -394,13 +412,15 @@ public struct ChatSessionAutocompactor: Sendable {
             }
 
             let replaced = Array(rows.prefix(replaceCount))
+            let pendingRecollections = replaced.filter(Self.hasPendingDistillation)
+            let foldingRows = replaced.filter { !Self.hasPendingDistillation($0) }
             // An unanswered or retryable inline card, and any card whose
             // continuation could still start a turn, is carried through
             // verbatim instead of being folded into the summary. Losing one
             // takes a person's open ask and an unresumable suspended request
             // with it (Agent's 644D65F1, 2026-09-14: 223 rows replaced, 8 cards
             // gone, 2 of them `failed` with a `waiting` continuation).
-            let (pendingResults, compactible) = InlineInteractionCompactionRetention.splitPendingResults(replaced)
+            let (pendingResults, compactible) = InlineInteractionCompactionRetention.splitPendingResults(foldingRows)
             let (retainedCards, removableRows) = InlineInteractionCompactionRetention.split(compactible)
             // Past the hard cap the preserved cards alone hold the session over
             // threshold for ever: every pass would rewrite the prior summary and
@@ -420,6 +440,7 @@ public struct ChatSessionAutocompactor: Sendable {
                 || (!removableRows.isEmpty
                     && (removableRows.count > 1 || Self.containsRawTurn(removableRows)))
             guard worthCompacting else {
+                if let pending { return pending }
                 return skipped(
                     sessionId: sessionId,
                     reason: "nothing compactible beside preserved inline cards",
@@ -436,8 +457,10 @@ public struct ChatSessionAutocompactor: Sendable {
             // The summary ingests what is actually being folded away. Feeding it
             // `replaced` duplicated every preserved card into the summary text
             // AND reinserted it verbatim below.
+            let sourceNote = ChatCompactionRowRendering.receiptSourceNote(removableRows, sessionId: sessionId)
             let summary = Self.compactionSummary(
                 for: removableRows,
+                sourceNote: sourceNote,
                 preservedCardCount: preservedCards.count,
                 foldedCards: foldedCards,
                 // 2026-09-23: 40K on a verified 1M route, 12K otherwise.
@@ -454,15 +477,16 @@ public struct ChatSessionAutocompactor: Sendable {
             // second consolidation owner (the dream lane) can tell whether it
             // has already consumed this material, without re-reading the backup
             // or re-summarizing the same turns. See ChatSessionRecollections.
-            let coverage = Self.coverageRange(replaced)
+            let coverage = Self.coverageRange(foldingRows)
             var summaryMetadata: [String: JSONValue] = [
                 "kind": .string(ChatSessionRecollections.rowKind),
                 ChatSessionRecollections.continuityProvenanceKey:
-                    ChatSessionRecollections.continuityProvenance(for: replaced),
+                    ChatSessionRecollections.continuityProvenance(for: foldingRows),
                 "messages_replaced": .int(Int64(replaceCount)),
                 "trigger": .string(trigger),
                 "lane": .string(ChatSessionCompactionOutcome.lane(forTrigger: trigger)),
                 "surface": .string(surface),
+                "receipt_source_note": .string(sourceNote),
             ]
             if let from = coverage.from {
                 summaryMetadata[ChatSessionRecollections.coversFromKey] = .string(from)
@@ -479,7 +503,11 @@ public struct ChatSessionAutocompactor: Sendable {
             }
             if willDistill {
                 summaryMetadata["distill"] = .string("pending")
-                summaryMetadata["distill_process"] = .string(Self.distillationProcess)
+                summaryMetadata["distill_backup"] = .string(backupURL.lastPathComponent)
+                summaryMetadata["distill_preserved_pending_ids"] = .array(pendingRecollections.compactMap {
+                    guard case .object(let object) = $0 else { return nil }
+                    return object["id"]
+                })
             }
             if !preservedCards.isEmpty {
                 summaryMetadata[InlineInteractionCompactionRetention.preservedMetadataKey] =
@@ -497,7 +525,7 @@ public struct ChatSessionAutocompactor: Sendable {
             // Summary first, then the preserved cards in their original order,
             // then the untouched tail — so a still-open card stays where the
             // reader and the resolver expect it, ahead of the recent turns.
-            let nextRows = [summaryRow] + pendingResults + preservedCards + kept
+            let nextRows = pendingRecollections + [summaryRow] + pendingResults + preservedCards + kept
             try writeRows(nextRows, to: messagesPath)
             let sourceBytesAfter = Self.fileSize(messagesPath)
             let outcome = ChatSessionCompactionOutcome(
@@ -529,41 +557,110 @@ public struct ChatSessionAutocompactor: Sendable {
         }
     }
 
-    private func settleOrphanedPendingSummaries(sessionId: String, messagesPath: URL) async throws {
-        let changed = try await persistence.withFileLock(messagesPath) {
-            let rows = try await readJSONLHonest(messagesPath, context: "aging recovery")
-            guard rows.contains(where: Self.hasOrphanedDistillation) else { return false }
-            let raw = try String(contentsOf: messagesPath, encoding: .utf8)
-            var segments = raw.components(separatedBy: "\n")
-            for index in segments.indices {
-                guard let row = try? JSONValue.parse(Data(segments[index].utf8)),
-                      Self.hasOrphanedDistillation(row),
-                      case .object(var object) = row,
-                      case .object(var metadata)? = object["metadata"] else { continue }
-                metadata["distill"] = .string("mechanical")
-                metadata.removeValue(forKey: "distill_process")
-                object["metadata"] = .object(metadata)
-                segments[index] = try JSONValue.object(object).serialize(pretty: false)
+    private func pendingDistillationOutcome(
+        sessionId: String, messagesPath: URL, trigger: String, sourceBytes: Int64
+    ) async throws -> ChatSessionCompactionOutcome? {
+        try await persistence.withFileLock(messagesPath) {
+            let rows = try await readJSONLHonest(messagesPath, context: "distillation recovery")
+            for row in rows where Self.hasPendingDistillation(row) {
+                guard case .object(var object) = row,
+                      case .string(let id)? = object["id"],
+                      case .object(var metadata)? = object["metadata"],
+                      case .int(let count)? = metadata["messages_replaced"], count > 0 else { continue }
+                let backup: String
+                if case .string(let recorded)? = metadata["distill_backup"],
+                   recorded == URL(fileURLWithPath: recorded).lastPathComponent {
+                    backup = recorded
+                } else {
+                    do {
+                        backup = try await recoverDistillationBackup(
+                            sessionId: sessionId, metadata: metadata, messagesReplaced: Int(count)
+                        ).lastPathComponent
+                    } catch {
+                        FileHandle.standardError.write(Data(
+                            "ChatSessionAutocompactor: pending recollection recovery failed for \(sessionId): \(error)\n".utf8
+                        ))
+                        continue
+                    }
+                    metadata["distill_backup"] = .string(backup)
+                    metadata.removeValue(forKey: "distill_process")
+                    object["metadata"] = .object(metadata)
+                    let raw = try String(contentsOf: messagesPath, encoding: .utf8)
+                    var segments = raw.components(separatedBy: "\n")
+                    if let index = segments.firstIndex(where: {
+                        guard let parsed = try? JSONValue.parse(Data($0.utf8)),
+                              case .object(let fields) = parsed else { return false }
+                        return fields["id"] == .string(id)
+                    }) {
+                        segments[index] = try JSONValue.object(object).serialize(pretty: false)
+                        try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                            Data(segments.joined(separator: "\n").utf8), to: messagesPath
+                        )
+                    }
+                }
+                let backupPath = sessionDir(sessionId: sessionId).appendingPathComponent(backup)
+                do {
+                    let source = try await readJSONLHonest(backupPath, context: "pending distillation source")
+                    guard source.count >= Int(count) else { throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -7) }
+                } catch {
+                    FileHandle.standardError.write(Data(
+                        "ChatSessionAutocompactor: pending recollection source failed for \(sessionId): \(error)\n".utf8
+                    ))
+                    continue
+                }
+                return ChatSessionCompactionOutcome(
+                    sessionId: sessionId, compacted: false, reason: "distillation pending",
+                    trigger: trigger, thresholdTokens: config.thresholdTokens,
+                    estimatedTokensBefore: 0, transcriptCharsBefore: Self.transcriptCharacterCount(rows),
+                    messagesBefore: rows.count, messagesAfter: rows.count,
+                    messagesReplaced: Int(count), summaryChars: 0,
+                    sourceBytesBefore: sourceBytes, sourceBytesAfter: sourceBytes,
+                    summaryRowId: id, backupPath: backupPath.path
+                )
             }
-            try Task.checkCancellation()
-            try await persistence.writeDataAtomicDurable(
-                Data(segments.joined(separator: "\n").utf8), to: messagesPath
-            )
-            return true
-        }
-        if changed {
-            await ChatCompactionDistiller.publishTranscriptChange(
-                sessionId: sessionId, dataRoot: dataRoot, persistence: persistence
-            )
+            return nil
         }
     }
 
-    private static func hasOrphanedDistillation(_ row: JSONValue) -> Bool {
-        guard hasPendingDistillation(row),
-              case .object(let object) = row,
-              case .object(let metadata)? = object["metadata"],
-              metadata["kind"] == .string(ChatSessionRecollections.rowKind) else { return false }
-        return metadata["distill_process"] != .string(distillationProcess)
+    private func recoverDistillationBackup(
+        sessionId: String, metadata: [String: JSONValue], messagesReplaced: Int
+    ) async throws -> URL {
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: sessionDir(sessionId: sessionId), includingPropertiesForKeys: nil
+        )
+        var matched: (url: URL, rows: [JSONValue])?
+        for candidate in entries where candidate.lastPathComponent.hasPrefix("messages.compact.")
+            && candidate.pathExtension == "jsonl" {
+            let rows: [JSONValue]
+            do {
+                rows = try await readJSONLHonest(candidate, context: "distillation backup recovery")
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "ChatSessionAutocompactor: distillation backup recovery could not read \(candidate.lastPathComponent): \(error)\n".utf8
+                ))
+                continue
+            }
+            guard rows.count >= messagesReplaced else { continue }
+            let replaced = Array(rows.prefix(messagesReplaced))
+            let coverage = Self.coverageRange(replaced)
+            guard let from = coverage.from, let until = coverage.until,
+                  metadata[ChatSessionRecollections.coversFromKey] == .string(from),
+                  metadata[ChatSessionRecollections.coversUntilKey] == .string(until),
+                  metadata[ChatSessionRecollections.continuityProvenanceKey]
+                    == ChatSessionRecollections.continuityProvenance(for: replaced) else { continue }
+            if let matched, matched.rows != replaced {
+                throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -7, userInfo: [
+                    NSLocalizedDescriptionKey: "Pending recollection has ambiguous source backups; its source is retained for repair."
+                ])
+            }
+            matched = (candidate, replaced)
+        }
+        guard let matched else {
+            throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -7, userInfo: [
+                NSLocalizedDescriptionKey: "Pending recollection has no matching source backup; its source is retained for repair."
+            ])
+        }
+        return matched.url
     }
 
     private func skipped(
@@ -668,7 +765,9 @@ public struct ChatSessionAutocompactor: Sendable {
             Self.pruneCompactBackups(
                 in: dir,
                 keeping: Self.maximumCompactBackups,
-                preserving: backup
+                originals: Self.originalsPath(dataRoot: dataRoot, sessionId: sessionId),
+                preserving: backup,
+                pendingRows: sourceData.split(separator: 0x0A).compactMap { try? JSONValue.parse(Data($0)) }
             )
         } catch {
             try? FileManager.default.removeItem(at: backup)
@@ -687,7 +786,9 @@ public struct ChatSessionAutocompactor: Sendable {
     static func pruneCompactBackups(
         in directory: URL,
         keeping: Int,
-        preserving protected: URL? = nil
+        originals: URL,
+        preserving protected: URL? = nil,
+        pendingRows: [JSONValue] = []
     ) -> [URL] {
         guard keeping >= 0,
               let entries = try? FileManager.default.contentsOfDirectory(
@@ -695,6 +796,7 @@ public struct ChatSessionAutocompactor: Sendable {
                   includingPropertiesForKeys: nil
               )
         else { return [] }
+        guard let pendingBackups = protectedCompactBackupNames(in: pendingRows) else { return [] }
         let backups = entries
             .filter {
                 $0.lastPathComponent.hasPrefix("messages.compact.")
@@ -707,15 +809,89 @@ public struct ChatSessionAutocompactor: Sendable {
             }
         var removed: [URL] = []
         for stale in backups.dropFirst(keeping) {
+            guard !pendingBackups.contains(stale.lastPathComponent) else { continue }
             do {
+                try preserveOriginalMessages(from: stale, at: originals)
                 try FileManager.default.removeItem(at: stale)
                 removed.append(stale)
             } catch {
-                // Best effort: a retained recovery copy is safer than making
-                // transcript compaction fail after its fresh backup verified.
+                nativeLog("Chat compaction: recovery copy preserved after archive failure: %@", String(describing: error))
             }
         }
         return removed
+    }
+
+    /// nil protects every copy when a legacy pending recollection cannot yet
+    /// identify its exact source. Protected overage is deferred, not failure.
+    static func protectedCompactBackupNames(in rows: [JSONValue]) -> Set<String>? {
+        var names: Set<String> = []
+        for row in rows where hasPendingDistillation(row) {
+            guard case .object(let object) = row,
+                  case .object(let metadata)? = object["metadata"],
+                  case .string(let name)? = metadata["distill_backup"] else { return nil }
+            names.insert(name)
+        }
+        return names
+    }
+
+    public static func originalsPath(dataRoot: URL, sessionId: String) -> URL {
+        dataRoot.appendingPathComponent("chat/archive/originals", isDirectory: true)
+            .appendingPathComponent("\(sessionId).jsonl")
+    }
+
+    /// Fold exact original lines into durable history before retiring a full
+    /// recovery copy. Deduplication is byte-exact, so edited versions of the
+    /// same message survive. Callers hold the session's transcript lock.
+    private static func preserveOriginalMessages(from backup: URL, at archive: URL) throws {
+        func lines(_ bytes: Data) throws -> [Data] {
+            try bytes.split(separator: 0x0A).map { line in
+                let data = Data(line)
+                guard case .object = try JSONValue.parse(data) else {
+                    throw NSError(domain: "NativeAgent.ChatCompactionArchive", code: 1)
+                }
+                return data
+            }
+        }
+        let source = try lines(Data(contentsOf: backup))
+        let existing: Data
+        do { existing = try Data(contentsOf: archive) }
+        catch CocoaError.fileReadNoSuchFile { existing = Data() }
+        var merged = try lines(existing)
+        var known = Set(merged)
+        for line in source where known.insert(line).inserted {
+            merged.append(line)
+        }
+        // Backups retire newest first. Keep recent reply evidence at the tail
+        // even when an older copy contributes previously unseen lines.
+        let dates = ISO8601DateFormatter()
+        dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let wholeSeconds = ISO8601DateFormatter()
+        var ordered: [(index: Int, line: Data, at: Date)] = []
+        for (index, line) in merged.enumerated() {
+            let row = try? JSONValue.parse(line)
+            var at = Date.distantPast
+            if case .object(let object)? = row, case .string(let raw)? = object["createdAt"] {
+                at = dates.date(from: raw) ?? wholeSeconds.date(from: raw) ?? .distantPast
+            }
+            ordered.append((index: index, line: line, at: at))
+        }
+        ordered.sort { lhs, rhs in
+            if lhs.at == rhs.at { return lhs.index < rhs.index }
+            return lhs.at < rhs.at
+        }
+        var output = Data()
+        for (_, line, _) in ordered {
+            output.append(line)
+            output.append(0x0A)
+        }
+        if output != existing {
+            try FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(output, to: archive)
+        }
+        let verified = Set(try lines(Data(contentsOf: archive)))
+        guard source.allSatisfy(verified.contains) else {
+            throw NSError(domain: "NativeAgent.ChatCompactionArchive", code: 2)
+        }
     }
 
     private func writeRows(_ rows: [JSONValue], to path: URL) throws {
@@ -815,6 +991,7 @@ public struct ChatSessionAutocompactor: Sendable {
     }
 
     private static func replacementCount(
+        sessionId: String,
         rows: [JSONValue],
         keepCount: Int,
         thresholdTokens: Int,
@@ -838,18 +1015,22 @@ public struct ChatSessionAutocompactor: Sendable {
             // stay in the session. Leaving them out of this sum made the search
             // believe a pass would get under threshold when it could not, and a
             // session whose cards alone exceed the budget never shrank at all.
+            let replaced = Array(rows.prefix(replaceCount))
+            let pendingRecollections = replaced.filter(Self.hasPendingDistillation)
             let (pendingResults, compactible) = InlineInteractionCompactionRetention
-                .splitPendingResults(Array(rows.prefix(replaceCount)))
+                .splitPendingResults(replaced.filter { !Self.hasPendingDistillation($0) })
             let (retained, removable) = InlineInteractionCompactionRetention.split(compactible)
             let (preserved, folded) = InlineInteractionCompactionRetention
                 .capPreserved(retained, maxCharacters: cardCap)
             let summary = compactionSummary(
                 for: removable,
+                sourceNote: ChatCompactionRowRendering.receiptSourceNote(removable, sessionId: sessionId),
                 preservedCardCount: preserved.count,
                 foldedCards: folded
             )
             let tail = Array(rows.suffix(messageCount - replaceCount))
             let postCompactionChars = summary.count
+                + transcriptCharacterCount(pendingRecollections)
                 + transcriptCharacterCount(pendingResults)
                 + transcriptCharacterCount(preserved)
                 + transcriptCharacterCount(tail)
@@ -1059,6 +1240,10 @@ public struct ChatSessionAutocompactor: Sendable {
     /// replayed an answer to nothing. Pull the cut back to that user row;
     /// skip when doing so would fold no raw turn.
     static func keepingLastUserRow(rows: [JSONValue], replaceCount: Int) -> Int {
+        let replaceCount = min(replaceCount, rows.firstIndex {
+            guard case .object(let row) = $0, case .object(let metadata)? = row["metadata"] else { return false }
+            return metadata["awaitingConsumption"] == .bool(true)
+        } ?? rows.count)
         func role(_ row: JSONValue) -> String? {
             guard case .object(let obj) = row, case .string(let value)? = obj["role"] else { return nil }
             return value
@@ -1109,6 +1294,7 @@ public struct ChatSessionAutocompactor: Sendable {
 
     private static func compactionSummary(
         for rows: [JSONValue],
+        sourceNote: String,
         preservedCardCount: Int = 0,
         foldedCards: [JSONValue] = [],
         maxChars: Int = ChatCompactionDistiller.maxSummaryChars
@@ -1116,11 +1302,12 @@ public struct ChatSessionAutocompactor: Sendable {
         let header = "[NativeAgent compacted \(rows.count + foldedCards.count) earlier message(s)."
             + InlineInteractionCompactionRetention.summaryClause(preservedCount: preservedCardCount)
             + InlineInteractionCompactionRetention.foldedClause(count: foldedCards.count)
+            + " Replaced messages stay readable with chat.search / context.expand history:<id>."
             + "]"
         // A card folded past the hard cap leaves its one line here, ahead of the
         // capped body, so the receipt can never be the text that ages out.
         let receipts = foldedCards.map(InlineInteractionCompactionRetention.foldReceipt)
-        var lines: [String] = [header] + receipts
+        var lines: [String] = [sourceNote, header] + receipts
         // 2026-09-05: a PRIOR recollection at the head of the replaced range is
         // the only carrier of everything that happened before it; the 500-char
         // per-row cap truncated it to its first paragraph, so when the distill
@@ -1189,6 +1376,22 @@ public struct ChatSessionAutocompactor: Sendable {
 /// every record of which tools ran was dropped from the summary and from the
 /// distiller prompt.
 enum ChatCompactionRowRendering {
+    static func receiptSourceNote(_ rows: [JSONValue], sessionId: String) -> String {
+        for row in rows.reversed() {
+            guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { continue }
+            if case .string? = metadata["toolName"], case .string(let id)? = object["id"] {
+                let read: JSONValue = .object(["action": .string("chat.message"), "args": .object([
+                    "session_id": .string(sessionId), "message_id": .string(id),
+                ])])
+                if let call = try? read.serialize(pretty: false) {
+                    return "[Source: recollection, not a receipt. Latest stored tool receipt: app \(call). Stored results may be bounded/redacted; result.page handles expire at turn end.]"
+                }
+            }
+            if case .string(let note)? = metadata["receipt_source_note"] { return note }
+        }
+        return "[Source: recollection. Tool receipts record dispatches; assistant text records claims.]"
+    }
+
     private static func contentValue(_ obj: [String: JSONValue]) -> JSONValue? {
         if case .string? = obj["content"] { return obj["content"] }
         if case .string? = obj["text"] { return obj["text"] }
@@ -1232,6 +1435,9 @@ enum ChatCompactionRowRendering {
         if line.isEmpty, case .string(let toolName)? = metadata?["toolName"],
            !toolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             line = SessionHistoryPromptRenderer.toolSummary(content: "", metadata: metadata, resultCap: toolSummaryCap)
+        }
+        if case .string? = metadata?["toolName"], case .string(let id)? = obj["id"] {
+            line = "[Recorded tool receipt; context.expand history:\(id)] " + line
         }
         let body = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
             line, attachments: metadata?["attachments"])

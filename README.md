@@ -40,7 +40,7 @@ main pages.
 | Work | Desk holds projects, dependencies, schedules, progress and outcomes; standing helpers have their own briefs, models and conversations. |
 | Mac and web | App actions reach files, shell, Mac apps, screen control, the built-in browser and the optional Chrome extension. `web.search` tries Codex for general queries and SearXNG for code queries. |
 | Connections | Connectors and agent contacts live under **Connectors**. Mounted MCP tools appear as `mcp.<server>.<tool>` actions inside `app`. |
-| Growth | Skills provide reusable guidance. `tool.propose` files authored code; `tool.approve` activates it as `authored.<id>`. |
+| Growth | Skills provide reusable guidance and optional admitted scripts: `skill.save`, `skill.enable`, `skill.run`, `skill.resume` and `skill.rollback`. They grant no new authority; see the [manifest spec](docs/skill_manifest_spec.md). `tool.propose` files authored code; `tool.approve` activates it as `authored.<id>`. |
 | Trust | Safe, Work mode, Builder and Full Mac govern access. Full Mac grants autonomy; macOS privacy permission resets still ask the owner. Peer-steered turns retain extra approval boundaries, except for authenticated agents enabled in Trust → Connected agents; ordinary Trust and domain checks still apply. |
 | Inner life | Settings controls reflection, dreams and memory in replies; Diagnostics exposes cognition and organism state. |
 

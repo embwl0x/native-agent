@@ -15,7 +15,7 @@ extension NativeClient {
     }
 
     private static var defaultConnectorActions: ConnectorActions {
-        NativeClient(baseURL: "").connectorActions
+        NativeClient().connectorActions
     }
 
     typealias ConnectorActionApprovalReplay = ApprovalTransactionCoordinator.ConnectorActionApprovalReplay

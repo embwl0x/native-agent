@@ -28,6 +28,7 @@ public enum TurnSecretRedactor {
             ("SLACK_TOKEN", "\\bxox[baprs]-[A-Za-z0-9-]{20,}\\b", []),
             ("GOOGLE_API_KEY", "\\bAIza[0-9A-Za-z_-]{25,}\\b", []),
             ("BEARER_TOKEN", "\\bBearer\\s+[A-Za-z0-9._~+/=-]{20,}\\b", [.caseInsensitive]),
+            ("TELEGRAM_TOKEN", #"(?:\bbot\d+|\b\d{6,})(?::|%3[Aa])[A-Za-z0-9_-]+"#, []),
             // Agent on the glass, 2026-09-13: the unquoted form ate ordinary
             // prose — it had no leading boundary and `[\w]*` ran through the
             // rest of whatever word it landed inside, so "Apiary: beekeeping
@@ -152,11 +153,19 @@ public enum TurnSecretRedactor {
                 options: [],
                 range: NSRange(location: 0, length: nsText.length)
             )
-            for match in matches.reversed() {
-                text = (text as NSString).replacingCharacters(
-                    in: match.range,
-                    with: "[REDACTED_\(kind)]"
-                )
+            // Each policy still sees the entire preceding policy's result.
+            // Assemble its edits once instead of copying the full document
+            // once per credential match.
+            if !matches.isEmpty {
+                var safe = "", start = 0
+                safe.reserveCapacity(text.utf8.count)
+                for match in matches {
+                    safe += nsText.substring(with: NSRange(location: start, length: match.range.location - start))
+                    safe += "[REDACTED_\(kind)]"
+                    start = match.range.location + match.range.length
+                }
+                safe += nsText.substring(from: start)
+                text = safe
             }
         }
         return text

@@ -6,6 +6,7 @@ import Cognition
 import CognitiveSubstrate
 import DeviceSync
 import PersistenceCore
+import StandingBots
 import TrustCenter
 
 /// The agent-bridge listener an A2A peer pushes task notifications to.
@@ -15,7 +16,7 @@ public protocol EngineAgentBridgePort: Sendable {
 
 /// The standing-bot runner that drains queued bot runs.
 public protocol EngineStandingBotQueuePort: Sendable {
-    func enqueueRun(bot: UUID) throws -> UUID
+    func enqueueRun(bot: UUID, question: String?) throws -> BotRunReceipt
 }
 
 /// Platform hosts supplied once to Core's composition root. The factories
@@ -30,7 +31,6 @@ public struct NativeAgentEnginePorts: Sendable {
     public let appTools: @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor
     public let interactions: any ToolInteractionResolving
     public let chatPlatform: ChatToolPlatformPort
-    public let catalogPosture: @Sendable () async -> OrganismBehaviorPosture?
     public let evolutionBridge: @Sendable (URL) -> any EvolutionToolBridge
     public let connectorActionStatuses: @Sendable () async throws -> [String: String]
 
@@ -44,7 +44,6 @@ public struct NativeAgentEnginePorts: Sendable {
         appTools: @escaping @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor,
         interactions: any ToolInteractionResolving,
         chatPlatform: ChatToolPlatformPort,
-        catalogPosture: @escaping @Sendable () async -> OrganismBehaviorPosture?,
         evolutionBridge: @escaping @Sendable (URL) -> any EvolutionToolBridge,
         connectorActionStatuses: @escaping @Sendable () async throws -> [String: String]
     ) {
@@ -57,7 +56,6 @@ public struct NativeAgentEnginePorts: Sendable {
         self.appTools = appTools
         self.interactions = interactions
         self.chatPlatform = chatPlatform
-        self.catalogPosture = catalogPosture
         self.evolutionBridge = evolutionBridge
         self.connectorActionStatuses = connectorActionStatuses
     }

@@ -154,12 +154,17 @@ public enum AgentConversationRouting {
         return .object(["tool": .string("agent_read"), "input": .object(input)])
     }
 
-    private static func validate(options: [String: JSONValue], agent: String, continuing: Bool) throws {
+    public static func supportedOptions(agent: String) -> Set<String>? {
+        guard ["codex", "claude", "omp"].contains(agent) else { return nil }
         var allowed: Set<String> = ["working_directory", "topic"]
         if agent == "omp" { allowed.insert("timeout_seconds") }
         if agent == "codex" { allowed.formUnion(["model", "reasoning_effort", "fast", "pair_reviewer"]) }
         if agent == "claude" { allowed.insert("pair_reviewer") }
-        try keys(options, allowed: allowed)
+        return allowed
+    }
+
+    private static func validate(options: [String: JSONValue], agent: String, continuing: Bool) throws {
+        try keys(options, allowed: supportedOptions(agent: agent) ?? [])
         if continuing, options["working_directory"] != nil || options["topic"] != nil {
             throw invalid("A continuation reuses its existing workspace and topic; omit those options.")
         }

@@ -578,7 +578,7 @@ public extension SwiftNativeStudioStore {
             let existing: [StudioCanonRow]
             do { existing = try await Self.readCanon(at: path, using: core) }
             catch {
-                NSLog("[StudioCanon] Append deferred: %@", error.localizedDescription)
+                nativeLog("[StudioCanon] Append deferred: %@", error.localizedDescription)
                 throw error
             }
             guard !existing.contains(where: { $0.proposalID == proposalID }) else { return false }

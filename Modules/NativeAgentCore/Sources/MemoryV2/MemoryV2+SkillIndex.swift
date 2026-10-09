@@ -133,7 +133,8 @@ extension SwiftNativeMemoryV2 {
         // An archived skill stays findable here, marked archived (`CapabilityLifecycle`).
         for entry in inventory {
             let archived = entry.row["status"] == .string(CapabilityLifecycle.archived)
-            guard entry.isAvailable || archived, let url = entry.bodyURL,
+            // First wins: a built-in sorts before her archived version of it.
+            guard current[entry.id] == nil, entry.isAvailable || archived, let url = entry.bodyURL,
                   let body = try? String(contentsOf: url, encoding: .utf8),
                   !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
             current[entry.id] = Self.skillPointerText(name: entry.id, body: body, archived: archived)
@@ -173,6 +174,7 @@ extension SwiftNativeMemoryV2 {
                     continue
                 }
                 let embedded = try await embedOneWithEpoch(text)
+                try await ensureCanonicalAttachment()
                 guard let storage else { throw MemoryV2Error.storageUnavailable }
                 _ = try await storage.updateMemory(
                     id: id,
@@ -198,6 +200,7 @@ extension SwiftNativeMemoryV2 {
                     status: "active",
                     extras: Self.skillPointerMetadata(name: name)
                 )
+                try await ensureCanonicalAttachment()
                 guard let storage else { throw MemoryV2Error.storageUnavailable }
                 _ = try await storage.insert(
                     record: record,
@@ -213,6 +216,7 @@ extension SwiftNativeMemoryV2 {
         // minting a rejection tombstone (deleteMemory would).
         for (name, row) in existing where current[name] == nil {
             guard row.status == "active" else { continue }
+            try await ensureCanonicalAttachment()
             guard let storage else { throw MemoryV2Error.storageUnavailable }
             _ = try await storage.updateMemory(
                 id: row.id,

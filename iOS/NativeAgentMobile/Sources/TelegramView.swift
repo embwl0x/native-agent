@@ -9,8 +9,6 @@ struct TelegramView: View {
     @State private var failure: String?
     @State private var snapshotFailure: String?
     @State private var showDisconnect = false
-    @State private var showAccessChange = false
-    @State private var pendingAccessChange: MobileTelegramChange?
 
     var body: some View {
         AlivePage(title: "Telegram", line: "Telegram settings on your Mac.") {
@@ -22,32 +20,13 @@ struct TelegramView: View {
                 AliveSection("Connection") {
                     AliveRow("Bot token", detail: snapshot.tokenConfigured ? "Saved on your Mac" : "Not set up") { EmptyView() }
                     AliveDivider()
-                    AliveRow("Telegram poll loop", detail: snapshot.pollerRunning ? "Running" : "Not running") { EmptyView() }
+                    AliveRow("Telegram poll loop", detail: snapshot.pollStatusMessage ?? (snapshot.pollerRunning ? "Running" : "Not running")) { EmptyView() }
+                    AliveDivider()
+                    AliveRow("Last successful poll", detail: snapshot.lastSuccessfulPollAt.map(UserDisplayFormatters.humanizeISOTimestamp) ?? "None") { EmptyView() }
                     AliveDivider()
                     AliveRow("Set up on your Mac", detail: "Open Telegram on your Mac to add or replace the bot token. Tokens cannot be sent through iCloud.") { EmptyView() }
                 }
-                AliveSection("Who can reach me") {
-                    Toggle("Telegram is on", isOn: Binding(
-                        get: { snapshot.enabled },
-                        set: { value in
-                            if value { confirmAccessChange(.enabled(true)) }
-                            else { Task { await change(.enabled(false)) } }
-                        }
-                    )).aliveRow()
-                    AliveDivider()
-                    Toggle("Only answer when mentioned in a group", isOn: Binding(
-                        get: { snapshot.requireMention },
-                        set: { value in
-                            if value { Task { await change(.requireMention(true)) } }
-                            else { confirmAccessChange(.requireMention(false)) }
-                        }
-                    )).aliveRow()
-                    AliveDivider()
-                    AliveRow("Allowed chat IDs", detail: snapshot.allowedChatIDs.isEmpty ? "None" : snapshot.allowedChatIDs.joined(separator: ", ")) { EmptyView() }
-                    AliveDivider()
-                    AliveRow("Allowed user IDs", detail: snapshot.allowedUserIDs.isEmpty ? "None" : snapshot.allowedUserIDs.joined(separator: ", ")) { EmptyView() }
-                }
-                .disabled(!pairingStore.isPaired || saving || !snapshot.tokenConfigured)
+                MobileAppSettingsSections(pages: ["telegram"], title: "Who can reach me")
 
                 AliveSection("Model") {
                     AliveRow("Follows Chat: \(snapshot.model)") { EmptyView() }
@@ -75,20 +54,6 @@ struct TelegramView: View {
         } message: {
             Text("This removes the saved bot token and disables Telegram until new credentials are saved.")
         }
-        .confirmationDialog(TelegramAccessConfirmation.title, isPresented: $showAccessChange, titleVisibility: .visible) {
-            Button(TelegramAccessConfirmation.action) {
-                if let pendingAccessChange { Task { await change(pendingAccessChange) } }
-                pendingAccessChange = nil
-            }
-            Button("Cancel", role: .cancel) { pendingAccessChange = nil }
-        } message: {
-            Text(TelegramAccessConfirmation.message)
-        }
-    }
-
-    private func confirmAccessChange(_ change: MobileTelegramChange) {
-        pendingAccessChange = change
-        showAccessChange = true
     }
 
     private func adopt(_ value: MobileTelegramSnapshot) {
@@ -99,6 +64,7 @@ struct TelegramView: View {
     private func refresh() async {
         failure = nil
         await readSnapshot()
+        await MobileAppSettingsStore.shared.refresh()
     }
 
     private func readSnapshot() async {

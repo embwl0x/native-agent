@@ -62,7 +62,7 @@ struct ToolsView: View {
                 }
 
                 if !appModel.toolOperationStatusReceipts.isEmpty {
-                    ToolsSection(title: "Recent tool activity") {
+                    AdvancedSection(title: "Recent tool activity", card: .single) {
                         ForEach(appModel.toolOperationStatusReceipts) { receipt in
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(receipt.outcome == .succeeded ? "Completed" : "Needs attention")
@@ -98,7 +98,7 @@ struct ToolsView: View {
             .disabled(appModel.isRefreshingTools)
             .accessibilityIdentifier("tools.refresh")
         }
-        .task {
+        .liveTask {
             guard loadsOnAppear else { return }
             await appModel.refreshForSidebarItem(.tools)
         }
@@ -895,7 +895,7 @@ private struct AuthoredToolsSection: View {
     @State private var quarantineCandidate: ToolRecord?
 
     var body: some View {
-        ToolsSection(title: "Tools I wrote") {
+        AdvancedSection(title: "Tools I wrote", card: .single) {
             ForEach(tools) { tool in
                 authoredRow(tool)
             }
@@ -1026,10 +1026,6 @@ private enum ToolsStatusTone {
     }
 }
 
-/// One section of the page: the eyebrow the Advanced list uses, and the rows
-/// under it on one card.
-private typealias ToolsSection<Content: View> = SettingsCardSection<Content>
-
 /// A bare fold: a chevron, the words, one gesture, and Reduce Motion honoured.
 private struct ToolsFold<Label: View, Content: View>: View {
     @Binding var isExpanded: Bool
@@ -1041,7 +1037,7 @@ private struct ToolsFold<Label: View, Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Button {
-                withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)) {
+                withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)) {
                     isExpanded.toggle()
                 }
             } label: {
@@ -1060,7 +1056,7 @@ private struct ToolsFold<Label: View, Content: View>: View {
 
             if isExpanded {
                 content
-                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+                    .transition(NativeAgentMotion.arrivalFade)
             }
         }
     }

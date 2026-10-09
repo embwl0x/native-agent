@@ -105,7 +105,7 @@ public struct GrokInboundReply: Sendable {
     func resumeHandOvers(dataRoot: URL) {
         let store = GrokRequestStore(dataRoot: dataRoot)
         do { try store.pruneSettled() }
-        catch { NSLog("Grok request retention failed: %@", error.localizedDescription) }
+        catch { nativeLog("Grok request retention failed: %@", error.localizedDescription) }
         let files = (try? FileManager.default.contentsOfDirectory(at: store.root, includingPropertiesForKeys: nil)) ?? []
         let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
         for file in files where file.pathExtension == "json" {

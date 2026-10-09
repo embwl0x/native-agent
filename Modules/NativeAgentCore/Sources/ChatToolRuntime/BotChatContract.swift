@@ -10,15 +10,13 @@ import StandingBots
 // bot-specific approval rule (lane1 finding 4 — the prose-editor bot saves
 // codex/gpt-5.5/medium and none of it was consulted).
 //
-// What a continued turn carries now: the bot's model and reasoning effort, and
-// surface "bot", which is what the extra visible-desktop/sound approval
-// requirement keys on (ChatOrchestrationClient+DispatchWrappers.swift:968). The
-// brief needs no carrying — every run persists it as the session's user row, so
-// it is already in the transcript the continuation reads. Per-run claim and
-// daily allowance stay with BotRunner: a person typing in the bot's session is
+// A continued turn carries the bot's model, reasoning effort and current brief.
+// Its execution policy is independent of the door delivering the message.
+// Per-run claim and daily allowance stay with BotRunner: a person in its session is
 // an attended turn, not scheduled spend.
 public struct BotChatContract: Sendable, Equatable {
     public let name: String
+    public let instructions: String
     public let model: String?
     public let reasoningEffort: String?
     /// The bot's saved provider tuple, exactly as StandingBotContinuity builds
@@ -32,8 +30,11 @@ public struct BotChatContract: Sendable, Equatable {
     public var choice: ProviderTurnChoice?
     /// What the bot still needs before it can run, or nil when it can.
     public var modelChoiceProblem: String? = nil
-    /// Keeps the bot-specific approval rule on a continued turn.
-    public var surface: String { "bot" }
+
+    public static func instructions(for bot: BotDefinition) -> String {
+        "Current standing instructions for \(bot.name):\n\(bot.brief)"
+            + (bot.outputFormat.map { "\nRequested output: " + $0 } ?? "")
+    }
 
     /// The contract with the FULL gate applied — the same one the runner uses:
     /// the route is connected and still offers this model at this Think level,
@@ -52,7 +53,7 @@ public struct BotChatContract: Sendable, Equatable {
         guard sessionId.hasPrefix("bot-"),
               UUID(uuidString: String(sessionId.dropFirst(4))) != nil else { return nil }
         guard let bot = definition(for: sessionId, dataRoot: dataRoot) else {
-            return BotChatContract(name: "Bot", model: nil, reasoningEffort: nil, choice: nil,
+            return BotChatContract(name: "Bot", instructions: "", model: nil, reasoningEffort: nil, choice: nil,
                                    modelChoiceProblem: "This bot's definition is unavailable or deleted. Restore it before continuing this conversation.")
         }
         return await contract(for: bot, dataRoot: dataRoot)
@@ -83,7 +84,7 @@ public struct BotChatContract: Sendable, Equatable {
                 reasoningEffort: bot.reasoningEffort ?? "", fast: bot.fast ?? false
             )
             : nil
-        return BotChatContract(name: bot.name, model: bot.model,
+        return BotChatContract(name: bot.name, instructions: instructions(for: bot), model: bot.model,
                                reasoningEffort: bot.reasoningEffort, choice: choice,
                                modelChoiceProblem: problem)
     }

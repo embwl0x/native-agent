@@ -66,6 +66,16 @@ public struct MacAXAttributes: Sendable, Equatable {
     /// it and calls it by, when its AX name says something else.
     public let placeholder: String?
     public let selectionRange: NSRange?
+    /// Typed AXValue state, never prose obtained by stringifying a boolean.
+    public let state: String?
+    /// Presentation metadata, not another text channel.
+    public let liveRegion: Bool
+    public let valueIsHelp: Bool
+    /// A display-only name when help duplicates the identity title. The
+    /// original title remains authoritative for redaction and act identity.
+    public let titleIsHelp: Bool
+    public let displayTitle: String?
+    public let listSummary: String?
 
     public init(
         role: String,
@@ -77,10 +87,22 @@ public struct MacAXAttributes: Sendable, Equatable {
         frame: MacAXFrame? = nil,
         actions: [String] = [],
         placeholder: String? = nil,
-        selectionRange: NSRange? = nil
+        selectionRange: NSRange? = nil,
+        state: String? = nil,
+        liveRegion: Bool = false,
+        valueIsHelp: Bool = false,
+        titleIsHelp: Bool = false,
+        displayTitle: String? = nil,
+        listSummary: String? = nil
     ) {
         self.placeholder = placeholder
         self.selectionRange = selectionRange
+        self.state = state
+        self.liveRegion = liveRegion
+        self.valueIsHelp = valueIsHelp
+        self.titleIsHelp = titleIsHelp
+        self.displayTitle = displayTitle
+        self.listSummary = listSummary
         self.role = role
         self.subrole = subrole
         self.title = title
@@ -127,7 +149,9 @@ public struct MacAXNode: Sendable, Equatable {
             object["value"] = .string(MacAccessibilityReader.truncate(value, to: valueChars))
         }
         if let selected = attributes.selected { object["selected"] = .bool(selected) }
+        if let state = attributes.state { object["state"] = .string(state) }
         if let frame = attributes.frame { object["frame"] = frame.toJSON() }
+        if let summary = attributes.listSummary { object["list_summary"] = .string(summary) }
         return .object(object)
     }
 }
@@ -334,6 +358,8 @@ public struct MacAXWindowHandle: Sendable {
 /// thousands of AX elements; an unbounded read would flood the turn. The
 /// `hard*` values are ceilings the caller CANNOT raise — `init` clamps.
 public struct MacAXLimits: Sendable, Equatable {
+    @TaskLocal static var readDeadline: Date?
+    static let readSeconds: TimeInterval = 5
     public static let hardMaxNodes = 400
     public static let hardMaxDepth = 12
     public static let hardValueChars = 200
@@ -563,12 +589,19 @@ public protocol MacAXElementSource: Sendable {
     /// These roots are never window-relative action addresses.
     func transientMenuRoots(pid: Int32) -> [MacAXElementRef]
     func attributes(of ref: MacAXElementRef) -> MacAXAttributes?
+    /// Only what the desktop capture's secret mask reads: role, subrole,
+    /// title, value, frame and actions, without the display-only reads.
+    /// Default: the full attribute read.
+    func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes?
+    /// Writable action attributes, queried only for selected screen marks.
+    func settableAttributes(of ref: MacAXElementRef) -> [String]
     func children(of ref: MacAXElementRef) -> [MacAXElementRef]
     /// Child count WITHOUT materializing the array. Default falls back to
     /// `children(of:).count`; the live source uses the ranged AX count API so a
     /// pathological node (100k children) can't force a huge bridge just to be
-    /// counted at the depth cap (gpt-5.5 SHOULD-FIX, 2026-08-12).
-    func childCount(of ref: MacAXElementRef) -> Int
+    /// counted at the depth cap (gpt-5.5 SHOULD-FIX, 2026-08-12). nil = the
+    /// app did not answer: unknown, never an empty subtree.
+    func childCount(of ref: MacAXElementRef) -> Int?
     /// At most `limit` children. Default prefixes `children(of:)`; the live
     /// source uses `AXUIElementCopyAttributeValues` ranged fetch so the whole
     /// child array is never bridged when only a bounded slice can still fit
@@ -595,6 +628,8 @@ public protocol MacAXElementSource: Sendable {
 }
 
 public extension MacAXElementSource {
+    func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes? { attributes(of: ref) }
+    func settableAttributes(of ref: MacAXElementRef) -> [String] { [] }
     func elementHash(_ ref: MacAXElementRef) -> Int? { nil }
     func sameElement(_ lhs: MacAXElementRef, _ rhs: MacAXElementRef) -> Bool { lhs == rhs }
     func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool {
@@ -602,7 +637,7 @@ public extension MacAXElementSource {
             && attributes(of: container)?.frame == frame
     }
     func transientMenuRoots(pid: Int32) -> [MacAXElementRef] { [] }
-    func childCount(of ref: MacAXElementRef) -> Int { children(of: ref).count }
+    func childCount(of ref: MacAXElementRef) -> Int? { children(of: ref).count }
     func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef] {
         limit <= 0 ? [] : Array(children(of: ref).prefix(limit))
     }
@@ -639,6 +674,15 @@ public extension MacAXElementSource {
 /// the existing reader owns their validation until the first effect begins.
 public final class MacWorkContinuation: @unchecked Sendable, Equatable {
     @TaskLocal public static var current: MacWorkContinuation?
+    /// The app's capture of where he was, installed once at launch.
+    nonisolated(unsafe) public static var capture: (@Sendable (_ text: String, _ taskReference: String) async -> MacWorkContinuation?)?
+
+    /// A door's "take over", read where he was when the door received it,
+    /// before any queue (every door is the same session).
+    public static func admit(_ text: String) async -> MacWorkContinuation? {
+        guard UserMessageIntentSignals.isTakeOver(text) else { return nil }
+        return await capture?(text, UUID().uuidString)
+    }
     private let id = UUID()
     private let lock = NSLock()
     private var started = false
@@ -715,8 +759,14 @@ public enum MacAccessibilityReader {
     public static func walk(
         source: any MacAXElementSource,
         root: MacAXElementRef,
-        limits: MacAXLimits = MacAXLimits()
+        limits: MacAXLimits = MacAXLimits(),
+        complete: Bool = false,
+        read: ((MacAXElementRef) -> MacAXAttributes?)? = nil,
+        deadline: Date? = nil,
+        stopAtCut: Bool = false
     ) -> MacAXTreeSnapshot {
+        let limits = complete ? MacAXLimits.deepPage : limits
+        let deadline = deadline ?? MacAXLimits.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds)
         var nodes: [MacAXNode] = []
         var skipped = 0
         var reasons: Set<String> = []
@@ -726,6 +776,14 @@ public enum MacAccessibilityReader {
         var seen: [Int: [MacAXElementRef]] = [:]
 
         while let item = stack.popLast() {
+            // A caller that only needs to know whether the walk was whole
+            // stops at the first cut.
+            if stopAtCut, !reasons.isEmpty { break }
+            if Task.isCancelled || Date() >= deadline {
+                skipped += 1 + stack.count
+                reasons.insert(Task.isCancelled ? "interrupted" : "time_budget")
+                break
+            }
             if nodes.count >= limits.maxNodes {
                 // Everything still pending is unseen. Count it and stop; we do
                 // not enumerate its children, hence "at least".
@@ -735,11 +793,10 @@ public enum MacAccessibilityReader {
             }
             // Her-screen Phase 4 — one element, one visit, whatever parent
             // re-lists it: a repeated subtree is budget spent on nothing.
-            if let hash = source.elementHash(item.ref) {
-                if seen[hash]?.contains(where: { source.sameElement($0, item.ref) }) == true { continue }
-                seen[hash, default: []].append(item.ref)
-            }
-            guard let attributes = source.attributes(of: item.ref) else {
+            let hash = source.elementHash(item.ref) ?? item.ref.id
+            if seen[hash]?.contains(where: { source.sameElement($0, item.ref) }) == true { continue }
+            seen[hash, default: []].append(item.ref)
+            guard let attributes = read.map({ $0(item.ref) }) ?? source.attributes(of: item.ref) else {
                 skipped += 1
                 reasons.insert("unreadable_element")
                 continue
@@ -749,12 +806,17 @@ public enum MacAccessibilityReader {
             if attributes.role == "AXMenuBar", !item.path.isEmpty { continue }
             nodes.append(MacAXNode(attributes: attributes, path: item.path, element: item.ref))
 
+            // An element whose children the app did not report (an AX error
+            // or the per-message timeout) is a cut, never an empty subtree.
+            guard let total = source.childCount(of: item.ref) else {
+                reasons.insert("ax_error")
+                continue
+            }
             if item.depth >= limits.maxDepth {
                 // Count-only: never materialize the child array just to report
                 // how many were cut at the depth boundary.
-                let pending = source.childCount(of: item.ref)
-                if pending > 0 {
-                    skipped += pending
+                if total > 0 {
+                    skipped += total
                     reasons.insert("depth_cap")
                 }
                 continue
@@ -764,18 +826,20 @@ public enum MacAccessibilityReader {
             // materializing the whole array is pure waste and a pathological node
             // could force a huge bridge. Fetch only what could still fit; count
             // the un-fetched remainder without materializing it.
-            let budget = max(0, limits.maxNodes - nodes.count)
-            let total = source.childCount(of: item.ref)
+            let budget = max(0, limits.maxNodes - nodes.count - stack.count)
             let children = source.children(of: item.ref, limit: budget)
             if total > children.count {
                 skipped += total - children.count
-                reasons.insert("node_cap")
+                // Fewer than the budget allowed is the copy failing, not the cap.
+                reasons.insert(children.count < min(total, budget) ? "ax_error" : "node_cap")
             }
             // Reverse-push so pop order is left-to-right preorder.
             for (index, child) in children.enumerated().reversed() {
                 stack.append((child, item.path + [index], item.depth + 1))
             }
         }
+
+        if Date() >= deadline { reasons.insert("time_budget") }
 
         return MacAXTreeSnapshot(
             nodes: nodes,
@@ -820,6 +884,8 @@ public enum MacAccessibilityReader {
         case nodeCap
         /// The caller cancelled the search or reached its deadline.
         case interrupted
+        /// The app did not answer a child read, so part of the tree is unseen.
+        case axError
 
         public var hit: (ref: MacAXElementRef, path: [Int])? {
             guard case .found(let ref, let path) = self else { return nil }
@@ -834,6 +900,7 @@ public enum MacAccessibilityReader {
             case .depthCap: return "depth_cap"
             case .nodeCap: return "node_cap"
             case .interrupted: return "interrupted"
+            case .axError: return "ax_error"
             }
         }
     }
@@ -871,6 +938,7 @@ public enum MacAccessibilityReader {
         // reachable leaves both false, and only then is `notFound` the truth.
         var hitDepthCap = false
         var hitNodeCap = false
+        var hitAXError = false
         while index < queue.count {
             if shouldStop() { return .interrupted }
             let item = queue[index]
@@ -891,24 +959,29 @@ public enum MacAccessibilityReader {
             }
             if shouldStop() { return .interrupted }
             guard item.depth < max(1, maxDepth) else {
-                if source.childCount(of: item.ref) > 0 { hitDepthCap = true }
+                if source.childCount(of: item.ref) != 0 { hitDepthCap = true }
                 continue
             }
             let remaining = max(0, max(1, nodeBudget) - visited - (queue.count - index))
             guard remaining > 0 else {
-                if source.childCount(of: item.ref) > 0 { hitNodeCap = true }
+                if source.childCount(of: item.ref) != 0 { hitNodeCap = true }
                 continue
             }
-            let total = source.childCount(of: item.ref)
+            // An unanswered child list leaves the search unfinished, never "not found".
+            guard let total = source.childCount(of: item.ref) else { hitAXError = true; continue }
             if shouldStop() { return .interrupted }
             let children = source.children(of: item.ref, limit: remaining)
-            if total > children.count { hitNodeCap = true }
+            // Fewer than the budget allowed is the copy failing, not the cap.
+            if children.count < min(total, remaining) { hitAXError = true }
+            else if total > children.count { hitNodeCap = true }
             for (childIndex, child) in children.enumerated() {
                 queue.append((child, item.path + [childIndex], item.depth + 1))
             }
         }
-        // Node cap first: it is the budget that actually bit in the Chrome case
+        // An unanswered read first: no budget explains what the app withheld.
+        // Then node cap: it is the budget that actually bit in the Chrome case
         // the finding names, and reporting the deeper one would understate it.
+        if hitAXError { return .axError }
         if hitNodeCap { return .nodeCap }
         if hitDepthCap { return .depthCap }
         return .notFound
@@ -1264,8 +1337,11 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             parent: { MacAXAttributeRead.copyElement($0, kAXParentAttribute) },
             children: { element, limit in
                 guard MacAXAttributeRead.copyString(element, kAXRoleAttribute) != "AXMenuBar" else { return [] }
+                let attribute = MacAXAttributeRead.childAttribute(element)
+                guard MacAXAttributeRead.prepare(element) else { return [] }
+                defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
                 var values: CFArray?
-                guard AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0,
+                guard AXUIElementCopyAttributeValues(element, attribute as CFString, 0,
                                                      CFIndex(limit), &values) == .success,
                       let children = values as? [AnyObject] else { return [] }
                 return children.compactMap { child in
@@ -1395,7 +1471,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         MacAXExecutionLane.sync { focusedElementPathOnExecutionLane(relativeTo: rootRef) }
     }
 
-    private func focusedElementPathOnExecutionLane(relativeTo rootRef: MacAXElementRef?, siblingLimit: Int? = nil) -> [Int]? {
+    private func focusedElementPathOnExecutionLane(relativeTo rootRef: MacAXElementRef?, siblingLimit: Int = MacAXLimits.hardMaxNodes) -> [Int]? {
         #if canImport(AppKit)
         let pid: pid_t
         if let rootRef, let root = element(rootRef) {
@@ -1431,16 +1507,13 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         for _ in 0..<MacAXLimits.hardMaxDepth {
             if CFEqual(current, root) { return path.reversed() }
             guard let parent = MacAXAttributeRead.copyElement(current, kAXParentAttribute) else { return nil }
-            let siblings: [AXUIElement]
-            if let siblingLimit {
-                var raw: CFArray?
-                guard AXUIElementCopyAttributeValues(parent, kAXChildrenAttribute as CFString,
+            let attribute = MacAXAttributeRead.childAttribute(parent)
+            var raw: CFArray?
+            guard MacAXAttributeRead.prepare(parent) else { return nil }
+            defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(parent, 0) } }
+            guard AXUIElementCopyAttributeValues(parent, attribute as CFString,
                     0, CFIndex(siblingLimit), &raw) == .success,
-                      let bounded = raw as? [AXUIElement] else { return nil }
-                siblings = bounded
-            } else {
-                siblings = MacAXAttributeRead.copyElementArray(parent, kAXChildrenAttribute)
-            }
+                  let siblings = raw as? [AXUIElement] else { return nil }
             guard let index = siblings.firstIndex(where: { CFEqual($0, current) }) else { return nil }
             path.append(index)
             current = parent
@@ -1451,16 +1524,33 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         #endif
     }
 
+    public func settableAttributes(of ref: MacAXElementRef) -> [String] {
+        guard let element = element(ref) else { return [] }
+        return [kAXValueAttribute, kAXFocusedAttribute, kAXSelectedAttribute].filter { attribute in
+            guard MacAXAttributeRead.prepare(element) else { return false }
+            defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
+            var settable = DarwinBoolean(false)
+            return AXUIElementIsAttributeSettable(element, attribute as CFString, &settable) == .success
+                && settable.boolValue
+        }
+    }
+
     public func attributes(of ref: MacAXElementRef) -> MacAXAttributes? {
         guard let element = element(ref) else { return nil }
         guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
+        let title = MacAXAttributeRead.copyLabel(element, role: role, prepare: prepareForRead)
+        let displayTitle = MacAXAttributeRead.copyLabel(element, role: role, forDisplay: true, prepare: prepareForRead)
         return MacAXAttributes(
             role: role,
             subrole: MacAXAttributeRead.copyString(element, kAXSubroleAttribute),
             // A field or popup named by a separate label ("Save As:") takes
             // that label's text — the same rule the act-side drift check reads.
-            title: MacAXAttributeRead.copyLabel(element, role: role, prepare: prepareForRead),
-            value: copyStringifiedValue(element, kAXValueAttribute),
+            title: title,
+            // AXHeading's numeric value is a heading level. Preserve a genuine
+            // string value, but never stringify its level as document text.
+            value: role == "AXHeading" ? MacAXAttributeRead.copyString(element, kAXValueAttribute)
+                : MacAXAttributeRead.valueState(element, role: role) == nil
+                    ? copyStringifiedValue(element, kAXValueAttribute) : nil,
             enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
             selected: MacAXAttributeRead.copyBool(element, kAXSelectedAttribute),
             frame: MacAXAttributeRead.copyFrame(element),
@@ -1468,7 +1558,34 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             placeholder: MacAXAttributeRead.placeholderRoles.contains(role)
                 ? MacAXAttributeRead.copyString(element, kAXPlaceholderValueAttribute) : nil,
             selectionRange: MacAXAttributeRead.placeholderRoles.contains(role)
-                ? MacAXAttributeRead.copyTextRange(element) : nil
+                ? MacAXAttributeRead.copyTextRange(element) : nil,
+            state: MacAXAttributeRead.valueState(element, role: role),
+            liveRegion: (role == "AXGroup" && (MacAXAttributeRead.copyString(element, "AXARIALive")
+                .map { $0 != "off" } ?? false))
+                || ["AXApplicationStatus", "AXApplicationAlert"].contains(
+                    MacAXAttributeRead.copyString(element, kAXSubroleAttribute) ?? role),
+            valueIsHelp: MacAXAttributeRead.copyString(element, kAXValueAttribute).map {
+                $0 == MacAXAttributeRead.copyString(element, kAXHelpAttribute)
+            } ?? false,
+            titleIsHelp: title != displayTitle,
+            displayTitle: displayTitle,
+            listSummary: MacAXAttributeRead.listSummary(element, role: role)
+        )
+    }
+
+    public func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes? {
+        guard let element = element(ref) else { return nil }
+        guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
+        return MacAXAttributes(
+            role: role,
+            subrole: MacAXAttributeRead.copyString(element, kAXSubroleAttribute),
+            title: MacAXAttributeRead.copyLabel(element, role: role, prepare: prepareForRead),
+            // The same value rule as `attributes(of:)`.
+            value: role == "AXHeading" ? MacAXAttributeRead.copyString(element, kAXValueAttribute)
+                : MacAXAttributeRead.valueState(element, role: role) == nil
+                    ? copyStringifiedValue(element, kAXValueAttribute) : nil,
+            frame: MacAXAttributeRead.copyFrame(element),
+            actions: MacAXAttributeRead.copyActions(element)
         )
     }
 
@@ -1477,24 +1594,27 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return MacAXAttributeRead.copyElementArray(element, kAXChildrenAttribute).map { mint($0) }
     }
 
-    /// Count without bridging the array (gpt-5.5 SHOULD-FIX): the ranged AX count
-    /// API returns the number of children without copying any of them.
-    public func childCount(of ref: MacAXElementRef) -> Int {
-        guard let element = element(ref) else { return 0 }
+    public func childCount(of ref: MacAXElementRef) -> Int? {
+        guard let element = element(ref) else { return nil }
+        let attribute = MacAXAttributeRead.childAttribute(element)
+        guard MacAXAttributeRead.prepare(element) else { return nil }
+        defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
         var count: CFIndex = 0
-        guard AXUIElementGetAttributeValueCount(
-            element, kAXChildrenAttribute as CFString, &count) == .success else { return 0 }
-        return max(0, Int(count))
+        switch AXUIElementGetAttributeValueCount(element, attribute as CFString, &count) {
+        case .success: return max(0, Int(count))
+        case .attributeUnsupported, .noValue: return 0
+        default: return nil
+        }
     }
 
-    /// Bounded fetch (gpt-5.5 SHOULD-FIX): `AXUIElementCopyAttributeValues` copies
-    /// only the requested [0, limit) slice, so a node with an enormous child
-    /// count never forces the whole array across the AX bridge.
     public func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef] {
         guard limit > 0, let element = element(ref) else { return [] }
+        let attribute = MacAXAttributeRead.childAttribute(element)
+        guard MacAXAttributeRead.prepare(element) else { return [] }
+        defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
         var values: CFArray?
         guard AXUIElementCopyAttributeValues(
-            element, kAXChildrenAttribute as CFString, 0, CFIndex(limit), &values) == .success,
+            element, attribute as CFString, 0, CFIndex(limit), &values) == .success,
               let array = values as? [AnyObject] else { return [] }
         return array.compactMap { candidate in
             guard CFGetTypeID(candidate) == AXUIElementGetTypeID() else { return nil }

@@ -122,9 +122,9 @@ public struct BotEventStore: Sendable {
 
     public func lastEvents() throws -> [UUID: BotEventRecord] {
         let saved = try disk.locked { try disk.read([String: BotEventRecord].self, at: path) ?? [:] }
-        return Dictionary(uniqueKeysWithValues: saved.compactMap { key, value in
+        return Dictionary(saved.compactMap { key, value in
             UUID(uuidString: key).map { ($0, value) }
-        })
+        }, uniquingKeysWith: { first, _ in first })
     }
 
     /// The event was accepted when it arrived and a gate shut before its request

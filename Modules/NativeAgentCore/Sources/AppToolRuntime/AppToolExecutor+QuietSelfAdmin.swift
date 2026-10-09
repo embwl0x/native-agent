@@ -244,9 +244,6 @@ extension AppToolExecutor {
             "page": .string(page),
             "page_read": .bool(true),
             "page_shown_by_this_call": .bool(false),
-            "summary": .string("Read \(page) in the background; it was not opened or shown. " + (SimpleViewMode.isShowing
-                ? SimpleViewMode.noPagesNote
-                : "To show it, use app {action:\"page.show\", args:{page:\"\(page)\"}}.")),
         ]) { _, receipt in receipt })
     }
 
@@ -260,13 +257,14 @@ extension AppToolExecutor {
         let current = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "current"
         guard let page = current ? presentation.currentPage : presentation.page(named: requested) else {
             if current {
-                return .object(["status": .string("failed"), "reason": .string("app_window_unavailable")])
+                return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("app_window_unavailable"),
+                                "detail": .string("No app window is showing a page right now; name the page instead of current.")])
             }
             return Self.unknownPageFailure(requested, pages: presentation.pages.map(\.id))
         }
         guard let appModel = quietHost() else { return Self.unattachedFailure() }
 
-        let read = await appModel.pageRead(page)
+        let content = await appModel.pageRead(page)
         let posture = await Self.freshQuietPosture()
         let fullMac = posture?.name == Self.fullMacModeName
         var settingRows: [JSONValue] = []
@@ -294,19 +292,9 @@ extension AppToolExecutor {
             "about": .string(page.summary),
             "settings": .array(settingRows),
             // What the page SAYS, built from the records the page draws from.
-            // Elements outline the same projection without mounting SwiftUI.
-            "content": .array(read.content),
-            "elements": .array(read.rows),
-            "elements_truncated": .bool(read.truncated),
+            "content": .array(content),
             "trust_mode": .string(posture?.name ?? "unreadable"),
             "changes_allowed": .bool(posture?.changesAllowed ?? false),
-            "note": .string(
-                "The page was read in the background, not opened or shown. " + (SimpleViewMode.isShowing
-                    ? SimpleViewMode.noPagesNote
-                    : "To show it, use app {action:\"page.show\", args:{page:\"\(page.id)\"}}.")
-                + " `content` is the page in words, built from the "
-                + "same records the page renders; `elements` is a text outline of that content, not rendered controls. Nothing came "
-                + "forward, moved, or made a sound, and the window on screen was not touched."),
         ])
     }
 
@@ -318,6 +306,8 @@ extension AppToolExecutor {
         let host: any QuietToolHost
         let posture: QuietPosture
         let value: JSONValue
+        let request: String?
+        let restoresPrevious: Bool
         let write: @MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void
     }
 
@@ -371,6 +361,19 @@ extension AppToolExecutor {
             ))
         }
 
+        var request: String?
+        var restoresPrevious = false
+        if ChatTurnRuntimeContext.current != nil {
+            request = Self.text(input["because"])
+            guard let request, request.split(whereSeparator: \.isWhitespace).count >= 3,
+                  let restores = await ChatToolSessionContext.settingRequestEvidence?(setting.id, input["value"] ?? .null, await setting.read(appModel), request) else {
+                return refuse(Self.failure("setting_not_requested",
+                    "No one asked to change \(setting.id); quote the request in because. Nothing changed.",
+                    extra: ["setting": .string(setting.id), "effects": .string("none"), "changed": .bool(false)]))
+            }
+            restoresPrevious = restores
+        }
+
         guard let posture = await Self.freshQuietPosture() else {
             return refuse(Self.unreadablePostureFailure(extra: [
                 "setting": .string(setting.id),
@@ -422,7 +425,7 @@ extension AppToolExecutor {
                 extra: ["setting": .string(setting.id), "type": .string(setting.kind.rawValue)]
             ))
         }
-        return .success(GatedSetting(setting: setting, host: appModel, posture: posture, value: requestedValue, write: write))
+        return .success(GatedSetting(setting: setting, host: appModel, posture: posture, value: requestedValue, request: request, restoresPrevious: restoresPrevious, write: write))
     }
 
     /// Every check that refuses a set before anything is written, the row's
@@ -435,7 +438,9 @@ extension AppToolExecutor {
         case .failure(let refusal): return refusal.answer
         case .success(let gated):
             guard let refused = await QuietSettings.$fullMac.withValue(gated.posture.name == Self.fullMacModeName, operation: {
-                await gated.setting.check?(gated.host, gated.value)
+                await QuietSettings.$restoringPreviousValue.withValue(gated.restoresPrevious) {
+                    await gated.setting.check?(gated.host, gated.value)
+                }
             }) else { return nil }
             return await Self.settingWriteFailure(refused, gated.setting, gated.value, host: gated.host)
         }
@@ -481,7 +486,9 @@ extension AppToolExecutor {
         do {
             try await QuietWriteDetail.$current.withValue(writeDetail) {
                 try await QuietSettings.$fullMac.withValue(posture.name == Self.fullMacModeName) {
-                    try await write(appModel, requestedValue)
+                    try await QuietSettings.$restoringPreviousValue.withValue(gated.restoresPrevious) {
+                        try await write(appModel, requestedValue)
+                    }
                 }
             }
         } catch {
@@ -517,6 +524,10 @@ extension AppToolExecutor {
                 + "Nothing was brought forward and no click was synthesized."),
         ]
         for (key, value) in detail { receipt[key] = value }
+        if let request = gated.request {
+            receipt["user_request"] = .string(request)
+            receipt["decided_by"] = .string("agent")
+        }
         return .object(receipt)
     }
 }

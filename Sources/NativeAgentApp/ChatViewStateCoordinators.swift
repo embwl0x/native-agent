@@ -103,6 +103,10 @@ enum ChatComposerBottomToastPresentation {
 final class ChatScrollCoordinator {
     var autoFollow = true
     var bottomSpacerVisible = false
+    /// The transcript is pinned to an earlier page (a page anchor is set), so
+    /// its bottom is not the live bottom. Read only by the re-arm, never by a
+    /// body, so it is not observed.
+    @ObservationIgnored var transcriptPagedBack = false
 
     private var serial = 0
     /// True only while the request holding the CURRENT serial is pending.
@@ -174,41 +178,6 @@ final class ChatScrollCoordinator {
                     proxy.scrollTo(bottomAnchor, anchor: .bottom)
                 }
             } else {
-                proxy.scrollTo(bottomAnchor, anchor: .bottom)
-            }
-        }
-    }
-
-    /// One event, several settles. Opening a long thread needs more than one
-    /// scroll — the LazyVStack lays out after the first, and images push the
-    /// bottom down after that — but each of those used to be a separate
-    /// forced call, and a forced call bumps the serial, so every earlier rung
-    /// of the ladder was cancelled by the next and only the last one ran
-    /// (2026-09-06). Scheduling them together shares one serial, so they all
-    /// fire; a reader who scrolls up cancels the whole ladder.
-    func scrollToBottomSettles(
-        _ proxy: ScrollViewProxy,
-        bottomAnchor: String,
-        delays: [TimeInterval]
-    ) {
-        // A late transcript load must respect a reader who already scrolled up,
-        // just as a gesture after scheduling cancels the settles below.
-        guard autoFollow, !delays.isEmpty else { return }
-        serial &+= 1
-        // The ladder takes over from whatever was pending, so it takes the
-        // latch too. Without this an ordinary scroll scheduled alongside the
-        // ladder (session load does exactly that) was superseded and never got
-        // to clear `scheduled`, and every later non-forced follow returned on
-        // a latch nothing would ever release (2026-09-06).
-        scheduled = false
-        let expectedSerial = serial
-        let expectedDisarm = disarmCount
-        for delay in delays {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard expectedSerial == self.serial,
-                      expectedDisarm == self.disarmCount
-                else { return }
-                self.lastScrollAt = Date()
                 proxy.scrollTo(bottomAnchor, anchor: .bottom)
             }
         }

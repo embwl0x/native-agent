@@ -4,6 +4,7 @@ import Agents
 import Cognition
 import ContextFlow
 import PersistenceCore
+import PersonaEngine
 
 /// HTTP lifecycle and app bindings for the Core state projection.
 extension ClaudeBridge {
@@ -35,7 +36,7 @@ extension ClaudeBridge {
 
     func readActivePersona(dataRoot: URL) -> String? {
         ClaudeBridgeStateProjection.readActivePersona(
-            dataRoot: dataRoot, preferred: UserDefaults.standard.string(forKey: "chatPersona")
+            dataRoot: dataRoot, preferred: PersonaSelection.current()
         )
     }
 
@@ -48,7 +49,7 @@ extension ClaudeBridge {
     private struct StatePort: ClaudeBridgeStatePort {
         let bridge: ClaudeBridge
         var startedAt: Date { bridge.startedAt }
-        var preferredPersona: String? { UserDefaults.standard.string(forKey: "chatPersona") }
+        var preferredPersona: String? { PersonaSelection.current() }
         var preferredSessionID: String? { UserDefaults.standard.string(forKey: "activeChatSessionId") }
         var cognition: NativeCognitionRuntime { NativeAgentEngine.liveCognition }
         var contextFlow: NativeContextFlowRuntime { NativeAgentEngine.live.contextFlow }

@@ -119,8 +119,21 @@ enum LLMProviderStatusFeed {
     /// ("key rejected", "HTTP 500"). Nil once a test passes, or once its key
     /// is not the one that test ran against: a reconnect is a new key.
     static func failedTest(providerID: String, dataRoot: URL) -> String? {
+        failedTests(providerIDs: [providerID], dataRoot: dataRoot)[providerID]
+    }
+
+    /// `failedTest` for each account, from one read of the status file.
+    static func failedTests(providerIDs: [String], dataRoot: URL) -> [String: String] {
         guard case .object(let file)? = (try? Data(contentsOf: path(in: dataRoot))).flatMap({ try? JSONValue.parse($0) })
-        else { return nil }
+        else { return [:] }
+        var failed: [String: String] = [:]
+        for id in providerIDs {
+            if let detail = failedTest(providerID: id, file: file, dataRoot: dataRoot) { failed[id] = detail }
+        }
+        return failed
+    }
+
+    private static func failedTest(providerID: String, file: [String: JSONValue], dataRoot: URL) -> String? {
         // Its own row, or the file's last check when that was this provider's
         // and was written before rows were kept, so a launch keeps it.
         let own: [String: JSONValue]? = if case .object(let rows)? = file["byProvider"], case .object(let row)? = rows[providerID] {

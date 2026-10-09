@@ -8,6 +8,11 @@ extension ChatStore {
     // by taking the oldest pending placeholder) and updates it.
     func receiveICloudReply(_ msg: BridgeMessage) {
         guard msg.sender == "mac" else { return }  // only accept Mac replies
+        if let correlation = msg.correlationID,
+           let placeholder = pendingICloudPlaceholders[correlation] ?? timedOutPendingIds[correlation],
+           let index = messages.firstIndex(where: { $0.id == placeholder }) {
+            messages[index].runId = correlation
+        }
         // The bridge records receipts as seen before dispatch. Settle offscreen
         // exchanges before the session-switch guards can drop their only receipt.
         if let correlationID = msg.correlationID,
@@ -26,13 +31,15 @@ extension ChatStore {
                 } else {
                     text = msg.text
                 }
-                let reply = ChatMessage(
+                var reply = ChatMessage(
                     id: record.placeholderID,
                     role: .assistant,
                     text: text,
                     attachments: attachmentSummaries(from: msg.attachments),
                     awaitingMacTranscript: true
                 )
+                reply.runId = correlationID
+                reply.completionState = kind == "error" ? "failed" : kind == "cancelled" ? nil : "completed"
                 if let index = cached.firstIndex(where: { $0.id == record.placeholderID }) {
                     cached[index] = reply
                 } else {
@@ -94,6 +101,10 @@ extension ChatStore {
         // created identity has crossed the bridge and is safe to reconcile
         // against published snapshots from here forward.
         acknowledgePublishedSession(msg.sessionID)
+        if msg.metadata?["live"] == "true" {
+            receiveLiveTurn(msg)
+            return
+        }
         if msg.metadata?["kind"] == "progress" {
             receiveICloudProgress(msg)
             return
@@ -276,6 +287,110 @@ extension ChatStore {
         }
     }
 
+    /// A turn another door (the Mac, Telegram) started in this conversation,
+    /// shown as it streams: the Mac sends its text so far under the turn's run
+    /// id, then the saved answer, failure sentence, or explicit cancellation. The
+    /// bubble awaits the Mac transcript like any reply, so the snapshot
+    /// settles it into the saved row.
+    private func receiveLiveTurn(_ msg: BridgeMessage) {
+        guard let runId = msg.correlationID, !runId.isEmpty else { return }
+        let kind = msg.metadata?["kind"]
+        let existingBubble = liveTurnBubbles[runId] ?? messages.last {
+            $0.role == .assistant && $0.runId == runId && $0.interaction == nil
+        }?.id
+        if kind == "text_delta" {
+            let seq = Int(msg.metadata?["seq"] ?? "") ?? 0
+            guard seq > (maxDeltaSeqByCorrelation[runId] ?? -1) else { return }
+            maxDeltaSeqByCorrelation[runId] = seq
+            if let id = existingBubble, let index = messages.firstIndex(where: { $0.id == id }) {
+                liveTurnBubbles[runId] = id
+                messages[index].text = msg.text
+            } else {
+                let bubble = ChatMessage(role: .assistant, text: msg.text, awaitingMacTranscript: true, runId: runId)
+                liveTurnBubbles[runId] = bubble.id
+                messages.append(bubble)
+            }
+            return
+        }
+        markICloudReplyResolved(runId)
+        if kind == "cancelled" { errorBanner = "Stopped. Any partial reply has been kept." }
+        let bubble = liveTurnBubbles.removeValue(forKey: runId) ?? existingBubble
+        let answer = msg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An unfinished turn keeps its saved text and says why it stopped.
+        let failure = kind == "error" ? msg.metadata?["errorDetail"] ?? msg.text : msg.metadata?["status"]
+        let state = kind == "error" ? "failed" : kind == "incomplete" || kind == "cancelled" ? "incomplete" : "completed"
+        if kind == "error", let failure { errorBanner = "Interrupted. \(failure)" }
+        // A snapshot that landed first already carries the saved row; it still
+        // takes this turn's terminal status.
+        let saved = messages.firstIndex {
+            $0.runId == runId && ($0.isTerminalReply || $0.completionState == "failed") && macPublishedMessageIDs.contains($0.id)
+        }
+        if let saved, let failure {
+            messages[saved].failureDetail = failure
+            messages[saved].completionState = state
+        }
+        if saved != nil || (answer.isEmpty && failure == nil) {
+            // Only a bubble of our own: a Mac row it became stays.
+            if let bubble, !macPublishedMessageIDs.contains(bubble) { messages.removeAll { $0.id == bubble } }
+        } else if let bubble, let index = messages.firstIndex(where: { $0.id == bubble }) {
+            // Failure keeps the partial reply and its cause in this same bubble.
+            messages[index].text = msg.text
+            messages[index].failureDetail = failure
+            messages[index].completionState = state
+        } else {
+            var reply = ChatMessage(role: .assistant, text: msg.text, awaitingMacTranscript: true,
+                runId: runId, failureDetail: failure)
+            reply.completionState = state
+            messages.append(reply)
+        }
+        persistMessages()
+    }
+
+    /// The Mac says its transcript goes back further than the snapshot's
+    /// window, and no page here has reached the start yet.
+    var canLoadOlderHistory: Bool {
+        guard let session = Self.cleanSessionID(selectedSessionID) else { return false }
+        return (iCloudSyncEngine.shared.chatTranscripts[session]?.hasOlder ?? pagedSessionsWithOlder.contains(session))
+            && !historyExhaustedSessionIDs.contains(session)
+    }
+
+    /// Older history the snapshot window leaves out, from the Mac on request.
+    func loadOlderHistory() async {
+        guard let session = Self.cleanSessionID(selectedSessionID), !isLoadingHistory,
+              let oldest = messages.first(where: { macPublishedMessageIDs.contains($0.id) || pagedHistoryIDs.contains($0.id) })
+        else { return }
+        isLoadingHistory = true
+        defer { isLoadingHistory = false }
+        do {
+            let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, beforeID: oldest.id.uuidString)
+            guard Self.cleanSessionID(selectedSessionID) == session,
+                  let at = messages.firstIndex(where: { $0.id == oldest.id }) else { return }
+            let older = page.messages.filter { row in !messages.contains { $0.id == row.id } }
+            pagedHistoryIDs.formUnion(older.map(\.id))
+            messages.insert(contentsOf: older, at: at)
+            if !page.hasOlder { historyExhaustedSessionIDs.insert(session) }
+            persistMessages()
+        } catch {
+            errorBanner = "Earlier messages did not load: \(error.localizedDescription)"
+        }
+    }
+
+    /// The whole text of a message the snapshot cut short.
+    func loadWholeMessage(_ id: UUID) async {
+        guard let session = Self.cleanSessionID(selectedSessionID), !isLoadingHistory else { return }
+        isLoadingHistory = true
+        defer { isLoadingHistory = false }
+        do {
+            let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, throughID: id.uuidString, limit: 1)
+            guard let whole = page.messages.first(where: { $0.id == id }),
+                  let index = messages.firstIndex(where: { $0.id == id }) else { return }
+            messages[index].text = whole.text
+            persistMessages()
+        } catch {
+            errorBanner = "The whole message did not load: \(error.localizedDescription)"
+        }
+    }
+
     func receiveICloudRejection(_ rejection: ICloudBridgeRejectedMessage) {
         // Reply authentication failure says nothing about request execution.
         // Keep observing the original identity; even its correlation is untrusted.
@@ -375,22 +490,24 @@ extension ChatStore {
         let clean = msg.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         let kind = msg.metadata?["kind"]
-        if kind == "tool_use" {
-            // F7 P2 + flip-box: each tool firing becomes a ToolEvent on the
-            // placeholder message. The flip-box renders the latest; the
-            // collapsed summary shows the running count. tool_result events are
-            // ignored here (the flip-box already reflects the tool); generic
-            // progress (no kind) still drives the typing hint below.
+        if kind == "tool_use" || kind == "tool_result" {
             let seq = Int(msg.metadata?["toolSeq"] ?? "")
-                ?? ((messages[idx].toolEvents.map(\.seq).max() ?? 0) + 1)
-            if !messages[idx].toolEvents.contains(where: { $0.seq == seq }) {
-                messages[idx].toolEvents.append(ToolEvent(name: clean, seq: seq))
+            guard let seq else { return }
+            let activity = msg.metadata?["activity"]
+            if let eventIndex = messages[idx].toolEvents.firstIndex(where: { $0.seq == seq }) {
+                if let activity { messages[idx].toolEvents[eventIndex].activity = activity }
+            } else {
+                messages[idx].toolEvents.append(ToolEvent(name: clean, seq: seq, activity: activity))
+                messages[idx].toolEvents.sort { $0.seq < $1.seq }
             }
-            // A tool firing is real progress — clear any stale "Typing"/waiting
-            // hint so the flip-box, not the hint line, drives the UI.
-            noteEvidencedActivity(correlationID: correlationID, activity: ToolActivityPresentation.progress(clean))
+            if kind == "tool_result", let eventIndex = messages[idx].toolEvents.firstIndex(where: { $0.seq == seq }) {
+                messages[idx].toolEvents[eventIndex].outcome = msg.metadata?["outcome"]
+                messages[idx].toolEvents[eventIndex].resultDetail = msg.metadata?["resultDetail"]
+            }
+            noteEvidencedActivity(correlationID: correlationID,
+                                  activity: activity ?? ToolActivityPresentation.progress(clean))
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
-        } else if kind != "tool_result" {
+        } else {
             // The Mac evidenced this activity; the waiting line ages from here
             // instead of narrating the Mac from a local clock.
             noteEvidencedActivity(correlationID: correlationID, activity: clean)
@@ -432,21 +549,41 @@ extension ChatStore {
         }
         maxDeltaSeqByCorrelation[correlationID] = seq
         _ = idx
-        // chat-smoothness phase 2: chunks arrive ~1.5s apart (iCloud transport
-        // batch). Play each one out progressively (~70ms word steps) instead
-        // of slamming the accumulated text in — and stop paying a full
-        // transcript persist per chunk (typewriter ticks suppress persistence;
-        // finalize writes the durable copy).
+        // Chunks arrive ~1s apart (iCloud transport batch). The bubble's
+        // paced reveal plays each one out at about 80 words a second; the
+        // store only publishes the accumulated text, without a transcript
+        // persist per chunk (finalize writes the durable copy).
         // The partial answer is durable from here: a phone closed mid-answer
         // must come back to the words it already had, not an empty bubble.
         noteEvidencedActivity(correlationID: correlationID, activity: nil, partialText: msg.text)
-        typewriterAdvance(placeholderId: placeholderId, target: msg.text)
+        setStreamingText(placeholderId, msg.text)
         // Once content is flowing, the static "Typing" hint is misleading —
         // clear it so the bubble's own text drives the UX.
         streamingHintsByMessageId.removeValue(forKey: placeholderId)
         // Keep the timeout fresh — visible progress proves the turn is alive.
         pendingTimeouts.removeValue(forKey: correlationID)?.cancel()
         armTimeout(for: correlationID, placeholderId: placeholderId)
+    }
+
+    private func setStreamingText(_ placeholderId: UUID, _ text: String) {
+        guard let idx = messages.firstIndex(where: { $0.id == placeholderId }) else { return }
+        suppressMessagePersistence = true
+        var updated = messages[idx]
+        updated.text = text
+        updated.isStreaming = true
+        messages[idx] = updated
+        suppressMessagePersistence = false
+    }
+
+    func streamingHint(for message: ChatMessage) -> String {
+        if let hint = streamingHintsByMessageId[message.id], !hint.isEmpty {
+            return hint
+        }
+        if isPollingFallback {
+            // No evidenced activity to repeat — say only what this phone knows.
+            return ChatWaitStatusPresentation.unacknowledged
+        }
+        return "Typing"
     }
 
     /// A terminal receipt must retire both wait tasks together.  Keeping this
@@ -659,8 +796,7 @@ extension ChatStore {
         awaitingMacTranscript: Bool = false
     ) {
         // Final text wins instantly — never make the user wait on the
-        // typewriter to catch up to an already-complete reply.
-        cancelTypewriter(placeholderId)
+        // paced reveal to catch up to an already-complete reply.
         guard let idx = messages.firstIndex(where: { $0.id == placeholderId }) else { return }
         streamingHintsByMessageId.removeValue(forKey: placeholderId)
         var updated = messages[idx]
@@ -668,9 +804,10 @@ extension ChatStore {
         updated.attachments = attachments
         updated.isStreaming = false
         updated.awaitingMacTranscript = awaitingMacTranscript
+        updated.completionState = text == "(stopped)" ? nil : success ? "completed" : "failed"
         messages[idx] = updated
         // phase 6: soft confirmation tap once the reply lands — one per turn,
-        // never per typewriter tick (this is the single finalize site). Only
+        // never per streamed chunk (this is the single finalize site). Only
         // genuine success: failure paths (failPendingReply: timeouts, stream
         // errors, rejections) pass success=false, and the user-stop sentinel
         // is skipped — a "success" tap on either would lie (gpt-5.5 r2 catch).

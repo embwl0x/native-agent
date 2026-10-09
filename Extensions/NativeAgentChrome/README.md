@@ -1,128 +1,35 @@
-# NativeAgent Chrome Control
+# NativeAgent Chrome surface
 
-Manifest V3 extension for NativeAgent's real-Chrome surface. It connects to
-the native-messaging host `com.nativeagent.chrome`, creates inactive agent
-tabs in a purple NativeAgent group beside the user's tabs in their existing window,
-can claim an exact user tab, and yields its lease when the user touches
-or activates that tab.
+The Chrome `NativeAgent` tab group is Agent's workspace and ownership state.
+Every other tab belongs to the person. Activation, trusted pointer/keyboard/wheel/touch
+input, or an address-bar navigation ungroups one of them tabs immediately and
+stops their pending actions. App and extension restarts recover tabs directly
+from the group. Nothing closes a tab except an explicit close of them own tab.
 
-Tab leases are now real, bounded, renewable, persisted in
-`chrome.storage.session`, and recovered across Manifest V3 service-worker
-restarts. Physical pointer, keyboard, wheel, touch, or tab-activation evidence
-terminally yields the lease without closing the tab. Default grouped tabs remain
-inactive, including X/Twitter post URLs. Explicit `visible_work_window` creation
-opens a separate ordinary window with `focused: false` and its own active tab.
-It never selects a tab in the user's window. Window focus, additional tabs,
-minimization, or trusted interaction ends control; cleanup closes only the exact
-created tab while its window remains unfocused. The create-only `rendering_mode`
-option can explicitly select `visible_work_window` or `grouped_background`.
-Claims remain unchanged. Resident verification read multiple actual replies
-on one X thread
-with visible rendering, zero takeover sequence and successful tab cleanup. This
-is not a universal guarantee: macOS occlusion can still suspend rendering. Snapshot
-`rendering` reports actual visibility and readiness, not completeness of a feed.
+Each conversation remembers its last tab ID. Navigation reuses that tab while
+it remains in the group, otherwise creates an inactive grouped tab. Reads and
+page actions use their current tab or an explicit owned tab ID. Chrome group
+membership is checked against Chrome before page dispatch; snapshots, document
+and element identity, and the user sequence guard against a changed page.
 
-The first group is placed in the last-focused normal Chrome window, without
-selecting a tab or focusing a window. Later work reuses the exact group's live
-window, including after worker restart. After an extension reload clears session
-storage, the sole group named NativeAgent in the current normal window is reused
-for presentation only; existing tabs are never claimed. Multiple matching groups
-refuse rather than guessing or adding a third. No separate hidden window or welcome
-tab is created. User-renamed/collapsed groups are preserved. Explicit claims
-stay where they are and are never grouped.
+The extension preserves structured DOM reading, frames and open shadow roots,
+folded text/control continuations, form controls, links, page changes, bounded
+typing, navigation settlement and action outcome receipts. HTTP(S) host access
+is needed for page readers. Temporary debugger focus emulation remains available
+for a hidden-tab scroll when the app confirms the person is away: infinite
+feeds can require rendering before scroll callbacks load more content.
 
-The pinned public key in `manifest.json` gives development builds stable
-extension id `egdbijiogeeggnmjheomgnnkhmlepfcn`. Host registration and key
-rotation instructions live in `native-host/README.md`.
+The native messaging host is `com.nativeagent.chrome`. The relay transports
+messages between the extension and the in-process NativeAgent runtime; it owns
+no browser policy. See [protocol/PROTOCOL.md](protocol/PROTOCOL.md) and
+[native-host/README.md](native-host/README.md).
 
-The Swift `NativeAgentChromeRelay` executable provides transport from Chrome's
-framed stdin/stdout to NativeAgent.app's owner-only Unix socket. The relay
-contains no policy, lease, Trust Center, receipt, or verification authority.
-NativeAgent.app opens and registers that path only while the default-off
-**Chrome control** Trust Center switch is enabled, and rechecks the policy at
-every browser effect.
+Load this directory as an unpacked Chrome extension. NativeAgent includes the
+native host registration and extension setup. Source deployment remains through
+the project's normal build and install workflow. The manifest version is
+managed separately from changes to these sources.
 
-Navigation, structured page snapshots, snapshot-scoped node clicks, fill,
-sequential type, bounded element/navigation waits, and page or element
-scrolling are implemented, together with select, bounded keypress,
-checked-state, and double-click. The snapshot walker aggregates every permitted
-frame and recursively includes open shadow roots, while unavailable frames and
-closed roots stay explicit. Every act accepts only a current node that
-advertised the exact action; password nodes advertise no actions. Every form
-act returns one outcome receipt, and a lost page reply becomes
-`outcome_unknown` with no automatic retry. The content agent exposes a bounded
-read model rather than raw HTML, invalidates node ids after page mutation, and
-runs in inactive tabs without requesting Chrome debugger or arbitrary
-scripting permission.
-
-Feed snapshots retain article/container hierarchy and parent node IDs while
-omitting layout-only wrappers. Repeated controls can be identified by their
-article, not guessed by index. Accessible names resolve `aria-labelledby`
-inside the element's own document/shadow root and are rechecked before actions.
-Mutation freshness and outcome-unknown rules remain unchanged.
-Native modal dialogs retain their container identity; background nodes remain
-readable but advertise no actions while a modal is open. Page-level scrolling
-also requires a current target inside the modal rather than moving its backdrop.
-
-Version 0.4.11 reads the current viewport, including the summary, instead of
-repeating a prefix of the entire document after every scroll. Offscreen feed
-articles do not spend the walk budget before visible replies. Container text
-includes its direct prose rather than repeating all offscreen descendants.
-Glyph-fragmented plain text joins visible inline glyphs, preserving word spaces
-and omitting the individual glyph rows. Transparent glyphs contribute no text;
-containers with no visible glyphs emit no row. Controls and semantic boundaries
-prevent compaction.
-Scroll replies allow a bounded 750 ms rendering interval and report whether
-the DOM changed;
-they never claim that a website finished fetching its feed. Read again or use
-the existing bounded wait when the site is still loading.
-
-The app renews a still-valid tab lease near expiry when performing authorized
-browsing work. Idle expiry, user takeover and revocation remain terminal; there
-is no heartbeat that holds a tab indefinitely and no automatic reacquisition.
-
-Open **Trust** on NativeAgent's left rail and click **Set up Chrome** in the
-Chrome control permissions. The extension comes with the app; no second
-download is needed. Setup reveals the app's
-`Contents/Resources/NativeAgentChrome` folder in Finder and opens
-`chrome://extensions` in Google Chrome. Follow these three steps:
-
-1. In Chrome, turn on **Developer mode** at `chrome://extensions`.
-2. Click **Load unpacked**.
-3. Select the **NativeAgentChrome** folder revealed in Finder. In the folder
-   picker, press **Command-Shift-G** and paste the folder path shown by the app
-   if needed.
-
-Keep the app in its installed location: Chrome loads this folder in place.
-Turn on **Chrome control** in NativeAgent and keep Chrome open. The switch
-allows access; it does not install the extension or prove a connection.
-
-If the bundled extension is missing or incomplete, **Set up Chrome** reports
-that setup cannot continue. This action does not download extension files.
-Install an app release that includes the extension. For a source checkout,
-open `chrome://extensions` and use the same three steps, selecting
-`Extensions/NativeAgentChrome` in that checkout instead. No source build is
-needed to load those extension files. If Chrome cannot be opened automatically,
-enter `chrome://extensions` in Chrome's address bar.
-
-After updating the extension source, reload NativeAgent at `chrome://extensions`
-and refresh the page being read so its content script is replaced. There is no
-JavaScript build step. `script/build_and_run.sh --build-only` bundles the source
-folder through `project.yml`; for an installed-folder setup, build and install
-the updated app before reloading the extension.
-
-The app registers
-the bundled host while Chrome control is enabled and removes the registration
-when it is disabled. The installer script remains available for isolated relay
-development. A disconnected extension retries the transport on a bounded
-Chrome alarm, so changing the switch does not require stealing focus or
-reloading the extension.
-# Dynamic feed navigation
-
-Unrelated feed mutations may retain an exact same-origin anchor inside a navigation
-landmark, or an unchanged tab inside a tablist, for up to 60 seconds. Only click can use this retained address; its URL,
-name, element, ancestor chain, page URL, visibility and enabled state must still
-match. Tab selection and controlled-panel identity must also match. Changes inside the navigation landmark, ancestor attributes, removal,
-user takeover, navigation, or an open modal require fresh evidence. Other actions
-and feed controls keep whole-snapshot invalidation. This is not a stale-click retry
-or selector guess: the page revalidates the original observed control synchronously.
+`chrome.reload_extension` reloads the installed extension through native
+messaging. The next accepted connection enumerates the group and reinstalls
+its existing page readers without navigating pages. The transport reconnect
+alarm remains so an absent app or disconnected native host can recover.

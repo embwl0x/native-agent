@@ -26,7 +26,6 @@ public final class CognitionViewFacade {
     public var backgroundEnabled = false
     public var reflectionEnabled = false
     public var organismEnabled = false
-    public var organismControlReadinessRevision: UInt64 = 0
     public var reflectionBudget = 0
     public var lastRefresh: Date?
     public var proposalsDetail: CognitiveObservatoryDetail?

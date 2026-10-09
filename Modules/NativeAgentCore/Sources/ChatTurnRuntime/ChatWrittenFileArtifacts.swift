@@ -25,7 +25,7 @@ public enum ChatWrittenFileArtifacts {
             let name = URL(fileURLWithPath: path).lastPathComponent
             guard !name.isEmpty, name.utf8.count <= 255, name != ".", name != "..",
                   !name.contains("/"), !name.contains("\\"),
-                  !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+                  name.rangeOfCharacter(from: .controlCharacters) == nil else { return nil }
             let mime = UTType(filenameExtension: (name as NSString).pathExtension)?.preferredMIMEType ?? "application/octet-stream"
             let bytes = Data(content.utf8)
             var reference: [String: JSONValue] = [

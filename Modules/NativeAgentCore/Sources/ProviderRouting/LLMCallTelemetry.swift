@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import os
 import PersistenceCore
 import TurnTrace
 
@@ -460,6 +461,11 @@ public enum ToolContractWeight {
 // Recording is non-fatal: an IO failure logs to stderr and the provider
 // call's result reaches the caller unchanged.
 public final class LLMCallTraceRecorder: @unchecked Sendable {
+    /// One `llm.call` row per provider request. The router binds a fresh flag
+    /// as the request's identity; the first row written under it (the adapter's
+    /// receipt or the router's failure row) claims it and any later row drops.
+    @TaskLocal public static var requestRecorded: OSAllocatedUnfairLock<Bool>?
+
     /// Test injection. Production leaves nil and the path resolves through
     /// `PersistenceCore.defaultDataRoot()` at append time (so the env-var /
     /// stamped-repo / cwd-walkup resolution happens in the live process,
@@ -605,8 +611,13 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         /// decode exactly as before.
         cacheMarkers: [LLMCacheMarker]? = nil,
         /// Provider stop reason (end_turn, max_tokens, tool_use…). Additive.
-        stopReason: String? = nil
+        stopReason: String? = nil,
+        errorDetail: String? = nil
     ) async {
+        if let claim = Self.requestRecorded, claim.withLock({ recorded in
+            defer { recorded = true }
+            return recorded
+        }) { return }
         let surface = LLMCallContext.surface ?? "unknown"
         // Turn Inspector W1: tag with the per-turn trace id so the Inspector
         // can join this llm.call to the rest of the turn's story. Unbound
@@ -663,6 +674,10 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             payload.merge(RequestPrefixReceipt.payload(requestBody, prefix: prefix)) { _, actual in actual }
         }
         if let stopReason { payload["stopReason"] = .string(stopReason) }
+        if let errorDetail {
+            payload["error"] = .string(String(ContextSecretContentPolicy.redactedFragment(errorDetail).prefix(4096)))
+            payload["status"] = .string(status)
+        }
         if let usage {
             if let v = usage.inputTokens { payload["inputTokens"] = .int(Int64(v)) }
             if let v = usage.outputTokens { payload["outputTokens"] = .int(Int64(v)) }

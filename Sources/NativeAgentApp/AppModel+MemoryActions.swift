@@ -125,7 +125,7 @@ enum MemoryRowEditorPinOutcome: Equatable {
         case let .applied(pinned):
             return pinned ? "Memory pinned" : "Memory unpinned"
         case let .failed(detail):
-            return "Memory update failed: \(detail)"
+            return detail
         }
     }
 
@@ -153,21 +153,26 @@ extension AppModel {
             await refreshAll()
             return outcome
         } catch {
-            let outcome = MemoryRowEditorPinOutcome.failed(error.localizedDescription)
+            let outcome = MemoryRowEditorPinOutcome.failed(
+                UserFacingError.message(error, action: "update that memory")
+            )
             statusText = outcome.message
             systemToasts.push(error: statusText)
             return outcome
         }
     }
 
+    /// False when the memory is still there; `statusText` says why.
     @MainActor
-    func deleteMemory(_ memory: MemoryV2.MemoryRecord) async {
+    func deleteMemory(_ memory: MemoryV2.MemoryRecord) async -> Bool {
         do {
             try await engine.memory.delete(id: memory.id)
             statusText = "Memory deleted"
             await refreshAll()
+            return true
         } catch {
-            statusText = "Memory delete failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "forget that memory")
+            return false
         }
     }
 
@@ -183,7 +188,7 @@ extension AppModel {
             statusText = memoryFeatureDisabledMessage ?? "Consolidate disabled"
             return .unavailable(statusText)
         } catch {
-            statusText = "Memory consolidation failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "consolidate memory")
             return .failed(statusText)
         }
     }
@@ -235,7 +240,7 @@ extension AppModel {
             systemToasts.push(warn: statusText, autoDismissAfter: 6)
             return .unavailable(statusText)
         } catch {
-            statusText = "Memory hygiene failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "tidy up memory")
             systemToasts.push(error: statusText)
             return .failed(statusText)
         }

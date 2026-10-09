@@ -133,6 +133,13 @@ public enum OpenAIExecutionControls {
         ) {
             body["reasoning"] = ["effort": effort]
         }
+        // Opt in even when the provider chooses its default reasoning effort.
+        // Summary frames renew the guard but never become answer/code content.
+        if ProviderStreamContext.stallOnly {
+            var reasoning = body["reasoning"] as? [String: String] ?? [:]
+            reasoning["summary"] = "auto"
+            body["reasoning"] = reasoning
+        }
         if let tier = serviceTier(
             model: model,
             requested: LLMCallContext.serviceTier,

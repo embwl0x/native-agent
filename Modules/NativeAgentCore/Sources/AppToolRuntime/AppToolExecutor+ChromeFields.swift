@@ -4,6 +4,7 @@ import ChromeControl
 import MacControl
 import PersistenceCore
 import ToolRegistry
+import Senses
 
 /// 2026-09-24 (tools-web): Chrome jobs in one call. A row can be named by its
 /// label, snapshot_id defaults to the last page read on the tab, and a form
@@ -21,31 +22,85 @@ extension AppToolExecutor {
 
     /// Which acts a verb can use on a row.
     private static let chromeWants: [String: Set<String>] = [
-        "browser.chrome_click": ["click"], "browser.chrome_double_click": ["double_click", "click"],
+        "browser.chrome_click": ["click", "fill", "type"], "browser.chrome_double_click": ["double_click", "click", "fill", "type"],
         "browser.chrome_fill": ["fill"], "browser.chrome_type": ["type", "fill"], "browser.chrome_select": ["select"],
         "browser.chrome_keypress": ["keypress", "fill", "type", "click"], "browser.chrome_set_checked": ["set_checked"],
+        "browser.chrome_wait": ["wait"], "browser.chrome_drag": ["drag"], "browser.chrome_drop_target": ["drop"],
+        "browser.chrome_scroll_target": ["scroll"],
     ]
 
     /// Fills in what the last page read on this tab already says: a row named
     /// by its label, a missing snapshot_id, option labels, one value as a list.
     /// A refusal when a named row is not on that page; nil otherwise.
     public static func resolveChromeTarget(_ actionId: String, _ input: inout [String: JSONValue]) -> JSONValue? {
+        guard let refusal = resolveChromeRows(actionId, &input) else { return nil }
+        guard case .object(var fields) = refusal else { return refusal }
+        fields["effects"] = .string("none")
+        fields["provenance"] = .string("raw view · Chrome conversation page bindings and displayed row index; no extension request was sent")
+        return .object(fields)
+    }
+
+    private static func resolveChromeRows(_ actionId: String, _ input: inout [String: JSONValue]) -> JSONValue? {
+        if actionId == "browser.chrome_scroll" || actionId == "browser.chrome_drag" {
+            if actionId == "browser.chrome_drag", let refusal = resolveChromeRow(actionId, &input) { return refusal }
+            guard let target = input["target_node_id"], !(inputString(target) ?? "").isEmpty else { return nil }
+            var destination = input
+            destination["node_id"] = target
+            if let refusal = resolveChromeRow(actionId == "browser.chrome_drag" ? "browser.chrome_drop_target" : "browser.chrome_scroll_target", &destination) { return refusal }
+            input["target_node_id"] = destination["node_id"]
+            input["snapshot_id"] = destination["snapshot_id"]
+            return nil
+        }
+        return resolveChromeRow(actionId, &input)
+    }
+
+    private static func resolveChromeRow(_ actionId: String, _ input: inout [String: JSONValue]) -> JSONValue? {
         if actionId == "browser.chrome_select", case .string(let one)? = input["values"] { input["values"] = .array([.string(one)]) }
         guard let wants = chromeWants[actionId],
-              let page = ChromePageMirror.page(lease: inputString(input["lease_id"]), session: ChatToolSessionContext.verifiedSessionId),
               let node = inputString(input["node_id"])?.trimmingCharacters(in: .whitespacesAndNewlines), !node.isEmpty else { return nil }
+        // The site sense owns its fresh source proof. Public calls own only
+        // the numbers or labels that their last page actually showed.
+        if SenseDoor.verifyingActCorner != nil { return nil }
+        if node.range(of: #"^n\d+$"#, options: .regularExpression) != nil {
+            return .object(["ok": .bool(false), "error": .string("internal_node_id"),
+                "reason": .string("Internal node ids are not row numbers. Use the row number shown on this page or its label. Nothing was sent.")])
+        }
+        guard let page = ChromePageMirror.page(tab: chromeTabID(input["tab_id"]), session: ChatToolSessionContext.verifiedSessionId) else {
+            return .object(["ok": .bool(false), "error": .string("no_page_read"),
+                "reason": .string("No page has been read in this conversation. Read the page with chrome.snapshot before choosing a row. Nothing was sent.")])
+        }
+        if input["tab_id"] == nil || input["tab_id"] == .null { input["tab_id"] = .int(page.tab) }
         let given = inputString(input["snapshot_id"]) ?? ""
         guard given.isEmpty || given == page.snapshotID else {
             return .object(["ok": .bool(false), "error": .string("snapshot_stale"),
                 "reason": .string("The supplied snapshot does not match the page last read. Read the page again with browser.chrome_snapshot. Nothing was sent.")])
         }
-        let byNumber = node.range(of: #"^n?\d+$"#, options: .regularExpression) != nil
+        let byNumber = node.range(of: #"^\d+$"#, options: .regularExpression) != nil
         var row: ChromePageMirror.Row?
         if byNumber {
             if given.isEmpty { input["snapshot_id"] = .string(page.snapshotID) }
-            row = ChromePageMirror.find(node, wants: wants, in: page).row
-        } else if page.rows.contains(where: { $0.node == node }) {
-            return nil
+            guard let found = ChromePageMirror.find(node, wants: wants, in: page).row else {
+                let numbers = page.rows.compactMap { $0.number.flatMap(Int.init) }.sorted()
+                let range = if let first = numbers.first, let last = numbers.last { "Valid rows on this page: \(first)–\(last)." }
+                    else { "This page has no numbered rows." }
+                let more = page.text.split(separator: "\n").first { $0.hasPrefix("More: ") }.map(String.init)
+                let instruction = range + " Use a shown row or its label. "
+                    + (more ?? "Read this tab again with chrome.snapshot {tab_id: \(page.tab)} to see its current rows.")
+                let nextInput: [String: JSONValue]
+                if let more, let address = more.dropFirst("More: ".count).components(separatedBy: " · ").first {
+                    nextInput = ["page": .string("site:" + (URL(string: page.url)?.host ?? "")), "item": .string(address)]
+                } else {
+                    nextInput = ["action": .string("chrome.snapshot"), "args": .object(["tab_id": .int(page.tab)])]
+                }
+                let reason = page.rows.contains(where: { $0.number == node })
+                    ? "Row \(node) on this page cannot perform this action. Nothing was sent."
+                    : "No row \(node) on this page. \(instruction) Nothing was sent."
+                return .object(["ok": .bool(false), "error": .string("no_such_row"), "reason": .string(reason),
+                    "remedy": .object(["kind": .string("reread"), "instruction": .string(instruction),
+                        "next_call": .object(["tool": .string("app"), "input": .object(nextInput)])])])
+            }
+            row = found
+            input["node_id"] = .string(found.node)
         } else {
             let verb = actionId.replacingOccurrences(of: "browser.chrome_", with: "").replacingOccurrences(of: "_", with: " ")
             let found: ChromePageMirror.Row
@@ -117,35 +172,32 @@ extension AppToolExecutor {
     /// anything is typed, so a missing field leaves the form untouched.
     public func runChromeFieldsCall(actionId: String, input: [String: JSONValue], fields: ChromeFields, direct: Bool,
                              surface: String, run: ChromeRun) async throws -> JSONValue {
-        var lease = Self.inputString(input["lease_id"]) ?? ""
+        var tab = Self.chromeTabID(input["tab_id"])
         var head: [String] = []
         if actionId == "browser.chrome_navigate" {
             var open = input
             open.removeValue(forKey: "fields"); open.removeValue(forKey: "submit")
             let opened = try await run(actionId, open)
             guard case .object(let row) = opened, row["outcome"] == .string("succeeded"),
-                  case .string(let granted)? = row["leaseId"] else { return opened }
-            lease = granted
-            if case .string(let url)? = row["url"] { await chrome().notePage(url: url, leaseID: granted) }
+                  case .int(let granted)? = row["tabId"] else { return opened }
+            tab = granted
             head.append(Self.chromeReceiptLine(actionId, row))
         }
         let session = ChatToolSessionContext.verifiedSessionId
         func refused(_ why: String) -> JSONValue {
             .object(["ok": .bool(false), "error": .string("fields_not_sent"), "reason": .string((head + [why]).joined(separator: "\n"))])
         }
-        if await chrome().actionBlockedOnPost(leaseID: lease, verifiedSessionID: session) {
-            return refused(Self.postOnBackgroundNote + " Nothing was sent.")
-        }
         guard await chromeFollowUpAllowed("browser.chrome_snapshot", input: input, surface: surface) else {
             return refused("Reading the page needs your approval here, so nothing was filled. Call browser.chrome_snapshot, then fill one row at a time.")
         }
-        var seen = ChromePageMirror.page(lease: lease, session: session)
+        var seen = ChromePageMirror.page(tab: tab, session: session)
         func read() async throws -> ChromePageMirror.Page? {
-            let snapshot = try await run("browser.chrome_snapshot", ["lease_id": .string(lease), "max_nodes": .int(200)])
-            guard case .object(let row) = snapshot, case .string(let id)? = row["leaseId"] else { return nil }
-            lease = id
+            // The whole page: a field below the fold is still on the form.
+            let snapshot = try await run("browser.chrome_snapshot", ["tab_id": tab.map(JSONValue.int) ?? .null, "max_nodes": .int(200), "scope": .string("page")])
+            guard case .object(let row) = snapshot, case .int(let id)? = row["tabId"] else { return nil }
+            tab = id
             Self.mirrorChromePage(snapshot)
-            return ChromePageMirror.page(lease: id, session: session)
+            return ChromePageMirror.page(tab: id, session: session)
         }
         func tool(for row: ChromePageMirror.Row) -> String? {
             if row.acts.contains("select") { return "browser.chrome_select" }
@@ -177,9 +229,9 @@ extension AppToolExecutor {
             // Her row numbers stay those of the page she saw: this unseen
             // whole-page read must not become what n12 means next call.
             if let seen, seen.snapshotID != page.snapshotID { ChromePageMirror.publish(seen, session: session) }
-            return refused("Nothing was filled. " + (missing.isEmpty ? "" : "Not in view on " + ChromePageText.safe(page.title) + ": "
+            return refused("Nothing was filled. " + (missing.isEmpty ? "" : "No field with that name on " + ChromePageText.safe(page.title) + ": "
                 + missing.joined(separator: ", ") + ". ") + (unclear.isEmpty ? "" : "More than one row matches: " + unclear.joined(separator: "; ") + ". ")
-                + "Use the whole label or the row number the page shows, or scroll first.")
+                + "Use the label as the page shows it (for a choice, the option itself, e.g. \"Medium\") or its row number.")
         }
         plan.sort { $0.index < $1.index }
         var lines: [String] = [], ok = true, last: String?, lastTool = actionId
@@ -196,19 +248,19 @@ extension AppToolExecutor {
                 case .none: lines.append("✗ " + shown + ": no longer on the page"); return false
                 }
                 var call = extra
-                call["lease_id"] = .string(lease); call["snapshot_id"] = .string(page.snapshotID); call["node_id"] = .string(row.node)
+                call["tab_id"] = .int(page.tab); call["snapshot_id"] = .string(page.snapshotID); call["node_id"] = .string(row.node)
                 call["expected_user_sequence"] = input["expected_user_sequence"]
                 do {
                     let result = try await run(tool, call)
-                    let rowNumber = row.node.hasPrefix("n") ? String(row.node.dropFirst()) : row.node
+                    let rowPlace = row.number.map { " (row " + $0 + ")" } ?? ""
                     if case .object(let done) = result, done["status"] == .string("yielded_to_user") {
                         takeover = done
                     }
                     if case .object(let done) = result, done["outcome"] == .string("succeeded") {
-                        lines.append("✓ " + shown + " (row " + rowNumber + ")"); lastTool = tool; return true
+                        lines.append("✓ " + shown + rowPlace); lastTool = tool; return true
                     }
                     let why: String = if case .object(let done) = result, case .string(let text)? = done["reason"] ?? done["error"] ?? done["outcome"] { text } else { "no clear outcome" }
-                    lines.append("✗ " + shown + " (row " + rowNumber + "): " + ChromePageText.safe(why) + "; not retried"); return false
+                    lines.append("✗ " + shown + rowPlace + ": " + ChromePageText.safe(why) + "; not retried"); return false
                 } catch {
                     let text = error.localizedDescription
                     // A stale page refuses before anything is sent: read again once.
@@ -253,49 +305,31 @@ extension AppToolExecutor {
             return .object(takeover)
         }
         guard direct else {
-            return .object(["ok": .bool(ok), "outcome": .string(ok ? "succeeded" : "failed"), "leaseId": .string(lease),
+            return .object(["ok": .bool(ok), "outcome": .string(ok ? "succeeded" : "failed"), "tabId": .int(page.tab),
                             "fields": .string(summary), "tool": .string(actionId)])
         }
-        let fresh = await freshChromePage(after: lastTool, lease: lease, sequence: nil, input: input, surface: surface, run: run)
+        let fresh = await freshChromePage(after: lastTool, tab: page.tab, sequence: nil, input: input, surface: surface, run: run)
         let text = (head + [summary, "", fresh]).joined(separator: "\n")
         guard ok else {
-            return .object(["ok": .bool(false), "outcome": .string("failed"), "leaseId": .string(lease),
+            return .object(["ok": .bool(false), "outcome": .string("failed"), "tabId": .int(page.tab),
                             "fields": .string(summary), "tool": .string(actionId), "text": .string(text)])
         }
         return .string(text)
     }
 
-    /// A main_content read of a page with no main or article region comes
-    /// back empty; read the whole page instead, once.
-    public static func wholePageIfNoMain(_ result: JSONValue, input: [String: JSONValue], run: ChromeRun) async throws -> JSONValue {
-        guard inputString(input["scope"]) == "main_content", case .object(let page) = result,
-              case .array(let nodes)? = page["nodes"], nodes.isEmpty,
-              case .object(let reading)? = page["reading"], reading["mainContentAvailable"] != .bool(true) else { return result }
-        var whole = input
-        whole["scope"] = .string("page")
-        if case .string(let lease)? = page["leaseId"] { whole["lease_id"] = .string(lease) }
-        return try await run("browser.chrome_snapshot", whole)
-    }
-
-    /// Keeps the page a snapshot read in the mirror (home, `tab.N`, labels);
-    /// a released tab leaves it.
-    public static func mirrorChromePage(_ result: JSONValue, releasedBy actionId: String? = nil, input: [String: JSONValue] = [:]) {
+    /// Snapshot rows remain attached to their exact tab until it closes.
+    public static func mirrorChromePage(_ result: JSONValue, closedBy actionId: String? = nil, input: [String: JSONValue] = [:]) {
         guard case .object(let page) = result else { return }
-        if actionId == "browser.chrome_release" {
-            // A refused release (released:false) leaves the tab and its page.
-            guard page["released"] == .bool(true) || page["tabClosed"] == .bool(true) else { return }
-            // The lease the release names is the one that closed; an input
-            // lease_id may be an empty pair the provider serialized.
-            if let lease = [inputString(page["leaseId"]), inputString(input["lease_id"])].compactMap({ $0 }).first(where: { !$0.isEmpty }) {
-                ChromePageMirror.forget(lease: lease)
-            }
-            if page["tabClosed"] == .bool(true), case .int(let tab)? = page["tabId"] { ChromePageMirror.tabClosed(tab) }
+        if actionId == "browser.chrome_close_tab" {
+            guard page["tabClosed"] == .bool(true), case .int(let tab)? = page["tabId"] else { return }
+            ChromePageMirror.forget(tab: tab)
+            ChromePageMirror.tabClosed(tab)
             return
         }
         if case .int(let tab)? = page["tabId"] { ChromePageMirror.tabLive(tab) }
-        guard case .string(let lease)? = page["leaseId"], case .string(let id)? = page["snapshotId"],
+        guard case .int(let tab)? = page["tabId"], case .string(let id)? = page["snapshotId"],
               let text = ChromePageText.render(result) else { return }
-        ChromePageMirror.publish(.init(lease: lease, title: ChromePageText.safe(inputString(page["title"]) ?? ""),
+        ChromePageMirror.publish(.init(tab: tab, title: ChromePageText.safe(inputString(page["title"]) ?? ""),
                                        url: ChromePageText.safe(inputString(page["url"]) ?? ""), snapshotID: id, text: text,
                                        rows: ChromePageText.rows(result)), session: ChatToolSessionContext.verifiedSessionId)
     }
@@ -315,54 +349,71 @@ extension AppToolExecutor {
         return print(before) == print(after)
     }
 
+    public static func chromeTabID(_ value: JSONValue?) -> Int64? {
+        if case .int(let id)? = value, id >= 0 { return id }
+        return nil
+    }
+
     /// Row lines' text with the row number off.
     private static func chromeRowTexts<S: StringProtocol>(_ lines: [S]) -> [String] {
-        lines.filter { $0.range(of: #"^\s*\d+  "#, options: .regularExpression) != nil }
-            .map { $0.replacingOccurrences(of: #"^\s*\d+  "#, with: "", options: .regularExpression) }
+        let lines = lines.map { String($0) }
+        return ChromePageText.rowRanges(lines).map { range in
+            lines[range].joined(separator: "\n").replacingOccurrences(of: #"^\s*\d+  "#, with: "", options: .regularExpression)
+        }
     }
 
     /// After a scroll, the rows the last read already showed are left out
     /// (they are still there, and act by their label): only what came into view.
     /// A read that is only a spinner or "Loading…" (three rows at most).
     public static func chromeStillLoading(_ snapshot: JSONValue) -> Bool {
+        if case .object(let page) = snapshot, page["document"] != nil { return false }
         let rows = ChromePageText.rows(snapshot).filter { !$0.label.isEmpty }
         return rows.count <= 3 && (rows.isEmpty || rows.contains { $0.role == "progressbar" || $0.label.lowercased().hasPrefix("loading") })
     }
 
-    /// The person is away: the screen is locked, or no input for 3 minutes
-    /// (the same system idle clock her home screen reads).
-    /// `stalled`: the scroll moved but nothing new came into view, even after
-    /// waiting — say that in one line instead of counting the old rows.
-    /// `personHere`: the tab was not rendered for the scroll because he is at the Mac.
-    public static func onlyNewRows(_ page: String, before: String, stalled: Bool = false, personHere: Bool = false) -> (text: String, new: Int) {
-        let row = #"^\s*\d+  "#
+    /// A zero text delta is not a viewport comparison. Only the content
+    /// agent's observation can establish that nothing changed in view.
+    public static func onlyNewRows(_ page: String, before: String, viewportChanged: Bool? = nil) -> (text: String, new: Int) {
         // A row counts as already shown only when the same text stood beside
         // the same neighbour (above or below) before: a new "Load more" with
         // new rows around it is new.
         func keys(_ texts: [String]) -> [(String, String, String)] {
             texts.indices.map { (texts[$0], $0 > 0 ? texts[$0 - 1] : "", $0 + 1 < texts.count ? texts[$0 + 1] : "") }
         }
-        let old = keys(chromeRowTexts(before.split(separator: "\n")))
+        let old = keys(chromeRowTexts(before.split(separator: "\n", omittingEmptySubsequences: false)))
         let above = Set(old.map { $0.0 + "\u{0}" + $0.1 }), below = Set(old.map { $0.0 + "\u{0}" + $0.2 })
         var lines = page.split(separator: "\n", omittingEmptySubsequences: false)
         var shown = keys(chromeRowTexts(lines))[...]
+        let blocks = Dictionary(uniqueKeysWithValues: ChromePageText.rowRanges(lines.map(String.init)).map { ($0.lowerBound, $0) })
         var kept: [Substring] = [], left = 0
-        for line in lines {
-            if line.range(of: row, options: .regularExpression) != nil, let (text, up, down) = shown.popFirst(),
-               above.contains(text + "\u{0}" + up) || below.contains(text + "\u{0}" + down) { left += 1; continue }
-            kept.append(line)
+        var index = 0
+        while index < lines.count {
+            if let range = blocks[index], let (text, up, down) = shown.popFirst() {
+                if above.contains(text + "\u{0}" + up) || below.contains(text + "\u{0}" + down) { left += 1 }
+                else { kept.append(contentsOf: lines[range]) }
+                index = range.upperBound
+            } else { kept.append(lines[index]); index += 1 }
         }
         let new = chromeRowTexts(kept).count
         guard left > 0 else { return (page, new) }
-        lines = kept
+        // Keep the observed rows when the viewport changed (or its comparison
+        // is incomplete), even if a previous document read included them.
+        lines = new == 0 && viewportChanged != false
+            ? page.split(separator: "\n", omittingEmptySubsequences: false) : kept
         // After the rows, before the footer: say what was left out.
-        let at = lines.lastIndex(where: { $0.range(of: row, options: .regularExpression) != nil }).map { $0 + 1 }
+        let lastRow = ChromePageText.rowRanges(lines.map(String.init)).last
+        var at = lastRow?.upperBound
             ?? lines.firstIndex(where: { $0.isEmpty }).map { $0 + 1 } ?? lines.count
-        lines.insert(stalled && new == 0
-            ? (personHere
-                ? "Nothing new came into view: a feed in a background tab doesn't load more while the Mac is in use. The rest comes once it has been idle a few minutes."
-                : "Nothing new came into view after waiting: the page did not load more. Scroll again to retry; if it stays the same, this is as far as it goes.")
-            : "(\(left) rows still in view from the last read left out; act on them by label)", at: min(at, lines.count))
+        if let lastRow, lastRow.count > 1, at < lines.count, lines[at].isEmpty { at += 1 }
+        let note: String
+        if new == 0 {
+            note = if viewportChanged == false { "Nothing new came into view in this read: the viewport content is unchanged." }
+                else if viewportChanged == true { "(The viewport changed; these rows were already included in the previous read.)" }
+                else { "(Viewport change could not be verified; these rows were already included in the previous read.)" }
+        } else {
+            note = "(\(left) previously read rows left out; act on them by label)"
+        }
+        lines.insert(Substring(note), at: min(at, lines.count))
         return (lines.joined(separator: "\n"), new)
     }
 
@@ -381,7 +432,7 @@ extension AppToolExecutor {
                 + (end.isEmpty ? "" : " · " + end)
         }
         var extra = obj
-        for key in ["receipt", "leaseId", "tabId", "requestedUrl", "status", "verified", "outcome", "title", "url",
+        for key in ["receipt", "tabId", "tabId", "requestedUrl", "status", "verified", "outcome", "title", "url",
                     "coordinateScope", "frameId", "observationScope", "userSequence", "snapshotId", "nodeId"] {
             extra.removeValue(forKey: key)
         }

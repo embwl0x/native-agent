@@ -42,7 +42,7 @@ public struct WorkshopSessionResultStore: Sendable {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
             return true
         } catch {
-            NSLog("[workshop] terminal result durability failed for %@: %@",
+            nativeLog("[workshop] terminal result durability failed for %@: %@",
                   receipt.reservationId, String(describing: error))
             return false
         }

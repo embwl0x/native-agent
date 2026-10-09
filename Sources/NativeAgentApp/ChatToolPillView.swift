@@ -48,9 +48,9 @@ enum ToolPillPresentation {
     /// The catch boundary projects AutonomyGateError and MCPSubprocessError to
     /// these exact wire forms; do not search arbitrary result prose for errors.
     static func outcome(toolName: String = "", result: String? = nil, ok: Bool? = nil) -> Outcome {
-        guard let result else { return ok == nil ? .pending : .unknown }
-        guard let value = try? JSONValue.parse(Data(result.utf8)) else { return .unknown }
-        let classification = ChatToolOutcome.exactResultClass(value)
+        guard let result else { return ok == false ? .failed : (ok == nil ? .pending : .unknown) }
+        guard let value = try? JSONValue.parse(Data(result.utf8)) else { return ok == false ? .failed : .unknown }
+        let classification = ChatToolOutcome.recordedResultClass(value) ?? ChatToolOutcome.exactResultClass(value)
         let macOutcome = MacControlReceiptOutcome.projecting(envelope: value)
         let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
         let status = fields["status"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -105,7 +105,7 @@ enum ToolPillPresentation {
     static func summary(outcome: Outcome, input: String?, result: String?) -> String {
         let value = result.flatMap { try? JSONValue.parse(Data($0.utf8)) }
         let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
-        let reason = fields["reason"]?.stringValue ?? fields["error"]?.stringValue
+        let reason = value.flatMap(ChatToolOutcome.explanation)
         let macOutcome = value.flatMap { MacControlReceiptOutcome.projecting(envelope: $0) }
         switch outcome {
         case .pending: return "No result yet"
@@ -158,6 +158,31 @@ enum ToolPillPresentation {
         guard let durationMs else { return "" }
         return "\(durationMs)ms"
     }
+
+    /// Fluid glass A2: a call's arguments or result as "key: value" lines a
+    /// person can read — top-level fields in key order, each value one short
+    /// line, nested values counted rather than dumped. Raw JSON stays behind
+    /// the row's "Raw" toggle. Not an object (or not JSON): no lines.
+    static func fieldLines(_ json: String?, limit: Int = 8) -> [(key: String, value: String)] {
+        guard let json, let value = try? JSONValue.parse(Data(json.utf8)),
+              case .object(let fields) = value else { return [] }
+        let lines = fields.keys.sorted().compactMap { key -> (key: String, value: String)? in
+            let shown: String
+            switch fields[key]! {
+            case .null: return nil
+            case .bool(let flag): shown = flag ? "yes" : "no"
+            case .int(let number): shown = String(number)
+            case .double(let number): shown = String(number)
+            case .string(let text):
+                guard !text.isEmpty else { return nil }
+                shown = boundedLine(text, limit: 120)
+            case .array(let items): shown = items.count == 1 ? "1 item" : "\(items.count) items"
+            case .object(let nested): shown = nested.count == 1 ? "1 field" : "\(nested.count) fields"
+            }
+            return (key.replacingOccurrences(of: "_", with: " "), shown)
+        }
+        return Array(lines.prefix(limit))
+    }
 }
 
 enum ToolDiffPresentation {
@@ -205,17 +230,18 @@ enum ToolDiffPresentation {
     }
 }
 
-// PATCH-2026-05-08: wave2-chat-ux — ToolPillView for role=tool messages
+// PATCH-2026-05-08: wave2-chat-ux — ToolPillView for role=tool messages.
+// Fluid glass A2: one tool call as the transcript's one activity row
+// (`ChatActivityRow`). Opened, it reads as a person would say it — the short
+// summary, then the call's arguments and result as "key: value" lines — and
+// the raw JSON sits behind a secondary "Raw" toggle.
 struct ToolPillView: View {
     var message: ChatMessage
+    /// The settled fold's own sentence for this call ("Wrote a file"); nil
+    /// shows the tool's title and target.
+    var headline: String? = nil
     @State private var expanded = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.dynamicTypeSize) private var typeSize
-
-    init(message: ChatMessage, initiallyExpanded: Bool = false) {
-        self.message = message
-        _expanded = State(initialValue: initiallyExpanded)
-    }
+    @State private var showsRaw = false
 
     private var meta: ChatMessageMetadata? { message.metadata }
     /// An app call reads as the action it ran, over that action's args.
@@ -237,115 +263,60 @@ struct ToolPillView: View {
             ToolPillPresentation.summary(outcome: outcome, input: call.inputJSON, result: meta?.resultSummary),
             limit: 240)
     }
-    private var textSize: CGFloat { typeSize.isAccessibilitySize ? 19 : 13 }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button(action: toggleDetails) {
-                VStack(alignment: .leading, spacing: 4) {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(alignment: .firstTextBaseline, spacing: 10) {
-                            Text(title).fontWeight(.semibold).fixedSize()
-                            Spacer(minLength: 0)
-                            controls
-                        }
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(title).fontWeight(.semibold).fixedSize(horizontal: false, vertical: true)
-                            controls
-                        }
-                    }
-                    if !target.isEmpty {
-                        Text(target)
-                            .lineLimit(2).truncationMode(.middle)
-                    }
-                    Text(summary)
-                        .foregroundStyle(.secondary)
+        let line = headline ?? (target.isEmpty ? title : "\(title) · \(target)")
+        ChatActivityRow(
+            title: line,
+            trailing: durationText,
+            isExpanded: $expanded,
+            accessibilityLabel: [line, summary, outcome.rawValue, durationText]
+                .filter { !$0.isEmpty }.joined(separator: ". ")
+        ) {
+            if headline == nil {
+                Image(systemName: outcome.icon)
+                    .accessibilityHidden(true)
+            }
+        } detail: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(summary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let value = try? JSONValue.parse(Data(resultSummary.utf8)),
+                   let remedy = ChatToolOutcome.remedy(value) {
+                    Text("Next step: " + remedy)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                .font(.system(size: textSize))
-                .padding(.horizontal, 10).padding(.vertical, 6)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .buttonFocusable()
-            .shellKeyboardTarget(.receipt)
-            .onKeyPress(.return) { toggleDetails(); return .handled }
-            .onKeyPress(.space) { toggleDetails(); return .handled }
-            .accessibilityElement(children: .ignore)
-            // Replacing the child AX tree must retain the disclosure's button
-            // semantics and default action, not just its descriptive text.
-            .accessibilityAddTraits(.isButton)
-            .accessibilityAction { toggleDetails() }
-            .accessibilityIdentifier("chat.tool.details")
-            .accessibilityLabel([title, target, summary, outcome.rawValue, durationText, "Details"].filter { !$0.isEmpty }.joined(separator: ". "))
-            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
-
-            // Expanded detail card
-            if expanded {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(title)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                    if let json = meta?.inputJSON {
-                        // Fix 4: cap display strings so large payloads don't materialise fully in the view
-                        let displayJSON = json.truncated(to: 8000, suffix: "\n…[truncated]")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Input")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            Text(displayJSON)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.primary)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    if !resultSummary.isEmpty {
-                        let displayResult = resultSummary.truncated(to: 8000, suffix: "\n…[truncated]")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Result")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            Text(displayResult)
-                                .font(.caption2)
-                                .foregroundStyle(.primary)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    // Inline diff for write_file
-                    if toolName == "write_file", let before = meta?.beforeContent, let after = meta?.afterContent {
-                        ToolDiffView(before: before, after: after)
+                let fields = ToolPillPresentation.fieldLines(call.inputJSON)
+                    + ToolPillPresentation.fieldLines(meta?.resultSummary)
+                ForEach(Array(fields.enumerated()), id: \.offset) { _, field in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(field.key + ":").foregroundStyle(NativeAgentShell.tertiary)
+                        Text(field.value).lineLimit(2)
                     }
                 }
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                // Keep selectable detail text inside its own layout while the
-                // row grows. Scaling a text-heavy card across the header made
-                // the two layers briefly overlap during expansion/collapse.
-                .clipped()
-                .transition(.opacity)
+                // Inline diff for write_file
+                if toolName == "write_file", let before = meta?.beforeContent, let after = meta?.afterContent {
+                    ToolDiffView(before: before, after: after)
+                }
+                Button(showsRaw ? "Hide raw" : "Raw") { showsRaw.toggle() }
+                    .buttonStyle(.plain)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .padding(.top, 2)
+                if showsRaw {
+                    // Fix 4: cap display strings so large payloads don't
+                    // materialise fully in the view.
+                    VStack(alignment: .leading, spacing: 4) {
+                        if let json = meta?.inputJSON {
+                            Text(json.truncated(to: 8000, suffix: "\n…[truncated]"))
+                        }
+                        if !resultSummary.isEmpty {
+                            Text(resultSummary.truncated(to: 8000, suffix: "\n…[truncated]"))
+                        }
+                    }
+                    .font(.system(size: ShellType.captionSize, design: .monospaced))
+                }
             }
-        }
-        .padding(.leading, 24) // indent tool pills from left margin
-    }
-
-    private var controls: some View {
-        HStack(spacing: 8) {
-            Label(outcome.rawValue, systemImage: outcome.icon)
-                .foregroundStyle(outcome.color)
-                .fixedSize(horizontal: false, vertical: true)
-            if !durationText.isEmpty {
-                Text(durationText).foregroundStyle(.secondary)
-            }
-            Label("Details", systemImage: expanded ? "chevron.down" : "chevron.right")
-        }
-    }
-
-    private func toggleDetails() {
-        withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion)) {
-            expanded.toggle()
         }
     }
 }

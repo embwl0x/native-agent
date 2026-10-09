@@ -26,6 +26,7 @@ package enum ChatToolSessionInjection {
             out["sessionId"] = .string(sessionId)
         }
         if toolName == "recent_trace_summary",
+           out["view"] != .string("receipts"), out["effects_only"] != .bool(true),
            out["session_id"] == nil,
            out["sessionId"] == nil {
             out["session_id"] = .string(sessionId)

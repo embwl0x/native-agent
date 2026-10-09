@@ -18,7 +18,7 @@ public struct BrowserToolPlatformPort: Sendable {
 /// Values and actions of the mounted window. Policy stays in the Core caller.
 @MainActor public protocol QuietToolHost: QuietSettingsHost {
     var activeChatSessionId: String { get }
-    func pageRead(_ page: QuietToolPage) async -> (content: [JSONValue], rows: [JSONValue], truncated: Bool)
+    func pageRead(_ page: QuietToolPage) async -> [JSONValue]
     /// Empty `sessionId` means the conversation on screen.
     func composerState(sessionId: String) async -> [String: JSONValue]
     /// `attachments` are files Core already resolved and fenced; `reachesUser`
@@ -41,6 +41,8 @@ public struct BrowserToolPlatformPort: Sendable {
     func saveProviderKey(_ key: String, provider: String) async -> QuietProviderKeyOutcome
     /// One upkeep button, through the call the button makes.
     func runUpkeep(verb: String, input: [String: JSONValue]) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
+    /// The upkeep executor's effect-free input and target checks.
+    func upkeepFence(verb: String, input: [String: JSONValue]) async -> JSONValue?
     /// The `inbox` tool's verbs over the Inbox page's own reads and actions.
     func inbox(verb: String, input: [String: JSONValue]) async -> JSONValue
     /// The checks `inbox` makes before it writes, asked alone for the door's
@@ -63,9 +65,10 @@ public struct QuietComposerOutcome: Sendable {
     public var changed: Bool
     public var element: String
     public var detail: String
+    public var status: String
     public var refusal: (reason: String, detail: String)?
-    public init(changed: Bool, element: String, detail: String, refusal: (reason: String, detail: String)?) {
-        self.changed = changed; self.element = element; self.detail = detail; self.refusal = refusal
+    public init(changed: Bool, element: String, detail: String, refusal: (reason: String, detail: String)?, status: String = "ok") {
+        self.changed = changed; self.element = element; self.detail = detail; self.refusal = refusal; self.status = status
     }
 }
 

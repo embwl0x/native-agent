@@ -56,7 +56,7 @@ final class NativeAgentA2AGRPCListener: @unchecked Sendable {
                         try await group.waitForAll()
                     }
                 } catch {
-                    if !Task.isCancelled { NSLog("[A2A gRPC] listener ended: %@", String(describing: error)) }
+                    if !Task.isCancelled { nativeLog("[A2A gRPC] listener ended: %@", String(describing: error)) }
                 }
             }
         }

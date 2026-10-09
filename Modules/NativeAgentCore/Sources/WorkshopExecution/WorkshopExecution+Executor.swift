@@ -96,33 +96,9 @@ public actor WorkshopExecutorLoop {
     func _setBeforeApprovalTimeoutClaimForTesting(_ hook: @escaping @Sendable () async -> Void) {
         beforeApprovalTimeoutClaimForTesting = hook
     }
-    /// One-shot startup orphan-reclaim, memoized as a Task so EVERY fresh-claim
-    /// path (drainOnce, start, resumeAfterApproval) awaits the SAME reclaim to
-    /// COMPLETION before it claims/flips anything. This is the barrier that
-    /// makes "a `running` execution seen at reclaim time is necessarily a dead
-    /// prior instance's orphan" actually true: no claim by THIS process can
-    /// land before the reclaim finishes (gpt-5.5 review: a bare bool let
-    /// start() claim a live execution that the first drain then wrongly failed).
-    ///
-    /// PROCESS-WIDE (per data-root), NOT per-instance (gpt-5.5 re-review): the
-    /// app may build MORE THAN ONE executor instance on the same root — the
-    /// background drain (WorkshopExecutorRef.shared) AND a cold-start fallback in
-    /// applyResolvedWorkshopStep when the ref isn't configured yet. Per-instance
-    /// memoization gave each its OWN once-guard, so a fallback resume instance
-    /// could flip an execution blocked→running and the drain instance's first
-    /// reclaim would then fail it as a crash orphan. Keying the barrier on
-    /// `root.path` makes both instances share ONE reclaim: it runs exactly once
-    /// per process per root, before any claim by any instance. Unique temp roots
-    /// keep test isolation; production's single root shares one barrier.
-    ///
-    /// fix-reconcile-memo-leak (2026-08-02): this used to be a hand-locked
-    /// `[String: Task]` with an insert and NO removal — every unique data root
-    /// permanently retained its reclaim `Task`, and a Task retains its closure
-    /// context, i.e. the executor instance that created it. `OnceByKey` keeps
-    /// the identical once-per-process-per-root guarantee but drops the Task
-    /// (and its captures) the moment the run completes, keeping only a
-    /// completion marker — plus a `reset()` seam so a temp-root-per-test suite
-    /// stops growing the table for the life of the test process.
+    /// Every executor on a root shares this admission barrier. Failed recovery
+    /// remains retryable; no process-local claim can land until all prior
+    /// running records have settled, so retries cannot reclaim our own work.
     static let orphanReclaimOnce = OnceByKey<String>(name: "workshop-orphan-reclaim")
     private static let logger = Logger(subsystem: "com.nativeagent.workshop", category: "executor")
 
@@ -244,6 +220,12 @@ public actor WorkshopExecutorLoop {
                     case .error: Self.logger.error("\(message, privacy: .public)")
                     case .info: Self.logger.info("\(message, privacy: .public)")
                     }
+                },
+                markTombstoned: { id in
+                    WorkshopExecutionMemory.markTombstoned(executionDirectory: root
+                        .appendingPathComponent("workshop", isDirectory: true)
+                        .appendingPathComponent("executions", isDirectory: true)
+                        .appendingPathComponent(id, isDirectory: true))
                 }
             )
         }
@@ -335,7 +317,12 @@ public actor WorkshopExecutorLoop {
     public func drainOnce() async -> Int {
         // Crash/restart orphan recovery — completes BEFORE this drain claims
         // anything (the shared barrier; see reconcileTask).
-        await ensureOrphansReconciled()
+        do {
+            try await ensureOrphansReconciled()
+        } catch {
+            Self.logger.error("Workshop startup reconciliation unavailable: \(error.localizedDescription, privacy: .public)")
+            return 0
+        }
         // Terminal execution state is canonical; its Desk projection and
         // unified receipt are retryable derived settlement. Reconcile every
         // terminal record before admitting new work so a crash between the
@@ -417,18 +404,8 @@ public actor WorkshopExecutorLoop {
         }.min()
     }
 
-    /// Run the one-shot orphan reclaim to completion, memoized PER DATA-ROOT so
-    /// concurrent claim paths — across ALL executor instances on that root —
-    /// share ONE reclaim and none claims before it finishes. `OnceByKey` is an
-    /// actor, so the lookup-or-create is atomic even when two instances race
-    /// here, and every caller awaits the same run to COMPLETION. (Strong
-    /// self-capture in the operation is intentional and harmless:
-    /// reconcileOrphanedRunning only touches root-derived paths, so whichever
-    /// instance first starts the reclaim runs it correctly for any instance —
-    /// and unlike the old memo table, the capture is released the moment the
-    /// run completes.)
-    private func ensureOrphansReconciled() async {
-        await Self.orphanReclaimOnce.run(root.path) { await self.reconcileOrphanedRunning() }
+    private func ensureOrphansReconciled() async throws {
+        try await Self.orphanReclaimOnce.runChecked(root.path) { try await self.reconcileOrphanedRunning() }
     }
 
     /// One-time startup reconcile (crash/restart orphan recovery). An orphan
@@ -438,45 +415,44 @@ public actor WorkshopExecutorLoop {
     /// continuation owns it and every recorded step succeeded with a settled
     /// receipt at a step boundary; that one resumes from its next step.
     /// CAS require:running → never clobbers an execution that has moved on.
-    private func reconcileOrphanedRunning() async {
-        let orphans = await scanQueue().filter { $0.status == "running" }
+    private func reconcileOrphanedRunning() async throws {
+        let queue = try await scanQueueChecked()
+        if let corrupt = queue.first(where: { ["corrupt", "unavailable"].contains($0.status) }) {
+            throw WorkshopExecutionError.persistenceFailure(String(describing: corrupt.result))
+        }
+        let orphans = queue.filter { $0.status == "running" }
         for orphan in orphans {
-            do {
-                if let handle = orphan.deskHandle {
-                    let task = try await SwiftNativeDeskStore(dataRoot: root).liveState().items.first { $0.handle == handle }
-                    let linked = task?.continuation?.pending.contains {
-                        $0.owner == "workshop" && $0.ownerID == orphan.id
-                    } == true
-                    let completed = orphan.stepsCompleted.filter { value in
-                        guard case .object(let fields) = value else { return false }
-                        return fields["status"] == .string(WorkshopStepOutcome.successStatus)
-                            && !DeskContinuation.receiptIsUnresolved(value)
+            if let handle = orphan.deskHandle {
+                let task = try await SwiftNativeDeskStore(dataRoot: root).liveState().items.first { $0.handle == handle }
+                let linked = task?.continuation?.pending.contains {
+                    $0.owner == "workshop" && $0.ownerID == orphan.id
+                } == true
+                let completed = orphan.stepsCompleted.filter { value in
+                    guard case .object(let fields) = value else { return false }
+                    return fields["status"] == .string(WorkshopStepOutcome.successStatus)
+                        && !DeskContinuation.receiptIsUnresolved(value)
+                }
+                let safeBoundary = orphan.currentStepId.isEmpty || completed.contains { value in
+                    guard case .object(let fields) = value else { return false }
+                    return fields["step_id"] == .string(orphan.currentStepId)
+                }
+                if linked, task?.status.isTerminal == false,
+                   task?.continuation?.state != .canceled, safeBoundary,
+                   completed.count == orphan.stepsCompleted.count {
+                    let resumed = try await casMutateWorkshopExecution(orphan.id, require: ["running"]) { rec in
+                        rec.status = "queued"
+                        rec.currentStepId = ""
                     }
-                    let safeBoundary = orphan.currentStepId.isEmpty || completed.contains { value in
-                        guard case .object(let fields) = value else { return false }
-                        return fields["step_id"] == .string(orphan.currentStepId)
-                    }
-                    if linked, task?.status.isTerminal == false,
-                       task?.continuation?.state != .canceled, safeBoundary,
-                       completed.count == orphan.stepsCompleted.count {
-                        let resumed = try await casMutateWorkshopExecution(orphan.id, require: ["running"]) { rec in
-                            rec.status = "queued"
-                            rec.currentStepId = ""
-                        }
-                        if resumed.applied {
-                            try await appendTimelineLocked(.object([
-                                "event": .string("continued_after_restart"),
-                                "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
-                            ]), executionId: orphan.id)
-                            continue
-                        }
+                    if resumed.applied {
+                        try await appendTimelineLocked(.object([
+                            "event": .string("continued_after_restart"),
+                            "ts": .string(SwiftNativeWorkshopRunner.isoTimestamp(now())),
+                        ]), executionId: orphan.id)
+                        continue
                     }
                 }
-            } catch {
-                Self.logger.error("Workshop continuation reconciliation failed: \(error.localizedDescription, privacy: .public)")
-                continue
             }
-            let failed = try? await casMutateWorkshopExecution(orphan.id, require: ["running"]) { rec in
+            let failed = try await casMutateWorkshopExecution(orphan.id, require: ["running"]) { rec in
                 rec.status = "failed"
                 rec.terminalReason = "interrupted_by_restart"
                 rec.result = .object([
@@ -486,8 +462,11 @@ public actor WorkshopExecutorLoop {
                 ])
                 rec.currentStepId = ""
             }
-            guard failed?.applied == true else { continue }
-            try? await appendTimelineLocked(
+            guard let settled = failed.record, settled.status != "running" else {
+                throw WorkshopExecutionError.persistenceFailure("Workshop orphan \(orphan.id) did not settle; restore its execution record before admitting work")
+            }
+            guard failed.applied else { continue }
+            try await appendTimelineLocked(
                 .object([
                     "event": .string("failed"),
                     "error": .string("interrupted_by_restart"),
@@ -495,7 +474,7 @@ public actor WorkshopExecutorLoop {
                 ]),
                 executionId: orphan.id
             )
-            await emitTerminalEvent(failed?.record, reason: "interrupted_by_restart")
+            await emitTerminalEvent(settled, reason: "interrupted_by_restart")
             Self.logger.notice("reclaimed orphaned Workshop execution \(orphan.id, privacy: .public) -> failed (interrupted_by_restart)")
         }
     }
@@ -606,7 +585,7 @@ public actor WorkshopExecutorLoop {
         // Reclaim orphans BEFORE this explicit start claims — else an execution
         // started here (before the first background drain) would be seen as a
         // "running" orphan by that drain and wrongly failed (gpt-5.5 review).
-        await ensureOrphansReconciled()
+        try await ensureOrphansReconciled()
         guard let claimed = try await claim(trimmed) else {
             // Mirror the daemon's typed refusal.
             let current = try await getRecord(trimmed)
@@ -1500,7 +1479,7 @@ public actor WorkshopExecutorLoop {
         }
         // Reclaim orphans before a resume flips a blocked step to running, so
         // the first reclaim can't race a concurrent resume (gpt-5.5 review).
-        await ensureOrphansReconciled()
+        try await ensureOrphansReconciled()
         guard let execution = try await getRecord(executionId) else {
             throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(executionId)")
         }
@@ -1902,6 +1881,9 @@ public actor WorkshopExecutorLoop {
         guard let known = await queue.recordedSources() else { return 0 }
         var reconciled = 0
         for entry in recent {
+            // A memory refused as a rejected claim is settled for good.
+            guard !fm.fileExists(atPath: entry.url
+                .appendingPathComponent(WorkshopExecutionMemory.tombstonedMarkerName).path) else { continue }
             // A corrupt record is logged and quarantined by readJSON; the scan skips it.
             guard let raw = try? await persistence.readJSON(
                 ExecutionRecordFile.resolve(in: entry.url), ifMissing: .null
@@ -1912,6 +1894,18 @@ public actor WorkshopExecutorLoop {
             guard ["completed", "failed", "cancelled"].contains(record.status) else { continue }
             guard case .remember = WorkshopExecutionMemory.decide(record) else { continue }
             guard !known.contains(WorkshopExecutionMemory.source(for: record)) else { continue }
+            // Ask once, then mark: a rejected claim was never lost to a crash.
+            // A failed lookup (logged by the recorder) skips this launch rather
+            // than reading as "not tombstoned".
+            switch await queue.isRefusedAsTombstoned(record, reason: record.terminalReason) {
+            case false?: break
+            case true?:
+                if !WorkshopExecutionMemory.markTombstoned(executionDirectory: entry.url) {
+                    Self.logger.error("[workshop-memory] ERROR marking execution \(id, privacy: .public) tombstoned")
+                }
+                continue
+            case nil: continue
+            }
             Self.logger.info(
                 """
                 [workshop-memory] reconcile: terminal execution \(id, privacy: .public) \
@@ -1963,7 +1957,9 @@ public actor WorkshopExecutorLoop {
                 ExecutionRecordFile.resolve(in: sub, fileManager: fm),
                 id: sub.lastPathComponent, persistence: persistence)
             guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == sub.lastPathComponent else { continue }
+                  case .string(let gotId)? = obj["id"], gotId == sub.lastPathComponent else {
+                throw WorkshopExecutionError.persistenceFailure("Workshop queue record \(sub.lastPathComponent) is malformed; restore its saved execution record before admitting work")
+            }
             out.append(SwiftNativeWorkshopRunner.recordFromJSON(obj))
         }
         return out

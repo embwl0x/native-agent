@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import os
 import PersistenceCore
 import TurnTrace
@@ -20,8 +21,8 @@ import TurnTrace
 ///   trip 09-23 at 4-of-4).
 ///   Density is the point (Sol, 09-23): a refrain or a log line that recurs
 ///   across a long reply is scattered, a loop is not. A line only counts when
-///   it is at least 40 characters with at least 20 letters, does not start
-///   with `|` (tables share headers), and is not inside a code fence.
+///   it has at least four letters and does not start with `|` (tables share
+///   headers). Dense repetition inside code is checked too.
 /// - `headerLimit` (3) lines that START with "NativeAgent tool result #", the
 ///   app's own result header. Tool results come from the app, never from the
 ///   model; a mention of the phrase inside a sentence is not one.
@@ -32,7 +33,7 @@ import TurnTrace
 /// max_tokens (98k chars of `agent_contacts`; `read_file` x12). Complete
 /// `<invoke>`/`<tool_use>` blocks are counted as they stream; a block that
 /// repeats the one just before it, an action repeated anywhere in the reply
-/// (reads may recur), or a 9th block, sets `toolBoundary` just after the
+/// (reads may recur), sets `toolBoundary` just after the
 /// last good block's closing tag. The adapter ends the stream there like a
 /// server stop sequence, so the complete calls before it dispatch. A block
 /// only counts once its closing tag has arrived, and the offending block's
@@ -44,10 +45,10 @@ public struct RunawayOutputDetector: Sendable {
     static let headerLimit = 3
     static let window = 24
     static let minWindow = 12
-    static let toolBlockLimit = 8
 
     /// UTF-8 offset where the reply ends at a tool-call boundary.
     public private(set) var toolBoundary: Int?
+    public private(set) var toolBoundaryReason: LLMToolBoundaryReason?
     private let endsAtToolBoundary: Bool
     private var blockCursor = 0
     private var openBlock: (start: Int, close: String)?
@@ -58,17 +59,25 @@ public struct RunawayOutputDetector: Sendable {
     /// Classification receives the complete block so the parser and registry
     /// owners can distinguish reads from actions without a second XML parser.
     public static func registerReadOnlyCalls(_ classify: @escaping @Sendable (String) -> Bool) {
-        readOnlyCalls.withLock { $0 = classify }
+        let box = Classifier(classify)
+        readOnlyCalls.withLock { $0 = box }
     }
-    private static let readOnlyCalls = OSAllocatedUnfairLock<(@Sendable (String) -> Bool)?>(initialState: nil)
+    // Boxed: a closure read back through withLock's inout state gains a
+    // reabstraction thunk on every read and eventually overflows the stack.
+    private final class Classifier<Input>: Sendable {
+        let call: @Sendable (Input) -> Bool
+        init(_ call: @escaping @Sendable (Input) -> Bool) { self.call = call }
+    }
+    private static let readOnlyCalls = OSAllocatedUnfairLock<Classifier<String>?>(initialState: nil)
 
     public static func registerAppReadOnlyCalls(_ classify: @escaping @Sendable ([String: JSONValue]) -> Bool) {
-        appReadOnlyCalls.withLock { $0 = classify }
+        let box = Classifier(classify)
+        appReadOnlyCalls.withLock { $0 = box }
     }
-    private static let appReadOnlyCalls = OSAllocatedUnfairLock<(@Sendable ([String: JSONValue]) -> Bool)?>(initialState: nil)
+    private static let appReadOnlyCalls = OSAllocatedUnfairLock<Classifier<[String: JSONValue]>?>(initialState: nil)
 
     public static func isAppReadOnly(_ input: [String: JSONValue]) -> Bool {
-        appReadOnlyCalls.withLock { $0 }?(input) ?? false
+        appReadOnlyCalls.withLock { $0 }?.call(input) ?? false
     }
     private var lastBlockEnd = 0
     /// Where the text after the last complete call starts being checked.
@@ -82,6 +91,7 @@ public struct RunawayOutputDetector: Sendable {
     public private(set) var reason: String?
     private var lineStart = 0
     private var pending = ""
+    private var inlineCheckBytes = 0
     /// The last `window` counted lines: hash and where each starts.
     private var recent: [(key: Int, start: Int)] = []
     private var inFence = false
@@ -109,6 +119,10 @@ public struct RunawayOutputDetector: Sendable {
             rest = Substring(rest.unicodeScalars[rest.unicodeScalars.index(after: nl)...])
         }
         pending += rest
+        if text.utf8.count >= inlineCheckBytes + 512 {
+            inlineCheckBytes = text.utf8.count
+            if checkInline(text, at: 0) { return true }
+        }
         // Record fence positions before checking completed tool blocks.
         if endsAtToolBoundary {
             bytes.append(contentsOf: delta.utf8)
@@ -118,6 +132,7 @@ public struct RunawayOutputDetector: Sendable {
     }
 
     private mutating func check(_ line: String, at start: Int) -> Bool {
+        if checkInline(line, at: start) { return true }
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         // Fences only guard the header rule (a quoted header in a code block is
         // not a fabricated one); loops are loops inside code too, and density
@@ -134,8 +149,8 @@ public struct RunawayOutputDetector: Sendable {
                 return trip(at: firstHeader, "\(headers) fabricated tool-result headers")
             }
         }
-        guard trimmed.count >= 40, !trimmed.hasPrefix("|"),
-              trimmed.unicodeScalars.filter(CharacterSet.letters.contains).count >= 20
+        guard !trimmed.hasPrefix("|"),
+              trimmed.unicodeScalars.filter(CharacterSet.letters.contains).count >= 4
         else { return false }
         let key = trimmed.hashValue
         recent.append((key, start))
@@ -145,6 +160,16 @@ public struct RunawayOutputDetector: Sendable {
         let repeats = recent.count - Set(recent.map(\.key)).count
         guard repeats * 2 >= recent.count else { return false }
         return trip(at: copies[1].start, "line repeated \(copies.count)x in \(recent.count) lines")
+    }
+
+    // Catch short-unit loops with or without newlines in a bounded tail.
+    private mutating func checkInline(_ line: String, at start: Int) -> Bool {
+        guard line.utf8.count >= 512 else { return false }
+        let tail = String(line.suffix(2048))
+        guard let loop = tail.range(of: #"(?s)(\S.{0,127}?)\1{7,}"#, options: .regularExpression),
+              tail[loop].utf8.count >= 512 else { return false }
+        let offset = start + line.utf8.count - tail.utf8.count + tail[..<loop.lowerBound].utf8.count
+        return trip(at: offset, "dense short-unit repetition")
     }
 
     private mutating func trip(at offset: Int, _ why: String) -> Bool {
@@ -180,20 +205,16 @@ public struct RunawayOutputDetector: Sendable {
                 // sequence — home between rooms (09-25: 21 of 24 repeat trips
                 // were `workspace {}` between rooms, each costing a round) —
                 // but an action repeated anywhere in the reply (send, read,
-                // send) still ends it: a double send is real harm. The block
-                // limit counts every block, so an A-B-A-B loop stops at 8.
+                // send) still ends it: a double send is real harm.
                 let signature = block.trimmingCharacters(in: .whitespacesAndNewlines)
                 if signature == lastSignature {
-                    return setToolBoundary("tool block repeated")
+                    return setToolBoundary(.repeatedBlock, "tool block repeated")
                 }
                 if !blockSignatures.insert(signature).inserted, !Self.isReadOnly(signature) {
-                    return setToolBoundary("tool action repeated")
+                    return setToolBoundary(.repeatedAction, "tool action repeated")
                 }
                 lastSignature = signature
                 blockCount += 1
-                if blockCount > Self.toolBlockLimit {
-                    return setToolBoundary("tool block \(blockCount) of \(Self.toolBlockLimit)")
-                }
                 lastBlockEnd = end
                 gapStart = end
             } else {
@@ -204,7 +225,7 @@ public struct RunawayOutputDetector: Sendable {
                 // lines until the loop guard cut the reply and nothing ran.
                 // Short narration between two calls stays (Sol).
                 if blockCount > 0, let why = gapAfterCall() {
-                    return setToolBoundary(why)
+                    return setToolBoundary(why.kind, why.detail)
                 }
                 let opens = [("<invoke", "</invoke>"), ("<tool_use", "</tool_use>")].compactMap { tag, close in
                     Self.find(tag, in: bytes, from: blockCursor, tag: true).map { ($0, tag, close) }
@@ -222,7 +243,7 @@ public struct RunawayOutputDetector: Sendable {
     /// A complete `<invoke name=…>` / `<tool_use name=…>` block is a read by
     /// the registered classification; no classification means an action.
     static func isReadOnly(_ block: String) -> Bool {
-        readOnlyCalls.withLock { $0 }?(block) ?? false
+        readOnlyCalls.withLock { $0 }?.call(block) ?? false
     }
 
     static let fabricatedResultMarkers = ["<system>", "<function_results", "<tool_result", "Tool ran without output",
@@ -230,12 +251,12 @@ public struct RunawayOutputDetector: Sendable {
     static let gapBudget = 400
 
     /// Why the text since the last complete call ends the reply, or nil.
-    private func gapAfterCall() -> String? {
+    private func gapAfterCall() -> (kind: LLMToolBoundaryReason, detail: String)? {
         let next = ["<invoke", "<tool_use", "<function_calls"].compactMap { Self.find($0, in: bytes, from: gapStart) }.min()
         let gap = String(decoding: bytes[gapStart..<(next ?? bytes.count)], as: UTF8.self)
-        if let marker = Self.fabricatedResultMarkers.first(where: gap.contains) { return "invented result after a call (\(marker))" }
+        if let marker = Self.fabricatedResultMarkers.first(where: gap.contains) { return (.fabricatedResult, "invented result after a call (\(marker))") }
         if next == nil, gap.trimmingCharacters(in: .whitespacesAndNewlines).count > Self.gapBudget {
-            return "prose after a call past \(Self.gapBudget) characters"
+            return (.postCallProse, "prose after a call past \(Self.gapBudget) characters")
         }
         return nil
     }
@@ -257,9 +278,10 @@ public struct RunawayOutputDetector: Sendable {
         return nil
     }
 
-    private mutating func setToolBoundary(_ why: String) -> Bool {
+    private mutating func setToolBoundary(_ kind: LLMToolBoundaryReason, _ why: String) -> Bool {
         let end = lastBlockEnd, chars = text.count
         toolBoundary = end
+        toolBoundaryReason = kind
         reason = "tool_marker_boundary: \(why)"
         Logger(subsystem: "NativeAgent", category: "Cutoff")
             .error("tool_marker_boundary: \(why, privacy: .public) chars=\(chars, privacy: .public) end=\(end, privacy: .public)B")

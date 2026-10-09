@@ -32,10 +32,13 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
     }
 
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else {
+        do {
+            let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
+            return WorkshopPump.nextMeaningfulDeadline(from: state, after: now)
+        } catch {
+            nativeLog("[workshop] deadline projection unavailable: %@", String(error.localizedDescription.prefix(600)))
             return nil
         }
-        return WorkshopPump.nextMeaningfulDeadline(from: state, after: now)
     }
 
     public func tick() async {
@@ -54,6 +57,8 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
             return .skipped(reason: "resource pressure")
         case .quiet:
             return .skipped(reason: "nothing due")
+        case .unavailable(let cause):
+            return .failed(error: "Workshop storage unavailable: \(cause)")
         case .leaseHeld:
             return .skipped(reason: "background-work lease held")
         case .reservationRefused:

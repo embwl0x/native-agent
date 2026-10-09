@@ -43,8 +43,7 @@ public struct AgentConversationContinuation: Sendable {
         let dotAgents = Set(((try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []).filter(ChatGPTDotIPCTransport.owns).map { "peer:" + $0.id })
         let ordinary = rows.filter { !dotAgents.contains($0.agent) && ($0.notice != nil || $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering")) }
             .map { max($0.nextReadAt ?? now, now.addingTimeInterval(1)) }.min()
-        return [ordinary, ChatGPTDotIPCTransport.nextPull(dataRoot: dataRoot, now: now),
-                AgentLocalHealth.nextRefresh(dataRoot, now: now), ResidentWake.shared.nextDeadline(dataRoot: dataRoot)]
+        return [ordinary, AgentLocalHealth.nextRefresh(dataRoot, now: now), ResidentWake.shared.nextDeadline(dataRoot: dataRoot)]
             .compactMap { $0 }.min()
     }
 
@@ -61,9 +60,11 @@ public struct AgentConversationContinuation: Sendable {
     private func resumeQueues() {
         guard queuesResumed.set() else { return }
         grok.resumeHandOvers(dataRoot: dataRoot)
+        // Dot's room is pushed to her from here on; nothing pulls it.
+        ChatGPTDotIPCTransport.listen(dataRoot: dataRoot)
         Task {
             do { try await dot.resumeAdmissions() }
-            catch { NSLog("Dot admission recovery failed: %@", error.localizedDescription) }
+            catch { nativeLog("Dot admission recovery failed: %@", error.localizedDescription) }
         }
         let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
         let dotAgents = Set(peers.filter(ChatGPTDotIPCTransport.owns).map { "peer:" + $0.id })
@@ -146,7 +147,7 @@ public struct AgentConversationContinuation: Sendable {
             do { _ = try await clients.bridgeChatClient().importAgentConversationHistory(sessionID: session, rows: list) }
             catch {
                 complete = false
-                NSLog("AgentConversationContinuation: history for \(owner) not imported: \(error)")
+                nativeLog("AgentConversationContinuation: history for \(owner) not imported: \(error)")
             }
         }
         if complete { try? await SwiftNativePersistenceCore().writeJSON(.string(iso.string(from: Date())), to: marker) }
@@ -172,10 +173,6 @@ public struct AgentConversationContinuation: Sendable {
         if try await wakeHer() { return }
         let now = Date()
         let dotAgents = Set(try AgentPeerStore(dataRoot: dataRoot).list().filter(ChatGPTDotIPCTransport.owns).map { "peer:" + $0.id })
-        if ChatGPTDotIPCTransport.takePull(dataRoot: dataRoot, now: now), let dot = dotAgents.first {
-            let tools = clients.bridgeToolDispatchClient(fileAccess: "read_only", verifiedSessionId: nil)
-            _ = try await tools.dispatch(tool: "agent_read", input: ["agent": .string(dot)], surface: "chat")
-        }
         let due = try store.records().filter {
             !dotAgents.contains($0.agent) && ($0.notice != nil || $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering"))
                 && ($0.nextReadAt ?? .distantPast) <= now
@@ -513,7 +510,7 @@ public struct AgentConversationContinuation: Sendable {
         var entry = try exactEntry()
         if entry == nil {
             switch try BotRunQueue(dataRoot: dataRoot).presence(bot: botID, requestID: requestID) {
-            case .queued, .running: return false
+            case .queued, .running, .deadlineExceeded: return false
             case .absent:
                 // Completion may have landed between the first shelf read and
                 // the queue/claim check. Reread after proving no live writer.

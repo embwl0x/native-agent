@@ -92,8 +92,8 @@ public struct ProviderVitalsTransition: Sendable, Equatable {
     public var to: ProviderVitalsBand
     public var direction: ProviderVitalsDirection
     public var occurredAt: Date
-    /// EMA read at transition time — carried as evidence for the felt signal
-    /// and the (later) approval card wording. Never any prompt/completion text.
+    /// EMA read at transition time — carried as evidence for the felt signal.
+    /// Never any prompt/completion text.
     public var emaLatencyMs: Double?
     public var baselineLatencyMs: Double?
     public var emaErrorRate: Double
@@ -121,20 +121,11 @@ public struct ProviderVitalsTransition: Sendable, Equatable {
         self.consecutiveFailures = consecutiveFailures
     }
 
-    /// True when the provider is running visibly slower than its own baseline —
-    /// backs the "at half speed" card wording.
+    /// How far the provider is running from its own baseline latency.
     public var latencyRatio: Double? {
         guard let ema = emaLatencyMs, let base = baselineLatencyMs, base > 0 else { return nil }
         return ema / base
     }
-}
-
-/// Card lifecycle decision surfaced by the sensor. The sensor NEVER switches a
-/// provider — it decides only whether a proposal card should be staged or
-/// expired; the actual staging rides the existing approval lane in the owner.
-public enum ProviderVitalsCardDecision: Sendable, Equatable {
-    case stage(providerId: String, transition: ProviderVitalsTransition)
-    case expire(providerId: String)
 }
 
 /// Tunables. Defaults chosen so a single slow call never trips a band and a
@@ -146,8 +137,6 @@ public struct ProviderVitalsConfiguration: Sendable, Equatable {
     public var baselineAlpha: Double
     /// Samples required before a provider may leave `nominal` (cold-start guard).
     public var warmupSamples: Int
-    /// Sustained-degraded dwell before a card is staged.
-    public var cardStageAfter: TimeInterval
     /// Provider-row cap (LRU eviction of nominal rows past this bound) —
     /// bounds resident memory AND the telemetry snapshot.
     public var maxTrackedProviders: Int
@@ -162,7 +151,6 @@ public struct ProviderVitalsConfiguration: Sendable, Equatable {
         fastAlpha: Double = 0.4,
         baselineAlpha: Double = 0.05,
         warmupSamples: Int = 5,
-        cardStageAfter: TimeInterval = 10 * 60,
         maxTrackedProviders: Int = 24,
         enterSluggish: Double = 1.0,
         exitSluggish: Double = 0.6,
@@ -172,7 +160,6 @@ public struct ProviderVitalsConfiguration: Sendable, Equatable {
         self.fastAlpha = fastAlpha
         self.baselineAlpha = baselineAlpha
         self.warmupSamples = max(0, warmupSamples)
-        self.cardStageAfter = max(0, cardStageAfter)
         self.maxTrackedProviders = max(1, maxTrackedProviders)
         self.enterSluggish = enterSluggish
         self.exitSluggish = exitSluggish
@@ -196,8 +183,6 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
         public var emaErrorRate: Double
         public var consecutiveFailures: Int
         public var sampleCount: Int
-        public var cardActive: Bool
-        public var degradedSince: Date?
     }
 
     private struct State {
@@ -209,8 +194,6 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
         var emaErrorRate: Double = 0
         var consecutiveFailures: Int = 0
         var sampleCount: Int = 0
-        var degradedSince: Date?
-        var cardActive: Bool = false
         /// LRU stamp for the provider-row cap (gpt-5.5 review: `states` was
         /// unbounded — an adversarial/misconfigured provider-id stream could
         /// grow memory and telemetry forever).
@@ -319,12 +302,6 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
                 state.baselineLatencyMs, duration, alpha: configuration.baselineAlpha)
         }
 
-        if nextBand == .degraded {
-            if state.degradedSince == nil { state.degradedSince = sample.occurredAt }
-        } else {
-            state.degradedSince = nil
-        }
-
         state.lastSampleAt = sample.occurredAt
         states[key] = state
         // Provider-row cap: evict the least-recently-sampled NOMINAL rows past
@@ -356,60 +333,6 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
         )
     }
 
-    // MARK: Card decision (pure; owner performs the actual staging)
-
-    /// Evaluate whether the sustained-degradation card should be staged or
-    /// expired for any provider, as of `now`. Pure state read + at-most-once
-    /// latch flip per provider (a staged card is not re-staged until it expires;
-    /// an expired card is not re-expired until a new one stages).
-    public func evaluateCardDecisions(now: Date) -> [ProviderVitalsCardDecision] {
-        var decisions: [ProviderVitalsCardDecision] = []
-        for key in states.keys.sorted() {
-            guard var state = states[key] else { continue }
-            if state.band == .degraded,
-               let since = state.degradedSince,
-               now.timeIntervalSince(since) >= configuration.cardStageAfter {
-                if !state.cardActive {
-                    state.cardActive = true
-                    states[key] = state
-                    decisions.append(.stage(
-                        providerId: key,
-                        transition: ProviderVitalsTransition(
-                            providerId: key,
-                            from: .degraded,
-                            to: .degraded,
-                            direction: .worsening,
-                            occurredAt: now,
-                            emaLatencyMs: state.emaLatencyMs,
-                            baselineLatencyMs: state.baselineLatencyMs,
-                            emaErrorRate: state.emaErrorRate,
-                            consecutiveFailures: state.consecutiveFailures
-                        )
-                    ))
-                }
-            } else if state.cardActive, state.band < .degraded {
-                // Recovered below degraded → the card is stale; expire it.
-                state.cardActive = false
-                states[key] = state
-                decisions.append(.expire(providerId: key))
-            }
-        }
-        return decisions
-    }
-
-    /// Put the card latch back where it was after the owner's inbox write
-    /// FAILED. User, 2026-09-06: `evaluateCardDecisions` flips `cardActive`
-    /// optimistically and the owner's append can fail (it logs and returns), so
-    /// a failed stage permanently consumed the transition — the latch said a
-    /// card was up, no card existed, and it was never re-staged. The owner
-    /// reverts here so the next sweep retries.
-    public func revertCardLatch(providerId: String, to active: Bool) {
-        let key = normalizedProviderId(providerId)
-        guard var state = states[key] else { return }
-        state.cardActive = active
-        states[key] = state
-    }
-
     // MARK: Read-only introspection / snapshot
 
     public func vitals(for providerId: String) -> ProviderVitals? {
@@ -432,9 +355,7 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
             emaTokensPerSec: state.emaTokensPerSec,
             emaErrorRate: state.emaErrorRate,
             consecutiveFailures: state.consecutiveFailures,
-            sampleCount: state.sampleCount,
-            cardActive: state.cardActive,
-            degradedSince: state.degradedSince
+            sampleCount: state.sampleCount
         )
     }
 
@@ -452,14 +373,12 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
                 "emaErrorRate": .double(v.emaErrorRate),
                 "consecutiveFailures": .int(Int64(v.consecutiveFailures)),
                 "sampleCount": .int(Int64(v.sampleCount)),
-                "cardActive": .bool(v.cardActive),
             ]
             if let l = v.emaLatencyMs { obj["emaLatencyMs"] = .double(l) }
             if let b = v.baselineLatencyMs { obj["baselineLatencyMs"] = .double(b) }
             if let t = v.emaTTFTMs { obj["emaTTFTMs"] = .double(t) }
             if let tps = v.emaTokensPerSec { obj["emaTokensPerSec"] = .double(tps) }
             if let date = state.lastSampleAt { obj["lastSampleAt"] = .string(Self.formatDate(date)) }
-            if let date = v.degradedSince { obj["degradedSince"] = .string(Self.formatDate(date)) }
             providers[v.providerId] = .object(obj)
         }
         return .object([
@@ -503,18 +422,14 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
                   let band = Self.band(row["band"]),
                   let errorRate = Self.number(row["emaErrorRate"]), errorRate >= 0, errorRate <= 1,
                   let failures = Self.integer(row["consecutiveFailures"]), failures >= 0,
-                  let samples = Self.integer(row["sampleCount"]), samples >= failures,
-                  let cardActive = Self.boolean(row["cardActive"]) else {
+                  let samples = Self.integer(row["sampleCount"]), samples >= failures else {
                 continue
             }
             let lastSampleAt = Self.optionalDate(row["lastSampleAt"])
-            let degradedSince = Self.optionalDate(row["degradedSince"])
             guard lastSampleAt != .invalid,
                   let sampledAt = lastSampleAt.value,
                   now.timeIntervalSince(sampledAt) <= max(0, maxAge),
-                  degradedSince != .invalid,
-                  (lastSampleAt.value?.timeIntervalSince(now) ?? 0) <= max(0, futureSkewAllowance),
-                  (degradedSince.value?.timeIntervalSince(now) ?? 0) <= max(0, futureSkewAllowance) else {
+                  (lastSampleAt.value?.timeIntervalSince(now) ?? 0) <= max(0, futureSkewAllowance) else {
                 continue
             }
             guard let latency = Self.optionalNonnegativeNumber(row["emaLatencyMs"]),
@@ -532,14 +447,11 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
             state.emaErrorRate = errorRate
             state.consecutiveFailures = failures
             state.sampleCount = samples
-            state.cardActive = cardActive
-            state.degradedSince = band == .degraded ? (degradedSince.value ?? generatedAt) : nil
             state.lastSampleAt = lastSampleAt.value
             restored.append((key, state))
         }
 
         restored.sort {
-            if $0.1.cardActive != $1.1.cardActive { return $0.1.cardActive }
             if $0.1.band != $1.1.band { return $0.1.band > $1.1.band }
             if $0.1.lastSampleAt != $1.1.lastSampleAt {
                 return ($0.1.lastSampleAt ?? .distantPast) > ($1.1.lastSampleAt ?? .distantPast)
@@ -649,11 +561,6 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
     private static func band(_ value: JSONValue?) -> ProviderVitalsBand? {
         guard case .string(let raw)? = value else { return nil }
         return ProviderVitalsBand.allCases.first { $0.label == raw }
-    }
-
-    private static func boolean(_ value: JSONValue?) -> Bool? {
-        guard case .bool(let result)? = value else { return nil }
-        return result
     }
 
     private static func integer(_ value: JSONValue?) -> Int? {

@@ -130,7 +130,7 @@ extension ChatView {
                 appModel.systemToasts.push(error: error.localizedDescription)
             }
         } catch {
-            appModel.systemToasts.push(error: "Export failed: \(error.localizedDescription)")
+            appModel.systemToasts.push(error: UserFacingError.message(error, action: "export the chat"))
         }
     }
 }

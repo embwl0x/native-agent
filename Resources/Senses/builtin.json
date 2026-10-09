@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "senses": [
+    { "id": "docx-file", "corner": "file:docx", "version": 7, "mode": "live", "entry": "builtin/docx.js", "verbs": [] },
+    { "id": "xlsx-file", "corner": "file:xlsx", "version": 7, "mode": "live", "entry": "builtin/xlsx.js", "verbs": [] },
+    { "id": "pptx-file", "corner": "file:pptx", "version": 7, "mode": "live", "entry": "builtin/pptx.js", "verbs": [] },
+    { "id": "pages-file", "corner": "file:pages", "version": 7, "mode": "live", "entry": "builtin/pages.js", "verbs": [] },
+    { "id": "numbers-file", "corner": "file:numbers", "version": 7, "mode": "live", "entry": "builtin/numbers.js", "verbs": [] },
+    { "id": "key-file", "corner": "file:key", "version": 7, "mode": "live", "entry": "builtin/key.js", "verbs": [] },
+    { "id": "epub-file", "corner": "file:epub", "version": 7, "mode": "live", "entry": "builtin/epub.js", "verbs": [] },
+    { "id": "rtf-file", "corner": "file:rtf", "version": 6, "mode": "live", "entry": "builtin/rtf.js", "verbs": [] },
+    { "id": "rtfd-file", "corner": "file:rtfd", "version": 6, "mode": "live", "entry": "builtin/rtfd.js", "verbs": [] },
+    { "id": "figma-canvas", "corner": "app:com.figma.Desktop", "version": 5, "mode": "live", "entry": "builtin/canvas-accessibility.js", "verbs": [] }
+  ]
+}

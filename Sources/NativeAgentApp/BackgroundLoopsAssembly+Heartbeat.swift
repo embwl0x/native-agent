@@ -16,13 +16,6 @@ extension BackgroundLoopsAssembly {
         HeartbeatBackgroundWork(port: AppBackgroundWorkPort()).makeHeartbeatLoop(dataRoot: dataRoot, llm: llm)
     }
 
-    static func makeSelfHealingHook(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        llm: any LLMClient
-    ) -> some EventDeadlineLoopRunner {
-        HeartbeatBackgroundWork(port: AppBackgroundWorkPort()).makeSelfHealingHook(dataRoot: dataRoot, llm: llm)
-    }
-
     static func repairHeartbeatInboxItem(
         id: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()

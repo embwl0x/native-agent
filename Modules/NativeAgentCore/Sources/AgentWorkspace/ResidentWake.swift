@@ -83,7 +83,7 @@ package final class ResidentWake: @unchecked Sendable {
             ledger.recent = Array(ledger.recent.filter { Date().timeIntervalSince($0.at) < 86_400 }.suffix(128))
             if ledger != before {
                 do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(ledger), to: Self.url(root)) }
-                catch { NSLog("ResidentWake: could not keep arrivals: %@", error.localizedDescription) }
+                catch { nativeLog("ResidentWake: could not keep arrivals: %@", error.localizedDescription) }
             }
             return result
         }

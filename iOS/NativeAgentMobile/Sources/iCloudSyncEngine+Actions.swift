@@ -1186,22 +1186,6 @@ extension iCloudSyncEngine {
     }
 
     @discardableResult
-    func approveOrganismReflex(candidateId: String) async throws -> [String: String]? {
-        let action = InboxAction.make(action: "approveOrganismReflex", payload: ["candidateId": candidateId])
-        let response = try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
-        await refreshHealthSnapshot()
-        return response
-    }
-
-    @discardableResult
-    func retireOrganismReflex(candidateId: String) async throws -> [String: String]? {
-        let action = InboxAction.make(action: "retireOrganismReflex", payload: ["candidateId": candidateId])
-        let response = try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
-        await refreshHealthSnapshot()
-        return response
-    }
-
-    @discardableResult
     func inboxAction(itemId: String, actionId: String) async throws -> [String: String]? {
         let action = InboxAction.make(action: "inboxAction", payload: [
             "itemId": itemId,
@@ -1336,14 +1320,6 @@ extension iCloudSyncEngine {
     func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot {
         let action: InboxAction
         switch change {
-        case .enabled(let value):
-            var payload = ["setting": "enabled", "value": String(value)]
-            if value { payload["confirmed"] = "true" }
-            action = .make(action: "set_telegram_settings", payload: payload)
-        case .requireMention(let value):
-            var payload = ["setting": "requireMention", "value": String(value)]
-            if !value { payload["confirmed"] = "true" }
-            action = .make(action: "set_telegram_settings", payload: payload)
         case .disconnect:
             action = .make(action: "disconnect_telegram", payload: ["confirmed": "true"])
         }
@@ -1356,6 +1332,21 @@ extension iCloudSyncEngine {
     }
 
     // MARK: - Provider control (signed actions; credential bodies are encrypted)
+
+    func answerInteraction(_ card: InlineInteraction, sessionID: String, actionName: String,
+                           values: [String: String] = [:]) async throws -> [String: String] {
+        guard let secret = pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
+        var action = InboxAction.make(action: "interaction_action", payload: [:])
+        var fields = values
+        fields["sessionID"] = sessionID
+        fields["interactionID"] = card.id
+        fields["revision"] = String(card.revision)
+        fields["action"] = actionName
+        action.payload = [SecretActionEnvelope.field: try SecretActionEnvelope.seal(fields, secret: secret,
+            actionID: action.msgId, actionName: action.action)]
+        return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action,
+            intentionalNewRequest: true, pollTimeoutSeconds: 90))
+    }
 
     /// Encrypt before any transport persistence. Only the Mac credential owner
     /// receives plaintext; replies contain verified state, never provider output.
@@ -1540,26 +1531,34 @@ extension iCloudSyncEngine {
         return recovered
     }
 
-    func setMacIntegrationPermission(
-        id: String,
-        read: Bool,
-        write: Bool
-    ) async throws -> (read: Bool, write: Bool) {
-        let action = InboxAction.make(action: "set_mac_integration_permission", payload: [
-            "id": id,
-            "read": String(read),
-            "write": String(write),
-        ])
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
-        func exactBool(_ key: String) throws -> Bool {
-            switch result[key]?.lowercased() {
-            case "true": return true
-            case "false": return false
-            default:
-                throw SyncError.persistence("Mac integration response omitted canonical \(key) state")
-            }
-        }
-        return (try exactBool("read"), try exactBool("write"))
+    /// Saved rows the transcript snapshot leaves out: older history before
+    /// `beforeID`, or one whole message through `throughID`.
+    func chatHistoryPage(sessionID: String, beforeID: String? = nil, throughID: String? = nil,
+                         limit: Int = 80) async throws -> (messages: [ChatMessage], hasOlder: Bool) {
+        var payload = ["sessionId": sessionID, "limit": String(limit)]
+        payload["beforeId"] = beforeID
+        payload["throughId"] = throughID
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            .make(action: "chat_history_page", payload: payload)))
+        guard let raw = result["messages"] else { throw SyncError.persistence("The Mac did not return the messages.") }
+        let records = try JSONDecoder().decode([ChatMessageRecord].self, from: Data(raw.utf8))
+        return (MacBridgeClient.projectChatRecords(records), result["hasOlder"] == "true")
+    }
+
+    /// The Mac's settings page, every row as the Mac reads it.
+    func appSettings() async throws -> [MobileAppSetting] {
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            .make(action: "app_settings", payload: [:])))
+        guard let raw = result["settings"] else { throw SyncError.persistence("The Mac did not return its settings.") }
+        return try JSONDecoder().decode([MobileAppSetting].self, from: Data(raw.utf8))
+    }
+
+    /// One setting, set through the Mac page's own control; returns its read-back.
+    func setAppSetting(id: String, value: String) async throws -> MobileAppSetting {
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            .make(action: "app_setting_set", payload: ["id": id, "value": value])))
+        guard let raw = result["setting"] else { throw SyncError.persistence("The Mac did not return the saved setting.") }
+        return try JSONDecoder().decode(MobileAppSetting.self, from: Data(raw.utf8))
     }
 
     func helperAction(_ name: String, payload: [String: String]) async throws -> (MobileHelperEdit, [String: String]) {

@@ -178,7 +178,7 @@ public actor UserMDGenerator {
             do {
                 _ = try await regenerate(persona: persona)
             } catch {
-                NSLog("UserMDGenerator: trailing-edge regeneration failed for %@: %@",
+                nativeLog("UserMDGenerator: trailing-edge regeneration failed for %@: %@",
                       persona, String(describing: error))
             }
         }

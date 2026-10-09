@@ -18,8 +18,8 @@ import CoreGraphics
 /// pointer" from "the person moved the pointer" without suppressing or
 /// intercepting either one. The tag contains no user data and never leaves the
 /// process.
-enum NativeAgentMacEventIdentity {
-    static let sourceUserData: Int64 = 0x4E_41_54_49_56_45 // "NATIVE"
+public enum NativeAgentMacEventIdentity {
+    public static let sourceUserData: Int64 = 0x4E_41_54_49_56_45 // "NATIVE"
 }
 
 /// Bounded, process-local provenance for UI changes caused by NativeAgent's
@@ -37,6 +37,7 @@ public enum NativeAgentMotorEpoch {
         lock.lock()
         lastAgentMotorUptime = max(lastAgentMotorUptime, uptime)
         lock.unlock()
+        PersonOnlyWindows.noteAgentMotor()
     }
 
     public static func isAgentDriven(
@@ -84,6 +85,7 @@ public enum NativeAgentMotorEpoch {
         lastPostedHIDUptime = uptime
         lastAgentMotorUptime = max(lastAgentMotorUptime, uptime)
         lock.unlock()
+        PersonOnlyWindows.noteAgentMotor()
     }
 
     /// Age of her last HID-tap post, `.infinity` when there has been none.
@@ -122,8 +124,11 @@ public enum MacPersonInput {
         let idle = CGEventSource.secondsSinceLastEventType(
             .combinedSessionState, eventType: CGEventType(rawValue: ~0) ?? .null
         )
-        guard idle.isFinite, idle >= 0, idle < activeWindow,
-              abs(idle - NativeAgentMotorEpoch.secondsSinceLastPostedHIDEvent()) > ownEventTolerance
+        // Shotgun (User, 10-04): typing to her in his own small chat is not
+        // being at the keys over her work; while it is up, nothing is (Stop is).
+        guard !PersonOnlyWindows.isShowing, idle.isFinite, idle >= 0, idle < activeWindow,
+              abs(idle - NativeAgentMotorEpoch.secondsSinceLastPostedHIDEvent()) > ownEventTolerance,
+              abs(idle - PersonOnlyWindows.secondsSincePersonInput()) > ownEventTolerance
         else { return nil }
         return idle
         #else
@@ -272,6 +277,19 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
                     == NativeAgentMacEventIdentity.sourceUserData {
                     return nil
                 }
+                // Shotgun (User, 10-04): while it is up, Stop in it is the only
+                // hand-back — his input anywhere never takes the Mac from her.
+                // With it closed, real input is a takeover as always.
+                if PersonOnlyWindows.isShowing {
+                    PersonOnlyWindows.notePersonInput()
+                    return nil
+                }
+                if PersonOnlyWindows.contains(number: event.windowNumber)
+                    || (event.type == .mouseMoved
+                        && event.cgEvent.map { PersonOnlyWindows.contains(point: $0.location) } == true) {
+                    PersonOnlyWindows.notePersonInput()
+                    return nil
+                }
                 let kind: MacAttentionActivityKind
                 switch event.type {
                 case .mouseMoved: kind = .pointerMoved
@@ -402,30 +420,61 @@ public enum MacAttentionActionPermission: Sendable, Equatable {
 /// Inherited by an act and all of its effects; observation cannot renew it.
 public enum MacDriverContext {
     @TaskLocal public static var binding: MacDriverBinding?
+    /// The admitted action runs in an app in the back: it needs none of his
+    /// cursor, keys, focus or screen. Off unless the action said so.
+    @TaskLocal public static var background = false
     @TaskLocal static var inputStartCount = 0
 }
 
 public final class MacDriverBinding: @unchecked Sendable {
     public let generation: UInt64
     private let owner: MacAttentionSessionStore
+    /// She held the Mac when this act began.
+    private let granted: Bool
+    private let handback: UInt64
     private let lock = NSLock()
     private var cancelled = false
+    private var yielded = false
     private var postedEvents = 0
     private var releases: [String: @Sendable () -> Void] = [:]
 
-    init(owner: MacAttentionSessionStore, generation: UInt64) {
+    init(owner: MacAttentionSessionStore, generation: UInt64, granted: Bool, handback: UInt64) {
         self.owner = owner
         self.generation = generation
+        self.granted = granted
+        self.handback = handback
     }
 
+    private var stopped: Bool { lock.withLock { cancelled } || Task.isCancelled }
+
+    /// Her hands on his cursor, keys, focus or screen: his own input ends it.
     public var allowsEmission: Bool {
-        lock.lock()
-        let stopped = cancelled
-        lock.unlock()
-        return !stopped && !Task.isCancelled && owner.permitsDriver(generation)
+        guard !stopped else { return false }
+        if owner.permitsDriver(generation) { return true }
+        lock.withLock { yielded = true }
+        return false
     }
 
-    public var takenOver: Bool { !owner.permitsDriver(generation) }
+    /// Work that moves none of his cursor, keys, focus or screen — an
+    /// action admitted to run in an app in the back, her own Chrome tab —
+    /// goes on while he uses the Mac (User, 10-04: his clicking around never
+    /// stops her Chrome work). "Let me take over" ends it in every session.
+    public var allowsBackgroundEmission: Bool {
+        guard granted, !stopped else { return false }
+        if owner.permitsBackground(handback) { return true }
+        lock.withLock { yielded = true }
+        return false
+    }
+
+    /// He took the Mac back explicitly since this act began.
+    public var handedBack: Bool { !owner.permitsBackground(handback) }
+
+    /// The permission the admitted action needs: in the back, only hers.
+    public var allowsAction: Bool { MacDriverContext.background ? allowsBackgroundEmission : allowsEmission }
+
+    /// An effect that needed his cursor, keys, focus or screen was refused
+    /// because he took the Mac.
+    public var yieldedToPerson: Bool { lock.withLock { yielded } }
 
     var inputCount: Int {
         lock.lock()
@@ -452,7 +501,7 @@ public final class MacDriverBinding: @unchecked Sendable {
         releases[key] = release
         lock.unlock()
         owner.trackHeldInputs(self)
-        if !allowsEmission { releaseHeldInputs() }
+        if stopped || !owner.permitsDriver(generation) { releaseHeldInputs() }
     }
 
     func releaseHeldInputs() {
@@ -506,6 +555,8 @@ public actor MacAttentionSessionStore {
     private nonisolated let driverLock = NSLock()
     private nonisolated(unsafe) var agentDriving = false
     private nonisolated(unsafe) var driverGeneration: UInt64 = 0
+    /// Moves only on "let me take over" or a hand-back Stop, never on input.
+    private nonisolated(unsafe) var handbackGeneration: UInt64 = 0
     private nonisolated(unsafe) weak var inputBinding: MacDriverBinding?
     private var driverObservers: [UUID: AsyncStream<UInt64>.Continuation] = [:]
 
@@ -513,6 +564,12 @@ public actor MacAttentionSessionStore {
         driverLock.lock()
         defer { driverLock.unlock() }
         return agentDriving && generation == driverGeneration
+    }
+
+    nonisolated func permitsBackground(_ handback: UInt64) -> Bool {
+        driverLock.lock()
+        defer { driverLock.unlock() }
+        return handback == handbackGeneration
     }
 
     public nonisolated var currentDriverAllowed: Bool {
@@ -573,12 +630,23 @@ public actor MacAttentionSessionStore {
         ensureDriverObservation(eventSource: eventSource)
         // Full Mac means her hands are on (User, 10-04): her next act is the
         // handback. Physical input still revokes every earlier binding, and
-        // input during the policy read moves the generation, so no handback.
+        // input during the policy read moves the generation, so no handback;
+        // her background work is still granted.
         let generation = makeDriverBinding().generation
-        if !currentDriverAllowed, await Self.savedFullMac() {
+        var granted = currentDriverAllowed
+        if !granted, await Self.savedFullMac() {
+            granted = true
             giveAgentControl(userGeneration: generation)
         }
-        return makeDriverBinding()
+        return makeDriverBinding(granted: granted)
+    }
+
+    /// Whether the composer's hand-back would change anything now: a Mac
+    /// action has asked for the driver this run, the person holds it, and the
+    /// posture is below Full Mac (under Full Mac her next act takes it back).
+    public func handoffWouldChange() async -> Bool {
+        guard observation != nil, !currentDriverAllowed else { return false }
+        return !(await Self.savedFullMac())
     }
 
     private static func savedFullMac() async -> Bool {
@@ -587,10 +655,11 @@ public actor MacAttentionSessionStore {
         return MacControlGate.fullMacActive(trust)
     }
 
-    private nonisolated func makeDriverBinding() -> MacDriverBinding {
+    private nonisolated func makeDriverBinding(granted: Bool = false) -> MacDriverBinding {
         driverLock.lock()
         defer { driverLock.unlock() }
-        return MacDriverBinding(owner: self, generation: driverGeneration)
+        return MacDriverBinding(owner: self, generation: driverGeneration, granted: granted,
+                                handback: handbackGeneration)
     }
 
     public func driverChanges() -> AsyncStream<UInt64> {
@@ -625,6 +694,8 @@ public actor MacAttentionSessionStore {
             #endif
             Task { await self?.record(activity) }
         }
+        // The first ask for the driver is news to the composer's hand-back.
+        if observation != nil { publishDriver() }
     }
 
     public init(screenViewStore: MacScreenViewStore) {
@@ -687,7 +758,9 @@ public actor MacAttentionSessionStore {
     }
 
     public func revokeDriverControl() async {
+        driverLock.withLock { handbackGeneration &+= 1 }
         takeUserControl()
+        publishDriver()
         stopInternal()
         await screenViewStore.invalidate()
     }
@@ -736,7 +809,7 @@ public actor MacAttentionSessionStore {
         now: Date
     ) async -> MacAttentionActionPermission {
         await expireIfNeeded(now: now)
-        guard let binding = MacDriverContext.binding, binding.allowsEmission else {
+        guard let binding = MacDriverContext.binding, binding.allowsAction else {
             return .refused(reason: Self.driverRefusal, current: snapshot(timedOutWaiting: false))
         }
         guard let current = session else { return .allowed }
@@ -747,6 +820,8 @@ public actor MacAttentionSessionStore {
                 current: snapshot(timedOutWaiting: false)!
             )
         }
+        // Work in the back never waits on his input (see MacDriverBinding).
+        if MacDriverContext.background { return .allowed }
         if observedUserSequence != current.userSequence
             || current.observedUserSequence != current.userSequence {
             return .refused(

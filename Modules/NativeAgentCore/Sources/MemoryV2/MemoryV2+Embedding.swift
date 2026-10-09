@@ -222,16 +222,14 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     private let mlModel: MLModel?
     #endif
 
-    /// Which compute units the model load uses: CPU + Neural Engine, never the
-    /// GPU. Low-memory mode pins `.cpuOnly`, keeping MiniLM off the ANE
-    /// residency pool too; 8 GB Macs previously had no way to cap that footprint.
+    /// The embedding model always uses CPU + Neural Engine, never the GPU.
     #if canImport(CoreML) && !os(Linux)
     public static func modelConfiguration(lowMemory: Bool) -> MLModelConfiguration? {
         let configuration = MLModelConfiguration()
         // 2026-10-01: off the GPU. MiniLM compiling GPU pipelines at launch
         // was caught alongside SwiftUI's RenderBox aborting on its own Metal
         // library load; the Neural Engine runs this model just as well.
-        configuration.computeUnits = lowMemory ? .cpuOnly : .cpuAndNeuralEngine
+        configuration.computeUnits = .cpuAndNeuralEngine
         return configuration
     }
 
@@ -241,10 +239,8 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
     #endif
 
-    /// - Parameter lowMemory: when true the CoreML model is loaded with
-    ///   `computeUnits = .cpuOnly`. Read at model-LOAD time only — see
-    ///   `ManagedEmbeddingProvider.setMemoryMode`, which drops a resident model
-    ///   when the selection flips so the next embed reloads under the new units.
+    /// - Parameter lowMemory: retained for source compatibility; compute units
+    ///   always include the Neural Engine.
     public init(
         modelURL: URL,
         vocabURL: URL? = nil,

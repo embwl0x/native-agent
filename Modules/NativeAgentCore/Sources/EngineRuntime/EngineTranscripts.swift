@@ -483,7 +483,7 @@ public final class TranscriptsFacade {
             // transcript byte is gone, rather than half-clear the pair.
             if let row = rows.first(where: { $0["id"] == .string(safeSessionId) }),
                ChatSessionIndexFile.isTranscriptGenerationExhausted(in: row) {
-                NSLog("TranscriptsFacade.clear: refusing to clear \(safeSessionId) — its transcript version is at Int64.max and cannot advance")
+                nativeLog("TranscriptsFacade.clear: refusing to clear \(safeSessionId) — its transcript version is at Int64.max and cannot advance")
                 throw ChatMessageClearError.transcriptVersionExhausted
             }
             return rows
@@ -535,6 +535,8 @@ public final class TranscriptsFacade {
                       let index = rows.firstIndex(where: { $0["id"] == .string(safeSessionId) })
                 else { return }
                 rows[index]["messageCount"] = .int(0)
+                rows[index]["firstMessageAt"] = .null
+                rows[index]["lastMessageAt"] = .null
                 rows[index]["lastMessagePreview"] = .null
                 rows[index]["updatedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
                 // 2026-09-06: the clear is what makes the published transcript

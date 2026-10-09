@@ -52,6 +52,7 @@ extension SwiftNativeTurnEngine {
         providerCalls: [ParsedToolCall],
         pairedIds: [String],
         providerTools: ProviderToolNameMap,
+        priorDispatches: [TurnEngineResult.ToolDispatchRecord],
         modelId: String,
         surface: String,
         sessionId: String?,
@@ -128,7 +129,7 @@ extension SwiftNativeTurnEngine {
                 images.append(contentsOf: slot.images)
                 out = await Self.makeSlotOutputs(
                     prepared: slot.prepared,
-                    result: slot.result,
+                    result: Self.webReadRecovery(slot.result, prepared: slot.prepared, history: priorDispatches + records),
                     isError: slot.isError,
                     sessionId: sessionId,
                     neutralizingText: neutralizingTextResults,
@@ -331,7 +332,7 @@ extension SwiftNativeTurnEngine {
         )
         let groups = ParallelToolDispatch.plan(
             parallelSafe: zip(baseSafe, fleetOverrides).map { $1 ?? $0 },
-            forceSerial: surface == "bot" || ParallelToolDispatch.effectiveForceSerial
+            forceSerial: StandingBotContinuity.isHelperTurn || ParallelToolDispatch.effectiveForceSerial
         )
 
         var slots: [DispatchedSlot] = []
@@ -375,13 +376,15 @@ extension SwiftNativeTurnEngine {
                     guard let need = InlineInteractionNeed.interaction(in: $0.result) else { return false }
                     return need.kind == .connector && need.target == connector
                 }) {
-                    let result: JSONValue = .object([
+                    let result = ChatToolOutcome.normalizedFailure(.object([
                         "status": .string("skipped"),
-                        "detail": .string("skipped: \(connector) isn't connected — card filed")
-                    ])
-                    await onOutcome(p, result, false)
+                        "outcome": .string("unmet"), "effects": .string("none"),
+                        "detail": .string("\(connector) is not connected. This action did not run."),
+                        "fix": .string("The owner must sign in to \(connector) in Settings > Connectors."),
+                    ]), tool: ran[idx])
+                    await onOutcome(p, result, true)
                     slots.append(DispatchedSlot(index: idx, prepared: p,
-                                                result: result, isError: false, images: []))
+                                                result: result, isError: true, images: []))
                     continue
                 }
                 let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink() : nil
@@ -471,6 +474,35 @@ extension SwiftNativeTurnEngine {
         return slots
     }
 
+    nonisolated private static func webReadRecovery(
+        _ result: JSONValue, prepared: PreparedToolCall, history: [TurnEngineResult.ToolDispatchRecord]
+    ) -> JSONValue {
+        guard ToolNameAliases.ranTool(prepared.internalName, input: prepared.dispatchInput) == "read_page",
+              case .object(var failure) = result, failure["status"] == .string("failed"),
+              [.int(402), .int(403)].contains(failure["http_status"] ?? .null),
+              case .string(let url)? = failure["url"] else { return result }
+        for call in history.reversed() where ToolNameAliases.ranTool(call.name, input: call.input) == "mcp__searxng-local__search" {
+            guard case .object(let envelope) = call.result, envelope["status"] == .string("ok"),
+                  case .object(let search)? = envelope["result"], case .array(let rows)? = search["results"] else { continue }
+            let urls = rows.compactMap { row -> String? in
+                guard case .object(let fields) = row, case .string(let value)? = fields["url"] else { return nil }
+                return value
+            }
+            guard let index = urls.firstIndex(of: url), let next = urls.dropFirst(index + 1).first(where: {
+                guard let parsed = URL(string: $0) else { return false }
+                return ["http", "https"].contains(parsed.scheme?.lowercased() ?? "") && parsed.host != nil && $0 != url
+            }) else { continue }
+            let nextCall: JSONValue = .object(["tool": .string("app"), "input": .object([
+                "action": .string("web.read"), "args": .object(["url": .string(next)])])])
+            failure["next_call"] = nextCall
+            failure["remedy"] = .object(["kind": .string("read_next_search_result"),
+                "instruction": .string("This source refused the public read. Read the next search result URL with next_call."),
+                "next_call": nextCall])
+            return .object(failure)
+        }
+        return result
+    }
+
     /// Slot finalization, pure: dispatch record + redacted tool_result
     /// block. (Redact before the provider sees it: persistence and progress
     /// events already redact this surface — this path was the one place raw
@@ -524,24 +556,6 @@ extension SwiftNativeTurnEngine {
             toolUseId: prepared.pairedId, content: providerResultStr, isError: isError
         )
         return (record, block)
-    }
-
-    /// The single-dispatch core shared by the serial slot and every
-    /// task-group child. Mirrors the original serial body: bind the notice bus
-    /// to this turn's progress stream + the live turn model/surface (TaskLocals
-    /// — propagate down the dispatch task tree), dispatch, and convert ANY
-    /// thrown error into the slot's error-object result (the loop continues;
-    /// the model sees the error as feedback).
-    ///
-    /// Trust loop #3: every dispatch is raced against a
-    /// hard deadline (ToolDispatchDeadline) — a wedged tool throws
-    /// ToolDispatchTimedOut, which the catch below turns into the same
-    /// error-object result as any other tool failure, so a hung turn fails
-    /// cleanly instead of freezing forever. Stop remains active even when the
-    /// deadline is disabled. The dispatch task is added INSIDE the TaskLocal
-    /// withValue scopes so it still inherits the runtime ctx + notice bus.
-    nonisolated static func projectedToolDispatchError(_ error: Error) -> String {
-        ChatToolOutcome.errorMessage(error)
     }
 
     /// One dispatch's outcome carried out of the deadline race, so a thrown
@@ -758,27 +772,6 @@ extension SwiftNativeTurnEngine {
             // surface ladder replay the whole turn and write it again.
             return (Self.interruptedToolResult(Self.spokenName(prepared)), true)
         } catch {
-            let message = Self.projectedToolDispatchError(error)
-            // A connector that says, in TYPED form, "there is no credential
-            // yet" is not a failed call — it is a call that never started
-            // because nobody has connected the account. That is a need, and
-            // it becomes a card at the point of use instead of a sentence
-            // telling the person to go find Connectors.
-            //
-            // Only `ConnectorCredentialsMissing` reaches here: an HTTP
-            // rejection, a rate limit, a malformed argument, or a corrupt
-            // store all return nil from that protocol and keep the failure
-            // envelope below, exactly as before.
-            if let connector = error.missingConnectorID {
-                let need = InlineInteractionRegistry.connector(
-                    connector,
-                    why: message,
-                    dataRoot: PersistenceCore.defaultDataRoot()
-                )
-                // isError is FALSE on purpose: nothing broke. The turn
-                // suspends on the card; the model is not told a tool failed.
-                return (InlineInteractionNeed.envelope(need), false)
-            }
             return (ChatToolOutcome.failure(error: error, tool: prepared.internalName), true)
         }
     }

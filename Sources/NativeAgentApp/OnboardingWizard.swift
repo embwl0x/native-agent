@@ -84,21 +84,22 @@ final class OnboardingWizardState {
     enum Step: Int, CaseIterable {
         case identity = 0
         case provider = 1
-        case confirm = 2
-        case building = 3
-        case done = 4
-        case error = 5
+        case building = 2
+        /// Reached only by a profile repair; a fresh setup goes straight to
+        /// the greeting, which does the "ready" job.
+        case done = 3
+        case error = 4
         /// User, 2026-09-06: memory/profile.json is missing on an install that
         /// really did onboard. Deliberately numbered ABOVE `.building` so it
         /// inherits the "no progress dots, no shared nav bar" gates — this is a
-        /// one-field repair, not step 1 of 3 — and carries its own action.
-        case profileRepair = 6
+        /// one-field repair, not step 1 of 2 — and carries its own action.
+        case profileRepair = 5
     }
 
     /// Number of user-facing steps before the build spinner — drives the
     /// progress dots and the "show the nav bar / progress" gate. Kept as a
     /// single source so adding a step updates both.
-    static let interactiveStepCount = 3
+    static let interactiveStepCount = 2
 
     var step: Step = .identity
     var agentName: String
@@ -114,6 +115,8 @@ final class OnboardingWizardState {
     var connectedProviderLabel: String?
     var providers: [ProviderInfo] = []
     var providersLoading = false
+    var savingModel = false
+    var chatModelReady = false
     var providerLoadError: String?
     private var pendingConnectedProviderID: String?
     private var providerLoadGeneration = 0
@@ -128,6 +131,7 @@ final class OnboardingWizardState {
         providerLoadGeneration += 1
         let generation = providerLoadGeneration
         providersLoading = true
+        chatModelReady = false
         providerConnected = false
         do {
             let refreshed = try await list()
@@ -152,10 +156,6 @@ final class OnboardingWizardState {
         }
         providersLoading = false
     }
-    /// Bumped by the nav bar's prominent "Connect a provider" action so the
-    /// provider step scrolls back to the sign-in panel (sweep R4 C2). A counter
-    /// rather than a Bool so repeated taps each re-scroll.
-    var connectPromptTick: Int = 0
     // Blank by default — never pre-fill from the macOS account name
     // (NSFullUserName): a public user's Mac account isn't their answer to
     // "your name," and it leaked the host account into onboarding (User, 2026-07-05).
@@ -227,10 +227,8 @@ final class OnboardingWizardState {
         switch step {
         case .identity:
             return missingNamesMessage == nil
-        case .provider, .confirm:
-            // `.provider` is intentionally always-continuable — connecting is
-            // strongly suggested but skippable.
-            return true
+        case .provider:
+            return !providersLoading && !savingModel && (!providerConnected || chatModelReady)
         case .building, .done, .error, .profileRepair:
             return false
         }
@@ -273,21 +271,13 @@ struct OnboardingWizard: View {
 
     var body: some View {
         ZStack {
-            // Gradient background
-            LinearGradient(
-                colors: [NativeAgentBrand.accent.opacity(0.08), NativeAgentBrand.accentCool.opacity(0.06), Color.clear],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-
             VStack(spacing: 0) {
                 // Progress dots
                 if state.step.rawValue < OnboardingWizardState.Step.building.rawValue {
                     HStack(spacing: 8) {
                         ForEach(0..<OnboardingWizardState.interactiveStepCount, id: \.self) { i in
                             Circle()
-                                .fill(i <= state.step.rawValue ? Color.blue : Color.secondary.opacity(0.3))
+                                .fill(i <= state.step.rawValue ? NativeAgentShell.text : NativeAgentShell.tertiary)
                                 .frame(width: 8, height: 8)
                                 .animation(NativeAgentMotion.quick, value: state.step)
                         }
@@ -302,7 +292,6 @@ struct OnboardingWizard: View {
                     switch state.step {
                     case .identity:   IdentityAndAbilitiesStep(state: state)
                     case .provider:   ProviderConnectStep(state: state)
-                    case .confirm:    ConfirmStep(state: state)
                     case .building:   BuildingStep(state: state)
                     case .done:       DoneStep(state: state, onComplete: onComplete)
                     case .profileRepair:
@@ -319,7 +308,7 @@ struct OnboardingWizard: View {
                         // Retry the repair itself.
                         if state.scaffoldRepairFailed {
                             Task {
-                                withAnimation(NativeAgentMotion.standard) { state.step = .building }
+                                state.step = .building
                                 await finishSuccessfulOnboarding()
                             }
                             return
@@ -327,7 +316,7 @@ struct OnboardingWizard: View {
                         // Otherwise re-read the durable start state before
                         // choosing a retry path. A normal submit may have failed
                         // after publishing its transaction manifest, so blindly
-                        // returning to Confirm can lose the payload-free
+                        // returning to the account step can lose the payload-free
                         // recovery lane and retry with blank wizard fields.
                         Task { await loadOnboardingState() }
                     }, onReset: state.pendingRecoveryNeedsReset ? {
@@ -335,14 +324,17 @@ struct OnboardingWizard: View {
                     } : nil)
                     }
                 }
+                // Each step arrives once: the old one leaves at once (no
+                // overlap, no lingering labels) and the new one fades up. The
+                // step changes themselves carry no animation, so the dots,
+                // spacers and nav bar never ride along.
+                .motionArrival()
                 .id(state.step)
-                .transition(.identity)
                 .frame(maxWidth: 520)
                 // The step owns its viewport. Native scroll content must not
                 // paint above it over the progress dots or below the nav bar.
                 .clipped()
                 .padding(.horizontal, NativeAgentSpacing.xl)
-                .animation(nil, value: state.step)
 
                 if state.step != .identity { Spacer() }
 
@@ -356,12 +348,9 @@ struct OnboardingWizard: View {
                     .padding(.bottom, NativeAgentSpacing.xl)
                 }
             }
-            // Replace step content atomically so translucent steps never overlap.
-            // Progress dots retain their scoped animation above.
-            .transaction { $0.animation = nil }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
         .frame(minWidth: 600, idealWidth: 680, minHeight: 500, idealHeight: 640)
+        .houseSheet()
         .task {
             await loadOnboardingState()
         }
@@ -383,12 +372,12 @@ struct OnboardingWizard: View {
             resp = try await appModel.startOnboarding()
         } catch {
             state.pendingRecoveryNeedsReset = true
-            state.errorMessage = "Onboarding recovery state is unavailable: \(error.localizedDescription)"
-            withAnimation(NativeAgentMotion.standard) { state.step = .error }
+            state.errorMessage = UserFacingError.message(error, action: "read where setup left off")
+            state.step = .error
             return
         }
         if resp.pendingRecovery == true {
-            withAnimation(NativeAgentMotion.standard) { state.step = .building }
+            state.step = .building
             do {
                 let resumed = try await appModel.resumePendingOnboarding()
                 if resumed.ok {
@@ -400,12 +389,12 @@ struct OnboardingWizard: View {
                 } else {
                     state.pendingRecoveryNeedsReset = true
                     state.errorMessage = resumed.detail ?? resumed.error ?? "Onboarding recovery failed."
-                    withAnimation(NativeAgentMotion.standard) { state.step = .error }
+                    state.step = .error
                 }
             } catch {
                 state.pendingRecoveryNeedsReset = true
-                state.errorMessage = error.localizedDescription
-                withAnimation(NativeAgentMotion.standard) { state.step = .error }
+                state.errorMessage = UserFacingError.message(error, action: "pick up setup where it left off")
+                state.step = .error
             }
             return
         }
@@ -427,7 +416,7 @@ struct OnboardingWizard: View {
             state.pendingRecoveryNeedsReset = false
             state.buildFailed = false
             state.errorMessage = nil
-            withAnimation(NativeAgentMotion.standard) { state.step = .profileRepair }
+            state.step = .profileRepair
             return
         }
         state.profileRepairRecheckOffered = false
@@ -435,7 +424,7 @@ struct OnboardingWizard: View {
         if resp.resetRequired == true {
             state.pendingRecoveryNeedsReset = true
             state.errorMessage = "Incomplete persona documents were found. Reset will back them up before onboarding starts again."
-            withAnimation(NativeAgentMotion.standard) { state.step = .error }
+            state.step = .error
             return
         }
         if resp.hasExisting {
@@ -446,7 +435,7 @@ struct OnboardingWizard: View {
                 state.pendingRecoveryNeedsReset = true
                 state.errorMessage = state.errorMessage
                     ?? Self.buildFailureMessage(error: "persona_already_exists", detail: nil)
-                withAnimation(NativeAgentMotion.standard) { state.step = .error }
+                state.step = .error
             }
             return
         }
@@ -455,10 +444,8 @@ struct OnboardingWizard: View {
         // ability overview is still consumed from the start response.
         state.abilities = resp.abilityOverview?.isEmpty == false ? (resp.abilityOverview ?? OnboardingWizardState.defaultAbilities) : OnboardingWizardState.defaultAbilities
         if state.step == .error {
-            withAnimation(NativeAgentMotion.standard) {
-                state.step = state.trimmedUserName.isEmpty || state.trimmedAgentName.isEmpty
-                    ? .identity : .confirm
-            }
+            state.step = state.trimmedUserName.isEmpty || state.trimmedAgentName.isEmpty
+                ? .identity : .provider
         }
     }
 
@@ -474,26 +461,23 @@ struct OnboardingWizard: View {
             state.errorMessage = nil
             state.agentName = state.suggestedName
             state.userName = ""
-            withAnimation(NativeAgentMotion.standard) { state.step = .identity }
+            state.step = .identity
         } catch {
-            state.errorMessage = error.localizedDescription
+            state.errorMessage = UserFacingError.message(error, action: "reset setup")
         }
     }
 
     private func handleContinue() async {
-        withAnimation(NativeAgentMotion.standard) {
-            switch state.step {
-            case .identity:
-                state.agentName = state.trimmedAgentName
-                state.userName = state.trimmedUserName
-                state.step = .provider
-            case .provider:
-                state.step = .confirm
-            case .confirm:
-                Task { await submitOnboarding() }
-            case .building, .done, .error, .profileRepair:
-                break
-            }
+        guard state.canContinue else { return }
+        switch state.step {
+        case .identity:
+            state.agentName = state.trimmedAgentName
+            state.userName = state.trimmedUserName
+            state.step = .provider
+        case .provider:
+            await submitOnboarding()
+        case .building, .done, .error, .profileRepair:
+            break
         }
     }
 
@@ -541,10 +525,10 @@ struct OnboardingWizard: View {
             // `finishSuccessfulOnboarding`, whose Doctor scaffold repair
             // reaches into unrelated stores on an install that has been in use
             // for months. The one file is already committed and verified.
-            withAnimation(NativeAgentMotion.standard) { state.step = .done }
+            state.step = .done
         } catch {
             state.isLoading = false
-            state.errorMessage = error.localizedDescription
+            state.errorMessage = UserFacingError.message(error, action: "save the names")
         }
     }
 
@@ -571,7 +555,7 @@ struct OnboardingWizard: View {
 
     private func submitOnboarding() async {
         state.scaffoldRepairFailed = false
-        withAnimation(NativeAgentMotion.standard) { state.step = .building }
+        state.step = .building
         do {
             let resp = try await appModel.completeOnboarding(
                 agentName: state.trimmedAgentName,
@@ -591,12 +575,12 @@ struct OnboardingWizard: View {
                 if resp.error == "persona_already_exists" {
                     state.pendingRecoveryNeedsReset = true
                 }
-                withAnimation(NativeAgentMotion.standard) { state.step = .error }
+                state.step = .error
             }
         } catch {
             state.buildFailed = true
-            state.errorMessage = error.localizedDescription
-            withAnimation(NativeAgentMotion.standard) { state.step = .error }
+            state.errorMessage = UserFacingError.message(error, action: "finish setup")
+            state.step = .error
         }
     }
 
@@ -652,17 +636,21 @@ struct OnboardingWizard: View {
             // offer it for a scaffold problem.
             state.pendingRecoveryNeedsReset = false
             state.errorMessage = Self.scaffoldRepairFailureMessage(outcome)
-            withAnimation(NativeAgentMotion.standard) { state.step = .error }
+            state.step = .error
             return
         }
         state.scaffoldRepairFailed = false
         // A profile repair is not a first run — arming the one-time welcome
         // would greet a user who has been using this install for months.
-        if !state.profileRepairOnly {
-            appModel.markFirstRunWelcomePending()
+        guard !state.profileRepairOnly else {
+            state.step = .done
+            return
         }
-        AppDelegate.registerLoginItemInBackground()
-        withAnimation(NativeAgentMotion.standard) { state.step = .done }
+        appModel.markFirstRunWelcomePending()
+        // User, 2026-09-25: a fresh setup lands in Simple view, straight into
+        // the greeting — no "ready" screen in between.
+        UserDefaults.standard.set(SimpleViewMode.simple, forKey: SimpleViewMode.key)
+        onComplete()
     }
 
     /// Honest, actionable copy for a scaffold repair that did not succeed.
@@ -684,10 +672,9 @@ struct OnboardingWizard: View {
 private struct IdentityAndAbilitiesStep: View {
     @Bindable var state: OnboardingWizardState
     @Environment(\.colorScheme) private var scheme
-    @Environment(\.dynamicTypeSize) private var textSize
-    private var titleSize: CGFloat { 25 * OnboardingInk.textScale(textSize) }
-    private var bodySize: CGFloat { 16 * OnboardingInk.textScale(textSize) }
-    private var labelSize: CGFloat { 13 * OnboardingInk.textScale(textSize) }
+    private let titleSize: CGFloat = 25
+    private let bodySize: CGFloat = 16
+    private let labelSize: CGFloat = 13
 
     private var secondaryInk: Color { OnboardingInk.secondary(scheme) }
 
@@ -726,8 +713,7 @@ private struct IdentityAndAbilitiesStep: View {
                     }
                 }
                 .padding(20)
-                .background(OnboardingInk.panel(scheme), in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(secondaryInk.opacity(0.35)))
+                .aliveCard()
 
                 if let message = state.missingNamesMessage {
                     Text(message)
@@ -756,45 +742,35 @@ private struct IdentityAndAbilitiesStep: View {
 }
 
 private enum OnboardingInk {
-    // macOS fixed-size fonts and ScaledMetric do not respond to Dynamic Type.
-    // Keep the accessibility environment effective for this first-run form.
-    static func textScale(_ size: DynamicTypeSize) -> CGFloat {
-        switch size {
-        case .xSmall: 0.85
-        case .small: 0.9
-        case .medium: 0.95
-        case .large: 1
-        case .xLarge: 1.1
-        case .xxLarge: 1.2
-        case .xxxLarge: 1.3
-        case .accessibility1: 1.4
-        case .accessibility2: 1.55
-        case .accessibility3: 1.7
-        case .accessibility4: 1.85
-        case .accessibility5: 2
-        @unknown default: 1
-        }
-    }
     static func secondary(_ scheme: ColorScheme) -> Color {
         scheme == .dark ? Color(red: 0.80, green: 0.82, blue: 0.86) : Color(red: 0.28, green: 0.30, blue: 0.34)
     }
-    static func panel(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color(red: 0.16, green: 0.17, blue: 0.19) : .white
+}
+
+/// The shell's card for onboarding's grouped fields.
+private struct OnboardingCard<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) { content() }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(NativeAgentSpacing.lg)
+            .aliveCard()
+            .accessibilityElement(children: .contain)
     }
 }
 
 private struct AbilityOverviewTile: View {
     let ability: OnboardingAbility
     @Environment(\.colorScheme) private var scheme
-    @Environment(\.dynamicTypeSize) private var textSize
-    private var bodySize: CGFloat { 16 * OnboardingInk.textScale(textSize) }
-    private var detailSize: CGFloat { 13 * OnboardingInk.textScale(textSize) }
+    private let bodySize: CGFloat = 16
+    private let detailSize: CGFloat = 13
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: ability.systemImage ?? "sparkles")
                 .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.blue)
+                .foregroundStyle(NativeAgentShell.secondary)
                 .frame(width: 24, height: 24, alignment: .leading)
             VStack(alignment: .leading, spacing: 6) {
                 Text(ability.title)
@@ -808,15 +784,8 @@ private struct AbilityOverviewTile: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .padding(NativeAgentSpacing.sm)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(OnboardingInk.panel(scheme))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(OnboardingInk.secondary(scheme).opacity(0.35), lineWidth: 1)
-        )
+        .padding(NativeAgentSpacing.md)
+        .aliveCard()
     }
 }
 
@@ -837,23 +806,14 @@ private struct ProviderConnectStep: View {
     @Environment(AppModel.self) private var appModel
 
     @State private var configureSheet: ProviderInfo? = nil
+    @State private var showsAPIKeys = false
+    @State private var modelSaveError: String?
 
-    /// Scroll target for the nav bar's "Connect a provider" action (sweep R4 C2).
-    private static let signInAnchor = "onboarding-provider-signin"
     private static let signInProviderIDs: Set<String> = [
         "openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct",
     ]
 
     var body: some View {
-        ScrollViewReader { proxy in
-            scrollBody
-                .onChange(of: state.connectPromptTick) {
-                    withAnimation(NativeAgentMotion.standard) { proxy.scrollTo(Self.signInAnchor, anchor: .top) }
-                }
-        }
-    }
-
-    private var scrollBody: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
@@ -868,7 +828,7 @@ private struct ProviderConnectStep: View {
 
                 // Sign in with a subscription account (same OAuth buttons as
                 // the Providers tab).
-                NativePanel {
+                OnboardingCard {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                         Text("Sign in with your account")
                             .font(NativeAgentFont.section)
@@ -886,41 +846,73 @@ private struct ProviderConnectStep: View {
                         OAuthSignInButton(provider: .xai) { Task { await reload(connectedId: "xai_oauth_direct") } }
                     }
                 }
-                .id(Self.signInAnchor)
 
-                // Full provider list — API keys (OpenAI, OpenRouter, Anthropic,
-                // …) and per-provider config, reusing the SAME row + sheet as the
-                // Providers tab panel.
-                NativePanel {
-                    VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                        HStack {
-                            Text("All providers")
-                                .font(NativeAgentFont.section)
-                            Spacer()
-                            if state.providersLoading { ProgressView().controlSize(.small) }
-                        }
-                        Text("Paste an API key for any provider — OpenAI, OpenRouter, Anthropic, xAI — or reconfigure one above.")
-                            .font(NativeAgentFont.label)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if let error = state.providerLoadError {
-                            Text(error)
-                                .foregroundStyle(.red)
-                            Button("Retry") { Task { await reload() } }
-                                .disabled(state.providersLoading)
-                        }
+                if let error = state.providerLoadError {
+                    Text(error)
+                        .foregroundStyle(.red)
+                    Button("Retry") { Task { await reload() } }
+                        .disabled(state.providersLoading)
+                }
+
+                // The rest of the provider list — API keys and per-provider
+                // config, the SAME row + sheet as the Providers tab — folded
+                // behind one line so sign-in is the first-run path.
+                DisclosureGroup(isExpanded: $showsAPIKeys) {
+                    OnboardingCard {
                         // 2026-09-22: sign-in rows repeat the buttons above;
                         // onboarding lists API-key rows only (Providers keeps all).
                         ForEach(state.providers.filter { !Self.signInProviderIDs.contains($0.provider_id) }) { provider in
                             ProviderRowView(provider: provider) { configureSheet = provider }
                         }
                     }
+                    .padding(.top, 12)
+                } label: {
+                    HStack {
+                        Text("Use an API key instead")
+                            .font(NativeAgentFont.label)
+                            .foregroundStyle(.secondary)
+                        if state.providersLoading { ProgressView().controlSize(.small) }
+                    }
                 }
 
                 if state.providerConnected {
-                    Label("Connected: \(state.connectedProviderLabel ?? "provider"). You're ready to chat.", systemImage: "checkmark.seal.fill")
+                    Label("Connected: \(state.connectedProviderLabel ?? "provider").", systemImage: "checkmark.seal.fill")
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.green)
+                    ProviderThenModelPicker(
+                        providers: state.providers.map { provider in
+                            ProviderThenModelPicker.Provider(
+                                id: provider.provider_id,
+                                name: ProviderThenModelPicker.plainProviderName(provider.display_name),
+                                ready: provider.auth_status.state == "ready",
+                                models: provider.models.map { .init(id: $0.id, name: $0.name) }
+                            )
+                        },
+                        currentProviderID: appModel.chatProvider,
+                        currentModelID: appModel.chatModel,
+                        disabled: state.savingModel || state.providersLoading,
+                        onSelect: { provider, model in
+                            state.savingModel = true
+                            state.chatModelReady = false
+                            modelSaveError = nil
+                            Task {
+                                defer { state.savingModel = false }
+                                do {
+                                    _ = try await appModel.saveProviderGroupSelection(
+                                        group: ProviderSurfaceGroups.chat,
+                                        providerID: provider.id, model: model.id
+                                    )
+                                    updateModelReadiness()
+                                } catch {
+                                    modelSaveError = UserFacingError.message(error, action: "save your model choice")
+                                }
+                            }
+                        },
+                        integrated: true
+                    )
+                    if let modelSaveError {
+                        Text(modelSaveError).font(.caption).foregroundStyle(.red)
+                    }
                 } else {
                     Text("You can connect later in Providers. Chat needs a connected account.")
                         .font(.caption)
@@ -959,86 +951,21 @@ private struct ProviderConnectStep: View {
     private func reload(connectedId: String? = nil) async {
         await state.reloadProviders(
             connectedId: connectedId,
-            list: { try await appModel.engine.providers.list() },
+            list: {
+                let snapshot = try await appModel.engine.providers.routing.checkedProviderSnapshot()
+                appModel.applySurfacePickerSnapshot(snapshot.routing)
+                return try await appModel.engine.providers.list()
+            },
             adopt: { await appModel.adoptProviderForBlankSurfaces($0) }
         )
-    }
-}
-
-private struct ConfirmStep: View {
-    let state: OnboardingWizardState
-    @Environment(\.dynamicTypeSize) private var textSize
-    private var scale: CGFloat { OnboardingInk.textScale(textSize) }
-
-    var body: some View {
-        ViewThatFits(in: .vertical) {
-            content.fixedSize(horizontal: false, vertical: true)
-            ScrollView { content }
-                .clipped()
-        }
+        updateModelReadiness()
     }
 
-    private var content: some View {
-        VStack(spacing: NativeAgentSpacing.xl) {
-            Text("Ready to finish setup.")
-                .font(scale == 1 ? NativeAgentFont.display : .system(
-                    size: NSFont.preferredFont(forTextStyle: .largeTitle).pointSize * scale,
-                    weight: .bold, design: .rounded))
-                .fixedSize(horizontal: false, vertical: true)
-                .multilineTextAlignment(.center)
-
-            NativePanel {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    ConfirmRow(label: "Agent name", value: state.agentName)
-                    ConfirmRow(label: "Your name", value: state.userName)
-                    ConfirmRow(
-                        label: "Provider",
-                        value: state.providerConnected
-                            ? (state.connectedProviderLabel ?? "Connected")
-                            : (state.providerLoadError != nil
-                                ? "Couldn't check accounts — go back to retry"
-                                : "Not connected — connect later in Providers.")
-                    )
-                }
-            }
-
-            Text("Choose Finish setup to save these names and get started. Your setup is saved on this Mac.")
-                .font(scale == 1 ? NativeAgentFont.label : .system(
-                    size: NSFont.preferredFont(forTextStyle: .caption1).pointSize * scale,
-                    weight: .semibold))
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
+    private func updateModelReadiness() {
+        state.chatModelReady = state.providers.contains { provider in
+            provider.provider_id == appModel.chatProvider && provider.auth_status.state == "ready"
+                && provider.models.contains { $0.id == appModel.chatModel && !$0.id.isEmpty }
         }
-    }
-
-}
-
-private struct ConfirmRow: View {
-    let label: String
-    let value: String
-    @Environment(\.dynamicTypeSize) private var textSize
-    private var scale: CGFloat { OnboardingInk.textScale(textSize) }
-
-    var body: some View {
-        let layout = textSize.isAccessibilitySize
-            ? AnyLayout(VStackLayout(alignment: .leading, spacing: NativeAgentSpacing.xs))
-            : AnyLayout(HStackLayout())
-        layout {
-            Text(label + ":")
-                .font(scale == 1 ? NativeAgentFont.label : .system(
-                    size: NSFont.preferredFont(forTextStyle: .caption1).pointSize * scale,
-                    weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: textSize.isAccessibilitySize ? nil : 90 * scale, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(value)
-                .font(scale == 1 ? NativeAgentFont.body : .system(
-                    size: NSFont.preferredFont(forTextStyle: .body).pointSize * scale))
-                .fontWeight(.medium)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1065,53 +992,20 @@ private struct DoneStep: View {
 
     var body: some View {
         VStack(spacing: NativeAgentSpacing.xl) {
-            ZStack {
-                Circle()
-                    .fill(
-                        RadialGradient(colors: [NativeAgentBrand.accent.opacity(0.25), .clear],
-                                       center: .center, startRadius: 5, endRadius: 70)
-                    )
-                    .frame(width: 130, height: 130)
-                Image(systemName: "sparkles")
-                    .font(.system(size: 64))
-                    .foregroundStyle(
-                        LinearGradient(colors: [.yellow, .orange, .pink], startPoint: .topLeading, endPoint: .bottomTrailing)
-                    )
-            }
-            GradientText(
-                text: state.profileRepairOnly
-                    ? "\(state.agentName) is back."
-                    : "\(state.agentName) is ready.",
-                colors: [NativeAgentBrand.accentDeep, NativeAgentBrand.accent, NativeAgentBrand.accentCool],
-                font: .system(.largeTitle, design: .rounded, weight: .bold)
-            )
-            if state.profileRepairOnly {
-                // A repair changed one file. It says nothing about providers,
-                // so it must not nag about connecting one.
-                Text("The names are saved again. Nothing else on this Mac was changed.")
-                    .font(NativeAgentFont.title)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if state.providerConnected {
-                Text("Open Chat — \(state.trimmedAgentName) is waiting.")
-                    .font(NativeAgentFont.title)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("One more step: choose Open Providers in Chat to connect an AI provider, then say hello.")
-                    .font(NativeAgentFont.title)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Button("Start") {
-                // User, 2026-09-25: a fresh setup lands in Simple view; a name
-                // repair leaves the saved choice alone.
-                if !state.profileRepairOnly {
-                    UserDefaults.standard.set(SimpleViewMode.simple, forKey: SimpleViewMode.key)
-                }
-                onComplete()
-            }
+            Image(systemName: "sparkles")
+                .font(.system(size: 48))
+                .foregroundStyle(NativeAgentShell.secondary)
+            Text("\(state.agentName) is back.")
+                .font(ShellType.display)
+            // A repair changed one file. It says nothing about providers,
+            // so it must not nag about connecting one.
+            Text("The names are saved again. Nothing else on this Mac was changed.")
+                .font(NativeAgentFont.title)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            // A name repair leaves the saved Simple/Advanced choice alone.
+            Button("Start") { onComplete() }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
         }
@@ -1154,7 +1048,7 @@ private struct ProfileRepairStep: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                NativePanel {
+                OnboardingCard {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Your name")
@@ -1261,20 +1155,11 @@ private struct OnboardingNavBar: View {
     @Bindable var state: OnboardingWizardState
     let onContinue: () -> Void
 
-    var continueLabel: String {
-        switch state.step {
-        case .confirm: return "Finish setup"
-        case .identity: return "Continue"
-        default: return "Continue"
-        }
-    }
-
     /// Sweep R4 C2: on the provider step with nothing connected, the big blue
     /// button used to read "Skip for now" — the app advertised skipping the one
     /// load-bearing step. Skipping is still allowed and unblocked (deliberate,
-    /// User 2026-07-04) but it is now a plain tertiary link UNDER the prominent
-    /// "Connect a provider" action, which scrolls the step back to the sign-in
-    /// panel. Once connected, the prominent button is "Continue" as before.
+    /// User 2026-07-04) but it is a plain link; the sign-in buttons are the
+    /// action. Once connected, the prominent button is "Continue" as before.
     private var isUnconnectedProviderStep: Bool {
         state.step == .provider && !state.providerConnected
     }
@@ -1282,9 +1167,7 @@ private struct OnboardingNavBar: View {
     var body: some View {
         HStack {
             if state.step.rawValue > OnboardingWizardState.Step.identity.rawValue {
-                Button("Back") {
-                    withAnimation(NativeAgentMotion.standard) { state.goBack() }
-                }
+                Button("Back") { state.goBack() }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .font(NativeAgentFont.label)
@@ -1293,23 +1176,16 @@ private struct OnboardingNavBar: View {
             Spacer()
 
             if isUnconnectedProviderStep {
-                VStack(alignment: .trailing, spacing: NativeAgentSpacing.xs) {
-                    Button("Connect a provider") {
-                        state.connectPromptTick += 1
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-
-                    Button("Skip for now") {
-                        onContinue()
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .font(NativeAgentFont.label)
-                    .help("Finish setup without a provider — chat won't work until one is connected.")
+                Button("Skip for now") {
+                    onContinue()
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .font(NativeAgentFont.label)
+                .help("Finish setup without a provider — chat won't work until one is connected.")
+                .disabled(!state.canContinue)
             } else {
-                Button(continueLabel) {
+                Button("Continue") {
                     onContinue()
                 }
                 .buttonStyle(.borderedProminent)
@@ -1377,10 +1253,10 @@ struct ResetPersonaView: View {
                 resetResult = "Reset complete. \(resp.backedUp.count) doc(s) backed up."
                 await onReset?()
             } else {
-                resetResult = "Reset failed: \(resp.error ?? "unknown")."
+                resetResult = UserFacingError.message(detail: resp.error ?? "no reason given", action: "reset the identity documents")
             }
         } catch {
-            resetResult = error.localizedDescription
+            resetResult = UserFacingError.message(error, action: "reset the identity documents")
         }
         isResetting = false
     }

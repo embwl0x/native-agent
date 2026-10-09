@@ -1,5 +1,6 @@
 import ChatSessionWork
 import Foundation
+import NativeAgentCore
 import CryptoKit
 import PersistenceCore
 
@@ -244,9 +245,10 @@ struct AgentWorkSession {
     }
 
     /// The sender of the session's first user row when the bridge wrote it:
-    /// built-in lanes by their verified origin agent, contacts by the label the
-    /// bridge itself prefixed ("[from: Hermes, via bridge] …").
+    /// built-in lanes by their persisted origin agent, contacts by their
+    /// verified envelope user id. Titles and message labels are display only.
     static func bridgeSender(sessionID: String, dataRoot: URL) -> (sender: String, topic: String)? {
+        guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) != nil else { return nil }
         let url = dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl")
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
@@ -273,24 +275,23 @@ struct AgentWorkSession {
             }
             guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
                   row["role"] as? String == "user" else { continue }
-            let origin = (row["metadata"] as? [String: Any])?["origin"] as? [String: Any]
-            guard let agent = origin?["agent"] as? String, !agent.isEmpty,
-                  let surface = origin?["surface"] as? String, surface.hasSuffix("-bridge"),
-                  let content = row["content"] as? String, content.hasPrefix("[from: "),
-                  let end = content.range(of: ", via bridge]") else { return nil }
-            let label = String(content[content.index(content.startIndex, offsetBy: 7)..<end.lowerBound])
-            let topic = String(content[end.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
-            return (["claude", "codex", "omp"].contains(agent) ? agent : label, topic)
+            let metadata = row["metadata"] as? [String: Any]
+            let origin = metadata?["origin"] as? [String: Any]
+            let envelope = metadata?["envelope"] as? [String: Any]
+            guard let surface = origin?["surface"] as? String ?? envelope?["surface"] as? String,
+                  surface.hasSuffix("-bridge"),
+                  let sender = HerScreen.source(metadata), sender != "peer:unknown",
+                  let content = row["content"] as? String else { return nil }
+            let topic = String(ContactThread.bridgedText(content).prefix(60))
+            return (sender, topic)
         }
     }
 
-    /// Newest first; names and latest line only. The title is a cheap
-    /// prefilter; the transcript metadata decides.
+    /// Newest first; transcript identity decides even after a chat is renamed.
     static func all(dataRoot: URL) -> [Self] {
         let agentName = ChatCompactionDistiller.configuredAgentName(dataRoot: dataRoot)
         var found: [Self] = ((try? HumanConversationIndex.rows(dataRoot: dataRoot)) ?? []).compactMap { row in
             guard let id = HumanConversationIndex.string(row["id"]),
-                  HumanConversationIndex.string(row["title"])?.hasPrefix("[from: ") == true,
                   let parsed = bridgeSender(sessionID: id, dataRoot: dataRoot) else { return nil }
             let preview = HumanConversationIndex.string(row["lastMessagePreview"]) ?? ""
             return .init(sessionID: id, sender: parsed.sender, topic: parsed.topic,
@@ -313,7 +314,7 @@ struct AgentWorkSession {
     /// The one person this sender is, or nil when none or several match.
     static func owner(_ sender: String, people: [(agent: String, name: String)]) -> (agent: String, name: String)? {
         let who = sender.lowercased()
-        let matches = people.filter { who == $0.agent || who == $0.name.lowercased() }
+        let matches = people.filter { who == $0.agent.lowercased() }
         return matches.count == 1 ? matches[0] : nil
     }
 

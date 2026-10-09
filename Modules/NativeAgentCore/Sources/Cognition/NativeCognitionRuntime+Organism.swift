@@ -933,16 +933,42 @@ extension NativeCognitionRuntime {
     ) -> NotificationDeliveryBelief {
         let apnsPath = dataRoot
             .appendingPathComponent("mobile_push", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
+            .appendingPathComponent("apns_outcomes.jsonl")
         let apns = lastJSONObjectInJSONL(at: apnsPath)
-        let apnsDate = (apns?["createdAt"] as? String).flatMap {
+        let apnsDate = (apns?["at"] as? String).flatMap {
             ISO8601DateFormatter().date(from: $0)
         }
-        let apnsID = (apns?["apnsId"] as? String) ?? "apns-unknown"
-        let status = (apns?["status"] as? String)?.lowercased()
-        let httpStatus = (apns?["httpStatus"] as? NSNumber)?.intValue
-        let accepted = status == "ok" && httpStatus.map { (200..<300).contains($0) } == true
-        let failed = apns != nil && !accepted
+        let eventID = (apns?["eventId"] as? String) ?? "apns-unknown"
+        let receipts = (apns?["receipts"] as? [[String: Any]]) ?? []
+        let targets = (apns?["targets"] as? NSNumber)?.intValue ?? 0
+        let acceptedCount = (apns?["accepted"] as? NSNumber)?.intValue ?? 0
+        var evidence: [BodyEvidenceReference] = []
+        var accepted = false
+        var failed = targets > acceptedCount || !(apns?["errors"] as? [String] ?? []).isEmpty
+        if let apnsDate {
+            for receipt in receipts {
+                let status = (receipt["status"] as? String)?.lowercased()
+                let httpStatus = (receipt["httpStatus"] as? NSNumber)?.intValue
+                let success = status == "ok" && httpStatus.map { (200..<300).contains($0) } == true
+                accepted = accepted || success
+                failed = failed || !success
+                let deviceID = (receipt["deviceId"] as? String) ?? "unknown"
+                let apnsID = (receipt["apnsId"] as? String) ?? "unknown"
+                evidence.append(BodyEvidenceReference(
+                    id: "apns:\(eventID):\(deviceID):\(apnsID):\(status ?? "unknown")",
+                    evidenceClass: success ? .apnsAcceptance : .notificationTransportFailure,
+                    observedAt: apnsDate, receivedAt: apnsDate
+                ))
+            }
+            // A deadline or fan-out error can leave a target without a receipt.
+            if targets > receipts.count || !(apns?["errors"] as? [String] ?? []).isEmpty {
+                evidence.append(BodyEvidenceReference(
+                    id: "apns:\(eventID):fan-out-failed",
+                    evidenceClass: .notificationTransportFailure,
+                    observedAt: apnsDate, receivedAt: apnsDate
+                ))
+            }
+        }
 
         var deviceReceived = false
         var deviceFailed = false
@@ -964,15 +990,6 @@ extension NativeCognitionRuntime {
             }
         }
 
-        var evidence: [BodyEvidenceReference] = []
-        if let apnsDate {
-            evidence.append(BodyEvidenceReference(
-                id: "apns:\(apnsID):\(status ?? "unknown")",
-                evidenceClass: accepted ? .apnsAcceptance : .notificationTransportFailure,
-                observedAt: apnsDate,
-                receivedAt: apnsDate
-            ))
-        }
         if let deviceEvidence { evidence.append(deviceEvidence) }
         let latestSuccessAt = [accepted ? apnsDate : nil, deviceReceived ? deviceOutcomeAt : nil]
             .compactMap { $0 }

@@ -977,6 +977,17 @@ public struct SwiftNativeStudioStore: Sendable {
         return consult
     }
 
+    public func listConsults() async throws -> [StudioConsult] {
+        let paths: [URL]
+        do { paths = try FileManager.default.contentsOfDirectory(at: consultsDirectory, includingPropertiesForKeys: nil) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return [] }
+        var consults: [StudioConsult] = []
+        for path in paths.filter({ $0.pathExtension == "json" }).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            consults.append(try await readConsult(id: path.deletingPathExtension().lastPathComponent))
+        }
+        return consults
+    }
+
     /// Read one consult envelope back, verbatim.
     public func readConsult(id: String) async throws -> StudioConsult {
         _ = try Self.validatedIdentifier(id)
@@ -1129,7 +1140,7 @@ public struct SwiftNativeStudioStore: Sendable {
             ]),
             to: journalTrimReceiptsPath
         )
-        NSLog("%@: journal cap reached — moved %d oldest line(s) to %@ before any trim",
+        nativeLog("%@: journal cap reached — moved %d oldest line(s) to %@ before any trim",
               Self.logLabel, doomed.count, archive.lastPathComponent)
     }
 
@@ -1217,7 +1228,7 @@ public struct SwiftNativeStudioStore: Sendable {
         // but is not an amendment this build understands are all the same loss.
         let unreadable = !report.isClean || amendments.count != rows.count
         if unreadable {
-            NSLog("%@: journal/amendments.jsonl is damaged (%d malformed, %d undecodable rows) - entries will read as corrections-unreadable",
+            nativeLog("%@: journal/amendments.jsonl is damaged (%d malformed, %d undecodable rows) - entries will read as corrections-unreadable",
                   Self.logLabel, report.malformedLineCount, rows.count - amendments.count)
         }
         return AmendmentsRead(amendments: amendments, unreadable: unreadable)
@@ -1242,7 +1253,7 @@ public struct SwiftNativeStudioStore: Sendable {
         let read: AmendmentsRead
         do { read = try await readAmendmentsReporting() }
         catch {
-            NSLog("%@: journal/amendments.jsonl could not be read (%@) - entries will read as corrections-unreadable",
+            nativeLog("%@: journal/amendments.jsonl could not be read (%@) - entries will read as corrections-unreadable",
                   Self.logLabel, String(describing: error))
             read = AmendmentsRead(amendments: [], unreadable: true)
         }
@@ -1352,7 +1363,7 @@ public struct SwiftNativeStudioStore: Sendable {
         var out: [StudioJournalEntry] = []
         for path in paths {
             guard let rows = try? await persistence.readJSONL(path) else {
-                NSLog("%@: journal archive %@ could not be read — skipped",
+                nativeLog("%@: journal archive %@ could not be read — skipped",
                       Self.logLabel, path.lastPathComponent)
                 continue
             }

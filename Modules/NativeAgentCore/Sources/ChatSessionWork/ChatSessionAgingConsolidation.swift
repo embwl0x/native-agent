@@ -311,10 +311,11 @@ public struct ChatSessionAgingConsolidation: Sendable {
             )
             return
         }
-        guard outcome.compacted else { return }
-        await ChatCompactionDistiller.publishTranscriptChange(
-            sessionId: sessionId, dataRoot: dataRoot, persistence: compactor.persistence
-        )
+        if outcome.compacted {
+            await ChatCompactionDistiller.publishTranscriptChange(
+                sessionId: sessionId, dataRoot: dataRoot, persistence: compactor.persistence
+            )
+        }
         guard config.distillEnabled,
               let summaryRowId = outcome.summaryRowId,
               let backupPath = outcome.backupPath

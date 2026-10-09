@@ -10,7 +10,7 @@ enum IOSPairingPresentation {
     private static var appName: String {
         NativeAgentIdentity.displayName(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
     }
-    private static var macPairingRoute: String { "\(appName) Settings on your Mac → Pair iPhone / iPad" }
+    static var macPairingRoute: String { "\(appName) on your Mac → Connectors → iPhone (in Simple view, ask your agent to pair this phone and open the pairing card)" }
     static let title = "Pair with the Mac app to get started."
     /// The operating requirement, stated at pairing, in the agent's own voice:
     /// this phone is a window onto the Mac, so the Mac has to be up.
@@ -65,7 +65,7 @@ struct PairingView: View {
                                 Text("This phone’s code").font(.headline).foregroundStyle(AlivePalette.text)
                                 Text(phoneCode).font(.callout.monospaced()).textSelection(.enabled)
                                     .foregroundStyle(AlivePalette.text)
-                                Text("On your Mac, open Settings → Pair iPhone / iPad, match this code and choose Pair. Then tap Connect again.")
+                                Text("Open \(IOSPairingPresentation.macPairingRoute), match this code and choose Pair. Then tap Connect again.")
                                     .font(.subheadline).foregroundStyle(AlivePalette.secondary)
                             }
                             .aliveRow()

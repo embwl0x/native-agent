@@ -35,44 +35,54 @@ public enum GrokBotConnection {
                     ? "Local keys revoked. Asked Grok Bot to delete only this app's routine; deletion is not yet confirmed. Approve it in Grok Bot if asked."
                     : "Local keys revoked and contact removed. I could not ask Grok Bot to delete the routine named \(GrokBotRoute.routineName(peerID)); delete it in Grok Bot's Routines if it exists.")
             default:
-                if contact.grokSetup == "set up" { return result("set up", "Set up. Send a message to check the reply path.") }
                 guard contact.grokSetup != "disconnected" else { return result("disconnected", "Finish disconnecting before creating a new connection.") }
-                var saved = contact
-                // An unconfirmed request is asked again: the request itself
-                // tells the Bot not to create a second routine, so a repeat
-                // can only finish the first one, never duplicate it.
-                if contact.grokConversation == nil || contact.grokBootstrapConfirmed != true {
-                    let conversation: String
-                    // The Bot's own 1:1 chat; Grok Bot's built-in Bot is "grok".
-                    if let chosen = contact.grokConversation ?? contact.conversationLabel, !chosen.isEmpty { conversation = chosen } else { conversation = "grok" }
-                    saved = try store.updateGrok(peerID) {
-                        guard $0.grokConversation == nil || $0.grokConversation == conversation else { throw GrokLinkCredential.Failure.invalid }
-                        $0.grokConversation = conversation
+                let requests = GrokRequestStore(dataRoot: dataRoot)
+                let expired = try requests.expiredUnanswered(peer: peerID)
+                do {
+                    try await port.importGrokRoutine(peer: peerID, dataRoot: dataRoot, waitForCreation: false)
+                    // Fresh credentials repair the path; an old unanswered request is never resent.
+                    if let expired {
+                        try requests.update(expired.messageID, peer: peerID) {
+                            if $0.reply == nil { $0.handOver = "connection repaired; no resend" }
+                        }
                     }
-                    guard let command = contact.approvedExecutablePath else { throw GrokLinkCredential.Failure.invalid }
-                    let message = "Create one Active webhook routine named \(GrokBotRoute.routineName(peerID)) for NativeAgent. Use the exact instruction below. If it already exists, do not create another. Never print the webhook URL or key in chat or command output; NativeAgent reads them from the Routines panel itself. Do not change local execution policy or any other routine.\n\n" + GrokBotRoute.instruction(peer: peerID, command: command)
-                    try await port.grokBootstrap(message, bot: conversation)
-                    saved = try store.updateGrok(peerID) { $0.grokBootstrapConfirmed = true }
+                    return result("set up", "Routine found in Grok Bot's Routines panel; credentials refreshed. Send one message to verify an actual reply.")
+                } catch let blocker as GrokRoutineAccessibility.Blocker {
+                    guard blocker == .missingRoutine else { throw blocker }
                 }
-                guard saved.grokBootstrapConfirmed == true else { throw GrokRoutineAccessibility.Blocker.submission }
-                // Read the routine's address and key from Grok Bot's Routines panel;
-                // the secure field is the fallback when that panel cannot be read.
+                var saved = try store.updateGrok(peerID) {
+                    var credential = try GrokLinkCredential.read(peer: peerID)
+                    credential.webhookURL = nil; credential.webhookKey = nil
+                    try credential.write(peer: peerID)
+                    $0.grokSetup = "creating"
+                    $0.grokBootstrapConfirmed = false
+                }
+                guard let command = saved.approvedExecutablePath, let conversation = saved.grokConversation else { throw GrokLinkCredential.Failure.invalid }
+                let message = "Create one Active webhook routine named \(GrokBotRoute.routineName(peerID)) for NativeAgent. Use the exact instruction below. If it already exists, do not create another. Never print the webhook URL or key in chat or command output; NativeAgent reads them from the Routines panel itself. Do not change local execution policy or any other routine.\n\n" + GrokBotRoute.instruction(peer: peerID, command: command)
+                try await port.grokBootstrap(message, bot: conversation)
+                saved = try store.updateGrok(peerID) { $0.grokBootstrapConfirmed = true }
+                if let expired {
+                    try requests.update(expired.messageID, peer: peerID) {
+                        if $0.reply == nil { $0.handOver = "connection bootstrap requested; no resend" }
+                    }
+                }
+                let approval = "Asked Grok Bot to create or finish the one NativeAgent reply routine. The owner must approve routine creation inside Grok Bot if asked. "
                 var blocker: String?
                 do {
-                    try await port.importGrokRoutine(peer: peerID, dataRoot: dataRoot)
+                    try await port.importGrokRoutine(peer: peerID, dataRoot: dataRoot, waitForCreation: true)
                     saved.grokSetup = "set up"
-                } catch {
+                } catch let error as GrokRoutineAccessibility.Blocker {
                     saved.grokSetup = "secure-paste"
-                    blocker = (error as? GrokRoutineAccessibility.Blocker)?.rawValue
+                    blocker = error.rawValue
                 }
                 _ = try store.updateGrok(peerID) { $0.grokSetup = saved.grokSetup }
                 return result(saved.grokSetup == "set up" ? "set up" : "needs_secure_setup",
-                    saved.grokSetup == "set up" ? "Routine credentials saved in Keychain. Set up; no answer checked yet."
-                        : (blocker.map { $0 + " " } ?? "") + GrokBotRoute.securePasteBlocker)
+                    approval + (saved.grokSetup == "set up" ? "Routine credentials saved in Keychain. Set up; no answer checked yet."
+                        : (blocker.map { $0 + " " } ?? "") + GrokBotRoute.securePasteBlocker))
             }
         } catch let blocker as GrokRoutineAccessibility.Blocker {
-            return result("needs_attention", blocker.rawValue + (contact.grokSetup == "disconnected" ? " Local keys are already revoked; only routine cleanup remains." : ""))
-        } catch { return result("needs_attention", "Grok Bot setup or delivery could not be confirmed. No automatic resend. Check the Connect card.") }
+            return result("needs_attention", blocker.rawValue + (contact.grokSetup == "disconnected" ? " Local keys are already revoked; only routine cleanup remains." : " Check Agents → Grok Bot → Routine credentials."))
+        } catch { return result("needs_attention", "Grok Bot setup or delivery could not be confirmed: \(error.localizedDescription) No automatic resend. Check Agents → Grok Bot → Routine credentials.") }
     }
     static func result(_ state: String, _ detail: String) -> JSONValue {
         .object(["status": .string(state), "detail": .string(detail), "completed": .bool(false), "automatic_resend": .bool(false)])

@@ -72,8 +72,10 @@ filesystem API; it cannot call every action merely because the action exists.
   a proposal, with optional input schema and declared permissions.
 - `tool.approve` activates the proposal under the applicable authority.
   Active authored code appears as `authored.<id>` on Diagnostics.
-- Skills are procedural guidance discovered and read through `app`; they
-  do not grant tools or permissions.
+- Skills provide procedural guidance and optional admitted scripts, discovered
+  and read through `app`. `skill.save`, `skill.enable`, `skill.run`,
+  `skill.resume` and `skill.rollback` manage those procedures. They grant no
+  new authority; see the [manifest spec](skill_manifest_spec.md).
 - Mounted MCP tools appear as `mcp.<server>.<tool>` from the server's live
   list, without adding model-facing tool schemas. Remote tools are not
   scriptable.

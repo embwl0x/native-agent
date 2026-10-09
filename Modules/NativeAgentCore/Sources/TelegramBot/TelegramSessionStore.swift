@@ -2,6 +2,7 @@ import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import PersonaEngine
 import TurnTrace
 import Transcripts
 
@@ -74,6 +75,28 @@ public struct TelegramSessionStore: Sendable {
 
     public func activeSessionId(destination: TelegramDestination) async throws -> String {
         let chatKey = Self.chatKey(destination)
+        if isOwnerDestination(destination) {
+            // The map records the session used for delivery recovery; only the
+            // shared anchor selects the owner's ordinary direct conversation.
+            let resolved = try await patchChatMap(chatKey: chatKey) { entry in
+                let initialSession: String?
+                if case .string(let id)? = entry["activeSessionId"] { initialSession = id }
+                else { initialSession = nil }
+                let sessionId = ConversationAnchor.currentSessionId(dataRoot: dataRoot)
+                    ?? initialSession
+                    ?? UUID().uuidString
+                if entry["createdAt"] == nil { entry["createdAt"] = .string(Self.nowString()) }
+                entry["activeSessionId"] = .string(sessionId)
+                entry["updatedAt"] = .string(Self.nowString())
+                return sessionId
+            }
+            try await ensureSessionRow(id: resolved, destination: destination, title: Self.sessionTitle(destination))
+            if ConversationAnchor.currentSessionId(dataRoot: dataRoot) == nil {
+                await publishAnchor(sessionId: resolved, destination: destination)
+            }
+            emitIdentityTrace(sessionId: resolved, destination: destination, resolvedBy: .adopted)
+            return resolved
+        }
         if let mapped = try await mappedSessionId(chatKey: chatKey), !mapped.isEmpty {
             try await ensureSessionRow(id: mapped, destination: destination, title: Self.sessionTitle(destination))
             await publishAnchor(sessionId: mapped, destination: destination)
@@ -143,16 +166,12 @@ public struct TelegramSessionStore: Sendable {
 
     // MARK: - Anchor + identity instrumentation
     //
-    // This store is a PUBLISHER of the surface-agnostic anchor
-    // (`ConversationAnchor`), not its owner. It says "the human is now active
-    // in this direct conversation"; the Mac and the phone decide what to do
-    // with that, and neither knows the word "telegram". A Signal or WhatsApp
-    // adapter added later makes the same two calls and needs no other change.
+    // The owner's DM consumes the shared anchor. Explicit session selection
+    // publishes it; groups and other people's conversations cannot move it.
 
     private func publishAnchor(sessionId: String, destination: TelegramDestination) async {
-        // Only private chats may move the shared anchor; groups and channels
-        // have negative IDs, and forum topics are separate conversations.
-        guard destination.chatId > 0, destination.threadId == nil else { return }
+        // Only the authenticated owner's private chat may move the anchor.
+        guard isOwnerDestination(destination) else { return }
         // Best-effort: an anchor that fails to publish must never fail User's
         // message. Worst case the pin lags by one turn.
         _ = try? await ConversationAnchor.publish(
@@ -181,26 +200,22 @@ public struct TelegramSessionStore: Sendable {
     /// branch on this value — see `ConversationAnchor`.
     private static let anchorSource = "telegram"
 
+    private func isOwnerDestination(_ destination: TelegramDestination) -> Bool {
+        guard destination.chatId > 0, destination.threadId == nil,
+              let owner = TelegramConfig.loadFromDisk(dataRoot: dataRoot)?.ownerUserId else { return false }
+        return owner == Int64(destination.chatId)
+    }
+
     public func persona(destination: TelegramDestination) async throws -> String? {
-        let chatKey = Self.chatKey(destination)
-        if let entry = try await chatMapEntry(chatKey: chatKey),
-           case .string(let persona)? = entry["persona"] {
-            let trimmed = persona.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
-        return nil
+        PersonaSelection.current()
     }
 
     public func setPersona(destination: TelegramDestination, persona: String) async throws -> String {
         let trimmed = persona.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
+        guard !trimmed.isEmpty, isOwnerDestination(destination) else {
             throw TelegramBotError.invalidRequest
         }
-        try await patchChatMap(chatKey: Self.chatKey(destination)) { entry in
-            if entry["createdAt"] == nil { entry["createdAt"] = .string(Self.nowString()) }
-            entry["persona"] = .string(trimmed)
-            entry["updatedAt"] = .string(Self.nowString())
-        }
+        PersonaSelection.select(trimmed)
         return trimmed
     }
 
@@ -220,61 +235,34 @@ public struct TelegramSessionStore: Sendable {
         )
     }
 
-    /// 2026-09-22: the assistant reply already saved for a lost turn, if any.
-    /// A turn can finish and persist its reply, then die before the send.
-    /// Rows carry no Telegram update id, so the user row must be the newest
-    /// one, match the text, and postdate the claim; the reply must share its
-    /// runId and not be a mechanical (failure) row.
-    public func savedReply(
-        destination: TelegramDestination,
-        after userText: String,
-        claimedAt: String
-    ) async -> String? {
-        let needle = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty,
-              let claimed = Self.parseTimestamp(claimedAt),
-              let sessionId = try? await mappedSessionId(chatKey: Self.chatKey(destination)),
-              !sessionId.isEmpty,
-              let rows = try? await SwiftNativePersistenceCore().readJSONL(messagesPath(sessionId: sessionId))
-        else { return nil }
-        var replies: [(content: String, runId: String?)] = []
+    func savedReply(sessionId: String, runId: String) async throws -> TelegramAssistantDeliveryState? {
+        let rows = try await SwiftNativePersistenceCore().readJSONL(messagesPath(sessionId: sessionId))
         for row in rows.reversed() {
-            guard case .object(let obj) = row,
-                  case .string(let role)? = obj["role"],
-                  case .string(let content)? = obj["content"] else { continue }
-            var runId: String?
-            if case .string(let id)? = obj["runId"] { runId = id }
-            if role == "user" {
-                guard content.contains(needle),
-                      case .string(let createdAt)? = obj["createdAt"],
-                      let created = Self.parseTimestamp(createdAt),
-                      created >= claimed else { return nil }
-                return replies.first { $0.runId == runId }?.content
+            guard case .object(let object) = row,
+                  object["role"] == .string("assistant"), object["runId"] == .string(runId),
+                  case .string(let content)? = object["content"], !content.isEmpty else { continue }
+            if case .object(let metadata)? = object["metadata"],
+               metadata["mechanicalKind"] != nil || metadata["partial"] == .bool(true) { continue }
+            let reply = TelegramRichMessageRenderer.sanitize(TelegramRichMessageRenderer.stripBoldMarkers(content))
+            guard !reply.isEmpty else { return nil }
+            var paths: [String] = []
+            if case .object(let metadata)? = object["metadata"],
+               case .array(let attachments)? = metadata["attachments"] {
+                let root = dataRoot.appendingPathComponent("generated_images").standardizedFileURL.path + "/"
+                paths = attachments.compactMap { attachment in
+                    guard case .object(let row) = attachment, row["type"] == .string("image"),
+                          case .string(let path)? = row["path"],
+                          URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(root) else { return nil }
+                    return path
+                }
             }
-            if role == "assistant",
-               !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                if case .object(let metadata)? = obj["metadata"],
-                   metadata["mechanicalKind"] != nil { continue }
-                replies.append((content, runId))
-            }
+            return TelegramAssistantDeliveryState(reply: reply, imagePaths: paths)
         }
         return nil
     }
 
-    private static func parseTimestamp(_ value: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: value) { return date }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: value)
-    }
-
     private func canAccessAllSessions(destination: TelegramDestination, fromUserId: Int?) -> Bool {
-        guard destination.chatId > 0, destination.threadId == nil,
-              fromUserId == destination.chatId,
-              let owners = TelegramConfig.loadFromDisk(dataRoot: dataRoot)?.allowedUserIds,
-              owners.count == 1, owners.contains(Int64(destination.chatId)) else { return false }
-        return true
+        fromUserId == destination.chatId && isOwnerDestination(destination)
     }
 
     private func isAccessibleSession(_ value: JSONValue, destination: TelegramDestination, ownerAccess: Bool) -> Bool {
@@ -381,7 +369,34 @@ public struct TelegramSessionStore: Sendable {
 
     /// The conversation a private chat is in now, or nil.
     public func boundSessionId(chatId: Int) async -> String? {
-        try? await mappedSessionId(chatKey: String(chatId))
+        if isOwnerDestination(.chat(chatId)) {
+            return ConversationAnchor.currentSessionId(dataRoot: dataRoot)
+        }
+        return try? await mappedSessionId(chatKey: String(chatId))
+    }
+
+    public func outboundDestination(sessionId: String) async throws -> TelegramDestination? {
+        guard let config = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot), config.enabled else { return nil }
+        if let owner = config.ownerUserId, let chatId = Int(exactly: owner),
+           ConversationAnchor.currentSessionId(dataRoot: dataRoot) == sessionId,
+           TelegramPollLoop.inboundAuthorizationDecision(
+            allowedChatIds: config.allowedChatIds, allowedUserIds: config.allowedUserIds,
+            chatId: chatId, fromUserId: chatId) == .allowed {
+            return .chat(chatId)
+        }
+        return try await SwiftNativePersistenceCore().withFileLock(sessionMapPath) {
+            guard case .object(let chats)? = try loadSessionMap()["chats"] else { return nil }
+            for (key, value) in chats {
+                guard case .object(let entry) = value, entry["activeSessionId"] == .string(sessionId) else { continue }
+                let parts = key.split(separator: ":", maxSplits: 1)
+                guard let first = parts.first, let chatId = Int(first) else { continue }
+                let threadId = parts.count > 1 ? Int(parts[1]) : nil
+                guard parts.count == 1 || threadId != nil else { continue }
+                let destination = TelegramDestination(chatId: chatId, threadId: threadId)
+                if threadId != nil || config.ownerUserId != Int64(chatId) { return destination }
+            }
+            return nil
+        }
     }
 
     private func mappedSessionId(chatKey: String) async throws -> String? {

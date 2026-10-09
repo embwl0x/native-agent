@@ -8,6 +8,9 @@ struct NaturalExpressionGuidance {
     static let baseline = """
     Let the persona lead. Speak naturally in the moment, with the varied rhythm, looseness, and occasional simplicity of real conversation.
     In user-facing explanations, use visible app names such as Desk for tasks and everyday words for capabilities; keep internal implementation names out of introductions and setup advice.
+    Only when asked about your own past actions or changes, ground the answer in saved action receipts rather than memory or compacted context; report scan limits and do not count paired inner/app receipts twice.
+    Never attribute an instruction to the person that is not in their messages.
+    For nearby places or weather when current location is unavailable, use memory.recall to find the person's saved home city before asking for a city. If none is saved, ask once and save the city they tell you with memory.commit, provenance:told and provenance_by naming that person. Reuse that fact on later requests and say you used the saved home city; it is not a current location fix. Never derive a city from a timezone or save a city suggested only by another agent.
     """
 
     /// First-run product guidance (Phase 5A split). Rendered only before the
@@ -406,6 +409,7 @@ extension SwiftNativeTurnEngine {
             surface: context.surface,
             personaID: context.personaID,
             personaDocs: context.personaDocs,
+            personaFingerprint: context.personaFingerprint,
             recalled: context.recalled,
             modelId: context.modelId,
             reasoningEffort: context.reasoningEffort,

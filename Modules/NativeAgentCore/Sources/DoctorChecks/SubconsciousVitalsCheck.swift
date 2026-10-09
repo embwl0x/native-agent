@@ -20,13 +20,8 @@ import PersistenceCore
 // the row, so a verdict always describes the build that is running. Rates over
 // a handful of turns are shown but not graded — see `minimumRateTurns`.
 //
-// Reading the payload honestly takes some care. `context.snapshot` carries the
-// assembled prompt as `_preview`, which is a TRUNCATED serialization of the
-// real payload — so it usually will not parse as JSON. The reader below tries
-// the structured path first (`cognitivePreview`, when the preview happens to be
-// intact) and falls back to unescaping the text and reading the capsule's own
-// labelled lines. A row that yields neither is counted as UNJUDGED, never as a
-// missing capsule.
+// Wording comes only from the bounded `cognitiveCue` field, retained even when
+// the snapshot is truncated. Missing or clipped wording is not measured.
 
 public struct SubconsciousVitalsCheck: DoctorCheck {
     public let id: String = "subconscious_vitals"
@@ -44,10 +39,8 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
     /// Hard ceiling on day FILES opened; the window's floor is this build's
     /// launch (see DoctorWindowFloor).
     private let maximumDayFiles = 7
-    /// The surfaces where a capsule is expected on every turn.
+    /// The conversational surfaces whose capsule observations are counted.
     private let capsuleSurfaces: Set<String> = ["chat", "telegram", "ios"]
-    /// Below this share of eligible turns, the capsule is not reaching her.
-    private let capsuleFloorPercent = 95.0
     /// One felt word above this share of all felt words is vocabulary collapse.
     private let feltWarnPercent = 25.0
     private let feltFailPercent = 40.0
@@ -101,6 +94,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         var rutTurns = 0
         var innerLines: [String: Int] = [:]
         var innerTurns = 0
+        var wordingTurns = 0
         var seenTurns = Set<String>()
 
         let moment = now()
@@ -121,29 +115,32 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
 
             let flag = row.payload["containsCognitiveSubstrate"]?.boolValue
             let capsuleBytes = row.payload["cognitiveCapsuleBytes"]?.intValue
-            let text = CognitivePreviewReader.text(from: row.payload)
-
-            if flag == true || (capsuleBytes ?? 0) > 0
-                || (text?.contains("[CognitiveSubstrate]") ?? false) {
+            if flag == true || (capsuleBytes ?? 0) > 0 {
                 capsulePresent.insert(key)
-            } else if flag == nil && capsuleBytes == nil && text == nil {
+            } else if flag == nil && capsuleBytes == nil {
                 // Nothing in this row can speak to the capsule either way.
                 capsuleUnjudged.insert(key)
             }
 
-            guard let text else { return }
-            if let felt = CognitivePreviewReader.feltWords(in: text), !felt.isEmpty {
+            guard case .object(let cue)? = row.payload["cognitiveCue"],
+                  cue["truncated"]?.boolValue == false,
+                  let kind = cue["kind"]?.stringValue,
+                  let line = cue["line"]?.stringValue, !line.isEmpty else { return }
+            wordingTurns += 1
+            if kind == "felt" {
+                let felt = line.split(separator: ",").map { Self.feelingWord(in: $0) }
+                    .filter { !$0.isEmpty }
                 feltTurns += 1
                 for word in felt { feltCounts[word, default: 0] += 1 }
             }
-            if CognitivePreviewReader.line(after: "- Sound: ", in: text) != nil {
+            if kind == "sound" {
                 soundTurns += 1
                 // The named rut rides its own Sound line after the echo.
-                if text.localizedCaseInsensitiveContains(rutMarker) { rutTurns += 1 }
+                if line.localizedCaseInsensitiveContains(rutMarker) { rutTurns += 1 }
             }
-            if let inner = CognitivePreviewReader.line(after: "- Inner: ", in: text) {
+            if kind == "inner" {
                 innerTurns += 1
-                innerLines[inner.lowercased(), default: 0] += 1
+                innerLines[line.lowercased(), default: 0] += 1
             }
         }
 
@@ -153,8 +150,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 detail: "\(summary.unreadableDays.count) turn-trace day file(s) exist but could"
                     + " not be read (\(summary.unreadableDays.joined(separator: ", ")))."
                     + " Her subconscious vitals are UNMEASURED \(window.describedAs) — this"
-                    + " row is not reporting healthy, it is reporting that it could not look.",
-                human_action: "Open Diagnostics → Doctor and include the named unreadable turn-trace day files in a support request."
+                    + " row is not reporting healthy, it is reporting that it could not look."
             )
         }
 
@@ -164,8 +160,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 id: id, title: title, status: "fail",
                 detail: "data/cognition/organism_state.json exists but \(reason)."
                     + " Her chemistry is UNMEASURED, which is a finding about this row's"
-                    + " coverage, not a clean reading.",
-                human_action: "Open Diagnostics → Doctor and include the organism_state.json read failure in a support request."
+                    + " coverage, not a clean reading."
             )
         }
 
@@ -191,9 +186,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
                     + " data/turn_traces. "
                     + chemistryLine(chemistry).sentence,
-                repair: chemistryLine(chemistry).repair,
-                human_action: level == nil ? nil
-                    : "Open Diagnostics → Doctor and include the Subconscious Vitals detail in a support request."
+                repair: chemistryLine(chemistry).repair
             )
         }
         guard !eligibleTurns.isEmpty else {
@@ -208,9 +201,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     + " (\(capsuleSurfaces.sorted().joined(separator: "/")))."
                     + " Nothing about her subconscious can be measured. "
                     + chemistryLine(chemistry).sentence + coverageDetail,
-                repair: chemistryLine(chemistry).repair,
-                human_action: level == "ok" ? nil
-                    : "Open Diagnostics → Doctor and include the Subconscious Vitals detail in a support request."
+                repair: chemistryLine(chemistry).repair
             )
         }
 
@@ -238,24 +229,21 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     "below the \(minimumRateTurns)-turn floor, so the rates in this row are"
                         + " MEASURED but NOT judged"
                 )
-            } else if percent < capsuleFloorPercent {
-                raise("fail")
-                repairs.append(
-                    "The cognitive capsule is missing from"
-                        + " \(judged - capsulePresent.count) turn(s). Check the assembly stage"
-                        + " that attaches CognitiveSubstrate to the system prompt."
-                )
             }
         } else {
             parts.append("capsule attachment UNMEASURED — no eligible turn could be judged")
         }
         if !capsuleUnjudged.isEmpty {
-            if eligibleTurns.count >= minimumRateTurns { raise("warn") }
             parts.append(
-                "\(capsuleUnjudged.count) turn(s) carried neither the capsule flag nor a"
-                    + " readable preview and were UNJUDGED rather than counted as missing"
+                "\(capsuleUnjudged.count) turn(s) carried neither the capsule flag nor its"
+                    + " byte count and were UNJUDGED rather than counted as missing"
             )
         }
+        // Cadence can intentionally leave a turn quiet; attachment is an observation.
+        parts.append(
+            "capsule wording measured on \(wordingTurns) of \(eligibleTurns.count) turn(s);"
+                + " missing or clipped wording is NOT MEASURED"
+        )
 
         // 2. Felt-word mass.
         let feltTotal = feltCounts.values.reduce(0, +)
@@ -324,12 +312,14 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                         + " the inner voice is repeating rather than responding."
                 )
             }
-        } else {
+        } else if innerTurns > 0 {
             parts.append(
                 "\(innerLines.count) distinct Inner line(s) over \(innerTurns) turn(s) —"
                     + " below the \(innerVarietyMinimumTurns)-turn floor, so variety is"
                     + " reported but NOT judged"
             )
+        } else {
+            parts.append("Inner line NOT MEASURED — no turn yielded complete Inner wording")
         }
 
         // 5. Organism chemistry. A fresh mind starts at rest (0 is where it begins, not a
@@ -349,9 +339,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         return CheckResult(
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",
-            repair: repairs.isEmpty ? nil : repairs.joined(separator: " "),
-            human_action: status == "ok" ? nil
-                : "Open Diagnostics → Doctor and include the Subconscious Vitals detail in a support request."
+            repair: repairs.isEmpty ? nil : repairs.joined(separator: " ")
         )
     }
 
@@ -435,114 +423,13 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             )
         }
     }
-}
-
-// MARK: - CognitivePreviewReader
-//
-// `context.snapshot._preview` is a TRUNCATED serialization of the payload, so
-// the honest reader tries the structured path and then degrades to text — it
-// never pretends a truncated blob is a parsed object.
-
-enum CognitivePreviewReader {
-    /// The capsule text for one snapshot row, or nil when the row carries none
-    /// this reader can see (which the caller reports as UNJUDGED, not absent).
-    static func text(from payload: [String: JSONValue]) -> String? {
-        // Structured path: an untruncated preview parses, and its
-        // `cognitivePreview` is the capsule verbatim.
-        if let raw = payload["_preview"]?.stringValue {
-            if let data = raw.data(using: .utf8),
-               let parsed = try? JSONValue.parse(data),
-               case .object(let object) = parsed,
-               case .array(let blocks)? = object["cognitivePreview"] {
-                let joined = blocks.compactMap(\.stringValue).joined(separator: "\n")
-                if !joined.isEmpty { return joined }
-            }
-            // Text path: the preview is cut mid-JSON. Unescape it and read the
-            // capsule's own labelled lines out of the resulting text.
-            let unescaped = unescape(raw)
-            return unescaped.isEmpty ? nil : unescaped
-        }
-        if case .array(let blocks)? = payload["cognitivePreview"] {
-            let joined = blocks.compactMap(\.stringValue).joined(separator: "\n")
-            return joined.isEmpty ? nil : joined
-        }
-        return nil
-    }
-
-    /// Undo one level of JSON string escaping so the capsule's newlines are
-    /// real newlines again. Deliberately tolerant: a truncated tail that ends
-    /// mid-escape is passed through rather than throwing the whole row away.
-    static func unescape(_ raw: String) -> String {
-        guard raw.contains("\\") else { return raw }
-        var out = String()
-        out.reserveCapacity(raw.count)
-        var index = raw.startIndex
-        while index < raw.endIndex {
-            let character = raw[index]
-            guard character == "\\" else {
-                out.append(character)
-                index = raw.index(after: index)
-                continue
-            }
-            let next = raw.index(after: index)
-            guard next < raw.endIndex else {
-                out.append(character)
-                break
-            }
-            switch raw[next] {
-            case "n": out.append("\n")
-            case "t": out.append("\t")
-            case "r": out.append("\r")
-            case "b": out.append("\u{08}")
-            case "f": out.append("\u{0C}")
-            case "\"": out.append("\"")
-            case "\\": out.append("\\")
-            case "/": out.append("/")
-            case "u":
-                let start = raw.index(next, offsetBy: 1, limitedBy: raw.endIndex) ?? raw.endIndex
-                if let end = raw.index(start, offsetBy: 4, limitedBy: raw.endIndex),
-                   let code = UInt32(raw[start..<end], radix: 16),
-                   let scalar = Unicode.Scalar(code) {
-                    out.append(Character(scalar))
-                    index = end
-                    continue
-                }
-                out.append("\\u")
-            default:
-                out.append(raw[next])
-            }
-            index = raw.index(next, offsetBy: 1, limitedBy: raw.endIndex) ?? raw.endIndex
-        }
-        return out
-    }
-
-    /// The remainder of the line following `marker`, trimmed. nil when the
-    /// marker is not in this (possibly truncated) text.
-    static func line(after marker: String, in text: String) -> String? {
-        guard let range = text.range(of: marker) else { return nil }
-        let rest = text[range.upperBound...]
-        let end = rest.firstIndex(of: "\n") ?? rest.endIndex
-        let value = rest[..<end].trimmingCharacters(in: .whitespaces)
-        return value.isEmpty ? nil : value
-    }
-
-    /// The comma-separated feeling words on the line under "How you feel:".
-    static func feltWords(in text: String) -> [String]? {
-        guard let line = line(after: "How you feel:\n\n", in: text)
-            ?? line(after: "How you feel:\n", in: text) else { return nil }
-        let words = line
-            .split(separator: ",")
-            .map { feelingWord(in: $0) }
-            .filter { !$0.isEmpty }
-        return words.isEmpty ? nil : words
-    }
 
     /// One comma-separated entry reduced to the feeling word itself. An entry
     /// may name what the feeling is ABOUT after a dash — "curious — completion
     /// event" is one feeling, "curious", not a distinct vocabulary item per
     /// subject. Keeping the subject inflates apparent emotional range every
     /// time the subject changes.
-    static func feelingWord(in entry: some StringProtocol) -> String {
+    private static func feelingWord(in entry: some StringProtocol) -> String {
         var value = entry.trimmingCharacters(in: .whitespaces)
         for separator in [" — ", " – ", " - ", "—", "–"] {
             if let range = value.range(of: separator) {

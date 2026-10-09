@@ -352,7 +352,8 @@ extension iCloudSyncEngine {
             return true
         } catch {
             guard generation == lifecycleGeneration else { return false }
-            syncError = "CloudKit \(group.rawValue) snapshot failed: \(error.localizedDescription)"
+            NSLog("[iCloudSyncEngine] %@ snapshot failed: %@", group.rawValue, error.localizedDescription)
+            syncError = "Mac updates could not be received. The last received data is still available. Open Connection in Settings to check the Mac link."
             return false
         }
     }

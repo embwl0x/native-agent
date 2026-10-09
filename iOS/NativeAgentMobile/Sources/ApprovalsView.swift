@@ -52,7 +52,7 @@ enum ApprovalDecisionRoute: Equatable {
 /// An approval in plain words on the phone: the kind of ask instead of its
 /// dotted action id, and the reason without internal tags or raw markdown.
 enum ApprovalText {
-    static let agentDecision = "Agent decides her studio canon."
+    @MainActor static var agentDecision: String { "\(iCloudSyncEngine.shared.agentDisplayName) decides her studio canon." }
 
     /// "self_improvement.apply" → "Self-improvement"; unknown ids read as words.
     static func kind(_ action: String) -> String {
@@ -790,16 +790,6 @@ struct RiskBadge: View {
 struct ResolvedRow: View {
     let approval: PendingApproval
 
-    private var decisionWord: String? {
-        switch approval.decision?.lowercased() {
-        case "approve", "approved": return "Approved"
-        case "deny", "denied", "reject", "rejected": return "Denied"
-        case "cancel", "canceled", "cancelled": return "Canceled"
-        case let other?: return AliveWords.humanized(other)
-        case nil: return nil
-        }
-    }
-
     var body: some View {
         MobileAdaptiveRow {
             VStack(alignment: .leading, spacing: 3) {
@@ -812,13 +802,17 @@ struct ResolvedRow: View {
                         .font(.footnote)
                         .foregroundStyle(AlivePalette.secondary)
                 }
+                if let summary = approval.expirationGuidance(agentName: iCloudSyncEngine.shared.agentDisplayName) ?? approval.executionSummary {
+                    Text(summary)
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 8)
-            if let decisionWord {
-                Text(decisionWord)
-                    .font(.subheadline)
-                    .foregroundStyle(AlivePalette.secondary)
-            }
+            Text(approval.decisionSummary)
+                .font(.subheadline)
+                .foregroundStyle(AlivePalette.secondary)
         }
         .aliveRow()
     }

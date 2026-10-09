@@ -11,19 +11,14 @@ struct AgentContactRow: Identifiable {
     var candidate: AgentDiscoveryCandidate? = nil
     var builtIn = false
     var sharesBuiltInName = false
-    var peers: [AgentPeerContact] = []
     /// The newest retained exchange with this contact, from any chat.
     var lastExchange: String?
     /// Home's own word for this contact (AgentContactHealth): one source, so
     /// Agents, the Simple view and home never disagree.
     var health: AgentLocalHealth?
-    var readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }
-
-    var credentialAvailable: Bool {
-        contact.map { AgentPeerCredentials.isAvailable($0, peers: peers, readCredential: readCredential) } ?? true
-    }
-
-    var state: AgentPeerContactState? { credentialAvailable ? contact?.state : .unavailable }
+    /// Read once when the row is built (a Keychain read), not on every redraw.
+    var credentialAvailable = true
+    var state: AgentPeerContactState?
 
     var repliesOnly: Bool {
         let hostID = contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? id
@@ -94,12 +89,17 @@ struct AgentContactRow: Identifiable {
     static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>, dataRoot: URL) -> [Self] {
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         let identity = AgentContactIdentity(dataRoot: dataRoot)
-        let all = rows(peers: peers, candidates: candidates, usable: usable)
+        let health = AgentLocalHealth.read(dataRoot)
+        let all = rows(peers: peers, candidates: candidates, usable: usable).map { row in
+            var row = row
+            row.health = health[row.key]
+            return row
+        }
         func claude(_ row: Self) -> Bool {
             identity.canonical(row.key) == "claude" || ["claude-code", "claude-desktop"].contains(row.id)
         }
         guard var her = all.first(where: { $0.builtIn && claude($0) }) ?? all.first(where: claude) else { return all }
-        her.health = AgentLocalHealth.read(dataRoot)["claude"]
+        her.health = health["claude"]
         return all.compactMap { !claude($0) ? $0 : $0.id == her.id ? her : nil }
     }
 
@@ -108,18 +108,21 @@ struct AgentContactRow: Identifiable {
 
     static func rows(peers: [AgentPeerContact], installed: [AgentHostRow]) -> [Self] {
         let configured = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
-        return peers.map { Self(id: "peer:" + $0.id, name: $0.name, contact: $0, peers: peers) }
+        return peers.map { peer in
+            let available = AgentPeerCredentials.isAvailable(peer, peers: peers)
+            return Self(id: "peer:" + peer.id, name: peer.name, contact: peer,
+                        credentialAvailable: available, state: available ? peer.state : .unavailable)
+        }
             + installed.filter { !configured.contains($0.id) }
                 .map { Self(id: $0.id, name: $0.displayName, contact: nil) }
     }
 
     /// The one word the row's pill carries; the full status stays below it.
     var pillWord: String {
-        if let health, health.problem != nil {
-            let word = health.status.replacingOccurrences(of: "_", with: " ")
-            return word.prefix(1).uppercased() + word.dropFirst()
-        }
-        if builtIn { return "Available" }
+        if health?.brokenSince != nil || health?.status == "unverified" { return health?.word ?? "Broken" }
+        if contact != nil && (!credentialAvailable || state == .unavailable || contact?.unavailableAt != nil) { return "Unavailable" }
+        if let word = health?.word, contact == nil || health?.problem != nil { return word }
+        if builtIn { return "Not checked" }
         guard contact != nil else { return "Not set up" }
         switch state {
         case .connected: return "Connected"
@@ -131,8 +134,11 @@ struct AgentContactRow: Identifiable {
     }
 
     var status: String {
-        if let problem = health?.problem { return problem }
-        if builtIn { return "Available · Reply not checked" }
+        if health?.brokenSince != nil || health?.status == "unverified", let problem = health?.problem { return problem }
+        if credentialAvailable, state != .unavailable, contact?.unavailableAt == nil, let problem = health?.problem { return problem }
+        if builtIn {
+            return health?.word.map { $0 + " · Reply not checked" } ?? "Reply not checked"
+        }
         guard let contact else { return "On this Mac · Not set up" }
         if repliesOnly {
             return !credentialAvailable ? AgentPeerCredentials.unavailableDetail
@@ -141,8 +147,8 @@ struct AgentContactRow: Identifiable {
         }
         if contact.transport == .grokBot {
             return contact.grokSetup == "set up" ? "Set up · \(contact.provenInboundAt == nil ? "No answer checked yet" : "A reply has arrived")"
-                : contact.grokSetup == "secure-paste" ? "Setup needs a secure credential import on the Connect card"
-                : contact.grokSetup == "disconnected" ? "Disconnected · Routine cleanup still needed" : "Routine setup is not confirmed"
+                : contact.grokSetup == "disconnected" ? "Disconnected · Routine cleanup still needed"
+                : "Setup needs a secure credential import at Agents → Grok Bot → Routine credentials"
         }
         let keyAvailable = credentialAvailable
         let returnProof = contact.mcpReturnProof.map {
@@ -202,16 +208,13 @@ struct AgentContactsSection: View {
     @State private var busy = false
     @State private var discovery: [AgentDiscoveryCandidate] = []
     @State private var refreshGeneration = 0
+    /// Reads can finish out of order; only the newest one applies.
+    @State private var reloadGeneration = 0
     private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Spacer()
-                Button("Refresh", systemImage: "arrow.clockwise") { refreshGeneration += 1 }
-                    .accessibilityLabel("Refresh agents")
-            }
             if let loadError { ConnectorsNote(text: loadError, color: NativeAgentShell.trouble) }
             if loading && fixtureRows == nil { ProgressView("Looking for agents…") }
             if !loading && (fixtureRows ?? rows).isEmpty && loadError == nil {
@@ -234,6 +237,9 @@ struct AgentContactsSection: View {
                         ConnectorsNote(text: row.route)
                         ConnectorsNote(text: row.status,
                             color: row.state == .connected ? NativeAgentShell.calm : NativeAgentShell.secondary)
+                        if let contact = row.contact, contact.transport == .grokBot, contact.grokSetup != "set up" {
+                            GrokSecureSetupCard(dataRoot: root)
+                        }
                         if let last = row.lastExchange {
                             ConnectorsNote(text: "Last exchange · " + last)
                         }
@@ -274,6 +280,17 @@ struct AgentContactsSection: View {
             }
             }.padding(.bottom, 32)
         }
+        .pageActions {
+            Button("Refresh", systemImage: "arrow.clockwise") { refreshGeneration += 1 }
+                .accessibilityLabel("Refresh agents")
+        }
+        // A screenshot's offscreen copy reads the contacts once, from the
+        // last discovery, and is counted so the capture waits for it.
+        .quietReadTask(live: false) {
+            guard fixtureRows == nil else { return }
+            discovery = await AgentDiscoverySession.shared.candidates()
+            await reload()
+        }
         .task(id: refresh + refreshGeneration) {
             guard fixtureRows == nil else { return }
             discovery = await AgentDiscoverySession.shared.candidates(refresh: true)
@@ -292,24 +309,35 @@ struct AgentContactsSection: View {
     }
 
     @MainActor private func reload() async {
-        defer { loading = false }
-        do {
-            let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
-            let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-            let peers = try AgentPeerStore(dataRoot: root).list()
-            // The conversations file and the sessions can be large: read and summarise them off the main actor, once.
-            let root = root
-            let lasts = await Task.detached(priority: .utility) {
-                AgentConversationStore.lastExchanges(peers: peers,
+        reloadGeneration += 1
+        let generation = reloadGeneration
+        // Peers (under their lock), the lanes, Keychain and the conversations
+        // file: all read off the main actor, once.
+        let root = root
+        let discovery = discovery
+        let read = await Task.detached(priority: .utility) {
+            Result {
+                let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
+                let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
+                let peers = try AgentPeerStore(dataRoot: root).list()
+                let lasts = AgentConversationStore.lastExchanges(peers: peers,
                     records: (try? AgentConversationStore(dataRoot: root).records()) ?? [], dataRoot: root).mapValues(\.summary)
-            }.value
-            rows = AgentContactRow.rows(peers: peers, candidates: discovery, usable: usable, dataRoot: root).map { row in
-                var row = row
-                row.lastExchange = row.contact.flatMap { lasts[$0.id] }
-                return row
+                return AgentContactRow.rows(peers: peers, candidates: discovery, usable: usable, dataRoot: root).map { row in
+                    var row = row
+                    row.lastExchange = row.contact.flatMap { lasts[$0.id] }
+                    return row
+                }
             }
+        }.value
+        guard generation == reloadGeneration else { return }
+        loading = false
+        switch read {
+        case .success(let next):
+            rows = next
             loadError = nil
-        } catch { loadError = "Could not load agent contacts. Refresh Agents to try again." }
+        case .failure:
+            loadError = "Could not load agent contacts. Refresh Agents to try again."
+        }
     }
 
     private func perform(_ row: AgentContactRow, _ action: AgentContactRow.Action) {

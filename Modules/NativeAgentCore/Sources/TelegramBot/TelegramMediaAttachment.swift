@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 
 // MARK: - TelegramMediaAttachment
 
@@ -10,6 +11,22 @@ public struct TelegramMediaAttachment: Sendable, Codable {
     public let sizeBytes: Int?
     public let bytes: Data?
     public let captureFilename: String?
+
+    public var chatTypeAndMime: (type: String, mime: String)? {
+        if let mimeType, mimeType.lowercased().hasPrefix("image/") {
+            return ("image", mimeType.lowercased())
+        }
+        let ext = captureFilename.map { URL(fileURLWithPath: $0).pathExtension } ?? ""
+        if let resolved = ChatAttachmentTypeResolver.typeAndMime(forExtension: ext) {
+            return resolved
+        }
+        switch mimeType?.lowercased() {
+        case "application/pdf": return ChatAttachmentTypeResolver.typeAndMime(forExtension: "pdf")
+        case "text/plain": return ChatAttachmentTypeResolver.typeAndMime(forExtension: "txt")
+        case "text/markdown", "text/x-markdown": return ChatAttachmentTypeResolver.typeAndMime(forExtension: "md")
+        default: return nil
+        }
+    }
 
     public init(
         kind: String,
@@ -160,7 +177,7 @@ public actor TelegramMediaDownloader {
             body.task.cancel()
         }
 
-        let filename = URL(fileURLWithPath: filePath).lastPathComponent
+        let filename = attachment.captureFilename ?? URL(fileURLWithPath: filePath).lastPathComponent
 
         return TelegramMediaAttachment(
             kind: attachment.kind,

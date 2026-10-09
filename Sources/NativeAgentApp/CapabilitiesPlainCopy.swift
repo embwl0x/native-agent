@@ -99,7 +99,12 @@ enum CapabilitiesPlainCopy {
         case "x.me", "x_me": return "Your X profile"
         case "x.post_tweet", "x_post_tweet": return "Post on X"
         case "mac.jxa": return "Automate Mac apps with JavaScript"
-        default: return (capability.name ?? capability.id).withoutStaleNextGenPhaseCopy
+        default:
+            let name = (capability.name ?? capability.id).withoutStaleNextGenPhaseCopy
+            // A skill has no title of its own, only its handle: "after-card-verify"
+            // reads "After card verify", not "After-card-verify".
+            guard capability.kind == "skill", !name.contains(" ") else { return name }
+            return name.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
         }
     }
 
@@ -126,8 +131,47 @@ enum CapabilitiesPlainCopy {
         case "nextgen_runtime": return "See which app features are ready and what needs attention."
         case "native_mac_power": return "Use Mac apps, controls, and notifications."
         case "eval_release_ops": return "Check updates and prepare information for support."
-        default: return capability.description?.withoutStaleNextGenPhaseCopy
+        case "after-card-verify":
+            return "Check that a skill you approved really went live, running the exact version you approved."
+        case "autonomous-delegation-loop":
+            return "Run Desk campaigns step by step: hand work off, recover it, check it independently, and go on to the next step without stopping to ask."
+        default:
+            guard let description = capability.description?.withoutStaleNextGenPhaseCopy else { return nil }
+            return capability.kind == "skill" ? plainSkillLine(description) : description
         }
+    }
+
+    /// A skill's description is written for me to pick it by ("Use this when
+    /// you…"). For User, one clean line: its first sentence that is not that
+    /// trigger line; failing that, the trigger with its lead-in stripped and
+    /// said as me ("I'm shaping a helper…"). Always a capital first, a full
+    /// stop last, and "helper" where the skill says "bot".
+    static func plainSkillLine(_ text: String) -> String {
+        let leadIns = ["use this skill when ", "use this whenever ", "use this when ", "use whenever ", "use when "]
+        func leadIn(_ sentence: String) -> String? {
+            leadIns.first { sentence.lowercased().hasPrefix($0) }
+        }
+        let sentences = text.components(separatedBy: ". ").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let first = sentences.first else { return text }
+        var line = first
+        if let lead = leadIn(first) {
+            if let plain = sentences.dropFirst().first(where: { !$0.isEmpty && leadIn($0) == nil }) {
+                line = plain
+            } else {
+                line = String(first.dropFirst(lead.count))
+                for (you, me) in [("you are ", "I'm "), ("you're ", "I'm "), ("you ", "I ")]
+                    where line.lowercased().hasPrefix(you) {
+                    line = me + line.dropFirst(you.count)
+                    for (later, mine) in [(" you are ", " I am "), (" you're ", " I'm "), (" your ", " my ")] {
+                        line = line.replacingOccurrences(of: later, with: mine)
+                    }
+                    break
+                }
+            }
+        }
+        line = line.replacing(/\bbots\b/, with: "helpers").replacing(/\bbot\b/, with: "helper")
+        line = TodayWords.capitalizedFirst(line)
+        return line.hasSuffix(".") || line.hasSuffix("!") || line.hasSuffix("?") ? line : line + "."
     }
 
     static func toolDescription(_ id: String, catalogDescription: String? = nil) -> String {
@@ -261,7 +305,7 @@ enum CapabilitiesPlainCopy {
         case "activity": return "Look back at recent activity."
         case "codex", "agent": return "Coordinate work with other assistants."
         case "browser": return "Open and explore web pages."
-        case "bot", "shelf": return "Manage your bots and their work."
+        case "bot", "shelf": return "Manage your helpers and their work."
         case "desk": return "Keep track of tasks on your Desk."
         case "persona": return "Read or update my personality notes."
         case "tool", "list": return "Find and prepare tools for a task."

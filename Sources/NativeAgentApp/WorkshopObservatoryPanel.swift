@@ -196,7 +196,7 @@ struct WorkshopObservatoryPanel: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        .houseInset(in: RoundedRectangle(cornerRadius: 8))
     }
 
     // MARK: pursuits

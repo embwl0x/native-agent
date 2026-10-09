@@ -266,8 +266,7 @@ enum MCPHubDurableCallHistory {
     }
 
     private static func boundedDetail(_ error: any Error) -> String {
-        let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        return detail.isEmpty ? "The Activity receipt could not be read." : String(detail.prefix(240))
+        UserFacingError.cause(error, action: "read the Activity receipt")
     }
 }
 

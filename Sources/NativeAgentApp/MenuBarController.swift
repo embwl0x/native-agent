@@ -112,6 +112,11 @@ final class GlobalHotkeyManager: NSObject {
             GetApplicationEventTarget(),
             { _, event, userData -> OSStatus in
                 guard let userData, let event else { return noErr }
+                // Shotgun's ⌥Space shares this event target; pass on any
+                // hot key that is not ⌘⇧J.
+                guard let id = hotKeyID(of: event), id.signature == fourCharCode("NASP"), id.id == 1 else {
+                    return OSStatus(eventNotHandledErr)
+                }
                 let manager = Unmanaged<GlobalHotkeyManager>.fromOpaque(userData).takeUnretainedValue()
                 let eventKind = GetEventKind(event)
                 Task { @MainActor in
@@ -198,7 +203,17 @@ struct GlobalHotkeyPressState: Sendable {
 
 // MARK: - Four-char code helper
 
-private func fourCharCode(_ string: String) -> FourCharCode {
+/// The registered id of the hot key a Carbon hot-key event is for.
+func hotKeyID(of event: EventRef) -> EventHotKeyID? {
+    var id = EventHotKeyID()
+    let status = GetEventParameter(
+        event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+        nil, MemoryLayout<EventHotKeyID>.size, nil, &id
+    )
+    return status == noErr ? id : nil
+}
+
+func fourCharCode(_ string: String) -> FourCharCode {
     var result: FourCharCode = 0
     for char in string.unicodeScalars {
         result = (result << 8) + FourCharCode(char.value)

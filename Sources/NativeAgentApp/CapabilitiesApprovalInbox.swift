@@ -2,9 +2,9 @@ import Foundation
 import ApprovalInbox
 import NativeAgentShared
 
-/// The compact Capabilities inbox and the full Approvals screen are two views
-/// of one durable queue. A second tap is therefore an observed no-op, never a
-/// second request to execute the approved effect.
+/// Every place an approval is decided (the chat's inline card, Today's
+/// Approvals) is a view of one durable queue. A second tap is therefore an
+/// observed no-op, never a second request to execute the approved effect.
 enum CapabilitiesApprovalInboxResolution: Equatable, Sendable {
     case applied(ApprovalRecord)
     case noOpInFlight(id: String)
@@ -26,43 +26,6 @@ enum CapabilitiesApprovalInboxResolution: Equatable, Sendable {
     }
 
     static func boundedUnavailable(_ error: any Error) -> String {
-        let detail = error.localizedDescription
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if detail.isEmpty { return "The approval store returned no error details." }
-        return String(detail.prefix(240))
-    }
-}
-
-enum CapabilitiesApprovalInboxPresentation {
-    enum ReadState: Equatable {
-        case loading
-        case empty
-        case available
-        case stale
-        case unavailable
-    }
-
-    static func readState(
-        approvalCount: Int,
-        refresh: AppModel.PanelRefreshStatus?
-    ) -> ReadState {
-        let approvalsReadFailed = refresh?.failedEndpoints.contains { endpoint in
-            endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-                .caseInsensitiveCompare("approvals") == .orderedSame
-        } ?? false
-        if approvalsReadFailed { return approvalCount > 0 ? .stale : .unavailable }
-        if approvalCount > 0 { return .available }
-        return refresh == nil ? .loading : .empty
-    }
-
-    static func outcomeTone(_ outcome: CapabilitiesApprovalInboxResolution) -> String {
-        switch outcome {
-        case .applied(let approval):
-            return approval.decision?.lowercased() == "approved" ? "success" : "warning"
-        case .noOpInFlight, .noOpAlreadyResolved:
-            return "warning"
-        case .unavailable:
-            return "failure"
-        }
+        UserFacingError.cause(error, action: "update that approval")
     }
 }

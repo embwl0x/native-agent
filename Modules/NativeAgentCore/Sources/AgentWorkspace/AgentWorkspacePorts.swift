@@ -40,6 +40,9 @@ package protocol AgentWorkspaceToolPort: Sendable {
     func withWebScheme(_ value: String) -> String
     func builderSourceRepoRoot(dataRoot: URL) -> URL?
     var listedPeerState: String { get }
+    /// Saved service blockers, without a network probe. Discovery keeps the
+    /// action and its reason; workspace controls wait until setup is ready.
+    func unreadyTools(dataRoot: URL) -> [String: String]
 }
 
 /// Bound by the chat entry points for the whole structured workspace operation.

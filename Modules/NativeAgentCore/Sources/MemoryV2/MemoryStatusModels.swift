@@ -32,15 +32,38 @@ public struct MemoryV2Status: Codable, Hashable {
     public var counts: MemoryV2Counts?
     public var hygiene: MemoryHygieneReport?
     public var vault: MemoryVaultStatus?
+    public var afterTurn: AfterTurnMemoryRecoveryStatus?
     public var createdAt: String?
-    public init(status: String, version: String? = nil, embedding: MemoryV2Embedding? = nil, counts: MemoryV2Counts? = nil, hygiene: MemoryHygieneReport? = nil, vault: MemoryVaultStatus? = nil, createdAt: String? = nil) {
+    public init(status: String, version: String? = nil, embedding: MemoryV2Embedding? = nil, counts: MemoryV2Counts? = nil, hygiene: MemoryHygieneReport? = nil, vault: MemoryVaultStatus? = nil, afterTurn: AfterTurnMemoryRecoveryStatus? = nil, createdAt: String? = nil) {
         self.status = status
         self.version = version
         self.embedding = embedding
         self.counts = counts
         self.hygiene = hygiene
         self.vault = vault
+        self.afterTurn = afterTurn
         self.createdAt = createdAt
+    }
+}
+
+public struct AfterTurnMemoryRecoveryStatus: Codable, Hashable, Sendable {
+    public let status: String
+    public let heldCount: Int?
+    public let failure: AfterTurnMemoryFailure?
+
+    public var lines: [String] {
+        guard let heldCount else {
+            return ["Held memory turns could not be read. Repair memory/moments_held.json without discarding its turns; recovery is paused."]
+        }
+        guard heldCount > 0 else { return [] }
+        var result = ["\(heldCount) turns waiting for the memory model. Their held memory opportunities have not become saved memories or review proposals.",
+                      "Held turns are reconsidered when the selected memory model next answers successfully.",
+                      "Recovery respects enabled memory lanes and the daily moment limit; remaining opportunities stay held."]
+        if let failure {
+            result.append(failure.detail)
+            result.append("Memory route for that failed pass: \(failure.surface) / \(failure.model ?? "unreported").")
+        }
+        return result
     }
 }
 

@@ -241,12 +241,6 @@ func appendStaleInstructionErrors(repo: URL, errors: inout [String]) throws {
             message: "iOS onboarding comments must not point to retired onboarding HTTP routes"
         ),
         StaleInstructionRule(
-            id: "retired-ios-mac-integration-copy",
-            file: "iOS/NativeAgentMobile/Sources/MacIntegrationView.swift",
-            pattern: #"Mac daemon"#,
-            message: "iOS Mac integration copy must describe the Swift runtime"
-        ),
-        StaleInstructionRule(
             id: "retired-ios-provider-routing",
             file: "iOS/NativeAgentMobile/Sources/ProviderSettingsView.swift",
             pattern: #"daemon /v1|daemon/native_agentd\.py"#,

@@ -355,9 +355,16 @@ public enum IntraTurnContextCompaction {
         // Tool additions/removals are provider state, not prose the notes can
         // replace. Carry them whole, in order, before the surviving rounds.
         let toolChangeMessages = conversation[foldStart..<keepTailStart].filter { !$0.toolChanges.isEmpty }
+        var continuation = "[Continue the task from these notes; earlier tool results were folded into them.]"
+        if let turnId = TurnTraceContext.turnId,
+           let read = try? JSONValue.object(["action": .string("trace.recent"), "args": .object([
+                "turn_id": .string(turnId), "kind": .string("tool.dispatch"), "fields": .array([.string("receipt")]),
+           ])]).serialize(pretty: false) {
+            continuation += "\n[Source: working notes. Recorded dispatch receipts: app \(read). Previews are not execution; dispatch is not verified effect.]"
+        }
         conversation.replaceSubrange(foldStart..<keepTailStart, with: [
             .assistantText("\(priorNoteMarker)\n\(body)"),
-            .user("[Continue the task from these notes; earlier tool results were folded into them.]"),
+            .user(continuation),
         ] + toolChangeMessages)
         return await overflowFallback(
             conversation: &conversation, foldStart: foldStart, target: target,

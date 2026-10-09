@@ -17,6 +17,12 @@ enum NativeAgentSpacing {
     static let md: CGFloat = 12
     static let lg: CGFloat = 16
     static let xl: CGFloat = 24
+    static let pageInset: CGFloat = 20
+    static let section: CGFloat = 28
+    static let pageTop: CGFloat = 36
+    // Content-specific exceptions to the general spacing steps.
+    static let rowInsetV: CGFloat = 14
+    static let eyebrowGap: CGFloat = 10
 }
 
 enum NativeAgentRadius {
@@ -28,7 +34,6 @@ enum NativeAgentRadius {
 
 enum NativeAgentLayout {
     static let cardPadding: CGFloat = NativeAgentSpacing.lg
-    static let maxReadableChatWidth: CGFloat = 760
 }
 
 enum NativeAgentTheme {

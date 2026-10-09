@@ -29,28 +29,28 @@ struct InboxPolicyStatus: Equatable {
     init(_ event: Event) {
         switch event {
         case let .settingsLoadFailed(detail):
-            text = "Failed to load inbox settings: \(detail)"
+            text = detail
             tone = .failure
         case let .triggersLoadFailed(detail):
-            text = "Failed to load triggers: \(detail)"
+            text = detail
             tone = .failure
         case let .masterSaved(enabled):
             text = enabled ? "Inbox enabled." : "Inbox disabled."
             tone = .success
         case let .masterSaveFailed(detail):
-            text = "Failed: \(detail)"
+            text = detail
             tone = .failure
         case let .triggerSaved(name, enabled):
             text = "\(name) \(enabled ? "enabled" : "disabled")."
             tone = .success
         case let .triggerSaveFailed(detail):
-            text = "Toggle failed: \(detail)"
+            text = detail
             tone = .failure
         case let .pathsSaved(count):
             text = "Paths saved (\(count) entries)."
             tone = .success
         case let .pathsSaveFailed(detail):
-            text = "Paths save failed: \(detail)"
+            text = detail
             tone = .failure
         }
     }
@@ -207,12 +207,14 @@ enum InboxPolicyTriggersPanelGate: Equatable {
 
 struct InboxSettingsView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var masterEnabled: Bool = false
     @State private var suppressMasterSave = false
     @State private var triggers: [InboxTriggerConfig] = []
     @State private var isLoading = false
     @State private var isSaving = false
+    @State private var isSavingPaths = false
     @State private var statusSlot = InboxPolicyStatusSlot()
     @State private var trustReadState: InboxPolicyTrustReadState = .loading
     @State private var inboxHistoryRoute = InboxHistoryRoute()
@@ -222,8 +224,7 @@ struct InboxSettingsView: View {
     // File watcher watched paths (comma-separated editing)
     @State private var watchedPaths: String = ""
 
-    // R22: source the client from AppModel's canonical `client` (already carries
-    // nativeBaseURL + the shared runtime) instead of constructing inline.
+    // Source the client from AppModel's canonical root and shared runtime.
     private var client: NativeClient { appModel.client }
     private var triggersPanelGate: InboxPolicyTriggersPanelGate {
         InboxPolicyTriggersPanelGate.resolve(trustRead: trustReadState)
@@ -304,19 +305,35 @@ struct InboxSettingsView: View {
                     InboxAliveSwitchRow(
                         title: "Let \(agentDisplayName) raise things unasked",
                         detail: "When this is on, \(agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without being asked.",
-                        isOn: $masterEnabled
+                        isOn: $masterEnabled,
+                        isSaving: isSaving
                     )
                     .disabled(masterToggleDisabled)
 
                     switch triggersPanelGate {
                     case .enabled:
-                        ForEach(triggers) { trigger in
-                            TriggerRowView(
-                                trigger: trigger,
-                                watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
-                                onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) }
+                        VStack(alignment: .leading, spacing: 0) {
+                            PageReadStatus(
+                                isReading: !triggersRead || isLoading,
+                                text: !triggersRead ? "Reading notification options…"
+                                    : isLoading ? "Refreshing notification options…"
+                                    : triggersReadFailed ? "I couldn't read notification options. Try again."
+                                    : triggers.isEmpty ? "No notification options configured yet." : nil
                             )
+                            ForEach(triggers) { trigger in
+                                Rectangle()
+                                    .fill(AlivePalette.divider)
+                                    .frame(height: 1)
+                                    .padding(.vertical, AliveMetrics.rowInsetV)
+                                TriggerRowView(
+                                    trigger: trigger,
+                                    watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
+                                    onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) }
+                                )
+                            }
                         }
+                        .id("notification-options")
+                        .transition(NativeAgentMotion.arrivalFade)
                     case .disabled:
                         EmptyView()
                     case .loading:
@@ -374,12 +391,17 @@ struct InboxSettingsView: View {
                                 .font(.system(size: 13))
                                 .foregroundStyle(NativeAgentShell.secondary)
                             watchedPathsEditor
-                            Button("Save paths") {
-                                Task { await saveWatchedPaths() }
+                            HStack(spacing: 8) {
+                                Button(isSavingPaths ? "Saving paths…" : "Save paths") {
+                                    Task { await saveWatchedPaths() }
+                                }
+                                .disabled(isSavingPaths)
+                                if isSavingPaths { ProgressView().controlSize(.small) }
                             }
                         }
                     }
                 }
+                .transition(NativeAgentMotion.arrivalFade)
             }
         }
         .padding(.bottom, 32)
@@ -394,17 +416,18 @@ struct InboxSettingsView: View {
             .scrollContentBackground(.hidden)
             .frame(minHeight: 80)
             .padding(8)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(NativeAgentShell.quietFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-            )
+            .houseInset(in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     // ── Data loading ──────────────────────────────────────────────────────
+
+    private var triggersReadFailed: Bool {
+        statusSlot.entries.contains { $0.source == .triggersRead && $0.status.tone == .failure }
+    }
+
+    private var foldAnimation: Animation? {
+        NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)
+    }
 
     func load() async {
         isLoading = true
@@ -419,7 +442,9 @@ struct InboxSettingsView: View {
             if case .object(let ip)? = obj["inboxPolicy"], case .bool(let enabled)? = ip["enabled"] {
                 loaded = enabled
             }
-            trustReadState = .loaded(enabled: loaded)
+            withAnimation(triggersRead ? foldAnimation : nil) {
+                trustReadState = .loaded(enabled: loaded)
+            }
             statusSlot.clear(source: .settingsRead)
             // Suppress the master toggle's onChange save only when the value
             // actually changes: this is a programmatic load, not a user toggle,
@@ -431,8 +456,8 @@ struct InboxSettingsView: View {
                 masterEnabled = loaded
             }
         } catch {
-            trustReadState = .unavailable(error.localizedDescription)
-            statusSlot.record(InboxPolicyStatus(.settingsLoadFailed(error.localizedDescription)), from: .settingsRead)
+            trustReadState = .unavailable(UserFacingError.cause(error, action: "read the notification setting"))
+            statusSlot.record(InboxPolicyStatus(.settingsLoadFailed(UserFacingError.message(error, action: "load inbox settings"))), from: .settingsRead)
         }
         // Load triggers
         // U5 W-A item 1 (:151): the trigger read was swallowed into [] —
@@ -440,10 +465,11 @@ struct InboxSettingsView: View {
         // signal. Keep last-known rows and surface the real error in the
         // panel's status line instead.
         do {
-            triggers = try await client.getInboxTriggers()
+            let loadedTriggers = try await client.getInboxTriggers()
+            withAnimation(foldAnimation) { triggers = loadedTriggers }
             statusSlot.clear(source: .triggersRead)
         } catch {
-            statusSlot.record(InboxPolicyStatus(.triggersLoadFailed(error.localizedDescription)), from: .triggersRead)
+            statusSlot.record(InboxPolicyStatus(.triggersLoadFailed(UserFacingError.message(error, action: "load triggers"))), from: .triggersRead)
         }
         triggersRead = true
         // Load watched paths for file_watch trigger
@@ -454,6 +480,7 @@ struct InboxSettingsView: View {
     }
 
     func saveMaster(enabled: Bool) async {
+        guard !isSaving else { return }
         isSaving = true
         defer { isSaving = false }
         let previousEnabled: Bool = {
@@ -464,10 +491,10 @@ struct InboxSettingsView: View {
             _ = try await client.postRaw("/v1/trust", body: [
                 "inboxPolicy": ["enabled": enabled]
             ])
-            trustReadState = .loaded(enabled: enabled)
+            withAnimation(foldAnimation) { trustReadState = .loaded(enabled: enabled) }
             statusSlot.record(InboxPolicyStatus(.masterSaved(enabled: enabled)), from: .masterToggle)
         } catch {
-            statusSlot.record(InboxPolicyStatus(.masterSaveFailed(error.localizedDescription)), from: .masterToggle)
+            statusSlot.record(InboxPolicyStatus(.masterSaveFailed(UserFacingError.message(error, action: "turn the inbox on or off"))), from: .masterToggle)
             suppressMasterSave = true
             masterEnabled = previousEnabled
             trustReadState = .loaded(enabled: previousEnabled)
@@ -487,12 +514,15 @@ struct InboxSettingsView: View {
             await load()
             return true
         } catch {
-            statusSlot.record(InboxPolicyStatus(.triggerSaveFailed(error.localizedDescription)), from: .triggerToggle(name))
+            statusSlot.record(InboxPolicyStatus(.triggerSaveFailed(UserFacingError.message(error, action: "change that trigger"))), from: .triggerToggle(name))
             return false
         }
     }
 
     func saveWatchedPaths() async {
+        guard !isSavingPaths else { return }
+        isSavingPaths = true
+        defer { isSavingPaths = false }
         let paths = watchedPaths
             .components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -503,7 +533,7 @@ struct InboxSettingsView: View {
             try await client.inboxTriggerConfigure("file_watch", body: ["paths": paths])
             statusSlot.record(InboxPolicyStatus(.pathsSaved(count: paths.count)), from: .watchedPaths)
         } catch {
-            statusSlot.record(InboxPolicyStatus(.pathsSaveFailed(error.localizedDescription)), from: .watchedPaths)
+            statusSlot.record(InboxPolicyStatus(.pathsSaveFailed(UserFacingError.message(error, action: "save the watched paths"))), from: .watchedPaths)
         }
     }
 
@@ -651,6 +681,8 @@ struct InboxTriggerToggleStateMachine: Equatable {
     private var latestRequestID: Int?
     private var nextRequestID = 0
 
+    var isSaving: Bool { latestRequestID != nil }
+
     init(serverEnabled: Bool) {
         visualEnabled = serverEnabled
         self.serverEnabled = serverEnabled
@@ -713,13 +745,16 @@ struct TriggerRowView: View {
             isOn: Binding(
                 get: { toggleState.visualEnabled },
                 set: { requestToggle($0) }
-            ))
+            ),
+            isSaving: toggleState.isSaving)
+        .disabled(toggleState.isSaving)
         .onChange(of: trigger.enabled) { _, val in
             toggleState.synchronizeServer(enabled: val)
         }
     }
 
     private func requestToggle(_ enabled: Bool) {
+        guard !toggleState.isSaving else { return }
         let request = toggleState.userToggled(to: enabled)
         Task {
             let accepted = await onToggle(request.requestedEnabled)
@@ -735,6 +770,7 @@ private struct InboxAliveSwitchRow: View {
     let title: String
     let detail: String?
     @Binding var isOn: Bool
+    var isSaving = false
 
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
@@ -751,6 +787,7 @@ private struct InboxAliveSwitchRow: View {
                 }
             }
             Spacer(minLength: 12)
+            if isSaving { ProgressView().controlSize(.small) }
             Toggle(title, isOn: $isOn)
                 .labelsHidden()
                 .toggleStyle(.switch)
@@ -758,4 +795,3 @@ private struct InboxAliveSwitchRow: View {
         }
     }
 }
-

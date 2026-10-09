@@ -51,7 +51,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// without executing a provider or waiting for a bot run. Supplied by the
     /// runner's app assembly; nil reports unavailable rather than fake success.
     let standingBotSession: BotRunnerSession?
-    let standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)?
+    let standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)?
     /// Exact semantic-memory owner for this dispatcher body. Alternate roots
     /// must never fall through to the process-wide production singleton.
     let memoryV2: SwiftNativeMemoryV2
@@ -154,7 +154,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         codexMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
         ompMessageWakeupHelperOverride: URL? = nil,
         ompMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
-        standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)? = nil,
+        standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)? = nil,
         standingBotSession: BotRunnerSession? = nil,
         swarmChatFactory: any SwarmChatClientFactory
     ) {

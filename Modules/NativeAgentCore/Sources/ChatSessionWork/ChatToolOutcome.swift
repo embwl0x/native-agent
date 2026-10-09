@@ -5,6 +5,28 @@ import PersistenceCore
 
 /// Exact result evidence shared by transcript projection and live turn receipts.
 public enum ChatToolOutcome {
+    public static func explanation(_ output: JSONValue) -> String? {
+        sentence(output, keys: ["detail", "message", "summary", "reason", "error"], limit: 600)
+    }
+
+    public static func remedy(_ output: JSONValue) -> String? {
+        if case .object(let fields) = output, let remedy = fields["remedy"],
+           let instruction = sentence(remedy, keys: ["instruction"], limit: 300) {
+            return instruction
+        }
+        return sentence(output, keys: ["remedy", "next_step"], limit: 300)
+    }
+
+    private static func sentence(_ output: JSONValue, keys: [String], limit: Int) -> String? {
+        guard case .object(let fields) = output else { return nil }
+        for key in keys {
+            guard case .string(let text)? = fields[key] else { continue }
+            let line = ChatSecretRedactor.redactText(text).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            if !line.isEmpty { return String(line.prefix(limit)) }
+        }
+        return nil
+    }
+
     public static func errorMessage(_ error: any Error) -> String {
         let raw = (error as? LocalizedError)?.errorDescription
             ?? ((error as Any) as? CustomStringConvertible)?.description
@@ -34,7 +56,7 @@ public enum ChatToolOutcome {
     ]
 
     package static let failureStatuses: Set<String> = [
-        "denied", "error", "failed", "failure", "rejected", "refused",
+        "denied", "error", "failed", "failure", "rejected", "refused", "blocked", "unavailable",
     ]
 
     /// Statuses that are not final: nothing is known to have finished.
@@ -47,6 +69,16 @@ public enum ChatToolOutcome {
         "pending", "pending_approval", "partial", "queued", "scheduled", "ready",
         "running", "started", "waiting", "waiting_approval", "skipped", "submitted", "unknown", "warning",
     ]
+
+    /// The persistence writer's classification for a bounded historical receipt.
+    /// Only transcript readers consult this; live results use their own evidence.
+    public static func recordedResultClass(_ output: JSONValue) -> ExactResultClass? {
+        guard case .object(let object) = output,
+              case .string(let projection)? = object["transcript_projection"],
+              ["bounded_read_receipt", "bounded_tool_receipt"].contains(projection),
+              case .string(let original)? = object["original_result_class"] else { return nil }
+        return ExactResultClass(rawValue: original)
+    }
 
     /// Exact machine-envelope classification for evidence and resident
     /// consequence paths. Unlike `outputLooksSuccessful`, this never treats a
@@ -71,6 +103,7 @@ public enum ChatToolOutcome {
         // Explicit failure/refusal/timeout evidence outranks pending states,
         // dry runs, and even an otherwise completed operation record.
         if let error = object["error"], error != .null { return .failed }
+        if object["outcome"] == .string("unmet") { return .failed }
         if case .bool(false)? = object["ok"] { return .failed }
         if case .bool(false)? = object["success"] { return .failed }
         if case .bool(true)? = object["isError"] { return .failed }
@@ -83,7 +116,7 @@ public enum ChatToolOutcome {
             guard case .string(let raw)? = object["status"] else { return nil }
             return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }()
-        if let status, failureStatuses.contains(status) || status == "blocked" { return .failed }
+        if let status, failureStatuses.contains(status) { return .failed }
         if let status, ["timeout", "timed_out"].contains(status) { return .timeout }
         if let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 { return .failed }
         if case .bool(true)? = object["dryRun"] ?? object["dry_run"] { return .unknown }

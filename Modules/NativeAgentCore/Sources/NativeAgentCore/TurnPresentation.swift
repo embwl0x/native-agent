@@ -103,7 +103,8 @@ public struct TurnPresentationState: Sendable, Equatable {
 public enum TurnPresentationReducer {
     public typealias AdditionalRedactor = @Sendable (String) -> String
 
-    public static let textLimit = 120
+    // Keep a bounded receipt's explanation and next step together.
+    public static let textLimit = 1_000
     public static let detailHistoryLimit = 12
     public static let defaultStalledAfter: TimeInterval = 90
 

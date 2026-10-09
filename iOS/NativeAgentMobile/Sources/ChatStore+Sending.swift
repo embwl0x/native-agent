@@ -134,7 +134,6 @@ extension ChatStore {
             // B1 retry: replay through the SAME placeholder bubble that timed
             // out instead of appending a fresh one. Reset it to a clean
             // streaming state so stale text / tool events don't linger.
-            cancelTypewriter(reuse)
             var reused = messages[idx]
             reused.text = ""
             reused.isStreaming = true
@@ -341,7 +340,6 @@ extension ChatStore {
         // PATCH-2026-05-30: stop() cancels in-flight turns; clear the text_delta
         // seq map alongside the other in-flight state.
         maxDeltaSeqByCorrelation.removeAll()
-        cancelAllTypewriters()
         isPollingFallback = false
         if let idx = messages.lastIndex(where: { $0.isStreaming }) {
             finishPlaceholder(id: messages[idx].id, text: "(stopped)")
@@ -406,6 +404,7 @@ extension ChatStore {
     }
 
     func recoverQueuedSendTransport() {
+        guard !transportPausedQueueSessionKeys.isEmpty else { return }
         transportPausedQueueSessionKeys.removeAll()
         scheduleQueuedSendDrain()
     }
@@ -612,7 +611,6 @@ extension ChatStore {
         timedOutPendingIds.removeValue(forKey: pendingId)
         pendingICloudPlaceholders[pendingId] = placeholderId
 
-        cancelTypewriter(placeholderId)
         var bubble = messages[index]
         bubble.text = ""
         bubble.isStreaming = true

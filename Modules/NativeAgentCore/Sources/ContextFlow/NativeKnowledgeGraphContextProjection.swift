@@ -63,7 +63,7 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
         maximumRelationsPerEntity: Int =
             NativeKnowledgeGraphContextProjection.maximumRelationsPerEntity,
         loadRelations: (@Sendable () async throws -> [KnowledgeGraphContextRelation])? = nil,
-        diagnostics: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }
+        diagnostics: @escaping @Sendable (String) -> Void = { nativeLog("%@", $0) }
     ) {
         let sqlite = dataRoot.appendingPathComponent("memory/memory.sqlite").standardizedFileURL
         self.invalidationSourceURL = sqlite
@@ -232,7 +232,7 @@ extension NativeKnowledgeGraphContextProjection {
             body: body,
             authority: .inferred,
             confidence: min(1, max(0, relation.weight)),
-            freshness: ContextFreshness(updatedAt: parseDate(relation.lastSeen) ?? .distantPast),
+            freshness: ContextFreshness(updatedAt: NativeMemoryContextProjection.parseDate(relation.lastSeen) ?? .distantPast),
             privacy: .localPrivate,
             permittedSurfaces: surfaces,
             injectionPolicy: .adaptive,
@@ -251,14 +251,5 @@ extension NativeKnowledgeGraphContextProjection {
     static func triggers(_ relation: KnowledgeGraphContextRelation) -> [String] {
         let text = [relation.subject, relation.object].joined(separator: " ")
         return NativeContextProjectionText.triggers(text)
-    }
-
-    static func parseDate(_ raw: String?) -> Date? {
-        guard let raw else { return nil }
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
     }
 }

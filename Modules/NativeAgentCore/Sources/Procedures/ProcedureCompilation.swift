@@ -931,7 +931,7 @@ public struct DeclarativeProcedureArtifact: Codable, Sendable, Equatable, Identi
         return CausalTransitionEvidence.opaqueIdentity(fingerprint)
     }
 
-    var requiresLegacyRevalidation: Bool {
+    public var requiresLegacyRevalidation: Bool {
         schema == Self.legacySchema && id != (try? canonicalIdentity())
     }
 

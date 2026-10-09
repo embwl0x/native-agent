@@ -133,11 +133,8 @@ struct DiagnosticsView: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .motionArrival(when: appModel.panelRefreshStatus[.diagnostics] != nil)
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        // Alive glass (2026-09-23): the tabs' panels and cards wear the kit.
-        .environment(\.aliveCards, true)
         .alivePageLine(Self.headerLine(appModel), id: "diagnostics.line")
         .navigationTitle("Diagnostics")
         .liveTask {

@@ -7,13 +7,17 @@ import ApprovalInbox
 
 enum CapabilitiesDisclosurePreference {
     static let nextGenKey = "capabilitiesShowNextGen"
+    /// The Developer fold the self-checks sit inside.
+    static let developerKey = "capabilitiesShowDeveloper"
 
     static func isNextGenExpanded(in defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: nextGenKey)
     }
 
+    /// Opening the self-checks opens the Developer fold around them too.
     static func setNextGenExpanded(_ isExpanded: Bool, in defaults: UserDefaults) {
         defaults.set(isExpanded, forKey: nextGenKey)
+        if isExpanded { defaults.set(true, forKey: developerKey) }
     }
 }
 
@@ -241,7 +245,8 @@ struct CapabilityCatalogInstallOutcomeRow: View {
 
 struct CapabilitiesView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var mode: CapabilityWorkspaceMode
+    /// Which of the page's tabs this is (CapabilitiesRailPage).
+    private let mode: CapabilityWorkspaceMode
     @State private var routeText = "Research a topic, save it as a reusable tool if it comes up again, and ask me before anything risky."
     @State private var researchObjective = "Find current best practices for lightweight autonomous agent capability systems."
     @State private var researchLabRunsState: CapabilitiesResearchLabPresentation.RunList = .loading
@@ -263,10 +268,10 @@ struct CapabilitiesView: View {
     @AppStorage(CapabilitiesDisclosurePreference.nextGenKey) private var showNextGen = false
     // Everything a stranger has no business reading — hardening, the research
     // lab, the demo pack and the gauntlet — behind one fold at the bottom.
-    @State private var showDeveloperTools = false
+    @AppStorage(CapabilitiesDisclosurePreference.developerKey) private var showDeveloperTools = false
 
     init(initialMode: CapabilityWorkspaceMode = .canDo) {
-        _mode = State(initialValue: initialMode)
+        mode = initialMode
     }
 
     var body: some View {
@@ -276,25 +281,6 @@ struct CapabilitiesView: View {
     private var pageBody: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-                HStack {
-                    Picker("Workspace", selection: $mode) {
-                        ForEach(CapabilityWorkspaceMode.allCases) { item in
-                            Text(item.rawValue).tag(item)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .hazeTinted(.segments)
-                    .labelsHidden()
-
-                    Button("Refresh", systemImage: "arrow.clockwise") {
-                        Task {
-                            await appModel.refreshForSidebarItem(.capabilities)
-                            await refreshNativeActionYoloAdmission()
-                            await refreshResearchLabRuns()
-                        }
-                    }
-                }
-
                 summaryGrid
 
                 switch mode {
@@ -302,8 +288,6 @@ struct CapabilitiesView: View {
                     overview
                 case .installed:
                     build
-                case .needsLook:
-                    operate
                 }
 
                 developerTools
@@ -317,9 +301,18 @@ struct CapabilitiesView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.bottom, 32)
         }
+        // The tab row's right end, as on every tabbed page.
+        .pageActions {
+            Button("Refresh", systemImage: "arrow.clockwise") {
+                Task {
+                    await appModel.refreshForSidebarItem(.capabilities)
+                    await refreshNativeActionYoloAdmission()
+                    await refreshResearchLabRuns()
+                }
+            }
+        }
         .alivePageLine(headerLine, id: "capabilities.line")
         .navigationTitle("Capabilities")
-        .motionArrival(when: appModel.panelRefreshStatus[.capabilities] != nil)
         .quietReadTask {
             await appModel.refreshForSidebarItem(.capabilities)
             await refreshNativeActionYoloAdmission()
@@ -370,7 +363,7 @@ struct CapabilitiesView: View {
                     (tiles.approvals, "approval", "approvals"),
                 ].filter { $0.0 != "0/0" }, id: \.2) { value, one, many in
                     Text("\(value) \(value == "1" ? one : many)")
-                        .font(.system(size: 13))
+                        .font(ShellType.label)
                         .monospacedDigit()
                         .foregroundStyle(NativeAgentShell.secondary)
                 }
@@ -422,32 +415,21 @@ struct CapabilitiesView: View {
             // Core CapabilityFoundry stays behind its MCP metadata consumer;
             // the panel claimed a workshop that does not exist.
 
-            collapsedCard(
-                title: "Checks I run on myself",
-                subtitle: "What I have checked after an update, action previews, and records of what changed.",
-                isExpanded: $showNextGen,
-                attentionBadge: nextGenReviewCount > 0 ? "\(nextGenReviewCount) to review" : nil,
-                accessibilityIdentifier: "capabilities.show-next-gen"
-            ) {
-                nextGenRuntime
-            }
-
             AdvancedSection(title: "Capabilities I can use") {
                 switch CapabilitiesFoundryIndexPresentation.state(summary: appModel.engine.trust.capabilitySummary) {
                 case .populated(let summary):
-                    HStack(spacing: 12) {
-                        // Fold, don't badge: a quiet count; a word only when it asks something.
-                        // Same source as the header: `active` of `total` records.
-                        AdvancedStatusWord(status: nil, text: summary.summary.active == summary.summary.total
-                            ? "\(summary.summary.total) ready"
-                            : "\(summary.summary.active) of \(summary.summary.total) ready")
-                        if summary.summary.review > 0 {
-                            AdvancedStatusWord(status: "pending", text: "\(summary.summary.review) to review")
+                    // Fold, don't badge: a word only when it asks something.
+                    // The ready count is the header's sentence already.
+                    if summary.summary.review > 0 || summary.summary.autoloaded > 0 {
+                        HStack(spacing: 12) {
+                            if summary.summary.review > 0 {
+                                AdvancedStatusWord(status: "pending", text: "\(summary.summary.review) to review")
+                            }
+                            if summary.summary.autoloaded > 0 {
+                                AdvancedStatusWord(status: "warn", text: "\(summary.summary.autoloaded) loaded automatically")
+                            }
+                            Spacer()
                         }
-                        if summary.summary.autoloaded > 0 {
-                            AdvancedStatusWord(status: "warn", text: "\(summary.summary.autoloaded) loaded automatically")
-                        }
-                        Spacer()
                     }
 
                     let listed = CapabilitiesPlainCopy.displayRecords(summary.records)
@@ -670,7 +652,7 @@ struct CapabilitiesView: View {
 
             AdvancedSection(title: "Capability list") {
                 HStack(spacing: 8) {
-                    // The demo pack install moved to the "For developers" fold
+                    // The demo pack install moved to the "Developer" fold
                     // at the bottom of the page; nothing else about the catalog
                     // changed.
                     Button("Check for updates") {
@@ -772,117 +754,122 @@ struct CapabilitiesView: View {
         }
     }
 
-    private var operate: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-            // What is actually waiting on a person leads this segment; the rest
-            // of the old Hardening tab is behind the developer fold.
-            CapabilitiesApprovalInboxPanel()
-
-            AdvancedSection(title: "Plan a task") {
-                VStack(alignment: .leading, spacing: 10) {
-                    TextField("Describe a task", text: $routeText, axis: .vertical)
-                        .textFieldStyle(.roundedBorder)
-                        .font(ShellType.label)
-                        .lineLimit(2...4)
-                    Button("Make a plan") {
-                        Task { await appModel.routeIntent(routeText) }
-                    }
-                    .disabled(appModel.routePresentation.isPlanning)
-                }
-
-                switch appModel.routePresentation {
-                case .idle:
-                    EmptyView()
-                case .planning:
-                    AdvancedWaitingLine("Working out a plan…")
-                case let .failed(message):
-                    Text("No plan came back: \(message)")
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.trouble)
-                        .fixedSize(horizontal: false, vertical: true)
-                case let .plan(plan):
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(spacing: 12) {
-                            AdvancedStatusWord(status: plan.risk, text: plan.goalType)
-                            AdvancedStatusWord(status: plan.risk)
-                            if plan.requiresApproval {
-                                AdvancedStatusWord(status: "pending", text: "Waiting on you")
-                            }
-                            Spacer()
-                        }
-                        ForEach(plan.nextActions, id: \.self) { action in
-                            Text(action)
-                                .font(ShellType.label)
-                                .foregroundStyle(NativeAgentShell.text)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        AdvancedEyebrow(text: "Matched capabilities")
-                        switch IntentRoutePresentation.plan(plan).capabilityMatchState {
-                        case let .matches(capabilities):
-                            ForEach(capabilities.prefix(5)) { capability in
-                                CapabilityRow(capability: capability, compact: true)
-                            }
-                        case .noMatches:
-                            Text("Nothing installed matches this task.")
-                                .font(ShellType.label)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        case nil:
-                            EmptyView()
-                        }
-                    }
-                }
-            }
-
-            AdvancedSection(title: "Recent activity") {
-                let traceState = appModel.capabilityTraceTimeline
-                if case .sourceAbsent = traceState {
-                    AdvancedEmptyState(
-                        title: "No activity yet",
-                        detail: "The activity log has not been created yet."
-                    )
-                } else if case .empty = traceState {
-                    AdvancedEmptyState(
-                        title: "Nothing has happened yet",
-                        detail: "Planning a task, saving a workflow, or installing an item writes the first entry."
-                    )
-                } else if case .unavailable(let detail) = traceState {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Recent activity is unavailable")
-                            .font(ShellType.bodySemibold)
-                            .foregroundStyle(NativeAgentShell.trouble)
-                        Text(detail)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                } else {
-                    if case .partial(_, let rejectedRows) = traceState {
-                        Text("\(rejectedRows) unreadable \(rejectedRows == 1 ? "entry was" : "entries were") left out of this list.")
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.trouble)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    ForEach(traceState.traces.prefix(14)) { trace in
-                        CapabilityDetailRow(title: trace.title, detail: trace.kind, status: trace.status ?? "ok")
-                    }
-                }
-            }
-
-            SkillMemoryGraphPanel()
-        }
-    }
-
-    /// Everything behind "For developers": the old Hardening tab whole, the
+    /// Everything behind "Developer": the self-checks, the planner and its
+    /// activity log, the skill graph, the old Hardening tab whole, the
     /// research lab, and the demo pack. Nothing here was deleted — it is one
-    /// door down instead of a top-level word a stranger reads first.
+    /// door down instead of mixed in with what a person came here to read.
     private var developerTools: some View {
         AdvancedFold(
-            title: "For developers",
-            subtitle: "Checks and tools for people working on the app.",
+            title: "Developer",
+            subtitle: "Checks, logs and tools for people working on the app.",
+            // Folded, the self-checks' review count still says itself.
+            attention: nextGenReviewCount > 0 ? "\(nextGenReviewCount) to review" : nil,
             isExpanded: $showDeveloperTools
         ) {
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                collapsedCard(
+                    title: "Checks I run on myself",
+                    subtitle: "What I have checked after an update, action previews, and records of what changed.",
+                    isExpanded: $showNextGen,
+                    attentionBadge: nextGenReviewCount > 0 ? "\(nextGenReviewCount) to review" : nil,
+                    accessibilityIdentifier: "capabilities.show-next-gen"
+                ) {
+                    nextGenRuntime
+                }
+
+                AdvancedSection(title: "Plan a task") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        TextField("Describe a task", text: $routeText, axis: .vertical)
+                            .textFieldStyle(.roundedBorder)
+                            .font(ShellType.label)
+                            .lineLimit(2...4)
+                        Button("Make a plan") {
+                            Task { await appModel.routeIntent(routeText) }
+                        }
+                        .disabled(appModel.routePresentation.isPlanning)
+                    }
+
+                    switch appModel.routePresentation {
+                    case .idle:
+                        EmptyView()
+                    case .planning:
+                        AdvancedWaitingLine("Working out a plan…")
+                    case let .failed(message):
+                        Text("No plan came back: \(message)")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.trouble)
+                            .fixedSize(horizontal: false, vertical: true)
+                    case let .plan(plan):
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack(spacing: 12) {
+                                AdvancedStatusWord(status: plan.risk, text: plan.goalType)
+                                AdvancedStatusWord(status: plan.risk)
+                                if plan.requiresApproval {
+                                    AdvancedStatusWord(status: "pending", text: "Waiting on you")
+                                }
+                                Spacer()
+                            }
+                            ForEach(plan.nextActions, id: \.self) { action in
+                                Text(action)
+                                    .font(ShellType.label)
+                                    .foregroundStyle(NativeAgentShell.text)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            AdvancedEyebrow(text: "Matched capabilities")
+                            switch IntentRoutePresentation.plan(plan).capabilityMatchState {
+                            case let .matches(capabilities):
+                                ForEach(capabilities.prefix(5)) { capability in
+                                    CapabilityRow(capability: capability, compact: true)
+                                }
+                            case .noMatches:
+                                Text("Nothing installed matches this task.")
+                                    .font(ShellType.label)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            case nil:
+                                EmptyView()
+                            }
+                        }
+                    }
+                }
+
+                AdvancedSection(title: "Recent activity") {
+                    let traceState = appModel.capabilityTraceTimeline
+                    if case .sourceAbsent = traceState {
+                        AdvancedEmptyState(
+                            title: "No activity yet",
+                            detail: "The activity log has not been created yet."
+                        )
+                    } else if case .empty = traceState {
+                        AdvancedEmptyState(
+                            title: "Nothing has happened yet",
+                            detail: "Planning a task, saving a workflow, or installing an item writes the first entry."
+                        )
+                    } else if case .unavailable(let detail) = traceState {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Recent activity is unavailable")
+                                .font(ShellType.bodySemibold)
+                                .foregroundStyle(NativeAgentShell.trouble)
+                            Text(detail)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else {
+                        if case .partial(_, let rejectedRows) = traceState {
+                            Text("\(rejectedRows) unreadable \(rejectedRows == 1 ? "entry was" : "entries were") left out of this list.")
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.trouble)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        ForEach(traceState.traces.prefix(14)) { trace in
+                            CapabilityDetailRow(title: trace.title, detail: trace.kind, status: trace.status ?? "ok")
+                        }
+                    }
+                }
+
+                SkillMemoryGraphPanel()
+
                 researchLab
                 demoPack
                 hardening
@@ -1349,119 +1336,15 @@ struct CapabilitiesRunActionPresentation: Equatable {
     }
 }
 
-struct CapabilitiesApprovalInboxPanel: View {
-    @Environment(AppModel.self) private var appModel
-
-    private var pendingApprovals: [ApprovalRecord] {
-        appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }
-    }
-
-    private var readState: CapabilitiesApprovalInboxPresentation.ReadState {
-        CapabilitiesApprovalInboxPresentation.readState(
-            approvalCount: pendingApprovals.count,
-            refresh: appModel.panelRefreshStatus[.capabilities]
-        )
-    }
-
-    var body: some View {
-        AdvancedSection(title: "Approval inbox") {
-            switch readState {
-            case .loading:
-                AdvancedWaitingLine("Reading the approval requests…")
-            case .empty:
-                AdvancedEmptyState(
-                    title: "No approval requests",
-                    detail: "Anything I need a yes for waits here."
-                )
-            case .unavailable:
-                Text("The approval inbox could not be read. Refresh Capabilities before trusting an empty list.")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.trouble)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("capabilities.approvals.unavailable")
-            case .stale:
-                Text("Showing the last loaded approval requests; the latest refresh failed.")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.trouble)
-                    .fixedSize(horizontal: false, vertical: true)
-                approvalRows
-            case .available:
-                approvalRows
-            }
-
-            if let outcome = appModel.capabilitiesApprovalInboxOutcome {
-                Text(outcome.visibleMessage)
-                    .font(ShellType.label)
-                    .foregroundStyle(outcomeColor(outcome))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-                    .accessibilityIdentifier("capabilities.approvals.outcome")
-            }
-        }
-    }
-
-    private var approvalRows: some View {
-            ForEach(pendingApprovals.prefix(8)) { approval in
-                HStack(alignment: .top, spacing: 8) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        CapabilityDetailRow(
-                            title: approval.title,
-                            detail: approval.reason,
-                            status: approval.status.lowercased() == "pending" ? approval.risk : approval.status
-                        )
-                        switch ApprovalPayloadPreviewPresentation.state(for: approval) {
-                        case .available(let preview):
-                            ApprovalPayloadPreviewView(preview: preview)
-                        case .unavailable:
-                            Text(ApprovalPayloadPreviewPresentation.unavailableText)
-                                .font(ShellType.label)
-                                .foregroundStyle(NativeAgentShell.trouble)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    Spacer()
-                    if approval.status.lowercased() == "pending" {
-                        Button("Approve") {
-                            Task { await appModel.resolveCapabilitiesApprovalInbox(approval, decision: "approved") }
-                        }
-                        .controlSize(.small)
-                        .disabled(appModel.isResolvingApproval(id: approval.id)
-                            || !ApprovalPayloadPreviewPresentation.canResolve(approval))
-                        .accessibilityIdentifier("capabilities.approvals.approve.\(approval.id)")
-                        .accessibilityHint(appModel.isResolvingApproval(id: approval.id)
-                            ? "This approval is already being decided."
-                            : "Approve this request once.")
-                        Button("Deny") {
-                            Task { await appModel.resolveCapabilitiesApprovalInbox(approval, decision: "denied") }
-                        }
-                        .controlSize(.small)
-                        .disabled(appModel.isResolvingApproval(id: approval.id))
-                        .accessibilityIdentifier("capabilities.approvals.deny.\(approval.id)")
-                        .accessibilityHint(appModel.isResolvingApproval(id: approval.id)
-                            ? "This approval is already being decided."
-                            : "Deny this request once.")
-                    }
-                }
-            }
-    }
-
-    private func outcomeColor(_ outcome: CapabilitiesApprovalInboxResolution) -> Color {
-        switch CapabilitiesApprovalInboxPresentation.outcomeTone(outcome) {
-        case "success": NativeAgentShell.calm
-        default: NativeAgentShell.trouble
-        }
-    }
-}
-
 struct CapabilityRow: View {
     var capability: CapabilityRecord
     var compact = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(CapabilitiesPlainCopy.title(for: capability))
-                    .font(compact ? ShellType.labelSemibold : ShellType.bodySemibold)
+                    .font(compact ? ShellType.labelSemibold : ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                 Spacer()
@@ -1547,7 +1430,7 @@ struct SkillMemoryGraphPanel: View {
                 }
 
                 if let error = appModel.graphLoadError {
-                    Text("The graph refresh failed; what is shown may be stale: \(error)")
+                    Text("\(error) What is shown may be out of date.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.trouble)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1600,7 +1483,7 @@ struct SkillMemoryGraphPanel: View {
             } else if let error = appModel.graphLoadError {
                 AdvancedEmptyState(
                     title: "Skill memory graph unavailable",
-                    detail: "The graph could not be read: \(error)",
+                    detail: error,
                     actionTitle: "Refresh the graph",
                     action: { Task { await appModel.refreshGraph() } }
                 )
@@ -1745,7 +1628,7 @@ struct CapabilityDetailRow: View {
             if let pairs = rawPairs, !pairs.isEmpty {
                 Button {
                     withAnimation(
-                        NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)
+                        NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)
                     ) {
                         showsPairs.toggle()
                     }
@@ -1776,7 +1659,7 @@ struct CapabilityDetailRow: View {
                             }
                         }
                     }
-                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+                    .transition(NativeAgentMotion.arrivalFade)
                 }
             }
         }

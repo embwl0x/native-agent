@@ -102,7 +102,7 @@ public actor BotGitHubEventWatcher {
             // Claim first. An unwritable claim ends the pass: the next refresh
             // retries this snapshot rather than delivering what is not recorded.
             do { try save(state, dataRoot) } catch {
-                NSLog("bot_github_events: claim unwritable, pass abandoned: \(error.localizedDescription)")
+                nativeLog("bot_github_events: claim unwritable, pass abandoned: \(error.localizedDescription)")
                 return
             }
             let kind = (entity["kind"] as? String) == "pull_request" ? "pull request" : "issue"
@@ -136,7 +136,7 @@ public actor BotGitHubEventWatcher {
         do { try save(state, dataRoot) } catch {
             // The claims above are already durable; only the snapshot stamp is
             // behind, which costs one repeated (and fully deduped) pass.
-            NSLog("bot_github_events: state save failed: \(error.localizedDescription)")
+            nativeLog("bot_github_events: state save failed: \(error.localizedDescription)")
         }
     }
 

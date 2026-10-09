@@ -264,6 +264,90 @@ extension MemoryStorage {
                 END;
             """)
         }
+        m.registerMigration("v12_sense_memory_provenance") { db in
+            try db.execute(sql: """
+                CREATE TABLE memory_wrong_sense_versions (
+                  sense_id TEXT NOT NULL,
+                  version INTEGER NOT NULL,
+                  PRIMARY KEY (sense_id, version)
+                );
+                CREATE TRIGGER memory_sense_wrong_insert AFTER INSERT ON memories
+                WHEN EXISTS (
+                  SELECT 1 FROM json_each(NEW.metadata_json, '$.sense_versions') ref
+                  JOIN memory_wrong_sense_versions wrong
+                    ON wrong.sense_id = json_extract(ref.value, '$.sense_id')
+                   AND wrong.version = json_extract(ref.value, '$.version')
+                )
+                BEGIN
+                  UPDATE memories SET metadata_json = json_set(metadata_json, '$.sense_version_later_wrong', json('true')) WHERE id = NEW.id;
+                END;
+                CREATE TRIGGER memory_sense_wrong_update AFTER UPDATE OF metadata_json ON memories
+                WHEN COALESCE(json_extract(NEW.metadata_json, '$.sense_version_later_wrong'), 0) != 1
+                  AND EXISTS (
+                    SELECT 1 FROM json_each(NEW.metadata_json, '$.sense_versions') ref
+                    JOIN memory_wrong_sense_versions wrong
+                      ON wrong.sense_id = json_extract(ref.value, '$.sense_id')
+                     AND wrong.version = json_extract(ref.value, '$.version')
+                  )
+                BEGIN
+                  UPDATE memories SET metadata_json = json_set(metadata_json, '$.sense_version_later_wrong', json('true')) WHERE id = NEW.id;
+                END;
+                """)
+        }
+        // Contact sessions use agent-; standing helpers use bot-. Repair the
+        // old user-seat label from that canonical source, never from acceptance.
+        m.registerMigration("v13_peer_moment_origin") { db in
+            for table in ["memories", "proposals"] {
+                try db.execute(sql: """
+                    UPDATE \(table)
+                    SET metadata_json = json_set(metadata_json, '$.author', 'peer')
+                    WHERE json_valid(metadata_json)
+                      AND json_extract(metadata_json, '$.author') = 'user'
+                      AND (json_extract(metadata_json, '$.lane') = 'moment'
+                           OR json_extract(metadata_json, '$.kind') = 'moment')
+                      AND (source GLOB 'moment-promoter:agent-?*'
+                           OR source GLOB 'moment-promoter:bot-?*');
+                    """)
+            }
+        }
+        // Relevance judgments belong to one canonical corpus. Access counters
+        // do not change its meaning; every other memory mutation advances it.
+        m.registerMigration("v14_recall_judgment_generation") { db in
+            try db.execute(sql: """
+                INSERT INTO memory_metadata (key, value) VALUES ('recall_generation', 0);
+                CREATE TRIGGER memory_recall_generation_insert AFTER INSERT ON memories
+                BEGIN
+                  UPDATE memory_metadata SET value = value + 1 WHERE key = 'recall_generation';
+                END;
+                CREATE TRIGGER memory_recall_generation_delete AFTER DELETE ON memories
+                BEGIN
+                  UPDATE memory_metadata SET value = value + 1 WHERE key = 'recall_generation';
+                END;
+                CREATE TRIGGER memory_recall_generation_update
+                AFTER UPDATE OF id, content, persona_id, source, confidence, created_at, updated_at,
+                  embedding, embedding_epoch, status, metadata_json, lifecycle,
+                  valid_from, valid_to, observed_at, evidence_json ON memories
+                BEGIN
+                  UPDATE memory_metadata SET value = value + 1 WHERE key = 'recall_generation';
+                END;
+                """)
+        }
+        // Repair rows imported after v13, including interrupted older imports.
+        // New imports normalize at their persistence boundary after this runs.
+        m.registerMigration("v15_imported_peer_moment_origin") { db in
+            for table in ["memories", "proposals"] {
+                try db.execute(sql: """
+                    UPDATE \(table)
+                    SET metadata_json = json_set(metadata_json, '$.author', 'peer')
+                    WHERE json_valid(metadata_json)
+                      AND json_extract(metadata_json, '$.author') = 'user'
+                      AND (json_extract(metadata_json, '$.lane') = 'moment'
+                           OR json_extract(metadata_json, '$.kind') = 'moment')
+                      AND (source GLOB 'moment-promoter:agent-?*'
+                           OR source GLOB 'moment-promoter:bot-?*');
+                    """)
+            }
+        }
         return m
     }
 

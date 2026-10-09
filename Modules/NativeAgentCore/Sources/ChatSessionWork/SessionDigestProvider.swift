@@ -400,7 +400,7 @@ public struct SessionDigestProvider: Sendable {
         do {
             return try priorSessionId(in: text, sessionId: sessionId, dataRoot: dataRoot)
         } catch {
-            NSLog("Conversation handoff evidence unavailable: %@", error.localizedDescription)
+            nativeLog("Conversation handoff evidence unavailable: %@", error.localizedDescription)
             return nil
         }
     }

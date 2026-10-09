@@ -24,6 +24,15 @@ public enum MobileTrustAction: Sendable {
             case .fullMac: "Full Mac"
             }
         }
+
+        public var summary: String {
+            switch self {
+            case .safe: "Read files; no changes or Mac control"
+            case .workMode: "Edit approved workspaces; no outside writes or shell"
+            case .builder: "Edit workspaces; ask to write outside; no shell"
+            case .fullMac: "Files anywhere, shell, system control, move or trash"
+            }
+        }
     }
 
     public enum Field: String, CaseIterable, Sendable {

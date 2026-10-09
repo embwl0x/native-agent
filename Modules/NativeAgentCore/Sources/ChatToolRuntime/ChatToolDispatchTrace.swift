@@ -1,7 +1,10 @@
+import AgentConversations
+import AgentWorkspace
 import ChatSessionWork
 import ChatTurnContracts
 import ProviderRouting
 import Foundation
+import CryptoKit
 import ToolRegistry
 import MacControl
 import MCPDispatcher
@@ -9,6 +12,7 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import TrustCenter
+import ChromeControl
 
 // MARK: - Tool-output failure-shape heuristic
 
@@ -22,7 +26,8 @@ extension ChatToolOutcome {
     /// Fill missing failure evidence at the result boundary; successes pass through unchanged.
     public static func normalizedFailure(_ output: JSONValue, tool: String? = nil) -> JSONValue {
         guard !outputLooksSuccessful(output), !isWaitingOnPerson(output),
-              !wasCancelled(output), case .object(var object) = output else { return output }
+              !wasCancelled(output), !InlineInteractionNeed.isWaiting(output),
+              case .object(var object) = output else { return output }
         func text(_ key: String) -> String? {
             guard case .string(let raw)? = object[key] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -48,8 +53,22 @@ extension ChatToolOutcome {
             isCode($0) && !["failed", "error"].contains($0)
         } ?? "tool_failed"
         let candidates = ["message", "spoken", "text", "detail", "output", "error", "content", "result", "fix", "recovery_hint", "hint"].flatMap { explanations(object[$0]) }
-        let message = candidates.first { !isCode($0) }
-            ?? oldReason.flatMap { isCode($0) ? nil : $0 }
+        // A process that failed says why on stderr and in its exit code.
+        let exit = [object["exit_code"], object["exitCode"]].lazy.compactMap { value -> Int? in
+            if case .int(let code)? = value { return Int(code) }
+            if case .double(let code)? = value { return Int(exactly: code) }
+            return nil
+        }.first
+        var processFailure: String?
+        if let stderr = text("stderr") {
+            let tail = String(stderr.split(whereSeparator: \.isNewline).suffix(3).joined(separator: "\n").suffix(600))
+            processFailure = (exit.map { "The command exited with code \($0). " } ?? "") + "Its stderr ends: " + tail
+        } else if let exit, exit != 0 {
+            processFailure = "The command exited with code \(exit) and wrote nothing to stderr."
+        }
+        let explained: String? = candidates.first { !isCode($0) } ?? oldReason.flatMap { isCode($0) ? nil : $0 }
+        let message = explained
+            ?? processFailure
             ?? candidates.first
             ?? oldReason.flatMap { $0 == code ? nil : $0 }
             ?? "The tool failed without providing an explanation."
@@ -60,12 +79,14 @@ extension ChatToolOutcome {
         if object["message"] == nil { object["message"] = .string(message) }
         if object["argument_path"] == nil { object["argument_path"] = .null }
         if object["accepted"] == nil { object["accepted"] = .null }
-        // A missing receipt is not proof that a write did not happen.
+        // A missing receipt is not proof that a write did not happen; a
+        // built-in reader (the workspace's own read list) writes nothing.
+        let named = tool ?? text("tool")
         let effects = text("effects") ?? (object["effects_unknown"] == .bool(true) ? "unknown"
-            : object["not_run_status"] != nil ? "none" : "unknown")
+            : object["not_run_status"] != nil || named.map { AgentWorkspaceEnvironment.readTools.contains($0) } == true
+                ? "none" : "unknown")
         if object["effects"] == nil { object["effects"] = .string(effects) }
         if object["remedy"] == nil {
-            let named = tool ?? text("tool")
             // A folded tool is an app action: she calls and finds it there,
             // when the call came through the door. A lane that calls it by
             // name (Workshop, studio wander) keeps its name.
@@ -86,16 +107,18 @@ extension ChatToolOutcome {
                 nextCall = door && !words.isEmpty
                     ? .object(["tool": .string("app"), "input": .object(["find": .string(words)])]) : .null
             }
-            if door { nextCall = ToolNameAliases.appPointer(nextCall) }
+            let fix = effects == "none" ? text("fix") : nil
+            if fix != nil { nextCall = .null }
+            else if door { nextCall = ToolNameAliases.appPointer(nextCall) }
             object["remedy"] = .object([
                 "kind": .string(correction ? "correct_arguments" : "inspect"),
-                "instruction": .string(correction
+                "instruction": .string(fix ?? (correction
                     ? "Correct \(argument!) to the accepted shape, then call \(action.map { "app " + $0 } ?? named!) again with the intended values. Do not guess missing choices. Use next_call to inspect accepted choices or the current state if needed."
                     : effects == "none"
                         ? "Inspect the tool contract and resolve the reported prerequisite before retrying."
                         : effects == "occurred"
                             ? "The call took effect. Read the affected state before making another change; do not replay it blindly."
-                            : "Inspect the tool contract, then verify the affected state with its reader before retrying; the failed call may have taken effect."),
+                            : "Inspect the tool contract, then verify the affected state with its reader before retrying; the failed call may have taken effect.")),
                 "next_call": nextCall,
             ])
         }
@@ -115,6 +138,25 @@ extension ChatToolOutcome {
             object["accepted"] = evidence.accepted.map { .string(ChatSecretRedactor.redactText($0)) } ?? .null
             object["effects"] = .string(evidence.effects.rawValue)
             if evidence.argumentPath != nil { object["failure_code"] = .string("invalid_arguments") }
+        }
+        if let refusal = error as? AgentConversationStore.Failure { object["effects"] = .string(refusal.effects.rawValue) }
+        if error is AgentWorkspaceFailure { object["effects"] = .string("none") }
+        if let connector = error.missingConnectorID {
+            object["effects"] = .string("none")
+            object["outcome"] = .string("unmet")
+            object["fix"] = .string("The owner must sign in to \(connector) in Settings > Connectors.")
+        }
+        if let chrome = error as? ChromeControlRuntimeError {
+            if let effects = chrome.failureEffects { object["effects"] = .string(effects.rawValue) }
+            if case .outcomeUnknown = chrome { object["effects_unknown"] = .bool(true) }
+            if case .extensionReconnecting(_, let retryAfter) = chrome {
+                object["remedy"] = .object([
+                    "kind": .string("wait"),
+                    "instruction": .string(chrome.recoverySuggestion!),
+                    "retry_after": .string(ISO8601DateFormatter().string(from: retryAfter)),
+                    "next_call": .null,
+                ])
+            }
         }
         if let recovery = (error as? LocalizedError)?.recoverySuggestion,
            !recovery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -153,6 +195,7 @@ extension ChatToolOutcome {
         // from the 08-18 "legacy AX find tool 12/12 failed" burst: MacControl's op
         // store had all 12 `completed`). Mirrors `exactResultClass`.
         if let error = obj["error"], error != .null { return false }
+        if obj["outcome"] == .string("unmet") { return false }
         // An explicit boolean failure beside a null error is still a failure
         // (gpt-5.5 review 2026-08-21: `{ok:false, error:null}` must not flip
         // to ok once null stops counting). Mirrors `exactResultClass`.
@@ -164,7 +207,7 @@ extension ChatToolOutcome {
         // and the UI rendered failures as successes (audit 2026-06-09).
         if case .string(let status)? = obj["status"] {
             let s = status.lowercased()
-            if failureStatuses.contains(s) { return false }
+            if failureStatuses.contains(s) || s == "skipped" { return false }
             // A raised need did not run. Counting it as a successful round let
             // the whole-turn budget renew on a card the person had not touched
             // yet — the same shape as the re-asked CONFIRM above.
@@ -448,8 +491,7 @@ extension ChatToolOutcome {
 /// FileAccessGatedDispatcher) so gate denials — which throw before the inner
 /// dispatcher runs — still land as status:"failed" rows.
 ///
-/// PRIVACY (hard constraint): rows carry input KEY NAMES, status, duration,
-/// and surface only — never argument values or result bodies. The traces
+/// PRIVACY: rows carry keys and compact dispatch evidence, never bodies. The traces
 /// file is unencrypted and long-lived.
 ///
 /// Tracing is non-fatal: an IO failure here logs to stderr and the dispatch
@@ -477,27 +519,32 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
 
     package func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let startNs = DispatchTime.now().uptimeNanoseconds
+        let receiptID = UUID().uuidString.lowercased()
         // Turn Inspector W1: mirror a "begin" event onto the bus the instant
         // the dispatch starts, so the live Inspector shows a tool as RUNNING
         // (not just on completion). Bus-only — the events.jsonl row stays a
         // single end-of-dispatch row, unchanged.
         Self.fireBusEvent(
             tool: tool, input: input, surface: surface,
-            phase: "begin", status: "running", durationMs: nil, result: nil
+            phase: "begin", status: "running", durationMs: nil, result: nil,
+            evidence: Self.dispatchEvidence(tool: tool, input: input, status: "running", result: nil, receiptID: receiptID)
         )
         let result: JSONValue
         do {
             result = ChatToolOutcome.normalizedFailure(try await inner.dispatch(tool: tool, input: input, surface: surface), tool: tool)
         } catch {
             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
+            let failure = ChatToolOutcome.failure(error: error, tool: tool)
+            let evidence = Self.dispatchEvidence(tool: tool, input: input, status: "failed", result: failure, receiptID: receiptID)
             Self.fireBusEvent(
                 tool: tool, input: input, surface: surface,
                 phase: "end", status: "failed", durationMs: durationMs,
-                result: ChatToolOutcome.failure(error: error, tool: tool)
+                result: failure, evidence: evidence
             )
             await appendTraceRow(
                 tool: tool, input: input, surface: surface,
                 status: "failed", startNs: startNs,
+                receiptID: receiptID, evidence: evidence,
                 errorClass: "dispatch_threw",
                 errorDetail: ChatToolOutcome.failureDetail(error: error)
             )
@@ -512,13 +559,15 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         let status = waiting ? "waiting" : (ok ? "ok" : "failed")
         let failureShaped = !ok && !waiting
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
+        let evidence = Self.dispatchEvidence(tool: tool, input: input, status: status, result: result, receiptID: receiptID)
         Self.fireBusEvent(
             tool: tool, input: input, surface: surface,
-            phase: "end", status: status, durationMs: durationMs, result: result
+            phase: "end", status: status, durationMs: durationMs, result: result, evidence: evidence
         )
         await appendTraceRow(
             tool: tool, input: input, surface: surface,
             status: status, startNs: startNs,
+            receiptID: receiptID, evidence: evidence,
             errorClass: failureShaped ? ChatToolOutcome.receiptFailureClass(result) : nil,
             // Failure-shaped envelope only: an ok or waiting row carries none.
             errorDetail: failureShaped ? ChatToolOutcome.failureDetail(result) : nil
@@ -526,14 +575,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         return result
     }
 
-    /// Turn Inspector W1: fire a tool.dispatch event onto the in-process bus
-    /// (fire-and-forget, drop-on-backpressure, NEVER awaited). Carries the tool
-    /// name, phase (begin/end), status, duration, and — UNLIKE the privacy-
-    /// strict events.jsonl row — a TRUNCATED args/result preview (≤500 chars
-    /// each) so the Inspector can show what the tool was called with and what
-    /// it returned. The truncation is the redaction-at-emission boundary the
-    /// build plan requires; full bodies never reach the bus. Skipped when no
-    /// turn is bound.
+    /// Mirror dispatch evidence and redacted previews onto the turn bus.
     private static func fireBusEvent(
         tool: String,
         input: [String: JSONValue],
@@ -541,19 +583,17 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         phase: String,
         status: String,
         durationMs: Int?,
-        result: JSONValue?
+        result: JSONValue?,
+        evidence: [String: JSONValue]
     ) {
         guard TurnTraceContext.turnId != nil else { return }
         var payload: [String: JSONValue] = [
             "name": .string(tool),
             "phase": .string(phase),
             "status": .string(status),
+            "receipt": .object(evidence),
             "argKeys": .array(input.keys.sorted().map { .string($0) }),
-            // W2/W3-FIX 4: truncation is not redaction. `legacy keystroke tool.text`
-            // is the literal characters about to be typed and is well under
-            // the 500-char preview cap, so the raw secret rode intact onto the
-            // TurnTrace bus and into the Inspector. Secret-bearing args are
-            // replaced by count + digest BEFORE the preview is built.
+            // Redact injections before bounding; short secrets fit in a preview.
             "args": .string(Self.truncatePreview(
                 .object(MacInjectionArgRedaction.redacted(tool: tool, input: input))
             )),
@@ -576,18 +616,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 }
                 payload["errorDetail"] = ChatToolOutcome.failureDetail(result).map(JSONValue.string)
             }
-            // W2/W3-FIX-R2 3: redacting the ARGS was half the job. `ax_act`
-            // re-reads the element it wrote and returns `element.value` +
-            // `post_state.value`, so a password set into a field came back out
-            // through the RESULT preview — the same bus, the same Inspector,
-            // the same 500-char cap that never truncates a short secret.
-            // W3.5-FIX 3 — `mac_view` returns a base64 screenshot of whatever
-            // was on screen. The injection redactor above only knows about
-            // secret-shaped VALUES, so the picture rode into the bus payload
-            // (and from there the Inspector) intact. The full image still goes
-            // to the live model call; only this preview loses the pixels.
-            // An app call of a folded action is redacted as the tool it ran
-            // (mac.act's result echoes what it typed).
+            // Redact echoed injections and screen pixels as the tool that ran.
             let ran = ToolNameAliases.ranTool(tool, input: input)
             payload["result"] = .string(Self.truncatePreview(
                 MacInjectionResultRedaction.redacted(
@@ -633,6 +662,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         "git_log": "read",
         "repo_dirty_summary": "read",
         "write_file": "write",
+        "move_file": "write",
+        "copy_file": "write",
         "file_write": "write",
         "apply_patch": "write",
     ]
@@ -643,7 +674,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
     /// the event still records {tool, mode:write} with an empty paths array,
     /// which is honest (we know it touched files, not which without parsing the
     /// patch — out of W2 scope).
-    private static let pathArgKeys: [String] = ["path", "dir", "directory", "file", "filepath", "file_path"]
+    private static let pathArgKeys: [String] = ["path", "destination", "dir", "directory", "file", "filepath", "file_path"]
 
     private static func fireFileTouchEvent(
         tool: String,
@@ -686,6 +717,69 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         return LLMCallContext.sessionId
     }
 
+    private static func dispatchEvidence(
+        tool: String, input: [String: JSONValue], status: String, result: JSONValue?, receiptID: String
+    ) -> [String: JSONValue] {
+        var fields: [String: JSONValue] = [
+            "id": .string(receiptID),
+            "source": .string("data/traces/events.jsonl"),
+            "action": .string(ToolNameAliases.appAction(tool) ?? tool),
+            "preview": .bool(input["preview"] == .bool(true)),
+            "status": .string(status),
+        ]
+        if case .string(let action)? = input["action"] {
+            fields["action"] = .string(ChatSecretRedactor.redactText(String(action.prefix(512))))
+        }
+        fields["model"] = LLMCallContext.admittedModel.map(JSONValue.string)
+        fields["reasoningEffort"] = LLMCallContext.reasoningEffort.map(JSONValue.string)
+        if let result {
+            let preview = if case .object(let object) = result { object["status"] == .string("preview") || object["execution"] == .string("preview") } else { false }
+            fields["resultClass"] = .string(preview ? "preview" : ChatToolOutcome.exactResultClass(result).rawValue)
+            let evidence = receiptFields(result)
+            fields["resultReceipt"] = (try? evidence.serializedData(pretty: false).count).map { $0 <= 6_144 } == true
+                ? evidence : .object(["_truncated": .bool(true)])
+            if let data = try? TurnTraceRedactor.redactValue(result).serializedData(pretty: false) {
+                fields["resultDigest"] = .string(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
+            }
+        }
+        return fields
+    }
+
+    // Select evidence before preview truncation; keep worker routing and outcome
+    // trees without retaining their prompts or answers.
+    private static func receiptFields(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .object(let object):
+            var fields: [String: JSONValue] = [:]
+            for key in ["id", "receipt_id", "run_id", "runId", "job_id", "message_id", "session_id", "handle",
+                        "status", "outcome", "final_status", "preview", "effects", "execution", "would_card", "approver", "preview_scope", "verified", "verification",
+                        "result_handle", "result_ref", "read_ref", "digest", "sha256", "has_more", "next", "runsPath", "report_id", "index",
+                        "model", "model_id", "reasoning_effort", "reasoningEffort", "provider"] {
+                guard let field = object[key] else { continue }
+                switch field {
+                case .string(let text) where text.utf8.count <= 512:
+                    fields[key] = .string(ChatSecretRedactor.redactText(text))
+                case .bool, .int, .double, .null: fields[key] = field
+                default: break
+                }
+            }
+            if case .array(let checks)? = object["checks_not_run"] {
+                fields["checks_not_run"] = .array(checks.prefix(8).compactMap { check in
+                    guard case .string(let text) = check else { return nil }
+                    return .string(ChatSecretRedactor.redactText(String(text.prefix(160))))
+                })
+                if checks.count > 8 { fields["checks_not_run_omitted"] = .int(Int64(checks.count - 8)) }
+            }
+            for key in ["execution", "receipt", "detail", "workers", "results", "outputs", "agents", "routing", "synthesis", "next"] {
+                if let field = object[key], case .object = field { fields[key] = receiptFields(field) }
+                else if let field = object[key], case .array = field { fields[key] = receiptFields(field) }
+            }
+            return .object(fields)
+        case .array(let values): return .array(values.map(receiptFields))
+        default: return .null
+        }
+    }
+
     /// Serialize a JSONValue to a compact preview string, SECRET-REDACTED
     /// (gpt-5.5 W1 review blocker: truncation alone is not redaction — a
     /// token/password under the limit would persist to turn_traces verbatim),
@@ -693,6 +787,17 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
     /// yields a short marker.
     private static func truncatePreview(_ value: JSONValue) -> String {
         let limit = 500
+        var value = value
+        if case .object(let fields) = value, fields["status"] == .string("preview") {
+            var compact = fields.filter { ["status", "effects", "execution", "would_card", "approver", "preview_scope"].contains($0.key) }
+            if case .array(let checks)? = fields["checks_not_run"] {
+                compact["checks_not_run"] = .array(checks.prefix(2).compactMap { check in
+                    if case .string(let text) = check { .string(String(text.prefix(40))) } else { nil }
+                })
+                if checks.count > 2 { compact["checks_not_run_omitted"] = .int(Int64(checks.count - 2)) }
+            }
+            value = .object(compact)
+        }
         let raw: String
         if let data = try? TurnTraceRedactor.redactValue(value).serializedData(pretty: false),
            let s = String(data: data, encoding: .utf8) {
@@ -722,6 +827,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         surface: String,
         status: String,
         startNs: UInt64,
+        receiptID: String,
+        evidence: [String: JSONValue],
         errorClass: String? = nil,
         errorDetail: String? = nil
     ) async {
@@ -742,13 +849,14 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             errorClass: errorClass,
             errorDetail: errorDetail
         )
+        guard case .object(let receiptFields) = receipt.toJSONValue() else { return }
+        let receiptEvidence = receiptFields.merging(evidence) { _, evidence in evidence }
         let row: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
+            "id": .string(receiptID),
             "kind": .string("tool.dispatch"),
             "title": .string(tool),
             "status": .string(status),
-            // Keys only — argument VALUES and result bodies must never land
-            // in this file.
+            // Compact evidence only; no argument or result bodies.
             "payload": .object([
                 "argKeys": .array(argKeys.map { .string($0) }),
                 "durationMs": .int(Int64(durationMs)),
@@ -756,7 +864,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 // Turn Inspector W1: correlate this row to its turn. Unbound
                 // (non-turn dispatch) → "unknown".
                 "turnId": .string(TurnTraceContext.turnId ?? "unknown"),
-                "receipt": receipt.toJSONValue(),
+                "receipt": .object(receiptEvidence),
             ]),
             "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
         ])

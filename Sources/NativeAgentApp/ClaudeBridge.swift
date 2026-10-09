@@ -314,7 +314,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     /// MacControlBridge.shared.start() which uses DispatchQueue and runs
     /// every time. NOT async.
     func startSyncForBootstrap() {
-        NSLog("[claude-bootstrap] startSyncForBootstrap entered — invoking startSync")
+        nativeLog("[claude-bootstrap] startSyncForBootstrap entered — invoking startSync")
         startSync()
     }
 
@@ -345,7 +345,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         stateLock.lock()
         let alreadyRunningOrStarting = bridgeListener.isActive || !_token.isEmpty
         stateLock.unlock()
-        NSLog(
+        nativeLog(
             "[ClaudeBridge] startSync entered (state=%@)",
             alreadyRunningOrStarting ? "already-running-or-starting" : "idle"
         )
@@ -353,7 +353,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         installAgentLivePublisher()
 
         guard let tk = BridgeCore.generateToken() else {
-            NSLog("[ClaudeBridge] failed to generate token")
+            nativeLog("[ClaudeBridge] failed to generate token")
             return
         }
         stateLock.lock()
@@ -398,12 +398,12 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         writeDiscoveryFiles(token: token, port: port)
         stateLock.unlock()
 
-        NSLog("[ClaudeBridge] listening on 127.0.0.1:%d", Int(port))
+        nativeLog("[ClaudeBridge] listening on 127.0.0.1:%d", Int(port))
         Task.detached(priority: .utility) {
             let reconciled = (try? await CodexCompletionLifecycle.shared
                 .reconcileInterruptedClaims()) ?? []
             if !reconciled.isEmpty {
-                NSLog(
+                nativeLog(
                     "[ClaudeBridge] marked %d interrupted Codex completion claim(s) outcome_unknown",
                     reconciled.count
                 )
@@ -425,13 +425,13 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let repoRoot = dataRoot.deletingLastPathComponent()
         guard let helper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot) else {
-            NSLog(
+            nativeLog(
                 "[ClaudeBridge] codex wake helper missing; expected %@",
                 AgentBridgeRuntime.expectedHelperPath(named: "codex_thread_wakeup.js", dataRoot: dataRoot).path
             )
             return
         }
-        NSLog("[ClaudeBridge] codex wake helper: %@", helper.path)
+        nativeLog("[ClaudeBridge] codex wake helper: %@", helper.path)
         let processEnvironment = AgentBridgeRuntime.processEnvironment(base: environment)
         guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: processEnvironment) else {
             return
@@ -451,7 +451,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         process.standardError = FileHandle.nullDevice
         process.terminationHandler = { process in
             if process.terminationStatus != 0 {
-                NSLog(
+                nativeLog(
                     "[ClaudeBridge] Codex reply-job recovery exited %d",
                     Int(process.terminationStatus)
                 )
@@ -460,7 +460,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         do {
             try process.run()
         } catch {
-            NSLog(
+            nativeLog(
                 "[ClaudeBridge] could not start Codex reply-job recovery: %@",
                 String(describing: error)
             )

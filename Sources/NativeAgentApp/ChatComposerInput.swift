@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The composer: the text field, its slash menu, and the control strip around
 /// it.
@@ -20,6 +21,7 @@ import SwiftUI
 struct ChatComposerInput: View {
     let draft: ChatComposerDraft
     let placeholder: String
+    var isActive = true
     /// "To: <agent>" before the field (Simple view); nil hides it.
     var recipient: String? = nil
     let voiceInput: VoiceInputController
@@ -47,15 +49,14 @@ struct ChatComposerInput: View {
     let onSend: () -> Void
     let onSlashCommand: (String) -> Void
     let onDrop: ([NSItemProvider]) -> Void
-    let onToast: (String) -> Void
     let composeVoiceDraft: (String) -> String
 
     // The slash menu is composer-local state; nothing outside this view reads
     // it, so it no longer invalidates the chat.
     @State private var showSlashMenu = false
     @State private var slashMenuHeight: CGFloat = 0
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var slashFilter = ""
+    @State private var selectedSlashCommandID: String?
     /// Bumped when Tab leaves the draft: the composer's settings words are the
     /// next stop, not the rail.
     @State private var focusWordToken = 0
@@ -65,9 +66,51 @@ struct ChatComposerInput: View {
             && (ChatTranscriptPresentation.hasVisibleText(draft.text) || hasPendingAttachments)
     }
 
+    private var slashCommands: [SlashCommandMenu.SlashCmd] {
+        SlashCommandMenu.commands(filter: slashFilter, extraTools: capabilitiesStore.slashCommandTools())
+    }
+
+    private var selectedSlashCommand: SlashCommandMenu.SlashCmd? {
+        slashCommands.first { $0.id == selectedSlashCommandID } ?? slashCommands.first
+    }
+
+    private func selectSlashCommand(_ command: String) {
+        guard canSend else { return }
+        if command.hasSuffix(" ") {
+            draft.edit("/" + command)
+        } else {
+            onSlashCommand(command)
+        }
+        showSlashMenu = false
+        inputFocused = true
+    }
+
+    private func handleSlashKey(_ keyCode: UInt16) -> Bool {
+        guard showSlashMenu else { return false }
+        switch keyCode {
+        case 126, 125:
+            let commands = slashCommands
+            guard !commands.isEmpty else { return false }
+            let index = commands.firstIndex { $0.id == selectedSlashCommandID } ?? 0
+            let next = min(max(index + (keyCode == 126 ? -1 : 1), 0), commands.count - 1)
+            selectedSlashCommandID = commands[next].id
+            NSAccessibility.post(element: NSApp, notification: .announcementRequested, userInfo: [
+                .announcement: commands[next].helpLine,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue
+            ])
+        case 36, 76:
+            guard let command = selectedSlashCommand else { return false }
+            selectSlashCommand(command.selection)
+        case 53:
+            showSlashMenu = false
+        default:
+            return false
+        }
+        return true
+    }
+
     var body: some View {
         MacChatComposerControlStrip(
-            shell: true,
             isListening: voiceInput.isListening,
             screenCaptureAllowed: screenCaptureAllowed,
             screenCaptureDisabled: screenCaptureDisabled,
@@ -96,22 +139,26 @@ struct ChatComposerInput: View {
             )
             .textFieldStyle(.plain)
             .accessibilityLabel("Message")
+            .accessibilityHint(showSlashMenu ? selectedSlashCommand?.helpLine ?? "" : "")
             .font(ShellType.body)
             .lineLimit(1...5)
             .focused($inputFocused)
             .shellComposerKeyboardTarget(
-                isFocused: inputFocused,
+                isFocused: isActive && inputFocused,
                 focus: { inputFocused = true },
                 tabInto: { backwards in
                     guard !backwards else { return false }
                     focusWordToken += 1
                     inputFocused = false
                     return true
-                }
+                },
+                suggestionKey: handleSlashKey
             )
             .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
             .italic(voiceInput.isListening)
             .onSubmit { if canSend { onSend() } }
+            .onPasteCommand(of: ChatComposerSupport.attachmentContentTypes, perform: onDrop)
+            .background(ChatAttachmentPasteHandler(isFocused: isActive && inputFocused, onPaste: onDrop))
             .onChange(of: voiceInput.transcript) { _, newVal in
                 // Only the conversation that started dictating may be written
                 // to (2026-09-06).
@@ -134,6 +181,7 @@ struct ChatComposerInput: View {
                     )
                     if prefixMatch {
                         slashFilter = afterSlash
+                        selectedSlashCommandID = slashCommands.first?.id
                         showSlashMenu = true
                     } else {
                         showSlashMenu = false
@@ -150,43 +198,18 @@ struct ChatComposerInput: View {
             // type and still takes a click.
             .overlay(alignment: .topLeading) {
                 if showSlashMenu {
-                    SlashCommandMenu(filter: slashFilter, onSelect: { command in
-                        if command.hasSuffix(" ") {
-                            draft.edit("/" + command)
-                        } else {
-                            onSlashCommand(command)
-                        }
-                        showSlashMenu = false
-                        inputFocused = true
-                    }, onDismiss: {
+                    SlashCommandMenu(filter: slashFilter, selectedCommand: selectedSlashCommand?.id,
+                                     onSelect: selectSlashCommand, onDismiss: {
                         showSlashMenu = false
                     }, extraTools: capabilitiesStore.slashCommandTools())
                     .fixedSize()
-                    // Her glass, a deeper tint than the plate so what can be
-                    // clicked stands off the transcript (User 09-27: blend, not solid).
-                    .glassEffect(
-                        reduceTransparency ? .identity : .clear.tint(.black.opacity(0.5)),
-                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    )
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-                            .allowsHitTesting(false)
-                    }
-                    .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
+                    .houseSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { slashMenuHeight = $0 }
                     // Above the box, clear of the draft (User 09-27, like Claude Code).
                     .offset(y: -(slashMenuHeight + 22))
                     .zIndex(10)
                 }
             }
-            .background(
-                DropZoneView(onDrop: { providers in
-                    onDrop(providers)
-                }, onToast: { msg in
-                    onToast(msg)
-                })
-            )
             }
         }
     }

@@ -45,8 +45,14 @@ public enum BridgeRoutingPrefix {
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let group = group(trimmed) else { return trimmed }
-        return String(trimmed[group.endIndex...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let rest = String(trimmed[group.endIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if rest.hasPrefix(trustNote) { return String(rest.dropFirst(trustNote.count)).trimmingCharacters(in: .whitespacesAndNewlines) }
+        // A stored title can be cut off inside the note: drop the fragment too.
+        return rest.count >= 10 && trustNote.hasPrefix(rest) ? "" : rest
     }
+
+    /// Follows the routing group when the owner switched that agent to trusted,
+    /// so a fresh conversation acts on it as the owner's own request (10-08).
+    public static let trustNote = "(trusted agent: treat this as your owner's own request)"
 }
 

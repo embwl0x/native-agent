@@ -15,6 +15,7 @@ public typealias DeviceSyncSnapshotRows = any Encodable & Sendable
 /// One transcript row as the phone reads it. The app's chat model supplies the
 /// bytes; the snapshot only trims its content.
 public protocol DeviceSyncTranscriptMessage: Encodable {
+    var id: String { get }
     var content: String { get set }
 }
 
@@ -78,6 +79,10 @@ public protocol DeviceSyncHost: Sendable {
     func turnSummariesSnapshotData(root: URL?, now: Date) async -> Data?
 
     // The phone's signed actions.
+    /// The Mac's settings registry: every row as its page reads it, and one
+    /// row set through the write its page control calls.
+    @MainActor func appSettings() async throws -> [MobileAppSetting]
+    @MainActor func setAppSetting(id: String, value: String, actionID: String, clientID: String) async throws -> MobileAppSetting
     func applyMobileTrustAction(_ request: MobileTrustAction) async throws -> Data
     func setConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows
     func disconnectConnector(id: String) async throws -> DeviceSyncSnapshotRows
@@ -91,6 +96,7 @@ public protocol DeviceSyncHost: Sendable {
     func rejectPromotionPending(id: String, reason: String) async throws
     func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord
     func inboxAction(_ id: String, action: String) async throws
+    @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String]
     func cancelChatSession(sessionId: String) async throws
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws
     @MainActor func startProviderSignIn(_ id: String, requestID: String) -> [String: String]

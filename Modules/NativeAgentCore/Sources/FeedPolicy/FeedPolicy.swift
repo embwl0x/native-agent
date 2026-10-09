@@ -87,6 +87,11 @@ public enum JSONLLineCaps {
     /// through `appendJSONLCapped` at this budget, the sibling of the already
     /// capped `errors.jsonl` (TelegramErrorLog).
     public static let telegramReceipts = 5000
+    /// Disposable moment outcomes use the same diagnostic recovery window.
+    public static let momentReceipts = 5000
+    public static let receiptTrimTargetLines = 4000
+    /// Enables first/every-128-append checks, with 1,000 rows of trim headroom.
+    public static let receiptTrimTriggerBytes = 4 * 1024 * 1024
     /// `<dataRoot>/telegram/blocked.jsonl` — bounded admission/drop evidence.
     public static let telegramBlocked = 5000
     /// `<dataRoot>/memory/<persona>/notes.jsonl` — Telegram `/note` captures
@@ -202,6 +207,14 @@ public struct JSONLPathOwnedCapPolicy: Sendable, Equatable {
 public func jsonlPathOwnedCapPolicy(for path: URL) -> JSONLPathOwnedCapPolicy? {
     let file = path.lastPathComponent
     let parent = path.deletingLastPathComponent().lastPathComponent
+    if (file == "receipts.jsonl" && parent == "telegram")
+        || (file == "moment_receipts.jsonl" && parent == "memory") {
+        return JSONLPathOwnedCapPolicy(
+            maxLines: file == "moment_receipts.jsonl" ? JSONLLineCaps.momentReceipts : JSONLLineCaps.telegramReceipts,
+            trimWhenBytesExceed: JSONLLineCaps.receiptTrimTriggerBytes,
+            trimToLines: JSONLLineCaps.receiptTrimTargetLines
+        )
+    }
     if file == "events.jsonl", parent == "traces" {
         return JSONLPathOwnedCapPolicy(
             maxLines: JSONLLineCaps.traceEvents,

@@ -35,9 +35,10 @@ class AppQuietSettingsHost: QuietSettingsHost {
     var searchServiceURL: String { appModel.searxngBaseURL }
 
     func saveChatBrainDefaultsFailure() async -> String? {
-        switch await appModel.saveChatBrainDefaults() {
+        let result = await appModel.saveChatBrainDefaults()
+        switch result {
         case .saved, .unchanged: return nil
-        case .failed(let message, _): return message
+        case .failed: return result.agentMessage
         }
     }
 

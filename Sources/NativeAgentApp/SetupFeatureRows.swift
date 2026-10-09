@@ -7,16 +7,22 @@
 // and the weekly self-improvement key. Nothing here owns a setting of its own,
 // and no row invents a second home for one.
 //
-// The page's own cards for the inner-life master, Moments and the hour stay in
-// SetupView; they are deliberately NOT repeated here.
+// The inner-life master's switch is SetupView's (it carries the runtime's
+// status and recovery); this card puts it first, over the lanes it owns.
 
 import Cognition
 import SwiftUI
 import Context
 import TrustCenter
 
-struct SetupFeatureRows: View {
+struct SetupFeatureRows<InnerLife: View>: View {
     @Environment(AppModel.self) private var appModel
+    /// "An inner life", at the head of its own card, unfolded.
+    private let innerLife: InnerLife
+
+    init(@ViewBuilder innerLife: () -> InnerLife) {
+        self.innerLife = innerLife()
+    }
 
     // Same keys the Subconscious section and the Observatory bind, so no two
     // surfaces can show different truth.
@@ -39,25 +45,22 @@ struct SetupFeatureRows: View {
     @State private var embeddingsOn = false
     @State private var savingEmbeddings = false
     @State private var pendingEmbeddings: Bool?
-    @State private var savingMemoryMode = false
-    @State private var releasingEmbeddings = false
     @State private var savingContextFlow = false
 
     var body: some View {
         // Alive glass (2026-09-23): the section's fourteen rows in two group
         // cards, the inner life and then memory, where each was its own card.
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-            SetupSection(title: "Inner life") {
-                DisclosureGroup("Mind diagnostics") {
-                    reflectionRow
-                    organismRow
-                    fluidContextRow
-                }
+            AdvancedSection(title: "Inner life") {
+                innerLife
+                reflectionRow
+                organismRow
+                fluidContextRow
                 dreamsRow
                 weeklyConsolidationRow
                 selfImprovementRow
             }
-            SetupSection(title: "Memory") {
+            AdvancedSection(title: "Memory") {
                 meaningMemoryRow
                 knowledgeGraphRow
                 nightlyConsolidationRow
@@ -65,7 +68,6 @@ struct SetupFeatureRows: View {
                 adaptivePromotionRow
                 hygieneRow
                 crossSessionRecallRow
-                memoryModeRow
             }
         }
         .task { await load() }
@@ -285,7 +287,7 @@ struct SetupFeatureRows: View {
         } catch {
             embeddingsOn = !value
             appModel.systemToasts.push(
-                error: "The memory backend could not be changed: \(error.localizedDescription)"
+                error: UserFacingError.message(error, action: "change how memory is searched")
             )
         }
         savingEmbeddings = false
@@ -433,86 +435,6 @@ struct SetupFeatureRows: View {
         )
     }
 
-    // MARK: - Memory mode (the embeddings runtime's idle retention)
-
-    private var memoryModeRow: some View {
-        SetupFeatureCard(
-            title: "Memory mode",
-            detail: memoryModeDetail
-        ) {
-            // The model is loaded right now: give its memory back without
-            // waiting for the mode's idle timer.
-            if embeddingsStatus.map({ EmbeddingsSettingsActionPresentation.controls(status: $0, errorMessage: nil).showsReleaseNow }) == true {
-                Button(releasingEmbeddings ? "Releasing…" : "Release now") {
-                    Task { await releaseEmbeddings() }
-                }
-                .buttonStyle(.bordered)
-                .tint(NativeAgentShell.text)
-                .controlSize(.small)
-                .disabled(releasingEmbeddings || savingMemoryMode)
-                .accessibilityIdentifier("setup.feature.embeddings.release-now")
-            }
-            Picker("Memory mode", selection: Binding(
-                get: { memoryMode },
-                set: { mode in Task { await setMemoryMode(mode) } }
-            )) {
-                Text("Fast").tag("performance")
-                Text("Balanced").tag("balanced")
-                Text("Low").tag("low_memory")
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            // Nothing on this page truncates mid-word.
-            .fixedSize()
-            .disabled(embeddingsStatus == nil || savingMemoryMode || releasingEmbeddings)
-            .accessibilityIdentifier("setup.feature.memoryMode")
-        }
-    }
-
-    private var memoryMode: String {
-        guard let status = embeddingsStatus else { return "balanced" }
-        return EmbeddingsSettingsStatusPresentation(status: status).memoryMode
-    }
-
-    private var memoryModeDetail: String {
-        guard let status = embeddingsStatus else {
-            return "Checking how much I keep loaded for recall."
-        }
-        return EmbeddingsSettingsStatusPresentation(status: status).memoryModeDescription
-    }
-
-    @MainActor
-    private func setMemoryMode(_ mode: String) async {
-        savingMemoryMode = true
-        defer { savingMemoryMode = false }
-        do {
-            let result = try await appModel.setEmbeddingsMemoryMode(mode: mode)
-            embeddingsStatus = result.status
-            if let error = result.error {
-                appModel.systemToasts.push(error: result.detail.map { "\(error): \($0)" } ?? error)
-            }
-        } catch {
-            appModel.systemToasts.push(
-                error: "Memory mode update failed: \(error.localizedDescription)"
-            )
-        }
-    }
-
-    @MainActor
-    private func releaseEmbeddings() async {
-        releasingEmbeddings = true
-        defer { releasingEmbeddings = false }
-        let update: EmbeddingsSettingsActionPresentation.Update
-        do {
-            update = EmbeddingsSettingsActionPresentation.released(try await appModel.releaseEmbeddingsMemory())
-        } catch {
-            update = EmbeddingsSettingsActionPresentation.releaseFailed(error, preserving: embeddingsStatus)
-        }
-        embeddingsStatus = update.status
-        if let error = update.errorMessage {
-            appModel.systemToasts.push(error: error)
-        }
-    }
 
     // MARK: - Loading and reconciliation
 

@@ -18,12 +18,11 @@ enum GitHubPermissionPresentation {
             $0.id == "github.set_repo_visibility" && $0.risk == "external_write" && $0.requiresApproval
         }
         var result = [
-            "Repository metadata read for listing repositories",
-            "Issues read for listing repository issues",
+            "Metadata: read, so I can list your repositories",
+            "Issues: read, so I can list their issues",
         ]
         if hasVisibilityWrite {
-            result.append("Repository visibility changes use github.set_repo_visibility and require repository Administration: write (or equivalent visibility-write permission).")
-            result.append("Keep that write permission off unless you intend to change repository visibility from NativeAgent.")
+            result.append("Administration: write only if you want me to make a repository public or private. Changes follow your Trust settings. Leave it off otherwise.")
         }
         return result
     }
@@ -47,9 +46,9 @@ enum SlackSettingsPortal {
         var message: String {
             switch self {
             case .requested:
-                return "Requested Slack Apps in your default browser."
+                return "Asked your browser to open Slack apps."
             case .unavailable:
-                return "Could not open Slack Apps. Visit api.slack.com/apps in a browser to continue."
+                return "Couldn't open your browser. Go to api.slack.com/apps to continue."
             }
         }
     }
@@ -77,7 +76,7 @@ enum GoogleOAuthSetupGuidance {
               !id.unicodeScalars.contains(where: {
                   CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0)
               }) else {
-            return "Paste the Client ID ending in .apps.googleusercontent.com from Google Auth Platform > Clients. An email address or API key will not work."
+            return "That isn't a Google Client ID. Copy the one ending in .apps.googleusercontent.com from Google Auth Platform › Clients."
         }
         return nil
     }
@@ -86,40 +85,39 @@ enum GoogleOAuthSetupGuidance {
 @Observable
 @MainActor
 final class ConnectorWizardState {
-    var provider: String = ""
-    var providerDisplayName: String = ""
     var step: WizardStep = .loading
-    var registrationStatus: ConnectorRegistrationStatus?
     var registerAppResponse: ConnectorRegisterAppResponse?
+    /// The one error line: what happened and what to do. Never a service's
+    /// own text, which goes to the log only.
     var errorMessage: String?
     var oauthClientId: String = ""
     var oauthClientSecret: String = ""
-    // Tracks the Connect-button native OAuth flow so a sheet dismissed mid-flow
-    // cannot mutate the torn-down wizard afterward.
+    // Tracks the running sign-in or save so a sheet dismissed mid-flow, or a
+    // step left with Back, cannot mutate the wizard afterward.
     var flowTask: Task<Void, Never>?
 
+    /// One page each. Which pages a connector walks is `ConnectorWizardView.trail`.
     enum WizardStep {
         case loading
-        case notRegistered
-        case registering
-        case waitingRegistration
-        case manualToken
+        case googleIntro
+        case googleCreateApp
+        case appCredentials
+        case signIn
+        case githubToken
+        case slackTokens
+        case slackAccess
         case notionToken
-        case deviceFlow
         case success
         case error
-    }
-
-    func reset() {
-        step = .loading
-        registrationStatus = nil
-        registerAppResponse = nil
-        errorMessage = nil
     }
 }
 
 // MARK: - ConnectorWizardView
 
+/// Connecting an account, one page at a time: a title and where you are, one
+/// page of cards, and Back / Cancel / the next step along the bottom. A
+/// resizable sheet in the shell's card style (the alive kit), not a stack of
+/// panels in a fixed box.
 struct ConnectorWizardView: View {
     let provider: String
     /// Opened from a chat card that already said "Connect with GitHub": start
@@ -140,40 +138,28 @@ struct ConnectorWizardView: View {
     @State private var slackRequireMention = true
     @State private var slackSettingsOpenOutcome: SlackSettingsPortal.OpenOutcome?
     @State private var notionToken: String = ""
-    @State private var isSavingGitHubToken = false
-    @State private var isSavingSlackToken = false
-    @State private var isSavingNotionToken = false
-    @State private var isSavingOAuthApp = false
-    @State private var showsGoogleCredentials = false
-    @State private var googleSetupIssue: String?
+    @State private var isSaving = false
+    @State private var isConnecting = false
     @State private var didCopyRedirect = false
     @State private var didSaveOAuthApp = false
+
+    private var route: ConnectorWizardSetupRoute { ConnectorWizardSetupRoute.resolve(provider: provider) }
+    private var connectorID: String { InlineInteractionRegistry.canonicalConnectorID(provider) }
+    private var isGitHub: Bool { connectorID == "github" }
 
     private var googleConnectorId: String? {
         GoogleOAuthSetupGuidance.connectorId(provider: provider)
     }
 
     private var displayName: String {
-        switch provider {
+        switch connectorID {
         case "github": "GitHub"
         case "slack": "Slack"
         case "notion": "Notion"
-        case "email", "gmail": "Gmail"
-        case "calendar", "gcal", "google_calendar": "Google Calendar"
-        case "x": "X (Twitter)"
+        case "gmail": "Gmail"
+        case "gcal": "Google Calendar"
+        case "x": "X"
         default: provider.capitalized
-        }
-    }
-
-    private var providerSystemImage: String {
-        switch provider {
-        case "github": "chevron.left.forwardslash.chevron.right"
-        case "slack": "bubble.left.and.bubble.right"
-        case "notion": "doc.text"
-        case "email", "gmail": "envelope"
-        case "calendar", "gcal": "calendar"
-        case "x": "bubble.left.and.text.bubble.right"
-        default: "plug"
         }
     }
 
@@ -181,50 +167,27 @@ struct ConnectorWizardView: View {
         !parseSlackIDs(slackAllowedChannels).isEmpty || !parseSlackIDs(slackAllowedUsers).isEmpty
     }
 
-    // PATCH-2026-05-07: polish-ConnectorWizardView GradientText title, tinted icon
     var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack(spacing: NativeAgentSpacing.md) {
-                Image(systemName: providerSystemImage)
-                    .font(.system(size: 28, weight: .medium))
-                    .foregroundStyle(NativeAgentBrand.accentDeep)
-                VStack(alignment: .leading, spacing: 2) {
-                    GradientText(
-                        text: "Connect \(displayName)",
-                        colors: [.blue, .purple],
-                        font: NativeAgentFont.title
-                    )
-                    Text(stepSubtitle)
-                        .font(NativeAgentFont.body)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button {
-                    onDismiss()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                        .font(.system(size: 20))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close connection setup")
-            }
-            .padding(NativeAgentSpacing.xl)
-
+        VStack(alignment: .leading, spacing: 0) {
+            header
             Divider()
-
-            // Step content
             ScrollView {
                 stepContent
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(NativeAgentSpacing.xl)
+                    .id(state.step)
+                    .transition(NativeAgentMotion.dissolve)
             }
+            Divider()
+            footer
         }
-        .frame(width: 520, height: 520)
+        // Resizable: the sheet opens at the ideal size and the person can
+        // drag it larger for the long Google steps.
+        .frame(minWidth: 480, idealWidth: 560, minHeight: 440, idealHeight: 600)
+        .animation(NativeAgentMotion.standard, value: state.step)
+        .animation(NativeAgentMotion.standard, value: state.errorMessage)
         .task {
-            state.provider = provider
-            state.providerDisplayName = displayName
-            if provider.lowercased() == "slack" {
+            if connectorID == "slack" {
                 loadSlackIngressPolicy()
             }
             await loadRegistrationStatus()
@@ -235,27 +198,202 @@ struct ConnectorWizardView: View {
         }
     }
 
-    // MARK: - Step subtitle
+    // MARK: - Frame
 
-    private var stepSubtitle: String {
-        switch state.step {
-        case .loading: "Checking status…"
-        case .notRegistered:
-            googleConnectorId == nil ? "One-time app setup required." : "Advanced: custom Google OAuth setup."
-        case .registering: "Setting up OAuth app…"
-        case .waitingRegistration: "Waiting for GitHub approval…"
-        case .manualToken:
-            provider.lowercased() == "github"
-                ? "Paste a GitHub Personal Access Token."
-                : "Paste the Slack token from your app."
-        case .notionToken: "Paste a Notion integration token."
-        case .deviceFlow: "Sign in to \(displayName)."
-        case .success: "Connected successfully."
-        case .error:
-            ConnectorWizardSetupRoute.resolve(provider: provider) == .unavailable
-                ? "No verified setup path is available."
-                : "Something went wrong."
+    private var header: some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
+            Text("Connect \(displayName)")
+                .font(ShellType.title)
+                .foregroundStyle(NativeAgentShell.text)
+                .accessibilityAddTraits(.isHeader)
+            Text(stepLine)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, NativeAgentSpacing.xl)
+        .padding(.vertical, NativeAgentSpacing.lg)
+    }
+
+    /// The pages this connector walks, in order, for "Step 2 of 4".
+    private var trail: [ConnectorWizardState.WizardStep] {
+        switch route {
+        case .nativeOAuth:
+            googleConnectorId != nil
+                ? [.googleIntro, .googleCreateApp, .appCredentials, .signIn]
+                : [.appCredentials, .signIn]
+        case .manualToken where !isGitHub:
+            [.slackTokens, .slackAccess]
+        default:
+            []
+        }
+    }
+
+    private var stepLine: String {
+        if let index = trail.firstIndex(of: state.step), trail.count > 1 {
+            return "Step \(index + 1) of \(trail.count) · \(stepTitle)"
+        }
+        return stepTitle
+    }
+
+    private var stepTitle: String {
+        switch state.step {
+        case .loading: "Checking what's already set up…"
+        case .googleIntro: "Before you start"
+        case .googleCreateApp: "Make a Google app"
+        case .appCredentials: "Add your app's details"
+        case .signIn: "Sign in"
+        case .githubToken: "Use a token instead"
+        case .slackTokens: "Add your Slack tokens"
+        case .slackAccess: "Choose who can message me"
+        case .notionToken: "Add your Notion token"
+        case .success: "All set"
+        case .error: "Couldn't set this up"
+        }
+    }
+
+    private var backStep: ConnectorWizardState.WizardStep? {
+        switch state.step {
+        case .googleCreateApp: .googleIntro
+        case .appCredentials: googleConnectorId != nil ? .googleCreateApp : nil
+        case .signIn: isGitHub ? nil : .appCredentials
+        case .githubToken: .signIn
+        case .slackAccess: .slackTokens
+        default: nil
+        }
+    }
+
+    private struct PrimaryAction {
+        let title: String
+        var enabled = true
+        let run: () -> Void
+    }
+
+    private var primary: PrimaryAction? {
+        switch state.step {
+        case .loading:
+            return nil
+        case .googleIntro:
+            return PrimaryAction(title: "Set up my own app") { go(.googleCreateApp) }
+        case .googleCreateApp:
+            return PrimaryAction(title: "Next") { go(.appCredentials) }
+        case .appCredentials:
+            return PrimaryAction(
+                title: isSaving ? "Saving…" : "Save and continue",
+                enabled: !isSaving && !trimmed(state.oauthClientId).isEmpty
+            ) { saveAppCredentials() }
+        case .signIn where isGitHub:
+            if let code = githubCode {
+                return PrimaryAction(title: "Open GitHub") { NSWorkspace.shared.open(code.verificationURI) }
+            }
+            return PrimaryAction(title: "Connect with GitHub") { startGitHubSignIn() }
+        case .signIn:
+            return PrimaryAction(title: "Connect") { startOAuthSignIn() }
+        case .githubToken:
+            return PrimaryAction(
+                title: isSaving ? "Checking…" : "Save token",
+                enabled: !isSaving && !trimmed(githubToken).isEmpty
+            ) { run { await saveGitHubToken() } }
+        case .slackTokens:
+            return PrimaryAction(title: "Next") { go(.slackAccess) }
+        case .slackAccess:
+            return PrimaryAction(
+                title: isSaving ? "Checking…" : "Save",
+                enabled: !isSaving && slackAllowlistConfigured
+            ) { run { await saveSlackToken() } }
+        case .notionToken:
+            return PrimaryAction(
+                title: isSaving ? "Checking…" : "Connect",
+                enabled: !isSaving && !trimmed(notionToken).isEmpty
+            ) { run { await saveNotionToken() } }
+        case .success:
+            return PrimaryAction(title: "Done") { onDismiss() }
+        case .error:
+            guard route != .unavailable else { return nil }
+            return PrimaryAction(title: "Try again") { Task { await loadRegistrationStatus() } }
+        }
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+            if let message = state.errorMessage, state.step != .error {
+                Text(message)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(NativeAgentMotion.fade)
+            }
+            HStack(spacing: NativeAgentSpacing.sm) {
+                if let back = backStep {
+                    Button("Back") { go(back) }
+                        .disabled(isSaving)
+                }
+                Spacer(minLength: 0)
+                if state.step != .success {
+                    Button(state.step == .error ? "Close" : "Cancel") { onDismiss() }
+                        .keyboardShortcut(.cancelAction)
+                }
+                if let primary {
+                    Button(primary.title, action: primary.run)
+                        .buttonStyle(.borderedProminent)
+                        .hazeTinted(.button)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!primary.enabled)
+                }
+            }
+            .controlSize(.large)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, NativeAgentSpacing.xl)
+        .padding(.vertical, NativeAgentSpacing.lg)
+    }
+
+    // MARK: - Pieces
+
+    /// An eyebrow over one card: the alive kit's card, on the sheet.
+    private func card<Content: View>(_ title: String? = nil, @ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            if let title { AliveEyebrow(title) }
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.md) { content() }
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.text)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, AliveMetrics.rowInsetH)
+                .padding(.vertical, AliveMetrics.rowInsetV)
+                .aliveCard()
+        }
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(text)
+            .font(ShellType.label)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func numbered(_ number: Int, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
+            Text("\(number).")
+                .monospacedDigit()
+                .foregroundStyle(NativeAgentShell.secondary)
+                .frame(width: 18, alignment: .leading)
+            Text(text).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func code(_ text: String) -> some View {
+        Text(text)
+            .font(ShellType.code)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func copyButton(_ value: String) -> some View {
+        Button(didCopyRedirect ? "Copied" : "Copy") {
+            NSPasteboard.general.clearContents()
+            didCopyRedirect = NSPasteboard.general.setString(value, forType: .string)
+        }
+        .controlSize(.small)
     }
 
     // MARK: - Step content
@@ -264,293 +402,175 @@ struct ConnectorWizardView: View {
     private var stepContent: some View {
         switch state.step {
         case .loading:
-            HStack { Spacer(); ProgressView("Loading…"); Spacer() }
-
-        case .notRegistered:
-            if let connectorId = googleConnectorId {
-                googleSetupView(connectorId: connectorId)
-            } else {
-                notRegisteredView
-            }
-
-        case .registering:
-            HStack { Spacer(); ProgressView("Opening browser…"); Spacer() }
-
-        case .waitingRegistration:
-            waitingRegistrationView
-
-        case .manualToken:
-            if provider.lowercased() == "github" {
-                githubTokenView
-            } else {
-                slackTokenView
-            }
+            AdvancedWaitingLine("One moment…")
+        case .googleIntro:
+            if let connectorId = googleConnectorId { googleIntroView(connectorId: connectorId) }
+        case .googleCreateApp:
+            if let connectorId = googleConnectorId { googleCreateAppView(connectorId: connectorId) }
+        case .appCredentials:
+            appCredentialsView
+        case .signIn:
+            if isGitHub { githubSignInView } else { oauthSignInView }
+        case .githubToken:
+            githubTokenView
+        case .slackTokens:
+            slackTokensView
+        case .slackAccess:
+            slackAccessView
         case .notionToken:
             notionTokenView
-
-        case .deviceFlow:
-            if provider.lowercased() == "github" {
-                githubSignInView
-            } else {
-                deviceFlowView
-            }
-
         case .success:
             successView
-
         case .error:
-            errorView
+            Text(state.errorMessage ?? "Something went wrong. Try again.")
+                .font(ShellType.body)
+                .foregroundStyle(NativeAgentShell.text)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    // MARK: - Not registered
+    // MARK: - Google
 
-    private func googleSetupView(connectorId: String) -> some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-            NativePanel(title: "Before you begin", systemImage: "info.circle") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Text("This advanced connection requires creating your own Google Cloud project and OAuth app. NativeAgent does not provide a managed Google app. Google handles sign-in in your browser.")
-                    Text(connectorId == "calendar"
-                         ? "Only need calendars available in Mac Calendar? Add your Google account in macOS System Settings > Internet Accounts and enable Calendars. Then use NativeAgent’s Setup > Mac integration to grant Calendar access and enable calendar reading. No custom OAuth app is needed."
-                         : "Only need mail available in Apple Mail? Add your Google account in macOS System Settings > Internet Accounts and enable Mail. Then use NativeAgent’s Setup > Mac integration to grant Mail access and enable mail reading. This uses Apple Mail on this Mac; it does not connect the Gmail API.")
-                    Button("Open Mac integration") {
-                        onDismiss()
-                        _ = NativeAgentAppCoordinator.shared.request(.sidebar(.macIntegration))
-                    }
-                    Text("Continue below for direct, read-only access to \(displayName).")
+    private func googleIntroView(connectorId: String) -> some View {
+        let calendar = connectorId == "calendar"
+        return VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            card(calendar ? "Only need your calendars?" : "Only need your mail?") {
+                Text(calendar
+                     ? "Add your Google account in System Settings › Internet Accounts and turn on Calendars. Then give me Calendar access in Mac integration. No Google app needed."
+                     : "Add your Google account in System Settings › Internet Accounts and turn on Mail. Then give me Mail access in Mac integration. That reads Apple Mail on this Mac, not the Gmail API.")
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Open Mac integration") {
+                    onDismiss()
+                    _ = NativeAgentAppCoordinator.shared.request(.sidebar(.macIntegration))
                 }
-                .font(NativeAgentFont.body)
             }
-            NativePanel(title: "1. Create a Google OAuth app", systemImage: "list.number") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Link("Open Google Cloud Console", destination: URL(string: "https://console.cloud.google.com/apis/library")!)
-                    Text("Select or create a project. In APIs & Services > Library, find \(connectorId == "gmail" ? "Gmail API" : "Google Calendar API") and click Enable.")
-                    Text("Open Google Auth Platform > Branding (Get started for a new project). Enter an app name and your support/contact email. For a personal Google account, choose External under Audience, keep Testing, and add your Google email under Test users.")
-                    Text("Under Data Access > Add or remove scopes, add this read-only scope:")
-                    Text(NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)?.scopes ?? "")
-                        .textSelection(.enabled)
-                    Text("Under Clients > Create client, choose Desktop app, name it, and click Create. Copy the Client ID and the client secret if Google supplies one (also available in the downloaded client settings file). Do not use an API key or service account.")
-                    Text("Desktop clients use a local callback; there is no Authorized redirect URIs field to fill in. NativeAgent sends this exact value:")
-                    if let redirect = NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)?.redirectURI {
-                        Text(redirect).textSelection(.enabled)
-                        Button(didCopyRedirect ? "Redirect copied" : "Copy redirect URI") {
-                            NSPasteboard.general.clearContents()
-                            didCopyRedirect = NSPasteboard.general.setString(redirect, forType: .string)
-                        }
-                    }
-                    Text("Testing apps may need sign-in again after seven days. A work or school account may need administrator approval.")
-                    Link("Google’s desktop OAuth instructions", destination: URL(string: "https://developers.google.com/identity/protocols/oauth2/native-app")!)
-                }
-                .font(NativeAgentFont.body)
-            }
-            if showsGoogleCredentials {
-                NativePanel(title: "2. Check and save credentials", systemImage: "key") {
-                    VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                        TextField("Google OAuth Client ID", text: $state.oauthClientId)
-                            .textFieldStyle(.roundedBorder)
-                        SecureField("Client secret, if supplied by Google", text: $state.oauthClientSecret)
-                            .textFieldStyle(.roundedBorder)
-                        Text("Credentials stay on this Mac. This checks the format and saves them; Google verifies the app and account during sign-in.")
-                        if let googleSetupIssue {
-                            Text(googleSetupIssue).foregroundStyle(.red)
-                        }
-                        Button(isSavingOAuthApp ? "Saving…" : "Check and save") {
-                            googleSetupIssue = GoogleOAuthSetupGuidance.clientIDIssue(state.oauthClientId)
-                            guard googleSetupIssue == nil else { return }
-                            state.flowTask?.cancel()
-                            state.flowTask = Task { await saveOAuthAppAndContinue() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .hazeTinted(.button)
-                        .disabled(isSavingOAuthApp)
-                    }
-                }
-            } else {
-                Button("I have a Desktop app — enter credentials") {
-                    showsGoogleCredentials = true
-                }
-                .buttonStyle(.borderedProminent)
-                .hazeTinted(.button)
+            card("Want direct access to \(displayName)?") {
+                Text(calendar
+                     ? "You'll make a small Google app of your own. NativeAgent doesn't come with one. I ask to read your calendars and manage events, and Google handles the sign-in in your browser."
+                     : "You'll make a small Google app of your own. NativeAgent doesn't come with one. I only ask for read access, and Google handles the sign-in in your browser.")
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
-    private var notRegisteredView: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-            NativePanel(title: "First time? Set up the OAuth app.", systemImage: "app.badge.checkmark") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    if provider == "github" {
-                        Text("Click Register to open GitHub. Approve the app — it only takes 30 seconds.")
-                            .font(NativeAgentFont.body)
-                        Text("Your credentials are stored locally. No sharing required.")
-                            .font(NativeAgentFont.label)
-                            .foregroundStyle(.secondary)
-                    } else if case .nativeOAuth(let connectorId) =
-                                ConnectorWizardSetupRoute.resolve(provider: provider) {
-                        Text("Create an OAuth app for \(displayName), then paste its client credentials here. They stay on this Mac.")
-                            .font(NativeAgentFont.body)
-                        TextField("OAuth client ID", text: $state.oauthClientId)
-                            .textFieldStyle(.roundedBorder)
-                        SecureField("Client secret (only if your app requires one)", text: $state.oauthClientSecret)
-                            .textFieldStyle(.roundedBorder)
-                        Text("Redirect URI: \(NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)?.redirectURI ?? "http://127.0.0.1")")
-                            .font(NativeAgentFont.label)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                        if let steps = state.registerAppResponse?.nextSteps {
-                            ForEach(steps, id: \.self) { step in
-                                Text(step)
-                                    .font(NativeAgentFont.label)
-                                    .foregroundStyle(.secondary)
-                            }
+    private func googleCreateAppView(connectorId: String) -> some View {
+        let config = NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)
+        return VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            card("In Google Cloud") {
+                Link("Open Google Cloud Console", destination: URL(string: "https://console.cloud.google.com/apis/library")!)
+                numbered(1, "Pick a project, or make a new one.")
+                numbered(2, "In APIs & Services › Library, find the \(connectorId == "gmail" ? "Gmail API" : "Google Calendar API") and turn it on.")
+                numbered(3, "In Google Auth Platform › Branding, give the app a name and your email. Under Audience choose External, leave it in Testing, and add your own Google address as a test user.")
+                numbered(4, connectorId == "calendar"
+                         ? "In Data Access, add these scopes to read calendars and manage events:"
+                         : "In Data Access, add this read-only scope:")
+                code(config?.scopes ?? "")
+                numbered(5, "In Clients › Create client, choose Desktop app. Copy the Client ID, and the client secret if Google shows one. Not an API key or a service account.")
+            }
+            if let redirect = config?.redirectURI {
+                card("Redirect address") {
+                    Text("Desktop apps don't ask for one. If Google does, this is the exact address I use:")
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .firstTextBaseline) {
+                        code(redirect)
+                        Spacer(minLength: 0)
+                        copyButton(redirect)
+                    }
+                }
+            }
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                note("Apps left in Testing ask you to sign in again after seven days. A work or school account may need an administrator's OK.")
+                Link("Google's guide for desktop apps", destination: URL(string: "https://developers.google.com/identity/protocols/oauth2/native-app")!)
+                    .font(ShellType.label)
+            }
+        }
+    }
+
+    // MARK: - OAuth app details
+
+    private var appCredentialsView: some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            card(googleConnectorId != nil ? "Your Google app" : "Your \(displayName) app") {
+                if googleConnectorId == nil {
+                    Text("Make an app in \(displayName)'s developer portal, then paste its details here.")
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                TextField(googleConnectorId != nil ? "Client ID" : "OAuth client ID", text: $state.oauthClientId)
+                    .textFieldStyle(.roundedBorder)
+                SecureField("Client secret, if you were given one", text: $state.oauthClientSecret)
+                    .textFieldStyle(.roundedBorder)
+                note(googleConnectorId != nil
+                     ? "They stay on this Mac. I check the format now; Google checks the app when you sign in."
+                     : "They stay on this Mac.")
+            }
+            if googleConnectorId == nil, case .nativeOAuth(let connectorId) = route {
+                card("Redirect address") {
+                    let redirect = NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)?.redirectURI ?? "http://127.0.0.1"
+                    HStack(alignment: .firstTextBaseline) {
+                        code(redirect)
+                        Spacer(minLength: 0)
+                        copyButton(redirect)
+                    }
+                    if let steps = state.registerAppResponse?.nextSteps, !steps.isEmpty {
+                        ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
+                            numbered(index + 1, step)
                         }
                     }
                 }
-            }
-            HStack {
-                Spacer()
-                if provider == "github" {
-                    Button("Register App") {
-                        Task { await startRegistration() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .hazeTinted(.button)
-                } else if let portalUrl = state.registerAppResponse?.portalUrl,
-                          let url = URL(string: portalUrl) {
-                    Button("Open Portal") {
-                        NSWorkspace.shared.open(url)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .hazeTinted(.button)
-                }
-                if provider != "github" {
-                    Button(isSavingOAuthApp ? "Saving…" : "Save & Continue") {
-                        state.flowTask?.cancel()
-                        state.flowTask = Task { await saveOAuthAppAndContinue() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .hazeTinted(.button)
-                    .disabled(
-                        isSavingOAuthApp
-                        || state.oauthClientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    )
+                if let portalUrl = state.registerAppResponse?.portalUrl, let url = URL(string: portalUrl) {
+                    Link("Open \(displayName)'s developer portal", destination: url)
+                        .font(ShellType.label)
                 }
             }
         }
     }
 
-    // MARK: - Waiting registration
+    // MARK: - Sign in
 
-    private var waitingRegistrationView: some View {
-        VStack(spacing: NativeAgentSpacing.lg) {
-            ProgressView()
-            Text("Waiting for GitHub approval…")
-                .font(NativeAgentFont.body)
-            Text("Approve the NativeAgent app in your browser, then return here.")
-                .font(NativeAgentFont.label)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            HStack {
-                Button("Check Status") {
-                    Task { await checkRegistrationAndProceed() }
-                }
-                .buttonStyle(.borderedProminent)
-                .hazeTinted(.button)
-                Button("Start Over") {
-                    state.step = .notRegistered
-                }
-                .buttonStyle(.bordered)
+    private var oauthSignInView: some View {
+        card("Sign in to \(displayName)") {
+            if googleConnectorId != nil {
+                Text(didSaveOAuthApp
+                     ? "Your app's details are saved. Google checks them when you sign in."
+                     : "Your Google app is already set up. To change it, go Back.")
+                    .fixedSize(horizontal: false, vertical: true)
             }
-        }
-        .padding(.vertical, NativeAgentSpacing.xl)
-    }
-
-    // MARK: - Device flow
-
-    private var deviceFlowView: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-            NativePanel(title: "Sign in to \(displayName)", systemImage: "person.badge.key") {
-                if googleConnectorId != nil {
-                    Text(didSaveOAuthApp
-                         ? "Credentials passed the local format check and were saved. Google has not verified them yet."
-                         : "Saved app credentials are available. Google will verify them during sign-in.")
-                        .font(NativeAgentFont.body)
-                }
-                Text("Tap Connect to start the authorization flow. A browser window will open.")
-                    .font(NativeAgentFont.body)
-            }
-            HStack {
-                if googleConnectorId != nil {
-                    Button("Review or edit app setup") {
-                        showsGoogleCredentials = true
-                        state.step = .notRegistered
-                    }
-                }
-                Spacer()
-                Button("Connect") {
-                    state.flowTask?.cancel()
-                    state.flowTask = Task { await startDeviceFlow() }
-                }
-                .buttonStyle(.borderedProminent)
-                .hazeTinted(.button)
+            Text("Connect opens your browser. Approve there, then come back here.")
+                .fixedSize(horizontal: false, vertical: true)
+            if isConnecting {
+                AdvancedWaitingLine("Waiting for you in the browser…")
             }
         }
     }
-
-    // MARK: - GitHub sign-in (OAuth device flow)
 
     private var githubSignInView: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             if let code = githubCode {
-                NativePanel(title: "Enter this code on GitHub", systemImage: "person.badge.key") {
-                    VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                        HStack(spacing: NativeAgentSpacing.md) {
-                            Text(code.userCode)
-                                .font(.system(size: 30, weight: .semibold, design: .monospaced))
-                                .textSelection(.enabled)
-                                // macOS 27: selectable text + a custom accessibility label loops SwiftUI AX and crashes the app.
-                            Spacer()
-                            Button(didCopyGitHubCode ? "Copied" : "Copy",
-                                   systemImage: didCopyGitHubCode ? "checkmark" : "doc.on.doc") {
-                                copyGitHubCode(code.userCode)
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                        HStack(spacing: NativeAgentSpacing.sm) {
-                            ProgressView().controlSize(.small)
-                            Text("Waiting for you to approve on GitHub…")
-                                .font(NativeAgentFont.body)
-                                .foregroundStyle(.secondary)
+                card("Enter this code on GitHub") {
+                    HStack(spacing: NativeAgentSpacing.md) {
+                        Text(code.userCode)
+                            .font(.system(size: ShellType.displaySize, weight: .semibold, design: .monospaced))
+                            .textSelection(.enabled)
+                            // macOS 27: selectable text + a custom accessibility label loops SwiftUI AX and crashes the app.
+                        Spacer(minLength: 0)
+                        Button(didCopyGitHubCode ? "Copied" : "Copy") {
+                            copyGitHubCode(code.userCode)
                         }
                     }
-                }
-                HStack {
-                    Button("Use a token instead") { cancelGitHubSignIn(); state.step = .manualToken }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Open GitHub") { NSWorkspace.shared.open(code.verificationURI) }
-                        .buttonStyle(.borderedProminent)
-                        .hazeTinted(.button)
+                    AdvancedWaitingLine("Waiting for you to approve on GitHub. The code is already copied.")
                 }
             } else {
-                NativePanel(title: "Sign in with your GitHub account", systemImage: "person.badge.key") {
+                card("Sign in with your GitHub account") {
                     Text("GitHub opens in your browser and shows what I'm asking for: your repositories, pull requests, issues, organizations and notifications. Approve it and you're done. The sign-in is kept in your Mac's Keychain.")
-                        .font(NativeAgentFont.body)
-                }
-                HStack {
-                    // A sign-in may already be asking GitHub for a code; stop
-                    // it, or the code lands on the clipboard and the browser
-                    // opens after the person chose to paste a token.
-                    Button("Use a token instead") { cancelGitHubSignIn(); state.step = .manualToken }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Connect with GitHub") { startGitHubSignIn() }
-                        .buttonStyle(.borderedProminent)
-                        .hazeTinted(.button)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            // A sign-in may already be asking GitHub for a code; `go` stops
+            // it, or the code lands on the clipboard and the browser opens
+            // after the person chose to paste a token.
+            Button("Use a token instead") { go(.githubToken) }
+                .buttonStyle(.link)
+                .font(ShellType.label)
         }
     }
 
@@ -559,22 +579,206 @@ struct ConnectorWizardView: View {
         didCopyGitHubCode = NSPasteboard.general.setString(code, forType: .string)
     }
 
-    private func cancelGitHubSignIn() {
+    // MARK: - Tokens
+
+    private var githubTokenView: some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            card("Personal access token") {
+                SecureField("ghp_… or github_pat_…", text: $githubToken)
+                    .textFieldStyle(.roundedBorder)
+                note("It's kept in your Mac's Keychain, and I check it with GitHub before using it.")
+                Link("Make a token on GitHub", destination: URL(string: "https://github.com/settings/tokens")!)
+            }
+            card("What the token needs") {
+                ForEach(GitHubPermissionPresentation.lines(), id: \.self) { line in
+                    Text(line).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var slackTokensView: some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            card("Bot token") {
+                SecureField("xoxb-…", text: $slackToken)
+                    .textFieldStyle(.roundedBorder)
+                note("From your Slack app's OAuth & Permissions page. Leave it empty if it's already saved. It stays on this Mac, and I check it with Slack before saving.")
+            }
+            card("App token, to chat with me in Slack") {
+                SecureField("xapp-…", text: $slackAppToken)
+                    .textFieldStyle(.roundedBorder)
+                note("From Basic Information › App-Level Tokens, with connections:write. Turn on Socket Mode too. Only needed if you want to message me from Slack.")
+            }
+            card("Scopes to add") {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
+                    Text("channels:read, groups:read, im:read, mpim:read")
+                    Text("app_mentions:read, channels:history, groups:history, im:history, mpim:history to chat with me")
+                    Text("chat:write to post")
+                    Text("search:read needs a user token")
+                }
+                .font(ShellType.code)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .textSelection(.enabled)
+                note("Changed scopes or event subscriptions? Reinstall the Slack app before you try chatting.")
+            }
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                Button("Open Slack apps") {
+                    slackSettingsOpenOutcome = SlackSettingsPortal.open {
+                        NSWorkspace.shared.open($0)
+                    }
+                }
+                if let slackSettingsOpenOutcome {
+                    Text(slackSettingsOpenOutcome.message)
+                        .font(ShellType.label)
+                        .foregroundStyle(slackSettingsOpenOutcome == .requested
+                                         ? NativeAgentShell.secondary : NativeAgentShell.trouble)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    private var slackAccessView: some View {
+        card("Who can message me") {
+            TextField("Channel IDs, like C0123", text: $slackAllowedChannels)
+                .textFieldStyle(.roundedBorder)
+            TextField("User IDs, like U0123", text: $slackAllowedUsers)
+                .textFieldStyle(.roundedBorder)
+            Toggle("In channels and groups, only answer when @mentioned", isOn: $slackRequireMention)
+            note("Add at least one channel or user. With both empty, I stay out of Slack chats. Direct messages never need an @mention.")
+        }
+    }
+
+    private var notionTokenView: some View {
+        card("Integration token") {
+            Text("Make an internal integration in Notion, share the pages or databases I should see with it, then paste its token here.")
+                .fixedSize(horizontal: false, vertical: true)
+            SecureField("ntn_… or secret_…", text: $notionToken)
+                .textFieldStyle(.roundedBorder)
+            note("I check it with Notion first. Pages you don't share stay private.")
+            Link("Open Notion integrations", destination: URL(string: "https://www.notion.so/profile/integrations")!)
+        }
+    }
+
+    // MARK: - Success
+
+    private var successView: some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+            HStack(spacing: NativeAgentSpacing.sm) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(ShellType.title)
+                    .foregroundStyle(NativeAgentShell.calm)
+                    .accessibilityHidden(true)
+                Text("\(displayName) is connected.")
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+            }
+            if let githubLogin {
+                note("Signed in as @\(githubLogin).")
+            }
+            note("Try asking me: \u{201C}List my \(isGitHub ? "repos" : "recent items").\u{201D}")
+        }
+    }
+
+    // MARK: - Logic
+
+    private func trimmed(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Moving between pages stops whatever the last page started: a GitHub
+    /// code request, a browser sign-in.
+    private func go(_ step: ConnectorWizardState.WizardStep) {
         state.flowTask?.cancel()
         state.flowTask = nil
         githubCode = nil
+        isConnecting = false
+        state.errorMessage = nil
+        state.step = step
+    }
+
+    private func run(_ work: @escaping @MainActor () async -> Void) {
+        state.flowTask?.cancel()
+        state.errorMessage = nil
+        state.flowTask = Task { await work() }
+    }
+
+    /// One line: what happened, and what to do. The service's own text can
+    /// echo a token, so it goes to the log only — through the same reason
+    /// classes the inline chat card uses. A browser sign-in is never
+    /// classified: "rejected the token" would misdescribe someone who simply
+    /// didn't finish.
+    private func failure(
+        _ raw: String?, typed: [String] = [], fallback: String, classify: Bool = true
+    ) -> String {
+        let reason = InlineConnectorSetup.failureReason(
+            raw ?? "", service: displayName, typed: typed, otherwise: fallback)
+        guard classify else { return fallback }
+        if reason.hasPrefix("Couldn't reach") {
+            return "\(reason) Check your internet connection, then try again."
+        }
+        if reason.hasSuffix("rejected the token.") {
+            return "\(reason) Check it's pasted in full, then try again."
+        }
+        if reason.contains("missing a permission") {
+            return "\(reason) Add it in \(displayName), then try again."
+        }
+        if reason.contains("needs a valid allowed") {
+            return "\(reason) Check the IDs, then try again."
+        }
+        return reason
+    }
+
+    private func loadRegistrationStatus() async {
+        state.step = .loading
+        state.errorMessage = nil
+        switch route {
+        case .manualToken where isGitHub:
+            // Sign-in first; the token paste stays one tap away.
+            state.step = .signIn
+            if startsSignIn && githubCode == nil { startGitHubSignIn() }
+        case .manualToken:
+            state.step = .slackTokens
+        case .notionToken:
+            state.step = .notionToken
+        case .unavailable:
+            state.errorMessage = "\(displayName) can't be set up from here yet. Nothing was changed."
+            state.step = .error
+        case .nativeOAuth(let connectorId):
+            if let credentials = NativeOAuthFlow.connectorOAuthAppCredentials(connectorId: connectorId) {
+                state.oauthClientId = credentials.clientId
+                state.oauthClientSecret = credentials.clientSecret ?? ""
+            }
+            do {
+                let status = try await appModel.getConnectorRegistrationStatus(provider: provider)
+                if status.registered && status.clientIdPresent {
+                    state.step = .signIn
+                } else {
+                    // The portal link and its steps, for the details page.
+                    state.registerAppResponse = try? await appModel.registerConnectorApp(provider: provider)
+                    state.step = googleConnectorId != nil ? .googleIntro : .appCredentials
+                }
+            } catch {
+                state.errorMessage = failure(
+                    error.localizedDescription,
+                    fallback: "Couldn't read what's already set up for \(displayName). Try again.",
+                    classify: false)
+                state.step = .error
+            }
+        }
     }
 
     private func startGitHubSignIn() {
-        state.flowTask?.cancel()
-        state.flowTask = Task {
+        run {
             let code: GitHubOAuthDeviceFlow.DeviceCode
             do {
                 code = try await GitHubOAuthDeviceFlow.requestDeviceCode()
             } catch {
                 guard !Task.isCancelled else { return }
-                state.errorMessage = error.localizedDescription
-                state.step = .error
+                state.errorMessage = failure(
+                    error.localizedDescription,
+                    fallback: "GitHub didn't start the sign-in. Try again, or use a token instead.",
+                    classify: false)
                 return
             }
             guard !Task.isCancelled else { return }
@@ -589,343 +793,48 @@ struct ConnectorWizardView: View {
                 state.step = .success
                 await appModel.refreshForSidebarItem(.connectors)
             } else {
-                state.errorMessage = outcome.result.error ?? "GitHub sign-in stopped."
-                state.step = .error
+                state.errorMessage = failure(
+                    outcome.result.error,
+                    fallback: "GitHub sign-in didn't finish. Try again, or use a token instead.",
+                    classify: false)
             }
         }
     }
 
-    private var slackTokenView: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-            NativePanel(title: "Slack Bot User OAuth Token", systemImage: "key.fill") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Text("Paste the Bot User OAuth Token from Slack's OAuth & Permissions page. Leave blank if it is already saved.")
-                        .font(NativeAgentFont.body)
-                    SecureField("xoxb-...", text: $slackToken)
-                        .textFieldStyle(.roundedBorder)
-                    Text("Saved locally under NativeAgent's data root. The token is validated with Slack before the connector is marked connected.")
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            NativePanel(title: "Slack Socket Mode App Token", systemImage: "dot.radiowaves.left.and.right") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Text("Paste the app-level token from Slack Basic Information > App-Level Tokens.")
-                        .font(NativeAgentFont.body)
-                    SecureField("xapp-...", text: $slackAppToken)
-                        .textFieldStyle(.roundedBorder)
-                    Text("Required only for inbound Slack chat. Enable Socket Mode and grant the app token connections:write.")
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
-                    Text("After changing Slack scopes or bot event subscriptions, reinstall the Slack app before testing inbound chat.")
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            NativePanel(title: "Who Can Message Your Agent", systemImage: "person.badge.shield.checkmark") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    TextField("Allowed channel IDs, such as C0123", text: $slackAllowedChannels)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Allowed user IDs, such as U0123", text: $slackAllowedUsers)
-                        .textFieldStyle(.roundedBorder)
-                    Toggle("Require an @mention in channels and group chats", isOn: $slackRequireMention)
-                    Text("Add at least one channel or user. Inbound Slack chat stays safely off when both lists are empty; direct messages never require an @mention.")
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
-                    if !slackAllowlistConfigured {
-                        Text("Slack is not ready to save: add at least one allowed channel or user.")
-                            .font(NativeAgentFont.label)
-                            .foregroundStyle(.orange)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-            NativePanel(title: "Useful Slack Scopes", systemImage: "checklist") {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("channels:read, groups:read, im:read, mpim:read")
-                    Text("app_mentions:read plus channels:history, groups:history, im:history, mpim:history for inbound chat")
-                    Text("chat:write for direct posting")
-                    Text("search:read requires a user token for legacy Slack search")
-                }
-                .font(NativeAgentFont.label)
-                .foregroundStyle(.secondary)
-            }
-            HStack {
-                Spacer()
-                Button("Open Slack Apps") {
-                    slackSettingsOpenOutcome = SlackSettingsPortal.open {
-                        NSWorkspace.shared.open($0)
-                    }
-                }
-                .buttonStyle(.bordered)
-                Button(isSavingSlackToken ? "Saving..." : "Save Slack Settings") {
-                    state.flowTask?.cancel()
-                    state.flowTask = Task { await saveSlackToken() }
-                }
-                .buttonStyle(.borderedProminent)
-                .hazeTinted(.button)
-                .disabled(isSavingSlackToken || !slackAllowlistConfigured)
-            }
-            if let slackSettingsOpenOutcome {
-                Text(slackSettingsOpenOutcome.message)
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(
-                        slackSettingsOpenOutcome == .requested ? Color.secondary : Color.orange
-                    )
-                    .textSelection(.enabled)
-            }
-        }
-    }
-
-    private var githubTokenView: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-            NativePanel(title: "GitHub Personal Access Token", systemImage: "key.fill") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Text("Paste a GitHub Personal Access Token. Fine-grained tokens should allow repository metadata reads for repo listing.")
-                        .font(NativeAgentFont.body)
-                    SecureField("ghp_... or github_pat_...", text: $githubToken)
-                        .textFieldStyle(.roundedBorder)
-                    Text("Saved in your Mac Keychain. The token is validated against GitHub /user before the connector is marked connected.")
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            NativePanel(title: "Useful GitHub Permissions", systemImage: "checklist") {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(GitHubPermissionPresentation.lines(), id: \.self) { line in
-                        Text(line)
-                    }
-                }
-                .font(NativeAgentFont.label)
-                .foregroundStyle(.secondary)
-            }
-            HStack {
-                Button("Connect with GitHub instead") { state.step = .deviceFlow }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Open GitHub Tokens") {
-                    if let url = URL(string: "https://github.com/settings/tokens") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-                .buttonStyle(.bordered)
-                Button(isSavingGitHubToken ? "Saving..." : "Save Token") {
-                    state.flowTask?.cancel()
-                    state.flowTask = Task { await saveGitHubToken() }
-                }
-                .buttonStyle(.borderedProminent)
-                .hazeTinted(.button)
-                .disabled(
-                    isSavingGitHubToken
-                    || githubToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
-            }
-        }
-    }
-
-    private var notionTokenView: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-            NativePanel(title: "Notion Internal Integration Token", systemImage: "key.fill") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Text("Create an internal integration, share the pages or databases it should access with that integration, then paste its token here.")
-                        .font(NativeAgentFont.body)
-                    SecureField("ntn_... or secret_...", text: $notionToken)
-                        .textFieldStyle(.roundedBorder)
-                    Text("NativeAgent validates the token against Notion before marking the connector connected. Unshared pages remain inaccessible.")
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            HStack {
-                Spacer()
-                Button("Open Notion Integrations") {
-                    NSWorkspace.shared.open(
-                        URL(string: "https://www.notion.so/profile/integrations")!
-                    )
-                }
-                .buttonStyle(.bordered)
-                Button(isSavingNotionToken ? "Validating…" : "Connect") {
-                    state.flowTask?.cancel()
-                    state.flowTask = Task { await saveNotionToken() }
-                }
-                .buttonStyle(.borderedProminent)
-                .hazeTinted(.button)
-                .disabled(
-                    isSavingNotionToken
-                    || notionToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
-            }
-        }
-    }
-
-    // MARK: - Success
-    // PATCH-2026-05-07: polish-ConnectorWizardView gradient success icon + AuroraBackground hint
-
-    private var successView: some View {
-        VStack(spacing: NativeAgentSpacing.lg) {
-            ZStack {
-                Circle()
-                    .fill(Color.green.opacity(0.12))
-                    .frame(width: 96, height: 96)
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 56))
-                    .foregroundStyle(.green)
-            }
-            GradientText(text: "\(displayName) connected", colors: [.green, .teal], font: NativeAgentFont.title)
-            if let githubLogin {
-                Text("Signed in as @\(githubLogin)")
-                    .font(NativeAgentFont.body)
-            }
-            Text("Try asking: \u{201C}List my \(provider == "github" ? "repos" : "recent items").\u{201D}")
-                .font(NativeAgentFont.body)
-                .foregroundStyle(.secondary)
-            Button("Done") { onDismiss() }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-        }
-        .padding(.vertical, NativeAgentSpacing.xl)
-    }
-
-    // MARK: - Error
-
-    private var errorView: some View {
-        VStack(spacing: NativeAgentSpacing.lg) {
-            ZStack {
-                Circle()
-                    .fill(Color.orange.opacity(0.12))
-                    .frame(width: 80, height: 80)
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 40))
-                    .foregroundStyle(.orange)
-            }
-            Text(state.errorMessage ?? "An error occurred.")
-                .font(NativeAgentFont.body)
-                .multilineTextAlignment(.center)
-            HStack {
-                if ConnectorWizardSetupRoute.resolve(provider: provider) != .unavailable {
-                    Button("Retry") {
-                        Task { await loadRegistrationStatus() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .hazeTinted(.button)
-                }
-                Button("Dismiss") { onDismiss() }
-                    .buttonStyle(.bordered)
-            }
-        }
-        .padding(.vertical, NativeAgentSpacing.xl)
-    }
-
-    // MARK: - Logic
-
-    private func loadRegistrationStatus() async {
-        state.step = .loading
-        switch ConnectorWizardSetupRoute.resolve(provider: provider) {
-        case .manualToken where provider.lowercased() == "github":
-            // Sign-in first; the token paste stays one tap away.
-            state.step = .deviceFlow
-            if startsSignIn && githubCode == nil { startGitHubSignIn() }
-            return
-        case .manualToken:
-            state.step = .manualToken
-            return
-        case .notionToken:
-            state.step = .notionToken
-            return
-        case .unavailable:
-            state.errorMessage = "\(displayName) does not have a verified in-app setup path. Configure it manually outside this wizard; NativeAgent will not mark it connected without validated credentials."
-            state.step = .error
-            return
-        case .nativeOAuth(let connectorId):
-            if let credentials = NativeOAuthFlow.connectorOAuthAppCredentials(
-                connectorId: connectorId
-            ) {
-                state.oauthClientId = credentials.clientId
-                state.oauthClientSecret = credentials.clientSecret ?? ""
-            }
-            break
-        }
-        do {
-            let status = try await appModel.getConnectorRegistrationStatus(provider: provider)
-            state.registrationStatus = status
-            if status.registered && status.clientIdPresent {
-                state.step = .deviceFlow
-            } else {
-                // Pre-fetch portal info
-                await fetchRegisterAppInfo()
-                state.step = .notRegistered
-            }
-        } catch {
-            state.errorMessage = error.localizedDescription
-            state.step = .error
-        }
-    }
-
-    private func fetchRegisterAppInfo() async {
-        state.registerAppResponse = try? await appModel.registerConnectorApp(provider: provider)
-    }
-
-    private func startRegistration() async {
-        state.step = .registering
-        guard let response = try? await appModel.registerConnectorApp(provider: provider) else {
-            state.errorMessage = "Failed to get registration URL."
-            state.step = .error
-            return
-        }
-        state.registerAppResponse = response
-        if let approvalUrl = response.approvalUrl, let url = URL(string: approvalUrl) {
-            NSWorkspace.shared.open(url)
-            state.step = .waitingRegistration
-        } else if let portalUrl = response.portalUrl, let url = URL(string: portalUrl) {
-            NSWorkspace.shared.open(url)
-            state.step = .notRegistered
-        }
-    }
-
-    private func checkRegistrationAndProceed() async {
-        if let status = try? await appModel.getConnectorRegistrationStatus(provider: provider),
-           status.registered && status.clientIdPresent {
-            state.registrationStatus = status
-            state.step = .deviceFlow
-        } else {
-            state.step = .waitingRegistration
-        }
-    }
-
-    private func startDeviceFlow() async {
-        switch ConnectorWizardSetupRoute.resolve(provider: provider) {
-        case .nativeOAuth(let connectorId):
+    private func startOAuthSignIn() {
+        guard case .nativeOAuth(let connectorId) = route else { return }
+        isConnecting = true
+        run {
             let result = await NativeOAuthFlow.startConnectorOAuthFlow(
                 platform: NativeOAuthPlatform.self,
                 connectorId: connectorId)
             guard !Task.isCancelled else { return }
+            isConnecting = false
             if result.ok {
                 state.step = .success
                 await appModel.refreshForSidebarItem(.connectors)
             } else {
-                state.errorMessage = result.error ?? "Sign-in failed."
-                state.step = .error
+                state.errorMessage = failure(
+                    result.error,
+                    fallback: "Sign-in didn't finish. Press Connect to try again, or go Back to check your app's details.",
+                    classify: false)
             }
-        case .manualToken:
-            state.step = .manualToken
-        case .notionToken:
-            state.step = .notionToken
-        case .unavailable:
-            state.errorMessage = "\(displayName) does not have a verified in-app setup path. NativeAgent did not change its connection state."
-            state.step = .error
         }
     }
 
-    private func saveOAuthAppAndContinue() async {
-        guard case .nativeOAuth(let connectorId) =
-                ConnectorWizardSetupRoute.resolve(provider: provider) else {
-            state.errorMessage = "This connector does not use OAuth app credentials."
-            state.step = .error
+    private func saveAppCredentials() {
+        if googleConnectorId != nil,
+           let issue = GoogleOAuthSetupGuidance.clientIDIssue(state.oauthClientId) {
+            state.errorMessage = issue
             return
         }
-        isSavingOAuthApp = true
-        defer { isSavingOAuthApp = false }
+        run { await saveOAuthAppAndContinue() }
+    }
+
+    private func saveOAuthAppAndContinue() async {
+        guard case .nativeOAuth(let connectorId) = route else { return }
+        isSaving = true
+        defer { isSaving = false }
         let result = await NativeOAuthFlow.saveConnectorOAuthApp(
             connectorId: connectorId,
             clientId: state.oauthClientId,
@@ -934,16 +843,19 @@ struct ConnectorWizardView: View {
         guard !Task.isCancelled else { return }
         if result.ok {
             didSaveOAuthApp = true
-            state.step = .deviceFlow
+            state.step = .signIn
         } else {
-            state.errorMessage = result.error ?? "Could not save OAuth app configuration."
-            state.step = .error
+            state.errorMessage = failure(
+                result.error,
+                typed: [state.oauthClientSecret],
+                fallback: "Couldn't save your app's details. Check the client ID and secret, then try again.",
+                classify: false)
         }
     }
 
     private func saveNotionToken() async {
-        isSavingNotionToken = true
-        defer { isSavingNotionToken = false }
+        isSaving = true
+        defer { isSaving = false }
         let result = await NativeOAuthFlow.saveNotionToken(notionToken)
         guard !Task.isCancelled else { return }
         if result.ok {
@@ -951,14 +863,15 @@ struct ConnectorWizardView: View {
             state.step = .success
             await appModel.refreshForSidebarItem(.connectors)
         } else {
-            state.errorMessage = result.error ?? "Notion token validation failed."
-            state.step = .error
+            state.errorMessage = failure(
+                result.error, typed: [notionToken],
+                fallback: "Couldn't connect Notion. Check the token, then try again.")
         }
     }
 
     private func saveSlackToken() async {
-        isSavingSlackToken = true
-        defer { isSavingSlackToken = false }
+        isSaving = true
+        defer { isSaving = false }
 
         let result = await NativeOAuthFlow.saveSlackToken(
             slackToken,
@@ -975,8 +888,9 @@ struct ConnectorWizardView: View {
             _ = await BackgroundLoopsManager.shared.restartLoop(id: "slack_socket_mode")
             await appModel.refreshForSidebarItem(.connectors)
         } else {
-            state.errorMessage = result.error ?? "Slack token save failed."
-            state.step = .error
+            state.errorMessage = failure(
+                result.error, typed: [slackToken, slackAppToken],
+                fallback: "Couldn't save the Slack settings. Go Back to check the tokens, then try again.")
         }
     }
 
@@ -995,8 +909,8 @@ struct ConnectorWizardView: View {
     }
 
     private func saveGitHubToken() async {
-        isSavingGitHubToken = true
-        defer { isSavingGitHubToken = false }
+        isSaving = true
+        defer { isSaving = false }
 
         let result = await NativeOAuthFlow.saveGitHubToken(githubToken, credentialStore: AppGitHubOAuthCredentials())
         guard !Task.isCancelled else { return }
@@ -1005,8 +919,9 @@ struct ConnectorWizardView: View {
             state.step = .success
             await appModel.refreshForSidebarItem(.connectors)
         } else {
-            state.errorMessage = result.error ?? "GitHub token save failed."
-            state.step = .error
+            state.errorMessage = failure(
+                result.error, typed: [githubToken],
+                fallback: "Couldn't save the GitHub token. Try again.")
         }
     }
 

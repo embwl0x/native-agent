@@ -77,7 +77,7 @@ public actor GitHubApprovalEdgeNotifier {
         state.pendingApprovalIDs = state.pendingApprovalIDs ?? [:]
         defer {
             do { try save(state, dataRoot) }
-            catch { NSLog("github_approval_notify: state save failed: \(error.localizedDescription)") }
+            catch { nativeLog("github_approval_notify: state save failed: \(error.localizedDescription)") }
         }
 
         guard state.seeded else {
@@ -120,7 +120,7 @@ public actor GitHubApprovalEdgeNotifier {
                     // The contract is "the phone gets the edge": keep the prior
                     // entry so the next cycle retries instead of losing the
                     // approval forever (review finding).
-                    NSLog("github_approval_notify: push failed, will retry: \(error.localizedDescription)")
+                    nativeLog("github_approval_notify: push failed, will retry: \(error.localizedDescription)")
                     continue
                 }
             }

@@ -40,7 +40,7 @@ public enum TriggerNotificationInbox {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> MirrorOutcome {
         guard case .object(var cardObj) = card else {
-            NSLog("trigger_mirror: card for %@ is not a JSON object — NOT written to the real inbox",
+            nativeLog("trigger_mirror: card for %@ is not a JSON object — NOT written to the real inbox",
                   triggerName)
             return .failed
         }
@@ -84,7 +84,7 @@ public enum TriggerNotificationInbox {
             }
             return .appended
         } catch {
-            NSLog("trigger_mirror: REAL-inbox card write FAILED for %@: %@",
+            nativeLog("trigger_mirror: REAL-inbox card write FAILED for %@: %@",
                   triggerName, String(describing: error))
             return .failed
         }
@@ -103,7 +103,7 @@ public enum TriggerNotificationInbox {
                     readAt: ISO8601DateFormatter().string(from: Date())
                 )
         } catch {
-            NSLog("trigger_mirror: morning brief reconciliation failed: %@", String(describing: error))
+            nativeLog("trigger_mirror: morning brief reconciliation failed: %@", String(describing: error))
         }
     }
 
@@ -133,7 +133,7 @@ public enum TriggerNotificationInbox {
         let name = result.name ?? "unknown"
         switch await mirrorCardIntoRealInbox(item, triggerName: name, dataRoot: dataRoot) {
         case .failed:
-            NSLog("trigger_mirror: non-notified fire for %@ (item %@) did NOT reach the real inbox — the card was DROPPED",
+            nativeLog("trigger_mirror: non-notified fire for %@ (item %@) did NOT reach the real inbox — the card was DROPPED",
                   name, result.itemId ?? "?")
             return false
         case .duplicate:

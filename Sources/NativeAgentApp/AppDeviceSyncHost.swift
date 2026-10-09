@@ -11,11 +11,31 @@ import ProviderRouting
 import ToolRegistry
 import Transcripts
 
+private struct MobileCardTranscriptMessage: DeviceSyncTranscriptMessage, Sendable {
+    var message: NativeAppChatMessage
+    let interactionJSON: String
+    let interactionDescriptorJSON: String
+    let interactionSessionID: String
+    var id: String { message.id }
+    var content: String {
+        get { message.content }
+        set { message.content = newValue }
+    }
+    private enum CodingKeys: String, CodingKey { case interactionJSON, interactionDescriptorJSON, interactionSessionID }
+    func encode(to encoder: Encoder) throws {
+        try message.encode(to: encoder)
+        var fields = encoder.container(keyedBy: CodingKeys.self)
+        try fields.encode(interactionJSON, forKey: .interactionJSON)
+        try fields.encode(interactionDescriptorJSON, forKey: .interactionDescriptorJSON)
+        try fields.encode(interactionSessionID, forKey: .interactionSessionID)
+    }
+}
+
 /// A needs-User knock the router did not get onto any channel. Thrown so the
 /// edge is not committed as delivered and the next pass retries it.
 struct NeedsUserNotifyUndelivered: LocalizedError {
     let projection: AttentionOutcome.Delivery
-    var errorDescription: String? { "needs-User knock not delivered (\(projection.rawValue))" }
+    var errorDescription: String? { "needs-owner knock not delivered (\(projection.rawValue))" }
 }
 
 enum MobileToolCatalogProjection {
@@ -66,10 +86,10 @@ extension NAProviderCatalogProvider {
 struct AppDeviceSyncHost: DeviceSyncHost {
     func retryRequestedResults() async {
         do { try await AttentionRouter.shared.retryRequestedResults(dataRoot: PersistenceCore.defaultDataRoot()) }
-        catch { NSLog("requested_result: publication retry failed: %@", error.localizedDescription) }
+        catch { nativeLog("requested_result: publication retry failed: %@", error.localizedDescription) }
     }
 
-    private var api: NativeClient { NativeClient(baseURL: "") }
+    private var api: NativeClient { NativeClient() }
     private var engine: NativeAgentEngine { NativeAgentEngine.live }
 
     func getWorkshopExecutions() async throws -> DeviceSyncSnapshotRows { try await engine.desk.taskRows() }
@@ -79,7 +99,30 @@ struct AppDeviceSyncHost: DeviceSyncHost {
     }
     func getChatSessions() async throws -> [ChatSession] { try await engine.transcripts.list() }
     func getChatMessages(sessionId: String) async throws -> [any DeviceSyncTranscriptMessage & Sendable] {
-        try await engine.transcripts.loadMessages(sessionId: sessionId)
+        let messages = try await engine.transcripts.loadMessages(sessionId: sessionId)
+        let pairs = try await InlineInteractionResolver.checkedInteractionsByRow(sessionID: sessionId).get()
+        let cards = Dictionary(pairs.map { ($0.rowID, $0.interaction) }, uniquingKeysWith: { _, last in last })
+        var result: [any DeviceSyncTranscriptMessage & Sendable] = []
+        for message in messages {
+            var card = cards[message.id]
+            var origin = sessionId
+            if let mirror = message.metadata?.interactionMirror {
+                origin = mirror.sessionID
+                card = await InlineInteractionResolver.interaction(id: mirror.interactionID, sessionID: origin)
+            }
+            if var card {
+                card = await InlineInteractionResolver.liveProjection(card, dataRoot: PersistenceCore.defaultDataRoot())
+                let descriptor = await InlineInteractionResolver.descriptor(for: card, dataRoot: PersistenceCore.defaultDataRoot())
+                card.continuation = nil
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                result.append(MobileCardTranscriptMessage(message: message,
+                    interactionJSON: String(decoding: try encoder.encode(card), as: UTF8.self),
+                    interactionDescriptorJSON: String(decoding: try encoder.encode(descriptor), as: UTF8.self),
+                    interactionSessionID: origin))
+            } else { result.append(message) }
+        }
+        return result
     }
     func getHealth() async throws -> RuntimeHealth { engine.doctor.readHealth() }
     func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows {
@@ -142,6 +185,11 @@ struct AppDeviceSyncHost: DeviceSyncHost {
         try await api.resolveApproval(id: id, decision: decision, provenance: provenance)
     }
     func inboxAction(_ id: String, action: String) async throws { try await api.inboxAction(id, action: action) }
+    @MainActor
+    func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String] {
+        try await InteractionCardDelivery.answer(payload: payload, actionID: actionID, clientID: clientID,
+            dataRoot: PersistenceCore.defaultDataRoot())
+    }
     func cancelChatSession(sessionId: String) async throws { try await engine.turns.stop(sessionId: sessionId) }
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws {
         _ = try await api.configureProvider(id, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)

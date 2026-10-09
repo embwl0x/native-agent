@@ -1,4 +1,7 @@
 (() => {
+  // Navigation can install manifest scripts while reload recovery injects
+  // them. Replace the existing listener instead of reporting input twice.
+  globalThis.__nativeAgentUserTouch?.();
   const bindings = [];
   let retired = false;
 
@@ -9,6 +12,7 @@
       window.removeEventListener(name, listener, options);
     }
   }
+  globalThis.__nativeAgentUserTouch = retire;
 
   function messageFailed(error) {
     if (/extension context invalidated/i.test(String(error?.message ?? error))) retire();

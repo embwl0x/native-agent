@@ -66,6 +66,19 @@ import PersistenceCore
                 ?? QuietPages.drawOnly.first(where: { $0.id == requested.lowercased() }) else {
             return AppToolExecutor.unknownPageFailure(requested, pages: QuietPages.ids)
         }
+        // A tab by the key page.show takes (`QuietComposerVerbs.tabs`), on
+        // this page's own rail page. Without one the page's default tab draws.
+        let tabKey = Self.text(input["tab"]).lowercased()
+        let railPage = SidebarItem.shellHome(for: page.item)?.parent ?? page.item
+        var tab: String?
+        if !tabKey.isEmpty {
+            guard let home = QuietComposerVerbs.tabs[tabKey], home.page == railPage else {
+                let keys = QuietComposerVerbs.tabs.filter { $0.value.page == railPage }.keys.sorted()
+                return AppToolExecutor.failure("unknown_tab", "This page has no tab called that.",
+                                               extra: ["requested": .string(tabKey), "tabs": .array(keys.map { .string($0) })])
+            }
+            tab = home.tab
+        }
         guard let appModel = QuietSelfAdmin.shared.appModel else { return AppToolExecutor.unattachedFailure() }
         var size = QuietSelfAdminRender.defaultSize
         switch input["height"] {
@@ -75,23 +88,33 @@ import PersistenceCore
         default: break
         }
         size.height = min(max(size.height, 400), 2400)
-        guard let rendered = await QuietSelfAdminRender.pageImagePNG(for: page, appModel: appModel, size: size) else {
+        guard let rendered = await QuietSelfAdminRender.pageImagePNG(for: page, tab: tab, appModel: appModel, size: size) else {
             return AppToolExecutor.failure("render_failed", "The page could not be drawn offscreen.")
         }
+        // Every picture is also a file, so whoever asked can open the PNG.
+        let folder = (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("diagnostics/page_shots", isDirectory: true)
+        let stamp = ISO8601DateFormatter.string(
+            from: Date(), timeZone: .current, formatOptions: [.withYear, .withMonth, .withDay, .withTime])
+        let file = folder.appendingPathComponent("\(page.id)\(tabKey.isEmpty ? "" : "-" + tabKey)-\(stamp)-\(UUID().uuidString.lowercased()).png")
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try rendered.data.write(to: file, options: .atomic)
+        } catch {
+            return AppToolExecutor.failure("write_failed", "The picture could not be saved: \(error.localizedDescription)")
+        }
+        do {
+            // The current file stays protected until delivery. Inline delivery
+            // owns the encoded bytes, so later trims cannot invalidate pixels
+            // already handed to an active model continuation.
+            try Self.prunePageShots(in: folder, preserving: file)
+        } catch {
+            return AppToolExecutor.failure("retention_failed", "The picture was saved, but diagnostic retention could not finish: \(error.localizedDescription)",
+                                           extra: ["path": .string(file.path)])
+        }
         // A text-only call (the Claude bridge) has no turn to show pixels in:
-        // the PNG goes to a file and the path comes back instead.
+        // the path comes back instead.
         if LocalToolImage.sink == nil {
-            let folder = (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-                .appendingPathComponent("diagnostics/page_shots", isDirectory: true)
-            let stamp = ISO8601DateFormatter.string(
-                from: Date(), timeZone: .current, formatOptions: [.withYear, .withMonth, .withDay, .withTime])
-            let file = folder.appendingPathComponent("\(page.id)-\(stamp).png")
-            do {
-                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                try rendered.data.write(to: file, options: .atomic)
-            } catch {
-                return AppToolExecutor.failure("write_failed", "The picture could not be saved: \(error.localizedDescription)")
-            }
             return .object([
                 "status": .string("ok"), "page": .string(page.id), "title": .string(page.title),
                 "path": .string(file.path),
@@ -107,6 +130,7 @@ import PersistenceCore
         }
         delivery["page"] = .string(page.id)
         delivery["title"] = .string(page.title)
+        delivery["path"] = .string(file.path)
         delivery["note"] = .string(
             "An offscreen drawing of this page, not a capture of the screen. The app was not brought "
             + "forward and nothing on screen changed.")
@@ -116,5 +140,33 @@ import PersistenceCore
     private static func text(_ value: JSONValue?) -> String {
         guard case .string(let raw)? = value else { return "" }
         return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Replaceable offscreen pictures: seven days, 64 files, 64 MiB. The
+    /// picture being returned is always kept, even if it alone exceeds a bound.
+    private static func prunePageShots(in folder: URL, preserving current: URL, now: Date = Date()) throws {
+        let files = try FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ).filter { $0.pathExtension == "png" }
+        var captures: [(url: URL, bytes: Int, modified: Date)] = []
+        for file in files {
+            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true,
+                  let bytes = values.fileSize, let modified = values.contentModificationDate else { continue }
+            captures.append((file, bytes, modified))
+        }
+        captures.sort {
+            $0.modified == $1.modified ? $0.url.lastPathComponent < $1.url.lastPathComponent : $0.modified < $1.modified
+        }
+        var count = captures.count
+        var bytes = captures.reduce(0) { $0 + $1.bytes }
+        let cutoff = now.addingTimeInterval(-7 * 24 * 60 * 60)
+        for capture in captures where capture.url != current {
+            guard capture.modified < cutoff || count > 64 || bytes > 64 * 1024 * 1024 else { continue }
+            try FileManager.default.removeItem(at: capture.url)
+            count -= 1
+            bytes -= capture.bytes
+        }
     }
 }

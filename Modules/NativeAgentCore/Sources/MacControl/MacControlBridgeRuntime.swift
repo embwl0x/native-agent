@@ -149,6 +149,14 @@ public final class MacControlBridgeRuntime: @unchecked Sendable {
         return (stopped, audit)
     }
 
+    /// The quit-time stop. It audits only when an exec child was actually
+    /// stopped, so the capped audit file keeps real entries.
+    public func stopProcessesOnBridgeStop() {
+        let stopped = processes.stopAllProcesses()
+        guard stopped > 0 else { return }
+        appendExecAudit(argv: ["emergency_stop"], status: "cancel_requested", reason: "bridge_stop: \(stopped)")
+    }
+
     /// A1.3 (prerelease-upgrade-campaign): don't bind 8770 or mint a bearer
     /// token until Mac Control is actually switched on. Reads the SAME live
     /// policy file + key `bridgePolicyAllows` already uses

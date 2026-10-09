@@ -23,9 +23,13 @@ struct ICloudTextDeltaCoalescer: Sendable {
     private var lastFlushedTextCount: Int = 0
     private var lastFlushUptimeNanoseconds: UInt64?
 
+    /// 2026-10-07: 1 s / 120 characters, from 1.5 s / 320. A short reply
+    /// never reached 320 between flushes, so the phone saw its first words and
+    /// then the whole answer. Each flush is one awaited CloudKit write, so the
+    /// writes still come at most about once a second.
     init(
-        minIntervalNanoseconds: UInt64 = 1_500_000_000,
-        minCharactersBetweenFlushes: Int = 320,
+        minIntervalNanoseconds: UInt64 = 1_000_000_000,
+        minCharactersBetweenFlushes: Int = 120,
         maxCharactersBetweenFlushes: Int = 1_200
     ) {
         self.minIntervalNanoseconds = minIntervalNanoseconds

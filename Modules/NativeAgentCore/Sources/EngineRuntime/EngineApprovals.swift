@@ -3,6 +3,7 @@ import Observation
 import ApprovalInbox
 import NativeAgentShared
 import PersistenceCore
+import ChatOrchestration
 
 /// `NativeAgentEngine.approvals` (S10): the ApprovalInbox for one data root, in
 /// core types. Every surface that shows approvals renders `records`; the read
@@ -41,6 +42,14 @@ public final class ApprovalsFacade {
 extension ApprovalRequest {
     /// The phone's approvals.json row, in the shape the Mac has always sent.
     public init(record: ApprovalRecord) {
+        let outcome = record.executedAction.map(ChatToolOutcome.exactResultClass)
+        let summary = record.executedAction.map { receipt in
+            var fields: [String: JSONValue] = { if case .object(let fields) = receipt { return fields }; return [:] }()
+            if fields["detail"] == nil, let detail = record.detail { fields["detail"] = .string(detail) }
+            let value = JSONValue.object(fields)
+            return [ChatToolOutcome.explanation(value), ChatToolOutcome.remedy(value)]
+                .compactMap { $0 }.joined(separator: " ")
+        }
         self.init(
             id: record.id,
             title: record.title,
@@ -57,7 +66,9 @@ extension ApprovalRequest {
             // Where the phone draws its inline card: the conversation the
             // approval's chat card went to, else the one that asked.
             chatOriginSessionId: record.chatCardSessionId ?? record.chatOriginSessionId,
-            lastRequestedAt: record.lastRequestedAt
+            lastRequestedAt: record.lastRequestedAt,
+            executionOutcome: outcome?.rawValue,
+            executionSummary: summary?.isEmpty == false ? summary : nil
         )
     }
 }

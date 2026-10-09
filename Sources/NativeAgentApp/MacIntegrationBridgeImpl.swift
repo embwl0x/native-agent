@@ -173,6 +173,10 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
         try await MacAppleScriptBridge.mailListRecent(input: input)
     }
 
+    func mailAttachment(input: [String: JSONValue]) async throws -> (filename: String, data: Data) {
+        try MacAppleScriptBridge.mailAttachment(input: input)
+    }
+
     func mailReadBatch(input: [String: JSONValue]) async throws -> JSONValue {
         await MacAppleScriptBridge.mailBatch(input: input, effects: false)
     }
@@ -183,6 +187,10 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
 
     func mailSearch(input: [String: JSONValue]) async throws -> JSONValue {
         try await MacAppleScriptBridge.mailSearch(input: input)
+    }
+
+    func mailSenders(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacAppleScriptBridge.mailSenders(input: input)
     }
 
     func mailSend(input: [String: JSONValue]) async throws -> JSONValue {
@@ -239,6 +247,14 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
         try await MacPIMConnectorActions.remindersCreate(input: input)
     }
 
+    func remindersListRename(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.remindersListRename(input: input)
+    }
+
+    func remindersListCreate(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.remindersListCreate(input: input)
+    }
+
     func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue {
         try await MacPIMConnectorActions.remindersComplete(input: input)
     }
@@ -264,10 +280,14 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
         try await MacAppleScriptBridge.mailReply(input: input)
     }
 
+    func mailDraft(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacAppleScriptBridge.mailDraft(input: input)
+    }
+
     // Notes update (W2)
 
-    func notesUpdate(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.notesUpdate(input: input)
+    func notesModify(input: [String: JSONValue], deleting: Bool) async throws -> JSONValue {
+        try await MacAppleScriptBridge.notesModify(input: input, deleting: deleting)
     }
 
     // Music library (W2)
@@ -311,6 +331,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
 
     /// The scheduler's own one-shot rule: an ISO-8601 string, type once, or one_shot.
     private static func schedulerOneShot(_ input: [String: JSONValue]) -> Bool {
+        if let delay = input["in_minutes"], delay != .null { return true }
         if case .string? = input["schedule"] { return true }
         if case .object(let schedule)? = input["schedule"], schedule["type"]?.stringValue?.lowercased() == "once" { return true }
         var payload: [String: JSONValue] = [:]
@@ -376,7 +397,13 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValid
 
     // MARK: - Phase 1
 
-    func spotlightSearch(input: [String: JSONValue]) async throws -> JSONValue {
+    func spotlightSearch(input rawInput: [String: JSONValue]) async throws -> JSONValue {
+        var input = rawInput
+        // name: filename contains, case-insensitive — content words drown filename hits (10-08).
+        if let name = input["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            input["query"] = .string("kMDItemFSName == \"*\(name.replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "*", with: ""))*\"cd")
+            input["name"] = nil; input["q"] = nil
+        }
         let query = (input["query"]?.stringValue ?? input["q"]?.stringValue ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {

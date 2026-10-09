@@ -589,15 +589,23 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 try? await self.recordSkillVersion(updated, reason: "created-update")
                 return updated
             }
-            let skillId = SkillMutation.availableID(for: name, existingIDs: existingIds)
+            // Her version of a built-in overrides it under the built-in's own
+            // id and keeps its status; the built-in's file is left as it ships.
+            let builtIn = inventory.first {
+                $0.row["source"] == .string("persona_body") && $0.name.caseInsensitiveCompare(name) == .orderedSame
+            }
+            let skillId = builtIn?.id ?? SkillMutation.availableID(for: name, existingIDs: existingIds)
             let bodyPath = self.skillBodiesDir.appendingPathComponent("\(skillId).md")
             try await self.writeBody(content, to: bodyPath)
             // body.get("status") or ("draft" if autoCreated else "active")
-            let status = SkillMutation.pyTruthyStrOptional(obj["status"]) ?? (autoCreated ? "draft" : "active")
+            let status = builtIn.flatMap { SkillMutation.pyTruthyStrOptional($0.row["status"]) }
+                ?? SkillMutation.pyTruthyStrOptional(obj["status"]) ?? (autoCreated ? "draft" : "active")
             var record: [String: JSONValue] = [
                 "id": .string(skillId),
                 "name": .string(name),
-                "description": .string(description),
+                // Saved without one, her version of a built-in keeps the built-in's.
+                "description": .string(rawDescription.isEmpty
+                    ? builtIn.flatMap { SkillMutation.pyTruthyStrOptional($0.row["description"]) } ?? description : description),
                 "triggers": .array(triggers.map { .string($0) }),
                 // body.get("kind") or "skill" (truthiness fall-through).
                 "kind": .string(SkillMutation.pyTruthyStrOptional(obj["kind"]) ?? "skill"),
@@ -644,7 +652,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     }
 
     /// `steer` is the restoring turn's origin; nil is User's own restore.
-    public func restoreSkill(id rawId: String, versionId rawVersionId: String, steer: JSONValue?) async throws -> JSONValue {
+    public func restoreSkill(id rawId: String, versionId rawVersionId: String, steer: JSONValue?, guidanceOnly: Bool = false) async throws -> JSONValue {
         let skillId = SkillMutation.unquote(rawId).trimmingCharacters(in: .whitespacesAndNewlines)
         let versionId = SkillMutation.unquote(rawVersionId).trimmingCharacters(in: .whitespacesAndNewlines)
         let versions = try await listSkillVersions(id: skillId)
@@ -676,9 +684,21 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 return SkillMutation.pyStr(object?["id"] ?? .null) == skillId
                     || SkillMutation.pyStr(object?["name"] ?? .null) == skillId
             }) else { throw SkillsError.unknownSkill(skillId) }
-            try await self.recordSkillVersion(skills[index], reason: "before-restore")
             var restored = capturedSkill
+            SkillScript.normalizeInterpreter(&restored)
             let before = skills[index].objectValue ?? [:]
+            if guidanceOnly {
+                guard before["script"] == nil, restored["script"] == nil else {
+                    throw SkillsError.historyUnavailable("The skill changed since the guidance version was read. Read it again before rollback.")
+                }
+                for key in ["permissions", "tools", "oauth", "admission", "origin", "status", "enabledAt"] + SkillMutation.agentMarks {
+                    restored[key] = before[key]
+                }
+            }
+            // Restoring prose or code does not undo evidence of use.
+            restored["useCount"] = before["useCount"]
+            restored["lastUsedAt"] = before["lastUsedAt"]
+            try await self.recordSkillVersion(skills[index], reason: "before-restore")
             SkillScript.settle(&restored, before: before,
                 origins: SkillScript.recorded(capturedSkill) + SkillScript.recorded(before) + (steer.map { [$0] } ?? []))
             let bodyPath = self.skillBodiesDir.appendingPathComponent("\(skillId).md")
@@ -689,7 +709,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 restored["bodyPath"] = .string(bodyPath.path)
             }
             restored["updatedAt"] = .string(SkillMutation.nowISO(self.now))
-            if InstalledSkillInventory.isAvailable(restored) {
+            if !guidanceOnly, InstalledSkillInventory.isAvailable(restored) {
                 restored["enabledAt"] = .string(SkillMutation.nowISO(self.now))
             }
             let restoredValue = JSONValue.object(restored)
@@ -709,7 +729,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     /// The pin on the actions a runnable script declares (skills-as-code PR 3):
     /// its first run under the digest records each action's hash (`pins`); a
     /// later run whose hashes differ suspends it, drafted with its admission
-    /// and pin gone, so it runs again only on a new admission of its exact
+    /// and action hashes gone, so it runs again only on a new admission of its exact
     /// digest. Returns the actions that changed; none when it may run.
     public func pinActions(id rawId: String, digest: String, pins: [String: String]) async throws -> [String] {
         try await withRegistryLock {
@@ -732,7 +752,8 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
                 return changed
             }
-            row["actionPin"] = .object(["digest": .string(digest), "actions": .object(wanted)])
+            row["actionPin"] = .object(["digest": .string(digest), "actions": .object(wanted),
+                "interpreter": .int(Int64(SkillScript.interpreterRevision))])
             row.removeValue(forKey: "suspended")
             skills[index] = .object(row)
             try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
@@ -740,14 +761,37 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         }
     }
 
-    /// Suspended: drafted, its admission and pin gone, naming the actions
+    /// Suspended: drafted, its admission and action hashes gone, naming the actions
     /// that changed; it runs again only on a new admission of its exact digest.
     private func suspend(_ row: inout [String: JSONValue], actions: [String]) {
         row["status"] = .string("draft")
-        for key in ["admission", "actionPin"] { row.removeValue(forKey: key) }
+        row.removeValue(forKey: "admission")
+        row["actionPin"] = .object(["digest": .string(SkillScript.digest(row["script"]) ?? ""),
+            "interpreter": .int(Int64(SkillScript.interpreterRevision))])
         row["suspended"] = .object(["actions": .array(actions.map(JSONValue.string)),
                                     "at": .string(SkillMutation.nowISO(now))])
         row["updatedAt"] = .string(SkillMutation.nowISO(now))
+    }
+
+    /// Grammar changes use the same lock, versions and exact-digest admission as edits.
+    public func migrateScriptInterpreter() async throws {
+        try await withRegistryLock {
+            var skills = try self.loadRegistryForMutation()
+            var changed = false
+            for index in skills.indices {
+                guard case .object(var row) = skills[index], case .string? = row["script"]?.objectValue?["source"],
+                      row["actionPin"]?.objectValue?["interpreter"] != .int(Int64(SkillScript.interpreterRevision)) else { continue }
+                let before = row
+                if SkillScript.normalizeInterpreter(&row) {
+                    try await self.recordSkillVersion(.object(before), reason: "before-interpreter-migration")
+                    SkillScript.settle(&row, before: before, origins: SkillScript.recorded(before))
+                    self.suspend(&row, actions: ["script interpreter"])
+                }
+                skills[index] = .object(row)
+                changed = true
+            }
+            if changed { try await self.persistence.writeJSON(.array(skills), to: self.registryPath) }
+        }
     }
 
     /// Retired (skills-as-code PR 5): archived, never deleted, and hers to
@@ -849,6 +893,10 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         try await withRegistryLock {
             var skills = try self.loadRegistryForMutation()
             var lines: [SkillLine] = []
+            // Her version of a built-in archives like her others, and the built-in
+            // shows again; the built-in itself has no row, so no clock.
+            let overrides = Set(try InstalledSkillInventory.entries(dataRoot: self.root)
+                .filter { $0.row["overrides"] == .string("built_in") }.map(\.id))
             for index in skills.indices {
                 guard case .object(var row) = skills[index] else { continue }
                 let name = SkillMutation.pyStrTruthyOr(row["name"], SkillMutation.pyStr(row["id"] ?? .null))
@@ -875,7 +923,10 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                                                        now: self.now(), days: unusedDays) {
                     try await self.recordSkillVersion(skills[index], reason: "before-retire")
                     self.retire(&row, why: "unused for \(unusedDays) days")
-                    lines.append(("\(name) archived: unused for \(unusedDays) days, not deleted; skill.restore brings it back",
+                    lines.append((overrides.contains(SkillMutation.pyStrTruthyOr(row["id"], name))
+                        ? "your version of the built-in \(name) archived: unused for \(unusedDays) days, not deleted; "
+                            + "the built-in shows again, and skill.restore brings yours back"
+                        : "\(name) archived: unused for \(unusedDays) days, not deleted; skill.restore brings it back",
                                   SkillScript.voices(row)))
                 } else { continue }
                 skills[index] = .object(row)
@@ -893,6 +944,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             guard let index = skills.firstIndex(where: { [$0.objectValue?["id"], $0.objectValue?["name"]].contains(.string(rawId)) }),
                   case .object(var row) = skills[index] else { return }
             row["lastUsedAt"] = .string(SkillMutation.nowISO(self.now))
+            row["useCount"] = .int(Int64((SkillMutation.intValue(row["useCount"]) ?? 0) + 1))
             skills[index] = .object(row)
             try await self.persistence.writeJSON(.array(skills), to: self.registryPath)
         }
@@ -931,7 +983,8 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             let before = row
             let earlier = Self.earlierScripts(row, history)
             guard let record = earlier.clean ?? earlier.previous else { throw SkillsError.unknownVersion("no earlier script") }
-            let version = record["skill"]?.objectValue ?? [:]
+            var version = record["skill"]?.objectValue ?? [:]
+            SkillScript.normalizeInterpreter(&version)
             row["script"] = version["script"]
             SkillScript.settle(&row, before: before, origins: [version["origin"], steer] + SkillScript.recorded(before))
             row["updatedAt"] = .string(SkillMutation.nowISO(self.now))
@@ -942,6 +995,36 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             try? await self.recordSkillVersion(.object(row), reason: "rolled-back")
             return .object(row)
         }
+    }
+
+    /// The previous complete guidance revision, ignoring usage bookkeeping.
+    public func previousGuidanceVersion(_ row: [String: JSONValue]) async throws -> [String: JSONValue]? {
+        let id = SkillMutation.pyStrTruthyOr(row["id"], SkillMutation.pyStr(row["name"] ?? .null))
+        let history = try await listSkillVersions(id: id)
+        guard let path = confinedBodyPath(for: row, skillId: id) else {
+            throw SkillsError.historyUnavailable("The guidance body is unavailable. Read the skill again before rollback.")
+        }
+        let body = try String(contentsOf: path, encoding: .utf8)
+        let keys = ["name", "description", "triggers", "kind"]
+        let header = row.filter { keys.contains($0.key) }
+        for case .object(let version) in history {
+            guard case .object(let saved)? = version["skill"], saved["script"] == nil,
+                  case .string(let savedBody)? = version["body"] else { continue }
+            if savedBody != body || saved.filter({ keys.contains($0.key) }) != header { return version }
+        }
+        return nil
+    }
+
+    public func guidanceVersions(_ row: [String: JSONValue]) async throws -> JSONValue {
+        guard let previous = try await previousGuidanceVersion(row) else {
+            return .object(["previous": .null])
+        }
+        let id = SkillMutation.pyStr(previous["versionId"] ?? .null)
+        let at = SkillMutation.pyStr(previous["createdAt"] ?? .null)
+        return .object(["previous": .object([
+            "version_id": .string(id), "at": .string(at),
+            "detail": .string("Previous guidance version: \(id), saved \(at). skill.rollback restores that body and header."),
+        ])])
     }
 
     /// The earlier scripts rollback weighs in `history` (newest first, as
@@ -1030,7 +1113,11 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         }
         let key = name.lowercased()
         var selected: (row: [String: JSONValue], manifest: [String: JSONValue])?
-        for case .object(let row) in records {
+        // Her version of a built-in that is not on shares the built-in's name:
+        // a verb on that name means hers.
+        let ordered = records.filter { $0.objectValue?["source"] != .string("persona_body") }
+            + records.filter { $0.objectValue?["source"] == .string("persona_body") }
+        for case .object(let row) in ordered {
             let manifest: [String: JSONValue]
             if row["state"] != nil {
                 guard let value = try? JSONValue.parse(Data(contentsOf: manifestDirectory(for: row).appendingPathComponent("manifest.json"))),
@@ -1081,6 +1168,34 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             || (SkillMutation.pyStrOptional(row["bodyPath"])?.hasPrefix(personaBodies) ?? false)
         if verb != "enable", builtIn {
             return (false, "\(skill) is built in: it ships with the app in persona/skills, so switching it off or deleting it is User's. Ask him.", fields)
+        }
+        // Her version of a built-in stands in for it, so switching it off or
+        // trashing it stays User's; rollback drops hers and the built-in shows again.
+        let override = row["overrides"] == .string("built_in")
+        if override, ["disable", "delete"].contains(verb) {
+            return (false, "\(skill) is your version of a built-in, so switching it off or deleting it is User's. Ask him. "
+                + "skill.rollback drops your version and the built-in shows again.", fields)
+        }
+        func dropOverride() async -> (ok: Bool, text: String, fields: [String: JSONValue]) {
+            if preview {
+                return (true, "Would drop your version of \(skill); the built-in shows again, as it ships.",
+                        fields.merging(["would_drop": .bool(true)]) { $1 })
+            }
+            do {
+                _ = try await deleteSkill(id: registeredName)
+                // A body that didn't delete leaves its row trashed, still hiding the built-in.
+                if try InstalledSkillInventory.entries(dataRoot: root, personaRoot: personaRoot).contains(where: {
+                    $0.row["source"] == .string("runtime_registry") && $0.id == registeredName
+                }) {
+                    return (false, "Dropping your version did not finish: its body did not delete, so it stays in the trash "
+                        + "(skill.restore brings it back). The built-in is in use again." + retry, fields)
+                }
+                try await reconcile()
+            } catch {
+                return (false, "Dropping your version failed: \(error.localizedDescription)." + retry, fields)
+            }
+            return (true, "Dropped your version of \(skill); the built-in shows again. Its version history keeps your text.",
+                    fields.merging(["dropped": .bool(true)]) { $1 })
         }
         if ["disable", "delete"].contains(verb), source == "runtime_body" {
             // Hers: a body in the data root, not one the app ships. It gets
@@ -1168,6 +1283,27 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             guard row["state"] == nil else {
                 return (false, "\(skill) is a manifest skill; it carries no script to roll back.", fields)
             }
+            // Before her first version of a built-in is the built-in itself.
+            if override, row["script"] == nil { return await dropOverride() }
+            if row["script"] == nil {
+                do {
+                    guard let previous = try await previousGuidanceVersion(row),
+                          case .string(let versionId)? = previous["versionId"] else {
+                        return (false, "\(skill) has no earlier guidance version to roll back to. skill.read shows its saved versions; nothing changed.", fields)
+                    }
+                    let resultFields = fields.merging(["version_id": .string(versionId)]) { $1 }
+                    if preview {
+                        return (true, "Would restore \(skill) to its previous guidance version. Its permissions would not change.", resultFields)
+                    }
+                    let restored = try await restoreSkill(id: registeredName, versionId: versionId,
+                        steer: SkillScript.origin(steeredBy: steer), guidanceOnly: true)
+                    try await reconcile()
+                    return (true, "Restored \(skill) to its previous guidance version. Its permissions did not change.",
+                            resultFields.merging(["state": restored.objectValue?["status"] ?? .null]) { $1 })
+                } catch {
+                    return (false, "Rollback failed: \(error.localizedDescription)." + retry, fields)
+                }
+            }
             do {
                 let rolled = try await rollbackScript(id: registeredName, steer: SkillScript.origin(steeredBy: steer), preview: preview)
                 if preview {
@@ -1185,6 +1321,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                     + "It is drafted: it runs again only once skill.enable turns it on.",
                     fields.merging(["script_digest": .string(digest), "state": .string("drafted")]) { $1 })
             } catch SkillsError.unknownVersion {
+                if override { return await dropOverride() }
                 return (false, "\(skill) has no earlier script to roll back to; nothing changed.", fields)
             } catch {
                 return (false, "Rollback failed: \(error.localizedDescription)." + retry, fields)
@@ -1632,6 +1769,26 @@ public enum SkillRegistryMigration {
         }
         try? FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? Data().write(to: marker)
+    }
+}
+
+extension SkillRegistryMigration {
+    /// Her versions of built-ins saved before they kept the built-in's
+    /// description carry the placeholder; they take the built-in's first
+    /// useful line, as its inventory row reads. Idempotent: only a placeholder changes.
+    public static func inheritBuiltInDescriptions(dataRoot: URL) async {
+        guard let entries = try? InstalledSkillInventory.entries(dataRoot: dataRoot) else { return }
+        let bodies = defaultPersonaRoot(dataRoot: dataRoot).appendingPathComponent("skills/bodies", isDirectory: true)
+        let client = SwiftNativeSkillsClient(root: dataRoot)
+        for entry in entries where entry.row["overrides"] == .string("built_in")
+            && entry.row["description"] == .string("Reusable procedure for \(entry.name).") {
+            let line = [entry.name, entry.id].lazy.filter { !$0.contains("/") }.compactMap {
+                (try? String(contentsOf: bodies.appendingPathComponent("\($0).md"), encoding: .utf8))
+                    .flatMap(SkillBodyHygiene.firstUsefulLine)
+            }.first
+            guard let line else { continue }
+            _ = try? await client.updateSkill(body: .object(["id": .string(entry.id), "description": .string(String(line.prefix(240)))]))
+        }
     }
 }
 

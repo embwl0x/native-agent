@@ -18,6 +18,7 @@ public enum SkillPatterns {
         public let args: [String]
         /// The skill a skill.run ran.
         public let skill: String?
+        public let readOnly: Bool
         var step: String { args.isEmpty ? action : action + "(" + args.joined(separator: ",") + ")" }
     }
 
@@ -28,12 +29,13 @@ public enum SkillPatterns {
         public let shape: String?
         /// The skill a follow-up names, whose origin decides whose words it is.
         public var skill: String? = nil
+        public var examples: [String] = []
     }
 
     /// The call as a step, or nil: it did not land, or it is scaffolding
     /// (home, find, a bare page or item read, a script, a preview, page.show,
     /// a screenshot).
-    public static func call(input: [String: JSONValue], landed: Bool) -> Call? {
+    public static func call(input: [String: JSONValue], landed: Bool, readOnly: Bool? = nil) -> Call? {
         guard landed, input["preview"] != .bool(true), text(input["script"]).isEmpty,
               case .string(let raw)? = input["action"] else { return nil }
         let action = String(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().prefix(64))
@@ -41,7 +43,8 @@ public enum SkillPatterns {
         let args = if case .object(let given)? = input["args"] { given } else { [String: JSONValue]() }
         let skill = String(text(args["name"]).prefix(120))
         return Call(action: action, args: Array(args.keys.filter { !$0.hasPrefix("__") }.sorted().prefix(12).map { String($0.prefix(32)) }),
-                    skill: action == "skill.run" && !skill.isEmpty ? skill : nil)
+                    skill: action == "skill.run" && !skill.isEmpty ? skill : nil,
+                    readOnly: readOnly ?? navigationAction(action))
     }
 
     static let windows = 2...5
@@ -57,21 +60,27 @@ public enum SkillPatterns {
     /// one notice a day, and one follow-up per skill until its shape changes).
     /// `name` is how a line names an agent other than her (nil for her).
     public static func observe(turn: String, agent: String, name: String?, calls: [Call],
-                               root: URL, now: Date = Date()) -> [Line] {
+                               root: URL, session: String? = nil, now: Date = Date()) -> [Line] {
         guard !calls.isEmpty else { return [] }
         return update(root) { file in
             var mind = file.agents[agent] ?? Agent()
             let cutoff = now.addingTimeInterval(-keptDays * 86_400)
-            mind.shapes = mind.shapes.filter { $0.value.last >= cutoff }
+            mind.shapes = mind.shapes.filter {
+                $0.value.last >= cutoff && ($0.value.meaningful ?? $0.value.steps.contains { !navigationAction(action($0)) })
+            }
             mind.followups = mind.followups.filter { $0.value.last >= cutoff }
             for start in calls.indices {
                 for length in windows where start + length <= calls.count {
                     let window = Array(calls[start..<start + length])
                     // One call repeated is not a workflow.
-                    guard Set(window.map(\.action)).count > 1 else { continue }
+                    guard Set(window.map(\.action)).count > 1,
+                          window.contains(where: { !($0.readOnly && navigationAction($0.action)) }) else { continue }
                     let steps = window.map(\.step)
                     var shape = mind.shapes[key(steps)] ?? Shape(steps: steps, turns: [], first: now, last: now)
                     if !shape.turns.contains(turn) { shape.turns = Array((shape.turns + [turn]).suffix(keptTurns)) }
+                    shape.meaningful = true
+                    if let session { shape.sessions = (shape.sessions ?? [:]).merging([turn: session]) { $1 } }
+                    shape.sessions = shape.sessions?.filter { shape.turns.contains($0.key) }
                     shape.last = now
                     mind.shapes[key(steps)] = shape
                 }
@@ -88,11 +97,15 @@ public enum SkillPatterns {
                 let after = calls[(index + 1)...].prefix { $0.action != "skill.run" }.prefix(3).map(\.step)
                 var follow = mind.followups[skill] ?? Followup(runs: [], raised: nil, last: now)
                 follow.runs = Array((follow.runs + [after]).suffix(3))
+                follow.turns = Array(((follow.turns ?? []) + [turn]).suffix(3))
+                if let session { follow.sessions = (follow.sessions ?? [:]).merging([turn: session]) { $1 } }
+                follow.sessions = follow.sessions?.filter { follow.turns?.contains($0.key) == true }
                 follow.last = now
-                if let usual = usual(follow.runs), key(usual) != follow.raised {
+                if let usual = usual(follow.runs), usual.contains(where: { !navigationAction(action($0)) }), key(usual) != follow.raised {
                     follow.raised = key(usual)
                     lines.append(Line(words: fit(usual) { "\(skill.prefix(40)) is usually followed by \($0); add them to it?" },
-                                      agent: agent, shape: nil, skill: skill))
+                                      agent: agent, shape: nil, skill: skill,
+                                      examples: references(follow.turns ?? [], sessions: follow.sessions)))
                 }
                 mind.followups[skill] = follow
             }
@@ -106,6 +119,7 @@ public enum SkillPatterns {
                 let offered = mind.shapes.values.filter { $0.state != nil }.map(\.steps)
                 let ready = mind.shapes.filter { _, shape in
                     shape.state != "noticed" && shape.turns.count >= turnsToNotice
+                        && (shape.meaningful ?? shape.steps.contains { !navigationAction(action($0)) })
                         && !offered.contains { $0 != shape.steps && (contains($0, shape.steps) || contains(shape.steps, $0)) }
                 }.sorted { ($1.value.steps.count, $1.value.turns.count, $0.key) < ($0.value.steps.count, $0.value.turns.count, $1.key) }
                 let scripts = ready.isEmpty ? [] : coveringScripts(root)
@@ -117,7 +131,8 @@ public enum SkillPatterns {
                     mind.shapes[pick.key]?.item = nil
                     mind.noticedAt = now
                     lines.append(Line(words: fit(pick.value.steps) { "\(who) done \($0) in \(pick.value.turns.count) turns; worth a skill?" },
-                                      agent: agent, shape: pick.key))
+                                      agent: agent, shape: pick.key,
+                                      examples: references(pick.value.turns, sessions: pick.value.sessions)))
                 }
             }
             file.agents[agent] = mind
@@ -175,11 +190,15 @@ public enum SkillPatterns {
         /// nil, "noticed" (its line is open) or "dismissed".
         var state: String?
         var item: String?
+        var meaningful: Bool?
+        var sessions: [String: String]?
     }
     struct Followup: Codable {
         var runs: [[String]]
         var raised: String?
         var last: Date
+        var turns: [String]?
+        var sessions: [String: String]?
     }
 
     private static let lock = NSLock()
@@ -204,13 +223,13 @@ public enum SkillPatterns {
                 data = try encoder.encode(store)
             }
             guard data.count <= byteCap else {
-                NSLog("[skill-patterns] not saved: over \(byteCap) bytes")
+                nativeLog("[skill-patterns] not saved: over \(byteCap) bytes")
                 return nil
             }
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)
         } catch {
-            NSLog("[skill-patterns] not saved: \(error)")
+            nativeLog("[skill-patterns] not saved: \(error)")
             return nil
         }
         return result
@@ -220,6 +239,17 @@ public enum SkillPatterns {
 
     static func key(_ steps: [String]) -> String { steps.joined(separator: " ") }
     static func action(_ step: String) -> String { String(step.prefix { $0 != "(" }) }
+    /// Older shapes predate the canonical action read flag.
+    static func navigationAction(_ action: String) -> Bool {
+        ["skill.list", "skill.read", "chrome.status", "mac.look"].contains(action)
+            || [".status", ".inspect"].contains { action.hasSuffix($0) }
+    }
+
+    static func references(_ turns: [String], sessions: [String: String]?) -> [String] {
+        turns.suffix(3).map { turn in
+            sessions?[turn].map { "conversation:\($0)/turn:\(turn)" } ?? "turn:\(turn)"
+        }
+    }
     /// The line with its calls by action id, kept to `lineLimit`: a long
     /// chain keeps its first and last calls.
     static func fit(_ steps: [String], _ line: (String) -> String) -> String {

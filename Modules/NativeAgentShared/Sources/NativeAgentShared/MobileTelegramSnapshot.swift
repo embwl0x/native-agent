@@ -17,10 +17,13 @@ public struct MobileTelegramSnapshot: Codable, Equatable, Sendable {
     public var allowedUserIDs: [String]
     public var model: String
     public var pollerRunning: Bool
+    public var pollStatusMessage: String?
+    public var lastSuccessfulPollAt: String?
 
     public init(observedAt: Double, tokenConfigured: Bool, enabled: Bool,
                 requireMention: Bool, allowedChatIDs: [String], allowedUserIDs: [String],
-                model: String, pollerRunning: Bool) {
+                model: String, pollerRunning: Bool,
+                pollStatusMessage: String? = nil, lastSuccessfulPollAt: String? = nil) {
         self.observedAt = observedAt
         self.tokenConfigured = tokenConfigured
         self.enabled = enabled
@@ -29,12 +32,12 @@ public struct MobileTelegramSnapshot: Codable, Equatable, Sendable {
         self.allowedUserIDs = allowedUserIDs
         self.model = model
         self.pollerRunning = pollerRunning
+        self.pollStatusMessage = pollStatusMessage
+        self.lastSuccessfulPollAt = lastSuccessfulPollAt
     }
 }
 
 /// Deliberately has no credential or allowlist mutation field.
 public enum MobileTelegramChange: Sendable {
-    case enabled(Bool)
-    case requireMention(Bool)
     case disconnect
 }

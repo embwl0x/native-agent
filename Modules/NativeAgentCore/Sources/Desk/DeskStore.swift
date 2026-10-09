@@ -786,7 +786,8 @@ public struct SwiftNativeDeskStore: Sendable {
     public func completeWorkAttempt(
         _ handle: String,
         attemptId: String,
-        receipt: String
+        receipt: String,
+        disposition: DeskWorkDisposition? = nil
     ) async throws -> DeskOp? {
         try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
@@ -802,7 +803,7 @@ public struct SwiftNativeDeskStore: Sendable {
             let op = DeskOp(
                 ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
-                body: .completeWorkAttempt(attemptId: attemptId, receipt: receipt)
+                body: .completeWorkAttempt(attemptId: attemptId, receipt: receipt, disposition: disposition)
             )
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
             _ = try await appendAndRecompactUnlocked(op, feed: feed)
@@ -1642,6 +1643,9 @@ public struct SwiftNativeDeskStore: Sendable {
                 throw DeskError.notAPursuit(handle: op.handle)
             }
             if state.hasWorkSlot(handle: op.handle, id: reservationId) { return }
+            guard item.status != .blocked, DeskSequencing.compute(state).byHandle[op.handle]?.isReady == true else {
+                throw DeskError.workReservationNotReady(handle: op.handle)
+            }
             if state.workSessions(on: day, handle: op.handle) >= maxWorkSessionsPerPursuitPerDay {
                 throw DeskError.workSessionCapReached(scope: "per-pursuit (2/day)", limit: maxWorkSessionsPerPursuitPerDay, handle: op.handle)
             }
@@ -1672,6 +1676,9 @@ public struct SwiftNativeDeskStore: Sendable {
                 throw DeskError.unknownHandle(op.handle)
             }
             if state.hasWorkSlot(handle: op.handle, id: attemptId) { return }
+            guard item.status != .blocked, DeskSequencing.compute(state).byHandle[op.handle]?.isReady == true else {
+                throw DeskError.workReservationNotReady(handle: op.handle)
+            }
             if state.workSessions(on: day, handle: op.handle) >= 1 {
                 throw DeskError.workSessionCapReached(scope: "per-owner-item (1/day)", limit: 1, handle: op.handle)
             }
@@ -1680,7 +1687,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 throw DeskError.workSessionCapReached(scope: "workshop (6/day)", limit: maxWorkSessionsGlobalPerDay, handle: op.handle)
             }
 
-        case let .completeWorkAttempt(attemptId, _):
+        case let .completeWorkAttempt(attemptId, _, _):
             guard let item = state.items.first(where: { $0.handle == op.handle }),
                   let attempt = item.workAttempts.first(where: { $0.attemptId == attemptId }) else {
                 throw DeskError.unknownReservation(reservationId: attemptId, handle: op.handle)
@@ -1794,7 +1801,7 @@ public struct SwiftNativeDeskStore: Sendable {
     /// Includes `startingAt` itself, then walks toward the root. Cycle-tolerant
     /// because legacy/hand-authored event feeds are decoded permissively.
     private static func terminalAncestor(startingAt handle: String, in state: DeskState) -> DeskItem? {
-        var byHandle = Dictionary(uniqueKeysWithValues: state.items.map { ($0.handle, $0) })
+        var byHandle = Dictionary(state.items.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
         var current: String? = handle
         var seen: Set<String> = []
         while let handle = current,

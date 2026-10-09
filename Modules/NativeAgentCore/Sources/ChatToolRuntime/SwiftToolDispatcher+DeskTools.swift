@@ -151,6 +151,18 @@ extension SwiftToolDispatcher {
     }
 
     /// Map a handle-or-alias string to a CURRENT stable handle, or throw.
+    private static func deskMatches(_ raw: String, in state: DeskState) throws -> [DeskItem] {
+        let reference = deskAlias(raw)
+        let exact = state.items.filter { $0.alias == reference || $0.handle == reference }
+        let matches = exact.isEmpty ? state.items.filter {
+            $0.title.caseInsensitiveCompare(raw.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+        } : exact
+        guard matches.count <= 1 else {
+            throw AutonomyGateError.toolDenied(reason: "desk: several items share that title; use query in desk.read to find their exact desk numbers")
+        }
+        return matches
+    }
+
     private func resolveDeskRef(_ raw: String) async throws -> String {
         let r = Self.deskAlias(raw)
         guard !r.isEmpty else {
@@ -158,8 +170,8 @@ extension SwiftToolDispatcher {
         }
         if r.hasPrefix("desk_") { return r }
         let state = try await deskStore().liveState()
-        if let item = state.items.first(where: { $0.alias == r }) { return item.handle }
-        if let item = state.items.first(where: { $0.handle == r }) { return item.handle }
+        let matches = try Self.deskMatches(raw, in: state)
+        if matches.count == 1 { return matches[0].handle }
         throw AutonomyGateError.toolDenied(
             reason: "desk: no live item numbered or handled '\(r)' — use the desk number you see (e.g. 1 or 2.1), or call desk_read first"
         )
@@ -201,6 +213,25 @@ extension SwiftToolDispatcher {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let query = optionalString(input, "query")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let updatedOn = optionalString(input, "updated_on")
+        let day: DateInterval?
+        if let updatedOn {
+            let formatter = DateFormatter()
+            formatter.calendar = Calendar.current
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = .current
+            formatter.dateFormat = "yyyy-MM-dd"
+            guard let date = updatedOn == "today" ? Date() : formatter.date(from: updatedOn),
+                  updatedOn == "today" || formatter.string(from: date) == updatedOn else {
+                throw AutonomyGateError.toolDenied(reason: "desk_read: updated_on must be today or YYYY-MM-DD in the Mac's local timezone")
+            }
+            day = Calendar.current.dateInterval(of: .day, for: date)
+        } else { day = nil }
+        func matchesDate(_ stamp: String) -> Bool {
+            guard let day else { return true }
+            guard let date = DeskClock.parseISO(stamp) else { return false }
+            return date >= day.start && date < day.end
+        }
         guard handle?.isEmpty != false || query?.isEmpty != false else {
             throw AutonomyGateError.toolDenied(
                 reason: "desk_read: use handle for one exact item or query for text search, not both"
@@ -210,7 +241,7 @@ extension SwiftToolDispatcher {
         // 2026-09-22: triage view. The board shows 25 rows with no dates, so
         // staleness was unjudgeable; list every open top-level item, oldest first.
         if optionalString(input, "sort") == "stale", handle?.isEmpty != false, query?.isEmpty != false {
-            let open = board.topLevel.filter { !$0.status.isTerminal }.sorted {
+            let open = board.topLevel.filter { !$0.status.isTerminal && matchesDate($0.updatedAt) }.sorted {
                 $0.updatedAt != $1.updatedAt ? $0.updatedAt < $1.updatedAt : $0.handle < $1.handle
             }
             return .object([
@@ -222,32 +253,69 @@ extension SwiftToolDispatcher {
             ])
         }
 
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        let locale = Locale(identifier: "en_US_POSIX")
+        let needle = query?.folding(options: options, locale: locale) ?? ""
+        func matchesText(_ values: [String]) -> Bool {
+            return needle.isEmpty || values.contains { $0.folding(options: options, locale: locale).contains(needle) }
+        }
         let rawMatches: [DeskItem]
         if let handle, !handle.isEmpty {
-            let wanted = Self.deskAlias(handle)
-            rawMatches = state.items.filter { $0.handle == wanted || $0.alias == wanted }
-        } else if let query, !query.isEmpty {
-            let needle = query.folding(
-                options: [.caseInsensitive, .diacriticInsensitive],
-                locale: Locale(identifier: "en_US_POSIX")
-            )
+            rawMatches = try Self.deskMatches(handle, in: state).filter { matchesDate($0.updatedAt) }
+        } else if query?.isEmpty == false || day != nil {
             rawMatches = state.items.filter { item in
-                [item.alias, item.handle, item.project, item.title, item.summary ?? ""]
-                    .contains { value in
-                        value.folding(
-                            options: [.caseInsensitive, .diacriticInsensitive],
-                            locale: Locale(identifier: "en_US_POSIX")
-                        ).contains(needle)
-                    }
+                matchesDate(item.updatedAt) && matchesText([item.alias, item.handle, item.project, item.title, item.summary ?? ""])
             }
         } else {
             rawMatches = []
         }
-        if input["structured"] == .bool(true) {
-            return Self.workspaceDesk(state: state, input: input, handle: handle, query: query, matches: rawMatches)
+        let includeArchived: Bool
+        switch input["include_archived"] {
+        case .some(.bool(let b)): includeArchived = b
+        case .some(.string(let s)): includeArchived = ["true", "1", "yes", "y", "on"].contains(s.lowercased())
+        default: includeArchived = false
+        }
+        var archiveProjection = ""
+        var archivedMatchCount = 0
+        var nextArchiveRead: JSONValue = .null
+        var archivedIsBounded = false
+        if includeArchived {
+            let archived = try await store.archivedRecords().filter { record in
+                guard matchesDate(record.closedAt) else { return false }
+                if let handle, !handle.isEmpty { return record.handle == Self.deskAlias(handle) }
+                return matchesText([record.handle, record.project, record.title, record.summary])
+            }
+            archivedMatchCount = archived.count
+            let archiveText = archived.map {
+                "  \($0.handle) \($0.finalStatus.rawValue) \($0.project) · \($0.title) — \($0.summary)"
+            }.joined(separator: "\n")
+            let start = min(archiveText.count, max(0, optionalInt(input, "archived_offset") ?? 0))
+            let window = String(archiveText.dropFirst(start).prefix(12_000))
+            let end = start + window.count
+            archivedIsBounded = start > 0 || end < archiveText.count
+            archiveProjection = "\n\narchived (\(archived.count) matching, characters \(start)–\(end)):\n" + window
+            if end < archiveText.count {
+                var args: [String: JSONValue] = ["include_archived": .bool(true), "archived_offset": .int(Int64(end))]
+                if let handle, !handle.isEmpty { args["handle"] = .string(handle) }
+                if let query, !query.isEmpty { args["query"] = .string(query) }
+                args["updated_on"] = input["updated_on"]
+                if input["structured"] == .bool(true) { args["structured"] = .bool(true) }
+                nextArchiveRead = .object(["tool": .string("app"), "input": .object([
+                    "action": .string("desk.read"), "args": .object(args)])])
+            }
+        }
+        if input["structured"] == .bool(true),
+           case .object(var result) = Self.workspaceDesk(state: state, input: input, handle: handle, query: query, matches: rawMatches) {
+            if includeArchived {
+                result["archived_projection"] = .string(archiveProjection)
+                result["archivedMatchCount"] = .int(Int64(archivedMatchCount))
+                result["next_archive_read"] = nextArchiveRead
+                if archivedMatchCount > 0 { result["status"] = .string("ok") }
+            }
+            return .object(result)
         }
 
-        let isFiltered = (handle?.isEmpty == false) || (query?.isEmpty == false)
+        let isFiltered = (handle?.isEmpty == false) || (query?.isEmpty == false) || day != nil
         let matchCap = 25
         let matches = Array(rawMatches.prefix(matchCap))
         let renderState: DeskState
@@ -301,22 +369,7 @@ extension SwiftToolDispatcher {
             }
         }
 
-        let includeArchived: Bool
-        switch input["include_archived"] {
-        case .some(.bool(let b)): includeArchived = b
-        case .some(.string(let s)): includeArchived = ["true", "1", "yes", "y", "on"].contains(s.lowercased())
-        default: includeArchived = false
-        }
-        if includeArchived {
-            let archived = try await store.archivedRecords()
-            if !archived.isEmpty {
-                var lines = ["", "archived (\(archived.count)):"]
-                for rec in archived {
-                    lines.append("  \(rec.handle.replacingOccurrences(of: "desk_", with: "")) \(rec.finalStatus.rawValue) \(rec.project) · \(rec.title) — \(rec.summary)")
-                }
-                text += "\n" + lines.joined(separator: "\n")
-            }
-        }
+        text += archiveProjection
         let defaultProjectionIsBounded = !isFiltered && (
             board.topLevel.count > DeskProjection.topLevelCap
                 || board.topLevel.filter { $0.status.isTerminal }.count > DeskProjection.doneCap
@@ -327,7 +380,9 @@ extension SwiftToolDispatcher {
             "liveItemCount": .int(Int64(state.items.count)),
             "topLevelItemCount": .int(Int64(state.topLevel.count)),
             "projectionTopLevelCap": .int(Int64(DeskProjection.topLevelCap)),
-            "projectionIsBounded": .bool(defaultProjectionIsBounded),
+            "projectionIsBounded": .bool(defaultProjectionIsBounded || archivedIsBounded),
+            "next_archive_read": nextArchiveRead,
+            "archivedMatchCount": .int(Int64(archivedMatchCount)),
             "matchCount": .int(Int64(rawMatches.count)),
             "matchesTruncated": .bool(rawMatches.count > matchCap),
             "continuation": matches.count == 1 ? (matches.first?.continuation?.summaryJSON() ?? .null) : .null,
@@ -348,6 +403,15 @@ extension SwiftToolDispatcher {
         let summary = optionalString(input, "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let assignee = optionalString(input, "assignee")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let laneRaw = optionalString(input, "lane_of")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let until = optionalString(input, "until")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let deferred = optionalString(input, "defer")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let until, let deferred, until != deferred {
+            throw AutonomyGateError.toolDenied(reason: "desk_add_item: until and defer must agree")
+        }
+        let park = until ?? deferred
+        if let park, !park.isEmpty, !DeskClock.isParseableDate(park) {
+            throw AutonomyGateError.toolDenied(reason: "desk_add_item: until must be yyyy-MM-dd or an ISO timestamp; nothing was added")
+        }
         // Resolve a parent given as a number ("2") to its handle, so "add a step
         // under 2" works by the visible alias.
         let parent: String? = (parentRaw?.isEmpty == false) ? try await resolveDeskRef(parentRaw!) : nil
@@ -379,12 +443,16 @@ extension SwiftToolDispatcher {
             )
         }
         let item = result.item
+        if let park, !park.isEmpty { _ = try await store.setDeferUntil(item.handle, until: park) }
         return .object([
             "status": .string("ok"),
             "disposition": .string(result.reusedEquivalent ? "existing" : "created"),
             "created": .bool(!result.reusedEquivalent),
             "handle": .string(item.handle),
             "alias": .string(item.alias),
+            "defer_until": (park?.isEmpty == false ? park : item.deferUntil).map(JSONValue.string) ?? .null,
+            "next_call": .object(["tool": .string("app"), "input": .object([
+                "action": .string("desk.read"), "args": .object(["handle": .string(item.handle)])])]),
             "confirmation": .string(result.reusedEquivalent
                 ? "reused existing \(item.alias) \(item.kind.rawValue) \(item.project) · \(item.title)"
                 : "created \(item.alias) \(item.kind.rawValue) \(item.project) · \(item.title)"),
@@ -995,7 +1063,7 @@ extension SwiftToolDispatcher {
         let state = try await store.liveState()
         let plan = DeskSequencing.compute(state)
         let parentAlias = state.items.first { $0.handle == parentHandle }?.alias ?? parentHandle
-        let byHandle = Dictionary(uniqueKeysWithValues: state.items.map { ($0.handle, $0) })
+        let byHandle = Dictionary(state.items.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
         var lines: [String] = []
         let addedHandles = createdHandles.enumerated().filter { !reusedSteps.contains($0.offset) }.map(\.element)
         for handle in addedHandles {

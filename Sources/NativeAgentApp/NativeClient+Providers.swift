@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Synchronization
 import Darwin
 import AppKit
 import NativeAgentShared
@@ -101,10 +102,50 @@ extension NativeClient {
             do {
                 try await LLMProviderStatusFeed.write(result, dataRoot: dataRoot)
             } catch {
-                NSLog("provider_status: could not persist provider check: \(error.localizedDescription)")
+                nativeLog("provider_status: could not persist provider check: \(error.localizedDescription)")
             }
             return result
         }
+        // User, 2026-10-07: the OAuth-direct providers she actually runs on have
+        // no API key to GET a models list with, so Doctor's provider repair
+        // could never test them ("no native probe"). One "ping" through the
+        // same adapter her turns use proves sign-in and reachability. No
+        // lifecycle observer: a probe is not her traffic and moves no vitals.
+        // Detached so it inherits no turn context (a caller's admitted model,
+        // session or token budget would otherwise override the probe's own).
+        if id.hasSuffix("_oauth_direct") {
+            let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedProviderSnapshot()
+            let probeModel = try Self.providerProbeModel(id, snapshot: snapshot)
+            let llm = makeResidentProviderLLMClient(dataRoot: dataRoot)
+            let start = Date()
+            let probe = Task.detached {
+                try await LLMCallContext.$providerId.withValue(id) {
+                    try await llm.complete(prompt: "ping", system: nil, model: probeModel)
+                }
+            }
+            do {
+                _ = try await withTaskCancellationHandler {
+                    try await probe.value
+                } onCancel: {
+                    probe.cancel()
+                }
+                return await recordProbeResult(ProviderTestResult(
+                    provider_id: id, status: "ok", tested: true,
+                    response: nil, model_used: probeModel,
+                    detail: "latency=\(Int(Date().timeIntervalSince(start) * 1000))ms", error: nil
+                ))
+            } catch is CancellationError {
+                // The caller gave up; that says nothing about the provider.
+                throw CancellationError()
+            } catch {
+                return await recordProbeResult(ProviderTestResult(
+                    provider_id: id, status: "error", tested: true,
+                    response: nil, model_used: probeModel,
+                    detail: nil, error: error.localizedDescription
+                ))
+            }
+        }
+
         let configFile: String? = switch id {
         case "openai", "anthropic", "moonshot", "kimi-code", "openrouter": "\(id).json"
         default: nil
@@ -129,9 +170,7 @@ extension NativeClient {
 
         if id == "kimi-code" {
             let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedProviderSnapshot()
-            guard let provider = snapshot.providers.first(where: { $0.id == id }) else {
-                throw ProviderRoutingError.providerNotFound
-            }
+            let probeModel = try Self.providerProbeModel(id, snapshot: snapshot)
             // Real reachability probe: the subscription API has no free GET
             // /models, so spend one token on a minimal Messages call. Proves
             // key validity + endpoint reachability, and its 200 also confirms
@@ -142,20 +181,6 @@ extension NativeClient {
             req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             req.setValue("application/json", forHTTPHeaderField: "content-type")
             req.timeoutInterval = 20
-            // A connectivity probe still needs A model to ask with: take the
-            // selected model from the checked snapshot, or the first catalog
-            // row when this account is not selected on any surface.
-            let selectedSurface = MODEL_SURFACES.first { snapshot.routing.activeProviders[$0] == id }
-            let selectedModel = selectedSurface.flatMap { snapshot.routing.preferences[$0]?.model }
-            let offeredModels: [String]
-            if case .array(let models)? = provider.modelCatalog {
-                offeredModels = models.compactMap {
-                    guard case .object(let row) = $0, case .string(let model)? = row["id"] else { return nil }
-                    return model
-                }
-            } else { offeredModels = [] }
-            guard let probeModel = selectedModel.flatMap({ offeredModels.contains($0) ? $0 : nil })
-                ?? offeredModels.first else { throw ProviderRoutingError.unavailable }
             req.httpBody = try? JSONSerialization.data(withJSONObject: [
                 "model": probeModel,
                 "max_tokens": 1,
@@ -238,6 +263,27 @@ extension NativeClient {
         }
     }
 
+    /// A connectivity probe still needs A model to ask with: the model
+    /// selected for this provider on any surface, or the first catalog row
+    /// when it is not selected anywhere.
+    private static func providerProbeModel(_ id: String, snapshot: ProviderCatalogSnapshot) throws -> String {
+        guard let provider = snapshot.providers.first(where: { $0.id == id }) else {
+            throw ProviderRoutingError.providerNotFound
+        }
+        let selectedSurface = MODEL_SURFACES.first { snapshot.routing.activeProviders[$0] == id }
+        let selectedModel = selectedSurface.flatMap { snapshot.routing.preferences[$0]?.model }
+        let offeredModels: [String]
+        if case .array(let models)? = provider.modelCatalog {
+            offeredModels = models.compactMap {
+                guard case .object(let row) = $0, case .string(let model)? = row["id"] else { return nil }
+                return model
+            }
+        } else { offeredModels = [] }
+        guard let probeModel = selectedModel.flatMap({ offeredModels.contains($0) ? $0 : nil })
+            ?? offeredModels.first else { throw ProviderRoutingError.unavailable }
+        return probeModel
+    }
+
     // DAEMON-DEAD PORT (2026-06-02): write surface→provider into
     // <dataRoot>/providers/active.json under flock, merged with existing.
     func setActiveProvider(surface: String, providerId: String) async throws -> EmptyResponse {
@@ -293,7 +339,7 @@ extension NativeClient {
             do {
                 try ProviderAPIKeyStore.delete(reference)
             } catch {
-                NSLog("provider_credentials: provider removed; unused Keychain item cleanup failed")
+                nativeLog("provider_credentials: provider removed; unused Keychain item cleanup failed")
             }
         }
         return EmptyResponse()
@@ -326,12 +372,74 @@ extension NativeClient {
         // only the offline core checks are ever served from the 60s window.
         let now = ISO8601DateFormatter().string(from: Date())
         let liveChecks = await liveDoctorCoverageChecks()
-        return await Self.makeHealthCard(
+        let card = await Self.makeHealthCard(
             now: now,
             cachePath: Self.doctorCachePath(),
             liveChecks: liveChecks,
             runCoreChecks: { try await makeDoctorChecks().runAll(repair: false) }
         )
+        await repairOnAdverseTransition(card)
+        return card
+    }
+
+    /// A row that read ok last poll and adverse now is recorded, and wakes
+    /// Doctor's repair pass.
+    private func repairOnAdverseTransition(_ card: HealthCard) async {
+        healthCardStatuses.withLock { state in
+            for row in card.subsystems
+            where state.statuses[row.id] == "ok" && DoctorSafeRepairPolicy.isAdverse(row.status) {
+                state.pending.insert(row.id)
+            }
+            state.statuses = Dictionary(card.subsystems.map { ($0.id, $0.status) }, uniquingKeysWith: { first, _ in first })
+        }
+        await wakeDoctorForPendingTransitions()
+    }
+
+    /// Fresh Doctor measurements settle only healed rows or successfully
+    /// surfaced sign-in/permission asks. Dispatch alone never settles a wake.
+    static func acknowledgeDoctorTransitions(_ checks: [CheckResult], asksFiled: Bool) {
+        healthCardStatuses.withLock { state in
+            for check in checks where check.status == "ok" || (asksFiled && DoctorSafeRepairPolicy.isUserAsk(check)) {
+                state.pending.remove(check.id)
+            }
+        }
+    }
+
+    /// One single-flight attempt per ten-minute window while repair is pending.
+    /// Manager readiness also wakes retained work without consuming it.
+    func wakeDoctorForPendingTransitions() async {
+        let now = Date()
+        let manager = backgroundLoopsManager.coreManager
+        let ready = await manager.isRunning(loopId: "doctor_auto_run")
+        let decision: (wake: Bool, deferFor: TimeInterval?) = healthCardStatuses.withLock { state in
+            guard !state.pending.isEmpty, !state.inFlight else { return (false, nil) }
+            let wait = state.lastAttempt.addingTimeInterval(600).timeIntervalSince(now)
+            if ready, wait <= 0 {
+                state.inFlight = true
+                state.lastAttempt = now
+                return (true, nil)
+            }
+            guard !state.deferred else { return (false, nil) }
+            state.deferred = true
+            return (false, ready ? wait : max(600, wait))
+        }
+        if decision.wake {
+            let client = self
+            Task {
+                _ = await manager.runTickOnce(loopId: "doctor_auto_run")
+                healthCardStatuses.withLock { $0.inFlight = false }
+                await client.wakeDoctorForPendingTransitions()
+            }
+        }
+        if let deferFor = decision.deferFor {
+            let client = self
+            Task {
+                do { try await Task.sleep(for: .seconds(deferFor)) }
+                catch { healthCardStatuses.withLock { $0.deferred = false }; return }
+                healthCardStatuses.withLock { $0.deferred = false }
+                await client.wakeDoctorForPendingTransitions()
+            }
+        }
     }
 
     static func doctorCachePath() -> URL {
@@ -358,8 +466,8 @@ extension NativeClient {
     /// `runAt` when the file was written (2026-09-12: the loop writer grew
     /// `measuredAt` first and this writer lagged; the wire-shape test caught it).
     /// Only the offline core checks are persisted — live coverage rows are
-    /// per-call truth and would otherwise leak into SelfHealingHook's and the
-    /// heartbeat's reading of this file.
+    /// per-call truth and would otherwise leak into the heartbeat's reading
+    /// of this file.
     ///
     /// Best-effort: a write failure costs the next call a live doctor run,
     /// i.e. exactly the pre-fix behavior. It can never produce a wrong verdict.
@@ -681,3 +789,8 @@ enum EmbeddingPlainCopy {
     static let notLoadedYetLine =
         "The search model is not loaded right now. It loads on your next search."
 }
+
+/// Last health-card reading per row, rows that turned adverse since Doctor's
+/// last transition run, and whether a run is scheduled for the window's end.
+private let healthCardStatuses = Mutex<(statuses: [String: String], pending: Set<String>, lastAttempt: Date, deferred: Bool, inFlight: Bool)>(
+    ([:], [], .distantPast, false, false))

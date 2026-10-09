@@ -431,6 +431,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
             Workshop task title: \(spec.title)
             Workshop task objective: \(spec.objective)
+            Required output phrases: \((spec.expectedOutputs ?? []).joined(separator: "\n"))
 
             Available tools:
             \(toolsSummary)
@@ -556,7 +557,8 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
                 triggerSource: spec.triggerSource,
                 trustRequired: spec.trustRequired,
                 deskHandle: spec.deskHandle,
-                projectSpaceId: spec.projectSpaceId
+                projectSpaceId: spec.projectSpaceId,
+                expectedOutputs: spec.expectedOutputs
             )
         )
         let exactPlanningProviderCallCount: Int? = enableAutonomy
@@ -645,7 +647,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             receiptsDir: receipts.path,
             triggerSource: spec.triggerSource,
             trustRequired: spec.trustRequired,
-            expectedOutputs: [],
+            expectedOutputs: (spec.expectedOutputs ?? []).map(JSONValue.string),
             currentStepId: "",
             updatedAt: nowStr,
             result: .null,

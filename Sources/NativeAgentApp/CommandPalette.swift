@@ -1,3 +1,4 @@
+import AppToolRuntime
 import NativeAgentCore
 import SwiftUI
 import AppKit
@@ -22,9 +23,14 @@ struct PaletteItem: Identifiable, Hashable {
     let subtitle: String?
     let systemImage: String
     let kind: Kind
+    /// Matched after the title and subtitle, never shown: a memory's whole
+    /// text, a tab's stored key.
+    var searchText: String? = nil
 
     enum Kind: Hashable {
         case tab(SidebarItem)
+        case railTab(SidebarItem, String)  // rail page, tab key
+        case setting(String, tab: String?) // registry page id, the tab it is on
         case chatSession(String)         // chat session id
         case recentAction(String)        // recent-action id
         case deskItem(String)            // desk handle — active OR done
@@ -34,28 +40,79 @@ struct PaletteItem: Identifiable, Hashable {
     }
 }
 
+extension PaletteItem {
+    /// A live Desk row, as the Desk page hands it in.
+    init(desk row: DeskPaletteRow) {
+        self.init(
+            id: "desk.\(row.handle)",
+            title: row.title,
+            subtitle: "\(row.alias) · \(row.status) · \(row.project)",
+            systemImage: row.isActionable ? "tray.full" : "eye",
+            kind: .deskItem(row.handle)
+        )
+    }
+}
+
+/// What the Desk page adds when ⌘K opens there: its live rows (GitHub watcher
+/// rows included), the row already selected, and its three verbs. A leading
+/// close / defer / note turns the field into a Desk command; anything else is
+/// the ordinary app-wide search with the Desk's rows in it.
+struct DeskPaletteScope {
+    let rows: [DeskPaletteRow]
+    let selectedHandle: String?
+    let onSelect: (String) -> Void
+    let onCommand: (DeskPaletteQuery.Verb, String) -> Void
+}
+
+/// Resolves the one row a Desk command names in its banner and hands to Enter.
+enum DeskPalettePresentation {
+    static func target(
+        rows: [DeskPaletteRow],
+        matches: [DeskPaletteRow],
+        selectedHandle: String?,
+        parsed: DeskPaletteQuery,
+        highlighted: Int
+    ) -> DeskPaletteRow? {
+        if parsed.verb != nil, parsed.query.isEmpty {
+            return rows.first { $0.handle == selectedHandle && $0.isActionable }
+        }
+        guard !matches.isEmpty else { return nil }
+        return matches[min(max(highlighted, 0), matches.count - 1)]
+    }
+
+    /// Says out loud what Enter is about to do. A palette that mutates on
+    /// Enter without naming the mutation is how a stray keystroke closes an item.
+    static func bannerText(
+        for verb: DeskPaletteQuery.Verb,
+        target: DeskPaletteRow?,
+        query: String
+    ) -> String {
+        guard let target else {
+            return query.isEmpty
+                ? "\(verb.actionLabel) — nothing selected yet; type part of an item's title."
+                : "\(verb.actionLabel) — no item matches \u{201C}\(query)\u{201D}."
+        }
+        switch verb {
+        case .close: return "Enter closes \u{201C}\(target.title)\u{201D}."
+        case .deferItem: return "Enter selects \u{201C}\(target.title)\u{201D} and opens the park menu."
+        case .note: return "Enter selects \u{201C}\(target.title)\u{201D} and opens the note field."
+        }
+    }
+}
+
 enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
-    case openSkills = "open_skills"
-    case openTools = "open_tools"
     case newChat = "new_chat"
     case refreshActivity = "refresh_activity"
     case reloadAll = "reload_all"
-    case openDoctor = "open_doctor"
 
     var presentation: (title: String, subtitle: String, systemImage: String) {
         switch self {
-        case .openSkills:
-            ("Skills", "Skills & Tools", "puzzlepiece.extension")
-        case .openTools:
-            ("Tools", "Skills & Tools", "wrench.and.screwdriver")
         case .newChat:
             ("New chat session", "Start a fresh chat", "plus.bubble")
         case .refreshActivity:
-            ("Refresh Activity", "Reload approvals, Inbox, and proposals", "arrow.clockwise")
+            ("Refresh Today", "Reload approvals, Inbox, and proposals", "arrow.clockwise")
         case .reloadAll:
-            ("Reload all", "Full refreshAll() pass", "arrow.triangle.2.circlepath")
-        case .openDoctor:
-            ("Open health checks", "Diagnostics surface", "stethoscope")
+            ("Refresh everything", "Read every page again", "arrow.triangle.2.circlepath")
         }
     }
 }
@@ -64,11 +121,15 @@ enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
 /// from the sheet lets every presentation state use the same exact pool and
 /// ranking rules the user interacts with.
 enum CommandPalettePresentation {
-    static func filteredItems(pool: [PaletteItem], query: String) -> [PaletteItem] {
+    /// `confirmed` are rows already matched elsewhere (a chat's words, found
+    /// by the message index): listed after the pool's matches, never
+    /// re-matched against what they display.
+    static func filteredItems(pool: [PaletteItem], query: String, confirmed: [PaletteItem] = []) -> [PaletteItem] {
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !cleanQuery.isEmpty else {
+            let rail = railItems()
             return Array(pool.filter {
-                if case .tab(let item) = $0.kind { return SidebarItem.primaryItems.contains(item) }
+                if case .tab(let item) = $0.kind { return rail.contains(item) }
                 return false
             }.prefix(8))
         }
@@ -81,31 +142,43 @@ enum CommandPalettePresentation {
             if subtitle.hasPrefix(cleanQuery) { return (item, 2, index) }
             if title.contains(cleanQuery) { return (item, 3, index) }
             if subtitle.contains(cleanQuery) { return (item, 4, index) }
+            if item.searchText?.lowercased().contains(cleanQuery) == true { return (item, 5, index) }
             return nil
         }
-        return scored.sorted {
+        // A chat its title already found is not listed again for its words.
+        var chats = Set<String>()
+        return (scored.sorted {
             if $0.1 != $1.1 { return $0.1 < $1.1 }
             return $0.2 < $1.2
-        }.map(\.0)
+        }.map(\.0) + confirmed).filter { item in
+            guard case .chatSession(let id) = item.kind else { return true }
+            return chats.insert(id).inserted
+        }
+    }
+
+    /// The rail top to bottom, in its own words — the Navigate menu's order.
+    static func railItems() -> [SidebarItem] {
+        BotsShelfRailProposal.ordered(SidebarItem.primaryItems, enabled: BotsShelfPreference.isEnabled())
     }
 
     @MainActor
     static func itemPool(
         sessions: [ChatSession],
+        settings: [PaletteItem] = [],
         saved: [PaletteItem] = []
     ) -> [PaletteItem] {
-        let tabCases: [SidebarItem] =
-            SidebarItem.primaryItems
-            + SidebarItem.advancedItems
-            + [.telegram]
-        let tabs = tabCases.map { item in
-            PaletteItem(
-                id: "tab.\(item.rawValue)",
-                title: item.displayName,
-                subtitle: item == .telegram ? "Settings" : (item.isAdvanced ? "Advanced" : "Primary"),
-                systemImage: item.systemImage,
-                kind: .tab(item)
-            )
+        let pages = railItems().map { item in
+            PaletteItem(id: "tab.\(item.rawValue)", title: item.shellRailTitle, subtitle: nil,
+                        systemImage: item.systemImage, kind: .tab(item))
+        }
+        // Every tab, under the rail page that holds it; a page's first tab
+        // shares its name and is the page row above.
+        let tabs = ShellRailTab.all.flatMap { page, tabs in
+            tabs.filter { $0.title != page.shellRailTitle }.map { tab in
+                PaletteItem(id: "railtab.\(page.rawValue).\(tab.key)", title: tab.title,
+                            subtitle: page.shellRailTitle, systemImage: page.systemImage,
+                            kind: .railTab(page, tab.key), searchText: tab.key)
+            }
         }
         let chats = visibleSessions(sessions).map { session in
             let title = ChatShellConversationRow.title(for: session)
@@ -120,7 +193,7 @@ enum CommandPalettePresentation {
         }
         // Destinations and chats rank first on an equal match; the saved things
         // sit behind them, so ⌘K still opens a page when that is what was typed.
-        return tabs + chats + saved + CommandPaletteRecentAction.allCases.map { action in
+        return pages + tabs + settings + chats + saved + CommandPaletteRecentAction.allCases.map { action in
             let presentation = action.presentation
             return PaletteItem(
                 id: "action.\(action.rawValue)",
@@ -142,17 +215,102 @@ enum CommandPalettePresentation {
                 return $0.id < $1.id
             }
         var ids = Set<String>()
-        return ordered.filter { ids.insert($0.id).inserted }.prefix(50).map { $0 }
+        return ordered.filter { ids.insert($0.id).inserted }
+    }
+
+    /// Every control in the settings registry, by its label, opening the
+    /// page it is on. Read once per opening.
+    @MainActor
+    static func settingItems(appModel: AppModel) -> [PaletteItem] {
+        QuietSettings.all(host: AppQuietSettingsHost(appModel)).map { row in
+            PaletteItem(id: "setting.\(row.id)", title: row.label,
+                        subtitle: QuietPages.page(named: row.page)?.title ?? row.page,
+                        systemImage: "slider.horizontal.3", kind: .setting(row.page, tab: row.tab))
+        }
+    }
+}
+
+/// Every visible conversation's words, for ⌘K: the text ⌘F searches in the
+/// open chat (`MacChatTranscriptSearch`), across all of them. A transcript is
+/// read once and again only when its session row moves; held for the app's
+/// life, so a second opening searches at once.
+actor CommandPaletteMessageIndex {
+    static let shared = CommandPaletteMessageIndex()
+
+    struct Hit: Sendable {
+        let sessionID: String
+        let snippet: String
+    }
+
+    private var texts: [String: (stamp: String, lines: [String])] = [:]
+    /// Newest conversation first, as the palette lists them.
+    private var order: [String] = []
+
+    static func stamp(_ session: ChatSession) -> String {
+        "\(session.updatedAt ?? session.createdAt)|\(session.transcriptGeneration ?? -1)|\(session.messageCount ?? -1)"
+    }
+
+    /// Reads what changed and returns how many conversations could not be
+    /// read. A failed read is not cached: it keeps whatever text it had
+    /// before, and is tried again on the next opening.
+    func refresh(_ sessions: [(id: String, stamp: String)], transcripts: TranscriptsFacade) async -> Int {
+        order = sessions.map(\.id)
+        let stale = sessions.filter { texts[$0.id]?.stamp != $0.stamp }
+        let read = await withTaskGroup(of: (String, String, [String]?).self) { group in
+            for session in stale {
+                group.addTask {
+                    guard let messages = try? await transcripts.loadMessages(sessionId: session.id) else {
+                        return (session.id, session.stamp, nil)
+                    }
+                    return (session.id, session.stamp, MacChatTranscriptSearch.documents(from: messages).map(\.content))
+                }
+            }
+            return await group.reduce(into: [(String, String, [String]?)]()) { $0.append($1) }
+        }
+        var unread = 0
+        for (id, stamp, lines) in read {
+            if let lines { texts[id] = (stamp, lines) } else { unread += 1 }
+        }
+        let kept = Set(order)
+        texts = texts.filter { kept.contains($0.key) }
+        return unread
+    }
+
+    /// The newest line in each conversation that holds `query`, newest
+    /// conversation first, every conversation that has one.
+    func search(_ query: String) -> [Hit] {
+        var hits: [Hit] = []
+        for id in order {
+            guard !Task.isCancelled else { break }
+            guard let lines = texts[id]?.lines else { continue }
+            for line in lines.reversed() {
+                guard let range = line.range(of: query, options: .caseInsensitive) else { continue }
+                hits.append(Hit(sessionID: id, snippet: Self.snippet(line, around: range)))
+                break
+            }
+        }
+        return hits
+    }
+
+    /// A line of the message starting a few words before the match.
+    private static func snippet(_ text: String, around range: Range<String.Index>) -> String {
+        var start = text.index(range.lowerBound, offsetBy: -40, limitedBy: text.startIndex) ?? text.startIndex
+        if start != text.startIndex, let space = text[start..<range.lowerBound].firstIndex(of: " ") {
+            start = text.index(after: space)
+        }
+        let flat = text[start...].split(whereSeparator: \.isNewline).joined(separator: " ")
+        return (start == text.startIndex ? "" : "…") + TodayWords.line(flat, limit: 90)
     }
 }
 
 /// The saved things ⌘K can find: Desk items (still open AND finished), what a
-/// bot actually said, dreams, and memories by their first line. Read once when
-/// the palette opens, through the canonical readers, bounded and newest first —
-/// finished work recedes, it does not disappear.
+/// bot actually said, dreams, and every memory by its words. Read once when
+/// the palette opens, through the canonical readers, newest first; the Desk,
+/// bot replies and dreams are bounded — finished work recedes, it does not
+/// disappear.
 enum CommandPaletteSavedThings {
-    /// Per source. Enough to reach back weeks; small enough that the pool stays
-    /// a list a person can rank in their head.
+    /// Per bounded source. Enough to reach back weeks; small enough that the
+    /// pool stays a list a person can rank in their head.
     static let perSource = 40
 
     static func load(dataRoot: URL, memories: [MemoryV2.MemoryRecord]) async -> [PaletteItem] {
@@ -225,30 +383,42 @@ enum CommandPaletteSavedThings {
         }
     }
 
+    /// Every memory, not a newest slice; its whole text is searched.
     private static func memoryItems(_ memories: [MemoryV2.MemoryRecord]) -> [PaletteItem] {
         memories.sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
-            .prefix(perSource)
             .map { record in
                 PaletteItem(
                     id: "memory.\(record.id)",
                     title: firstLine(record.text),
                     subtitle: "Memory · \(record.layer ?? "")",
                     systemImage: "brain",
-                    kind: .memory(record.id)
+                    kind: .memory(record.id),
+                    searchText: record.text
                 )
             }
     }
 }
 
-/// Cmd+K command palette. Presented as a sheet from ContentView.
+/// The one ⌘K palette. ContentView presents it everywhere except the Desk,
+/// which presents the same view with its `DeskPaletteScope`.
 struct CommandPaletteView: View {
     @Environment(AppModel.self) private var appModel
     @Binding var isPresented: Bool
+    var desk: DeskPaletteScope? = nil
 
     @State private var query: String = ""
     @State private var selection: Int = 0
     /// Desk items, bot replies, dreams and memories — read once per opening.
     @State private var savedThings: [PaletteItem] = []
+    /// The settings registry's controls — read once per opening.
+    @State private var settingThings: [PaletteItem] = []
+    /// Conversations whose words hold the query, from the message index.
+    @State private var messageHits: [PaletteItem] = []
+    /// The query `messageHits` answer; another query shows none of them.
+    @State private var messageHitsQuery = ""
+    @State private var messagesIndexed = false
+    /// Conversations the index could not read this opening.
+    @State private var unreadChats = 0
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
@@ -256,7 +426,7 @@ struct CommandPaletteView: View {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
-                TextField("Jump to anything…", text: $query)
+                TextField(desk == nil ? "Jump to anything…" : "Find anything — or type close, defer or note", text: $query)
                     .textFieldStyle(.plain)
                     .font(.title3)
                     .focused($fieldFocused)
@@ -285,9 +455,20 @@ struct CommandPaletteView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
-            .background(.regularMaterial)
 
             Divider()
+
+            if let desk, let verb = DeskPaletteQuery.parse(query).verb {
+                Text(DeskPalettePresentation.bannerText(
+                    for: verb, target: deskTarget(desk), query: DeskPaletteQuery.parse(query).query))
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                Divider()
+            }
 
             let items = filteredItems()
             if items.isEmpty {
@@ -352,15 +533,16 @@ struct CommandPaletteView: View {
                 paletteHint(symbol: "return", label: "Open")
                 paletteHint(symbol: "escape", label: "Close")
                 Spacer()
-                Text("\(items.count) result\(items.count == 1 ? "" : "s")")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                Text("\(items.count) result\(items.count == 1 ? "" : "s")"
+                     + (unreadChats > 0 ? " · \(unreadChats) chat\(unreadChats == 1 ? "" : "s") could not be searched" : ""))
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .background(.thinMaterial)
         }
         .frame(width: 560)
+        .houseSheet()
         .background(KeyCatcher(
             onMoveUp: { moveSelection(-1) },
             onMoveDown: { moveSelection(1) },
@@ -379,89 +561,142 @@ struct CommandPaletteView: View {
         }
         // The saved things land behind the field; typing never waits on them.
         .task {
+            settingThings = CommandPalettePresentation.settingItems(appModel: appModel)
             savedThings = await CommandPaletteSavedThings.load(
                 dataRoot: PersistenceCore.defaultDataRoot(),
-                memories: appModel.engine.memory.memories
+                memories: (try? await appModel.engine.memory.activeMemories(limit: nil)) ?? []
             )
+            let sessions = CommandPalettePresentation.visibleSessions(appModel.engine.transcripts.sessions)
+                .map { (id: $0.id, stamp: CommandPaletteMessageIndex.stamp($0)) }
+            unreadChats = await CommandPaletteMessageIndex.shared.refresh(sessions, transcripts: appModel.engine.transcripts)
+            messagesIndexed = true
+        }
+        // The words of every chat, searched a beat after typing stops.
+        .task(id: "\(messagesIndexed) \(query)") {
+            let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard messagesIndexed, text.count >= 3 else { messageHits = []; return }
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            let hits = await CommandPaletteMessageIndex.shared.search(text)
+            guard !Task.isCancelled else { return }
+            let sessions = appModel.engine.transcripts.sessions
+            messageHitsQuery = text
+            messageHits = hits.compactMap { hit in
+                guard let session = sessions.first(where: { $0.id == hit.sessionID }) else { return nil }
+                return PaletteItem(id: "message.\(hit.sessionID)", title: ChatShellConversationRow.title(for: session),
+                                   subtitle: hit.snippet, systemImage: "text.bubble", kind: .chatSession(hit.sessionID))
+            }
         }
     }
 
     // MARK: - Rows
 
+    // The shell's row: the soft fill marks the highlighted row, the kind is a
+    // quiet word at the trailing edge.
     @ViewBuilder
     private func paletteRow(item: PaletteItem, isSelected: Bool) -> some View {
         HStack(spacing: 10) {
             Image(systemName: item.systemImage)
                 .frame(width: 22)
-                .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                .foregroundStyle(NativeAgentShell.secondary)
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.title)
-                    .font(.system(.body, weight: .medium))
-                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                    .font(ShellType.labelMedium)
+                    .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                 if let subtitle = item.subtitle, !subtitle.isEmpty {
                     Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(isSelected ? AnyShapeStyle(Color.white.opacity(0.85)) : AnyShapeStyle(.secondary))
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .lineLimit(1)
                 }
             }
             Spacer()
-            kindBadge(kind: item.kind, isSelected: isSelected)
+            Text(kindLabel(item))
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.tertiary)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(isSelected ? Color.accentColor : Color.clear)
+            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
+                .fill(isSelected ? NativeAgentShell.softFill : Color.clear)
                 .padding(.horizontal, 4)
         )
     }
 
-    @ViewBuilder
-    private func kindBadge(kind: PaletteItem.Kind, isSelected: Bool) -> some View {
-        let label: String = {
-            switch kind {
-            case .tab: return "Tab"
-            case .chatSession: return "Chat"
-            case .recentAction: return "Action"
-            case .deskItem: return "Desk"
-            case .bot: return "Bot"
-            case .dream: return "Dream"
-            case .memory: return "Memory"
-            }
-        }()
-        Text(label)
-            .font(.caption2)
-            .foregroundStyle(isSelected ? AnyShapeStyle(Color.white.opacity(0.9)) : AnyShapeStyle(.secondary))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(
-                Capsule().fill(isSelected ? Color.white.opacity(0.18) : Color.secondary.opacity(0.12))
-            )
+    private func kindLabel(_ item: PaletteItem) -> String {
+        switch item.kind {
+        case .tab: return "Page"
+        case .railTab: return "Tab"
+        case .setting: return "Setting"
+        case .chatSession: return "Chat"
+        case .recentAction: return "Action"
+        case .deskItem(let handle):
+            guard let row = desk?.rows.first(where: { $0.handle == handle }) else { return "Desk" }
+            if handle == desk?.selectedHandle { return "Selected" }
+            return row.isActionable ? "Desk" : "Watch only"
+        case .bot: return "Bot"
+        case .dream: return "Dream"
+        case .memory: return "Memory"
+        }
     }
 
     @ViewBuilder
     private func paletteHint(symbol: String, label: String) -> some View {
         HStack(spacing: 4) {
             Image(systemName: symbol)
-                .font(.caption2)
             Text(label)
-                .font(.caption2)
         }
-        .foregroundStyle(.secondary)
+        .font(ShellType.caption)
+        .foregroundStyle(NativeAgentShell.secondary)
     }
 
     // MARK: - Filtering / ranking
 
     private func filteredItems() -> [PaletteItem] {
-        CommandPalettePresentation.filteredItems(pool: itemPool(), query: query)
+        guard let desk else {
+            return CommandPalettePresentation.filteredItems(pool: itemPool(), query: query, confirmed: currentMessageHits)
+        }
+        let parsed = DeskPaletteQuery.parse(query)
+        // A verb narrows the list to the rows it can act on; an empty field
+        // opens on the Desk's own rows.
+        let rows = deskMatches(desk, parsed).map(PaletteItem.init(desk:))
+        if parsed.verb != nil || parsed.query.isEmpty { return rows }
+        // A plain search: the Desk's rows fuzzy-matched first, as the Desk
+        // ranks them, then everything else — including the saved Desk entries,
+        // so an item's summary still finds it.
+        let shown = Set(rows.map(\.id))
+        return rows + CommandPalettePresentation.filteredItems(pool: itemPool(), query: query, confirmed: currentMessageHits)
+            .filter { !shown.contains($0.id) }
+    }
+
+    private var currentMessageHits: [PaletteItem] {
+        messageHitsQuery == query.trimmingCharacters(in: .whitespacesAndNewlines) ? messageHits : []
     }
 
     private func itemPool() -> [PaletteItem] {
         CommandPalettePresentation.itemPool(
             sessions: appModel.engine.transcripts.sessions,
+            settings: settingThings,
             saved: savedThings
+        )
+    }
+
+    private func deskMatches(_ desk: DeskPaletteScope, _ parsed: DeskPaletteQuery) -> [DeskPaletteRow] {
+        DeskFuzzy.filter(parsed.verb == nil ? desk.rows : desk.rows.filter(\.isActionable), query: parsed.query)
+    }
+
+    /// The row a Desk command applies to: the selected row when only the verb
+    /// is typed, otherwise the highlighted match.
+    private func deskTarget(_ desk: DeskPaletteScope) -> DeskPaletteRow? {
+        let parsed = DeskPaletteQuery.parse(query)
+        return DeskPalettePresentation.target(
+            rows: desk.rows,
+            matches: deskMatches(desk, parsed),
+            selectedHandle: desk.selectedHandle,
+            parsed: parsed,
+            highlighted: selection
         )
     }
 
@@ -475,6 +710,13 @@ struct CommandPaletteView: View {
     }
 
     private func commitCurrent() {
+        // A Desk command applies to the row its banner names; with nothing
+        // named the sheet stays open so the query can be corrected.
+        if let desk, DeskPaletteQuery.parse(query).verb != nil {
+            guard let target = deskTarget(desk) else { return }
+            commit(PaletteItem(desk: target))
+            return
+        }
         let items = filteredItems()
         guard !items.isEmpty else { return }
         let idx = max(0, min(selection, items.count - 1))
@@ -482,12 +724,28 @@ struct CommandPaletteView: View {
     }
 
     private func commit(_ item: PaletteItem) {
+        if let desk, case .deskItem(let handle) = item.kind,
+           desk.rows.contains(where: { $0.handle == handle }) {
+            isPresented = false
+            if let verb = DeskPaletteQuery.parse(query).verb {
+                desk.onCommand(verb, handle)
+            } else {
+                desk.onSelect(handle)
+            }
+            return
+        }
         switch item.kind {
         case .tab(let s):
-            if s == .skills {
-                NativeAgentAppCoordinator.shared.request(.skillsTools(.skills))
-            } else {
-                NativeAgentAppCoordinator.shared.request(.sidebar(s.normalized))
+            NativeAgentAppCoordinator.shared.request(.sidebar(s.normalized))
+        case .railTab(let page, let key):
+            // A route lands on the page's first tab; Settings' own links
+            // choose the tab after it, and so does this.
+            SettingsLink.open(page, tab: key)
+        case .setting(let pageID, let tab):
+            // The page the control is on, on the tab it is on.
+            if let page = QuietPages.page(named: pageID) {
+                let home = SidebarItem.shellHome(for: page.item)
+                SettingsLink.open(home?.parent ?? page.item, tab: tab ?? page.tab ?? home?.tab)
             }
         case .chatSession(let sid):
             if let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sid }) {
@@ -514,18 +772,12 @@ struct CommandPaletteView: View {
     private func handleRecentAction(_ id: String) {
         guard let action = CommandPaletteRecentAction(rawValue: id) else { return }
         switch action {
-        case .openSkills:
-            NativeAgentAppCoordinator.shared.request(.skillsTools(.skills))
-        case .openTools:
-            NativeAgentAppCoordinator.shared.request(.skillsTools(.tools))
         case .newChat:
             Task { await appModel.newChatSession() }
             NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
         case .refreshActivity:
             Task { await appModel.refreshForSidebarItem(.activity) }
             NativeAgentAppCoordinator.shared.request(.sidebar(.activity))
-        case .openDoctor:
-            NativeAgentAppCoordinator.shared.request(.sidebar(.diagnostics))
         case .reloadAll:
             Task { await appModel.refreshAll() }
         }

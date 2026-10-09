@@ -1,23 +1,21 @@
 import AppToolRuntime
 // AlivePageKit.swift
 // "Alive glass", the pages — User approved the mockup 2026-09-23. The shared
-// pieces Today and Desk are built from in the Advanced shell. Content layer:
-// every surface here is a FILL, never glassEffect; the haze behind the window
-// (WindowHaze.swift) is what makes it read as glass.
+// pieces Today and Desk are built from in the Advanced shell. Cards share
+// the house glass; the window owns the single haze behind them.
 //
-// Contrast: every text colour here is a shell token that clears 4.5:1 on the
-// card fill and on the room where all three haze discs overlap (peak 0.44).
-// Tertiary grey does not (≈2.6:1 at the haze peak), so nothing here uses it.
+// Text keeps the shell's primary and secondary ink. Verify translucent
+// contrast in installed dark and light captures; tertiary stays off cards.
 
 import AppKit
 import SwiftUI
 
 enum AliveMetrics {
     static let cardRadius: CGFloat = 18
-    static let rowInsetH: CGFloat = 20
-    static let rowInsetV: CGFloat = 14
-    static let sectionSpacing: CGFloat = 28
-    static let eyebrowGap: CGFloat = 10
+    static let rowInsetH = NativeAgentSpacing.pageInset
+    static let rowInsetV = NativeAgentSpacing.rowInsetV
+    static let sectionSpacing = NativeAgentSpacing.section
+    static let eyebrowGap = NativeAgentSpacing.eyebrowGap
 }
 
 enum AlivePalette {
@@ -50,13 +48,13 @@ struct AlivePageHeader: View {
 
     var body: some View {
         let shown = line.flatMap { $0.isEmpty ? nil : $0 }
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             Text(title)
-                .font(.system(size: 44, design: .serif))
+                .font(ShellType.pageTitle)
                 .foregroundStyle(NativeAgentShell.text)
                 .accessibilityAddTraits(.isHeader)
             Text(shown ?? " ")
-                .font(.system(size: 15))
+                .font(ShellType.pageSentence)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -96,7 +94,7 @@ struct AliveEyebrow: View {
 
     var body: some View {
         Text(title)
-            .font(.system(size: 11, weight: .semibold))
+            .font(ShellType.captionSemibold)
             .textCase(.uppercase)
             .tracking(1.0)
             .foregroundStyle(NativeAgentShell.secondary)
@@ -107,8 +105,7 @@ struct AliveEyebrow: View {
 // MARK: - Cards
 
 extension View {
-    /// The one card surface: fill, top light and rim, and the soft teal glow
-    /// when the card holds something waiting on him.
+    /// The house glass and a bounded teal edge when something is waiting.
     func aliveCard(waiting: Bool = false, radius: CGFloat = AliveMetrics.cardRadius) -> some View {
         modifier(AliveCardSurface(waiting: waiting, radius: radius))
     }
@@ -118,6 +115,7 @@ private struct AliveCardSurface: ViewModifier {
     let waiting: Bool
     let radius: CGFloat
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
@@ -126,26 +124,28 @@ private struct AliveCardSurface: ViewModifier {
                 ZStack(alignment: .top) {
                     // Reduce Transparency asks for MORE opacity: the opaque
                     // card the page wore before.
-                    shape.fill(reduceTransparency ? TodayPalette.cardFill : NativeAgentShell.quietFill)
+                    if reduceTransparency || quietOffscreenRead { shape.fill(TodayPalette.cardFill) }
                     if waiting {
-                        LinearGradient(
-                            colors: [NativeAgentShell.needsYou.opacity(0.10), .clear],
-                            startPoint: .top, endPoint: .bottom)
-                            .frame(height: 60)
+                        // A top edge, never a fill: at most 60pt and at most
+                        // half the card, so a one-row card keeps the same
+                        // edge a tall one wears.
+                        GeometryReader { proxy in
+                            LinearGradient(
+                                colors: [NativeAgentShell.needsYou.opacity(0.10), .clear],
+                                startPoint: .top, endPoint: .bottom)
+                                .frame(height: min(60, proxy.size.height / 2))
+                        }
                     }
                 }
                 .clipShape(shape)
             }
+            .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate, in: shape)
             .overlay {
-                shape.strokeBorder(
-                    reduceTransparency
-                        ? AnyShapeStyle(TodayPalette.cardStroke)
-                        : AnyShapeStyle(LinearGradient(
-                            stops: [.init(color: AlivePalette.highlight, location: 0),
-                                    .init(color: AlivePalette.rim, location: 0.22)],
-                            startPoint: .top, endPoint: .bottom)),
-                    lineWidth: 1)
+                if reduceTransparency || quietOffscreenRead {
+                    shape.strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                }
             }
+            .environment(\.houseGlassEnclosed, true)
     }
 }
 
@@ -217,7 +217,7 @@ struct AliveProgressBar: View {
             }
             .frame(width: 96, height: 4)
             Text("\(done) of \(total)")
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .monospacedDigit()
                 .foregroundStyle(NativeAgentShell.secondary)
         }
@@ -246,7 +246,7 @@ struct AliveProgressRing: View {
                     .rotationEffect(.degrees(-90))
             }
             Text(fraction == nil ? "–" : "\(Int((value * 100).rounded()))%")
-                .font(.system(size: 11, weight: .semibold))
+                .font(ShellType.captionSemibold)
                 .monospacedDigit()
                 .foregroundStyle(NativeAgentShell.text)
         }
@@ -287,7 +287,7 @@ struct AlivePill: View {
             }
             Text(text).foregroundStyle(NativeAgentShell.text)
         }
-        .font(.system(size: 13))
+        .font(ShellType.label)
         .lineLimit(1)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -295,16 +295,6 @@ struct AlivePill: View {
         .overlay(Capsule().strokeBorder(reduceTransparency ? TodayPalette.cardStroke : AlivePalette.rim, lineWidth: 1))
         .accessibilityElement(children: .combine)
     }
-}
-
-// MARK: - Older pieces inside an alive page
-
-extension EnvironmentValues {
-    /// Set by a page rebuilt in the kit whose tabs still draw with the older
-    /// shared pieces (`NativePanel`, `SettingsCardSection`,
-    /// `settingsCardSurface`, `HealthPill`): inside it they wear the kit's
-    /// eyebrow and card. Off everywhere else, so no other page moves.
-    @Entry var aliveCards: Bool = false
 }
 
 /// Left-aligned wrapping flow, for pills and the Desk's count line.

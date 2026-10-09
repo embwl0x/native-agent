@@ -270,7 +270,7 @@ extension NativeClient {
             // the visible card stayed put, masking the live-store failure. The
             // live store is the only store; a failed write surfaces as the
             // retryable error below (same resurrect-audit rationale, 2026-06-09).
-            NSLog("[NativeClient] inboxAction(\(endpointAction)) id=\(id): live inbox status write declined")
+            nativeLog("[NativeClient] inboxAction(\(endpointAction)) id=\(id): live inbox status write declined")
             throw NSError(
                 domain: "NativeAgentSwiftOnly",
                 code: -423,
@@ -291,11 +291,11 @@ extension NativeClient {
             } catch ApprovalInboxError.alreadyResolved(let resolvedID, let status) {
                 // Idempotent re-tap: the record is already terminal. Treat as
                 // success so a double-tap doesn't surface a spurious error.
-                NSLog("[NativeClient] inboxAction(\(endpointAction)) id=\(resolvedID): already resolved (\(status)); treating as success")
+                nativeLog("[NativeClient] inboxAction(\(endpointAction)) id=\(resolvedID): already resolved (\(status)); treating as success")
             } catch {
                 // Surface real failures to the caller instead of reporting
                 // unconditional success over a swallowed error.
-                NSLog("[NativeClient] inboxAction(\(endpointAction)) id=\(id): \(error)")
+                nativeLog("[NativeClient] inboxAction(\(endpointAction)) id=\(id): \(error)")
                 throw error
             }
             return
@@ -311,7 +311,7 @@ extension NativeClient {
         if endpointAction == HeartbeatCardAction.repair.rawValue {
             let message = try await BackgroundLoopsAssembly.repairHeartbeatInboxItem(id: id)
             _ = await Self.updateVisibleNotificationInboxStatus(id: id, action: "archive")
-            NSLog("[NativeClient] inboxAction(repair) id=\(id): \(message)")
+            nativeLog("[NativeClient] inboxAction(repair) id=\(id): \(message)")
             return
         }
         // DAEMON-KILL (2026-06-06) + gpt-5.5 review-2 BLOCKING, resolver wired
@@ -418,7 +418,7 @@ extension NativeClient {
                 // were offenders but nothing could move, so the button never
                 // shows a silent green over a failed cleanup.
                 let message = try await BackgroundLoopsAssembly.cleanUpDiskHygiene()
-                NSLog("[NativeClient] inboxAction(act) disk_hygiene: \(message)")
+                nativeLog("[NativeClient] inboxAction(act) disk_hygiene: \(message)")
             case .unresolved(let reason):
                 throw NSError(
                     domain: "NativeAgentSwiftOnly",
@@ -583,7 +583,7 @@ extension NativeClient {
         let sessionId = (UserDefaults.standard.string(forKey: "activeChatSessionId") ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sessionId.isEmpty else {
-            NSLog("[NativeClient] inbox act chat_spoken: no active chat session — falling back to draft")
+            nativeLog("[NativeClient] inbox act chat_spoken: no active chat session — falling back to draft")
             return nil
         }
         let client = NativeAgentEngine.live.chatClient(profile: .background)
@@ -612,13 +612,13 @@ extension NativeClient {
             case .rateLimited(let seconds):
                 // Unreachable on the `.userRequested` route (see the seam's
                 // header); handled rather than assumed away.
-                NSLog("[NativeClient] inbox act chat_spoken: rate limited (%ds) — falling back to draft", seconds)
+                nativeLog("[NativeClient] inbox act chat_spoken: rate limited (%ds) — falling back to draft", seconds)
                 return nil
             }
         } catch let error as ProactiveSpeechError {
             throw error
         } catch {
-            NSLog("[NativeClient] inbox act chat_spoken failed: \(error) — falling back to draft")
+            nativeLog("[NativeClient] inbox act chat_spoken failed: \(error) — falling back to draft")
             return nil
         }
     }
@@ -697,7 +697,7 @@ extension NativeClient {
                 id: id, status: status, readAt: readAt, metadata: metadata
             )
         } catch {
-            NSLog("[inbox] updateVisibleNotificationInboxStatus(\(action)) failed for \(id): \(String(describing: error))")
+            nativeLog("[inbox] updateVisibleNotificationInboxStatus(\(action)) failed for \(id): \(String(describing: error))")
             return false
         }
     }

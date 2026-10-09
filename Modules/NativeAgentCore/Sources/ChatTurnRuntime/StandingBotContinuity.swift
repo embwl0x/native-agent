@@ -7,6 +7,28 @@ import ProviderRouting
 /// the ordinary chat client. No bot-owned conversational state is maintained.
 public enum StandingBotContinuity {
     @TaskLocal public static var currentBot: BotDefinition?
+    @TaskLocal static var currentContract: BotChatContract?
+
+    static var isHelperTurn: Bool { currentBot != nil || currentContract != nil }
+
+    static func withSessionContract<T>(
+        sessionID: String?, dataRoot: URL, isolation: isolated (any Actor)? = #isolation,
+        operation: () async throws -> T
+    ) async throws -> T {
+        let sessionID = try SwiftNativeChatOrchestrationClient.resolveSessionId(sessionID)
+        guard currentBot == nil,
+              let contract = await BotChatContract.checked(sessionID, dataRoot: dataRoot) else {
+            return try await operation()
+        }
+        if let problem = contract.modelChoiceProblem {
+            throw ChatOrchestrationError.helperModelChoice(
+                sessionID: sessionID, reason: problem,
+                message: "\(contract.name) can't run yet. \(problem) Choose its account, model and Think level on its helper card on the Mac. Nothing was started, and its unfinished work is kept.")
+        }
+        return try await $currentContract.withValue(contract) {
+            try await ProviderTurnChoice.$current.withValue(contract.choice, operation: operation)
+        }
+    }
 
     public static func session(client: SwiftNativeChatOrchestrationClient, dataRoot: URL) -> BotRunnerSession {
         { bot, message in
@@ -34,8 +56,7 @@ public enum StandingBotContinuity {
             // the current saved brief on every turn so first asks and edited
             // jobs receive their instructions without replaying a prior run.
             // This stays in the ordinary session; there is no second memory.
-            var message = "Current standing instructions for \(bot.name):\n\(bot.brief)"
-                + (bot.outputFormat.map { "\nRequested output: " + $0 } ?? "")
+            var message = BotChatContract.instructions(for: bot)
                 + "\n\nMessage for this turn:\n" + message
             if let provider = bot.provider, !ProviderToolCapability.supportsTools(providerID: provider) {
                 message = ProviderToolCapability.textOnlyTurnPreface + "\n\n" + message

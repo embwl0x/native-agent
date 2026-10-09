@@ -855,10 +855,16 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// Execution annotations may heal an outcome without replacing this state.
     public func annotateChatContinuation(
         _ id: String, done: Bool, legacyStartedAt: String? = nil,
-        clearQueuedDelivery: Bool = false, settlement: String? = nil
+        clearQueuedDelivery: Bool = false, settlement: String? = nil,
+        assistantDelivery: JSONValue? = nil
     ) async throws -> Bool {
         let now = clock()
         return try await updateChatContinuation(id) { record, state in
+            if let assistantDelivery {
+                guard state["done"] != .bool(true) else { return false }
+                state["assistantDelivery"] = assistantDelivery
+                return true
+            }
             if done {
                 guard state["done"] != .bool(true) else { return false }
                 state["done"] = .bool(true)
@@ -916,8 +922,12 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                     return object["id"] == .string(id)
                 }), case .object(var object) = items[index],
                     object["status"] == .string("pending") else { return nil }
-                if object["chatCard"] == nil {
-                    object["chatCard"] = card
+                // A Telegram mark (`markChatCard`) may come first; the
+                // destination joins it.
+                var current: [String: JSONValue] = [:]
+                if case .object(let saved)? = object["chatCard"] { current = saved }
+                if current["sessionId"] == nil, case .object(let fresh) = card {
+                    object["chatCard"] = .object(current.merging(fresh) { kept, _ in kept })
                     items[index] = .object(object)
                     try await persistence.writeJSON(.array(items), to: approvalsPath)
                 }
@@ -930,6 +940,26 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 items[index] = .object(object)
                 try await persistence.writeJSON(.array(items), to: approvalsPath)
                 return ApprovalRecord(json: .object(object))
+            }
+        }
+    }
+
+    /// Merge `fields` into a pending approval's chat card (its Telegram DM
+    /// prompt), creating the card when there is none yet.
+    public func markChatCard(_ id: String, _ fields: [String: JSONValue]) async throws {
+        try await runSerialized { [persistence, approvalsPath] in
+            try await persistence.withFileLock(approvalsPath) {
+                var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
+                guard let index = items.firstIndex(where: {
+                    guard case .object(let object) = $0 else { return false }
+                    return object["id"] == .string(id)
+                }), case .object(var object) = items[index],
+                    object["status"] == .string("pending") else { return }
+                var card: [String: JSONValue] = [:]
+                if case .object(let saved)? = object["chatCard"] { card = saved }
+                object["chatCard"] = .object(card.merging(fields) { _, new in new })
+                items[index] = .object(object)
+                try await persistence.writeJSON(.array(items), to: approvalsPath)
             }
         }
     }
@@ -1219,6 +1249,19 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             }
             return
         }
+        // The card posted into User's own Telegram DM (`ApprovalChatCards`):
+        // a private chat's id IS its one user's id, so the binding is the
+        // chat and that person both. User, 10-07: that DM is User, with the
+        // signed phone's authority, local-only included.
+        if case .telegram(let chatID, let userID) = provenance, !chatID.isEmpty, chatID == userID,
+           case .object(let card)? = row["chatCard"], card["telegramChatId"] == .string(chatID) {
+            guard !record.isAgentsOwnDecision else {
+                throw ApprovalInboxError.resolutionNotAuthorized(
+                    id: id, reason: "Agent decides her studio canon."
+                )
+            }
+            return
+        }
         if provenance.isRemote {
             guard record.remoteResolvable, !record.localOnly else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
@@ -1232,11 +1275,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 id: id, reason: "Telegram transport identity is incomplete"
             )
         }
-        // The card posted into User's own Telegram DM (`ApprovalChatCards`):
-        // a private chat's id IS its one user's id, so the binding is the
-        // chat and that person both.
-        if case .object(let card)? = row["chatCard"],
-           card["telegramChatId"] == .string(chatID), chatID == userID { return }
         guard case .object(let payload) = record.payload,
               case .object(let telegram)? = payload["telegram"],
               telegram["chatId"] == .string(chatID),

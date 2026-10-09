@@ -208,7 +208,7 @@ public enum GitHubConnectorActions {
         if parts.count == 2 {
             owner = String(parts[0])
             repo = String(parts[1])
-        } else if let rawOwner, !rawOwner.isEmpty {
+        } else if let rawOwner = (rawOwner?.isEmpty == false ? rawOwner : nil) ?? signedInLogin() {
             owner = rawOwner
             repo = rawRepo
         } else {
@@ -523,7 +523,7 @@ public enum GitHubConnectorActions {
                 rateLimitRemaining: remaining
             ) {
                 await GitHubRateLimitGate.shared.trip(seconds: backoff)
-                NSLog(
+                nativeLog(
                     "[github] secondary rate limit — backing off %ds (status %d, remaining %@)",
                     Int(backoff), http.statusCode, remaining.map(String.init) ?? "n/a"
                 )
@@ -727,5 +727,16 @@ extension GitHubConnectorActions {
             return seconds
         }
         return 60
+    }
+}
+
+extension GitHubConnectorActions {
+    /// The signed-in GitHub login from the connector's saved metadata, if any.
+    static func signedInLogin(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> String? {
+        guard let path = GitHubCredentialStore.metadataPaths(dataRoot: dataRoot).first,
+              let data = try? Data(contentsOf: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let login = object["login"] as? String, !login.isEmpty else { return nil }
+        return login
     }
 }

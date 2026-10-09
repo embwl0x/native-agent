@@ -34,6 +34,7 @@ extension SwiftToolDispatcher {
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("missing_text"),
                 "fix": .string("claude_message requires a non-empty 'text' parameter."),
             ])
@@ -140,11 +141,13 @@ extension SwiftToolDispatcher {
         guard appendResult.status != "conflict" else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("message_id_conflict"),
+                "detail": .string("That message_id already names a different message, so nothing was queued. Use a new message_id, or omit it."),
                 "messageId": .string(messageId),
             ])
         }
-        // Delivered is the whole outcome: no wake, no reply turn is promised.
+        // Inbox delivery does not start her live session.
         var response: [String: JSONValue] = [
             "status": .string("delivered"),
             "messageId": .string(messageId),
@@ -152,14 +155,14 @@ extension SwiftToolDispatcher {
             "filePath": .string(inboxURL.path),
             "priority": .string(priority),
             "queuedAt": .string(appendResult.queuedAt),
-            "detail": .string("Delivered to Claude's inbox; Claude reads it in her live session."),
+            "detail": .string("Delivered to Claude's inbox. Her reply arrives when her live session reads and answers it; no session was started. Read the linked reply with app {action:\"agent.read\",args:{agent:\"claude\",message_id:\"\(messageId)\"}}."),
         ]
         Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
-            response["detail"] = .string("Delivered to Claude's inbox; Claude reads it in her live session. desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
+            response["detail"] = .string((Self.stringField("detail", in: .object(response)) ?? "") + " desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
         }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
         if let conversationId = conversation.conversationId {

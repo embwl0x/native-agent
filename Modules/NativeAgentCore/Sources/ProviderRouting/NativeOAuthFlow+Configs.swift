@@ -162,6 +162,15 @@ struct ProviderOAuthConfig: @unchecked Sendable {
                     existing.removeValue(forKey: "expires_at")
                 }
             }
+            // The sign-in is saved; a failed child copy is re-synced (and
+            // reported) by the next Codex spawn.
+            do {
+                try OpenAIOAuthDirectAdapter.syncCodexChildCopy(from: authPath)
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "NativeOAuthFlow: Codex child credential copy failed: \(error)\n".utf8
+                ))
+            }
         },
         extraTokenParams: { _ in [:] }
     )

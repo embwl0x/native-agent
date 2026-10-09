@@ -48,15 +48,9 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
 
     static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> SlackSocketModeConfig? {
         let objects = tokenObjects(dataRoot: dataRoot)
-        // Match the connector readiness and outbound-delivery vocabulary.
-        // Imported/legacy Slack credentials may use `oauth_token` or `token`;
-        // rejecting those only here leaves an admitted connector unable to
-        // start its inbound transport.
-        let botToken = firstString(
-            keys: SlackConnectorActions.credentialKeys,
-            in: objects
-        )
-        let appToken = firstString(keys: ["socket_mode_app_token", "app_token", "slack_app_token"], in: objects)
+        // The tokens are Keychain's (SlackCredentials); the files say the rest.
+        let botToken = try? SlackCredentials.read(.bot, dataRoot: dataRoot)
+        let appToken = try? SlackCredentials.read(.app, dataRoot: dataRoot)
         guard let botToken, !botToken.isEmpty,
               let appToken, !appToken.isEmpty else {
             return nil

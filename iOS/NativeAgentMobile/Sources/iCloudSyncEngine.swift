@@ -221,6 +221,8 @@ final class iCloudSyncEngine: ObservableObject {
         /// clear and every transcript write. nil on pre-2026-09-06 Mac builds;
         /// an empty transcript with no version never clears anything.
         var generation: Int?
+        /// The Mac holds rows older than the published window.
+        var hasOlder = false
     }
     @Published var chatTranscripts: [String: PublishedTranscript] = [:]
     @Published var health: RuntimeHealth?

@@ -24,5 +24,7 @@ while IFS= read -r -d '' path; do
     cp -pP "$source_path" "$snapshot/$path"
 done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard -z)
 
-gitleaks dir "$snapshot" --no-banner --redact -c "$ROOT/.gitleaks.toml"
+# Scan from inside the snapshot: gitleaks reports paths relative to the scanned
+# directory, and the config's path allowlists are anchored to the repo root.
+(cd "$snapshot" && gitleaks dir . --no-banner --redact -c "$ROOT/.gitleaks.toml")
 echo "[privacy] tracked working tree is clean"

@@ -590,10 +590,9 @@ public actor SwiftNativeLoopScheduler {
     private var persistedFirstSeen: [String: Date] = [:]
     private var persistedStateLoaded = false
     private var persistedStateLoad: Task<(runs: [String: Date], completions: [String: Date], firstSeen: [String: Date]), Never>?
-    // A1/FIX-3 — durable-flush coalescing. See `recordDurableRun`.
-    private let durableFlushWindow: TimeInterval
+    public static let healthCheckpointInterval: TimeInterval = 60
     private let durableFlushImmediateInterval: TimeInterval
-    private var pendingDurableFlush: Task<Void, Never>?
+    private var lastDurableFlushAt: Date?
     private var durableFlushCount = 0
     /// Slot counter used to fan overdue startup ticks out instead of firing
     /// every starved loop in the same instant. Reset on each `start()`.
@@ -657,11 +656,9 @@ public actor SwiftNativeLoopScheduler {
         startupStagger: TimeInterval = 5,
         failureBackoff: LoopFailureBackoffPolicy = .default,
         minimumTickSpacing: TimeInterval = 0.25,
-        durableFlushWindow: TimeInterval = 5,
-        durableFlushImmediateInterval: TimeInterval = 60,
+        durableFlushImmediateInterval: TimeInterval = SwiftNativeLoopScheduler.healthCheckpointInterval,
         jitter: @escaping @Sendable (ClosedRange<Double>) -> Double = { Double.random(in: $0) }
     ) {
-        self.durableFlushWindow = max(0, durableFlushWindow)
         self.durableFlushImmediateInterval = max(0, durableFlushImmediateInterval)
         self.clock = clock
         self.tickTimeout = tickTimeout
@@ -866,8 +863,7 @@ public actor SwiftNativeLoopScheduler {
         for registration in loops.values {
             await registration.loop.shutdown()
         }
-        // An orderly stop must not drop a coalesced durable stamp (A1/FIX-3).
-        await flushPendingDurableState()
+        await flushLoopState()
     }
 
     public func loopState(loopId: String) async -> LoopState? {
@@ -1115,7 +1111,7 @@ public actor SwiftNativeLoopScheduler {
         do {
             value = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
         } catch {
-            NSLog("BackgroundLoops: loop state unreadable, starting with no run history: %@", "\(error)")
+            nativeLog("BackgroundLoops: loop state unreadable, starting with no run history: %@", "\(error)")
             return ([:], [:], [:])
         }
         guard case .object(let root) = value else { return ([:], [:], [:]) }
@@ -1138,6 +1134,7 @@ public actor SwiftNativeLoopScheduler {
     /// `restartLoop` must not reset a weekly loop's due clock back to zero.
     private func flushLoopState() async {
         guard let loopStatePath else { return }
+        lastDurableFlushAt = clock()
         durableFlushCount += 1
         let iso = ISO8601DateFormatter()
         var loops: [String: JSONValue] = [:]
@@ -1163,76 +1160,24 @@ public actor SwiftNativeLoopScheduler {
                 to: loopStatePath
             )
         } catch {
+            lastDurableFlushAt = nil
             FileHandle.standardError.write(Data(
                 "BackgroundLoops: failed to persist loop run state: \(error)\n".utf8
             ))
         }
     }
 
-    /// A1/FIX-3: `flushLoopState` serializes ALL registered loops and does an
-    /// atomic write+rename, and it used to run on EVERY durable record. The
-    /// 2s telegram_poll loop alone therefore rewrote the whole file ~3,400
-    /// times a day so that its own sub-minute due clock — which no restart
-    /// path can meaningfully use — stayed byte-current.
-    ///
-    /// What the durable clock is FOR (LOOPS-4, and `firstTickDelay` above) is
-    /// starvation detection across restarts: a loop whose period is long
-    /// enough that a machine can be restarted more often than it ticks. That
-    /// property is preserved exactly by flushing SYNCHRONOUSLY for every loop
-    /// at or above `durableFlushImmediateInterval`, which is where all of it
-    /// lives. It is also preserved for a loop we cannot classify (not
-    /// registered — e.g. the first-ever `register` seed, or `recordFailure`
-    /// for an unknown id): unknown always flushes immediately.
-    ///
-    /// Below that threshold the flush is coalesced onto a short trailing
-    /// window, so a burst of short-interval records costs ONE write instead of
-    /// N. The in-memory map is still updated on every record, so `nextDelay`,
-    /// Doctor, and `_testPersistedLastRun` see the stamp immediately — only
-    /// the disk write is coalesced. The worst-case loss is the last <window>
-    /// seconds of a sub-minute loop's stamp on a hard kill, which shortens
-    /// that loop's first sleep after relaunch by at most `window` and cannot
-    /// hide a starvation (a sub-minute loop is due again within a minute).
-    /// `stop()` drains any pending window, so an orderly quit loses nothing.
+    /// Keep sub-minute liveness current in memory and checkpoint it on an
+    /// existing tick. Long-period and unclassified work stays immediately
+    /// durable; stop flushes the final live stamps without another wakeup.
     private func recordDurableRun(loopId: String, at date: Date) async {
         persistedLastRun[loopId] = date
         let interval = loops[loopId]?.loop.interval
-        guard let interval, interval < durableFlushImmediateInterval, durableFlushWindow > 0 else {
-            await flushLoopState()
+        if let interval, interval < durableFlushImmediateInterval,
+           let lastDurableFlushAt,
+           date.timeIntervalSince(lastDurableFlushAt) < durableFlushImmediateInterval {
             return
         }
-        scheduleCoalescedFlush()
-    }
-
-    /// Opens a trailing write window if one is not already open. Leading-edge
-    /// records are absorbed by the window that is already in flight — that IS
-    /// the coalescing.
-    private func scheduleCoalescedFlush() {
-        if pendingDurableFlush != nil { return }
-        let window = durableFlushWindow
-        pendingDurableFlush = Task { [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: timeoutNanoseconds(window))
-            } catch {
-                // Cancelled by stop(), which flushes synchronously itself.
-                return
-            }
-            await self?.drainCoalescedFlush()
-        }
-    }
-
-    /// Clears the window BEFORE writing, never after: a record that lands
-    /// while the write is in flight must be able to open a fresh window, or
-    /// its stamp would sit in memory with nothing scheduled to persist it.
-    private func drainCoalescedFlush() async {
-        pendingDurableFlush = nil
-        await flushLoopState()
-    }
-
-    /// Drains a pending coalesced write. Called from `stop()`.
-    private func flushPendingDurableState() async {
-        guard let pending = pendingDurableFlush else { return }
-        pending.cancel()
-        pendingDurableFlush = nil
         await flushLoopState()
     }
 
@@ -1387,6 +1332,27 @@ public actor SwiftNativeLoopScheduler {
         return false
     }
 
+    /// Network weather the loop's own cadence already retries: offline (above),
+    /// a timeout, an unreachable host, or the server's 5xx. It still counts
+    /// toward the streak and lands a receipt, but never files a card — there is
+    /// nothing for User to do (User, 2026-10-07: 139 telegram_poll blips).
+    /// Loops report either `String(describing:)` (domain + code) or only
+    /// `localizedDescription` (URLSession's own sentence), so both are matched.
+    static func isRetriedNetworkError(_ error: String) -> Bool {
+        if isOfflineError(error) { return true }
+        let e = error.lowercased()
+        if e.contains("nsurlerrordomain"), ["-1001", "-1003", "-1004", "-1005", "-1009"].contains(where: {
+            e.contains("code=\($0)") || e.contains("code \($0)") || e.contains("error \($0)")
+        }) {
+            return true
+        }
+        if ["the request timed out", "could not connect to the server",
+            "a server with the specified hostname could not be found"].contains(where: e.contains) {
+            return true
+        }
+        return e.range(of: #"(server status|http) 5\d\d"#, options: .regularExpression) != nil
+    }
+
     /// L4-13: an error whose `localizedDescription` is empty ("The operation
     /// couldn't be completed" with no reason, or a custom Error with an empty
     /// message) produced receipts whose `error` field was blank — a failure row
@@ -1532,7 +1498,8 @@ public actor SwiftNativeLoopScheduler {
         let streak = (consecutiveFailures[loopId] ?? 0) + 1
         consecutiveFailures[loopId] = streak
         if streak == 1 { failureStreakStartedAt[loopId] = now }
-        guard let push = failureTransitionPush else { return }
+        guard !Self.isRetriedNetworkError(error),
+              let push = failureTransitionPush else { return }
         // Below threshold: could still be a self-healing blip.
         guard streak >= failurePushConsecutiveThreshold else { return }
         // Too brief: a short-interval loop can rack up "consecutive"
@@ -1695,9 +1662,6 @@ public actor SwiftNativeLoopScheduler {
     /// Test seam: how many whole-file serialize + atomic-rename writes of the
     /// durable loop-state map have actually happened (A1/FIX-3).
     internal func _testDurableFlushCount() -> Int { durableFlushCount }
-
-    /// Test seam: true while a coalesced durable write is still scheduled.
-    internal func _testHasPendingDurableFlush() -> Bool { pendingDurableFlush != nil }
 
     internal func _testFailureReceiptRows() async -> [JSONValue] {
         guard let failureReceiptsPath else { return [] }

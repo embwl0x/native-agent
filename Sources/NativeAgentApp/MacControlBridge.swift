@@ -137,6 +137,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             "build": buildIdentity.build,
             "sourceRevision": buildIdentity.sourceRevision ?? NSNull(),
             "sourceDirty": buildIdentity.sourceDirty,
+            "sourceContentID": buildIdentity.sourceContentID ?? NSNull(),
             "exactSourceRevision": buildIdentity.exactSourceRevision ?? NSNull(),
             "writtenAt": ISO8601DateFormatter().string(from: Date()),
         ]
@@ -155,7 +156,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // `BridgeCore.generateToken()` — a gated-off launch must leave no
         // listener, no in-memory token, and no descriptor on disk.
         guard Self.startGateAllows() else {
-            NSLog(
+            nativeLog(
                 "NativeAgent MacControlBridge not starting: macControlPolicy.enabled is false "
                 + "— no port bound, no token minted"
             )
@@ -183,7 +184,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             do {
                 try await runtime.recoverInterruptedOperations()
             } catch {
-                NSLog("NativeAgent MacControl operation recovery failed closed: \(error)")
+                nativeLog("NativeAgent MacControl operation recovery failed closed: \(error)")
                 self.failStartup(generation: generation)
                 return
             }
@@ -203,7 +204,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
 
         // Generate token
         guard let tk = BridgeCore.generateToken() else {
-            NSLog("NativeAgent MacControlBridge failed to generate a secure bridge token")
+            nativeLog("NativeAgent MacControlBridge failed to generate a secure bridge token")
             failStartup(generation: generation)
             return
         }
@@ -307,7 +308,7 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             entry.conn.cancel()
         }
         removeDescriptor()
-        _ = runtime.stopAllProcesses(reason: "bridge_stop")
+        runtime.stopProcessesOnBridgeStop()
     }
 
     private func accept(_ conn: NWConnection) {

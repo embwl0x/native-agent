@@ -95,7 +95,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
     private static var invalidPart: AgentContactFailure { .init(code: -32602, message: "Invalid attachment") }
     static func safeName(_ name: String) -> Bool {
         !name.isEmpty && name.utf8.count <= 255 && name != "." && name != ".."
-            && !name.contains("/") && !name.contains("\\") && !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            && !name.contains("/") && !name.contains("\\") && name.rangeOfCharacter(from: .controlCharacters) == nil
     }
 
     public var wire03: [String: Any] {

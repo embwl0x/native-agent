@@ -371,7 +371,7 @@ final class UpdateController: NSObject {
             let installed = info["CFBundleShortVersionString"] as? String ?? "this version"
             return ("NativeAgent is up to date (\(installed)).", nil)
         }
-        return ("NativeAgent \(version) is available. Installing it is User's: \"\(menuTitle)\" in the app menu.", nil)
+        return ("NativeAgent \(version) is available. Installing it is the owner's: \"\(menuTitle)\" in the app menu.", nil)
     }
 
     private func presentUnavailableExplanation() {

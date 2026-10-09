@@ -784,14 +784,14 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
         return SwiftNativeLLMClient(
             router: router,
             codex: CodexAdapter(),
-            anthropic: AnthropicAdapter(),
-            openAI: OpenAIAdapter(),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(),
-            xaiOAuthDirect: XAIOAuthDirectAdapter(),
-            moonshot: MoonshotAdapter(),
-            kimiCode: AnthropicAdapter.kimiCode(),
-            openRouter: OpenRouterAdapter(),
+            anthropic: AnthropicAdapter(session: ProviderStreamGuard.stallOnlySession),
+            openAI: OpenAIAdapter(session: ProviderStreamGuard.stallOnlySession),
+            openAIOAuthDirect: OpenAIOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
+            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
+            xaiOAuthDirect: XAIOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
+            moonshot: MoonshotAdapter(session: ProviderStreamGuard.stallOnlySession),
+            kimiCode: AnthropicAdapter.kimiCode(session: ProviderStreamGuard.stallOnlySession),
+            openRouter: OpenRouterAdapter(session: ProviderStreamGuard.stallOnlySession),
             lifecycleObserver: lifecycleObserver
         )
     }

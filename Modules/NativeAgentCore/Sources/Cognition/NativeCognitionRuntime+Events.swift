@@ -517,8 +517,8 @@ extension NativeCognitionRuntime: LLMCallLifecycleObserving {
             return
         }
         // INTEROCEPTION: passively feed the vitals sensor from the SAME lifecycle
-        // event. Band transitions become graded felt sluggishness; sustained
-        // degradation stages one approval card. Zero new provider calls.
+        // event. Band transitions become graded felt sluggishness. Zero new
+        // provider calls.
         await feedProviderVitals(event)
         let kind: SomaticSignalKind
         let intensity: Double

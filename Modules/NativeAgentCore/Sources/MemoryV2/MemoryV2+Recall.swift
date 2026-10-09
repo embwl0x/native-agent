@@ -4,11 +4,32 @@ import PersistenceCore
 
 extension SwiftNativeMemoryV2 {
 
+    /// Restore the canonical semantic corpus before serving recall. Content
+    /// changes invalidate only that snapshot; keep converging until cancellation.
+    @discardableResult
+    public func reconcileMemoryEmbeddingEpoch() async throws -> MemoryEmbeddingEpochActivationReport? {
+        try await ensureCanonicalAttachment()
+        guard let embedder else { throw MemoryV2Error.storageUnavailable }
+        guard storage is MemoryStorageBridge else { return nil }
+        try await warmUpEmbedder()
+        while true {
+            try Task.checkCancellation()
+            let state = try await memoryEmbeddingEpochState()
+            if state.activeEpoch == embedder.embeddingEpoch.rawValue { return nil }
+            do {
+                return try await reindexAllMemoryEmbeddingsForCurrentProvider()
+            } catch let error as MemoryStorageError {
+                guard case .embeddingActivationInvalid(.corpusDrift, _) = error else { throw error }
+            }
+        }
+    }
+
     /// Access-signal bump for records served OUTSIDE the recall lane (the
     /// fluid-context serve path, task #42). Same storage write as recall's
     /// fire-and-forget bump; unwired actors fail closed like every other
     /// storage-backed method.
     public func recordRecallHits(ids: [String]) async throws {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try await storage.recordRecallHits(ids: ids)
     }
@@ -31,49 +52,50 @@ extension SwiftNativeMemoryV2 {
         recordingUsage: Bool = true
     ) async throws -> MemoryV2RecallResponse {
         guard !query.text.isEmpty else { throw MemoryV2Error.invalidQuery }
+        let recallStarted = ProcessInfo.processInfo.systemUptime
+        var timings: [String: Double] = [:]
+        func milliseconds(since start: Double) -> Double {
+            (ProcessInfo.processInfo.systemUptime - start) * 1_000
+        }
+        defer {
+            if query.requiresRelevance == true {
+                timings["total_ms"] = milliseconds(since: recallStarted)
+                let detail = timings.sorted { $0.key < $1.key }
+                    .map { "\($0.key)=\(Int($0.value))" }.joined(separator: " ")
+                nativeLog("MemoryV2 recall: \(detail)")
+            }
+        }
+        try await ensureCanonicalAttachment()
+        timings["attachment_ms"] = milliseconds(since: recallStarted)
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try Task.checkCancellation()
-        // Sweep R4 A5: a cold/failed embedder used to THROW out of here, so the
-        // caller's whole recall lane collapsed to zero hits on the first message
-        // after launch. Catch it and degrade to the lexical lane instead. A
-        // genuinely unwired embedder (storageUnavailable) still propagates —
-        // that is a configuration fault, not a warm-up race.
-        var queryEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?
-        var embedFailure: Error?
-        do {
-            queryEmbedding = try await embedOneWithEpoch(query.text)
-        } catch MemoryV2Error.storageUnavailable {
-            throw MemoryV2Error.storageUnavailable
-        } catch let error where memoryV2IsColdEmbedderFailure(error) {
-            embedFailure = error
-            queryEmbedding = nil
-        }
-        // Any OTHER embedding error — dimension mismatch, model corruption,
-        // the runtime's "model unavailable, reinstall" load failure —
-        // RETHROWS. Downgrading those to lexical recall would silently mask
-        // a broken dense lane behind plausible keyword hits (gpt-5.5 review
-        // 2026-08-06, blocking #2; fail-loud doctrine). Only the warm-up
-        // race gets the graceful path.
-        // A provider can transiently throw CancellationError without this
-        // caller being canceled. Preserve that cold-model fallback, but never
-        // turn an actually canceled request into another retrieval attempt.
+        let epochStarted = ProcessInfo.processInfo.systemUptime
+        let reindexed = try await reconcileMemoryEmbeddingEpoch()
+        timings["epoch_ms"] = milliseconds(since: epochStarted)
+        timings["reindexed"] = reindexed == nil ? 0 : 1
+        let embeddingStarted = ProcessInfo.processInfo.systemUptime
+        let queryEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)? =
+            try await embedOneWithEpoch(query.text)
         try Task.checkCancellation()
         let qvec = queryEmbedding?.vector ?? []
         let topK = max(1, query.topK)
-        // Disclosure filtering happens before results leave MemoryV2. Fetch a
-        // bounded wider candidate window so private/disallowed high scorers do
-        // not crowd authorized records out of the caller's requested top-K.
-        // The SQLite path already scans/sorts the same bounded canonical set;
-        // this only retains more rows from that existing pass.
-        let storageTopK = (query.surface != nil || query.persona != nil)
-            ? min(memoryStoredRowCap, max(topK, topK * 8))
-            : topK
+        // Explicit recall judges the bounded corpus in one pass rather than
+        // paying for a small window and then judging a refill. Other callers
+        // retain their wider disclosure window. SQLite scans/sorts the same
+        // canonical set either way; only the retained window changes.
+        let storageTopK: Int
+        if query.requiresRelevance == true {
+            storageTopK = memoryStoredRowCap
+        } else {
+            storageTopK = (query.surface != nil || query.persona != nil)
+                ? min(memoryStoredRowCap, max(topK, topK * 8)) : topK
+        }
         var usedKeywordFallback = false
         // Immutable copies for the retrieval closure below: a nested async
         // function that captured the mutable locals directly is a data-race
         // error under strict concurrency.
         let resolvedQueryEmbedding = queryEmbedding
-        let resolvedEmbedFailure = embedFailure
+
         // A vector of all zeros is what a not-yet-warm embedder returns; it has
         // no direction, so cosine recall would return [] just as surely as a
         // thrown error would.
@@ -98,6 +120,7 @@ extension SwiftNativeMemoryV2 {
         } else {
             rewrittenEmbedding = nil
         }
+        timings["embedding_ms"] = milliseconds(since: embeddingStarted)
         try Task.checkCancellation()
         // One retrieval at a given candidate-window size. Hoisted out of the
         // straight-line code (User, 2026-09-06) purely so the refill below can
@@ -107,29 +130,30 @@ extension SwiftNativeMemoryV2 {
         ) async throws -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool) {
             if let queryEmbedding = resolvedQueryEmbedding, hasUsableVector {
                 var keywordFallback = false
-                // 2026-09-06: storage degrades to the keyword lane on its own when
-                // the query vector's epoch does not match the corpus. It reports
-                // that, and the caller raises `usedKeywordFallback`, so `source`,
-                // `search_kg` and the dense-lane starvation alarm all describe the
-                // lane that actually answered.
                 func dense(
                     _ text: String, _ vector: [Float], _ epoch: MemoryEmbeddingEpoch
                 ) async throws -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool) {
-                    if let hybrid = storage as? any HybridMemoryStorageProtocol {
-                        return try await hybrid.recallReportingKeywordFallback(
-                            embedding: vector,
-                            embeddingEpoch: epoch,
-                            queryText: text,
-                            topK: window,
-                            persona: query.persona
-                        )
+                    func read(_ vector: [Float], _ epoch: MemoryEmbeddingEpoch) async throws
+                        -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool) {
+                        if let hybrid = storage as? any HybridMemoryStorageProtocol {
+                            return try await hybrid.recallReportingKeywordFallback(
+                                embedding: vector, embeddingEpoch: epoch, queryText: text,
+                                topK: window, persona: query.persona
+                            )
+                        }
+                        return (try await storage.recall(
+                            embedding: vector, embeddingEpoch: epoch,
+                            topK: window, persona: query.persona
+                        ), false)
                     }
-                    return (try await storage.recall(
-                        embedding: vector,
-                        embeddingEpoch: epoch,
-                        topK: window,
-                        persona: query.persona
-                    ), false)
+                    do {
+                        return try await read(vector, epoch)
+                    } catch let error as MemoryStorageError {
+                        guard case .embeddingEpochMismatch = error else { throw error }
+                        try await reconcileMemoryEmbeddingEpoch()
+                        let repaired = try await embedOneWithEpoch(text)
+                        return try await read(repaired.vector, repaired.epoch)
+                    }
                 }
                 let written = try await dense(query.text, qvec, queryEmbedding.epoch)
                 if written.usedKeywordFallback { keywordFallback = true }
@@ -148,25 +172,8 @@ extension SwiftNativeMemoryV2 {
                     merged = Array(best.values)
                 }
                 return (merged, keywordFallback)
-            } else if let keywordStorage = storage as? any KeywordRecallStorageProtocol {
-                if loggingKeywordFallback {
-                    FileHandle.standardError.write(Data(
-                        ("MemoryV2: query embedding unavailable"
-                         + (resolvedEmbedFailure.map { " (\($0))" } ?? "")
-                         + " — falling back to keyword recall\n").utf8
-                    ))
-                }
-                return (try await keywordStorage.recallByKeyword(
-                    queryText: rewritten.map { query.text + " " + $0 } ?? query.text,
-                    topK: window,
-                    persona: query.persona
-                ), true)
-            } else if let resolvedEmbedFailure {
-                // No embedding AND no lexical lane: nothing honest to return.
-                throw resolvedEmbedFailure
-            } else {
-                return ([], false)
             }
+            throw MemoryV2Error.underlying("Semantic recall is unavailable: the embedding query has no usable vector.")
         }
         func disclosedRows(_ rows: [ScoredMemoryRecord]) -> [ScoredMemoryRecord] {
             var seen: Set<String> = []
@@ -181,29 +188,55 @@ extension SwiftNativeMemoryV2 {
                 return key.isEmpty || seen.insert(key).inserted
             }
         }
+        // Read BEFORE candidates so a concurrent mutation can only cause a
+        // later cache miss, never label an older read with a newer generation.
+        let generationStarted = ProcessInfo.processInfo.systemUptime
+        let generation: String?
+        if query.requiresRelevance == true, let bridge = storage as? MemoryStorageBridge {
+            generation = try await bridge.underlyingStorage().recallJudgmentGeneration()
+        } else {
+            generation = nil
+        }
+        timings["generation_ms"] = milliseconds(since: generationStarted)
+        var retrievalStarted = ProcessInfo.processInfo.systemUptime
         var retrieved = try await retrieve(storageTopK, loggingKeywordFallback: true)
+        timings["retrieval_ms"] = milliseconds(since: retrievalStarted)
+        timings["retrieval_passes"] = 1
         usedKeywordFallback = retrieved.usedKeywordFallback
         var scored = retrieved.hits
         try Task.checkCancellation()
+        let disclosureStarted = ProcessInfo.processInfo.systemUptime
         var disclosed = disclosedRows(scored)
-        // User, 2026-09-06: the ×8 window is a heuristic, not a guarantee. When
-        // the rows this surface may not see are also the top scorers, a
-        // saturated window can come back with fewer eligible rows than the
-        // caller asked for — or none — and recall reported an empty store to a
-        // surface whose own memories were sitting below the cut. The whole
-        // table is capped at `memoryStoredRowCap`, so one re-ask at the cap
-        // exhausts the candidate set; it only runs when the window came back
-        // full AND still short.
+        var disclosureFilteredCount = scored.count - disclosed.count
+        timings["disclosure_ms"] = milliseconds(since: disclosureStarted)
+        timings["candidates"] = Double(disclosed.count)
+        if query.requiresRelevance == true, !disclosed.isEmpty {
+            let relevanceStarted = ProcessInfo.processInfo.systemUptime
+            let admitted = try await AdaptiveMemoryPromoter.shared.relevantRecallIDs(query: query.text,
+                candidates: disclosed.map {
+                    MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text,
+                        kind: $0.record.memoryKind ?? MemoryRecallScoring.kind(of: $0.record.extras))
+                }, generation: generation, topK: topK)
+            timings["relevance_ms", default: 0] += milliseconds(since: relevanceStarted)
+            disclosed = disclosed.filter { admitted.contains($0.record.id) }
+        }
+        // Non-judged callers retain the disclosure refill. Explicit recall
+        // already fetched the row cap and never repeats retrieval or judgment.
         if disclosed.count < topK, scored.count >= storageTopK, storageTopK < memoryStoredRowCap {
+            retrievalStarted = ProcessInfo.processInfo.systemUptime
             retrieved = try await retrieve(memoryStoredRowCap, loggingKeywordFallback: false)
+            timings["retrieval_ms", default: 0] += milliseconds(since: retrievalStarted)
+            timings["retrieval_passes", default: 0] += 1
             usedKeywordFallback = usedKeywordFallback || retrieved.usedKeywordFallback
             scored = retrieved.hits
             try Task.checkCancellation()
             disclosed = disclosedRows(scored)
+            disclosureFilteredCount = scored.count - disclosed.count
         }
         // storageTopK is a wider disclosure candidate window, not the result
         // budget. Reapply the existing skill-hint share AFTER disclosure at
         // the actual requested size so hints cannot consume the entire answer.
+        let selectionStarted = ProcessInfo.processInfo.systemUptime
         let sorted = MemoryRecallScoring.selectRecallResults(
             from: disclosed.sorted { $0.score > $1.score }, limit: topK
         ) {
@@ -212,6 +245,8 @@ extension SwiftNativeMemoryV2 {
                 kind: $0.record.memoryKind ?? MemoryRecallScoring.kind(of: $0.record.extras)
             )
         }.sorted { $0.score > $1.score }
+        timings["selection_ms"] = milliseconds(since: selectionStarted)
+        timings["results"] = Double(sorted.count)
         // Dead-lane alarm (2026-07-24): `persona` is an exact-equality filter
         // over RECORD persona ids (configured agent names). A
         // caller that hands it a persona SLOT id can never match a row, so the
@@ -221,7 +256,7 @@ extension SwiftNativeMemoryV2 {
         // Not on the keyword-fallback path: that diagnostic probes the DENSE
         // lane, and a cold-embedder turn is not evidence of a persona-id
         // mismatch. It would fire a false alarm on every first-turn recall.
-        if query.persona != nil, sorted.isEmpty, !usedKeywordFallback,
+        if query.persona != nil, (query.requiresRelevance == true ? scored.isEmpty : sorted.isEmpty), !usedKeywordFallback,
            let queryEmbedding {
             await reportPersonaRecallStarvation(
                 query: query,
@@ -260,10 +295,11 @@ extension SwiftNativeMemoryV2 {
         // untouched, and no extra storage round-trip happens (zero added
         // read latency).
         let hits: [MemoryRecallHit] = sorted.map { sr in
-            let displayText = MemoryTextClip.memoryDisplayText(
+            let canonicalText = MemoryTextClip.memoryDisplayText(
                 sr.record.text,
                 kind: sr.record.memoryKind
             )
+            let displayText = (MemorySenseProvenance.warning(in: sr.record.extras).map { "[\($0)]\n" } ?? "") + canonicalText
             let content = MemoryTextClip.sentenceClip(displayText, cap: memoryRecallContentCap)
             // Sweep R4 A4: the prompt renderer stamps a compact
             // `[YYYY-MM-DD, kind]` provenance marker on each recalled row so the
@@ -272,6 +308,16 @@ extension SwiftNativeMemoryV2 {
             // (documented as the landing spot for extra keys) rather than a new
             // struct field, so the hit shape is unchanged.
             var extras: [String: JSONValue] = ["id": .string(sr.record.id)]
+            extras.merge(MemoryDataProvenance.fields(in: sr.record.extras)) { _, value in value }
+            if let origin = MemoryMoments.recallOrigin(source: sr.record.sourceRunId, metadata: sr.record.extras) {
+                extras["origin"] = origin
+            }
+            if let warning = MemorySenseProvenance.warning(in: sr.record.extras) {
+                extras["sense_warning"] = .string(warning)
+            }
+            if case .object(let metadata)? = sr.record.extras, let versions = metadata["sense_versions"] {
+                extras["sense_versions"] = versions
+            }
             if content.count < displayText.count {
                 extras["content_truncated"] = .bool(true)
                 extras["full_content_chars"] = .int(Int64(displayText.count))
@@ -291,6 +337,7 @@ extension SwiftNativeMemoryV2 {
             // `provenance_by`). Carried verbatim so recall can tell "I checked
             // this" from "someone told me"; absent on rows written before it.
             if case .object(let metadata)? = sr.record.extras {
+                if let sources = metadata["untrusted_sources"] { extras["untrusted_sources"] = sources }
                 for key in ["provenance", "provenance_by"] {
                     if case .string(let value)? = metadata[key], !value.isEmpty {
                         extras[key] = .string(value)
@@ -309,11 +356,13 @@ extension SwiftNativeMemoryV2 {
                 extras: .object(extras)
             )
         }
+        timings["total_ms"] = milliseconds(since: recallStarted)
         return MemoryV2RecallResponse(
             hits: hits,
             scored: sorted,
             total: sorted.count,
-            disclosureFilteredCount: scored.count - disclosed.count
+            disclosureFilteredCount: disclosureFilteredCount,
+            timings: timings
         )
     }
 
@@ -322,6 +371,7 @@ extension SwiftNativeMemoryV2 {
     public func readMemoryRecord(id: String, persona: String? = nil, surface: String) async throws -> MemoryRecord? {
         let id = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty, id.utf8.count <= 512 else { throw MemoryV2Error.invalidQuery }
+        try await ensureCanonicalAttachment()
         guard let lookup = storage as? any MemoryRecordLookupStorage else {
             throw MemoryV2Error.storageUnavailable
         }

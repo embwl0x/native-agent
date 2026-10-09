@@ -323,6 +323,7 @@ public extension MacChatTurnPresentationPort {
         at instant: Date = Date(),
         loadProof: @MainActor (MacChatTurnIdentity) async -> MacChatTurnTranscriptTerminalProof
     ) async -> Bool {
+        await macChatTurns.loadQueuedTurnsIfNeeded()
         guard !macChatTurns.chatTurnLifecycleRepairCompleted else { return true }
         let records: [MacChatPersistedTurnLifecycle]
         do {
@@ -422,7 +423,7 @@ public extension MacChatTurnPresentationPort {
 
     private func logChatTurnLifecyclePersistenceFailure(_ operation: String, error: Error) {
         let safe = NativeAppSecretRedactor.redactText(String(describing: error))
-        NSLog("Mac chat turn lifecycle %@ failed: %@", operation, safe)
+        nativeLog("Mac chat turn lifecycle %@ failed: %@", operation, safe)
     }
 
 }

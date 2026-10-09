@@ -134,7 +134,7 @@ final class ActivityWatchController {
             self.policy = try policyStore.loadChecked()
         } catch {
             self.policy = ActivityPolicy()
-            recordIssue(error.localizedDescription, severity: .critical)
+            recordIssue(UserFacingError.message(error, action: "read the activity policy"), severity: .critical)
         }
     }
 
@@ -232,7 +232,7 @@ final class ActivityWatchController {
                         do {
                             _ = try self.policyStore.loadChecked()
                         } catch {
-                            self.recordIssue(error.localizedDescription, severity: .critical)
+                            self.recordIssue(UserFacingError.message(error, action: "read the activity policy"), severity: .critical)
                         }
                     }
                 },
@@ -246,7 +246,7 @@ final class ActivityWatchController {
             watcher = created
             return created
         } catch {
-            recordIssue("Could not open the activity store: \(error.localizedDescription)", severity: .critical)
+            recordIssue(UserFacingError.message(error, action: "open the activity store"), severity: .critical)
             return nil
         }
     }
@@ -295,7 +295,7 @@ final class ActivityWatchController {
         do {
             try policyStore.save(next)
         } catch {
-            recordIssue("Could not save the activity policy: \(error.localizedDescription)", severity: .critical)
+            recordIssue(UserFacingError.message(error, action: "save the activity policy"), severity: .critical)
             return false
         }
         policy = next
@@ -375,7 +375,7 @@ final class ActivityWatchController {
             // An absent store has no rows; an unavailable store throws.
             lastPurgedRowCount = try await existingStore()?.purge(bundleID: trimmed) ?? 0
         } catch {
-            recordIssue("Excluded \(trimmed), but could not delete its recorded rows: \(error.localizedDescription)", severity: .critical)
+            recordIssue("Excluded \(trimmed), but couldn't delete what was already recorded. " + UserFacingError.cause(error, action: "delete excluded activity rows"), severity: .critical)
         }
     }
 
@@ -407,7 +407,7 @@ final class ActivityWatchController {
             lastPurgedRowCount = removed
             return .deleted(rows: removed)
         } catch {
-            let message = "Wipe failed: \(error.localizedDescription)"
+            let message = UserFacingError.message(error, action: "wipe recorded activity")
             recordIssue(message, severity: .critical)
             return .failed(message: message)
         }
@@ -430,7 +430,7 @@ final class ActivityWatchController {
             // Retention failure does not expand collection authority, but it
             // does leave older local rows in place and must stay visible.
             recordIssue(
-                "Activity retention could not remove expired rows: \(error.localizedDescription)",
+                "Couldn't remove expired activity rows. " + UserFacingError.cause(error, action: "remove expired activity rows"),
                 severity: .warning
             )
         }

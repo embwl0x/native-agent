@@ -107,23 +107,13 @@ extension TelegramPollLoop {
         errorContext: String,
         update: TelegramUpdate?,
         message: TelegramMessage?,
-        text: String?
+        text: String?,
+        approvalId: String? = nil
     ) -> TelegramAssistantDeliveryDriver {
-        let ordinary = TelegramDraftStreamer(
-            token: token,
-            destination: destination,
-            editIntervalSeconds: draftEditIntervalSeconds,
-            sendReturningId: sendMessageReturningId,
-            editMessage: editMessageText
-        )
         return TelegramAssistantDeliveryDriver(
             token: token,
             destination: destination,
             turnId: turnId,
-            ordinary: ordinary,
-            sendOrdinary: sendMessage,
-            // Stream native draft previews like Hermes; ordinary grow-in-place
-            // delivery remains the fallback for unsupported or rejected drafts.
             sendRichDraft: sendRichMessageDraft,
             sendRichFinal: sendRichMessage,
             richDraftInterval: draftEditIntervalSeconds,
@@ -135,6 +125,27 @@ extension TelegramPollLoop {
                     message: message,
                     text: text
                 )
+            },
+            persistDelivery: { delivery in
+                if let update {
+                    try await TelegramUpdateInbox(offsetURL: offsetURL).recordAssistantDelivery(
+                        updateId: update.updateId, delivery: delivery
+                    )
+                } else if let approvalId {
+                    guard try await approvalInbox.annotateChatContinuation(
+                        approvalId, done: false,
+                        assistantDelivery: JSONValue.parse(JSONEncoder().encode(delivery))
+                    ) else { throw TelegramBotError.underlying("Approval answer delivery could not be recorded.") }
+                } else {
+                    throw TelegramBotError.underlying("Assistant answer has no durable delivery owner.")
+                }
+            },
+            sendGeneratedImage: { path in
+                do { try await sendChatAction(token, destination, "upload_photo") }
+                catch {
+                    FileHandle.standardError.write(Data("TelegramPollLoop: upload_photo action failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8))
+                }
+                try await sendPhoto(token, destination, path, nil)
             }
         )
     }
@@ -151,54 +162,30 @@ extension TelegramPollLoop {
         }
     }
 
+    func retainedAssistantDelivery(for claim: TelegramUpdateClaim) async throws -> TelegramAssistantDeliveryState? {
+        if claim.noRecoverableAnswer { return nil }
+        if let delivery = claim.assistantDelivery, delivery.imagePaths != nil { return delivery }
+        guard let sessionId = claim.assistantSessionId, let runId = claim.assistantRunId else { return claim.assistantDelivery }
+        let saved = try await TelegramSessionStore(dataRoot: dataRoot).savedReply(sessionId: sessionId, runId: runId)
+        var delivery = claim.assistantDelivery ?? saved
+        if delivery?.imagePaths == nil { delivery?.imagePaths = saved?.imagePaths }
+        // No wire attempt can precede the delivery row. This canonical reply
+        // survived a stop or restart between model settlement and that handoff.
+        return try await TelegramUpdateInbox(offsetURL: offsetURL).recordAssistantDelivery(
+            updateId: claim.updateId, delivery: delivery, recovering: true
+        )
+    }
+
     func repairInterruptedTurnCardsIfNeeded() async {
         let result = await turnCardRestartRepairer.repairOnce(
             token: token,
             editCard: editMessageTextWithReplyMarkup,
-            deleteCard: deleteMessage
+            deleteCard: deleteMessage,
+            isActive: { await turnCoordinator.activeTurnIDs().contains($0) }
         )
         for failure in result.failures {
             await recordError(context: "turn_card_restart_repair", error: failure)
         }
-    }
-
-    func deliverGeneratedImages(
-        _ imagePaths: [String],
-        destination: TelegramDestination,
-        errorContext: String,
-        update: TelegramUpdate?,
-        message: TelegramMessage?,
-        text: String?
-    ) async -> TelegramAssistantDeliveryOutcome {
-        for imagePath in imagePaths {
-            do {
-                try await sendChatAction(token, destination, "upload_photo")
-            } catch {
-                // Native action is only a secondary status signal. Its failure
-                // does not change the photo's delivery truth.
-                FileHandle.standardError.write(Data(
-                    "TelegramPollLoop: upload_photo action failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8
-                ))
-            }
-            do {
-                try await sendPhoto(token, destination, imagePath, nil)
-            } catch {
-                let reason = TelegramTurnPresentationReducer.sanitized(String(describing: error))
-                    ?? "generated media delivery failed"
-                await recordError(
-                    context: errorContext,
-                    error: reason,
-                    update: update,
-                    message: message,
-                    text: text
-                )
-                if TelegramTurnReplyDeliveryFailure.isAmbiguous(error) {
-                    return .outcomeUnknown(reason: reason)
-                }
-                return .failed(reason: reason)
-            }
-        }
-        return .delivered(messageId: nil)
     }
 
     static func progressMessage(for event: TelegramChatProgressEvent) -> String? {
@@ -214,7 +201,7 @@ extension TelegramPollLoop {
         case .toolResult:
             return nil
         case .textDelta:
-            return nil  // draft-streamer lane, never a discrete message
+            return nil  // native draft preview, never a discrete message
         case .toolUse(let name, let input):
             let lower = name.lowercased()
             switch lower {
@@ -224,7 +211,7 @@ extension TelegramPollLoop {
                 }
                 return "Loading skill"
             default:
-                return ToolActivityPresentation.progress(name)
+                return ToolActivityPresentation.progress(name, args: input?.stringFields ?? [:])
             }
         }
     }
@@ -248,7 +235,8 @@ extension TelegramPollLoop {
         replyTo: TelegramReplyContext? = nil,
         fromUserId: Int? = nil,
         suppressUserAppend: Bool = false,
-        sessionId: String? = nil
+        sessionId: String? = nil,
+        runId: String? = nil
     ) async throws -> String {
         let typing = await startTypingHeartbeat(destination: destination)
         let displayProgress: TelegramChatProgressSink = { event in
@@ -264,7 +252,7 @@ extension TelegramPollLoop {
                 let reply = try await runChatHandlerAttempts(
                     destination: destination, text: text, attachments: attachments,
                     progress: displayProgress, replyTo: replyTo, fromUserId: fromUserId,
-                    suppressUserAppend: suppressUserAppend, sessionId: sessionId
+                    suppressUserAppend: suppressUserAppend, sessionId: sessionId, runId: runId
                 )
                 await typing.stop()
                 return reply
@@ -285,7 +273,8 @@ extension TelegramPollLoop {
         replyTo: TelegramReplyContext?,
         fromUserId: Int?,
         suppressUserAppend: Bool,
-        sessionId: String?
+        sessionId: String?,
+        runId: String?
     ) async throws -> String {
         // The retired model/effort/fast/persona commands, said in words.
         // This is the single choke point every non-slash Telegram text turn
@@ -308,6 +297,7 @@ extension TelegramPollLoop {
                 fromUserId: fromUserId,
                 suppressUserAppend: suppressUserAppend,
                 sessionId: sessionId,
+                runId: runId,
                 threadId: destination.threadId
             )
             do {
@@ -352,7 +342,7 @@ extension TelegramPollLoop {
                     "lastChatRetryFailedAttempt": .int(Int64(attempt + 1)),
                     "lastChatRetryNextAttempt": .int(Int64(attempt + 2)),
                     "lastChatRetrySuppressUserAppend": .bool(true),
-                    "lastChatRetryError": .string(String(describing: error)),
+                    "lastChatRetryError": .string(Self._tgRedactToken(String(describing: error))),
                 ])
                 // A3.4: honor a provider Retry-After when the failure carried
                 // one (the typed failure carries the delay). Wait

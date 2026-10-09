@@ -57,6 +57,8 @@ struct BotsShelfView: View {
                         .buttonStyle(.borderedProminent)
                         .hazeTinted(.button)
                         .padding(.top, 14)
+                        // Ends where the other pages' controls end.
+                        .padding(.trailing, ShellScrollGutter.shared.width)
                 }
                 .padding(.bottom, AliveMetrics.sectionSpacing - 14)
             } else {
@@ -94,7 +96,7 @@ struct BotsShelfView: View {
             if let selected { detail(selected) } else if aliveList { groupList } else { list }
         }
         .foregroundStyle(NativeAgentShell.text)
-        .padding(.horizontal, 20)
+        .padding(.horizontal, NativeAgentSpacing.pageInset)
         .padding(.bottom, 20)
         .padding(.top, aliveList ? TodayMetrics.topPadding : 20)
         .frame(maxWidth: aliveList ? TodayMetrics.contentWidth : .infinity, alignment: .leading)
@@ -161,26 +163,26 @@ struct BotsShelfView: View {
         }
     }
 
-    /// The Advanced shell's list: every helper a row in ONE group card, rows
-    /// split by hairlines, the status as a pill on the right.
+    /// The Advanced shell's list shares its header's page column.
     private var groupList: some View {
-        // The Mac's own grouped list, System Settings style (User 09-27: all
-        // controls native).
-        Form {
-            if !records.isEmpty {
-                Section {
-                    ForEach(records) { record in
-                        Button { selectedID = record.id; notice = nil } label: {
-                            BotRow(record: record, state: state(record))
-                                .contentShape(Rectangle())
-                        }.buttonStyle(.plain)
+        ScrollView {
+            VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                if !records.isEmpty {
+                    AliveGroupCard {
+                        ForEach(records) { record in
+                            Button { selectedID = record.id; notice = nil } label: {
+                                BotRow(record: record, state: state(record))
+                                    .contentShape(Rectangle())
+                            }.buttonStyle(.plain)
+                        }
                     }
                 }
+                listFooter
             }
-            Section { listFooter }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.bottom, NativeAgentSpacing.pageInset)
         }
-        .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
+        .pageScrollColumn()
     }
 
     /// The header's one sentence, in numerals: how many helpers, and when the
@@ -257,7 +259,7 @@ struct BotsShelfView: View {
                                     _ = try await BotRunConversation.enqueueRequestedCheck(botID: record.id, dataRoot: root)
                                     notice = "Run queued."
                                     reload()
-                                } catch { notice = error.localizedDescription }
+                                } catch { notice = Self.problem(error, action: "queue a run") }
                             }
                         }
                         // Pause has nothing to stop on a manual bot with no event.
@@ -325,7 +327,7 @@ struct BotsShelfView: View {
                                 messages = loaded
                             } catch {
                                 guard !Task.isCancelled else { break }
-                                messagesError = "Messages could not be loaded. Close and reopen this section to try again. \(error.localizedDescription)"
+                                messagesError = UserFacingError.message(error, action: "load these messages")
                             }
                             messagesLoading = false
                         }
@@ -340,7 +342,7 @@ struct BotsShelfView: View {
         "Limits: \(bot.budget.tokens.formatted()) output tokens and \(Int(bot.budget.seconds)) seconds per run · \((bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens).formatted()) reserved output tokens daily"
     }
     private func perform(_ action: () throws -> Void) {
-        do { try action(); reload() } catch { notice = error.localizedDescription }
+        do { try action(); reload() } catch { notice = Self.problem(error, action: "change that helper") }
     }
     private func reload() {
         // A settling run writes several watched files in a burst, and each
@@ -385,7 +387,7 @@ struct BotsShelfView: View {
             if queuedIDs != loaded.runs.queued { queuedIDs = loaded.runs.queued }
             shelfLoaded = true
             shelfError = nil
-        } catch { shelfError = "Helpers could not be loaded. Reopen Bots to try again. \(error.localizedDescription)" }
+        } catch { shelfError = UserFacingError.message(error, action: "load helpers") }
     }
     nonisolated static func readRecords(root: URL, unattended: Bool = true) throws -> [BotsShelfRecord] {
         let shelf = ShelfStore(dataRoot: root)
@@ -436,7 +438,7 @@ struct BotsShelfView: View {
                 if !appModel.engine.transcripts.sessions.contains(where: { $0.id == session.id }) { appModel.engine.transcripts.sessions.append(session) }
                 onContinue(destination)
             }
-        } catch { notice = error.localizedDescription }
+        } catch { notice = Self.problem(error, action: "open that helper's chat") }
     }
 
     /// Only an IDENTIFIED pending approval sends the person to Approvals. A
@@ -451,6 +453,13 @@ struct BotsShelfView: View {
 
     /// A new bot can be opened before its first turn. Use the ordinary checked
     /// session index and lock, preserving an existing row if a turn won the race.
+    /// A helper-store failure in words: the store's own sentence when it
+    /// carries one, otherwise one plain line (the raw error goes to the log).
+    static func problem(_ error: Error, action: String) -> String {
+        if case .invalidValue(let detail)? = error as? StandingBotsError { return detail }
+        return UserFacingError.message(error, action: action)
+    }
+
     static func chatSession(for bot: BotDefinition, root: URL) async throws -> ChatSession {
         let path = root.appendingPathComponent("chat/sessions.json")
         let row = try await SwiftNativePersistenceCore().withFileLock(path) {
@@ -475,8 +484,12 @@ struct BotsShelfView: View {
 }
 
 private extension View {
-    /// The shared settings card: slate under the lamp since 2026-09-10.
-    func botCardSurface() -> some View { settingsCardSurface() }
+    /// The kit's card (Alive glass), the one every other page wears.
+    func botCardSurface() -> some View {
+        frame(maxWidth: .infinity, alignment: .leading)
+            .aliveCard()
+            .accessibilityElement(children: .contain)
+    }
 }
 
 /// One settled run, summarized: the headline the reply opened with, when the
@@ -708,9 +721,9 @@ struct BotMarkContent: View {
     let reduceMotion: Bool
     var allowsMotion = true
     var body: some View {
-        RoundedRectangle(cornerRadius: 9, style: .continuous)
+        RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
             .fill(Color.primary.opacity(0.08))
-            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous).strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
             .overlay {
                 if state.running && !reduceMotion && allowsMotion {
                     light.phaseAnimator([false, true]) { content, expanded in
@@ -866,7 +879,7 @@ struct BotRow: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
                 .fill(NativeAgentShell.softFill)
                 .overlay {
                     Image(systemName: glyph)
@@ -877,14 +890,14 @@ struct BotRow: View {
                     if waitingOnHim { AliveWaitingDot().offset(x: 3, y: -3) }
                 }
                 .frame(width: 36, height: 36)
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
                 Text(record.definition.name)
-                    .font(.system(size: 15, weight: .medium))
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Text([timing, last].compactMap { $0 }.joined(separator: " · "))
-                    .font(.system(size: 13))
+                    .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -918,7 +931,7 @@ private struct BotsShelfArtifactLink: View {
                     panel.begin { response in
                         guard response == .OK, let url = panel.url else { return }
                         do { try data.write(to: url, options: .atomic) }
-                        catch { self.error = error.localizedDescription }
+                        catch { self.error = UserFacingError.message(error, action: "save that file") }
                     }
                 }.buttonStyle(.link)
             } else { Text("\(artifact.name) · File unavailable") }

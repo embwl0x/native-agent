@@ -193,7 +193,8 @@ extension SwiftNativeTurnEngine {
                 userMessage: queryMessage,
                 surface: surface,
                 historyLimit: historyLimit,
-                windowTokens: historyWindowTokens
+                windowTokens: historyWindowTokens,
+                consumeToolReceipt: SwiftToolDispatcher.consumeRenderedToolReceipt
             )
         }
         var historyMessages: [LLMMessage] = []
@@ -273,6 +274,11 @@ extension SwiftNativeTurnEngine {
             }
             replayedRunIds = projected.replayedRunIds
             historyMessages = projected.messages
+            for message in historyMessages {
+                for case .text(let text) in message.content {
+                    SwiftToolDispatcher.consumeRenderedToolReceipt(text)
+                }
+            }
             historyMessageChars = projected.messages.reduce(0) { total, message in
                 total + message.content.reduce(0) {
                     if case .text(let text) = $1 { return $0 + text.count }
@@ -297,7 +303,12 @@ extension SwiftNativeTurnEngine {
         trace.setCount("budget.historyChars", historyBudget.historyChars)
         trace.setCount("budget.memoryBlockChars", historyBudget.memoryBlockChars)
         trace.setCount("budget.recallRowLimit", historyBudget.recallRowLimit)
-        let historyBlock = renderedHistory.historyBlock
+        let receiptStrip = SessionHistoryPromptRenderer.recentReceiptStrip(from: prior)
+        if let receiptStrip, let evidence = try? JSONValue.parse(Data(receiptStrip.utf8)) {
+            SwiftToolDispatcher.consumePersistedHistoryEvidence(evidence)
+        }
+        let historyParts = [renderedHistory.historyBlock, receiptStrip].compactMap { $0 }
+        let historyBlock = historyParts.isEmpty ? nil : historyParts.joined(separator: "\n\n")
         trace.setCount("history.prompt.sourceBytes", priorStats.sourceBytes)
         trace.setCount("history.prompt.bytesRead", priorStats.bytesRead)
         trace.setCount("history.prompt.linesRead", priorStats.linesRead)
@@ -336,7 +347,8 @@ extension SwiftNativeTurnEngine {
                 base,
                 clockNowOverride: clockNowOverride,
                 quietHours: quietHoursWindow,
-                sessionID: sessionId
+                sessionID: sessionId,
+                queryUserMessage: queryMessage
             )
             var finalBase = Self.contextBySettingNaturalExpressionCue(
                 clockedBase,
@@ -401,6 +413,7 @@ extension SwiftNativeTurnEngine {
             surface: base.surface,
             personaID: base.personaID,
             personaDocs: base.personaDocs,
+            personaFingerprint: base.personaFingerprint,
             recalled: base.recalled,
             modelId: base.modelId,
             reasoningEffort: base.reasoningEffort,
@@ -424,7 +437,8 @@ extension SwiftNativeTurnEngine {
             contextWithHistory,
             clockNowOverride: clockNowOverride,
             quietHours: quietHoursWindow,
-            sessionID: sessionId
+            sessionID: sessionId,
+            queryUserMessage: queryMessage
         )
         var finalContext = Self.contextBySettingNaturalExpressionCue(
             clocked,
@@ -594,6 +608,7 @@ extension SwiftNativeTurnEngine {
             surface: base.surface,
             personaID: base.personaID,
             personaDocs: base.personaDocs,
+            personaFingerprint: base.personaFingerprint,
             recalled: base.recalled,
             modelId: base.modelId,
             reasoningEffort: base.reasoningEffort,

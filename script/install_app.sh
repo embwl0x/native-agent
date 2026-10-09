@@ -156,6 +156,14 @@ fi
 # 2. Stage fresh bundle — copy to temp then mv for atomic swap
 mkdir -p "$HOME/Applications" "$DATA/logs"
 DIST_BUNDLE="$ROOT/dist/$APP_NAME.app"
+# The helper and its kit are one release; refuse an incomplete builder result
+# before staging or touching the running installation.
+if [[ ! -x "$DIST_BUNDLE/Contents/MacOS/NativeAgentSenseHost" \
+   || ! -f "$DIST_BUNDLE/Contents/Resources/Senses/sense.js" \
+   || ! -f "$DIST_BUNDLE/Contents/Resources/Senses/builtin.json" ]]; then
+    echo "[install_app.sh] ERROR: built bundle is missing the Senses helper or authoring kit." >&2
+    exit 1
+fi
 TEMP_BUNDLE="$(dirname "$APP_DEST")/.NativeAgent.app.tmp.$$"
 rm -rf "$TEMP_BUNDLE"
 cp -R "$DIST_BUNDLE" "$TEMP_BUNDLE"
@@ -390,19 +398,11 @@ _verify_ready() {
   [[ "$INSTALL_LAUNCH_OK" == "1" ]] && "$ROOT/script/verify_installed_runtime_ready.sh" \
     "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 45
 }
-# 2026-10-01: macOS can abort a fresh launch inside RenderBox (SwiftUI's
-# renderer failing to load its own Metal library) before any app code runs —
-# 4 crash reports that day, every one within 3s of launch, old and new builds
-# alike. A process that died is relaunched once before blaming the build.
+# A replacement that dies at launch is a failed build and rolls back. The
+# 2026-10-01 RenderBox aborts were the app's own fd exhaustion (5b687f19a,
+# 404571e4b), not macOS, so there is no relaunch-once retry to hide one.
 INSTALL_READY=0
-if _verify_ready; then
-  INSTALL_READY=1
-elif ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1; then
-  echo "[install_app.sh] the replacement exited during launch; relaunching once"
-  INSTALL_LAUNCH_OK=0
-  _launch_nativeagent_bundle && INSTALL_LAUNCH_OK=1
-  _verify_ready && INSTALL_READY=1
-fi
+if _verify_ready; then INSTALL_READY=1; fi
 if [[ "$INSTALL_READY" == "1" ]]; then
   APP_PID="$(pgrep -fxn "$APP_DEST/Contents/MacOS/NativeAgentApp" || true)"
   echo "OK — NativeAgentApp ready (pid=$APP_PID)."
@@ -427,6 +427,8 @@ if [[ "$INSTALL_READY" == "1" ]]; then
   fi
   trap - EXIT ERR INT TERM HUP
   rm -rf "$APP_OLD" 2>/dev/null || true
+  # A good install supersedes every earlier failed replacement kept for triage.
+  rm -rf "${APP_DEST:?}".failed.* 2>/dev/null || true
   exit 0
 fi
 

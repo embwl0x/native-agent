@@ -34,7 +34,7 @@ struct MCPHubConsentSection: View {
     }
 
     var body: some View {
-        MCPSection(label: "Consent log") {
+        AdvancedSection(title: "Consent log", card: .bare) {
             switch presentation {
             case .loading:
                 MCPNote("Reading the consent decisions I've been given.")
@@ -208,7 +208,7 @@ struct MCPHubView: View {
     // MARK: - Servers
 
     private var serversSection: some View {
-        MCPSection(label: "Servers") {
+        AdvancedSection(title: "Servers", card: .bare) {
             switch MCPHubCollectionPresentation.resolve(
                 recordCount: appModel.mcpServers.count,
                 endpoint: "mcp servers",
@@ -258,7 +258,7 @@ struct MCPHubView: View {
         return MCPCard(selected: isSelected) {
             HStack(alignment: .center, spacing: 8) {
                 Text(server.name)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                 Spacer(minLength: 8)
                 ConnectorsStatusPill(text: MCPHubWords.health(server.healthStatus), tone: healthColor(server.healthStatus))
@@ -336,7 +336,7 @@ struct MCPHubView: View {
     // MARK: - Tools
 
     private var toolsSection: some View {
-        MCPSection(label: "Tools — \(appModel.selectedMCPServer?.name ?? "no server selected")") {
+        AdvancedSection(title: "Tools — \(appModel.selectedMCPServer?.name ?? "no server selected")", card: .bare) {
             let notice = MCPHubInventoryPresentation.notice(
                 state: appModel.mcpToolReadState,
                 selectedServerName: appModel.selectedMCPServer?.name,
@@ -446,7 +446,7 @@ struct MCPHubView: View {
     // MARK: - Resources
 
     private var resourcesSection: some View {
-        MCPSection(label: "Resources — \(appModel.selectedMCPServer?.name ?? "no server selected")") {
+        AdvancedSection(title: "Resources — \(appModel.selectedMCPServer?.name ?? "no server selected")", card: .bare) {
             switch appModel.mcpResourceReadState {
             case .notLoaded, .loading:
                 MCPNote(MCPHubResourcesPresentation.notice(
@@ -500,7 +500,7 @@ struct MCPHubView: View {
     // MARK: - Recent call
 
     private var recentCallSection: some View {
-        MCPSection(label: "Recent call") {
+        AdvancedSection(title: "Recent call", card: .bare) {
             switch appModel.mcpRecentCallState {
             case .durable(let call):
                 recentCallRow(call, provenance: "Recorded in Activity; available after relaunch.")
@@ -523,7 +523,7 @@ struct MCPHubView: View {
                 )
             case .latestAttemptFailed(let detail):
                 MCPNote(
-                    "The latest call failed this app session: \(detail). No durable call receipt was recorded.",
+                    "The latest call failed this app session. \(detail) No durable call receipt was recorded.",
                     tone: NativeAgentShell.trouble
                 )
             case .unavailable(let detail):
@@ -570,10 +570,7 @@ struct MCPHubView: View {
                     .lineLimit(12)
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(NativeAgentShell.quietFill)
-                    )
+                    .houseInset(in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
             }
             if call.resultTruncated == true {
                 Text("Result preview truncated · \(call.resultByteCount ?? 0) bytes")
@@ -635,23 +632,6 @@ private enum MCPHubWords {
     }
 }
 
-/// An eyebrow over its run of cards — the shape every group on an Advanced
-/// page takes.
-private struct MCPSection<Content: View>: View {
-    let label: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        // Lazy because a server's tool list can run to dozens of rows, and the
-        // `List` this page used to be built them lazily too.
-        LazyVStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(label)
-            content
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
 /// One row of a list. Alive glass (2026-09-23): rows carry no chrome; the
 /// list's `AliveGroupCard` is the card. A selected row takes the next fill
 /// rung, reaching out into the card's row inset.
@@ -666,7 +646,7 @@ private struct MCPCard<Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
             if selected {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
                     .fill(NativeAgentShell.softFill)
                     .padding(.horizontal, -12)
                     .padding(.vertical, -8)

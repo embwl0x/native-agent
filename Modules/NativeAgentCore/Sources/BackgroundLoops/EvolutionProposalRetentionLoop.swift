@@ -40,10 +40,10 @@ public struct EvolutionProposalRetentionLoop: LoopRunner {
             guard removed > 0 else {
                 return .skipped(reason: "no terminal proposals past the retention cutoff")
             }
-            NSLog("evolution_proposal_retention: swept %d terminal proposal(s)", removed)
+            nativeLog("evolution_proposal_retention: swept %d terminal proposal(s)", removed)
             return .completed(result: "evolution proposal sweep removed \(removed)")
         } catch {
-            NSLog("evolution_proposal_retention: sweep failed: %@", String(describing: error))
+            nativeLog("evolution_proposal_retention: sweep failed: %@", String(describing: error))
             return .failed(error: String(describing: error))
         }
     }

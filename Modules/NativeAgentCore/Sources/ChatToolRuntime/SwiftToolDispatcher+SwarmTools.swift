@@ -31,7 +31,7 @@ public struct SwarmProviderAssembly: Sendable {
     init(dataRoot: URL, environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.dataRoot = dataRoot
         self.codexEnvironment = environment.merging([
-            "CODEX_HOME": dataRoot.appendingPathComponent("codex_home", isDirectory: true).path,
+            "CODEX_HOME": OpenAIOAuthDirectAdapter.codexChildHome(dataRoot: dataRoot).path,
             "NATIVE_AGENT_DATA_ROOT": dataRoot.path,
         ]) { _, bound in bound }
         self.anthropicDataRoot = dataRoot

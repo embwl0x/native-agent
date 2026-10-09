@@ -171,7 +171,7 @@ public enum InlineInteractionResolver {
             return rows
         } catch {
             if loggedReadFailures.insert(sessionID).inserted {
-                NSLog("[interaction] transcript read failed for \(sessionID): \(error)")
+                nativeLog("[interaction] transcript read failed for \(sessionID): \(error)")
             }
             throw error
         }
@@ -344,9 +344,10 @@ public enum InlineInteractionResolver {
                 try await persistence.appendJSONLDurable(rowToAppend, to: file)
             }
         } catch {
-            NSLog("[interaction] raise failed for \(stamped.id): \(error)")
+            nativeLog("[interaction] raise failed for \(stamped.id): \(error)")
             return nil
         }
+        await ApprovalChatCards.publishInteractionChange(id: stamped.id, sessionID: sessionID, dataRoot: dataRoot)
         NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: sessionID)
         NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
         return stamped
@@ -925,7 +926,7 @@ public enum InlineInteractionResolver {
                 }
             )
         } catch {
-            NSLog("[interaction] resume claim failed for \(interaction.id): \(error)")
+            nativeLog("[interaction] resume claim failed for \(interaction.id): \(error)")
             return
         }
 
@@ -1030,7 +1031,7 @@ public enum InlineInteractionResolver {
                     claimed, from: .claimed, sessionID: sessionID, dataRoot: dataRoot
                 )
             } catch {
-                NSLog("[interaction] pre-dispatch marker failed for \(interaction.id): \(error)")
+                nativeLog("[interaction] pre-dispatch marker failed for \(interaction.id): \(error)")
                 await failAfterLostTransition(
                     id: interaction.id, sessionID: sessionID,
                     reason: "Couldn't record that the \(toolName) call was about to run, so it wasn't made. Try again.",
@@ -1065,7 +1066,7 @@ public enum InlineInteractionResolver {
                     // tapped again into a second real effect — so the card is
                     // failed RETRYABLY and the turn is not started. The person
                     // sees what happened instead of a silent double-send.
-                    NSLog("[interaction] replay checkpoint failed for \(interaction.id): \(error)")
+                    nativeLog("[interaction] replay checkpoint failed for \(interaction.id): \(error)")
                     await failAfterLostTransition(
                         id: interaction.id, sessionID: sessionID,
                         reason: "The \(toolName) call ran, but recording it failed. Try again.",
@@ -1088,12 +1089,12 @@ public enum InlineInteractionResolver {
                         claimed, from: .replaying, sessionID: sessionID, dataRoot: dataRoot
                     )
                 } catch {
-                    NSLog("[interaction] clearing the pre-dispatch marker failed for \(interaction.id): \(error)")
+                    nativeLog("[interaction] clearing the pre-dispatch marker failed for \(interaction.id): \(error)")
                 }
                 // Nothing happened, so nothing is recorded. The prompt falls
                 // back to telling the model the call may now run, and a retry
                 // is free to replay it for real.
-                NSLog("[interaction] replay of \(toolName) did not run for \(interaction.id): \(reason)")
+                nativeLog("[interaction] replay of \(toolName) did not run for \(interaction.id): \(reason)")
             }
             }
         }
@@ -1161,7 +1162,7 @@ public enum InlineInteractionResolver {
                 // row still read `.claimed` — the turn swallowed the card and
                 // nothing on disk said so. A write that did not land publishes
                 // nothing and fails the card retryably instead.
-                NSLog("[interaction] hand-back record failed for \(interaction.id): \(error)")
+                nativeLog("[interaction] hand-back record failed for \(interaction.id): \(error)")
                 await failAfterLostTransition(
                     id: interaction.id, sessionID: sessionID,
                     reason: "Couldn't record that this was handed back to the turn already "
@@ -1175,7 +1176,7 @@ public enum InlineInteractionResolver {
         }
 
         guard let startTurn else {
-            NSLog("[interaction] no turn starter installed; \(interaction.id) settled without resuming")
+            nativeLog("[interaction] no turn starter installed; \(interaction.id) settled without resuming")
             return
         }
         // The pre-admission marker, written DURABLY before the turn starts —
@@ -1195,7 +1196,7 @@ public enum InlineInteractionResolver {
                 admittingClaim, from: .claimed, sessionID: sessionID, dataRoot: dataRoot
             )
         } catch {
-            NSLog("[interaction] pre-admission marker failed for \(interaction.id): \(error)")
+            nativeLog("[interaction] pre-admission marker failed for \(interaction.id): \(error)")
             await failAfterLostTransition(
                 id: interaction.id, sessionID: sessionID,
                 reason: "Couldn't record that this was about to continue, so it wasn't started. "
@@ -1239,7 +1240,7 @@ public enum InlineInteractionResolver {
         // and a retry tells the model what the call already returned rather
         // than making it a second time.
         guard admitted else {
-            NSLog("[interaction] resume was not admitted for \(interaction.id); claim released")
+            nativeLog("[interaction] resume was not admitted for \(interaction.id); claim released")
             await failAfterLostTransition(
                 id: interaction.id, sessionID: sessionID,
                 reason: "That couldn't be continued just now. Try again.",
@@ -1260,7 +1261,7 @@ public enum InlineInteractionResolver {
             // `.replaying` for reclaim to guess about later in this same
             // launch. It is failed retryably against the state we know, and
             // the person is told the resume is unverifiable.
-            NSLog("[interaction] recording the resume of \(interaction.id) failed: \(error)")
+            nativeLog("[interaction] recording the resume of \(interaction.id) failed: \(error)")
             await failAfterLostTransition(
                 id: interaction.id, sessionID: sessionID,
                 reason: "I can't tell whether that resumed. Try again.",
@@ -1552,7 +1553,7 @@ public enum InlineInteractionResolver {
         let found = onDisk.revision
         let foundState = onDisk.continuation?.state
         guard foundState != .resumed, foundState != .invalidated else {
-            NSLog("[interaction] \(id) already moved on; not failing it")
+            nativeLog("[interaction] \(id) already moved on; not failing it")
             return
         }
         onDisk.continuation?.state = .waiting
@@ -1639,6 +1640,7 @@ public enum InlineInteractionResolver {
             rows[index] = .object(object)
             try await persistence.replaceJSONL(rows, to: file)
         }
+        await ApprovalChatCards.publishInteractionChange(id: interaction.id, sessionID: sessionID, dataRoot: dataRoot)
         // Nothing re-reads the transcript on its own; the open conversation
         // still shows the pending card until told. Same signal a remote turn
         // posts.

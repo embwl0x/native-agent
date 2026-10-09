@@ -14,14 +14,10 @@ public enum BotRunConversation {
         let result = try await ChatToolSessionContext.withReplyRoute(.init(surface: "chat")) {
             try await dispatch(input: ["id": .string(botID.uuidString)], surface: "chat",
                                scope: bot.sessionID, dataRoot: dataRoot) { _, _ in
-                let request = try BotRunQueue(dataRoot: dataRoot).enqueueRequest(bot: botID)
-                return .object(["status": .string("queued"), "id": .string(botID.uuidString),
-                                "requestId": .string(request.uuidString)])
+                let receipt = try BotRunQueue(dataRoot: dataRoot).enqueue(bot: botID)
+                return .object(["status": .string(receipt.accepted ? "queued" : "joined"), "id": .string(botID.uuidString),
+                                "requestId": .string(receipt.runID.uuidString)])
             }
-        }
-        if case .object(let fields) = result, fields["status"] == .string("waiting"),
-           case .string(let detail)? = fields["detail"] {
-            throw StandingBotsError.invalidValue(detail)
         }
         guard case .object(let fields) = result, fields["automatic_return"] == .bool(true),
               case .string(let raw)? = fields["requestId"], let requestID = UUID(uuidString: raw) else {
@@ -34,13 +30,23 @@ public enum BotRunConversation {
                          dataRoot: URL, perform: Dispatch) async throws -> JSONValue {
         let definitions = BotDefinitionStore(dataRoot: dataRoot)
         let bot = try definitions.get(botReference(input, definitions: definitions))
+        guard !BotRunQueue.ancestry.contains(bot.id) else {
+            throw StandingBotsError.invalidValue(BotRunQueue.alreadyExecutingWords)
+        }
         let store = AgentConversationStore(dataRoot: dataRoot)
         let agent = "bot-run:" + bot.id.uuidString
         if let old = try store.find(scopeSessionID: scope, agent: agent, label: "Requested check"),
            ["sending", "waiting"].contains(old.phase) || old.deliveryState == "delivering" {
             if old.automaticRead {
-                return .object(["status": .string("waiting"), "with": .string(bot.name),
-                    "detail": .string("That requested check is already being handled. Its result will return here; no second check was queued.")])
+                guard case .string(let request)? = old.readInput?["message_id"], UUID(uuidString: request) != nil else {
+                    throw StandingBotsError.invalidValue("The earlier check has no exact run reference. Inspect the helper's saved work; no second check was queued.")
+                }
+                return .object(["status": .string("joined"), "with": .string(bot.name),
+                    "id": .string(bot.id.uuidString), "requestId": .string(request),
+                    "automatic_return": .bool(true), "return_session": .string(old.scopeSessionID),
+                    "read_with": .object(["action": .string("shelf.entry"), "args": .object([
+                        "id": .string(request), "bot_id": .string(bot.id.uuidString)])]),
+                    "detail": .string("Joined run \(request). Its result will return to conversation \(old.scopeSessionID) and be saved on the helper's shelf; no second check was queued.")])
             }
             _ = try store.update(id: old.id, operationID: old.operationID) {
                 $0.phase = "attention"; $0.deliveryState = "interrupted"
@@ -67,7 +73,7 @@ public enum BotRunConversation {
             }
             throw error
         }
-        guard case .object(var fields) = result, fields["status"] == .string("queued"),
+        guard case .object(var fields) = result, [JSONValue.string("queued"), .string("joined")].contains(fields["status"] ?? .null),
               case .string(let returnedBot)? = fields["id"], UUID(uuidString: returnedBot) == bot.id,
               case .string(let request)? = fields["requestId"], let requestID = UUID(uuidString: request) else {
             _ = try? store.update(id: row.id, operationID: row.operationID) {
@@ -85,10 +91,11 @@ public enum BotRunConversation {
             }
             fields["with"] = .string(bot.name)
             fields["automatic_return"] = .bool(true)
-            fields["detail"] = .string("The check is queued. Its result will return to this conversation; you can keep talking in the meantime.")
+            fields["return_session"] = .string(scope)
+            fields["detail"] = .string("\(fields["status"] == .string("joined") ? "Joined" : "Queued") run \(requestID.uuidString). Its result will return to conversation \(scope) and be saved on the helper's shelf; you can keep talking in the meantime.")
         } catch {
             fields["automatic_return"] = .bool(false)
-            fields["detail"] = .string("The check was queued, but its return address could not be saved. Read the exact saved result later; do not queue the check again.")
+            fields["detail"] = .string("The run was accepted, but its return address could not be saved. Read the exact saved result later; do not queue the check again.")
         }
         return .object(fields)
     }

@@ -449,6 +449,9 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     // unwired actor and assert it fails closed.
     internal var embedder: (any EmbeddingProvider)?
     internal var storage: (any MemoryStorageProtocol)?
+    internal var canonicalDataRoot: URL?
+    internal var canonicalAttachmentReady: Task<Void, Never>?
+    internal var userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?
     private struct EmbeddingRetryKey: Hashable {
         let epoch: String
         let kind: String
@@ -488,12 +491,18 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         if let diagnosticSink {
             diagnosticSink(message)
         } else {
-            NSLog("%@", message)
+            nativeLog("%@", message)
         }
     }
 
     public init() {
         self.embedder = nil
+        self.storage = nil
+    }
+
+    internal init(canonicalDataRoot: URL) {
+        self.canonicalDataRoot = canonicalDataRoot
+        self.embedder = ManagedEmbeddingProvider(dataRoot: canonicalDataRoot)
         self.storage = nil
     }
 
@@ -506,6 +515,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     }
 
     public func listMemory(kind: String?) async throws -> [MemoryRecord] {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         return try await storage.listMemory(kind: kind)
     }
@@ -536,6 +546,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     }
 
     public func updateMemory(id: String, update: JSONValue) async throws -> MemoryRecord {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         let existingKind: String?
         if case .object(let patch) = update, Self.patchKind(patch) == nil,
@@ -595,6 +606,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     /// Foreground callers that distinguish a missing row use the atomic
     /// deletion result while sharing the canonical projection completion.
     public func deleteMemoryIfPresent(id: String) async throws -> Bool {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         let deleted = try await storage.deleteMemory(id: id)
         await flushDerivedMemoryChanges()
@@ -602,6 +614,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     }
 
     public func v2Status() async throws -> JSONValue {
+        try await ensureCanonicalAttachment()
         guard let embedder, storage != nil else { throw MemoryV2Error.storageUnavailable }
         return .object([
             "phase": .string("B"),
@@ -651,7 +664,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
             effectiveBackend: isMock
                 ? ManagedEmbeddingProvider.mockBackend
                 : (isFailClosed ? ManagedEmbeddingProvider.failClosedBackend : ManagedEmbeddingProvider.coreMLBackend),
-            mode: ManagedEmbeddingProvider.balancedMode,
+            mode: ManagedEmbeddingProvider.performanceMode,
             modelId: embedder.modelId,
             dimensions: embedder.dimensions,
             embeddingEpoch: embedder.embeddingEpoch.rawValue,
@@ -665,7 +678,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
             lastLoadError: nil,
             loadCount: coreMLUp ? 1 : 0,
             unloadCount: 0,
-            idleUnloadSeconds: 300
+            idleUnloadSeconds: nil
         )
     }
 
@@ -688,8 +701,12 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     /// (the first real use will surface the same error with better
     /// context).
     public func warmUpEmbedder() async throws {
-        guard let embedder else { return }
-        _ = try await embedder.embed(["warmup"])
+        guard let embedder else { throw MemoryV2Error.storageUnavailable }
+        if let managed = embedder as? ManagedEmbeddingProvider {
+            try await managed.warmUp()
+        } else {
+            _ = try await embedder.embed(["warmup"])
+        }
     }
 
     /// Bounded public projection for derived local indexes such as ContextFlow.
@@ -733,6 +750,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     }
 
     public func memoryEmbeddingEpochState() async throws -> MemoryEmbeddingEpochState {
+        try await ensureCanonicalAttachment()
         guard let bridge = storage as? MemoryStorageBridge else {
             throw MemoryV2Error.storageUnavailable
         }
@@ -746,6 +764,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     public func reindexAllMemoryEmbeddingsForCurrentProvider(
         batchSize: Int = 64
     ) async throws -> MemoryEmbeddingEpochActivationReport {
+        try await ensureCanonicalAttachment()
         guard let embedder,
               let bridge = storage as? MemoryStorageBridge else {
             throw MemoryV2Error.storageUnavailable
@@ -813,7 +832,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
             return try await concreteStorage.activateEmbeddingEpoch(candidateEpoch, staged: staged)
         } catch let error as MemoryStorageError {
             if case .embeddingActivationInvalid(.corpusDrift, _) = error,
-               attempt < 3, embeddingReindexID == invocation, !Task.isCancelled {
+               embeddingReindexID == invocation, !Task.isCancelled {
                 embeddingRetryVectors = Dictionary(uniqueKeysWithValues: staged.map {
                     (EmbeddingRetryKey(epoch: candidateEpoch, row: $0.row), $0.vector)
                 })

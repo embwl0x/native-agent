@@ -63,6 +63,10 @@ struct ToolEvent: Codable, Equatable, Identifiable {
     var id: String { "\(seq)-\(name)" }
     let name: String
     let seq: Int
+    /// The Mac's phrase for it ("Working in Mail"); nil from an older Mac.
+    var activity: String? = nil
+    var outcome: String? = nil
+    var resultDetail: String? = nil
 }
 
 struct ChatMessage: Identifiable, Codable, Equatable {
@@ -78,6 +82,17 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     /// A settled bridge receipt that the Mac transcript has not yet published.
     /// Persist with the row so switching chats cannot expire its protection.
     var awaitingMacTranscript: Bool = false
+    var runId: String?
+    var failureDetail: String?
+    var interaction: InlineInteraction?
+    var interactionDescriptor: InlineInteractionDescriptor?
+    var interactionSessionID: String?
+    var completionState: String? = nil
+
+    var isTerminalReply: Bool {
+        role == .assistant && interaction == nil && interactionDescriptor == nil && !isStreaming
+            && (completionState == "completed" || completionState == "incomplete")
+    }
 
     init(
         id: UUID = UUID(),
@@ -86,7 +101,12 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         isStreaming: Bool = false,
         attachments: [ChatAttachmentSummary] = [],
         toolEvents: [ToolEvent] = [],
-        awaitingMacTranscript: Bool = false
+        awaitingMacTranscript: Bool = false,
+        runId: String? = nil,
+        failureDetail: String? = nil,
+        interaction: InlineInteraction? = nil,
+        interactionDescriptor: InlineInteractionDescriptor? = nil,
+        interactionSessionID: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -95,10 +115,17 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         self.attachments = attachments
         self.toolEvents = toolEvents
         self.awaitingMacTranscript = awaitingMacTranscript
+        self.runId = runId
+        self.failureDetail = failureDetail
+        self.interaction = interaction
+        self.interactionDescriptor = interactionDescriptor
+        self.interactionSessionID = interactionSessionID
     }
 
     enum CodingKeys: String, CodingKey {
         case id, role, text, isStreaming, attachments, toolEvents, awaitingMacTranscript
+        case runId, failureDetail, completionState
+        case interaction, interactionDescriptor, interactionSessionID
     }
 
     init(from decoder: Decoder) throws {
@@ -110,6 +137,12 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         attachments = try c.decodeIfPresent([ChatAttachmentSummary].self, forKey: .attachments) ?? []
         toolEvents = try c.decodeIfPresent([ToolEvent].self, forKey: .toolEvents) ?? []
         awaitingMacTranscript = try c.decodeIfPresent(Bool.self, forKey: .awaitingMacTranscript) ?? false
+        runId = try c.decodeIfPresent(String.self, forKey: .runId)
+        failureDetail = try c.decodeIfPresent(String.self, forKey: .failureDetail)
+        completionState = try c.decodeIfPresent(String.self, forKey: .completionState)
+        interaction = try c.decodeIfPresent(InlineInteraction.self, forKey: .interaction)
+        interactionDescriptor = try c.decodeIfPresent(InlineInteractionDescriptor.self, forKey: .interactionDescriptor)
+        interactionSessionID = try c.decodeIfPresent(String.self, forKey: .interactionSessionID)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -121,6 +154,12 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         try c.encode(attachments, forKey: .attachments)
         if !toolEvents.isEmpty { try c.encode(toolEvents, forKey: .toolEvents) }
         if awaitingMacTranscript { try c.encode(true, forKey: .awaitingMacTranscript) }
+        try c.encodeIfPresent(runId, forKey: .runId)
+        try c.encodeIfPresent(failureDetail, forKey: .failureDetail)
+        try c.encodeIfPresent(completionState, forKey: .completionState)
+        try c.encodeIfPresent(interaction, forKey: .interaction)
+        try c.encodeIfPresent(interactionDescriptor, forKey: .interactionDescriptor)
+        try c.encodeIfPresent(interactionSessionID, forKey: .interactionSessionID)
     }
 }
 

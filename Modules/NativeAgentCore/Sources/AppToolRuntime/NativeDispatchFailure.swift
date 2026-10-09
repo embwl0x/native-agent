@@ -11,7 +11,7 @@ public enum NativeDispatchFailure {
         let toolName = (parsed?["tool"] as? String) ?? ""
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
         let runId = UUID().uuidString.lowercased()
-        NSLog("[NativeClient] dispatch missing native handler for tool=\(toolName)")
+        nativeLog("[NativeClient] dispatch missing native handler for tool=\(toolName)")
         return makeResult(
             false,
             toolName,

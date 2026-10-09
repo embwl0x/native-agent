@@ -56,6 +56,17 @@ extension MacFourVerbs {
         /// given, `verb`/`target` are ignored.
         steps: [MacActStep] = []
     ) async -> MacFourVerbsReply {
+        if steps.isEmpty, Self.parseVerb(rawVerb).0 == "key",
+           (try? MacKeySyntax.parseChords(Self.keySpec(target) ?? target)) == nil,
+           let holding, let chords = try? MacKeySyntax.parseChords(holding),
+           chords.count == 1, !chords[0].modifiers.isEmpty {
+            return .init(ok: false,
+                text: "For key, target is the chord; app names the application. Nothing was pressed. Use next_call.",
+                detail: ["error": .string("key_chord_in_holding"), "effects": .string("none"),
+                    "next_call": .object(["tool": .string("app"), "input": .object([
+                        "action": .string("mac.act"), "args": .object([
+                            "app": .string(app ?? target), "verb": .string("key"), "target": .string(holding)])])])])
+        }
         if MacDriverContext.binding == nil {
             let binding = await MacAttentionSessionStore.shared.bindDriver()
             return await withTaskCancellationHandler {
@@ -523,7 +534,7 @@ extension MacFourVerbs {
         let state = string(reply.detail["operationState"])
         guard !reply.ok,
               bool(reply.detail["ax_delivered"]) == true
-                || status.map({ ["wrong_target", "acted_unobserved", "outcome_unknown"].contains($0) }) == true
+                || status.map({ ["wrong_target", "acted_on_different_target", "acted_unobserved", "outcome_unknown"].contains($0) }) == true
                 || state.map({ ["started", "cancel_requested", "outcome_unknown", "timed_out", "failed"].contains($0) }) == true else {
             return reply
         }
@@ -632,8 +643,12 @@ extension MacFourVerbs {
         if verbName == "press" { verbName = Self.pressMeansKey(target) ? "key" : "click" }
         // {verb:key, target:"Save As", text:"cmd+a"}: the chord rode in text
         // and target named the field (09-24: unknownKey("Save")).
+        // In an app left in the back, "whatever has focus" is that app's
+        // focused field: it is typed into there, through accessibility.
         let target = verbName == "key" && (try? MacKeySyntax.parseChords(Self.keySpec(target) ?? target)) == nil
-            && text.map(Self.pressMeansKey) == true ? text ?? target : target
+            && text.map(Self.pressMeansKey) == true ? text ?? target
+            : verbName == "type" && app != nil && target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "focused field" : target
         /// The escalation ladder's middle rung, in words: nothing was touched,
         /// here is why the front is needed, and how to ask for it.
         func needsFront(_ reason: String, screen: String? = nil, delivered: Bool = false) -> MacFourVerbsReply {
@@ -784,7 +799,6 @@ extension MacFourVerbs {
         }
         // No target: type into whatever has focus, as a person does.
         if verb == .type, target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let text {
-            if app != nil { return needsFront("typing into whatever has focus takes real keystrokes") }
             var before = carry?.take()
             var windowlessPid: Int32?
             if before == nil {
@@ -845,7 +859,7 @@ extension MacFourVerbs {
         // b. RESOLVE BY NAME.
         var resolution = verb == .scroll
             ? Self.resolveScrollTarget(target, among: sighting.targets)
-            : Self.resolve(target, among: sighting.targets)
+            : Self.resolve(target, among: sighting.targets, pressing: [.click, .select, .toggle, .open].contains(verb))
         var reobservedAfterTransientMiss = false
         var acquisitionSamples = 0
         // Motion sampling reads the FRONT screen; a background act never uses it.
@@ -866,7 +880,7 @@ extension MacFourVerbs {
                     sighting = refreshed
                     resolution = verb == .scroll
                         ? Self.resolveScrollTarget(target, among: sighting.targets)
-                        : Self.resolve(target, among: sighting.targets)
+                        : Self.resolve(target, among: sighting.targets, pressing: [.click, .select, .toggle, .open].contains(verb))
                     acquisitionSamples += 1
                     reobservedAfterTransientMiss = true
                 }
@@ -892,7 +906,7 @@ extension MacFourVerbs {
                         )
                     }
                     sighting = refreshed
-                    resolution = Self.resolve(target, among: refreshed.targets)
+                    resolution = Self.resolve(target, among: refreshed.targets, pressing: [.click, .select, .toggle, .open].contains(verb))
                 }
             }
         }
@@ -1000,6 +1014,25 @@ extension MacFourVerbs {
                              "nearest": .array([.string(Self.recoveryName(candidate))])]
                 )
             }
+            // "Delete" must never press "Delete All": a name that only appears
+            // inside longer labels is answered with those labels, not acted on.
+            if Self.committingVerbs.contains(verb), !candidate.regionOnly, !bareFieldHit,
+               !Self.answers(target, candidate, exact: true) {
+                let containing = sighting.targets.filter { $0 == candidate || Self.containsName(Self.askedName(target), $0) }
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: "Nothing here is named exactly \"\(target)\"; it is only part of "
+                        + containing.map { Self.recoveryName($0) + " (\($0.kind))" }.joined(separator: ", ")
+                        + ". Name the one you mean exactly. I haven't touched anything.\n" + sighting.render,
+                    detail: ["error": .string("inexact_name"), "target": .string(target),
+                             "candidates": .array(containing.map(Self.candidateDetail))]
+                )
+            }
+            if Self.nativeSurfaceApp != nil, let label = Self.nativeSurfaceLabel, candidate.label != label {
+                return MacFourVerbsReply(ok: false,
+                    text: "The selected native surface changed before I could act. I haven't touched it; read the screen again.\n" + sighting.render,
+                    detail: ["error": .string("native_surface_changed")])
+            }
             guard candidate.enabled else {
                 return MacFourVerbsReply(
                     ok: false, text: "\(Self.name(candidate)) is disabled. I haven't touched it.\n" + sighting.render,
@@ -1037,7 +1070,8 @@ extension MacFourVerbs {
             // Background: only the app's own accessibility actions run in the
             // back. A pixel-found target or a wheel gesture is window-server
             // input, so it asks for the front instead of taking it.
-            if app != nil, physicalScroll || candidate.isSupplemental {
+            if app != nil, physicalScroll || candidate.isSupplemental,
+               !(Self.nativeSurfaceApp == app && sighting.isFront) {
                 return needsFront(
                     physicalScroll
                         ? "scrolling it needs the wheel over the window"
@@ -1236,9 +1270,10 @@ extension MacFourVerbs {
             let redirected = Self.bool(actedOn["redirected"]) == true
             let dismissPressed = Self.string(Self.object(output["dismiss_target"])["label"])
             func answersLabel(_ label: String) -> Bool {
-                Self.answers(target, ActTarget(handle: candidate.handle, label: label, aliases: candidate.aliases,
-                                               kind: candidate.kind, ordinal: candidate.ordinal,
-                                               roleOrdinal: candidate.roleOrdinal, enabled: true))
+                guard Self.exactName(label) == Self.exactName(candidate.label ?? "") else {
+                    return Self.exactName(label) == Self.exactName(target)
+                }
+                return Self.answers(target, candidate)
             }
             let matchedName: String = {
                 if verb == .dismiss, let pressed = dismissPressed {
@@ -1286,12 +1321,14 @@ extension MacFourVerbs {
             // field; other verbs produced an observed app reaction. Promote
             // that evidence on the model-facing receipt while leaving every
             // acted_unobserved branch honestly unverified.
-            if effect.status == "acted" {
+            if effect.status == "acted", output["verified"] == .bool(true) {
                 detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
-                detail["verification_evidence"] = .string("closed_loop_semantic_effect")
+                detail["verification_evidence"] = output["verification_evidence"] ?? .string(effect.sentence)
+                detail["verification_scope"] = output["verification_scope"] ?? .string("observed_control_effect")
             } else {
                 detail["verification"] = .string(MotorVerificationState.unverified.rawValue)
                 detail.removeValue(forKey: "verification_evidence")
+                if effect.status == "acted" { detail["status"] = .string("acted_unobserved") }
             }
             // "Satisfied" means the INTENDED control was hit. The element the
             // app acted on must answer to the name asked; a redirected open must
@@ -1309,9 +1346,10 @@ extension MacFourVerbs {
                     return Self.path(output["path"]).starts(with: ancestor) ? nil
                         : (Self.string(actedOn["role"]).map { MacScreenRender.kindName(role: $0) } ?? "another element")
                 }
-                if bareFieldHit, let path = candidate.sourceAXPath,
-                   Self.path(output["path"]) == path,
-                   Self.string(Self.object(Self.object(output["effect"])["acted_element"])["handle"]) == candidate.handle { return nil }
+                // The element acted on IS the handle that was resolved (the
+                // loop re-checked its identity): a page that renamed it for
+                // reading ("(unnamed button)", a row identity) is not a miss.
+                if Self.string(Self.object(Self.object(output["effect"])["acted_element"])["handle"]) == candidate.handle { return nil }
                 guard let actedLabel = Self.string(acted["label"]), !answersLabel(actedLabel) else { return nil }
                 return actedLabel
             }()
@@ -1324,11 +1362,13 @@ extension MacFourVerbs {
                    let path = candidate.sourceAXPath {
                     await MacAppMapStore.shared.penalize(bundle: bundle, window: window, path: path, evict: true)
                 }
-                detail["status"] = .string("wrong_target")
+                detail["status"] = .string("acted_on_different_target")
+                detail["requested"] = .string(target)
+                detail["matched"] = .string(actedLabel)
                 detail["verification"] = .string(MotorVerificationState.failed.rawValue)
                 detail.removeValue(forKey: "verification_evidence")
                 var wrong = "\(Self.pastTense(verb, direction: direction)) \"\(actedLabel)\", not \"\(target)\" — "
-                    + "that isn't what was asked, so this act failed."
+                    + "acted on a different target. Verify before claiming success."
                 if case .seen(let hit) = after { wrong += "\n" + hit.render }
                 return MacFourVerbsReply(ok: false, text: wrong, detail: detail)
             }
@@ -1485,6 +1525,7 @@ extension MacFourVerbs {
             guard !first.ok, Self.string(first.detail["error"])?.hasPrefix("mark_drifted") == true,
                   case .seen(let fresh) = await sight(part: nil),
                   case .hit(let again) = Self.resolve(target, among: fresh.targets),
+                  Self.answers(target, again, exact: Self.committingVerbs.contains(verb)),
                   let freshView = again.viewId, let freshMark = again.mark else { return first }
             body["view"] = .string(freshView)
             body["mark"] = .int(Int64(freshMark))
@@ -1523,6 +1564,9 @@ extension MacFourVerbs {
         if let holding { body["holding"] = .string(holding) }
         if let button { body["button"] = .string(button) }
         switch verb {
+        case .focus:
+            return MacFourVerbsReply(ok: false, text: "This thing has no accessibility focus target; no input was sent.",
+                detail: ["error": .string("focus_requires_accessibility")])
         case .click, .select, .toggle, .dismiss:
             body["gesture"] = .string("click")
         case .open:
@@ -1549,18 +1593,29 @@ extension MacFourVerbs {
                 body["dy"] = .int(direction == .up ? magnitude : direction == .down ? -magnitude : 0)
             }
         }
-        let reply = await performHand(
-            body: body,
-            description: (button == "right" ? (verb == .open ? "Double-right-clicked" : "Right-clicked")
-                : Self.pastTense(verb, direction: direction)) + " " + spokenTarget + ".",
-            unverifiedDescription: verb == .scroll
-                ? "Tried to scroll \(direction.rawValue) in \(spokenTarget)."
-                : nil,
-            attention: attention,
-            before: before,
-            allowGenericScreenChangeVerification: !candidate.physicalOnly,
-            afterPart: candidate.physicalOnly ? "visual surface" : nil
-        )
+        // The native-surface exception permits real input only for this exact
+        // observed app. Carry its PID through the hand's per-event front guard,
+        // including any await between this capture and dispatch.
+        if Self.nativeSurfaceApp != nil, before.pid == nil {
+            return MacFourVerbsReply(ok: false,
+                text: "The selected native surface changed before I could act. I haven't touched it; read the screen again.\n" + before.render,
+                detail: ["error": .string("native_surface_changed")])
+        }
+        let frontPid = Self.nativeSurfaceApp != nil ? before.pid : Self.requiredFrontPid
+        let reply = await Self.$requiredFrontPid.withValue(frontPid) {
+            await performHand(
+                body: body,
+                description: (button == "right" ? (verb == .open ? "Double-right-clicked" : "Right-clicked")
+                    : Self.pastTense(verb, direction: direction)) + " " + spokenTarget + ".",
+                unverifiedDescription: verb == .scroll
+                    ? "Tried to scroll \(direction.rawValue) in \(spokenTarget)."
+                    : nil,
+                attention: attention,
+                before: before,
+                allowGenericScreenChangeVerification: !candidate.physicalOnly,
+                afterPart: candidate.physicalOnly ? "visual surface" : nil
+            )
+        }
         var detail = reply.detail
         detail["verb"] = .string(verb.rawValue)
         if let button { detail["button"] = .string(button) }
@@ -1568,17 +1623,26 @@ extension MacFourVerbs {
         detail["matched"] = .string(Self.name(candidate))
         let physicalRoute: String
         switch verb {
+        case .focus: physicalRoute = "none"
         case .click, .select, .toggle, .dismiss: physicalRoute = "click"
         case .open: physicalRoute = "double_click"
         case .type: physicalRoute = "click_type"
         case .scroll: physicalRoute = usesPageKey ? "page_key" : "wheel"
         }
         detail["physical_route"] = .string(physicalRoute)
-        detail["status"] = .string(
-            Self.string(detail["verification"]) == MotorVerificationState.satisfied.rawValue
-                ? "acted"
-                : "acted_unobserved"
-        )
+        // A hand-routed click never reads the control's own state back; a
+        // screen difference elsewhere is not its effect, so it stays unverified.
+        if physicalRoute == "click", Self.string(detail["verification"]) == MotorVerificationState.satisfied.rawValue {
+            detail["verification"] = .string(MotorVerificationState.unverified.rawValue)
+            detail.removeValue(forKey: "verification_evidence")
+        }
+        if reply.ok || Self.nativeSurfaceApp == nil {
+            detail["status"] = .string(
+                Self.string(detail["verification"]) == MotorVerificationState.satisfied.rawValue
+                    ? "acted"
+                    : "acted_unobserved"
+            )
+        }
         return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
     }
 
@@ -1642,6 +1706,22 @@ extension MacFourVerbs {
             )
         }
         guard result.ok else {
+            if Self.nativeSurfaceApp != nil, result.error == "front_changed" {
+                let output = Self.object(result.output)
+                var detail = Self.operationDetail(result)
+                for key in ["requested_events_emitted", "recovery_events_emitted", "effects_may_have_occurred"] {
+                    detail[key] = output[key]
+                }
+                if Self.int(output["requested_events_emitted"]) == 0 {
+                    detail["error"] = .string("native_surface_changed")
+                    return MacFourVerbsReply(ok: false,
+                        text: "The selected native surface changed before I could act. I haven't touched it; read the screen again."
+                            + (before.map { "\n" + $0.render } ?? ""), detail: detail)
+                }
+                detail["error"] = .string("front_changed")
+                return Self.frontChangedWords(MacFourVerbsReply(ok: false,
+                    text: before?.render ?? "", detail: detail), verbName: "act")
+            }
             return MacFourVerbsReply(
                 ok: false,
                 text: "Couldn't do that. \(result.error ?? "The Mac refused the gesture.")"
@@ -1941,7 +2021,7 @@ extension MacFourVerbs {
             return fail("Couldn't open \(Self.name(popup)).", "popup_not_opened", screen: before.render)
         }
         let items = open.targets.filter { $0.kind == "menu item" }
-        guard case .hit(let item) = Self.resolve(option, among: items), Self.answers(option, item), item.enabled else {
+        guard case .hit(let item) = Self.resolve(option, among: items), Self.answers(option, item, exact: true), item.enabled else {
             let dismissed = try? await host.dispatch(action: "hand", body: ["gesture": .string("key"), "keys": .string("escape")])
             let offered = items.compactMap { $0.enabled ? $0.label : nil }.filter { !$0.isEmpty }
             let words = "\(Self.name(popup)) has no \"\(option)\" to choose"

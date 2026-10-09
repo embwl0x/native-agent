@@ -104,11 +104,17 @@ extension SwiftToolDispatcher {
             return .object(row)
         }
         let totalPendingMoments = allMoments.count
+        let recovery = MemoryStatusProjection.afterTurnRecovery(dataRoot: dataRoot)
         return .object([
             "status": .string("ok"),
             "moments": .array(rows),
             "count": .int(Int64(rows.count)),
             status == "rejected" ? "total_rejected" : "total_pending": .int(Int64(totalPendingMoments)),
+            "after_turn_memory": .object([
+                "status": .string(recovery.status),
+                "held_count": recovery.heldCount.map { .int(Int64($0)) } ?? .null,
+                "detail": .array(recovery.lines.map(JSONValue.string)),
+            ]),
         ])
     }
 

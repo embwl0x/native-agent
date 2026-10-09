@@ -123,7 +123,7 @@ extension AppModel {
             : nil
         engine.transcripts.messagesBySession.removeValue(forKey: sessionId)
         detachedChatRefreshStatus.removeValue(forKey: sessionId)
-        engine.turns.queuedBySession.removeValue(forKey: sessionId)
+        Task { await engine.turns.runtime.updateQueuedTurns { $0.removeValue(forKey: sessionId) } }
         engine.turns.pausedQueueSessions.remove(sessionId)
         engine.turns.queuePauseReasons.removeValue(forKey: sessionId)
         // A Stop/Archive can reach pruning before its joined producer has
@@ -268,7 +268,7 @@ extension AppModel {
         // placeholder, error bubble) flows through here, while wholesale
         // replaces (end-of-turn disk refresh, session load) stay instant so the
         // optimistic→daemon id swap never animates a teardown/rebuild.
-        withAnimation(NativeAgentMotion.standard) {
+        withAnimation(NativeAgentMotion.arrive) {
             engine.transcripts.messagesBySession[sessionId] = arr
         }
     }
@@ -300,6 +300,23 @@ extension AppModel {
         if idx == arr.count - 1 {
             engine.transcripts.setMessagesTailOnly(arr, for: sessionId)
         } else {
+            engine.transcripts.messagesBySession[sessionId] = arr
+        }
+    }
+
+    /// Fluid glass A1: the streamed reply learns where its working notes end
+    /// as soon as the core's final result says, so a reply that has already
+    /// settled folds them in one animated swap, and the row the disk refresh
+    /// puts in its place draws the same fold instead of snapping to it.
+    func setChatMessageWorkingCommentary(_ characters: Int, id messageId: String, in sessionId: String) {
+        guard var arr = engine.transcripts.messagesBySession[sessionId],
+              let idx = arr.lastIndex(where: { $0.id == messageId }),
+              arr[idx].metadata?.workingCommentaryChars != characters
+        else { return }
+        var metadata = arr[idx].metadata ?? ChatMessageMetadata()
+        metadata.workingCommentaryChars = characters
+        arr[idx].metadata = metadata
+        withAnimation(NativeAgentMotion.arrive) {
             engine.transcripts.messagesBySession[sessionId] = arr
         }
     }
@@ -406,6 +423,8 @@ extension AppModel {
         defer { state.reloadingDefaults = false }
 
         let defaults = UserDefaults.standard
+        let selectedPersona = NativeChatTurnOptions.normalizedPickerPersona(PersonaSelection.current())
+        if chatPersona != selectedPersona { chatPersona = selectedPersona }
         func string(_ key: String, _ fallback: String) -> String {
             defaults.string(forKey: key) ?? fallback
         }

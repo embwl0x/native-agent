@@ -98,6 +98,22 @@ extension SwiftToolDispatcher {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let requestedOperation = optionalString(input, "operation")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let expectedOutputs: [String]
+        switch input["expected_outputs"] {
+        case nil, .null: expectedOutputs = []
+        case .array(let values):
+            expectedOutputs = try values.map { value in
+                guard case .string(let text) = value, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw AutonomyGateError.toolDenied(reason: "workshop.submit: expected_outputs must contain nonblank strings")
+                }
+                return text
+            }
+        default:
+            throw AutonomyGateError.toolDenied(reason: "workshop.submit: expected_outputs must be an array of strings")
+        }
+        if !expectedOutputs.isEmpty, requestedProcedure?.isEmpty == false || requestedOperation?.isEmpty == false {
+            throw AutonomyGateError.toolDenied(reason: "workshop.submit: expected_outputs applies to ordinary tasks; omit operation and procedure for synthesis")
+        }
         let redundantExactPair = requestedProcedure == "local_file_copy_v1"
             && requestedOperation == "copy_workspace_file"
         if requestedProcedure?.isEmpty == false,
@@ -215,7 +231,7 @@ extension SwiftToolDispatcher {
                             case "read_file":
                                 return try await impl_read_file(input: arguments)
                             case "write_file":
-                                return try await impl_trusted_write_file(input: arguments)
+                                return try await impl_trusted_file_mutation(tool: "write_file", input: arguments)
                             default:
                                 throw WorkshopCompiledProcedureRuntimeError.unsupportedTool
                             }
@@ -277,6 +293,7 @@ extension SwiftToolDispatcher {
         return try await ordinaryWorkshopSubmission(
             title: title,
             text: text,
+            expectedOutputs: expectedOutputs,
             deskHandle: optionalString(input, "desk_handle")?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
             procedureFallbackReason: procedureFallbackReason
@@ -286,12 +303,13 @@ extension SwiftToolDispatcher {
     private func ordinaryWorkshopSubmission(
         title: String,
         text: String,
+        expectedOutputs: [String] = [],
         deskHandle: String? = nil,
         procedureFallbackReason: String?
     ) async throws -> JSONValue {
         // "agent", not the person's "manual": workshop_reject may stop only
         // work she started, never his.
-        let spec = WorkshopExecutionSpec(title: title, objective: text, triggerSource: "agent")
+        let spec = WorkshopExecutionSpec(title: title, objective: text, triggerSource: "agent", expectedOutputs: expectedOutputs)
         let result: WorkshopDirectedTaskResult
         do {
             result = try await WorkshopDirectedTaskSubmitter(
@@ -526,7 +544,8 @@ extension SwiftToolDispatcher {
                     throw AutonomyGateError.toolDenied(reason: "task_ledger_post: deleted requires expected_title from task_ledger_list")
                 }
                 guard try await ledger.delete(event, expectedTitle: expectedTitle) else {
-                    return .object(["status": .string("failed"), "reason": .string("task_not_found_or_changed")])
+                    return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("task_not_found_or_changed"),
+                                    "detail": .string("No task matches that id and expected_title, so nothing was deleted. Read task_ledger_list and use its exact values.")])
                 }
                 written = event
             } else {
@@ -582,6 +601,9 @@ extension SwiftToolDispatcher {
         return .object([
             "status": .string("ok"),
             "tasks": .array(tasks.map { $0.toJSON() }),
+            "include_done": .bool(includeDone),
+            "note": .string(includeDone ? "Includes open and finished tasks."
+                : "Only open tasks are shown. app {action:\"ledger.list\",args:{include_done:true}} also shows finished tasks."),
         ])
     }
 

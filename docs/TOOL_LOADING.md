@@ -16,8 +16,8 @@ requests offer it alone. The schema is defined in
 | `app {}` | Home first—where they left off—then the page index and action IDs. |
 | `app {"page":"home"}` | Their work, arrivals, conversations and places. |
 | `app {"item":"<name or ref>","args":{…}}` | Open or act on a name returned by home or one of its rooms. Home arguments are `text` and `fields`. |
-| `app {"page":"home","find":"<words>"}` | Search their work and conversations. |
-| `app {"page":"<page>","item":"<optional item>"}` | Read a page or one of that page's items. Page reads return a version and available actions. |
+| `app {"page":"home","find":"<words>"}` | Discover matching pages, actions and skills, just like find alone. |
+| `app {"page":"<page>","item":"<optional item>"}` | Read a page or one of that page's items. Page reads return a version and registered actions, including unavailable ones with their blocker. |
 | `app {"find":"<words>"}` | Discover matching pages, actions and skills. |
 | `app {"action":"<id>","args":{…}}` | Run one registered action. |
 | `app {"script":"<JavaScript>"}` | Compose permitted app calls in JavaScriptCore. |
@@ -30,6 +30,52 @@ understand it first: home items do not support `preview` or
 For actions, `preview:true` describes the call without executing it.
 `expected_version` can guard against a page changing after it was read.
 Unknown keys, invalid arguments and stale versions refuse with a remedy.
+
+Action discovery blends MemoryV2's on-device embeddings with lexical matching.
+Information questions without a strong local action match offer a `web.search`
+next call and `web.read` for the chosen result URL. Nearby queries state when
+the current location is unknown; timezone is not location evidence.
+Action vectors are shared per model epoch; negative clauses lower matching
+actions. Find shows five ranked actions with `matched_actions` and `shown_actions`
+counts. Known service blockers appear as `availability:"unavailable"` and
+`blocker`; page and index lists show the same reason. These are saved setup
+verdicts, not network-health checks, and do not change execution admission.
+
+Senses serve `mac.look`, `mac.read`, `files.read`, `web.read` and browser page
+reads through the same door. Their compact pages include named things,
+addresses, offered verbs and a `via sense …` provenance line. On these reads,
+`args {raw:true}` returns the original route with a raw-view provenance line.
+`args {wrong:true, why:"one sentence in your words"}` returns today's raw route,
+records the exact previous door reply and its source binding as a private
+`viewWrong` wall, and immediately queues stuck work for that app bundle ID,
+site host or file kind. `why` is optional. The reply says:
+“Noted. NativeAgent is growing a better view of <place>; you'll get a note when it's ready.”
+Without an earlier view of that source, today's raw reply is the rejected view.
+The generic reader remains unchanged; the body grows a corner sense, or repairs
+the corner's existing sense. Growth uses already-running windows, existing
+NativeAgent group tabs and read-only file material; it never opens apps or tabs or drives
+the desktop. A successful version announces:
+“<place> now has its own sense: v<version>, grown because: <why>”.
+Read the same place again for its new page, provenance and offered verbs. Mark
+that page wrong with the same call to grow the next version. Growth failures
+announce their reason and retain the open wall. A failed grown sense names its
+failure and serves no page. Without a matching sense, the original payload
+carries its actual generic reader's provenance or a raw-view reason.
+
+Sense-served file replies retain the original reader's envelope (`ok`,
+`bytes`, `version`, `has_more` and other metadata), replacing raw `content`
+with the rendered `sense_page` and adding `sense_provenance`. Native senses
+retain their original presentation. Explicit raw file reads return the
+reader's JSON envelope. A failed sense adds a provenance line:
+`raw view · sense <id> v<version> failed: <code>`.
+
+`find` can discover corners by `app:<bundle id>`, `file:<extension>` or
+`site:<host>`. Read one with `page` set to its corner key and `item` set to
+the file path or site URL (an app corner needs no item). A served thing's
+verbs appear as `sense.<id>.<verb>(address, args?)`; invoke that action with
+the thing's address and an optional object of verb arguments. These verbs
+run only in their turn. Every existing action the sense requests re-enters
+the normal Trust gate; a sense grants no authority and cannot act on a read.
 
 ## No loading lifecycle
 
@@ -56,14 +102,17 @@ discovery tool.
 - Built-in capabilities are registered app actions, not additional request
   schemas.
 - Mounted MCP tools appear as `mcp.<server>.<tool>`, generated from the live
-  server list. The built-in search/fetch actions appear as `web.search` and
-  `web.fetch`.
+  server list. The built-in search action appears as `web.search`; `web.read`
+  reads a page.
 - Self-authored tools follow `tool.propose` → `tool.approve` →
   `authored.<id>`. A proposal supplies Swift code and input/expected cases,
   with optional permissions and input schema. Only active registry entries
   become authored actions; approval follows the current Trust policy.
-- Skills remain guidance: discovery can return a `skill.read` call for a
-  relevant body.
+- Skills provide guidance and optional admitted scripts: discovery can return
+  a `skill.read` call for a relevant body. `skill.save`, `skill.enable`,
+  `skill.run`, `skill.resume` and `skill.rollback` manage those procedures
+  through the same app gates; a skill grants no new authority. See the
+  [manifest spec](skill_manifest_spec.md).
 
 `web.search` tries Codex web search first for general queries. Code-shaped
 queries try SearXNG first. Unfiltered searches try the other route if the first
@@ -74,7 +123,7 @@ Cancellation stops the search.
 ## Scripts
 
 `AppScriptRunner` creates a fresh JavaScriptCore context with
-`app.<action>(args)`, `app.read`, `app.find` and `app.log`. It exposes no
+`app.<action>(args)`, `app.call(id, args)`, `app.read`, `app.find` and `app.log`. It exposes no
 direct filesystem, network, process or timer API. Every nested app call
 re-enters the same gate chain.
 
@@ -83,7 +132,7 @@ read, but home items cannot be opened from a script. Sends, shell commands,
 Mac control and MCP calls are examples of actions that must be separate app
 calls. Secret arguments must also be passed through a single action.
 
-The runner bounds source size, reads, actions, call duration and total time.
+The runner bounds source size, reads, actions and script time; time spent waiting on app calls is not counted.
 Its receipt retains completed effects if a later step fails; a script is not
 an atomic transaction or a rollback mechanism.
 

@@ -58,7 +58,11 @@ public struct TelegramInputRichTableCell: Sendable, Equatable {
     }
 
     var jsonValue: JSONValue {
-        var value: [String: JSONValue] = ["text": .string(text)]
+        var value: [String: JSONValue] = [
+            "text": .string(text),
+            "align": .string("left"),
+            "valign": .string("top"),
+        ]
         if isHeader { value["is_header"] = .bool(true) }
         return .object(value)
     }
@@ -80,62 +84,151 @@ public struct TelegramInputRichMessage: Sendable, Equatable {
 /// assistant reply. It strips explicit reasoning containers defensively and
 /// runs the same secret redactor used by turn traces before building blocks.
 enum TelegramRichMessageRenderer {
+    // Bot API rich limits: 32768 UTF-8 bytes, 500 nested blocks/rows,
+    // 16 nesting levels and 20 table columns. Keep payload headroom.
     static let maximumUTF8Bytes = 30_000
     static let maximumBlocks = 256
     static let maximumBlockUnits = 480
-    static let maximumTableColumns = 12
-    static let maximumTableRows = 40
+    static let maximumTableColumns = 20
 
-    static func render(_ raw: String) -> TelegramInputRichMessage? {
+    /// Split at native block boundaries, retaining every visible text fragment.
+    /// A draft uses the latest packet; final delivery persists all packets.
+    static func render(_ raw: String) -> [TelegramInputRichMessage] {
         let safe = sanitize(raw)
-        guard !safe.isEmpty, safe.utf8.count <= maximumUTF8Bytes else { return nil }
+        guard !safe.isEmpty else { return [] }
         let parsed = parseBlocks(Array(safe.split(separator: "\n", omittingEmptySubsequences: false)))
-        var remainingUnits = maximumBlockUnits
-        let blocks = bounded(parsed, remainingUnits: &remainingUnits)
-        guard !blocks.isEmpty, blocks == parsed, blocks.allSatisfy(fitsLimits) else { return nil }
-        return TelegramInputRichMessage(blocks: blocks)
-    }
-
-    private static func fitsLimits(_ block: TelegramInputRichBlock) -> Bool {
-        switch block {
-        case .paragraph(let text): return text.utf8.count <= 8_000
-        case .heading(let text, _): return text.utf8.count <= 1_024
-        case .preformatted(let text, let language):
-            return text.utf8.count <= 12_000 && (language?.count ?? 0) <= 32
-        case .table(let rows):
-            return rows.count <= maximumTableRows && rows.allSatisfy {
-                $0.count <= maximumTableColumns && $0.allSatisfy { $0.text.utf8.count <= 1_024 }
-            }
-        case .details(let summary, let children):
-            return summary.utf8.count <= 512 && children.count <= 48 && children.allSatisfy(fitsLimits)
+        let blocks = parsed.flatMap {
+            split($0, maximumBytes: maximumUTF8Bytes, maximumUnits: maximumBlockUnits)
         }
+        return packets(blocks, maximumBytes: maximumUTF8Bytes, maximumUnits: maximumBlockUnits)
+            .map(TelegramInputRichMessage.init(blocks:))
     }
 
-    /// Telegram counts nested blocks and table rows toward its 500-block
-    /// ceiling. Reserve headroom for future server-side accounting changes.
-    private static func bounded(
-        _ blocks: [TelegramInputRichBlock],
-        remainingUnits: inout Int
+    private static func split(
+        _ block: TelegramInputRichBlock,
+        maximumBytes: Int,
+        maximumUnits: Int
     ) -> [TelegramInputRichBlock] {
-        var result: [TelegramInputRichBlock] = []
-        for block in blocks.prefix(maximumBlocks) where remainingUnits > 0 {
-            switch block {
-            case .table(let rows):
-                guard remainingUnits >= 2 else { return result }
-                let keptRows = Array(rows.prefix(min(rows.count, remainingUnits - 1)))
-                guard !keptRows.isEmpty else { continue }
-                result.append(.table(keptRows))
-                remainingUnits -= 1 + keptRows.count
-            case .details(let summary, let children):
-                remainingUnits -= 1
-                let boundedChildren = bounded(children, remainingUnits: &remainingUnits)
-                guard !boundedChildren.isEmpty else { continue }
-                result.append(.details(summary: summary, blocks: boundedChildren))
-            default:
-                result.append(block)
-                remainingUnits -= 1
+        switch block {
+        case .paragraph(let text):
+            return textChunks(text, maximumBytes: maximumBytes).map(TelegramInputRichBlock.paragraph)
+        case .heading(let text, let size):
+            return textChunks(text, maximumBytes: maximumBytes).map { .heading(text: $0, size: size) }
+        case .preformatted(let text, let language):
+            return textChunks(text, maximumBytes: maximumBytes).map { .preformatted(text: $0, language: language) }
+        case .table(let rows):
+            let columnCount = rows.map(\.count).max() ?? 0
+            var result: [TelegramInputRichBlock] = []
+            let columnsPerBlock = min(maximumTableColumns, max(1, maximumBytes / 4))
+            for column in stride(from: 0, to: columnCount, by: columnsPerBlock) {
+                var current: [[TelegramInputRichTableCell]] = []
+                var currentBytes = 0
+                for row in rows {
+                    let cells = Array(row.dropFirst(column).prefix(columnsPerBlock))
+                    guard !cells.isEmpty else { continue }
+                    let fragments = cells.map {
+                        textChunks($0.text, maximumBytes: maximumBytes / columnsPerBlock)
+                    }
+                    // Continue oversized cell text in the same column; no text
+                    // is dropped to make a wide or long table fit a packet.
+                    for part in 0..<max(1, fragments.map(\.count).max() ?? 0) {
+                        let continued = cells.enumerated().map { index, cell in
+                            TelegramInputRichTableCell(
+                                text: part < fragments[index].count ? fragments[index][part] : "",
+                                isHeader: cell.isHeader
+                            )
+                        }
+                        let rowBytes = continued.reduce(0) { $0 + $1.text.utf8.count }
+                        if !current.isEmpty,
+                           currentBytes + rowBytes > maximumBytes || current.count + 2 > maximumUnits {
+                            result.append(.table(current))
+                            current = []
+                            currentBytes = 0
+                        }
+                        current.append(continued)
+                        currentBytes += rowBytes
+                    }
+                }
+                if !current.isEmpty { result.append(.table(current)) }
+            }
+            return result
+        case .details(let summary, let children):
+            // A deeply nested summary can consume its parent's remaining text
+            // budget. Preserve its text and children as native sibling blocks.
+            guard maximumBytes >= 8, maximumUnits >= 2 else {
+                return split(.paragraph(summary), maximumBytes: maximumBytes, maximumUnits: maximumUnits)
+                    + children.flatMap { split($0, maximumBytes: maximumBytes, maximumUnits: maximumUnits) }
+            }
+            let summaries = textChunks(summary, maximumBytes: maximumBytes / 2)
+            guard let lastSummary = summaries.last else { return [] }
+            var result = summaries.dropLast().map(TelegramInputRichBlock.paragraph)
+            let childBytes = maximumBytes - lastSummary.utf8.count
+            let childUnits = maximumUnits - 1
+            let blocks = children.flatMap { split($0, maximumBytes: childBytes, maximumUnits: childUnits) }
+            let groups = packets(blocks, maximumBytes: childBytes, maximumUnits: childUnits)
+            if groups.isEmpty { result.append(.details(summary: lastSummary, blocks: [])) }
+            for group in groups { result.append(.details(summary: lastSummary, blocks: group)) }
+            return result
+        }
+    }
+
+    private static func packets(
+        _ blocks: [TelegramInputRichBlock],
+        maximumBytes: Int,
+        maximumUnits: Int
+    ) -> [[TelegramInputRichBlock]] {
+        var result: [[TelegramInputRichBlock]] = []
+        var current: [TelegramInputRichBlock] = []
+        var bytes = 0
+        var units = 0
+        for block in blocks {
+            let size = dimensions(block)
+            if !current.isEmpty,
+               bytes + size.bytes > maximumBytes || units + size.units > maximumUnits || current.count >= maximumBlocks {
+                result.append(current)
+                current = []
+                bytes = 0
+                units = 0
+            }
+            current.append(block)
+            bytes += size.bytes
+            units += size.units
+        }
+        if !current.isEmpty { result.append(current) }
+        return result
+    }
+
+    private static func dimensions(_ block: TelegramInputRichBlock) -> (bytes: Int, units: Int) {
+        switch block {
+        case .paragraph(let text), .heading(let text, _), .preformatted(let text, _):
+            return (text.utf8.count, 1)
+        case .table(let rows):
+            return (rows.reduce(0) { $0 + $1.reduce(0) { $0 + $1.text.utf8.count } }, 1 + rows.count)
+        case .details(let summary, let children):
+            return children.reduce((bytes: summary.utf8.count, units: 1)) { total, child in
+                let size = dimensions(child)
+                return (total.bytes + size.bytes, total.units + size.units)
             }
         }
+    }
+
+    private static func textChunks(_ text: String, maximumBytes: Int) -> [String] {
+        guard !text.isEmpty else { return [] }
+        guard text.utf8.count > maximumBytes else { return [text] }
+        var result: [String] = []
+        var chunk = ""
+        var bytes = 0
+        for scalar in text.unicodeScalars {
+            let size = scalar.utf8.count
+            if bytes + size > maximumBytes, !chunk.isEmpty {
+                result.append(chunk)
+                chunk = ""
+                bytes = 0
+            }
+            chunk.unicodeScalars.append(scalar)
+            bytes += size
+        }
+        if !chunk.isEmpty { result.append(chunk) }
         return result
     }
 
@@ -207,7 +300,7 @@ enum TelegramRichMessageRenderer {
         }.joined(separator: "\n")
     }
 
-    private static func parseBlocks(_ source: [Substring]) -> [TelegramInputRichBlock] {
+    private static func parseBlocks(_ source: [Substring], depth: Int = 0) -> [TelegramInputRichBlock] {
         let lines = source.map(String.init)
         var blocks: [TelegramInputRichBlock] = []
         var index = 0
@@ -241,18 +334,22 @@ enum TelegramRichMessageRenderer {
                 continue
             }
 
-            if line.trimmingCharacters(in: .whitespacesAndNewlines) == "<details>",
+            if depth < 14, line.trimmingCharacters(in: .whitespacesAndNewlines) == "<details>",
                index + 1 < lines.count,
                let summary = detailsSummary(from: lines[index + 1]) {
                 index += 2
                 var nested: [Substring] = []
-                while index < lines.count,
-                      lines[index].trimmingCharacters(in: .whitespacesAndNewlines) != "</details>" {
+                var nesting = 1
+                while index < lines.count {
+                    let marker = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                    if marker == "<details>" { nesting += 1 }
+                    if marker == "</details>" { nesting -= 1 }
+                    if nesting == 0 { break }
                     nested.append(Substring(lines[index]))
                     index += 1
                 }
                 if index < lines.count { index += 1 }
-                let childBlocks = parseBlocks(nested)
+                let childBlocks = parseBlocks(nested, depth: depth + 1)
                 blocks.append(.details(summary: summary, blocks: childBlocks))
                 continue
             }

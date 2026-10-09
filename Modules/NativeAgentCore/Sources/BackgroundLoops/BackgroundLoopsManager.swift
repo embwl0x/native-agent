@@ -647,6 +647,8 @@ public actor BackgroundLoopsManager {
 
     public func registered() -> [String] { registeredIds }
 
+    public func loopRunner(loopId: String) -> (any LoopRunner)? { registrations[loopId]?.runner.underlying }
+
     public func uptimeSeconds(now: Date = Date()) -> Double {
         // Uptime describes the CURRENT manager lifecycle, not process age or a
         // historical start. A stopped manager has no running-loop uptime.

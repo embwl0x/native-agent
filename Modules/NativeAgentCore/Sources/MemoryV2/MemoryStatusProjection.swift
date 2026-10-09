@@ -3,6 +3,17 @@ import PersistenceCore
 
 /// Read-only status and hygiene projections using the existing stores and runtime.
 public enum MemoryStatusProjection {
+    public static func afterTurnRecovery(dataRoot: URL) -> AfterTurnMemoryRecoveryStatus {
+        do {
+            let held = try AdaptiveMemoryPromoter.readHeld(dataRoot: dataRoot)
+            let latest = held.compactMap(\.failure).max { $0.at < $1.at }
+            return AfterTurnMemoryRecoveryStatus(status: held.isEmpty ? "ready" : "held",
+                                                heldCount: held.count, failure: latest)
+        } catch {
+            return AfterTurnMemoryRecoveryStatus(status: "unavailable", heldCount: nil, failure: nil)
+        }
+    }
+
     public static func getMemoryVectorStatus(dataRoot: URL) async throws -> MemoryVectorStatus {
         // An absent feed is unmeasured. A present-but-unreadable feed is
         // unavailable; neither state may impersonate a ready zero-count store.
@@ -133,6 +144,7 @@ public enum MemoryStatusProjection {
             ),
             hygiene: hygieneReport,
             vault: nil,
+            afterTurn: afterTurnRecovery(dataRoot: dataRoot),
             createdAt: ISO8601DateFormatter().string(from: Date())
         )
     }

@@ -10,13 +10,13 @@ import Privacy
 import ChatOrchestration
 import Desk
 import NotificationInbox
+import TrustPersistence
 
 @MainActor final class AppQuietToolHost: AppQuietSettingsHost, QuietToolHost {
     var activeChatSessionId: String { appModel.activeChatSessionId }
-    func pageRead(_ page: QuietToolPage) async -> (content: [JSONValue], rows: [JSONValue], truncated: Bool) {
+    func pageRead(_ page: QuietToolPage) async -> [JSONValue] {
         // The presentation port resolved this value from the same immutable page catalog.
-        let read = await QuietSelfAdminRender.pageRead(for: QuietPages.page(named: page.id)!, appModel: appModel)
-        return (read.content, read.rows, read.truncated)
+        await QuietSelfAdminRender.pageRead(for: QuietPages.page(named: page.id)!, appModel: appModel)
     }
     func composerState(sessionId: String) async -> [String: JSONValue] {
         await QuietComposerVerbs.state(appModel: appModel, sessionId: sessionId)
@@ -29,7 +29,7 @@ import NotificationInbox
             verb: verb, value: value, choice: choice, sessionId: sessionId,
             attachments: attachments, reachesUser: reachesUser, turnSessionId: turnSessionId, appModel: appModel
         )
-        return QuietComposerOutcome(changed: outcome.changed, element: outcome.element, detail: outcome.detail, refusal: outcome.refusal)
+        return QuietComposerOutcome(changed: outcome.changed, element: outcome.element, detail: outcome.detail, refusal: outcome.refusal, status: outcome.status)
     }
     func runChatSession(verb: String, input: [String: JSONValue], reachesUser: Bool) async -> JSONValue {
         await QuietChatSessionVerbs.run(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel)
@@ -50,6 +50,38 @@ import NotificationInbox
         let outcome = await InlineConnectorSetup.saveProviderKey(key, provider: provider, appModel: appModel)
         return QuietProviderKeyOutcome(error: outcome.error, note: outcome.note)
     }
+    private struct BackupRestoreFailure: Error {
+        let detail: String
+        let fields: [String: JSONValue]
+        var refusal: JSONValue {
+            .object(fields.merging(["status": .string("failed"), "detail": .string(detail), "effects": .string("none")]) { $1 })
+        }
+    }
+    private func backupRestoreTarget(_ input: [String: JSONValue]) async -> Result<BackupRecord, BackupRestoreFailure> {
+        let id = AppToolExecutor.inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let backups: [BackupRecord]
+        do { backups = try await appModel.engine.trust.listBackups() }
+        catch {
+            return .failure(BackupRestoreFailure(
+                detail: "Backups could not be read: \(error.localizedDescription). Nothing was restored.",
+                fields: ["reason": .string("backups_unavailable")]))
+        }
+        guard let backup = backups.first(where: { $0.id == id }) else {
+            return .failure(BackupRestoreFailure(
+                detail: "No backup has id \(id.isEmpty ? "(none passed)" : id). Pass id, one of these.",
+                fields: ["reason": .string("backup_not_found"), "argument_path": .string("args.id"),
+                "backups": .array(backups.prefix(8).map {
+                    .object(["id": .string($0.id), "reason": .string($0.reason), "created_at": .string($0.createdAt),
+                             "scope": .array($0.scope.map(JSONValue.string))])
+                })]))
+        }
+        return .success(backup)
+    }
+    func upkeepFence(verb: String, input: [String: JSONValue]) async -> JSONValue? {
+        guard verb == "backup_restore" else { return nil }
+        if case .failure(let failure) = await backupRestoreTarget(input) { return failure.refusal }
+        return nil
+    }
     /// Each verb is the button's own call: Doctor's support report,
     /// Capabilities' Export, Trust's Back up now, the embedding download row,
     /// Setup's Release now and the Memories page's upkeep row.
@@ -59,10 +91,10 @@ import NotificationInbox
         case "support_report":
             switch await appModel.loadSupportDiagnostics() {
             case .loaded(let report, _):
-                return (true, "Support report: \(report.app) \(report.version), health \(report.doctorStatus ?? "unknown"), made \(report.generatedAt).",
+                return (true, "Support report: \(report.app) \(report.version), health \(report.doctorStatus ?? "unknown"), made \(report.generatedAt). A file to send the developer: export.bundle {support:true}.",
                         ["report": (try? JSONValue.fromEncodable(report)) ?? .null])
             case .unavailable(let detail): return (false, detail, [:])
-            case .failed(let detail): return (false, "Support report failed: \(detail)." + retry, [:])
+            case .failed(let detail): return (false, "Support report failed: \(detail)\(detail.hasSuffix(".") ? "" : ".")" + retry, [:])
             }
         case "export_bundle":
             let support = input["support"] == .bool(true)
@@ -74,8 +106,8 @@ import NotificationInbox
             }
         case "backup_now":
             let backup = await appModel.createBackup(reason: "upkeep backup_now")
-            return backup.map { (true, appModel.statusText, ["id": .string($0.id), "created_at": .string($0.createdAt)]) }
-                ?? (false, appModel.statusText + " Check free disk space, then try again.", [:])
+            return backup.map { (true, appModel.statusForAgent, ["id": .string($0.id), "created_at": .string($0.createdAt)]) }
+                ?? (false, appModel.statusForAgent, [:])
         case "embeddings_pause":
             let download = EmbeddingModelDownloadController.shared
             guard download.status.running else {
@@ -90,41 +122,28 @@ import NotificationInbox
             }
             download.start(createOnly: false, reconcile: true)
             return (true, "Checking and resuming the memory-search model download. \(AppToolExecutor.doorDoctor) shows its progress.", ["changed": .bool(true)])
-        case "embeddings_release":
-            do {
-                let result = try await appModel.releaseEmbeddingsMemory()
-                if result.ok == false {
-                    return (false, (result.error ?? "Embedding memory release could not be confirmed.") + retry, [:])
-                }
-                return (true, result.detail ?? "Released the memory-search model's memory; it loads again on the next search.", [:])
-            } catch {
-                return (false, "Release failed: \(error.localizedDescription)." + retry, [:])
-            }
         case "spotlight_reindex":
             let outcome = await MemorySpotlightReindexOperation.run(dataRoot: appModel.dataRootOverride ?? NativeAgentPaths.dataRoot)
             if case .indexed = outcome { return (true, outcome.userMessage, [:]) }
-            return (false, outcome.userMessage, [:])
+            return (false, outcome.agentMessage, [:])
         case "consolidate_now", "hygiene_now":
             let feedback = verb == "consolidate_now" ? await appModel.consolidateMemory() : await appModel.runMemoryHygiene()
-            return (!feedback.isAdverse, feedback.message, [:])
+            return (!feedback.isAdverse,
+                    UserFacingError.forAgent(feedback.message, cause: feedback.isAdverse ? appModel.statusCause : nil), [:])
         // User's two below Full Mac; the door refuses them there.
         case "backup_restore":
-            let id = AppToolExecutor.inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if let backups = try? await appModel.engine.trust.listBackups() { appModel.engine.trust.backups = backups }
-            guard let backup = appModel.engine.trust.backups.first(where: { $0.id == id }) else {
-                return (false, "No backup has id \(id.isEmpty ? "(none passed)" : id). Pass id, one of these.",
-                        ["backups": .array(appModel.engine.trust.backups.prefix(8).map {
-                            .object(["id": .string($0.id), "reason": .string($0.reason), "created_at": .string($0.createdAt),
-                                     "scope": .array($0.scope.map(JSONValue.string))])
-                        })])
+            let backup: BackupRecord
+            switch await backupRestoreTarget(input) {
+            case .success(let target): backup = target
+            case .failure(let failure): return (false, failure.detail, failure.fields.merging(["effects": .string("none")]) { $1 })
             }
             await appModel.restoreBackup(backup)
-            guard !appModel.statusText.hasPrefix("Restore failed") else { return (false, appModel.statusText + retry, [:]) }
+            guard !appModel.statusText.hasPrefix("Restore failed") else { return (false, appModel.statusForAgent + retry, [:]) }
             // Awaited: a restore that stages restarts the app once this turn ends.
             _ = await HarnessDecidedRow.record(requester: "Full Mac", tool: "backup.restore \(backup.id)",
                                                sessionID: AppToolExecutor.inputString(input["__session_id"]),
                                                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            return (true, appModel.statusText, ["id": .string(backup.id)])
+            return (true, appModel.statusForAgent, ["id": .string(backup.id)])
         case "activity_wipe":
             let activity = ActivityWatchController.shared
             let removed: Int
@@ -300,7 +319,7 @@ extension AppQuietToolHost {
             }
             if case .object(let payload) = record.payload, payload["peer_id"] != nil {
                 return refuse(AppToolExecutor.failure("users_call",
-                    "That approval is another agent's ask, not yours, so answering it is User's. Leave it for him."))
+                    "That approval is another agent's ask, not yours, so answering it is the owner's. Leave it for them."))
             }
             target.approval = (approvalID, record.title)
         default: // act, repair, not_now
@@ -337,7 +356,7 @@ extension AppQuietToolHost {
             let opensForUser = item.source == InteractionCardDelivery.source && action == "act"
             if !fullMac, opensForUser {
                 return refuse(AppToolExecutor.failure("opens_for_user",
-                    "That card's Open on Mac only opens it for User at the Mac (inbox.open_on_mac is User's). inbox.not_now declines it; if it is stale, inbox.archive or inbox.dismiss it with a reason.",
+                    "That card's Open on Mac only opens it for the person at the Mac (inbox.open_on_mac is theirs). inbox.not_now declines it; if it is stale, inbox.archive or inbox.dismiss it with a reason.",
                     extra: ["id": .string(item.id)]))
             }
             let fence = opensForUser ? nil : await Self.inboxFloor(item, action: action, dataRoot: appModel.engine.inbox.dataRoot)
@@ -346,12 +365,12 @@ extension AppQuietToolHost {
                 root: appModel.dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()).get(approvalID))?.action
                 == SwiftNativeApprovalInbox.skillScriptInstallAction {
                 return refuse(AppToolExecutor.failure("users_call",
-                    "That's User's even under Full Mac: approving installs the script as his. Leave it for him; "
+                    "That's the owner's even under Full Mac: approving installs the script as theirs. Leave it for them; "
                     + "inbox.withdraw takes back your ask.", extra: ["id": .string(item.id), "action": .string(action)]))
             }
             if !fullMac, let fence {
                 return refuse(AppToolExecutor.failure("users_call",
-                    "That's User's — leave it for him (\(fence)). If it is stale, archive or dismiss it with a reason.",
+                    "That's the owner's — leave it for them (\(fence)). If it is stale, archive or dismiss it with a reason.",
                     extra: ["id": .string(item.id), "action": .string(action)]))
             }
             target.press = (item, action)
@@ -543,10 +562,10 @@ extension AppQuietToolHost {
             }
         }
         switch NativeClient.resolveInboxPrimaryAction(for: item) {
-        case .openApprovals: return "Marked the note read; its approvals wait on the Approvals page. User's screen was not moved."
-        case .openDeskExecution: return "Marked the note read; its work is on the Desk. User's screen was not moved."
-        case .chatDraft: return "Marked the note read. Its action only drafts a chat message for User, so nothing was put in his composer."
-        case .chatSpoken: return "Posted the note into chat as your message and marked it read. User's screen was not moved."
+        case .openApprovals: return "Marked the note read; its approvals wait on the Approvals page. The person's screen was not moved."
+        case .openDeskExecution: return "Marked the note read; its work is on the Desk. The person's screen was not moved."
+        case .chatDraft: return "Marked the note read. Its action only drafts a chat message for the person, so nothing was put in their composer."
+        case .chatSpoken: return "Posted the note into chat as your message and marked it read. The person's screen was not moved."
         case .diskCleanup: return "Moved the disk offenders to the Trash; the note now shows the result."
         case .unresolved(let reason): return reason
         }
@@ -601,7 +620,7 @@ extension AppQuietToolHost {
             let detail = works
                 ? "\(name) works: it answered\(result.model_used.map { " on \($0)" } ?? "")."
                 : result.tested
-                    ? "\(name) did not work: \(problem). A rejected key or expired sign-in is User's to fix: ask him to reconnect \(name) in Providers."
+                    ? "\(name) did not work: \(problem). A rejected key or expired sign-in is the owner's to fix: ask them to reconnect \(name) in Providers."
                     : "\(name) has no connection test, so nothing was checked. \(result.detail ?? "")"
             var body: [String: JSONValue] = [
                 "status": .string("ok"), "provider": .string(id), "tested": .bool(result.tested),
@@ -614,7 +633,7 @@ extension AppQuietToolHost {
             guard account.auth_status.state == "ready" else {
                 return AppToolExecutor.failure(
                     "not_connected",
-                    "\(name) is not connected, so it has no fallback model to set. Connecting it is User's: ask him to sign in on Providers.")
+                    "\(name) is not connected, so it has no fallback model to set. Connecting it is the owner's: ask them to sign in on Providers.")
             }
             let offered = account.models.map(\.id)
             guard !offered.isEmpty else {
@@ -638,7 +657,7 @@ extension AppQuietToolHost {
             guard mode.canSave else {
                 return AppToolExecutor.failure(
                     "sign_in_method_unclear",
-                    "\(name)'s saved sign-in method isn't one its sheet can keep, so nothing was changed. That's User's: ask him to open \(name) in Providers.")
+                    "\(name)'s saved sign-in method isn't one its sheet can keep, so nothing was changed. That's the owner's: ask them to open \(name) in Providers.")
             }
             let old = account.default_model ?? ""
             do {
@@ -658,13 +677,14 @@ extension AppQuietToolHost {
             let outcome = await appModel.disconnectProvider(id)
             guard outcome.ok else {
                 return AppToolExecutor.failure("disconnect_failed",
-                    "\(outcome.detail) app {page:\"providers\"} shows where \(name) stands.", extra: ["provider": .string(id)])
+                    "\(UserFacingError.forAgent(outcome.detail, cause: outcome.cause)) app {page:\"providers\"} shows where \(name) stands.",
+                    extra: ["provider": .string(id)])
             }
             HarnessDecidedRow.post(requester: "Full Mac", tool: "provider.disconnect \(id)",
                                    sessionID: AppToolExecutor.inputString(input["__session_id"]),
                                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             return .object(["status": .string("ok"), "provider": .string(id), "changed": .bool(true),
-                            "detail": .string("\(name) is disconnected. \(outcome.detail) Signing back in is User's.")])
+                            "detail": .string("\(name) is disconnected. \(outcome.detail) Signing back in is the owner's.")])
         default:
             return AppToolExecutor.failure("unknown_verb", "No provider verb is called \(verb).")
         }

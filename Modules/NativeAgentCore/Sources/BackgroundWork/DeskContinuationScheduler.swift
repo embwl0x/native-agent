@@ -151,7 +151,7 @@ public actor DeskContinuationScheduler {
         guard try queue.presence(bot: botID, requestID: request) == .absent else { return .waiting }
         let entry: ShelfEntry
         do { entry = try ShelfStore(dataRoot: dataRoot).entry(request) }
-        catch StandingBotsError.notFound { return .waiting }
+        catch StandingBotsError.notFound { return .unknown("helper request \(requestID) has no queued request, live claim, or result") }
         guard entry.botId == botID, entry.id == request else { throw DeskContinuationError.unsafe }
         guard entry.runtimeStatus == .completed,
               !entry.uncertainties.contains("Run receipt pending finalization.") else {

@@ -1,6 +1,25 @@
 import Foundation
 import SwiftUI
 
+/// A stable quiet slot for a page read; cached content stays mounted below it.
+struct PageReadStatus: View {
+    let isReading: Bool
+    var text: String?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if isReading { ProgressView().controlSize(.small) }
+            if let text {
+                Text(text)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 24, alignment: .leading)
+    }
+}
+
 // MARK: - The Advanced page kit
 //
 // 2026-09-03 finish pass. Capabilities, Knowledge Graph and Dreams sit inside
@@ -15,24 +34,54 @@ import SwiftUI
 struct AdvancedEyebrow: View {
     let text: String
 
-    // Alive glass (2026-09-23): the kit's eyebrow. Only Capabilities uses it.
+    // Alive glass (2026-09-23): the kit's eyebrow.
     var body: some View {
         AliveEyebrow(text)
     }
 }
 
-/// An eyebrow and the card under it — what a panel becomes on these pages.
+/// How a section's content sits under its eyebrow.
+enum AdvancedSectionCard {
+    /// ONE group card, each child a row with a hairline between.
+    case rows
+    /// ONE card holding the content as a single stack of controls.
+    case single
+    /// No card: the content brings its own cards.
+    case bare
+}
+
+/// THE section block on every settings and Advanced page: the kit's eyebrow,
+/// the content under it in the shape `card` names, and an optional quiet line.
 struct AdvancedSection<Content: View>: View {
     let title: String
+    var card: AdvancedSectionCard = .rows
+    var note: String?
     @ViewBuilder var content: Content
 
-    /// Alive glass (2026-09-23): the kit's eyebrow over ONE group card, each
-    /// child a row with a hairline between. Only Capabilities uses it.
     var body: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
             AliveEyebrow(title)
-            AliveGroupCard { content }
+            switch card {
+            case .rows:
+                AliveGroupCard { content }
+            case .single:
+                AliveGroupCard {
+                    VStack(alignment: .leading, spacing: 12) { content }
+                }
+            case .bare:
+                content
+            }
+            if let note {
+                Text(note)
+                    .font(ShellType.rowDetail)
+                    // Secondary, not tertiary: tertiary fails where the haze peaks.
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 2)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -183,10 +232,9 @@ struct AdvancedStat: View {
     }
 }
 
-/// Type the shell has no token for: a code is a code, and 13 monospaced is the
-/// one exception the kit allows. Sized off `ShellType`, never a loose number.
+/// A code at caption size, which `ShellType` has no token for (13 monospaced
+/// is `ShellType.code`). Sized off `ShellType`, never a loose number.
 enum AdvancedType {
-    static let code = Font.system(size: ShellType.labelSize, design: .monospaced)
     static let codeCaption = Font.system(size: ShellType.captionSize, design: .monospaced)
 }
 
@@ -207,7 +255,7 @@ struct AdvancedFold<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             Button {
                 withAnimation(
-                    NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)
+                    NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)
                 ) {
                     isExpanded.toggle()
                 }
@@ -243,7 +291,7 @@ struct AdvancedFold<Content: View>: View {
 
             if isExpanded {
                 content
-                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+                    .transition(NativeAgentMotion.arrivalFade)
             }
         }
     }

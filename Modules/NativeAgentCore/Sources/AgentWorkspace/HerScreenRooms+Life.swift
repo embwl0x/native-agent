@@ -43,13 +43,8 @@ enum AgentWorkspaceLife {
         guard room(for: tool) != nil, !tool.hasPrefix("mac_") else { return nil }
         let row = object(result)
         var content: [String: JSONValue] = ["status": row["status"] ?? (row["ok"] == .bool(false) ? .string("failed") : .string("ok"))]
+        for key in ["connected", "detail", "fix"] { content[key] = row[key] }
         if let problem = problem(row) { content["error"] = .string(problem) }
-        // A connection card reads the same as the other rooms' (comms): one line.
-        if row["needs"] != nil, row["kind"] == .string("connector") {
-            content["error"] = .string((destinations.first { $0.id == room(for: tool) }?.title ?? "It") + " not connected"
-                + (tool.hasPrefix("notion") ? ", so nothing was searched" : ", so nothing was read")
-                + " — app card.request (kind connector) puts the connect card in this chat; or the person opens Settings (the gear, bottom-left), then Connectors.")
-        }
         var items: [AgentWorkspaceItem] = [], actions: [AgentWorkspaceButton] = []
         switch tool {
         case "google_calendar_calendars":
@@ -141,7 +136,9 @@ enum AgentWorkspaceLife {
             // User, 2026-09-24: X is read in Chrome, not on his paid API key.
             if tool == "x_status" {
                 content["message"] = .string("Read X in Chrome: x.open, or browser.go https://x.com/<handle> or x.com/search?q=<words>.")
-                content["note"] = .string("The (API) verbs spend the paid X API; use them only if the person asks or Chrome can't.")
+                if AgentWorkspaceReadiness.ready(tool: "x_search") {
+                    content["note"] = .string("The (API) verbs spend the paid X API; use them only if the person asks or Chrome can't.")
+                }
                 // A real status read (x.status) says how the API stands; the room itself reads nothing.
                 if row["room"] == nil { content["detail"] = content["error"] ?? .string("The X API is connected.") }
             }
@@ -348,11 +345,11 @@ extension HerScreen {
 }
 
 /// A row that would act when named (`reminders.3`) opens as this short page
-/// of its verbs instead. Expired and obsolete rooms are discarded.
+/// of its verbs instead, as long as her names last (`HerRoomCache`).
 final class HerItemPages: @unchecked Sendable {
     static let shared = HerItemPages()
     struct Page: Sendable { let text: String; let peers: [String] }
-    private let cache = HerRoomCache<Page>()
+    private let cache = HerRoomCache<Page>(lasting: true)
 
     func keep(_ root: URL, _ pages: [String: String], room: String? = nil, scope: String? = nil,
               peers: [String: [String]] = [:]) {

@@ -92,6 +92,7 @@ extension TelegramPollLoop {
                 guard case .object(var obj) = current else {
                     throw TelegramUpdateInboxError.malformedClaim("state.json")
                 }
+                guard patch.contains(where: { obj[$0.key] != $0.value }) else { return }
                 for (key, value) in patch { obj[key] = value }
                 try await store.writeJSON(.object(obj), to: path)
             }
@@ -262,6 +263,35 @@ extension TelegramPollLoop {
         )
     }
 
+    /// A disabled bot can show the owner who messaged it without executing
+    /// anything or granting the sender authority. Preserve the whole fetched
+    /// page in the canonical inbox before advancing, so later checks progress
+    /// and enabling the bot can still process those updates with admission.
+    public static func discoverSenders(token: String, dataRoot: URL) async throws -> Int {
+        let loop = TelegramPollLoop(token: token, revokeDriverControl: {}, dataRoot: dataRoot)
+        try await loop.prepareBotIngressStorage()
+        let store = SwiftNativePersistenceCore()
+        return try await store.withFileLock(loop.offsetURL.appendingPathExtension("discovery")) {
+            let cursor = TelegramOffsetCursor(fileURL: loop.offsetURL)
+            let inbox = TelegramUpdateInbox(offsetURL: loop.offsetURL)
+            let result = try await loop.bot.longPoll(token: token, offset: cursor.load(), timeoutSeconds: 0,
+                                                     session: loop.longPollSession)
+            var count = 0
+            for update in result.updates {
+                let claim = try await inbox.ensurePending(update)
+                guard let message = claim.update.message else { continue }
+                await loop.recordBlocked(reason: "setup_sender_not_admitted", update: claim.update,
+                                         message: message, text: nil)
+                count += 1
+            }
+            if let last = result.updates.map(\.updateId).max() {
+                guard last < Int.max else { throw TelegramOffsetCursorError.invalidOffset }
+                try await cursor.advance(to: last + 1)
+            }
+            return count
+        }
+    }
+
     /// Strip the bot token from any string headed for logs/state/UI.
     /// URLSession errors embed the failing URL — which contains
     /// /bot<TOKEN>/ — and recordError rows render verbatim in the Mac
@@ -328,10 +358,8 @@ extension TelegramPollLoop {
         ])
     }
 
-    /// Finish an otherwise silent turn with one visible Telegram notice.
-    /// Prefer replacing an existing streaming draft; if no draft was ever
-    /// created, send a new message. Both paths persist the same receipt.
-    func deliverDraftOrSendNotice(
+    /// Stop the ephemeral preview, then persist one system notice and receipt.
+    func deliverTurnNotice(
         _ notice: String,
         delivery: TelegramAssistantDeliveryDriver,
         receiptKind: String,
@@ -340,16 +368,7 @@ extension TelegramPollLoop {
         message: TelegramMessage,
         text: String
     ) async {
-        if await delivery.abortDelivering(notice: notice) {
-            await recordReceipt(
-                kind: receiptKind,
-                update: update,
-                message: message,
-                text: text,
-                reply: notice
-            )
-            return
-        }
+        await delivery.stop()
         do {
             try await sendMessage(token, message.destination, notice)
             await recordReceipt(

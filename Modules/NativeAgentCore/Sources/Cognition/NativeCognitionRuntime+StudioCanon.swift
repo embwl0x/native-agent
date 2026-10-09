@@ -51,7 +51,7 @@ extension NativeCognitionRuntime {
         do {
             report = try await StudioCanonTending.run(dataRoot: dataRoot, now: now())
         } catch {
-            NSLog("[StudioCanon] Tending deferred: %@", error.localizedDescription)
+            nativeLog("[StudioCanon] Tending deferred: %@", error.localizedDescription)
             return
         }
         await StudioCanonTending.recordAudit(report.audit, dataRoot: dataRoot, now: now())

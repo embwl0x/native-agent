@@ -804,7 +804,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         var dispatchedOrder: [String] = []
         var updatedAt: String?
         if let base {
-            byId = Dictionary(uniqueKeysWithValues: base.items.map { ($0.itemId, $0) })
+            byId = Dictionary(base.items.map { ($0.itemId, $0) }, uniquingKeysWith: { first, _ in first })
             dispatched = Set(base.dispatchedEventKeys)
             dispatchedOrder = base.dispatchedEventKeys
             updatedAt = base.updatedAt

@@ -48,7 +48,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// review: proposal-store I/O must never be awaited on the turn path;
     /// card↔provider association is derived from the store via the evidence
     /// marker, never remembered in memory — restart-safe by construction).
-    var providerVitalsCardSweepInFlight = false  // internal for actor extensions
     /// Published by the canonical owners after mutation; ordinary turns read
     /// this without entering the runtime, substrate, or organism actors.
     nonisolated let attentionProjection: CognitiveAttentionResidentProjection  // internal for actor extensions (move-only Wave C)
@@ -697,7 +696,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         await startApprovalLifecycleObservationIfNeeded()
         await reconcilePendingApprovalExpectationsAtBootstrap()
         await restoreProviderLifecycleEvidence()
-        await reconcileProviderVitalsNotices()
+        await retireProviderVitalsNotices()
         await host.archiveSupersededMorningBriefs(dataRoot: dataRoot)
         // The only awaited Desk replay is launch/bootstrap work, performed in
         // a detached task so its synchronous JSONL parse never occupies this
@@ -922,7 +921,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             noteTurnFinished(runId: completedRunId)
         }
         // Exact replay is inert across both resident owners. It must not create
-        // settlement work, persistence, invalidations, prewarm, or telemetry.
+        // settlement work, persistence, invalidations, or telemetry.
         guard substrateAccepted || somaticAccepted else { return }
         if somaticAccepted {
             cachedBodyRead = nil
@@ -940,22 +939,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         }
         if somaticAccepted { await rescheduleResidualRepairDeadline() }
         publishRuntimeChange(reason: "event:\(inherited.event.kind.rawValue)")
-        if usesLiveAppBody {
-            let contextFlow = contextFlow
-            Task {
-                await contextFlow.prewarm(
-                    kind: .cognitive,
-                    id: inherited.event.subject.id,
-                    terms: [
-                        inherited.event.kind.rawValue,
-                        inherited.event.subject.type,
-                        inherited.event.subject.id,
-                        inherited.event.subject.label ?? "",
-                        inherited.event.summary,
-                    ]
-                )
-            }
-        }
         // Keep this as the final non-suspending action. The sole persistence
         // drain cannot enter the actor until this acceptance turn returns.
         if somaticAccepted {
@@ -2105,8 +2088,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         let backgroundEnabled = enabled && (
             defaults.object(forKey: backgroundKey) as? Bool ?? true
         )
+        // User, 2026-10-04: the personality ships on, reflection included; off is a choice.
         let reflectionEnabled = enabled && (
-            defaults.bool(forKey: reflectionKey)
+            defaults.object(forKey: reflectionKey) as? Bool ?? true
                 || env["NATIVE_AGENT_COGNITION_REFLECTION_ENABLED"] == "1"
         )
         // The old daily quota is now the HARD cost ceiling per rolling 24h —

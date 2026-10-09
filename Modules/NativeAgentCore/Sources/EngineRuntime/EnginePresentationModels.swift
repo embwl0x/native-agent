@@ -5,6 +5,7 @@ import Foundation
 import NativeAgentShared
 import TelegramBot
 import PersistenceCore
+import NativeAgentCore
 /// UI diagnostics around the canonical transport/configuration values.
 public struct TelegramPresentationSnapshot: Equatable, Sendable {
     public var transport: TelegramBot.TelegramStatus
@@ -83,6 +84,13 @@ extension TelegramPresentationSnapshot {
 
     public var actionableError: String? {
         isTransientPollInterruption ? nil : normalizedLastError
+    }
+
+    public var pollStatusMessage: String? {
+        guard let error = normalizedLastError else { return nil }
+        return TurnPresentationReducer.sanitized(isTransientPollInterruption
+            ? "The poller is active and retrying after a transient interruption. \(error)"
+            : error)
     }
 
     public var isOperational: Bool {

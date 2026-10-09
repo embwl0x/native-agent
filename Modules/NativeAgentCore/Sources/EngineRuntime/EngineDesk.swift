@@ -97,7 +97,7 @@ public final class DeskFacade {
         let rows = try await SwiftNativeWorkshopRunner(root: dataRoot).listWorkshopExecutionsMerged()
         let tasks = rows.compactMap(WorkshopTaskRow.init(row:))
         if tasks.count < rows.count {
-            NSLog("[DeskFacade] taskRows dropped \(rows.count - tasks.count) of \(rows.count) malformed execution row(s)")
+            nativeLog("[DeskFacade] taskRows dropped \(rows.count - tasks.count) of \(rows.count) malformed execution row(s)")
         }
         if !rows.isEmpty && tasks.isEmpty {
             throw NSError(domain: "NativeAgent", code: -3, userInfo: [

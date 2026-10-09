@@ -17,7 +17,7 @@ enum ChatTurnNoticePresentation {
     static func destination(for kind: String) -> ChatTurnNoticeDestination {
         // 2026-09-22 WHY: reconnect notices live in the turn's own lane, which
         // clears when the turn ends, so a long-held one never outlives the retry.
-        if kind == "slow_turn" || kind == "provider_retry" {
+        if kind == "provider_retry" {
             return .chatTop
         }
         if kind.contains("timeout") {
@@ -27,33 +27,21 @@ enum ChatTurnNoticePresentation {
     }
 }
 
-/// The two Mac chat entry points must derive the exact same provider-facing
-/// settings. Keeping this as a value projection makes a paid tier or persona
-/// preference testable without constructing the resident client (which owns
-/// live persistence and provider state).
+/// The two Mac chat entry points share their provider-facing tier setting.
+/// Core resolves the installation's persona for every door.
 struct NativeChatTurnOptions: Sendable, Equatable {
-    let persona: String?
     let serviceTier: String?
 
     static func resolve(
-        personaRawValue: String?,
         fastModeEnabled: Bool,
         surface: String
     ) -> NativeChatTurnOptions {
-        let persona = personaRawValue.flatMap { raw -> String? in
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
         return NativeChatTurnOptions(
-            persona: persona,
             serviceTier: surface == "chat" && fastModeEnabled ? "priority" : nil
         )
     }
 
-    /// `AppModel.chatPersona` is what the picker displays and persists. Its
-    /// stored form must be the same value the turn carries; otherwise a padded
-    /// picker value can visibly say one persona while the provider receives a
-    /// different one. Blank input deliberately becomes the product fallback.
+    /// The picker displays the same normalized value Core compiles.
     static func normalizedPickerPersona(_ raw: String?, fallback: String = "AI") -> String {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? fallback : trimmed
@@ -61,7 +49,6 @@ struct NativeChatTurnOptions: Sendable, Equatable {
 
     static func current(surface: String, defaults: UserDefaults = .standard) -> NativeChatTurnOptions {
         resolve(
-            personaRawValue: defaults.string(forKey: "chatPersona"),
             fastModeEnabled: defaults.bool(forKey: "chatFastMode"),
             surface: surface
         )
@@ -79,7 +66,7 @@ extension NativeClient {
             reasoningEffort: reasoningEffort,
             fileAccess: fileAccess,
             attachments: Self.adaptAttachments(attachments),
-            persona: options.persona,
+            persona: nil,
             surface: surface,
             suppressUserAppend: suppressUserAppend,
             replacementAssistantMessageID: replacementAssistantMessageId,
@@ -150,7 +137,7 @@ extension NativeClient {
                 reasoningEffort: reasoningEffort,
                 fileAccess: fileAccess,
                 attachments: Self.adaptAttachments(attachments),
-                persona: options.persona,
+                persona: nil,
                 surface: surface,
                 suppressUserAppend: suppressUserAppend,
                 choice: choice,

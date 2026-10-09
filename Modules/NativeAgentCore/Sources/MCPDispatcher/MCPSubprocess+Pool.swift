@@ -178,7 +178,7 @@ public actor MCPSubprocessPool {
         for (id, newSpec) in dict {
             guard let old = specs[id], old != newSpec else { continue }
             if let proc = processes.removeValue(forKey: id) {
-                NSLog("MCPSubprocessPool: spec changed for %@ — bouncing stale subprocess", id)
+                nativeLog("MCPSubprocessPool: spec changed for %@ — bouncing stale subprocess", id)
                 staleProcesses.append(proc)
             }
             // A new command deserves a clean slate — the old command's
@@ -486,7 +486,7 @@ public actor MCPSubprocessPool {
             await proc.stop()
         }
         if !reapedIds.isEmpty {
-            NSLog("MCPSubprocessPool: reaped %d idle stdio child(ren): %@",
+            nativeLog("MCPSubprocessPool: reaped %d idle stdio child(ren): %@",
                   reapedIds.count, reapedIds.joined(separator: ", "))
         }
         return reapedIds.sorted()

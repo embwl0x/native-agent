@@ -230,13 +230,6 @@ public enum ContactThread {
         public var fetched = false
     }
 
-    /// The sessions the contact owns that are still kept (not archived).
-    public static func sessions(dataRoot: URL, owner: String) -> [String] {
-        let start = prefix(owner: owner)
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: dataRoot.appendingPathComponent("chat/messages").path)) ?? []
-        return names.filter { $0.hasPrefix(start) && $0.hasSuffix(".jsonl") }.map { String($0.dropLast(6)) }
-    }
-
     /// Presentation-only union for Simple and home rows. Route readers use lines.
     /// Everything said between her and the contact, oldest first, from its
     /// sessions: the live logs and the copies each compaction kept, once each
@@ -244,12 +237,12 @@ public enum ContactThread {
     /// The contact's lines are the turns it sent and its saved replies; hers
     /// are her sends (each carries its send id) and her answers to turns it
     /// started. Her turn on one of its replies is her own: it went nowhere.
-    public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil) -> [Line] {
+    public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil) throws -> [Line] {
         let identity = AgentContactIdentity(dataRoot: dataRoot)
         let owners = identity.owners(owner)
         var seen: Set<String> = []
-        return owners.flatMap { door -> [Line] in
-            lines(dataRoot: dataRoot, owner: door, tailBytes: tailBytes).map { line in
+        return try owners.flatMap { door -> [Line] in
+            try lines(dataRoot: dataRoot, owner: door, tailBytes: tailBytes).map { line in
                 var line = line
                 if owners.count > 1 { line.door = identity.doors[identity.aliases["peer:" + door] == nil ? door : "peer:" + door] }
                 return line
@@ -258,53 +251,70 @@ public enum ContactThread {
     }
 
     /// Exact route history; directory counts must not include another door.
-    public static func lines(dataRoot: URL, owner: String, tailBytes: Int? = nil) -> [Line] {
-        let chat = dataRoot.appendingPathComponent("chat", isDirectory: true)
+    public static func lines(dataRoot: URL, owner: String, tailBytes: Int? = nil) throws -> [Line] {
+        let archived = tailBytes == nil ? try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) : [:]
+        let plan = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, prefix: prefix(owner: owner), archived: archived)
+        let key = "\(dataRoot.path)|\(owner)|\(tailBytes.map(String.init) ?? "")"
+        let stamp = (plan.map(\.1) + [ContactReplyReads.url(dataRoot)]).map { fileStamp($0.path) }
+        if let hit = cache.withLock({ $0[key] }), hit.stamp == stamp { return hit.lines }
         let fetched = ContactReplyReads.read(dataRoot)
         let dates = ISO8601DateFormatter()
         dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        var seen: Set<String> = [], started: Set<String> = [], found: [Line] = []
-        for session in sessions(dataRoot: dataRoot, owner: owner) {
-            let folder = chat.appendingPathComponent("sessions/\(session)", isDirectory: true)
-            let backups = tailBytes != nil ? [] : ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
-                .filter { $0.hasPrefix("messages.compact.") && $0.hasSuffix(".jsonl") }.sorted()
-                .map { folder.appendingPathComponent($0) }
-            for file in backups + [chat.appendingPathComponent("messages/\(session).jsonl")] {
-                guard let text = read(file, tailBytes: tailBytes) else { continue }
-                for row in text.split(separator: "\n") {
-                    guard let object = try? JSONSerialization.jsonObject(with: Data(row.utf8)) as? [String: Any],
-                          let role = object["role"] as? String, let id = object["id"] as? String, !seen.contains(id),
-                          let content = object["content"] as? String else { continue }
-                    let metadata = object["metadata"] as? [String: Any]
-                    let origin = metadata?["origin"] as? [String: Any]
-                    let envelope = metadata?["envelope"] as? [String: Any]
-                    let run = object["runId"] as? String
-                    var said = content
-                    if role == "user" {
-                        // A peer's turns come over the agent bridge; a built-in lane's carry its name.
-                        guard envelope?["surface"] as? String == "agent-bridge" || origin?["agent"] as? String == owner else { continue }
-                        // A reply handed to her, or a pull of Dot's room: her answer stays hers.
-                        let handed = (origin?["replyTo"] as? String)?.hasPrefix("agent-conversation:") == true
-                            || (envelope?["correlationId"] as? String)?.hasPrefix("dot-room:") == true
-                        if !handed, let run { started.insert(run) }
-                        said = bridgedText(content)
-                        // The note under Dot's turn is for her, not his words.
-                        if let note = said.range(of: "(Dot sees your answer only if", options: .backwards) {
-                            said = said[..<note.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-                        }
-                    } else if role != "assistant" || !(metadata?["dotClientUserMessageID"] is String || run.map(started.contains) == true) {
-                        continue
+        var seen: Set<String> = [], started: Set<String> = [], found: [(line: Line, run: String?)] = []
+        for (session, file) in plan {
+            guard let text = read(file, tailBytes: tailBytes) else { continue }
+            for row in text.split(separator: "\n") {
+                guard let object = try? JSONSerialization.jsonObject(with: Data(row.utf8)) as? [String: Any],
+                      let role = object["role"] as? String, let id = object["id"] as? String, !seen.contains(id),
+                      let content = object["content"] as? String else { continue }
+                let metadata = object["metadata"] as? [String: Any]
+                let origin = metadata?["origin"] as? [String: Any]
+                let envelope = metadata?["envelope"] as? [String: Any]
+                let run = object["runId"] as? String
+                var said = content
+                if role == "user" {
+                    // A peer's turns come over the agent bridge; a built-in lane's carry its name.
+                    guard envelope?["surface"] as? String == "agent-bridge" || origin?["agent"] as? String == owner else { continue }
+                    // A reply handed to her, or a pull of Dot's room: her answer stays hers.
+                    let handed = (origin?["replyTo"] as? String)?.hasPrefix("agent-conversation:") == true
+                        || (envelope?["correlationId"] as? String)?.hasPrefix("dot-room:") == true
+                    if !handed, let run { started.insert(run) }
+                    said = bridgedText(content)
+                    // The note under Dot's turn is for her, not his words.
+                    if let note = said.range(of: "(Dot sees your answer only if", options: .backwards) {
+                        said = said[..<note.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
                     }
-                    seen.insert(id)
-                    guard !said.isEmpty else { continue }
-                    let at = (object["createdAt"] as? String).flatMap { dates.date(from: $0) } ?? .distantPast
-                    found.append(Line(id: id, mine: role == "assistant", text: said, at: at,
-                                      byPerson: metadata?["byPerson"] as? Bool == true,
-                                      fetched: role == "assistant" && fetched.contains { $0.session == session && $0.run == run }))
+                } else if role != "assistant" || !(metadata?["dotClientUserMessageID"] is String || run != nil) {
+                    continue
                 }
+                seen.insert(id)
+                guard !said.isEmpty else { continue }
+                let at = (object["createdAt"] as? String).flatMap { dates.date(from: $0) } ?? .distantPast
+                found.append((Line(id: id, mine: role == "assistant", text: said, at: at,
+                                   byPerson: metadata?["byPerson"] as? Bool == true,
+                                   fetched: role == "assistant" && fetched.contains { $0.session == session && $0.run == run }),
+                              metadata?["dotClientUserMessageID"] is String ? nil : run))
             }
         }
-        return found.sorted { $0.at < $1.at }
+        // A live reply's starting turn may now live only in compaction originals.
+        let result = found.filter { !$0.line.mine || ($0.run.map(started.contains) ?? true) }
+            .map(\.line).sorted { $0.at < $1.at }
+        cache.withLock { $0[key] = (stamp, result) }
+        return result
+    }
+
+    /// `lines` re-parsed every session file a contact owns on each Simple
+    /// refresh, and a Codex state write alone asks for one (perf sweep
+    /// 2026-10-05). Kept per owner until a file it read, or the reply reads,
+    /// changes on disk.
+    private static let cache = OSAllocatedUnfairLock<[String: (stamp: [String], lines: [Line])]>(initialState: [:])
+
+    /// A file's identity, size and times; any write moves it.
+    private static func fileStamp(_ path: String) -> String {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return path + " -" }
+        return "\(path) \(info.st_ino) \(info.st_size) "
+            + "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
     }
 
     /// A bridged turn without the bracketed notes the bridge puts on top (and
@@ -354,10 +364,10 @@ public enum ContactThread {
     /// keeps the send either way; a failed append is logged, never retried.
     public static func write(_ entry: Entry, dataRoot: URL) async {
         guard let write = writer.withLock({ $0 }) else {
-            NSLog("ContactThread: no writer installed; a message with \(entry.owner) was not saved to its session")
+            nativeLog("ContactThread: no writer installed; a message with \(entry.owner) was not saved to its session")
             return
         }
         do { try await write(dataRoot, entry) }
-        catch { NSLog("ContactThread: a message with \(entry.owner) was not saved to its session: \(error)") }
+        catch { nativeLog("ContactThread: a message with \(entry.owner) was not saved to its session: \(error)") }
     }
 }

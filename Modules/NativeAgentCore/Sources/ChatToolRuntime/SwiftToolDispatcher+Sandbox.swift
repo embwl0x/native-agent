@@ -14,6 +14,7 @@ import Context
 import SwarmRuns
 import WorkshopExecution
 import Skills
+import Senses
 // W7 (2026-08-14) — THE ONLY `import ActivityWatch` in ChatOrchestration, and
 // ActivityWatchArchitectureTests asserts it stays the only one. The module is
 // reachable from an EXPLICIT tool call and from nowhere else: not from context
@@ -538,7 +539,7 @@ extension SwiftToolDispatcher {
         return nil
     }
 
-    func impl_local_connector_tool(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    func impl_local_connector_tool(tool: String, input: [String: JSONValue], surface: String, attachment: (filename: String, data: Data)? = nil) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
         let category = categoryForLocalConnectorTool(tool)
         let allowed: Bool
@@ -563,6 +564,12 @@ extension SwiftToolDispatcher {
             )
         }
         let workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
+        if ["mac_volume", "mac_media"].contains(tool) {
+            let impl = makeMacControl(
+                policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
+                auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl"))
+            return try await impl.dispatch(action: tool == "mac_volume" ? "volume" : "media", body: input).toJSON()
+        }
         let operationalRoot = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? workspaceRoot
         let ctx = ConnectorActionContext(
@@ -594,7 +601,8 @@ extension SwiftToolDispatcher {
                     workspaceRoot: workspaceRoot
                 )
                 resolvedInput[key] = .string(
-                    Self.normalizeFullMacPathArgument(workspacePath)
+                    Self.normalizeFullMacPathArgument(["trash_file", "move_file", "copy_file"].contains(tool) && !workspacePath.hasPrefix("/") && !workspacePath.hasPrefix("~")
+                        ? workspaceRoot.appendingPathComponent(workspacePath).path : workspacePath)
                 )
             }
         }
@@ -605,11 +613,15 @@ extension SwiftToolDispatcher {
         // the whole app (the exact hazard FileSystemActions.swift:1296 documents
         // one layer down). Run on a Dispatch worker outside that pool.
         let imageSink = LocalToolImage.sink
+        let sourceMaterialOnly = FileReadSourceMaterial.metadataOnly
         let connectorInput = resolvedInput
+        if let attachment { return LocalConnectorActions.saveAttachment(attachment, input: connectorInput, ctx: ctx) }
         let connectorResult: JSONValue? = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                let result = LocalToolImage.$sink.withValue(imageSink) {
-                    LocalConnectorActions.fileSystemDefault.run(tool, input: connectorInput, ctx: ctx)
+                let result = FileReadSourceMaterial.$metadataOnly.withValue(sourceMaterialOnly) {
+                    LocalToolImage.$sink.withValue(imageSink) {
+                        LocalConnectorActions.fileSystemDefault.run(tool, input: connectorInput, ctx: ctx)
+                    }
                 }
                 continuation.resume(returning: result)
             }
@@ -711,6 +723,33 @@ extension SwiftToolDispatcher {
     }
 
 
+    /// A screen page's whole address given as `target` (an object or its JSON
+    /// text) is that exact selection: its handle and frame, or a supplemental
+    /// surface's current target in its app.
+    static func unwrappingScreenAddress(_ input: [String: JSONValue]) -> [String: JSONValue] {
+        let address: [String: JSONValue]
+        switch input["target"] {
+        case .object(let fields)?: address = fields
+        case .string(let text)? where text.hasPrefix("{"):
+            guard case .object(let fields)? = try? JSONValue.parse(Data(text.utf8)) else { return input }
+            address = fields
+        default: return input
+        }
+        var input = input
+        if case .string? = address["handle"], case .string? = address["frame_id"] {
+            input["target"] = nil
+            input["handle"] = address["handle"]
+            input["frame_id"] = address["frame_id"]
+        } else if case .string? = address["target"], case .string? = address["app"],
+                  case .string? = address["__sense_screen_frame"] {
+            input["target"] = address["target"]
+            input["app"] = address["app"]
+            input["__sense_native_surface"] = .bool(true)
+            input["__sense_native_label"] = address["label"]
+        }
+        return input
+    }
+
     /// READ-ONLY accessibility perception (W1b): legacy AX status tool / legacy AX tree tool /
     /// legacy AX find tool. Mirrors `impl_mac_app_control_tool`'s shape, with three
     /// deliberate differences:
@@ -738,10 +777,18 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue],
         surface: String
     ) async throws -> JSONValue {
-        let input = input.filter {
+        if MacObservationMode.current != .passive,
+           input["__sense_app_observation"] == .bool(true) || SensesHub.passiveObservation {
+            return try await MacObservationMode.$current.withValue(.passive) {
+                try await self.impl_mac_four_verbs_tool(tool: tool, input: input, surface: surface)
+            }
+        }
+        let filtered = input.filter {
             !(["direction", "button"].contains($0.key) && ($0.value == .string("")))
         }
-        if let continuation = MacWorkContinuation.current, continuation.isPending,
+        let input = tool == "act" ? Self.unwrappingScreenAddress(filtered) : filtered
+        if MacObservationMode.current != .passive,
+           let continuation = MacWorkContinuation.current, continuation.isPending,
            let refusal = continuation.refusal() {
             return .object(["ok": .bool(false), "text": .string(refusal),
                 "detail": .object(["error": .string("continuation_unavailable")])])
@@ -775,8 +822,19 @@ extension SwiftToolDispatcher {
             default: return nil
             }
         }
-        if tool == "screen", try Self.desktopPixelsRequested(input) {
-            return await Self.desktopPixels(input: input)
+        if tool == "screen", input["__sense_app_material"] != .bool(true), try Self.desktopPixelsRequested(input) {
+            // A failed picture reports its own cause; no other read stands in for it.
+            let result = await Self.desktopPixels(input: input)
+            if input["wrong"] == .bool(true), let corner = senseAppCorner(input) {
+                return try await SenseDoor.read(corner: corner, address: str("part"), input: input,
+                    scope: ChatToolSessionContext.verifiedSessionId ?? "", raw: { result },
+                    material: { _ in throw SenseFailure(code: "source_unavailable", message: "Desktop pixels are a raw view; app growth uses the running window's AX material.") })
+            }
+            if case .object(var fields) = result {
+                fields["sense_provenance"] = .string("raw view · desktop pixels requested")
+                return .object(fields)
+            }
+            return result
         }
         let impl = makeMacControl(
             policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
@@ -786,6 +844,71 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(
                 reason: "four_verbs_host_unavailable: the MacControl client in this build does not host the four verbs"
             )
+        }
+        if tool == "screen", input["__sense_app_material"] == .bool(true) {
+            guard let bundle = str("app"), bundle != "*" else {
+                throw SenseFailure(code: "source_unavailable", message: "App material needs a concrete already-running app.")
+            }
+            var body: [String: JSONValue] = ["grade": .string("look"),
+                "app_map": .bool(true), "sense_material": .bool(true), "app": .string(bundle)]
+            if let part = str("part") { body["seek"] = .string(part) }
+            let readBody = body
+            let passive = input["__sense_app_observation"] == .bool(true) || SensesHub.passiveObservation
+                || MacObservationMode.current == .passive
+            let frameSource = "sense:app:" + bundle + (passive ? ":watch" : "")
+            let view = try await MacObservationMode.$current.withValue(passive ? .passive : .interactive) {
+                try await MacLookFrameStore.$source.withValue(frameSource) {
+                    try await host.dispatch(action: "look", body: readBody)
+                }
+            }
+            if passive, !view.ok, case .object(let output) = view.output, case .string(let message)? = output["message"] {
+                throw SenseFailure(code: "source_unavailable", message: message)
+            }
+            guard view.ok, case .object(let output) = view.output, case .object(var tree)? = output["accessibility"] else {
+                throw SenseFailure(code: "source_unavailable", message: "The app's accessibility material could not be read.")
+            }
+            let recognized = try await MacObservationMode.$current.withValue(passive ? .passive : .interactive) {
+                try await MacAppWindowText.read(bundleID: bundle, window: output["window_identity"])
+            }
+            tree["seam"] = output["seam"]
+            if case .object(let seam)? = output["seam"] { tree["renderer_wait_note"] = seam["renderer_wait_note"] }
+            tree["recognized_text"] = recognized.rows
+            tree["recognized_text_body"] = .string(recognized.text)
+            tree["window_identity"] = output["window_identity"]
+            tree["frame_id"] = output["frame_id"]
+            tree["affordances"] = output["affordances"]
+            tree["app_bundle_id"] = .string(bundle)
+            return .object(tree)
+        }
+        if tool == "screen", let corner = senseAppCorner(input), !SenseDoor.readingRaw {
+            let requestedPart = str("part")
+            return try await SenseDoor.read(corner: corner, address: str("part"), input: input,
+                scope: ChatToolSessionContext.verifiedSessionId ?? "",
+                raw: { try await self.impl_mac_four_verbs_tool(tool: tool, input: input.merging(["structured": .bool(true)]) { _, new in new }, surface: surface) },
+                material: { raw in
+                    _ = try Self.senseTextMaterial(raw)
+                    var body: [String: JSONValue] = ["grade": .string("look"), "app_map": .bool(true), "sense_material": .bool(true)]
+                    if case .app(let bundleID) = corner { body["app"] = .string(bundleID) }
+                    if let part = requestedPart { body["seek"] = .string(part) }
+                    let view = try await MacLookFrameStore.$source.withValue("sense:" + corner.key) {
+                        try await host.dispatch(action: "look", body: body)
+                    }
+                    guard view.ok else { throw SenseFailure(code: "source_unavailable", message: "The app's raw view could not be read.") }
+                    guard case .object(let output) = view.output, let tree = output["accessibility"] else {
+                        throw SenseFailure(code: "source_unavailable", message: "The app's accessibility material could not be read.")
+                    }
+                    let recognized = try await MacAppWindowText.read(bundleID: corner.key.dropFirst(4).description, window: output["window_identity"])
+                    guard case .object(var fields) = tree else { throw SenseFailure(code: "bad_output", message: "The app accessibility tree is invalid.") }
+                    fields["seam"] = output["seam"]
+                    if case .object(let seam)? = output["seam"] { fields["renderer_wait_note"] = seam["renderer_wait_note"] }
+                    fields["recognized_text"] = recognized.rows
+                    fields["recognized_text_body"] = .string(recognized.text)
+                    fields["window_identity"] = output["window_identity"]
+                    fields["frame_id"] = output["frame_id"]
+                    fields["affordances"] = output["affordances"]
+                    if case .app(let bundle) = corner { fields["app_bundle_id"] = .string(bundle) }
+                    return .accessibility(.object(fields))
+                })
         }
         // What the chat's working card says while this verb runs. Said BEFORE
         // the verb, so a click that produces no new capture still moves the
@@ -815,7 +938,8 @@ extension SwiftToolDispatcher {
         case "screen":
             let seen = await verbs.screen(part: str("part"), app: str("app"), structured: input["structured"] == .bool(true))
             reply = seen.ok ? pixels?.attach().map {
-                MacFourVerbsReply(ok: true, text: seen.text + "\n" + $0, detail: seen.detail)
+                MacFourVerbsReply(ok: true, text: seen.text + "\n" + $0,
+                    detail: seen.detail.merging(["pixel_capture_status": .string($0)]) { _, new in new })
             } ?? seen : seen
         case "act":
             func typeMode(_ fields: [String: JSONValue]) throws -> MacTypeMode {
@@ -825,6 +949,19 @@ extension SwiftToolDispatcher {
                     throw AutonomyGateError.toolDenied(reason: "act mode must be replace (default) or append; append requires type")
                 }
                 return mode
+            }
+            if input["__sense_native_surface"] == .bool(true) {
+                // A screen page lists "press" among an item's verbs.
+                guard let app = str("app"), let target = str("target"), let verb = str("verb").map({ $0 == "press" ? "click" : $0 }),
+                      ["click", "type", "select", "focus", "toggle", "scroll"].contains(verb),
+                      ["handle", "frame_id", "front", "steps", "to", "to_app", "seconds", "repeat", "interval", "holding", "button", "scroll_amount"].allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
+                    throw AutonomyGateError.toolDenied(reason: "A native surface selection requires its app and current target, without foreground or gesture options.")
+                }
+                reply = await verbs.actNativeSurface(verb: verb, target: target, app: app,
+                    label: str("__sense_native_label"),
+                    text: input["text"].flatMap { if case .string(let text) = $0 { return text }; return nil },
+                    mode: try typeMode(input))
+                break
             }
             // 2026-09-22: models send "" for unused fields; empty is absent, not a selection.
             let absent: [JSONValue?] = [nil, .null, .string("")]
@@ -976,8 +1113,9 @@ extension SwiftToolDispatcher {
         ]
         if let operationId = reply.detail["operationId"] { payload["operationId"] = operationId }
         if let operationState = reply.detail["operationState"] { payload["operationState"] = operationState }
-        if let verification = reply.detail["verification"] { payload["verification"] = verification }
+        if let verification = reply.agentDetail["verification"] { payload["verification"] = verification }
         if !reply.agentDetail.isEmpty { payload["detail"] = .object(reply.agentDetail) }
+        if tool == "screen" { payload["sense_provenance"] = .string("raw view · existing screen reader") }
         return .object(payload)
     }
 
@@ -1162,8 +1300,45 @@ extension SwiftToolDispatcher {
             policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
             auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
         )
-        let result = try await impl.dispatch(action: "read", body: input)
-        return result.toJSON()
+        var selectedCorner = senseAppCorner(input) ?? SenseCorner.stream(id: "mac.read")
+        var nativeReadSupported = true
+        if let namedPath {
+            let fileCorner = SenseCorner.fileKind(URL(fileURLWithPath: namedPath).pathExtension.lowercased())
+            selectedCorner = fileCorner
+            if case .unsupported = MacDocumentRead.kind(forPath: namedPath) {
+                selectedCorner = fileCorner
+                nativeReadSupported = false
+            }
+        }
+        let corner = selectedCorner
+        var senseInput = input
+        senseInput["__sense_reader"] = .string("read")
+        return try await SenseDoor.read(corner: corner, address: namedPath, input: senseInput,
+                scope: ChatToolSessionContext.verifiedSessionId ?? "",
+                nativeCorner: .stream(id: "mac.read"),
+                nativeReadSupported: nativeReadSupported,
+                fileAlreadyReadable: namedPath.map { FileReadSourceMaterial.nativeReadSupported(path: $0) } ?? false,
+                raw: { try await impl.dispatch(action: "read", body: input).toJSON() },
+                material: { raw in
+                    if let namedPath {
+                        guard case .object(let fields) = raw,
+                              fields["ok"] == .bool(true) || fields["error"] == .string("unsupported_document_type") else {
+                            throw SenseFailure(code: "source_unavailable", message: "The original document reader refused this file.")
+                        }
+                        let path = URL(fileURLWithPath: NSString(string: namedPath).expandingTildeInPath).resolvingSymlinksInPath().path
+                        guard MacControlSensitivePathFence.reason(forPath: path) == nil else {
+                            throw SenseFailure(code: "source_unavailable", message: "This document is inside a protected path.")
+                        }
+                        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+                        return .file(path: path, bytes: (attributes[.size] as? NSNumber)?.intValue ?? 0)
+                    }
+                    if case .app(let bundle) = corner {
+                        let tree = try await self.impl_mac_four_verbs_tool(tool: "screen",
+                            input: ["app": .string(bundle), "raw": .bool(true), "__sense_app_material": .bool(true)], surface: surface)
+                        return .accessibility(tree)
+                    }
+                    return try Self.senseTextMaterial(raw)
+                })
     }
 
     func impl_mac_accessibility_read_tool(
@@ -1409,10 +1584,20 @@ extension SwiftToolDispatcher {
     }
 
     func impl_full_mac_read_file(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        let result = try await impl_local_connector_tool(tool: "read_file", input: input, surface: surface)
+        let path = jsonString(input["path"]) ?? ""
+        let nativeReadSupported = FileReadSourceMaterial.nativeReadSupported(path: path)
+        let result = try await SenseDoor.read(corner: .fileKind(URL(fileURLWithPath: path).pathExtension.lowercased()),
+            address: path, input: input,
+            scope: ChatToolSessionContext.verifiedSessionId ?? "",
+            nativeReadSupported: nativeReadSupported,
+            fileAlreadyReadable: nativeReadSupported,
+            raw: { try await self.impl_local_connector_tool(tool: "read_file", input: input, surface: surface) },
+            material: { try Self.senseFileMaterial($0) })
+        if input["raw"] == .bool(true) || input["wrong"] == .bool(true) || SenseDoor.readingRaw { return result }
         guard case .object(let obj) = result else { return result }
+        if obj["ok"] == .bool(false), obj["raw"] != nil, obj["sense_provenance"] != nil { return result }
         if case .string? = obj["content"] {
-            return Self.fileReadPresentation(result, callerPath: jsonString(input["path"]) ?? "", continuing: jsonString(input["version"])?.isEmpty == false)
+            return Self.fileReadPresentation(result, callerPath: path)
         }
         if case .string(let code)? = obj["error_code"],
            ["file_changed", "bad_input", "window_too_small", "continuation_unavailable", "read_failed", "unsupported_file_type"].contains(code) {

@@ -16,21 +16,26 @@ changes shape, so nothing loads and nothing has to be looked up first.
   its action ids.
 - `app {item:"desk.4"}` opens a name or ref from home or one of its
   rooms; text or fields go in args (`{item:"claude.say", args:{text:"…"}}`).
-  `app {page:"home", find:"…"}` finds your work, documents and conversations.
+  `app {find:"…"}` discovers actions, including with page:"home".
+  Use work.context or chat.search to search saved work and conversations.
 - `app {page:"mail"}` reads a page: what it shows, its version, and its
   actions as `id(args) label`.
 - `app {action:"memory.recall", args:{query:"…"}}` does one action. The
   ones you reach for most are named in app's own description, so they
   need no read first: memory.recall, memory.commit, desk.read, files.read,
   files.write, agent.message, agent.read, mail.recent, calendar.upcoming,
-  chat.search, mac.look, mac.act, mac.go and the rest of its hot line.
+  chat.search, mac.look, mac.volume, mac.act, mac.go and the rest of its hot line.
+  Plain reads need no Mac act guide; that guide is for screen actions.
 - `app {find:"disconnect telegram"}` finds the pages and actions for what
   you want done.
-- `app {script:"…"}` finishes a task in one call with app.* calls only;
-  sends, writes and anything outward stay single actions.
+- `app {script:"…"}` composes app.* calls in one call. The registry decides
+  which actions are scriptable, including eligible app-local Desk writes.
+  Sends, file writes, shell commands and Mac effects stay separate actions;
+  every call still passes its authority checks.
 
 Tools you've written show up as `authored.<id>` actions on diagnostics
-once the user has approved them; MCP servers' tools are `mcp.<server>.<tool>`.
+once activated under the current Trust policy; MCP servers' tools are
+`mcp.<server>.<tool>`.
 
 Trust app {action:"agent.introspect"} and app {} over anything written
 here. This manual describes the pattern, not the inventory.
@@ -38,8 +43,8 @@ here. This manual describes the pattern, not the inventory.
 ## Skills (different from tools)
 
 Tools are dispatchable functions you call directly with a JSON
-argument. Skills are markdown bodies — written guidance for tasks
-that benefit from a recipe rather than a single tool call.
+argument. Skills are reusable Markdown guidance with optional admitted scripts
+for tasks that benefit from a procedure rather than a single tool call.
 
 Skill bodies are NOT auto-loaded into your prompt. Same manifest
 pattern as tools: you see the catalog, you load only what you need.
@@ -62,14 +67,19 @@ manifest tags each entry with its `source` so you know where it
 came from. Runtime skills can also carry `triggers` and `use_count`
 from <data_root>/skills/registry.json.
 
-When you write a new skill, use app {action:"persona.write", args:{kind:"skill",
-skill_name:"<name>", content:"..."}} — that lands the body in
-your runtime skills dir. app skill.list will surface it
-on the next call. Start the body with a one-line "Use this when..."
-sentence so the manifest shows a useful description.
+Write a procedure with `app {action:"skill.save", args:{name:"<name>",
+description:"<when to use it>", content:"..."}}`; add an optional `script`
+for runnable steps. The older `persona.write` skill-body route remains
+supported for guidance. New or changed scripts land drafted. `skill.enable`
+admits the exact script under the current authority; `skill.run` executes it,
+`skill.resume` continues a retained hand-back with your answer, and
+`skill.rollback` restores an earlier script for fresh admission, or drops
+your version of a built-in skill so the built-in shows again.
 
-Skills don't auto-execute — you read them, then plan the steps
-yourself using your existing tools. They're knowledge, not code.
+Guidance-only skills are read and followed with existing tools. Script skills
+run only when called and admitted; neither kind grants new authority. The
+authoring and recovery rules are in `docs/skill_manifest_spec.md` in the source
+checkout.
 
 ## Memory
 
@@ -98,7 +108,7 @@ or `app {action:"mac.system_info"}` for available runtime details and resolved
 roots. They survive reinstalls.
 
 Conventions (true regardless of where roots resolve):
-- <data_root>/memory/<persona>/notes.jsonl — your durable notes
+- <data_root>/memory/memory.sqlite — canonical MemoryV2 records; use memory actions to read and change them
 - <data_root>/traces/events.jsonl — your dispatch history
 - <persona_root>/SOUL.md, USER.md, VOICE.md, AGENTS.md, GROWTH.md
 - <workspace_root>/ — drafts, scratch, generated work product
@@ -107,8 +117,13 @@ Conventions (true regardless of where roots resolve):
 
 - Local app runtime, single operator.
 - bash sandbox is heuristic, not a security boundary.
-- CONFIRM-tier tools queue an approval the user must approve. Don't
-  try to bypass; trust the pattern.
+- Approval follows the current Trust policy. Admitted Full Mac provides
+  persistent full autonomy for ordinary checks, converting ordinary asks to
+  allow. Explicit blocks and protected exceptions remain: macOS privacy
+  permission resets still need the owner, as do protected effects on
+  untrusted peer-steered turns. Authenticated agents enabled in Trust carry
+  the owner's authority; origin, service and macOS permission checks still
+  apply. Follow any approval the app actually requests.
 
 ## Self-modification
 

@@ -9,6 +9,13 @@ import CoreGraphics
 
 // MARK: - SwiftNative impl
 
+/// Background perception carries this mode through the whole read, including
+/// nested dispatches. It may observe, never wake, write AX flags or use hands.
+public enum MacObservationMode: Sendable {
+    case interactive, passive
+    @TaskLocal public static var current: MacObservationMode = .interactive
+}
+
 public actor SwiftNativeMacControl: MacControlClient {
     let now: @Sendable () -> Date
     /// Mac banners are posted by the app's one banner exit, which it injects
@@ -155,6 +162,10 @@ public actor SwiftNativeMacControl: MacControlClient {
         body rawBody: [String: JSONValue],
         capability: MacInjectionCapability?
     ) async throws -> MacControlResult {
+        if MacObservationMode.current == .passive {
+            // No motor-driver binding or held-input cleanup for an observer.
+            return try await dispatchBound(action: action, body: rawBody, capability: capability)
+        }
         if MacDriverContext.binding == nil {
             let binding = await attentionStore.bindDriver(eventSource: attentionEventSource)
             return try await withTaskCancellationHandler {
@@ -164,8 +175,13 @@ public actor SwiftNativeMacControl: MacControlClient {
                 }
             } onCancel: { binding.cancel() }
         }
-        return try await MacDriverContext.$inputStartCount.withValue(MacDriverContext.binding?.inputCount ?? 0) {
-            driverCheckedResult(try await dispatchBound(action: action, body: rawBody, capability: capability), action: action)
+        // An act admitted to run in an app in the back stays there, and
+        // his input elsewhere does not stop it (MacDriverBinding).
+        let background = MacDriverContext.background || rawBody["background"] == .bool(true)
+        return try await MacDriverContext.$background.withValue(background) {
+            try await MacDriverContext.$inputStartCount.withValue(MacDriverContext.binding?.inputCount ?? 0) {
+                driverCheckedResult(try await dispatchBound(action: action, body: rawBody, capability: capability), action: action)
+            }
         }
     }
 
@@ -173,7 +189,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         let motor = macControlAccessibilityInjectionActions.contains(action)
             || macControlAccessibilityNudgeActions.contains(action)
             || ["focus_app", "quit_app", "open_target"].contains(action)
-        guard motor, MacDriverContext.binding?.takenOver == true else { return reply }
+        guard motor, MacDriverContext.binding?.yieldedToPerson == true else { return reply }
         var output: [String: JSONValue] = [:]
         if case .object(let existing) = reply.output { output = existing }
         output["status"] = .string("yielded_to_user")
@@ -206,6 +222,10 @@ public actor SwiftNativeMacControl: MacControlClient {
         // drop it so it can never be revived by a future reader as "evidence".
         var body = rawBody
         body.removeValue(forKey: "__mac_injection_approved")
+        if MacObservationMode.current == .passive {
+            // Refuse effects before minting a capability or motor operation.
+            return try await executeAction(normalized, body: body)
+        }
 
         // GATE 3 of 3 — the APPROVAL tier, resolved here at the entry point so
         // there is exactly one place to read for "can this call inject".
@@ -467,6 +487,13 @@ public actor SwiftNativeMacControl: MacControlClient {
         action: String,
         body: [String: JSONValue]
     ) async throws -> MacControlResult? {
+        if MacObservationMode.current == .passive {
+            guard MacScreenLock.isCovered() else { return nil }
+            return MacControlResult(ok: false, action: action,
+                output: .object(["status": .string("display_obstructed"),
+                    "message": .string(MacScreenLock.passiveReply)]),
+                error: "display_obstructed", durationMs: 0, viaSwift: true)
+        }
         do {
             try await MacScreenLock.wakeIfCovered {
                 if let refusal = await self.attentionActionRefusal(action: action, body: body) {
@@ -484,6 +511,12 @@ public actor SwiftNativeMacControl: MacControlClient {
         body: [String: JSONValue],
         gateAlreadyChecked: Bool = false
     ) async throws -> MacControlResult {
+        if MacObservationMode.current == .passive,
+           !["look", "view", "read", "file/read", "spotlight", "ax_status", "ax_tree", "ax_find", "clipboard_read"].contains(normalized) {
+            return MacControlResult(ok: false, action: normalized,
+                output: .object(["message": .string("raw view · passive observation · desktop effects are unavailable")]),
+                error: "passive_observation", durationMs: 0, viaSwift: true)
+        }
         // GATE PRE-FLIGHT (wave 30 W01). When a live policy is available, run
         // the W4 MacControlGate read-only refusal pipeline IN-PROCESS, in the
         // EXACT order the daemon does (_gate master/remote/category → file
@@ -516,7 +549,14 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
         // Perception and hands share the desktop-send wake: an inert nudge
         // only while the saver covers the screen and the person is idle.
-        if ["look", "view", "act", "hand", "menu", "menu_press"].contains(normalized) {
+        if MacObservationMode.current == .passive,
+           ["look", "view", "ax_tree", "ax_find"].contains(normalized), MacScreenLock.isCovered() {
+            return MacControlResult(ok: false, action: normalized,
+                output: .object(["status": .string("display_obstructed"), "message": .string(MacScreenLock.passiveReply)]),
+                error: "display_obstructed", durationMs: 0, viaSwift: true)
+        }
+        if MacObservationMode.current != .passive,
+           ["look", "view", "act", "hand", "menu", "menu_press"].contains(normalized) {
             let started = now()
             do {
                 if let refusal = try await wakeScreenIfCovered(action: normalized, body: body) {
@@ -543,6 +583,8 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "file/move":   return try await handleFileMove(body)
         case "file/trash":  return try await handleFileTrash(body)
         case "applescript": return try await handleAppleScript(body)
+        case "volume":      return try await handleVolume(body)
+        case "media":       return try await handleMedia(body)
         case "focus_app":   return try await handleFocusApp(body)
         case "quit_app":    return try await handleQuitApp(body)
         case "open_target": return try await handleOpenTarget(body)
@@ -554,7 +596,10 @@ public actor SwiftNativeMacControl: MacControlClient {
         // native-look item 2 — THE PERCEPTION COMPILER. Read tier like the
         // three above and for the same reason: it walks the same AX tree
         // through the same read organ and changes no UI state.
-        case "look":        return await handleLook(body)
+        case "look":
+            return await MacAXLimits.$readDeadline.withValue(Date().addingTimeInterval(MacAXLimits.readSeconds)) {
+                await handleLook(body)
+            }
         // W3.5 — THE FUSED VIEW. Read tier like the three above: it looks at
         // the screen (AX structure + pixels) and changes nothing.
         case "view":        return await handleView(body)
@@ -1020,7 +1065,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 // must go through appendAuditLineRaw, not JSONValue.serialize.
                 let dropped = try enforceJSONLLineCap(at: path, maxLines: JSONLLineCaps.macControlAudit)
                 if dropped > 0 {
-                    NSLog("MacControl.audit: %@ cap dropped %d oldest line(s)",
+                    nativeLog("MacControl.audit: %@ cap dropped %d oldest line(s)",
                           path.lastPathComponent, dropped)
                 }
             }

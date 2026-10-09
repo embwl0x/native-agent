@@ -64,6 +64,7 @@ extension BrowserActionRoutes {
                 readLinks: false,
                 screenshot: false
             )
+            Self.retainRead?(capture)
             let receipt = try await persistBrowserTextCapture(
                 id: "browser-text-\(UUID().uuidString.lowercased())",
                 url: capture.url,
@@ -92,6 +93,7 @@ extension BrowserActionRoutes {
                 readLinks: true,
                 screenshot: false
             )
+            Self.retainRead?(capture)
             let receipt = try await persistBrowserLinksCapture(
                 id: "browser-links-\(UUID().uuidString.lowercased())",
                 url: capture.url,

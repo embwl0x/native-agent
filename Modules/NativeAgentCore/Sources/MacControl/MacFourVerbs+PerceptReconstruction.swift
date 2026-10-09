@@ -88,7 +88,8 @@ extension MacFourVerbs {
                     labelJSON: labelJSON,
                     valueJSON: valueJSON,
                     // Clear text only: a withheld placeholder names nothing.
-                    placeholder: string(affordance["placeholder"])
+                    placeholder: string(affordance["placeholder"]),
+                    state: string(affordance["state"])
                 )
             },
             unlabeledByRole: object(output["unlabeled"] ?? .null).reduce(into: [:]) { out, entry in

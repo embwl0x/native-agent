@@ -15,7 +15,6 @@ import SwiftUI
 import PersistenceCore
 
 struct AnthropicSetupTokenInput: View {
-    var nativeBaseURL: String = NativeBaseURLDefaults.read()
     var onSuccess: (() -> Void)? = nil
 
     @State private var token: String = ""

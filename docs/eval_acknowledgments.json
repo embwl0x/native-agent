@@ -5,7 +5,7 @@
       "detector": "bridge.undelivered",
       "horizon": "2026-08-21T19:00:00Z",
       "verdict": "Triaged 2026-08-21: bulk is the July 16-28 failure cluster from an already-fixed era; recent 409/504 non-retry is reviewed bridge design (ambiguous outcomes preserved, not retried); the 13 preserved dead-letter replies are the real item.",
-      "evidence": "docs/build_plans/full-system-eval-coverage.md § Wave-1 lead triage",
+      "evidence": "Historical record: git show 694c3c9a986f011b475cff1985fd1ed872434a60:docs/build_plans/full-system-eval-coverage.md § Wave-1 lead triage (removed from the current tree)",
       "tracked": "chip task_d99f693c — surface the codex dead-letter reply box",
       "by": "claude",
       "on": "2026-08-21"

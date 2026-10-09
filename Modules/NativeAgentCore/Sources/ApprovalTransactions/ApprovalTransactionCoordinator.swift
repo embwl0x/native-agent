@@ -87,7 +87,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 guard let target else {
                     // Annotate, don't just return — an approved record with no
                     // executable target must never read as silently applied.
-                    NSLog("[selfImprovement] missing target for op: \(op)")
+                    nativeLog("[selfImprovement] missing target for op: \(op)")
                     try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                         id: rec.id,
                         executedAction: .object(["op": .string(op), "error": .string("missing target")]),
@@ -97,7 +97,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 try await effects.disableSkill(name: target)
             case "enable_skill":
                 guard let target else {
-                    NSLog("[selfImprovement] missing target for op: \(op)")
+                    nativeLog("[selfImprovement] missing target for op: \(op)")
                     try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                         id: rec.id,
                         executedAction: .object(["op": .string(op), "error": .string("missing target")]),
@@ -106,7 +106,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 }
                 try await effects.enableSkill(name: target, reviewedDigest: nil)
             default:
-                NSLog("[selfImprovement] unknown apply op: \(op)")
+                nativeLog("[selfImprovement] unknown apply op: \(op)")
                 try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                     id: rec.id,
                     executedAction: .object(["op": .string(op), "error": .string("unknown op")]),
@@ -125,7 +125,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         } catch {
             // Don't leave an approved-but-silently-failed record: annotate the
             // failure so the UI shows it didn't apply.
-            NSLog("[selfImprovement] apply failed for op \(op): \(error)")
+            nativeLog("[selfImprovement] apply failed for op \(op): \(error)")
             try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object(["op": .string(op), "error": .string("\(error)")]),
@@ -180,7 +180,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
               case .object(let proposal)? = payload["proposal"],
               case .string(let proposalId)? = proposal["id"],
               !proposalId.isEmpty else {
-            NSLog("[remProposal] missing proposal id on approval \(rec.id)")
+            nativeLog("[remProposal] missing proposal id on approval \(rec.id)")
             try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object(["error": .string("missing proposal id")]),
@@ -231,7 +231,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                         try await REMLessonOrigin.record(
                             row, memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot), dataRoot: dataRoot)
                     } catch {
-                        NSLog("[remProposal] lesson origin not kept for \(proposalId): \(error)")
+                        nativeLog("[remProposal] lesson origin not kept for \(proposalId): \(error)")
                     }
                 }
                 try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
@@ -266,7 +266,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                     detail: "REM proposal canceled — left pending; next REM pass re-stages it")
             }
         } catch {
-            NSLog("[remProposal] \(decision) failed for proposal \(proposalId): \(error)")
+            nativeLog("[remProposal] \(decision) failed for proposal \(proposalId): \(error)")
             // The approval record is already terminal (resolve preceded this
             // executor), so a stamped-but-unapplied row would be a permanent
             // dead-end: stagePendingApprovals skips stamped rows. Clear the
@@ -366,7 +366,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             return
         }
         let herSeat = StudioCanonSeat.isAgent(rec.decidedBy)
-        NSLog("[studioCanon] not applying \(rec.id) from an executor "
+        nativeLog("[studioCanon] not applying \(rec.id) from an executor "
             + "(decidedBy=\(rec.decidedBy ?? "unknown"))")
         try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
             id: rec.id,
@@ -474,7 +474,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         do {
             try await TelegramPollLoop.importLegacyApprovalContinuations(dataRoot: dataRoot, inbox: inbox)
         } catch {
-            NSLog("[approvalReconcile] legacy Telegram continuation import failed; file preserved: \(String(describing: error))")
+            nativeLog("[approvalReconcile] legacy Telegram continuation import failed; file preserved: \(String(describing: error))")
         }
         do {
             let cursor = try ApprovalReconciliationCursor.read(dataRoot)
@@ -506,7 +506,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 return SwiftNativeApprovalInbox.continuationIsPending(record)
             }
         } catch {
-            NSLog("[approvalReconcile] scan failed: \(String(describing: error))")
+            nativeLog("[approvalReconcile] scan failed: \(String(describing: error))")
             return []
         }
     }
@@ -541,7 +541,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             cursor.boundaryIDs?.formIntersection(Set(refreshed.map(\.id)))
             try JSONEncoder().encode(cursor).write(to: ApprovalReconciliationCursor.path(dataRoot), options: .atomic)
         } catch {
-            NSLog("[approvalReconcile] checkpoint failed: \(error)")
+            nativeLog("[approvalReconcile] checkpoint failed: \(error)")
         }
     }
 
@@ -558,7 +558,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             for rec in resolved where rec.executedAction == nil
                 && ExecutionEventVocabulary.matches(rec.action, kind.action) {
                 guard kind.shouldReconcile(rec) else { continue }
-                NSLog("[approvalReconcile] reconciling unexecuted resolved \(kind.action) "
+                nativeLog("[approvalReconcile] reconciling unexecuted resolved \(kind.action) "
                     + "\(rec.id) (decision: \(rec.decision ?? "?"))")
                 await kind.execute(rec)
             }
@@ -793,7 +793,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         let resolved = await Self.resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
         for rec in resolved where Self.chatToolApprovalReplay(from: rec) != nil {
             if Self.chatToolApprovalReplayNeedsExecution(rec) {
-                NSLog("[approvalReconcile] reconciling eligible resolved chat tool approval "
+                nativeLog("[approvalReconcile] reconciling eligible resolved chat tool approval "
                     + "\(rec.id) action=\(rec.action) decision=\(rec.decision ?? "?")")
                 await applyResolvedChatToolApproval(from: rec, dataRoot: dataRoot, continuation: continuation)
             }
@@ -1015,7 +1015,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 do {
                     _ = try AgentConversationStore(dataRoot: dataRoot).records()
                 } catch {
-                    NSLog("[approvals] conversation decision write failed for \(rec.id): \(error)")
+                    nativeLog("[approvals] conversation decision write failed for \(rec.id): \(error)")
                     return
                 }
             }
@@ -1177,7 +1177,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot, continuation: continuation)
             }
         } catch {
-            NSLog("[approvals] approved chat tool replay failed for \(rec.id): \(error)")
+            nativeLog("[approvals] approved chat tool replay failed for \(rec.id): \(error)")
             try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object([
@@ -1217,7 +1217,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         do {
             rec = try await inbox.get(record.id)
         } catch {
-            NSLog("[approvals] continuation record read failed: \(error)")
+            nativeLog("[approvals] continuation record read failed: \(error)")
             return false
         }
         guard rec.status == "resolved",
@@ -1368,12 +1368,12 @@ public struct ApprovalTransactionCoordinator: Sendable {
                     }
                 } catch {
                     settlement = "failed"
-                    NSLog("[approvals] continuation failed for \(rec.id); receipt retained: \(error)")
+                    nativeLog("[approvals] continuation failed for \(rec.id); receipt retained: \(error)")
                 }
                 _ = try await inbox.annotateChatContinuation(rec.id, done: true, settlement: settlement)
             }
         } catch {
-            NSLog("[approvals] outcome receipt or continuation failed for \(rec.id): \(error)")
+            nativeLog("[approvals] outcome receipt or continuation failed for \(rec.id): \(error)")
             return false
         }
         // The row is on disk; nothing re-read it. Resolving an approval refreshes
@@ -1495,14 +1495,14 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 }
                 try await effects.executeApprovedBrowserRun(from: rec)
             } catch {
-                NSLog("[approvalReconcile] browser re-run failed for \(rec.id): \(String(describing: error))")
+                nativeLog("[approvalReconcile] browser re-run failed for \(rec.id): \(String(describing: error))")
             }
         } else {
             do {
                 try await effects.finishRejectedBrowserRun(
                     from: rec, status: decision == "denied" ? "denied" : "canceled")
             } catch {
-                NSLog("[approvalReconcile] browser rejected-finish failed for \(rec.id): \(String(describing: error))")
+                nativeLog("[approvalReconcile] browser rejected-finish failed for \(rec.id): \(String(describing: error))")
             }
         }
     }
@@ -1553,7 +1553,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                   return nil
               }),
               case .string(let stepId)? = payload["step_id"], !stepId.isEmpty else {
-            NSLog("[workshopStep] missing execution_id/step_id on approval \(rec.id)")
+            nativeLog("[workshopStep] missing execution_id/step_id on approval \(rec.id)")
             try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object(["error": .string("missing execution_id/step_id")]),
@@ -1631,7 +1631,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             // refused to run the step; annotate the approval record
             // honestly. Do NOT clear the claim (the execution is not coming
             // back to this approval) and do NOT report a generic failure.
-            NSLog("[workshopStep] \(decision) skipped for \(executionId)/\(stepId): \(detail)")
+            nativeLog("[workshopStep] \(decision) skipped for \(executionId)/\(stepId): \(detail)")
             try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object([
@@ -1641,7 +1641,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 ]),
                 detail: "Desk step \(decision) — \(detail)")
         } catch {
-            NSLog("[workshopStep] \(decision) failed for \(executionId)/\(stepId): \(error)")
+            nativeLog("[workshopStep] \(decision) failed for \(executionId)/\(stepId): \(error)")
             // The approval record is already terminal; a stamped-but-
             // unresumed step would dead-end (resume guards reject a stale
             // approval_id). Clear the claim so re-staging works (mirror of
@@ -1688,7 +1688,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 try await persistence.writeJSON(.object(obj), to: path)
             }
         } catch {
-            NSLog("[workshopStep] claim clear failed for \(executionId)/\(stepId): \(error)")
+            nativeLog("[workshopStep] claim clear failed for \(executionId)/\(stepId): \(error)")
         }
     }
 
@@ -1820,7 +1820,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         } else if rec.action.hasPrefix("nextgen.action."), decisionEnum == .approved {
             // No executor is wired for nextgen actions: annotate the record so
             // an approved request never reads as silently applied.
-            NSLog("[approvals] no executor wired for nextgen action: \(rec.action)")
+            nativeLog("[approvals] no executor wired for nextgen action: \(rec.action)")
             try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object([
@@ -1846,7 +1846,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             // retired. Best-effort stands: a declined write leaves a
             // re-tappable card (alreadyResolved → success), never a lost resolve.
             if await effects.updateVisibleNotificationInboxStatus(id: rec.id, action: "archive") == false {
-                NSLog("[NativeClient] resolve(\(rec.id)): visible-card archive declined — card stays re-tappable")
+                nativeLog("[NativeClient] resolve(\(rec.id)): visible-card archive declined — card stays re-tappable")
             }
         }
         // The record as the executor left it, execution annotations included.

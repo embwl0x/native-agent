@@ -59,9 +59,9 @@ extension CognitiveSubstrate {
             return CognitiveWorkspaceSnapshot(generatedAt: now, items: [])
         }
         let sessionId = Self.cleanedSessionId(currentSessionId)
-        let turnKindsByNodeID = Dictionary(uniqueKeysWithValues: settledNodes.map {
+        let turnKindsByNodeID = Dictionary(settledNodes.map {
             ($0.id, field.cachedTurnKind(for: $0))
-        })
+        }, uniquingKeysWith: { first, _ in first })
         let nodes = settledNodes.filter {
             workspaceEligible(
                 $0,
@@ -182,9 +182,9 @@ extension CognitiveSubstrate {
             )
         }
         let sessionId = Self.cleanedSessionId(currentSessionId)
-        let turnKindsByNodeID = Dictionary(uniqueKeysWithValues: settledNodes.map {
+        let turnKindsByNodeID = Dictionary(settledNodes.map {
             ($0.id, copiedField.cachedTurnKind(for: $0))
-        })
+        }, uniquingKeysWith: { first, _ in first })
         let eligible = settledNodes.filter {
             workspaceEligible(
                 $0,

@@ -106,6 +106,7 @@ public struct WorkshopPump: Sendable {
         case postureNotNormal   // organism not in a green window (H4)
         case resourcePressure   // low power / thermal
         case quiet              // nothing due — ZERO dispatch
+        case unavailable(String) // canonical storage could not be read or settled
         case leaseHeld          // background-work lease already spent this window (H4)
         case reservationRefused // canonical reservation/durability refusal — ZERO LLM (H3)
         case ran(WorkshopSessionStatus)
@@ -113,21 +114,27 @@ public struct WorkshopPump: Sendable {
 
     @discardableResult
     public func tick() async -> TickOutcome {
+        do {
+            return try await tickChecked()
+        } catch {
+            return .unavailable(String(error.localizedDescription.prefix(600)))
+        }
+    }
+
+    private func tickChecked() async throws -> TickOutcome {
         // ---- 1. ZERO-EFFECT DURABLE REPAIR ----
         // Repair admitted/terminal bookkeeping even when new autonomous work
         // is disabled or the machine is conserving resources. This crosses no
         // provider/tool boundary and prevents disabled mode from preserving
         // zombie reservations forever.
-        guard var state = try? await store.liveState() else {
-            return .quiet
-        }
+        var state = try await store.liveState()
 
         // Finish any terminal result that was durably produced before a prior
         // process exited. A claimed attempt with no result is settled blocked:
         // replaying it could duplicate tool effects, while leaving it open
         // forever creates a zombie reservation.
-        await reconcileClaimedAttempts(from: state)
-        if let refreshed = try? await store.liveState() { state = refreshed }
+        try await reconcileAttempts(from: state)
+        state = try await store.liveState()
 
         // ---- 2a. BUDGET-EXHAUSTION CLOSURE (2026-08-08) ----
         // A pursuit whose session budget is spent can never be picked again
@@ -136,42 +143,37 @@ public struct WorkshopPump: Sendable {
         // pursuits starve the volition lane FOREVER (live case: both slots
         // heading to 12/12 with zero terminal paths). Its own written
         // abandonCondition promises "I close it with a note", so honor that
-        // mechanically: receipt first, then cancel. Best-effort — a store
-        // refusal (e.g. open children) logs and retries on a later tick.
+        // mechanically: receipt first, then cancel. A refused settlement fails
+        // the tick and remains pending for the next owner event.
         for item in state.items {
             guard item.isPursuit, item.origin == .agent, !item.status.isTerminal,
                   let p = item.pursuit, p.sessionsUsed >= p.maxSessions else { continue }
-            do {
-                // CAS close (gpt-5.5 review): re-verifies live + untouched
-                // under the ops flock, so a mutation landing between our
-                // state read and the close skips this sweep (retries next
-                // tick) instead of being stomped.
-                if let satisfied = p.reservations.last(where: {
-                    $0.disposition == .goalSatisfied && $0.completedAt != nil
-                }), verifyArtifactRefs(satisfied.artifactRefs, handle: item.handle) {
-                    _ = try await store.closePursuitIfGoalSatisfied(
-                        item.handle,
-                        reservationId: satisfied.reservationId,
-                        expectedUpdatedAt: item.updatedAt,
-                        outcomeSummary: satisfied.receipt ?? "Pursuit goal satisfied."
-                    )
-                } else {
-                    _ = try await store.closeItemIfUnchanged(
-                        item.handle,
-                        expectedUpdatedAt: item.updatedAt,
-                        outcomeSummary: "abandon-condition close: session budget exhausted "
-                            + "(\(p.sessionsUsed)/\(p.maxSessions)) with no verified completion — "
-                            + "closed per the pursuit's own abandon condition.",
-                        canceled: true
-                    )
-                }
-            } catch {
-                NSLog("[workshop] exhausted-pursuit close failed for %@: %@",
-                      item.handle, String(describing: error))
+            // CAS close (gpt-5.5 review): re-verifies live + untouched
+            // under the ops flock, so a mutation landing between our
+            // state read and the close skips this sweep (retries next
+            // tick) instead of being stomped.
+            if let satisfied = p.reservations.last(where: {
+                $0.disposition == .goalSatisfied && $0.completedAt != nil
+            }), verifyArtifactRefs(satisfied.artifactRefs, handle: item.handle) {
+                _ = try await store.closePursuitIfGoalSatisfied(
+                    item.handle,
+                    reservationId: satisfied.reservationId,
+                    expectedUpdatedAt: item.updatedAt,
+                    outcomeSummary: satisfied.receipt ?? "Pursuit goal satisfied."
+                )
+            } else {
+                _ = try await store.closeItemIfUnchanged(
+                    item.handle,
+                    expectedUpdatedAt: item.updatedAt,
+                    outcomeSummary: "abandon-condition close: session budget exhausted "
+                        + "(\(p.sessionsUsed)/\(p.maxSessions)) with no verified completion — "
+                        + "closed per the pursuit's own abandon condition.",
+                    canceled: true
+                )
             }
         }
 
-        if let refreshed = try? await store.liveState() { state = refreshed }
+        state = try await store.liveState()
 
         // ---- 2. NEW-WORK GATES ----
         guard await isEnabled() else { return .disabled }
@@ -220,14 +222,23 @@ public struct WorkshopPump: Sendable {
         }
         // Desk's O_APPEND return establishes ordering but does not itself call
         // fsync. Flush the canonical op log, then re-read the reservation before
-        // crossing the provider boundary. Any flush/read failure consumes the
-        // slot but spends zero tokens (fail closed).
-        guard flushReservationLog(store.opsPath),
-              let reservedState = try? await store.liveState(),
-              let reservedItem = reservedState.items.first(where: { $0.handle == candidate.handle }),
-              Self.hasLiveAttempt(reservationId, on: reservedItem) else {
+        // crossing the provider boundary. Failure spends zero tokens; settle
+        // the unclaimed reservation now if storage is readable, or on its next
+        // recovery edge.
+        do {
+            guard flushReservationLog(store.opsPath) else {
+                throw WorkshopExecutionError.persistenceFailure("Desk reservation log could not be flushed; restore Desk storage before continuing work")
+            }
+            let reservedState = try await store.liveState()
+            guard let reservedItem = reservedState.items.first(where: { $0.handle == candidate.handle }),
+                  Self.hasLiveAttempt(reservationId, on: reservedItem) else {
+                throw WorkshopExecutionError.persistenceFailure("Desk reservation is no longer live; inspect its saved settlement before continuing work")
+            }
+        } catch {
             _ = await lease.releaseUnused(holder: "workshop", window: window)
-            return .reservationRefused
+            let pending = try await store.liveState()
+            try await reconcileAttempts(from: pending)
+            throw error
         }
 
         // Record the volition BEFORE running (Wave C): the choice is auditable
@@ -239,7 +250,7 @@ public struct WorkshopPump: Sendable {
             do {
                 _ = try await store.appendWorkReceipt(candidate.handle, receipt: "chose: \(candidate.choiceRationale)")
             } catch {
-                NSLog("[workshop] choice rationale not recorded for %@: %@",
+                nativeLog("[workshop] choice rationale not recorded for %@: %@",
                       candidate.handle, String(describing: error))
             }
         }
@@ -275,7 +286,8 @@ public struct WorkshopPump: Sendable {
                 _ = try await store.completeWorkAttempt(
                     candidate.handle,
                     attemptId: reservationId,
-                    receipt: receiptLine
+                    receipt: receiptLine,
+                    disposition: receipt.disposition
                 )
                 // 2026-09-22: a blocked owner cadence re-ran on schedule with the
                 // same "blocked" (Desk 618, 4x). Park it only when its own clean
@@ -289,7 +301,7 @@ public struct WorkshopPump: Sendable {
             }
             deskSettled = true
         } catch {
-            NSLog("[workshop] terminal Desk settlement failed for %@/%@: %@",
+            nativeLog("[workshop] terminal Desk settlement failed for %@/%@: %@",
                   candidate.handle, reservationId, String(describing: error))
         }
         let receiptSettled = await receiptLog.append(receipt)
@@ -298,7 +310,7 @@ public struct WorkshopPump: Sendable {
                 try await store.handOffWorkReceipt(candidate.handle, reservationId: reservationId)
                 WorkshopSessionResultStore(dataRoot: dataRoot, platform: platform).remove(reservationId: reservationId)
             } catch {
-                NSLog("[workshop] receipt handoff acknowledgement failed for %@/%@: %@",
+                nativeLog("[workshop] receipt handoff acknowledgement failed for %@/%@: %@",
                       candidate.handle, reservationId, String(describing: error))
             }
         }
@@ -345,8 +357,9 @@ public struct WorkshopPump: Sendable {
         }
     }
 
-    private func reconcileClaimedAttempts(from state: DeskState) async {
+    private func reconcileAttempts(from state: DeskState) async throws {
         let results = WorkshopSessionResultStore(dataRoot: dataRoot, platform: platform)
+        let claims = WorkshopReservationClaimStore(dataRoot: dataRoot)
         var loggedReservations: [String: Set<String>]?
         for item in state.items {
             var attempts: [(id: String, ownerCadence: Bool, completed: Bool, handedOff: Bool)] =
@@ -356,79 +369,84 @@ public struct WorkshopPump: Sendable {
             attempts.append(contentsOf: item.workAttempts.map {
                 (id: $0.attemptId, ownerCadence: true, completed: $0.completedAt != nil, handedOff: $0.receiptHandedOff)
             })
-            for attempt in attempts where results.hasClaim(reservationId: attempt.id) {
+            for attempt in attempts {
+                if !results.hasClaim(reservationId: attempt.id) {
+                    if attempt.completed { continue }
+                    guard claims.claim(handle: item.handle, reservationId: attempt.id, unstarted: true)
+                            || results.hasClaim(reservationId: attempt.id) else {
+                        throw WorkshopExecutionError.persistenceFailure("Workshop reservation \(attempt.id) could not be reconciled; restore its claim storage before continuing work")
+                    }
+                }
                 let attemptId = attempt.id
+                let unstarted = try claims.isUnstarted(reservationId: attemptId)
                 let durable = results.load(reservationId: attemptId)
                 if durable == nil, results.hasResult(reservationId: attemptId) {
-                    NSLog("[workshop] pending terminal result is unreadable for %@/%@; retained",
-                          item.handle, attemptId)
-                    continue
+                    throw WorkshopExecutionError.persistenceFailure("Workshop terminal result \(item.handle)/\(attemptId) is unreadable; restore it before continuing work")
                 }
                 if attempt.completed, durable == nil {
                     if attempt.handedOff { continue }
-                    do {
-                        if loggedReservations == nil {
-                            loggedReservations = try await receiptLog.reservationIdsByHandle()
-                        }
-                        if loggedReservations?[item.handle]?.contains(attemptId) == true {
-                            try await store.handOffWorkReceipt(item.handle, reservationId: attemptId)
-                        }
-                    } catch {
-                        NSLog("[workshop] prior receipt acknowledgement failed for %@/%@: %@",
-                              item.handle, attemptId, String(describing: error))
+                    if loggedReservations == nil {
+                        loggedReservations = try await receiptLog.reservationIdsByHandle()
+                    }
+                    if loggedReservations?[item.handle]?.contains(attemptId) == true {
+                        try await store.handOffWorkReceipt(item.handle, reservationId: attemptId)
                     }
                     continue
                 }
-                let receipt = durable ?? WorkshopSessionReceipt(
+                let receipt = (unstarted ? nil : durable) ?? WorkshopSessionReceipt(
                     handle: item.handle,
                     reservationId: attemptId,
-                    status: .blocked,
-                    summary: "execution was durably admitted but interrupted before a terminal result; not replayed to avoid duplicate effects",
+                    status: unstarted ? .refused : .blocked,
+                    summary: unstarted
+                        ? "reservation was interrupted before execution admission; no work ran and its budget charge was released"
+                        : "execution was durably admitted but interrupted before a terminal result; not replayed to avoid duplicate effects",
                     model: nil,
                     artifactPaths: [],
                     generatedAt: now(),
-                    disposition: .blocked
+                    disposition: unstarted ? .unstarted : .blocked
                 )
-                let line = "[\(receipt.status.rawValue)] \(receipt.summary)"
-                do {
-                    if !attempt.completed {
-                        if attempt.ownerCadence {
-                            _ = try await store.completeWorkAttempt(
-                                item.handle,
-                                attemptId: attemptId,
-                                receipt: line
-                            )
-                        } else {
-                            _ = try await store.completeWorkSession(
-                                item.handle,
-                                reservationId: attemptId,
-                                receipt: line,
-                                disposition: receipt.disposition == .goalSatisfied &&
-                                    !verifyArtifactRefs(receipt.artifactPaths, handle: item.handle)
-                                    ? .progress
-                                    : receipt.disposition,
-                                artifactRefs: receipt.artifactPaths
-                            )
-                        }
+                if !attempt.completed, unstarted || durable == nil {
+                    guard results.save(receipt) else {
+                        throw WorkshopExecutionError.persistenceFailure("Workshop recovery result \(attemptId) could not be persisted; restore Workshop storage before continuing work")
                     }
-                    if attempt.ownerCadence, receipt.disposition == .blocked, receipt.status == .completed {
-                        _ = try await store.setStatus(item.handle, status: .blocked,
-                                                      blockedReason: String(receipt.summary.prefix(600)))
-                    }
-                    if !attempt.ownerCadence {
-                        let disposition: DeskWorkDisposition = receipt.disposition == .goalSatisfied &&
-                            !verifyArtifactRefs(receipt.artifactPaths, handle: item.handle)
-                            ? .progress : receipt.disposition
-                        try await settlePursuitDisposition(receipt, disposition: disposition)
-                    }
-                    if await receiptLog.append(receipt) {
-                        try await store.handOffWorkReceipt(item.handle, reservationId: attemptId)
-                        results.remove(reservationId: attemptId)
-                    }
-                } catch {
-                    NSLog("[workshop] restart reconciliation failed for %@/%@: %@",
-                          item.handle, attemptId, String(describing: error))
                 }
+                let line = "[\(receipt.status.rawValue)] \(receipt.summary)"
+                if !attempt.completed {
+                    if attempt.ownerCadence {
+                        _ = try await store.completeWorkAttempt(
+                            item.handle,
+                            attemptId: attemptId,
+                            receipt: line,
+                            disposition: receipt.disposition
+                        )
+                    } else {
+                        _ = try await store.completeWorkSession(
+                            item.handle,
+                            reservationId: attemptId,
+                            receipt: line,
+                            disposition: receipt.disposition == .goalSatisfied &&
+                                !verifyArtifactRefs(receipt.artifactPaths, handle: item.handle)
+                                ? .progress
+                                : receipt.disposition,
+                            artifactRefs: receipt.artifactPaths
+                        )
+                    }
+                }
+                if attempt.ownerCadence, receipt.disposition == .blocked, receipt.status == .completed {
+                    _ = try await store.setStatus(item.handle, status: .blocked,
+                                                  blockedReason: String(receipt.summary.prefix(600)))
+                }
+                if !attempt.ownerCadence {
+                    let disposition: DeskWorkDisposition = receipt.disposition == .goalSatisfied &&
+                        !verifyArtifactRefs(receipt.artifactPaths, handle: item.handle)
+                        ? .progress : receipt.disposition
+                    try await settlePursuitDisposition(receipt, disposition: disposition)
+                }
+                guard await receiptLog.append(receipt) else {
+                    throw WorkshopExecutionError.persistenceFailure("Workshop receipt \(item.handle)/\(attemptId) could not be persisted; restore Workshop storage before continuing work")
+                }
+                try await store.handOffWorkReceipt(item.handle, reservationId: attemptId)
+                results.remove(reservationId: attemptId)
             }
         }
     }
@@ -455,12 +473,12 @@ public struct WorkshopPump: Sendable {
         // no work, every tick, for the rest of the day.
         let globalToday = state.workSessions(on: today)
         let globalCapHit = globalToday >= SwiftNativeDeskStore.maxWorkSessionsGlobalPerDay
-        let liveBlockers = Set(state.items.filter { !$0.status.isTerminal }.map(\.handle))
+        let sequencing = DeskSequencing.compute(state, now: now)
 
         // Self-pursuits first — eligible ones are those within budget.
         let pursuits = globalCapHit ? [] : state.items.filter { item in
             guard item.isPursuit, !item.status.isTerminal, item.status != .blocked,
-                  !item.blockedOn.contains(where: { $0 != item.handle && liveBlockers.contains($0) }),
+                  sequencing.byHandle[item.handle]?.isReady == true,
                   let p = item.pursuit else { return false }
             let usedSessions = p.sessionsUsed
             let todayCount = state.workSessions(on: today, handle: item.handle)
@@ -516,11 +534,9 @@ public struct WorkshopPump: Sendable {
         }
 
         // Else User items with a beating cadence that is due.
-        // Effective blockers only, as DeskSequencing derives them: a stored
-        // handle that has closed or left live state no longer blocks.
         let userDue = globalCapHit ? [] : state.items.filter { item in
             guard !item.isPursuit, !item.status.isTerminal, item.status != .blocked,
-                  !item.blockedOn.contains(where: { $0 != item.handle && liveBlockers.contains($0) })
+                  sequencing.byHandle[item.handle]?.isReady == true
             else { return false }
             switch item.cadence.mode {
             case .tick, .daily, .weekly: break
@@ -582,6 +598,15 @@ public struct WorkshopPump: Sendable {
         let eligibleOwnerCadenceItems = ownerCadenceItems.filter { item in
             state.workSessions(on: today, handle: item.handle) == 0
         }
+        // Ancestor deferrals also hold ready children; their exact crossing
+        // must wake selection even if no Desk mutation occurs that day.
+        if !eligiblePursuits.isEmpty || !ownerCadenceItems.isEmpty {
+            candidates += state.items.compactMap { item in
+                guard let raw = item.deferUntil,
+                      let due = DeskSequencing.parseDeferStamp(raw), due > now else { return nil }
+                return due
+            }
+        }
         if !eligiblePursuits.isEmpty || !eligibleOwnerCadenceItems.isEmpty {
             if globalToday >= SwiftNativeDeskStore.maxWorkSessionsGlobalPerDay {
                 candidates.append(nextUTCDateBoundary(after: now))
@@ -637,7 +662,7 @@ public struct WorkshopPump: Sendable {
     public static func choiceScore(for item: DeskItem, now: Date = Date()) -> PursuitChoiceScore? {
         guard item.isPursuit, let p = item.pursuit else { return nil }
         let reservations = p.reservations
-        let completed = p.retiredSessions + reservations.filter { $0.completedAt != nil }.count
+        let completed = p.retiredSessions + reservations.filter { $0.completedAt != nil && $0.disposition != .unstarted }.count
         let openReservations = reservations.filter { $0.completedAt == nil }.count
 
         // Evidence strength: breadth × diversity of NON-FRICTION citations only.
@@ -955,7 +980,7 @@ public actor WorkshopReceiptLog {
             }
             return true
         } catch {
-            NSLog("[workshop] compact receipt append failed for %@/%@: %@",
+            nativeLog("[workshop] compact receipt append failed for %@/%@: %@",
                   receipt.handle, receipt.reservationId, String(describing: error))
             return false
         }

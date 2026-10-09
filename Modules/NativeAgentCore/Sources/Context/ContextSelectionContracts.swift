@@ -476,6 +476,8 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
     /// How the memory came to be known (`verified` / `told by X` / `inferred`),
     /// when the record says. nil on rows written before provenance existed.
     public let provenance: ContextMemoryProvenance?
+    /// Untrusted sources of the selected text, retained from its exact atom.
+    public let untrustedSources: [String]?
 
     public init(
         pointer: ContextAtomPointer,
@@ -484,7 +486,8 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
         mandatory: Bool,
         summary: String? = nil,
         recordedAt: Date? = nil,
-        provenance: ContextMemoryProvenance? = nil
+        provenance: ContextMemoryProvenance? = nil,
+        untrustedSources: [String]? = nil
     ) {
         self.pointer = pointer
         self.text = text
@@ -495,6 +498,7 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
         self.summary = (trimmedSummary?.isEmpty == false) ? trimmedSummary : nil
         self.recordedAt = recordedAt
         self.provenance = provenance
+        self.untrustedSources = untrustedSources
     }
 
     /// The item as built from the atom it came from: identical to the
@@ -514,7 +518,8 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
             mandatory: mandatory,
             summary: atom.draft.deterministicSummary,
             recordedAt: ContextMemoryLead.recordedAt(for: atom.draft),
-            provenance: ContextMemoryLead.provenance(for: atom.draft)
+            provenance: ContextMemoryLead.provenance(for: atom.draft),
+            untrustedSources: ContextMemoryLead.untrustedSources(for: atom.draft)
         )
     }
 }

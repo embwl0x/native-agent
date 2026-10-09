@@ -42,14 +42,14 @@ enum VoiceOutputModeSelection {
         do {
             return resolve(for: try await trust.load())
         } catch {
-            return .policyUnreadable(reason: error.localizedDescription)
+            return .policyUnreadable(reason: UserFacingError.cause(error, action: "read the voice policy"))
         }
     }
 }
 
 /// A selected OpenAI voice that cannot speak says so and reads nothing — it
 /// never switches to the Mac voice (S12, 2026-09-26). Preflight failures get a
-/// plain sentence; every other failure surfaces its own description.
+/// plain sentence; every other failure gets one plain line (raw in the log).
 enum OpenAIVoiceFailure {
     static func message(for error: Error) -> String {
         switch error {
@@ -62,7 +62,7 @@ enum OpenAIVoiceFailure {
             // quietly call a different provider or another voice.
             return "The provider Chat runs on has no cloud voice. Nothing was read aloud."
         default:
-            return error.localizedDescription
+            return UserFacingError.message(error, action: "read that aloud")
         }
     }
 }
@@ -171,7 +171,7 @@ final class VoiceOutputController: NSObject {
         case .policyUnreadable(let reason):
             stop()
             guard !text.isEmpty, !VoicePreference.quiet() else { return }
-            errorMessage = "Voice policy could not be read (\(reason)). Nothing was read aloud."
+            errorMessage = "Couldn't read the voice settings, so nothing was read aloud. \(reason)"
             errorOwnerID = ownerID
         }
     }
@@ -372,12 +372,12 @@ extension VoiceOutputController: AVAudioPlayerDelegate {
 
     nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         let playerID = ObjectIdentifier(player)
-        let message = error?.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let error { nativeLog("%@", "[voice] audio decode failed: \(error)") }
         Task { @MainActor in
             guard self.audioPlayer.map(ObjectIdentifier.init) == playerID else { return }
             self.audioPlayer = nil
             self.errorOwnerID = self.speechOwnerID
-            self.errorMessage = message.flatMap { $0.isEmpty ? nil : $0 } ?? "The audio couldn't be played."
+            self.errorMessage = "The audio couldn't be played."
             self.isSpeaking = false
             self.speechOwnerID = nil
         }

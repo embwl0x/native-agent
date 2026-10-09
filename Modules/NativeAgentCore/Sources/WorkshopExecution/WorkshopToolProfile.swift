@@ -324,6 +324,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         guard Set(input.keys) == Set(["disposition", "summary"]),
               case .string(let raw)? = input["disposition"],
               let disposition = DeskWorkDisposition(rawValue: raw),
+              disposition != .unstarted,
               case .string(let summary)? = input["summary"],
               !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw WorkshopMembraneError.badArtifactArgs("workshop_progress requires a valid disposition and non-empty summary")

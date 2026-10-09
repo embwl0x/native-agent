@@ -9,6 +9,8 @@ import ChromeControl
 import Desk
 import StandingBots
 import WorkshopExecution
+import Senses
+import SwarmRuns
 
 /// Her home screen (2026-09-23, her-screen plan Phase 1): the agent's own
 /// world as one laid-out text page, the way a desktop is a picture for a
@@ -75,16 +77,20 @@ package enum HerScreen {
     /// nothing is written (names.json, remembered verbs and item pages).
     @TaskLocal static var previewing = false
 
-    static func withNames<T>(_ dataRoot: URL, _ body: (inout NameBook) -> T) -> T {
+    static func withNames<T>(_ dataRoot: URL,
+                             onWriteFailure: (Error) -> Void = { nativeLog("Workspace names could not be saved: %@", $0.localizedDescription) },
+                             _ body: (inout NameBook) -> T) -> T {
         let url = dataRoot.appendingPathComponent("her_screen/names.json")
         namesLock.lock(); defer { namesLock.unlock() }
         let old = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(NameBook.self, from: $0) } ?? NameBook()
         var book = old
         let result = body(&book)
         if book != old, !previewing {
-            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-            try? encoder.encode(book).write(to: url, options: .atomic)
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+                try encoder.encode(book).write(to: url, options: .atomic)
+            } catch { onWriteFailure(error) }
         }
         return result
     }
@@ -104,8 +110,8 @@ package enum HerScreen {
     static let verbs: Set<String> = ["say", "run", "settings", "note", "done", "drop", "status", "add", "go", "click", "fill", "more"]
 
     /// Whether her screen names `raw` (desk.4, desk.4.note, claude.say),
-    /// as `item` opens or does it: the door refuses such a name given as an
-    /// action with the item call to make instead.
+    /// as `item` opens or does it: the door opens such a name given as an
+    /// action as that item.
     package static func isName(_ raw: String, dataRoot: URL, scope: String) async -> Bool {
         await resolve(raw, dataRoot: dataRoot, scope: scope, browserPages: []) != nil
     }
@@ -116,6 +122,9 @@ package enum HerScreen {
     static func resolve(_ raw: String, dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation],
                         openPlaces: [AgentWorkspaceLocation] = [], currentPlace: AgentWorkspaceLocation? = nil) async -> Target? {
         var name = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if name == "senses" {
+            return .page("MY SENSES\n" + (await sensesRows(now: Date(), full: true)).joined(separator: "\n"))
+        }
         // The mac room's verbs: `mac.look Calculator`, or `mac.look` with the app as text.
         for (prefix, tool, field) in [("mac.look", "screen", "app"), ("mac.go", "go", "name")]
             where name == prefix || name.hasPrefix(prefix + " ") {
@@ -172,10 +181,14 @@ package enum HerScreen {
            let id = withNames(dataRoot, { $0.id("crew", n) }) {
             return crewPage(id: id, name: name, dataRoot: dataRoot).map(Target.page)
         }
-        if verb == nil, name.hasPrefix("chat."), let n = Int(name.dropFirst(5)),
-           let id = withNames(dataRoot, { $0.id("chat", n) }) {
-            let title = bridgeChats(dataRoot: dataRoot).first { $0.id == id }?.title ?? "Conversation"
-            return open(.record(tool: "chat_conversations", input: ["conversation_session_id": .string(id)], title: title))
+        if verb == nil, name.hasPrefix("chat.") || UUID(uuidString: name) != nil || name == scope.lowercased() {
+            let id = name.hasPrefix("chat.") ? Int(name.dropFirst(5)).flatMap { n in withNames(dataRoot, { $0.id("chat", n) }) } : raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let id, let row = try? HumanConversationIndex.rows(dataRoot: dataRoot).first(where: {
+                HumanConversationIndex.string($0["id"])?.caseInsensitiveCompare(id) == .orderedSame
+            }), let session = HumanConversationIndex.string(row["id"]) {
+                return open(.record(tool: "chat_conversations", input: ["conversation_session_id": .string(session)],
+                                    title: HumanConversationIndex.string(row["title"]) ?? "Conversation"))
+            }
         }
         if verb == nil, name.hasPrefix("browser.tab"), let n = Int(name.dropFirst(11)),
            let id = withNames(dataRoot, { $0.id("browser.tab", n) }),
@@ -226,14 +239,14 @@ package enum HerScreen {
     /// Home reads the shared world, shows what changed since she last looked
     /// (CHANGED, newest first), and her looking advances that. `markSeen:
     /// false` is User's Agent view reading the same page without looking.
-    static func home(dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation], windows: [String] = [],
+    static func home(dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation], windows: [String] = [], notable: String? = nil,
                      now: Date = Date(), markSeen: Bool = true) async -> String {
         let (agent, person) = names(dataRoot)
         let world = await readWorld(dataRoot, now: now)
         let seen = await lastSeen(dataRoot)
         let idle = idleSeconds()
         let connected = BrowserConnectionMirror.connected == true
-        let page = ChromePageMirror.page(lease: nil, session: scope)
+        let page = ChromePageMirror.page(tab: nil, session: scope)
         var marks = worldMarks(world, dataRoot: dataRoot, person: person, now: now)
         // What only home shows (walk 3: all four of these changed and home
         // said "no changes"): presence, the Chrome link, the day's badges and
@@ -249,7 +262,7 @@ package enum HerScreen {
             let words = HerLifePulse.shared.latest(name).flatMap { Calendar.current.isDate($0.at, inSameDayAs: now) ? $0.words : nil } ?? ""
             shown["home:" + name] = Mark(fp: words, line: words.isEmpty ? "" : name + ": " + words, at: now.timeIntervalSince1970)
         }
-        let tabs: [(id: String, title: String)] = page.map { [("lease:" + $0.lease, tabTitle($0))] }
+        let tabs: [(id: String, title: String)] = page.map { [("tab:" + String($0.tab), tabTitle($0))] }
             ?? browserPages.compactMap { place in AgentWorkspaceNavigation.placeIdentity(place).map { ($0, place.title) } }
         // Tabs are per chat: another chat's saved tabs pass through untouched
         // (a day at most), so its home never calls them closed here.
@@ -283,6 +296,7 @@ package enum HerScreen {
 
         let rule = String(repeating: "─", count: 61)
         var lines = [header.joined(separator: " · "), rule]
+        if let notable { lines.append(pad("NOTABLE TODAY", 14) + notable) }
         if !changed.isEmpty {
             lines += section("CHANGED", changed.prefix(5).map { "● " + clip($0, 70) } + (changed.count > 5 ? ["+\(changed.count - 5) more"] : []))
         }
@@ -300,6 +314,7 @@ package enum HerScreen {
         let fixed = lines.count
         lines += section("PEOPLE", columns(people) + (peopleMore > 0 ? ["+\(peopleMore) more · item \"people\""] : []))
         lines += section("HELPERS", columns(helpers) + (helpersMore > 0 ? ["+\(helpersMore) more · item \"helpers\""] : []))
+        lines += section("MY SENSES", await sensesRows(now: now))
         lines += section("ELSEWHERE", elsewhereRows(dataRoot: dataRoot, scope: scope, person: person, now: now))
 
         // Places always show: pulse where an owner has a cheap number, the bare
@@ -322,7 +337,9 @@ package enum HerScreen {
         }
         let pulses = ["mail": mailPulse(now: now), "calendar": lifePulse("calendar", now: now), "desk": desk.pulse,
                       "browser": browser, "reminders": lifePulse("reminders", now: now)]
-        lines += section("PLACES", placeRows.map { $0.map { pulses[$0] ?? $0 }.joined(separator: " · ") })
+        // Gmail shows once it is connected (User's Gmail is read through Apple Mail).
+        lines += section("PLACES", placeRows.map { $0.filter { $0 != "gmail" || AgentWorkspaceReadiness.ready(tool: "gmail_search") }
+            .map { pulses[$0] ?? $0 }.joined(separator: " · ") })
         let mine = touched(dataRoot: dataRoot, now: now)
         lines += section("MAC", [await macFront(person) + " · Mac apps I acted in: "
             + (mine.isEmpty ? "none" : mine.prefix(4).map { clip($0.app, 30) + ($0.readout.map { " · " + clip($0, 20) } ?? "") }
@@ -440,7 +457,7 @@ package enum HerScreen {
     struct Contact { let id: String; let name: String; let builtIn: Bool; let kind: String?; var agents: [String] = [] }
 
     /// A chat another agent opened with her over the bridge, from the session
-    /// index alone: the bridge titles it "[from: X, via bridge] …". Newest first.
+    /// index and persisted bridge identity. Its title is display only. Newest first.
     /// `heard` is the other side's newest message: `at` also moves for hers.
     /// `answered`: her message is the newest in the chat, so what they said there she has seen.
     package struct BridgeChat { package let id: String; package let who: String; package let title: String; package let at: Date; package var heard: Date? = nil; package var answered = false }
@@ -448,15 +465,15 @@ package enum HerScreen {
     package static func bridgeChats(dataRoot: URL) -> [BridgeChat] {
         var chats: [BridgeChat] = ((try? HumanConversationIndex.rows(dataRoot: dataRoot)) ?? []).compactMap { row in
             guard let id = HumanConversationIndex.string(row["id"]),
-                  let raw = HumanConversationIndex.string(row["title"]), raw.hasPrefix("[from: "),
+                  let sender = AgentWorkSession.bridgeSender(sessionID: id, dataRoot: dataRoot),
                   let at = HumanConversationIndex.string(row["updatedAt"]).flatMap(date) else { return nil }
+            let raw = HumanConversationIndex.string(row["title"]) ?? sender.topic
             let named = humanTitle(raw, agentName: nil)
-            guard let who = named.who?.lowercased() else { return nil }
             // The index keeps a title's first 60 characters; its last word may be cut.
             var title = named.title
             if raw.count >= 60, let space = title.lastIndex(of: " ") { title = String(title[..<space]) + "…" }
             if let summary = HumanConversationIndex.string(row["summary"]) { title = clip(summary, 56) }
-            return .init(id: id, who: who, title: title, at: at)
+            return .init(id: id, who: sender.sender, title: title, at: at)
         }
         // When the other side last spoke, from the log's last 32 KB, for each
         // sender's two newest chats (the one she may be in, and the one before).
@@ -517,7 +534,7 @@ package enum HerScreen {
         guard !AgentContactIdentity(dataRoot: dataRoot).owners(owner).contains(where: {
             scope?.hasPrefix(ContactThread.prefix(owner: $0)) == true
         }) else { return nil }
-        let tail = ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536)
+        guard let tail = try? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536) else { return nil }
         guard let last = tail.last else { return nil }
         return BridgeChat(id: ContactThread.session(owner: owner), who: contact.id, title: "", at: last.at,
                           heard: tail.last { !$0.mine }?.at, answered: last.mine)
@@ -559,6 +576,7 @@ package enum HerScreen {
                 text = "✓ replied " + age(now.timeIntervalSince(at))
             } else { text = "sent " + ago }
         } else { text = "idle" }
+        if let word = health?.word { text = word + " · " + text }
         if let kind = contact.kind { text += " · " + kind }
         return (text, asks)
     }
@@ -638,7 +656,7 @@ package enum HerScreen {
     // MARK: Crews
 
     private static func crewRows(_ world: HerWorld, dataRoot: URL, now: Date) -> [String] {
-        let live = world.crews
+        let live = world.crews.filter { $0["pid"] != nil }
         return withNames(dataRoot) { book in
             live.compactMap { row -> String? in
                 guard let id = row["id"] as? String else { return nil }
@@ -646,8 +664,7 @@ package enum HerScreen {
                 let working = workers.filter { ($0["status"] as? String ?? "working") == "working" }.count
                 let started = (row["createdAt"] as? String).flatMap(date)
                 let n = book.number("crew", id: id) {
-                    Set((rows(dataRoot.appendingPathComponent("swarms/live.json"))
-                        + rows(dataRoot.appendingPathComponent("swarms/runs.json"))).compactMap { $0["id"] as? String })
+                    Set(world.crews.compactMap { $0["id"] as? String })
                 }
                 return pad("crew.\(n)", 10) + clip(firstLine(row["objective"] as? String ?? "A task"), 40)
                     + " · \(working) of \(workers.count) working" + (started.map { " · " + age(now.timeIntervalSince($0)) } ?? "")
@@ -667,8 +684,10 @@ package enum HerScreen {
 
     /// Opening a crew: its task, each worker's state and first line.
     static func crewPage(id: String, name: String, dataRoot: URL) -> String? {
-        let row = rows(dataRoot.appendingPathComponent("swarms/live.json")).first { $0["id"] as? String == id }
-            ?? rows(dataRoot.appendingPathComponent("swarms/runs.json")).first { $0["id"] as? String == id }
+        let all: [[String: Any]]
+        do { all = try SwiftNativeSwarmRunsReader(runsPath: dataRoot.appendingPathComponent("swarms/runs.json")).readCrews() }
+        catch { return "Crew unavailable: \(error.localizedDescription)" }
+        let row = all.first { $0["id"] as? String == id }
         guard let row else { return nil }
         let workers = row["workers"] as? [[String: Any]] ?? []
         var lines = [name + " · " + clip(firstLine(row["objective"] as? String ?? "A task"), 80) + " · "
@@ -689,6 +708,29 @@ package enum HerScreen {
     }
 
     // MARK: - Small readers
+
+    private static func sensesRows(now: Date, full: Bool = false) async -> [String] {
+        guard let registry = SensesHub.shared.registry else { return ["have: senses not connected yet"] }
+        async let records = registry.all()
+        async let news = SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity)
+        let all: [SenseRecord]
+        do { all = try await records }
+        catch { return ["have: senses unavailable · \(error.localizedDescription)"] }
+        let active = all.filter { $0.status == .on }.sorted { $0.corner.key < $1.corner.key }
+        let corners = active.prefix(full ? active.count : 5).map { full ? $0.corner.key : clip($0.corner.key, 36) }.joined(separator: ", ")
+        var rows = ["have: " + (active.isEmpty ? "none yet" : corners)
+            + (!full && active.count > 5 ? " +\(active.count - 5) more" : "")]
+        let grown = all.filter { $0.origin == .grown && $0.status == .on && now.timeIntervalSince($0.createdAt) < 86_400 }
+            .sorted { $0.createdAt > $1.createdAt }.prefix(full ? all.count : 2)
+        let changes = grown.map { (full ? $0.corner.key : clip($0.corner.key, 32)) + " v\($0.version) grew" }
+            + (await news).filter { now.timeIntervalSince($0.at) < 86_400 }
+                .prefix(full ? Int.max : 2).map { full ? $0.summary : clip($0.summary, 60) }
+        rows.append("just changed: " + (changes.isEmpty ? "nothing recent" : changes.joined(separator: " · ")))
+        rows += all.filter { $0.status == .unavailable }.prefix(full ? all.count : 2).map {
+            "unavailable: \($0.corner.key) · \($0.unavailableReason ?? "repair the sense and switch it on to retry")"
+        }
+        return rows
+    }
 
     static func rows(_ url: URL) -> [[String: Any]] {
         guard let data = try? Data(contentsOf: url) else { return [] }

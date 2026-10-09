@@ -325,7 +325,7 @@ public actor SelfImprovementOrchestrator {
             pending[run.id] = run
         }
         if !undecodedPending.isEmpty {
-            NSLog("SelfImprovementOrchestrator: preserving %d undecodable pending_actions entrie(s) verbatim through rewrites",
+            nativeLog("SelfImprovementOrchestrator: preserving %d undecodable pending_actions entrie(s) verbatim through rewrites",
                   undecodedPending.count)
         }
         if expireStalePendingActions() { try await persistPending() }
@@ -353,7 +353,7 @@ public actor SelfImprovementOrchestrator {
             }
         }
         guard !expiredIds.isEmpty else { return false }
-        NSLog("SelfImprovementOrchestrator: expired %d pending_actions entrie(s) past %dd retention: %@",
+        nativeLog("SelfImprovementOrchestrator: expired %d pending_actions entrie(s) past %dd retention: %@",
               expiredIds.count, Int(Self.pendingActionExpirySeconds / 86_400),
               expiredIds.joined(separator: ", "))
         return true

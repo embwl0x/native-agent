@@ -65,7 +65,7 @@ private func makeSpeechRecognitionHandler(
             let nsError = error as NSError
             let ignoredCodes: Set<Int> = [203, 216]
             if nsError.domain != "kAFAssistantErrorDomain" || !ignoredCodes.contains(nsError.code) {
-                let message = error.localizedDescription
+                let message = UserFacingError.message(error, action: "hear that")
                 Task { @MainActor [weak controller] in
                     controller?.receiveNativeRecognitionFailure(
                         message: message,
@@ -315,7 +315,7 @@ final class VoiceInputController {
             try audioEngine.start()
         } catch {
             cleanupRecognition()
-            errorMessage = "Audio engine failed to start: \(error.localizedDescription)"
+            errorMessage = UserFacingError.message(error, action: "start the microphone")
             return
         }
 
@@ -337,7 +337,7 @@ final class VoiceInputController {
                 self.handleRecognitionEvent(event)
             }
         } catch {
-            errorMessage = "Speech recognizer failed to start: \(error.localizedDescription)"
+            errorMessage = UserFacingError.message(error, action: "start speech recognition")
             cleanupRecognition()
         }
     }

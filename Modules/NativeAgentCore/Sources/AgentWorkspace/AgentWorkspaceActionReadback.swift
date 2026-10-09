@@ -3,7 +3,7 @@ import PersistenceCore
 
 /// Completes an already-dispatched action with its owner's current view. This
 /// never repeats an effect, changes tabs, or replaces a receipt with a claim of
-/// success. Browser reads retain the exact lease; Computer reads obtain fresh
+/// success. Browser reads retain the exact tab; Computer reads obtain fresh
 /// bounded controls, and Calendar/Reminders use their canonical bounded lists.
 enum AgentWorkspaceActionReadback {
     struct Readback {
@@ -12,7 +12,7 @@ enum AgentWorkspaceActionReadback {
     }
 
     private static let browserEffects: Set<String> = [
-        "browser.chrome_acquire", "browser.chrome_navigate", "browser.chrome_scroll",
+        "browser.chrome_navigate", "browser.chrome_scroll",
         "browser.chrome_click", "browser.chrome_fill", "browser.chrome_type",
         "browser.chrome_select", "browser.chrome_keypress", "browser.chrome_set_checked",
         "browser.chrome_double_click", "browser.chrome_drag",
@@ -82,12 +82,12 @@ enum AgentWorkspaceActionReadback {
             }
         }
         if browserEffects.contains(tool), status == "outcome_unknown", owner["error"] != nil,
-           let lease = string(input["lease_id"]) {
-            let arguments: [String: JSONValue] = ["lease_id": .string(lease), "max_nodes": .int(80), "max_text_chars": .int(10000)]
+           let tab = integer(input["tab_id"]) {
+            let arguments: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
             let source = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot", input: arguments, title: title)
             do {
                 let fresh = try await perform("browser.chrome_snapshot", arguments)
-                if matches(fresh, lease: lease, sequence: integer(input["expected_user_sequence"])) {
+                if matches(fresh, tab: tab, sequence: integer(input["expected_user_sequence"])) {
                     return .init(location: source, result: attaching(fresh, receipt: receipt))
                 }
                 return .init(location: source, result: unavailable(receipt: receipt, detail: "The selected page is unavailable. Reopen it to read; no browser action was repeated.", observation: fresh))
@@ -122,37 +122,25 @@ enum AgentWorkspaceActionReadback {
               owner["error_code"] == nil else { return nil }
         let actionReceipt = object(owner["receipt"] ?? .null)
         let outcome = string(owner["outcome"]) ?? string(actionReceipt["outcome"])
-        let succeeded = tool == "browser.chrome_acquire" ? owner["state"] == .string("active") : outcome == "succeeded"
+        let succeeded = outcome == "succeeded"
         guard succeeded,
-              let lease = string(owner["leaseId"]) ?? string(actionReceipt["leaseId"]) ?? string(input["lease_id"]) else { return nil }
-        // Even a successful-looking receipt cannot retarget the selected tab.
-        if let selected = string(input["lease_id"]), selected != lease { return nil }
+              let tab = integer(owner["tabId"]) ?? integer(actionReceipt["tabId"]) ?? integer(input["tab_id"]) else { return nil }
+        // Navigation may open a new owned tab after User takes the old one.
+        // Other effects must retain the exact selected tab.
+        if tool != "browser.chrome_navigate", let selected = integer(input["tab_id"]), selected != tab { return nil }
         let sequence = integer(owner["userSequence"]) ?? integer(actionReceipt["userSequence"]) ?? integer(input["expected_user_sequence"])
-        var readInput: [String: JSONValue] = ["lease_id": .string(lease), "max_nodes": .int(80), "max_text_chars": .int(10000)]
+        var readInput: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
         var location = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot", input: readInput, title: title)
         do {
-            // Acquisition returns immediately after creating the tab. Let its
-            // owner observe a bounded navigation quiet interval before the first
-            // snapshot; this neither activates the tab nor claims load success.
-            if tool == "browser.chrome_acquire", let sequence {
-                let wait = try await perform("browser.chrome_wait", ["lease_id": .string(lease),
-                    "expected_user_sequence": .int(sequence), "condition": .string("navigation_settled"),
-                    "timeout_ms": .int(1500), "settle_ms": .int(100)])
-                let waitRow = object(wait)
-                if waitRow["ok"] == .bool(false) || waitRow["error"] != nil || waitRow["error_code"] != nil {
-                    return .init(location: location, result: unavailable(receipt: receipt,
-                        detail: "The tab opened, but its loading observation was refused. Read this page again to continue; no action was repeated.", observation: wait))
-                }
-            }
             var snapshot = try await perform("browser.chrome_snapshot", readInput)
-            guard matches(snapshot, lease: lease, sequence: sequence) else {
+            guard matches(snapshot, tab: tab, sequence: sequence) else {
                 return .init(location: location, result: unavailable(receipt: receipt,
                     detail: "The action returned, but its exact page could not be read. Read this page again to continue; the action will not be repeated.", observation: snapshot))
             }
             if object(object(snapshot)["rendering"] ?? .null)["readyState"] == .string("loading") {
                 try await Task.sleep(nanoseconds: 350_000_000)
                 let next = try await perform("browser.chrome_snapshot", readInput)
-                if matches(next, lease: lease, sequence: sequence) { snapshot = next }
+                if matches(next, tab: tab, sequence: sequence) { snapshot = next }
                 else {
                     return .init(location: location, result: unavailable(receipt: receipt,
                         detail: "The page changed while loading. Read this page again to continue; the action will not be repeated.", observation: next))
@@ -170,7 +158,7 @@ enum AgentWorkspaceActionReadback {
                 readInput["scope"] = .string("main_content")
                 location = .record(tool: "browser.chrome_snapshot", input: readInput, title: title)
                 let content = try await perform("browser.chrome_snapshot", readInput)
-                guard matches(content, lease: lease, sequence: sequence),
+                guard matches(content, tab: tab, sequence: sequence),
                       object(object(content)["reading"] ?? .null)["scope"] == .string("main_content") else {
                     return .init(location: location, result: unavailable(receipt: receipt,
                         detail: "The page's main content could not be read from the selected tab. Read this page again to continue; no action was repeated.", observation: content))
@@ -186,10 +174,10 @@ enum AgentWorkspaceActionReadback {
         }
     }
 
-    private static func matches(_ snapshot: JSONValue, lease: String, sequence: Int64?) -> Bool {
+    private static func matches(_ snapshot: JSONValue, tab: Int64, sequence: Int64?) -> Bool {
         let row = object(snapshot)
         guard row["ok"] != .bool(false), row["error"] == nil, row["error_code"] == nil,
-              row["leaseId"] == .string(lease), string(row["snapshotId"]) != nil,
+              row["tabId"] == .int(tab), string(row["snapshotId"]) != nil,
               integer(row["tabId"]) != nil, case .array? = row["nodes"],
               let observed = integer(row["userSequence"]) else { return false }
         return sequence == nil || observed == sequence

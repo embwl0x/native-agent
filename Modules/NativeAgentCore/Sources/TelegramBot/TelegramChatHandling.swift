@@ -14,7 +14,7 @@ public enum TelegramChatProgressEvent: Sendable, Equatable {
     /// lets the sink throttle heartbeats while always delivering terminal
     /// notices like `invoke_timeout`.
     case notice(kind: String, text: String)
-    /// Accumulated reply text so far. Routed to the growing draft streamer,
+    /// Accumulated reply text so far. Routed to the native draft preview,
     /// never rendered as a discrete progress message.
     case textDelta(accumulated: String)
 }
@@ -35,6 +35,7 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
     /// resume the session the interrupted turn ran in, not whichever session
     /// the chat is bound to now. Nil means "resolve the chat's active session".
     public let sessionId: String?
+    public let runId: String?
     /// 2026-09-06: the forum topic this turn arrived in, when there is one.
     /// The handler keys its chat session on (chatId, threadId): a topic in a
     /// supergroup is its own conversation, and nil means the whole chat — a
@@ -52,6 +53,7 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
         fromUserId: Int? = nil,
         suppressUserAppend: Bool = false,
         sessionId: String? = nil,
+        runId: String? = nil,
         threadId: Int? = nil
     ) {
         self.attemptIndex = max(0, attemptIndex)
@@ -62,6 +64,7 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
         self.suppressUserAppendOverride = suppressUserAppend
         let trimmedSession = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.sessionId = (trimmedSession?.isEmpty ?? true) ? nil : trimmedSession
+        self.runId = runId
     }
 }
 

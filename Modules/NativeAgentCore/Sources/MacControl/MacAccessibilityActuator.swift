@@ -76,7 +76,7 @@ final class MacDocumentScrollRestoration: MacDocumentScrollRestoring, @unchecked
               CFEqual(current, scrollbar) else { return false }
         // Avoid even a no-op write when the downward end probe never moved.
         if isRestored { return true }
-        guard MacDriverContext.binding?.allowsEmission == true else { return false }
+        guard MacDriverContext.binding?.allowsAction == true else { return false }
         return AXUIElementSetAttributeValue(scrollbar, kAXValueAttribute as CFString, value) == .success
         #else
         return false
@@ -495,7 +495,7 @@ struct DriverCheckedMacEventSink: MacEventSink {
     var secureKeyboardEntryActive: Bool { base.secureKeyboardEntryActive }
 
     func post(key event: MacKeyEvent) {
-        guard let binding = MacDriverContext.binding, binding.allowsEmission else { return }
+        guard !event.down || Self.waitWhilePersonTypes(), let binding = MacDriverContext.binding, binding.allowsEmission else { return }
         base.post(key: event)
         binding.notePostedEvent()
         let key = "key:\(event.keyCode)"
@@ -506,8 +506,26 @@ struct DriverCheckedMacEventSink: MacEventSink {
         } else { binding.held(key, release: nil) }
     }
 
+    /// Shotgun (User, 10-04): a keystroke posted to the HID tap goes to
+    /// whatever is key, and while the person types in Shotgun that is their
+    /// message. Hers wait until they send or click away (the app hands the
+    /// keyboard back), or until this act is stopped. A key-up never waits, so
+    /// no key or modifier of hers stays held down over the person's typing;
+    /// on its own it types nothing anywhere. Per-process keys
+    /// (`postToPid`) never reach Shotgun and never wait. On the main thread
+    /// nothing can be waited for — Shotgun's own send runs there — so a held
+    /// key is not sent at all and the act's own readback reports it.
+    static func waitWhilePersonTypes() -> Bool {
+        while PersonOnlyWindows.keyboardHeldByPerson {
+            guard !Thread.isMainThread, !Task.isCancelled,
+                  MacDriverContext.binding?.allowsEmission == true else { return false }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return true
+    }
+
     func post(key event: MacKeyEvent, toPid pid: Int32) -> Bool {
-        guard let binding = MacDriverContext.binding, binding.allowsEmission,
+        guard let binding = MacDriverContext.binding, binding.allowsAction,
               base.post(key: event, toPid: pid) else { return false }
         binding.notePostedEvent()
         let key = "pid:\(pid):\(event.keyCode)"
@@ -615,6 +633,10 @@ public struct CGEventSink: MacEventSink {
 
     public func post(mouse event: MacMouseEvent) {
         let point = CGPoint(x: event.x, y: event.y)
+        // Her own pointer: the person's mouse is unhooked for her action and
+        // their cursor goes back where it was after it.
+        AgentPointerHold.begin(warpTo: nil)
+        defer { AgentPointerHold.posted(phase: event.phase, at: point) }
         let type: CGEventType
         let button: CGMouseButton
         switch (event.phase, event.button) {
@@ -648,12 +670,18 @@ public struct CGEventSink: MacEventSink {
         // every consumer that watches that clock. It is tagged like any other
         // motor output; consumers separate it from human input by comparing the
         // two ages, not by leaving our own events unrecorded.
+        // Routed by location: her pointer passes through Shotgun.
+        PersonOnlyWindows.beforeAgentPointer(at: point)
         NativeAgentMotorEpoch.notePostedHIDEvent()
         cg.post(tap: .cghidEventTap)
     }
 
     public func post(scroll event: MacScrollEvent) {
         let units: CGScrollEventUnit = event.unit == .pixel ? .pixel : .line
+        // A scroll goes where the cursor is: back to her last point first, if
+        // the person's cursor had been given back since.
+        let scrollPoint = AgentPointerHold.begin(warpTo: AgentPointerHold.lastAgentPoint)
+        defer { scrollPoint.map { AgentPointerHold.posted(phase: nil, at: $0) } }
         guard let cg = CGEvent(
             scrollWheelEvent2Source: source(),
             units: units,
@@ -667,8 +695,104 @@ public struct CGEventSink: MacEventSink {
             value: NativeAgentMacEventIdentity.sourceUserData
         )
         cg.flags.formUnion(flags(event.modifiers))
+        PersonOnlyWindows.beforeAgentPointer(at: cg.location)
         NativeAgentMotorEpoch.notePostedHIDEvent()
         cg.post(tap: .cghidEventTap)
+    }
+}
+
+/// Shotgun (User, 10-04): "She should have her own mouse pointer so I don't
+/// interfere with her." For the length of one pointer action of hers — a
+/// click, double-click, drag or scroll, through the gap after it — the
+/// person's physical mouse is unhooked from the cursor, so their hand cannot
+/// knock her click off target, and then their cursor is put back exactly where
+/// they left it. Never while one of her buttons is still down, and never
+/// longer than `cap`. Accessibility presses never touch the pointer at all.
+enum AgentPointerHold {
+    /// Idle time after her last pointer event that ends the action.
+    static let settle: TimeInterval = 1.0
+    /// The longest the person's mouse is ever unhooked for one action.
+    static let cap: TimeInterval = 15
+
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var held = false
+    private nonisolated(unsafe) static var generation = 0
+    private nonisolated(unsafe) static var personPoint = CGPoint.zero
+    private nonisolated(unsafe) static var agentPoint: CGPoint?
+    private nonisolated(unsafe) static var buttonsDown = 0
+    private nonisolated(unsafe) static var startedAt = 0.0
+    private nonisolated(unsafe) static var lastPost = 0.0
+
+    static var lastAgentPoint: CGPoint? {
+        lock.lock()
+        defer { lock.unlock() }
+        return agentPoint
+    }
+
+    /// Before her pointer event. Starting an action notes the person's cursor
+    /// and unhooks their mouse; `warpTo` then puts the cursor on her point
+    /// (a scroll is routed by where the cursor is). Returns where the cursor
+    /// now is for her.
+    @discardableResult
+    static func begin(warpTo point: CGPoint?) -> CGPoint? {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        lastPost = now
+        guard !held else {
+            let current = agentPoint
+            lock.unlock()
+            return current
+        }
+        guard let current = CGEvent(source: nil)?.location else { lock.unlock(); return nil }
+        held = true
+        generation &+= 1
+        let chain = generation
+        personPoint = current
+        startedAt = now
+        lock.unlock()
+        CGAssociateMouseAndMouseCursorPosition(0)
+        if let point { CGWarpMouseCursorPosition(point) }
+        scheduleRelease(chain: chain, after: settle)
+        return point ?? current
+    }
+
+    /// After her event: where her pointer is, and whether a button is down.
+    /// Her pointer is shown there (Shotgun's overlay).
+    static func posted(phase: MacMousePhase?, at point: CGPoint) {
+        lock.lock()
+        lastPost = ProcessInfo.processInfo.systemUptime
+        agentPoint = point
+        if phase == .down { buttonsDown += 1 }
+        if phase == .up { buttonsDown = max(0, buttonsDown - 1) }
+        lock.unlock()
+        PersonOnlyWindows.noteAgentPointer(at: point, pressed: phase == .down)
+    }
+
+    private static func scheduleRelease(chain: Int, after delay: TimeInterval) {
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) {
+            releaseIfIdle(chain: chain)
+        }
+    }
+
+    /// The action is over: the person's cursor goes back and their mouse is
+    /// hooked up again. Otherwise look again when it could be.
+    private static func releaseIfIdle(chain: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        guard held, chain == generation else { lock.unlock(); return }
+        let idle = now - lastPost
+        if now - startedAt < cap, buttonsDown > 0 || idle < settle {
+            lock.unlock()
+            scheduleRelease(chain: chain, after: max(0.05, settle - idle))
+            return
+        }
+        // Under the lock: a new action of hers can't begin between the
+        // person's cursor going back and their mouse being hooked up again.
+        held = false
+        buttonsDown = 0
+        CGWarpMouseCursorPosition(personPoint)
+        CGAssociateMouseAndMouseCursorPosition(1)
+        lock.unlock()
     }
 }
 
@@ -997,13 +1121,19 @@ enum MacAXExecutionLane {
     static func sync<T>(_ body: () -> T) -> T {
         if Thread.isMainThread { return body() }
         let binding = MacDriverContext.binding
+        let background = MacDriverContext.background
         let continuation = MacWorkContinuation.current
+        let readDeadline = MacAXLimits.readDeadline
         return withoutActuallyEscaping(body) { operation in
             // GCD sync completes this nonescaping operation before returning.
             nonisolated(unsafe) let synchronousOperation = operation
             return DispatchQueue.main.sync {
                 MacDriverContext.$binding.withValue(binding) {
-                    MacWorkContinuation.$current.withValue(continuation, operation: synchronousOperation)
+                    MacDriverContext.$background.withValue(background) {
+                        MacWorkContinuation.$current.withValue(continuation) {
+                            MacAXLimits.$readDeadline.withValue(readDeadline) { synchronousOperation() }
+                        }
+                    }
                 }
             }
         }
@@ -1442,7 +1572,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                         }
                     }
                     var rawChildren: CFTypeRef?
-                    let status = AXUIElementCopyAttributeValue(current, kAXChildrenAttribute as CFString, &rawChildren)
+                    let status = AXUIElementCopyAttributeValue(current, MacAXAttributeRead.childAttribute(current) as CFString, &rawChildren)
                     if status == .attributeUnsupported || status == .noValue { continue }
                     guard status == .success, let rawChildren,
                           CFGetTypeID(rawChildren) == CFArrayGetTypeID() else { return .complete(nil) }
@@ -1512,7 +1642,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     private func performOnExecutionLane(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
         guard target.actions.contains(action) else { return .unsupported }
-        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
+        guard MacDriverContext.binding?.allowsAction == true else { return .failed }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
         let status = recordMutationStatus(AXUIElementPerformAction(element, action as CFString))
         switch status {
@@ -1531,7 +1661,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         var settable: DarwinBoolean = false
         let probe = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
         guard probe == .success, settable.boolValue else { return .unsupported }
-        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
+        guard MacDriverContext.binding?.allowsAction == true else { return .failed }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
         let status = recordMutationStatus(AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFTypeRef))
         switch status {
@@ -1660,7 +1790,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             guard probe == .success, settable.boolValue else { return .unsupported }
             var selection = CFRange(location: range.location, length: range.length)
             guard let value = AXValueCreate(.cfRange, &selection) else { return .failed }
-            guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
+            guard MacDriverContext.binding?.allowsAction == true else { return .failed }
             NativeAgentMotorEpoch.noteAgentMotorEvent()
             let status = recordMutationStatus(AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value))
             switch status {
@@ -1677,7 +1807,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             var settable: DarwinBoolean = false
             let probe = AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable)
             guard probe == .success, settable.boolValue else { return .unsupported }
-            guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
+            guard MacDriverContext.binding?.allowsAction == true else { return .failed }
             NativeAgentMotorEpoch.noteAgentMotorEvent()
             let status = recordMutationStatus(AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef))
             switch status {
@@ -1697,7 +1827,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         var settable: DarwinBoolean = false
         let probe = AXUIElementIsAttributeSettable(element, "AXSelected" as CFString, &settable)
         guard probe == .success, settable.boolValue else { return .unsupported }
-        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
+        guard MacDriverContext.binding?.allowsAction == true else { return .failed }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
         let status = recordMutationStatus(AXUIElementSetAttributeValue(element, "AXSelected" as CFString, true as CFTypeRef))
         return status == .success ? .performed : .failed
@@ -1708,7 +1838,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         var settable: DarwinBoolean = false
         let probe = AXUIElementIsAttributeSettable(element, kAXFocusedAttribute as CFString, &settable)
         guard probe == .success, settable.boolValue else { return .unsupported }
-        guard MacDriverContext.binding?.allowsEmission == true else { return .failed }
+        guard MacDriverContext.binding?.allowsAction == true else { return .failed }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
         let status = recordMutationStatus(AXUIElementSetAttributeValue(
             element,

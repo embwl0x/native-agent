@@ -5,18 +5,20 @@ import MacControl
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import PersonaEngine
 import Privacy
 import TurnTrace
 import TelegramBot
 import TrustCenter
 
 public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling {
-    /// Approval ids whose Telegram prompt was delivered by this process. Row
+    /// Telegram prompt deliveries by this process, per approval and chat. Row
     /// creation and prompt delivery are separate steps; a reused pending row
     /// whose prompt never went out (send threw, or the process restarted between
     /// the two) is prompted again, while a true duplicate is not. (Agent's
-    /// review, 2026-09-07.)
-    private var promptedApprovalIDs: Set<String> = []
+    /// review, 2026-09-07.) A duplicate caller awaits the delivery in flight
+    /// and gets its result; a failed one is dropped so the next call retries.
+    private var promptDeliveries: [String: Task<Void, Error>] = [:]
     private var promptFlights: [(id: UUID, metadata: JSONValue, task: Task<String, Error>)] = []
 
     public typealias PromptSender = @Sendable (
@@ -40,7 +42,7 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     /// A plain message with its own keyboard (a mirrored inline card).
     public typealias CardSender = @Sendable (
         _ token: String, _ destination: TelegramDestination, _ text: String, _ replyMarkup: JSONValue
-    ) async throws -> Void
+    ) async throws -> Int
     private let cardSender: CardSender
 
     public init(
@@ -48,7 +50,7 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         token: String,
         promptSender: @escaping PromptSender,
         approvalResolver: @escaping ApprovalResolver,
-        cardSender: @escaping CardSender = TelegramPollLoop.defaultSendMessageWithReplyMarkup
+        cardSender: @escaping CardSender = TelegramPollLoop.defaultSendMessageWithReplyMarkupReturningId
     ) {
         self.dataRoot = dataRoot
         self.token = token
@@ -57,9 +59,16 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         self.cardSender = cardSender
     }
 
-    /// Send a mirrored inline card to User's DM (`ApprovalChatCards`).
-    public func sendChatCard(text: String, chatId: Int, markup: JSONValue) async throws {
+    /// Send a mirrored inline card to User's DM (`ApprovalChatCards`); returns its message id.
+    @discardableResult
+    public func sendChatCard(text: String, chatId: Int, markup: JSONValue) async throws -> Int {
         try await cardSender(token, TelegramDestination(chatId: chatId, threadId: nil), text, markup)
+    }
+
+    /// A mirrored card answered anywhere: its Telegram copy loses its buttons and says so.
+    public func settleChatCard(chatId: Int, messageId: Int, text: String) async throws {
+        try await TelegramPollLoop.defaultEditMessageTextWithReplyMarkup(
+            token, chatId, messageId, text, .object(["inline_keyboard": .array([])]))
     }
 
     public func fileApprovalRequest(
@@ -153,13 +162,20 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
             ]),
             matchesPending: { pending in Self.isSameTelegramRequest(pending, metadata) }
         )
-        if !promptedApprovalIDs.contains(outcome.record.id) {
+        do {
+            try await deliverPrompt(outcome.record, chatId: chatId, toolName: toolName, payload: payload)
+        } catch {
+            throw AutonomyGateError.notRun(.approvalDeliveryFailed)
+        }
+        // Raised in User's own DM: it is there, so his DM needs no second one.
+        if chatId == ApprovalChatCards.ownerDM(dataRoot: dataRoot) {
             do {
-                try await promptSender(token, chatId, outcome.record, toolName, payload)
+                try await inbox.markChatCard(outcome.record.id, [
+                    "telegramPromptedAt": .string(ISO8601DateFormatter().string(from: Date())),
+                ])
             } catch {
-                throw AutonomyGateError.notRun(.approvalDeliveryFailed)
+                nativeLog("[telegram-approval] prompt mark failed: %@", error.localizedDescription)
             }
-            promptedApprovalIDs.insert(outcome.record.id)
         }
         return outcome.record.id
     }
@@ -297,10 +313,15 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
             }
             return TelegramApprovalResolution(acknowledgement: answer)
         }
-        // A late tap on a card answered elsewhere (Mac, phone, Inbox) is a
-        // harmless no-op that says so — once the chat is proven to be its own.
-        if pending.status != "pending", Self.boundChat(pending) == String(chatId) {
-            return TelegramApprovalResolution(acknowledgement: "Already answered — nothing changed.")
+        // A late tap changes nothing; report the canonical decision or expiry
+        // once the chat is proven to be its own.
+        if pending.status != "pending", Self.answers(pending, chatId: chatId) {
+            let approval = ApprovalRequest(id: pending.id, title: pending.title, action: pending.action,
+                risk: pending.risk, status: pending.status, decision: pending.decision)
+            let message = approval.expirationGuidance(agentName: PersonaCompiler.agentDisplayName(dataRoot: dataRoot))
+                .map { approval.decisionSummary + ". " + $0 }
+                ?? (approval.decisionSummary + " — nothing changed.")
+            return TelegramApprovalResolution(acknowledgement: message)
         }
         try validateTelegramDecision(record: pending, chatId: chatId)
         guard let fromUserId else {
@@ -337,12 +358,11 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         // /resume created while the approval was pending.
         let originSessionId = Self.approvalSessionId(pending.payload)
         // 2026-09-06: the topic the interrupted turn ran in, off the record.
-        // The chat id is already proven equal to the caller's by
-        // `validateTelegramDecision`; the thread is not, because a typed
-        // `/approve <id>` can arrive from any topic in the supergroup. The
-        // continuation belongs to the recorded topic either way.
+        // The tap may come from User's DM rather than the turn's own chat, and
+        // a typed `/approve <id>` can arrive from any topic in the supergroup.
+        // The continuation belongs to the recorded chat and topic either way.
         let originDestination = TelegramDestination(
-            chatId: chatId,
+            chatId: Self.telegramChatId(pending.payload).flatMap { Int($0) } ?? chatId,
             threadId: Self.telegramThreadId(pending.payload)
         )
         // Generic tool cards already claimed their tool-free result turn in
@@ -437,18 +457,23 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         guard record.status == "pending" else {
             throw TelegramApprovalError.notPending(record.status)
         }
-        guard record.remoteResolvable, !record.localOnly else {
+        // User's own DM (its chat card's) decides local-only too, as the signed
+        // phone does (User, 10-07). Any other chat, remote-safe requests only.
+        guard Self.cardChat(record) == String(chatId) || (record.remoteResolvable && !record.localOnly) else {
             throw TelegramApprovalError.notRemoteResolvable
         }
-        guard Self.boundChat(record) == String(chatId) else {
+        guard Self.answers(record, chatId: chatId) else {
             throw TelegramApprovalError.chatMismatch
         }
     }
 
-    /// The Telegram chat an approval answers to: the one its turn ran in, or
+    /// The Telegram chats an approval answers to: the one its turn ran in, and
     /// the DM its chat card was posted into (`ApprovalChatCards`).
-    private static func boundChat(_ record: ApprovalRecord) -> String? {
-        if let stored = telegramChatId(record.payload) { return stored }
+    private static func answers(_ record: ApprovalRecord, chatId: Int) -> Bool {
+        telegramChatId(record.payload) == String(chatId) || cardChat(record) == String(chatId)
+    }
+
+    private static func cardChat(_ record: ApprovalRecord) -> String? {
         guard case .object(let card)? = record.chatCard, case .string(let chat)? = card["telegramChatId"] else { return nil }
         return chat
     }
@@ -456,9 +481,22 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     /// Post the Approve/Deny prompt for an approval raised outside this chat
     /// into User's DM. Once per approval in this process.
     public func promptChatCard(_ approval: ApprovalRecord, chatId: Int, payload: JSONValue) async throws {
-        guard !promptedApprovalIDs.contains(approval.id) else { return }
-        try await promptSender(token, chatId, approval, approval.action, payload)
-        promptedApprovalIDs.insert(approval.id)
+        try await deliverPrompt(approval, chatId: chatId, toolName: approval.action, payload: payload)
+    }
+
+    private func deliverPrompt(_ approval: ApprovalRecord, chatId: Int, toolName: String, payload: JSONValue) async throws {
+        let key = "\(approval.id):\(chatId)"
+        if let delivery = promptDeliveries[key] { return try await delivery.value }
+        let delivery = Task { [token, promptSender] in
+            try await promptSender(token, chatId, approval, toolName, payload)
+        }
+        promptDeliveries[key] = delivery
+        do {
+            try await delivery.value
+        } catch {
+            promptDeliveries[key] = nil
+            throw error
+        }
     }
 
     /// 2026-09-06: the chat session recorded on the approval, in the same two
@@ -584,9 +622,13 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         ])
         try await send(
             token,
+            // The origin's topic belongs to the origin chat only; a mirror
+            // into User's DM is sent unthreaded (a group topic id there fails
+            // or lands in the wrong topic).
             TelegramDestination(
                 chatId: chatId,
-                threadId: Self.telegramThreadId(approval.payload)
+                threadId: telegramChatId(approval.payload) == String(chatId)
+                    ? Self.telegramThreadId(approval.payload) : nil
             ),
             text,
             replyMarkup

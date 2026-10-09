@@ -8,9 +8,9 @@ extension MacFourVerbs {
     // The ladder, and it NEVER falls back to "just click the first match":
     //
     //   1. exact label, case/whitespace-insensitive
-    //   2. unique contains-match, either direction
-    //   3. ordinal address — "row 3", "button 2", "text area 1", "3" — the
+    //   2. ordinal address — "row 3", "button 2", "text area 1", "3" — the
     //      content or role ordinals the render printed
+    //   3. unique label containing the whole request (one way only)
     //   4. a ROLE HINT in the phrase ("the Send button") narrows a multi-match
     //      at every rung, never widens one
     //
@@ -24,7 +24,7 @@ extension MacFourVerbs {
 
     /// `actionable` (every verb but scroll): when a control and a container
     /// (sheet, window, group, any region) share the name, the control wins.
-    static func resolve(_ target: String, among targets: [ActTarget], actionable: Bool = true) -> Resolution {
+    static func resolve(_ target: String, among targets: [ActTarget], actionable: Bool = true, pressing: Bool = false) -> Resolution {
         // Her-screen 09-24 — a symbol names the control whose AX label is its
         // word (Calculator's "=" is the button "Equals"). Only when no AX
         // control carries the symbol itself; an AX control beats a pixel guess
@@ -76,6 +76,11 @@ extension MacFourVerbs {
             }
             let controls: Set<String> = ["button", "link", "radio", "tab", "checkbox", "menu item"]
             let plain: Set<String> = ["text", "group", "window", "web area", "sheet"]
+            let presses = candidates.filter { $0.actions.contains("AXPress") }
+            if pressing, presses.count == 1, candidates.allSatisfy({
+                $0 == presses[0] || plain.contains($0.kind) || $0.regionOnly
+                    || ($0.kind == presses[0].kind && $0.actions.isEmpty && $0.frame == nil)
+            }) { return presses[0] }
             let picked = candidates.filter { controls.contains($0.kind) }
             // Her-screen 09-24 — a window's title repeated by its own
             // descendants (TextEdit's ruler row, scroll area) names the window.
@@ -150,18 +155,15 @@ extension MacFourVerbs {
         // the one element the screen says is focused without minting a second
         // handle or letting fuzzy matching choose another control.
         let normalizedTarget = normalize(identityTarget)
+        if let hit = narrow(targets.filter {
+            let label = exactName($0.label ?? "")
+            return !label.isEmpty && label == exactName(target)
+        }, respectingQualifier: false) { return hit }
         if let hit = narrow(targets.filter { candidate in
             candidate.aliases.contains { normalize($0) == normalizedTarget }
         }, respectingQualifier: false) {
             return hit
         }
-
-        // A literal label can contain role words without describing its role
-        // (a row named "Send button", for example). Preserve that exact
-        // address before interpreting a trailing kind as a qualifier.
-        if let hit = narrow(targets.filter {
-            normalize($0.label ?? "") == normalizedTarget && !normalizedTarget.isEmpty
-        }, respectingQualifier: false) { return hit }
 
         // A copied DO/recovery address includes both its ordinal and label,
         // e.g. `button 4 Remove`. Resolve that complete address before fuzzy
@@ -188,12 +190,12 @@ extension MacFourVerbs {
         }
 
         // 1. exact
-        if let hit = narrow(targets.filter { normalize($0.label ?? "") == needle && !needle.isEmpty }) {
+        if let hit = narrow(targets.filter { normalize($0.label ?? "") == needle && !needle.isEmpty && answers(target, $0) }) {
             return hit
         }
         // Walk 4 — a field answers to the placeholder a person reads in it
         // ("Search Maps"), only after every exact label on the screen.
-        if let hit = narrow(targets.filter { !needle.isEmpty && $0.placeholder.map(normalize) == needle }) {
+        if let hit = narrow(targets.filter { !needle.isEmpty && $0.placeholder.map(normalize) == needle && answers(target, $0) }) {
             return hit
         }
         // A short or numeric name is exact-only (her-screen 09-23: "7" became
@@ -202,56 +204,65 @@ extension MacFourVerbs {
         if isExactOnlyName(needle) {
             return .none(nearest: nearest(to: needle, among: targets))
         }
-        // 2. contains — whole phrases only, both sides at least three
-        //    characters, so a fragment never drifts onto an unrelated control.
-        let contains = targets.filter { candidate in
-            guard !needle.isEmpty else { return false }
-            let labelMatches: Bool = {
-                guard let label = candidate.label else { return false }
-                let normalized = normalize(label)
-                return normalized.count >= 3
-                    && (normalized.contains(needle) || needle.contains(normalized))
-            }()
-            let aliasMatches = candidate.aliases.contains { alias in
-                let normalized = normalize(alias)
-                // An alias may refine a short request ("yellow" -> "yellow
-                // object"), but a longer request may not silently discard
-                // qualifiers such as moving, above, or left-of.
-                return !normalized.isEmpty && normalized.contains(needle)
-            }
-            return labelMatches || aliasMatches
-        }
-        if let hit = narrow(contains) { return hit }
         if let hit = ordinalHit() { return hit }
+        // 2. contains — one way only, see containsName.
+        let name = askedName(target)
+        if let hit = narrow(targets.filter { containsName(name, $0) }) { return hit }
         return .none(nearest: nearest(to: needle, among: targets))
     }
 
     /// Her-screen 09-23 — does the element acted on ANSWER to what was asked?
     /// Independent of which resolver rung picked it: an explicit address
-    /// ("row 3", "button 2 Remove"), an exact alias or kind, the exact label,
-    /// or a whole-phrase containment of at least three characters. "7" is never
-    /// answered by "Apple".
-    static func answers(_ target: String, _ candidate: ActTarget) -> Bool {
+    /// ("row 3", "button 2 Remove"), an exact alias or kind, or the exact label.
+    /// Fuzzy resolution never authorizes a named action; `exact` also refuses
+    /// the one-way contains rung and a copied address whose label only
+    /// prefixes the live one (click, toggle and select commit on a name).
+    static func answers(_ target: String, _ candidate: ActTarget, exact: Bool = false) -> Bool {
         if candidate.handle == target.trimmingCharacters(in: .whitespacesAndNewlines) { return true }
         if let words = symbolAliasWords(target), words.contains(normalize(candidate.label ?? "")) { return true }
         let identity = stripWithinTargetAimQualifier(target)
-        if labeledOrdinalAddress(in: identity) != nil { return true }
+        if let address = labeledOrdinalAddress(in: identity) {
+            return !exact || normalize(candidate.label ?? "") == address.label
+        }
         let asked = trailingRoleQualifier(in: identity)?.label ?? normalize(stripRoleWords(identity))
         if !isExactOnlyName(asked), ordinalAddress(in: identity) != nil { return true }
         // A bare number answers to the row the render numbered with it.
         if let number = Int(asked), candidate.ordinal == number { return true }
         let whole = normalize(identity)
         if candidate.aliases.contains(where: { normalize($0) == whole }) || candidate.kind == whole { return true }
-        let label = normalize(candidate.label ?? "")
+        let label = exactName(candidate.label ?? "")
         if asked.isEmpty { return roleHint(in: identity) == candidate.kind }
-        if label == asked || label == whole { return true }
-        if let placeholder = candidate.placeholder.map(normalize), !placeholder.isEmpty,
-           placeholder == asked || placeholder == whole { return true }
-        // The label must answer the WHOLE request: "Delete" does not answer
-        // "Delete selected file" (a label inside a longer request is refused).
-        guard !isExactOnlyName(asked) else { return false }
-        if label.count >= 3, label.contains(asked) { return true }
-        return candidate.aliases.contains { normalize($0).contains(asked) }
+        let literal = exactName(target)
+        if !label.isEmpty, label == literal { return true }
+        let name = askedName(target)
+        return !name.isEmpty && (label == name || candidate.placeholder.map(exactName) == name
+            || (!exact && !isExactOnlyName(asked) && containsName(name, candidate)))
+    }
+
+    /// The label holds the whole literal request ("Send" → "Send message"),
+    /// never the reverse: a request is never trimmed to fit a shorter label,
+    /// so "Reminders ⚠️" can't land on "Reminders".
+    static func containsName(_ name: String, _ candidate: ActTarget) -> Bool {
+        let label = exactName(candidate.label ?? "")
+        return name.count >= 3 && label != name && label.contains(name)
+    }
+
+    static func askedName(_ target: String) -> String {
+        var name = exactName(withinTargetAimQualifier(target)?.target ?? target)
+        for role in trailingRolePhrases {
+            let suffix = name.hasSuffix(" (\(role))") ? " (\(role))" : " \(role)"
+            guard name.hasSuffix(suffix) else { continue }
+            name = String(name.dropLast(suffix.count))
+            for article in ["the ", "a ", "an "] where name.hasPrefix(article) {
+                name = String(name.dropFirst(article.count))
+            }
+            break
+        }
+        return name
+    }
+
+    static func exactName(_ text: String) -> String {
+        text.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     }
 
     /// A bare number that took a control while the render ALSO numbered a row
@@ -262,6 +273,9 @@ extension MacFourVerbs {
               let row = targets.first(where: { $0.ordinal == number && $0 != candidate }) else { return nil }
         return "(\"\(asked)\" is the control named \(asked); row \(number) is \((row.label ?? "").isEmpty ? "unlabeled" : name(row)) — say \"row \(number)\" for that.)"
     }
+
+    /// The verbs that commit on a name: they need it exactly.
+    static let committingVerbs: Set<MacActVerb> = [.click, .select, .toggle]
 
     /// Symbols and key caps → the words apps label those controls with.
     static let symbolAliases: [String: Set<String>] = [

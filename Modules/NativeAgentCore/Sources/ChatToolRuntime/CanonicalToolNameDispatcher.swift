@@ -29,6 +29,8 @@ import AgentConversations
 public enum AppDoorReentry {
     public typealias Perform = @Sendable (String, [String: JSONValue]) async throws -> JSONValue
     @TaskLocal public static var perform: Perform?
+    public typealias Validate = @Sendable (String, [String: JSONValue]) async -> JSONValue?
+    @TaskLocal public static var validate: Validate?
 }
 
 // MARK: - Dotted-alias canonicalization (outermost)
@@ -72,10 +74,10 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
             return input
         }
         var matches = try AgentPeerStore(dataRoot: root).list().filter {
-            $0.name.caseInsensitiveCompare(name) == .orderedSame
+            $0.id == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
         }.map { "peer:" + $0.id }
         matches += try BotDefinitionStore(dataRoot: root).list().filter {
-            $0.name.caseInsensitiveCompare(name) == .orderedSame
+            $0.id.uuidString.lowercased() == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
         }.map { "bot:" + $0.id.uuidString }
         guard matches.count <= 1 else {
             throw AgentConversationStore.Failure(message: "More than one contact is named \(name). Choose its exact contact from agent_contacts.")
@@ -93,22 +95,36 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        try await AgentWorkspacePorts.$binding.withValue(ChatWorkspaceBinding.ports) {
+        let action = tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // Folded native calls already came through the door; translate only ingress.
+        if AppDoorReentry.perform == nil, action.contains("."), AppActionPolicy.action(input: ["action": .string(action)]) != nil {
+            var call = input.filter { $0.key.hasPrefix("__") }
+            call["action"] = .string(action)
+            call["args"] = .object(input.filter { !$0.key.hasPrefix("__") })
+            return try await dispatch(tool: "app", input: call, surface: surface)
+        }
+        return try await AgentWorkspacePorts.$binding.withValue(ChatWorkspaceBinding.ports) {
             try await dispatchWithWorkspacePorts(tool: tool, input: input, surface: surface)
         }
     }
 
     private func dispatchWithWorkspacePorts(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let result = try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
-            try await dispatchNormalized(tool: tool, input: input, surface: surface)
+            let result = try await dispatchNormalized(tool: tool, input: input, surface: surface)
+            if Self.canonical(tool) == "agent_read", case .object(var fields) = result,
+               case .string(let agent)? = fields["agent_id"] ?? fields["agent"], agent.lowercased() == "claude" {
+                fields["worklog"] = AgentConversationView.claudeWorklog()
+                return .object(fields)
+            }
+            return result
         }
-        // A released Chrome tab leaves her screen's windows and home too.
-        if case .object(let fields) = result, fields["tool"] == .string("browser.chrome_release"),
-           fields["released"] == .bool(true), case .string(let lease)? = fields["leaseId"], let root = peerDataRoot,
+        // Only an explicit close removes a Chrome tab from the workspace.
+        if case .object(let fields) = result,
+           fields["tool"] == .string("browser.chrome_close_tab"), fields["tabClosed"] == .bool(true),
+           case .int(let tab)? = fields["tabId"], let root = peerDataRoot,
            let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
-            let tab: Int64? = if case .int(let id)? = fields["tabId"] { id } else { nil }
-            await AgentWorkspaceNavigation.shared.forgetTab(lease: lease, tabID: tab,
-                                                            key: root.standardizedFileURL.path + "\u{0}" + scope)
+            await AgentWorkspaceNavigation.shared.forgetTab(tab: tab,
+                key: root.standardizedFileURL.path + "\u{0}" + scope)
         }
         // Attach to structured owner results so every provider lane receives
         // the same replayable receipt, without altering scalar/file contents,
@@ -131,12 +147,19 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         // complete chain as its own `app` call; a script cannot confer its
         // authority. The name it reaches is active for that call only.
         if Self.canonical(tool) == "app" {
-            return try await AppDoorReentry.$perform.withValue({ name, arguments in
-                try await LLMCallContext.$turnActiveTools.withValue((LLMCallContext.turnActiveTools ?? []).union([name])) {
-                    try await self.dispatch(tool: name, input: arguments, surface: surface)
+            return try await AppDoorReentry.$validate.withValue({ name, arguments in
+                if let validating = self.inner as? any PreApprovalToolValidating {
+                    return await validating.preApprovalRefusal(tool: name, input: arguments, surface: surface)
                 }
+                return await (self.inner as? any PureToolArgumentValidating)?.argumentRefusal(tool: name, input: arguments)
             }) {
-                try await dispatchExact(tool: tool, input: input, surface: surface)
+                try await AppDoorReentry.$perform.withValue({ name, arguments in
+                    try await LLMCallContext.$turnActiveTools.withValue((LLMCallContext.turnActiveTools ?? []).union([name])) {
+                        try await self.dispatch(tool: name, input: arguments, surface: surface)
+                    }
+                }) {
+                    try await dispatchExact(tool: tool, input: input, surface: surface)
+                }
             }
         }
         if Self.canonical(tool) == "workspace" {
@@ -206,9 +229,15 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
             for key in ["agent", "conversation"] where input[key].map(blank) == true { input.removeValue(forKey: key) }
         }
         let readWait = tool == "agent_read" ? input.removeValue(forKey: "wait_seconds") : nil
-        let waitsOnRead: Bool = switch readWait { case .int(let n)?: n > 0; case .double(let n)?: n > 0; default: false }
-        if waitsOnRead, input.contains(where: { !blank($0.value) && !["agent", "conversation", "details", "session_id", "__session_id"].contains($0.key) }) {
-            throw AgentConversationStore.Failure(message: "wait_seconds waits on a conversation by name; it cannot be combined with exact ids, history or listing filters. Nothing was read.")
+        let waitsOnRead: Bool = switch readWait { case .int(let n)?: (1...300).contains(n); default: false }
+        if let readWait, readWait != .null, !waitsOnRead {
+            throw ToolFailureError("wait_seconds must be an integer from 1 to 300.", argumentPath: "wait_seconds",
+                                   accepted: "app {action:\"agent.read\",args:{agent:\"<contact>\",wait_seconds:60}}", effects: .none)
+        }
+        if waitsOnRead, input.contains(where: { !blank($0.value) && !["agent", "conversation", "conversation_id", "message_id", "task_id", "details", "session_id", "__session_id"].contains($0.key) }) {
+            throw ToolFailureError("wait_seconds accepts only agent, conversation, conversation_id, message_id, task_id and details. Use max_chars or history/listing filters in a separate read without wait_seconds.",
+                                   argumentPath: "wait_seconds",
+                                   accepted: "app {action:\"agent.read\",args:{agent:\"<contact>\",wait_seconds:60}}", effects: .none)
         }
         if (Self.canonical(tool) == "wait" && input["agent"] != nil) || waitsOnRead {
             guard let root = peerDataRoot, let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty else {
@@ -272,7 +301,15 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     }
 
     private func dispatchExact(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        if let route = try AgentConversationRouting.route(tool: tool, input: input) {
+        let route: AgentConversationRouting.Route?
+        do { route = try AgentConversationRouting.route(tool: tool, input: input) }
+        catch let error as AgentConversationRouting.InvalidRequest {
+            throw ToolFailureError(error.message, argumentPath: "args",
+                accepted: tool == "agent_read"
+                    ? "app {action:\"agent.read\",args:{agent:\"<contact>\",message_id:\"<receipt message_id>\"}}"
+                    : "app {action:\"agent.message\",args:{agent:\"<contact>\",text:\"<message>\"}}; options.timeout_seconds is OMP only", effects: .none)
+        }
+        if let route {
             let alias = GatedToolNameAlias(raw: tool, canonical: route.tool)
             return try await GatedToolNameContext.$alias.withValue(alias) {
                 let result = try await inner.dispatch(tool: route.tool, input: route.input, surface: surface)

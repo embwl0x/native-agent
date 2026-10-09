@@ -27,7 +27,6 @@ enum AppScriptRunner {
     static let actionLimit = 50
     static let readLimit = 100
     static let wallSeconds = 60.0
-    static let callSeconds = 20.0
     static let returnLimit = 16 * 1024
     static let logLimit = 2 * 1024
     static let inputLimit = 16 * 1024
@@ -68,24 +67,39 @@ enum AppScriptRunner {
         private let lock = NSLock()
         private var value: JSONValue?
         let done = DispatchSemaphore(value: 0)
-        func put(_ result: JSONValue) { lock.withLock { value = result }; done.signal() }
+        func put(_ result: JSONValue) {
+            let stored = lock.withLock {
+                guard value == nil else { return false }
+                value = result
+                return true
+            }
+            if stored { done.signal() }
+        }
         func take() -> JSONValue? { lock.withLock { value } }
+        func cancel() {
+            put(.object([
+                "status": .string("failed"), "reason": .string("cancelled"),
+                "not_run_status": .string("cancelled"),
+                "detail": .string("The turn was stopped while this call was running."),
+            ]))
+        }
     }
 
     private final class ActionTasks: @unchecked Sendable {
         private let lock = NSLock()
-        private var tasks: [UUID: Task<Void, Never>] = [:]
+        private var tasks: [UUID: (task: Task<Void, Never>, reply: Reply)] = [:]
         private var cancelled = false
 
         func start(_ job: Job, perform: @escaping Perform) {
             lock.withLock {
-                guard !cancelled else { return }
+                guard !cancelled else { job.reply.cancel(); return }
                 let id = UUID()
-                tasks[id] = Task {
+                let task = Task {
                     defer { _ = self.lock.withLock { self.tasks.removeValue(forKey: id) } }
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled else { job.reply.cancel(); return }
                     job.reply.put(await perform(job.input))
                 }
+                tasks[id] = (task, job.reply)
             }
         }
 
@@ -94,7 +108,7 @@ enum AppScriptRunner {
                 cancelled = true
                 return Array(tasks.values)
             }
-            for task in active { task.cancel() }
+            for action in active { action.task.cancel(); action.reply.cancel() }
         }
     }
 
@@ -156,8 +170,8 @@ enum AppScriptRunner {
         return await withTaskCancellationHandler {
             defer { actions.cancel() }
             thread.start()
-            // A call that outlives its wait is never retried; its task stays
-            // tracked so stopping the turn still cancels the action.
+            // Admitted actions keep their provider/turn budget. Stop cancels
+            // the action and wakes the script's blocked reply wait.
             for await job in jobs {
                 actions.start(job, perform: perform)
             }
@@ -199,6 +213,7 @@ enum AppScriptRunner {
         if fields["status"] == .string("preview") {
             let refused = text("would_refuse")
             if fields["owner"] == .string("his") { return (.stop, refused.isEmpty ? "users_call" : refused, detail) }
+            if fields["would_card"] == .bool(true) { return (.stop, "would_card", detail) }
             return refused.isEmpty ? (.preview, "", detail) : (.failed, refused, detail)
         }
         if fields["status"] == .string("did_not_stick") { return (.failed, "did_not_stick", detail) }
@@ -297,8 +312,10 @@ enum AppScriptRunner {
     /// object carries expected_version or preview); anything else is
     /// positional, in the order the action's line declares.
     static func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], ScriptError> {
-        guard let action = AppActions.action(id) else {
-            return .failure(ScriptError(reason: "unknown_action", detail: "No action is called \(id)."))
+        guard let action = AppActions.action(id) ?? AppActions.pagePrefixedAction(id) else {
+            // Let the door return its exact nearest-action recovery; it executes no unknown action.
+            return .success(["action": .string(id), "args": given.first ?? .object([:]),
+                             AppToolExecutor.doorScriptKey: .bool(true)])
         }
         guard action.scriptable else {
             return .failure(ScriptError(reason: "not_scriptable",
@@ -401,7 +418,7 @@ enum AppScriptRunner {
         guard kind == "action", let action = AppActions.action(id) else { return nil }
         let args: [String: JSONValue] = if case .object(let named)? = given.first { named } else { [:] }
         guard let page = action.page == "*" ? word(args["page"]) : action.page.lowercased() else { return nil }
-        return (page, word(args["handle"]) ?? word(args["id"]) ?? word(args["item"]), !action.read)
+        return (page, word(args["handle"]) ?? word(args["id"]) ?? word(args["item"]), !action.readOnly(args: args))
     }
 
     /// A version's page or page/item.
@@ -428,7 +445,7 @@ enum AppScriptRunner {
         let answer: JSONValue
         let setTimeLimit: SetTimeLimit
         let post: @Sendable ([String: JSONValue]) -> Reply
-        let deadline = Date().addingTimeInterval(AppScriptRunner.wallSeconds)
+        var deadline = Date().addingTimeInterval(AppScriptRunner.wallSeconds)
         /// The deadline where the watchdog's C callback can read it.
         let deadlineCell = UnsafeMutablePointer<Double>.allocate(capacity: 1)
 
@@ -469,10 +486,18 @@ enum AppScriptRunner {
         private var cancelled = false
         private var done = false
         private var waiter: CheckedContinuation<Void, Never>?
+        private var waitingReply: Reply?
 
         /// Also spends the deadline, so the watchdog ends running JavaScript
         /// within a quarter second.
-        func cancel() { flags.withLock { cancelled = true; deadlineCell.pointee = 0 } }
+        func cancel() {
+            let reply = flags.withLock {
+                cancelled = true
+                deadlineCell.pointee = 0
+                return waitingReply
+            }
+            reply?.cancel()
+        }
         var isCancelled: Bool { flags.withLock { cancelled } }
 
         func markFinished() {
@@ -559,9 +584,9 @@ enum AppScriptRunner {
 
             // Wrapped on the first line, so a line number in the stack is the
             // script's own line; `return` hands a value back.
-            // app.* calls are synchronous; models write `await` out of habit, so it reads as a no-op.
-            let runnable = source.replacingOccurrences(of: #"\bawait\s+"#, with: "", options: .regularExpression)
-            let value = context.evaluateScript("(function () {" + runnable + "\n})()", withSourceURL: AppScriptRunner.scriptURL)
+            let body = context.evaluateScript("(function () {" + source + "\n})", withSourceURL: AppScriptRunner.scriptURL)
+            let syntaxError = thrown?.objectForKeyedSubscript("name")?.toString() == "SyntaxError"
+            let value = thrown == nil ? body?.call(withArguments: []) : nil
             if let thrown {
                 let message = thrown.toString() ?? "error"
                 if message.contains("execution terminated") {
@@ -571,6 +596,18 @@ enum AppScriptRunner {
                     }
                 } else if stopped == nil {
                     var report: [String: JSONValue] = ["message": .string(String(message.prefix(400)))]
+                    if syntaxError {
+                        report["reason"] = .string("script_syntax")
+                        report["rule"] = .string("javascript_function_body")
+                        report["instruction"] = .string("Fix the JavaScript syntax reported in message at line. "
+                            + "Top-level await is not supported: app.* calls return synchronously. Use const result = app.read(\"inbox\"); return result; without await.")
+                    }
+                    // A bare action family (time.now()) is app.time.now() inside a script.
+                    if let name = message.range(of: #"(?<=Can't find variable: )\w+"#, options: .regularExpression).map({ String(message[$0]) }),
+                       AppActions.all.contains(where: { $0.id.hasPrefix(name + ".") }) {
+                        report["reason"] = .string("script_name")
+                        report["instruction"] = .string("Inside a script, actions live under app: use app.\(name).… (for example app.\(name).\(AppActions.all.first { $0.id.hasPrefix(name + ".") }.map { String($0.id.dropFirst(name.count + 1)) } ?? "…")()).")
+                    }
                     // An app call's refusal keeps its code (not_scriptable).
                     if let reason = thrown.objectForKeyedSubscript("reason"), reason.isString, let code = reason.toString() {
                         report["reason"] = .string(code)
@@ -584,6 +621,7 @@ enum AppScriptRunner {
                        ledger.indices.contains(n - 1), case .object(let row) = ledger[n - 1] {
                         report["n"] = .int(Int64(n))
                         report["call"] = row["call"] ?? .null
+                        for key in ["nearest", "remedy", "argument_path"] { report[key] = row[key] }
                     }
                     error = report
                 }
@@ -633,6 +671,7 @@ enum AppScriptRunner {
         /// call that can land or stop, and a resumed one answers them from
         /// its journal (`Replay`).
         func call(kind: String, id: String, args: String, line: Int) -> String {
+            let id = kind == "action" ? (AppActions.pagePrefixedAction(id)?.id ?? id) : id
             guard strict, ["action", "read", "find", "decide"].contains(kind), stopped == nil else {
                 return dispatch(kind: kind, id: id, args: args, line: line)
             }
@@ -656,6 +695,8 @@ enum AppScriptRunner {
             }
             replayed += 1
             var row = entry["row"] ?? .null
+            let read = if case .object(let fields) = row, let read = fields["read_only"] { read == .bool(true) }
+                else { AppActions.action(id)?.read == true }
             if replayed == replay.count {
                 // Where it stopped: her answer, never the call, a read included.
                 out = encode(["ok": .bool(true), "value": answer], line: line, n: n)
@@ -665,7 +706,7 @@ enum AppScriptRunner {
                     row = .object(fields)
                 }
             } else if Self.status(row) != "answered",
-                      kind == "read" || kind == "find" || (kind == "action" && AppActions.action(id)?.read == true),
+                      kind == "read" || kind == "find" || (kind == "action" && read),
                       !writtenLater(replay[replayed - 1], at: replayed - 1) {
                 // What it read is read again, live: a resume goes on only if it all reads the same.
                 // (A read the run itself later wrote over replays as saved, below.)
@@ -722,6 +763,8 @@ enum AppScriptRunner {
             var row: [String: JSONValue] = ["n": .int(Int64(n)), "line": .int(Int64(line))]
             if strict, !steps.isEmpty { row["step"] = .int(Int64(steps.count)) }
             let given: [JSONValue] = if case .array(let list)? = try? JSONValue.parse(Data(args.utf8)) { list } else { [] }
+            let named: [String: JSONValue] = if case .object(let named)? = given.first { named } else { [:] }
+            let write = kind == "action" && AppActions.action(id)?.readOnly(args: named) != true
             func answer(_ fields: [String: JSONValue]) -> String { encode(fields, line: line, n: n) }
             func refuse(_ reason: String, _ detail: String, stop: Bool) -> String {
                 answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail), "stopped": .bool(stop)])
@@ -802,6 +845,9 @@ enum AppScriptRunner {
             func stopCall(_ reason: String, _ detail: String, call name: String, receipt: JSONValue?) -> String {
                 stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
                            "reason": .string(reason), "detail": .string(detail)]
+                if case .object(let fields)? = receipt {
+                    for key in ["nearest", "remedy", "argument_path"] { stopped?[key] = fields[key] }
+                }
                 var fields: [String: JSONValue] = ["ok": .bool(false), "reason": .string(reason), "detail": .string(detail),
                                                    "stopped": .bool(true)]
                 if let receipt { fields["receipt"] = receipt }
@@ -837,6 +883,17 @@ enum AppScriptRunner {
             default:
                 let words = given.compactMap(AppToolExecutor.inputString)
                 name = kind == "find" ? "find " + (words.first ?? "") : "read " + words.joined(separator: "/")
+                if kind == "read", given.count > 2 {
+                    let detail = "app.read takes page and optional item, not extra arguments. Use app.<action>({args}) to select a target. Nothing was read."
+                    row["call"] = .string(name)
+                    row["status"] = .string("failed")
+                    row["reason"] = .string("invalid_args")
+                    row["detail"] = .string(detail)
+                    row["argument_path"] = .string("app.read.arguments[2]")
+                    row["effects"] = .string("none")
+                    ledger.append(.object(row))
+                    return latch("invalid_args", detail, call: name) ?? refuse("invalid_args", detail, stop: false)
+                }
                 guard reads < AppScriptRunner.readLimit else {
                     return halt("read_limit", "A script does at most \(AppScriptRunner.readLimit) reads.", call: name)
                 }
@@ -864,19 +921,28 @@ enum AppScriptRunner {
 
             let left = deadline.timeIntervalSinceNow
             guard left > 0 else { return halt("timed_out", "The script used its \(Int(AppScriptRunner.wallSeconds)) seconds.", call: name) }
+            let waitingStarted = Date()
+            flags.withLock { if !cancelled { deadlineCell.pointee = Double.greatestFiniteMagnitude } }
             let reply = post(input)
-            guard reply.done.wait(timeout: .now() + min(AppScriptRunner.callSeconds, left)) == .success,
-                  let receipt = reply.take() else {
-                row["status"] = .string("outcome_unknown")
+            // Stop must answer even a buffered job the action consumer never sees.
+            let turnStopped = flags.withLock {
+                waitingReply = reply
+                return cancelled
+            }
+            if turnStopped { reply.cancel() }
+            reply.done.wait()
+            deadline = deadline.addingTimeInterval(Date().timeIntervalSince(waitingStarted))
+            flags.withLock {
+                waitingReply = nil
+                if !cancelled { deadlineCell.pointee = deadline.timeIntervalSinceReferenceDate }
+            }
+            guard !isCancelled, let receipt = reply.take() else {
+                row["status"] = .string("cancelled")
+                if write { row["effects"] = .string("unknown") }
                 ledger.append(.object(row))
-                let detail = "No answer within \(Int(min(AppScriptRunner.callSeconds, left))) seconds. It may still finish; "
-                    + "read the page before trying it again."
-                stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
-                           "reason": .string("call_timed_out"), "detail": .string(detail)]
-                return refuse("call_timed_out", detail, stop: true)
+                return stopCall("cancelled", "The turn was stopped while this call was running.", call: name, receipt: reply.take())
             }
 
-            let write = kind == "action" && AppActions.action(id)?.read != true
             let (outcome, reason, detail) = AppScriptRunner.classify(receipt, strict: strict, write: write)
             if kind == "action" { record(receipt, into: &row) } else if case .object(let read) = receipt {
                 if let version = read["version"] { row["version"] = version }
@@ -931,6 +997,7 @@ enum AppScriptRunner {
         /// script itself got the whole receipt.
         func record(_ receipt: JSONValue, into row: inout [String: JSONValue]) {
             guard case .object(let fields) = receipt else { return }
+            for key in ["nearest", "remedy", "argument_path", "read_only", "irreversible", "effect", "execution"] { row[key] = fields[key] }
             if let changed = fields["changed"] { row["changed"] = changed }
             // A strict run keeps each call's effects and real ids, however
             // long its result.
@@ -939,11 +1006,25 @@ enum AppScriptRunner {
                 if let effects = AppScriptRunner.effects(fields) { row["effects"] = effects }
                 let ids = AppScriptRunner.returnedIDs(receipt)
                 if !ids.isEmpty { row["ids"] = .object(ids) }
+            } else {
+                // Ordinary scripts need the same small returned facts for
+                // later history, even when the result body is too large.
+                if let effects = AppScriptRunner.effects(fields) { row["effects"] = effects }
+                var ids: [String: JSONValue] = [:]
+                for key in ["approval_id", "message_id", "run_id", "request_id", "id", "version", "page_version"] {
+                    guard let value = SessionHistoryPromptRenderer.receiptField(key, in: receipt) else { continue }
+                    switch value {
+                    case .string(let id) where !id.isEmpty: ids[key] = value
+                    case .int: ids[key] = value
+                    default: break
+                    }
+                }
+                if !ids.isEmpty { row["ids"] = .object(ids) }
             }
             // Why she did it rides her ledger as it rides a single action's receipt.
             if let given = fields["reason_given"] { row["reason_given"] = given }
             // A preview's word on whether it would card or hand back.
-            for key in ["would_card", "would_hand_back"] where fields[key] != nil { row[key] = fields[key] }
+            for key in ["would_card", "approver", "would_hand_back"] where fields[key] != nil { row[key] = fields[key] }
             // A folded tool's answer is its own result, with no door receipt around it.
             if let result = fields["action"] == nil ? receipt : fields["result"] {
                 var shown = result
@@ -976,7 +1057,7 @@ enum AppScriptRunner {
                           fields["status"] == .string(status) && !(changing && strict && fields["effects"] == .string("none"))
                               || changing && took(fields),
                           let call = fields["call"].flatMap(AppToolExecutor.inputString), !call.hasPrefix("read "),
-                          !call.hasPrefix("find "), !(changing && AppActions.action(call)?.read == true),
+                          !call.hasPrefix("find "), !(changing && (fields["read_only"] ?? .bool(AppActions.action(call)?.read == true)) == .bool(true)),
                           case .int(let n)? = fields["n"], case .int(let line)? = fields["line"]
                     else { return nil }
                     return .string("#\(n) line \(line) \(call)")
@@ -1002,7 +1083,13 @@ enum AppScriptRunner {
                 "landed": .array(landed),
                 "side_effects_not_observed": .string("Continuations a card wakes, and anything the app does after a call returns."),
             ]
-            if preview { out["preview"] = .bool(true) }
+            if preview {
+                out["preview"] = .bool(true)
+                let card = ledger.contains { if case .object(let fields) = $0 { fields["would_card"] == .bool(true) } else { false } }
+                out["would_card"] = .bool(card)
+                out["approver"] = card ? .string("owner") : .null
+                out["preview_scope"] = .string("calls_reached")
+            }
             if let returnedNote { out["returned_note"] = .string(returnedNote) }
             if !log.isEmpty { out["log"] = .array(log.map(JSONValue.string)) }
             if var stopped {
@@ -1034,6 +1121,9 @@ enum AppScriptRunner {
                 if !code.isEmpty { out["reason"] = .string(code) }
                 let users = AppToolExecutor.doorFloorReasons.contains(stopReason) || stopReason == "needs_glass"
                 let alone = code == "not_scriptable"
+                let cardPreview = preview && code == "would_card"
+                let cardInstruction = "Preview stopped at a call that would raise User's approval card; no card was filed. "
+                    + "Run the action outside preview when you want to request his approval."
                 let asked = strict && stopReason == "decide"
                 let ask = "It stopped to ask you hand_back.question: decide, then do only what is left."
                 // The call by its number and what it asked, not its line: a
@@ -1051,16 +1141,22 @@ enum AppScriptRunner {
                 // Reads that landed changed nothing.
                 let nothing = landed.isEmpty ? "Nothing landed. " : "Nothing changed. "
                 out["remedy"] = .object([
-                    "kind": .string(users ? "drop_users_line" : alone ? "run_alone" : asked ? "decide" : "read_ledger"),
+                    "kind": .string(users ? "drop_users_line" : alone ? "run_alone" : asked ? "decide"
+                        : cardPreview ? "request_approval" : "read_ledger"),
                     "instruction": .string(changed.isEmpty
                         ? (!unknown.isEmpty || !unsure.isEmpty ? check
                             : users ? nothing + drop : alone ? nothing + own : asked ? nothing + ask
-                            : nothing + "Fix what stopped it, then run it again.")
+                            : cardPreview ? cardInstruction : nothing + (at?["instruction"].flatMap(AppToolExecutor.inputString)
+                                ?? "Fix what stopped it, then run it again."))
                         : "The calls in \(strict ? "changed" : "landed") took effect; don't run them again. "
                             + (!unknown.isEmpty || !unsure.isEmpty ? check : users ? drop : alone ? own : asked ? ask
                                 : "Read the page, then do only what is left.")),
                     "next_call": .null,
                 ])
+                if code == "unknown_action", let recovery = at?["remedy"] {
+                    out["remedy"] = recovery
+                    out["nearest"] = at?["nearest"]
+                }
                 // A strict run hands back: its step, what landed by real id,
                 // and the one question when it asked one.
                 if strict {
@@ -1112,17 +1208,20 @@ enum AppScriptRunner {
                   invoke("step", "", [String(label), guidance === undefined ? "" : String(guidance), options === undefined ? null : options]);
                 }
             """
-        let unknown = !strict ? "" : """
+        let unknown = """
 
               function named(space, base) {
                 return new Proxy(base, { get: function (t, key) {
                   if (typeof key !== "string" || key in t) return t[key];
+                  if (key in api) return api[key];
                   return function () { return invoke("action", space + "." + key, Array.prototype.slice.call(arguments)); };
                 } });
               }
               Object.keys(api).forEach(function (key) { if (typeof api[key] === "object") api[key] = named(key, api[key]); });
               return new Proxy(Object.freeze(api), { get: function (t, key) {
-                return typeof key !== "string" || key in t ? t[key] : named(key, Object.freeze({}));
+                if (typeof key !== "string" || key in t) return t[key];
+                if (key.indexOf(".") >= 0) return function () { return invoke("action", key, Array.prototype.slice.call(arguments)); };
+                return named(key, Object.freeze({}));
               } });
             """
         let frozen = !input ? "" : """
@@ -1148,7 +1247,8 @@ enum AppScriptRunner {
             throw e;
           }
           var api = {
-            read: function (page, item) { return invoke("read", "", [page, item]); },
+            call: function (id) { return invoke("action", id, Array.prototype.slice.call(arguments, 1)); },
+            read: function () { return invoke("read", "", Array.prototype.slice.call(arguments)); },
             find: function (words) { return invoke("find", "", [words]); },
             log: function () {
               say(Array.prototype.map.call(arguments, function (a) {
@@ -1159,7 +1259,7 @@ enum AppScriptRunner {
           ids.forEach(function (id) {
             var dot = id.indexOf("."), space = id.slice(0, dot);
             api[space] = api[space] || {};
-            api[space][id.slice(dot + 1)] = function () {
+            api[id] = api[space][id.slice(dot + 1)] = function () {
               return invoke("action", id, Array.prototype.slice.call(arguments));
             };
           });

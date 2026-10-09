@@ -16,16 +16,18 @@ import CoreSpotlight
 import CloudKit
 #endif
 
-/// Intercept only Tab while this draft owns the field editor, before NSTextView
-/// inserts it. All typing and Return variants retain their existing dispatch.
+/// Intercept Tab and open slash suggestions while this draft owns the editor.
+/// Other typing and modified Return retain their existing dispatch.
 struct ComposerTabKeyHandler: NSViewRepresentable {
     var active: Bool
     var move: (Bool) -> Bool
+    var suggestionKey: ((UInt16) -> Bool)? = nil
 
     func makeNSView(context: Context) -> TabView { TabView() }
     func updateNSView(_ view: TabView, context: Context) {
         view.active = active
         view.move = move
+        view.suggestionKey = suggestionKey
     }
 
     static func dismantleNSView(_ view: TabView, coordinator: ()) { view.stop() }
@@ -33,6 +35,7 @@ struct ComposerTabKeyHandler: NSViewRepresentable {
     final class TabView: NSView {
         var active = false
         var move: ((Bool) -> Bool)?
+        var suggestionKey: ((UInt16) -> Bool)?
         private var monitor: Any?
 
         override func viewDidMoveToWindow() {
@@ -40,10 +43,14 @@ struct ComposerTabKeyHandler: NSViewRepresentable {
             stop()
             guard window != nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self, active, event.window === window,
+                guard let self, active, !isHiddenOrHasHiddenAncestor, event.window === window,
                       !event.modifierFlags.contains(.command),
                       !event.modifierFlags.contains(.control),
                       let editor = window?.firstResponder as? NSTextView else { return event }
+                if event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+                   !editor.hasMarkedText(), suggestionKey?(event.keyCode) == true {
+                    return nil
+                }
                 // SwiftUI's vertical TextField submits Shift-Return too. Keep
                 // it in the native editor so selection, undo and draft binding
                 // receive a newline without accepting or queuing a turn.
@@ -99,7 +106,6 @@ struct AttachmentChip: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -223,19 +229,13 @@ func composerCardRequestedForCapture() -> ChatComposerCard? {
 struct MacChatComposerControlStrip<InputContent: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     /// Which settings card is open. Shared with the card layer that draws it
     /// above the transcript; absent in the detached panel and the snapshots.
     @Environment(ComposerShellState.self) private var composerCardState: ComposerShellState?
 
 
-
-    /// ui-simplify 2026-09-02 (Lane A). ON: one material, 22pt radius, a single
-    /// hairline, a soft shadow, plus and mic on the left and a plain send arrow
-    /// on the right — the thing you sit down at. OFF: the previous GlassCard
-    /// strip, unchanged, for the detached panels that have not been reshaped
-    /// yet.
-    var shell: Bool = false
 
     let isListening: Bool
     let screenCaptureAllowed: Bool
@@ -258,16 +258,15 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     /// Agent, 2026-09-03: the composer must not look identical with the
     /// keyboard in it as it does at rest. The view cannot own the focus —
     /// the `@FocusState` belongs to the chat that owns the text field — so
-    /// the owner reports it here. One value, one call site (ChatView); the
-    /// detached panel is on the classic body and keeps the default.
+    /// the owner reports it here, including the detached panel.
     var isFocused: Bool = false
+    var sessionId: String? = nil
     var showsConversationSettings: Bool = false
     /// Incremented by the draft when Tab should move into the settings words.
     var focusWordToken: Int = 0
     let inputContent: InputContent
 
     init(
-        shell: Bool = false,
         isListening: Bool,
         screenCaptureAllowed: Bool,
         screenCaptureDisabled: Bool,
@@ -283,11 +282,11 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         onSend: @escaping () -> Void,
         onFocusRequest: (() -> Void)? = nil,
         isFocused: Bool = false,
+        sessionId: String? = nil,
         showsConversationSettings: Bool = false,
         focusWordToken: Int = 0,
         @ViewBuilder inputContent: () -> InputContent
     ) {
-        self.shell = shell
         self.isListening = isListening
         self.screenCaptureAllowed = screenCaptureAllowed
         self.screenCaptureDisabled = screenCaptureDisabled
@@ -303,6 +302,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         self.onSend = onSend
         self.onFocusRequest = onFocusRequest
         self.isFocused = isFocused
+        self.sessionId = sessionId
         self.showsConversationSettings = showsConversationSettings
         self.focusWordToken = focusWordToken
         self.inputContent = inputContent()
@@ -321,17 +321,13 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         .resolve(isRunning: isRunning, hasQueuedTurns: hasQueuedTurns, isQueuePaused: isQueuePaused)
     }
 
-    var body: some View {
-        if shell {
-            shellBody
-        } else {
-            classicBody
-        }
+    /// Send ↔ Stop: the glyph swaps, the circle stays. None under Reduce Motion.
+    private var glyphSwap: AnyTransition {
+        reduceMotion ? .identity
+            : .scale(scale: 0.5).combined(with: .opacity).animation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.2))
     }
 
-    // MARK: - The shell composer
-
-    private var shellBody: some View {
+    var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             inputContent
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -396,41 +392,36 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 // when a turn starts. A calm circle in the send button's fill,
                 // the glyph in the text colour; red was the loudest thing on
                 // screen. Return still queues a draft during a turn.
-                if isRunning {
-                    Button(action: onStop) {
-                        Image(systemName: "stop.fill")
-                            .font(ShellType.label)
-                            .frame(width: 36, height: 36)
-                            .background(Color.primary.opacity(0.12), in: Circle())
-                            .foregroundStyle(NativeAgentShell.text)
-                            .contentShape(Circle())
+                // Wave 3 (after Grok): one circle; only the glyph changes,
+                // scaling from half size as it fades, 200ms quint-out.
+                let lit = isRunning || canSend
+                Button(action: isRunning ? onStop : onSend) {
+                    ZStack {
+                        if isRunning {
+                            Image(systemName: "stop.fill")
+                                .font(ShellType.label)
+                                .transition(glyphSwap)
+                        } else {
+                            Image(systemName: "arrow.right")
+                                .font(ShellType.body)
+                                .transition(glyphSwap)
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .shellKeyboardTarget(.send)
-                    .help("Stop generation")
-                    .accessibilityLabel("Stop generation")
-                } else {
-                    Button(action: onSend) {
-                        Image(systemName: "arrow.right")
-                            .font(ShellType.body)
-                            .frame(width: 36, height: 36)
-                            .background(
-                                canSend ? Color.primary.opacity(0.12) : NativeAgentShell.quietFill,
-                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            )
-                            .foregroundStyle(canSend ? NativeAgentShell.text : NativeAgentShell.tertiary)
-                    }
-                    .buttonStyle(.plain)
-                    .shellKeyboardTarget(.send)
-                    .disabled(!canSend)
-                    .animation(
-                        NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
-                        value: canSend
-                    )
-                    .help("\(sendAction.label). \(sendAction.hint)")
-                    .accessibilityLabel(sendAction.label)
-                    .accessibilityHint(sendAction.hint)
+                    .frame(width: 36, height: 36)
+                    .background(lit ? Color.primary.opacity(0.12) : NativeAgentShell.quietFill, in: Circle())
+                    .foregroundStyle(lit ? NativeAgentShell.text : NativeAgentShell.tertiary)
+                    .contentShape(Circle())
                 }
+                .buttonStyle(.plain)
+                .shellKeyboardTarget(.send)
+                .disabled(!lit)
+                .animation(
+                    NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
+                    value: lit
+                )
+                .help(isRunning ? "Stop generation" : "\(sendAction.label). \(sendAction.hint)")
+                .accessibilityLabel(isRunning ? "Stop generation" : sendAction.label)
+                .accessibilityHint(isRunning ? "" : sendAction.hint)
             }
         }
         // The room's gutter, inside the glass: the field's first character
@@ -448,8 +439,11 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         // its own lensing and shadow, so the hairline and the hand shadow are
         // gone with it. Reduce transparency still gets the opaque fill: that
         // setting asks for more opacity, never less.
+        // A quiet screenshot draws that opaque fill too: tinted glass drawn
+        // into a bitmap blanks the WHOLE capture, not just itself, so the
+        // chat page came back as an empty (black) image.
         .background {
-            if reduceTransparency {
+            if reduceTransparency || quietOffscreenRead {
                 RoundedRectangle(
                     cornerRadius: NativeAgentShellLayout.composerRadius,
                     style: .continuous
@@ -469,39 +463,31 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
             // glass and the words, so neither washes the draft. Leaves only:
             // see ThinkingGlow.swift.
             HazeBottomGlow(cornerRadius: NativeAgentShellLayout.composerRadius)
-            ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.composerRadius)
+            ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.composerRadius, sessionId: sessionId)
         }
         // The card holds independent controls; interactive glass makes a
         // click in the field press/dim the entire card on macOS 27.
         .glassEffect(
-            reduceTransparency ? .identity : ShellSidebarRail.plateGlass,
+            reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate,
             in: RoundedRectangle(
                 cornerRadius: NativeAgentShellLayout.composerRadius,
                 style: .continuous
             )
         )
-        // Agent, 2026-09-03: held. One hairline lift when the field has the
-        // keyboard — not a tint, not a glow, not a second shadow. Reduce
-        // transparency already draws this border permanently on its opaque
-        // fill, so the focused state stays out of its way there.
+        // Held keyboard focus stays visible on both glass and the opaque plate.
         .overlay {
-            if !reduceTransparency {
-                // Agent, 2026-09-03: the hairline only showed on the top rim
-                // over glass; one step of fill reads as "held" all round.
-                RoundedRectangle(
-                    cornerRadius: NativeAgentShellLayout.composerRadius,
-                    style: .continuous
-                )
-                .fill(Color.primary.opacity(0.04))
-                .opacity(isFocused ? 1 : 0)
-                // Animate only the focus wash, never the field's focus layout.
-                .animation(reduceMotion ? nil : NativeAgentMotion.quick, value: isFocused)
-                .allowsHitTesting(false)
-            }
+            RoundedRectangle(
+                cornerRadius: NativeAgentShellLayout.composerRadius,
+                style: .continuous
+            )
+            .strokeBorder(NativeAgentShell.text, lineWidth: isFocused ? 2 : 0)
+            .animation(reduceMotion ? nil : NativeAgentMotion.quick, value: isFocused)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
         }
         // The thinking rim: one arc of light travelling round the edge. Outside
         // the focus animation's scope; it carries its own fade.
-        .overlay { ThinkingGlow(kind: .rim, cornerRadius: NativeAgentShellLayout.composerRadius) }
+        .overlay { ThinkingGlow(kind: .rim, cornerRadius: NativeAgentShellLayout.composerRadius, sessionId: sessionId) }
         .contentShape(Rectangle())
         .onTapGesture {
             composerCardState?.dismiss()
@@ -527,99 +513,6 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         }
     }
 
-    // MARK: - The classic composer (unchanged)
-
-    private var classicBody: some View {
-        GlassCard(tint: NativeAgentBrand.accent.opacity(0.2)) {
-            HStack(alignment: .bottom, spacing: NativeAgentSpacing.sm) {
-                Menu {
-                    Button(action: onToggleVoice) {
-                        Label(
-                            isListening ? "Stop Listening" : "Voice Input",
-                            systemImage: isListening ? "mic.fill" : "mic"
-                        )
-                    }
-
-                    Button(action: onCaptureScreen) {
-                        Label(
-                            screenCaptureAllowed ? "Show Agent My Screen" : "Enable Screen Capture in Trust",
-                            systemImage: "camera.viewfinder"
-                        )
-                    }
-                    .disabled(screenCaptureDisabled)
-
-                    Button(action: onAttach) {
-                        Label("Attach Image or File…", systemImage: "paperclip")
-                    }
-                } label: {
-                    ZStack(alignment: .topTrailing) {
-                        Image(systemName: isListening ? "mic.fill" : "plus.circle")
-                            .foregroundStyle(isListening ? Color.red : Color.primary)
-                            .frame(width: 30, height: 30)
-                            .contentShape(Rectangle())
-
-                        if pendingAttachmentCount > 0 {
-                            Text("\(pendingAttachmentCount)")
-                                .font(NativeAgentFont.tag)
-                                .foregroundStyle(.white)
-                                .padding(3)
-                                .background(NativeAgentBrand.accent, in: Circle())
-                                .offset(x: 6, y: -6)
-                        }
-                    }
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Voice, screen capture, and attachments")
-                .accessibilityLabel(optionsAccessibilityLabel)
-
-                inputContent
-
-                if isRunning {
-                    Button(action: onStop) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 13, weight: .semibold))
-                            .frame(width: 34, height: 34)
-                            .background(
-                                Color.red.opacity(0.85),
-                                in: RoundedRectangle(cornerRadius: NativeAgentRadius.control)
-                            )
-                            .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Stop generation")
-                    .accessibilityLabel("Stop generation")
-                }
-
-                Button(action: onSend) {
-                    Image(systemName: "paperplane.fill")
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 34, height: 34)
-                        .background(
-                            canSend ? NativeAgentBrand.accentDeep : Color.secondary.opacity(0.18),
-                            in: RoundedRectangle(cornerRadius: NativeAgentRadius.control)
-                        )
-                        .foregroundStyle(canSend ? .white : .secondary)
-                }
-                .buttonStyle(.borderless)
-                .shellKeyboardTarget(.send)
-                .disabled(!canSend)
-                .animation(
-                    NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
-                    value: canSend
-                )
-                .help("\(sendAction.label). \(sendAction.hint)")
-                .accessibilityLabel(sendAction.label)
-                .accessibilityHint(sendAction.hint)
-            }
-        }
-        // The whole visible box focuses the field. contentShape covers the
-        // card padding; a click on the menu/stop/send still routes to those
-        // controls first, and a click already on the text field just
-        // re-asserts the focus it produced.
-        .contentShape(Rectangle())
-        .onTapGesture { onFocusRequest?() }
-    }
 }
 
 // PATCH-2026-05-09: nextgen-surface — Horizontal row of suggested NextGen action chips above composer
@@ -668,6 +561,131 @@ enum NextGenActionChipsPresentation {
             && !isGlobalActionRunning
             && !isTracked(actionID, in: runningIDs)
             && !isTracked(actionID, in: completedIDs)
+    }
+}
+
+/// Fluid glass A2: what waits above the composer — queued sends, pending
+/// attachments, chats running elsewhere, suggested actions — is ONE tray of
+/// the composer's own glass, fused to its top edge. It used to be four rows,
+/// each at its own width (760 against the room's 740), stacked over the
+/// composer and pushing the transcript as they came and went. The caller puts
+/// this and the composer in one `GlassEffectContainer`, so the two read as a
+/// single object; the tray materializes, grows and shrinks on a smooth spring.
+/// Glass is the tray's alone: nothing inside it wears glass of its own.
+struct ChatComposerTray: View {
+    @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    /// A quiet screenshot takes the opaque tray, as the composer does.
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
+    @Namespace private var glass
+
+    let sessionId: String
+    let isBusy: Bool
+    let attachments: [MultimodalAttachment]
+    let onRemoveAttachment: (String) -> Void
+    let otherRunning: [String]
+    let routes: ([String]) -> [MacChatRunningSessionRoute]
+    let onGoTo: (String) -> Void
+    let onStop: (String) -> Void
+
+    /// The gap between the tray and the composer under it. Inside the
+    /// container's merge distance, so the two glass shapes fuse.
+    static let gap: CGFloat = 6
+    static let radius: CGFloat = 16
+
+    /// What is in the tray, by identity. The spring keys on this and nothing
+    /// else, so a chip that only changes its words does not move the tray.
+    private struct Contents: Equatable {
+        var queued: [String]
+        var attachments: [String]
+        var others: [String]
+        var actions: [String]
+        var isEmpty: Bool {
+            queued.isEmpty && attachments.isEmpty && others.isEmpty && actions.isEmpty
+        }
+    }
+
+    private var contents: Contents {
+        Contents(
+            queued: ChatQueuePresentation.visibleTurns(
+                appModel.engine.turns.queued(for: sessionId)).map(\.id),
+            attachments: attachments.map(\.id),
+            others: otherRunning,
+            actions: NextGenActionChipsPresentation.visibleActions(
+                summary: appModel.nextGenSummary).map(\.id)
+        )
+    }
+
+    var body: some View {
+        let contents = contents
+        VStack(spacing: 0) {
+            if !contents.isEmpty {
+                rows(contents)
+                    .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background {
+                        if reduceTransparency || quietOffscreenRead {
+                            RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                                .fill(Color(nsColor: .controlBackgroundColor))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                                        .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+                                }
+                        }
+                    }
+                    .glassEffect(
+                        reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate,
+                        in: RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                    )
+                    .glassEffectID("composer.tray", in: glass)
+                    .glassEffectTransition(reduceMotion ? .identity : .materialize)
+                    .transition(.opacity)
+                    .padding(.bottom, Self.gap)
+            }
+        }
+        .animation(NativeAgentMotion.respecting(NativeAgentMotion.glide, reduceMotion: reduceMotion),
+                   value: contents)
+    }
+
+    private func rows(_ contents: Contents) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !contents.queued.isEmpty {
+                ChatQueuedTurnsView(sessionId: sessionId, isBusy: isBusy)
+                    .transition(.opacity)
+            }
+            if !attachments.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: NativeAgentSpacing.sm) {
+                            ForEach(attachments) { att in
+                                AttachmentChip(attachment: att) { onRemoveAttachment(att.id) }
+                                    .transition(.opacity)
+                            }
+                        }
+                    }
+                    if attachments.count >= 2 {
+                        Text("\(appModel.agentDisplayName) will treat these as one combined input.")
+                            .font(ShellType.caption)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                    }
+                }
+                .transition(.opacity)
+            }
+            if !contents.others.isEmpty {
+                MacChatOtherSessionsBanner(
+                    otherRunning: otherRunning,
+                    routes: routes,
+                    onGoTo: onGoTo,
+                    onStop: onStop
+                )
+            }
+            if !contents.actions.isEmpty {
+                NextGenActionChipsRow(appModel: appModel)
+                    .transition(.opacity)
+            }
+        }
     }
 }
 
@@ -785,7 +803,7 @@ struct NextGenChip: View {
                         .foregroundStyle(.green)
                         .transition(NativeAgentMotion.reveal())
                 } else if isRunning {
-                    PulsingDot(color: NativeAgentBrand.accent, size: 6, animates: true)
+                    PulsingDot(color: NativeAgentShell.secondary, size: 6, animates: true)
                 } else {
                     Image(systemName: chipIcon)
                         .font(NativeAgentFont.tag)
@@ -798,12 +816,14 @@ struct NextGenChip: View {
             }
             .padding(.horizontal, NativeAgentSpacing.sm)
             .padding(.vertical, NativeAgentSpacing.xs)
-            .glassEffect(.regular.interactive(), in: Capsule())  // Liquid Feel W2
+            // Fluid glass A2: the chips ride in the composer tray's glass, so
+            // they take a fill, not glass of their own (never glass on glass).
+            .background(NativeAgentShell.softFill, in: Capsule())
             .overlay(
                 Capsule()
                     .strokeBorder(
                         isCompleted ? Color.green.opacity(0.45) :
-                        isRunning   ? NativeAgentBrand.accent.opacity(0.45) :
+                        isRunning   ? NativeAgentShell.secondary.opacity(0.45) :
                                       Color.primary.opacity(0.10),
                         lineWidth: 0.8
                     )

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Senses
 
 /// Call-local proof supplied by the canonical view capture, never by app-name
 /// matching. A source that cannot bind pixels to this look is discarded.
@@ -25,6 +26,17 @@ final class MacSightCaptureBinding: @unchecked Sendable {
 
 extension MacFourVerbs {
     // MARK: 1 — EYES
+
+    static func runningAppsLine(_ output: [String: JSONValue]) -> String {
+        guard case .array(let running)? = output["running_apps"] else { return "" }
+        let names = running.compactMap { value -> String? in
+            let row = object(value)
+            return string(row["name"]).map { $0 + (row["front"] == .bool(true) ? " (frontmost)" : "") }
+        }
+        let omitted = int(output["running_apps_omitted"]) ?? 0
+        return "Running apps: " + names.joined(separator: ", ")
+            + (omitted > 0 ? " (+\(omitted) more)" : "") + "\n"
+    }
 
     /// A FRESH look, rendered in the one canonical structure.
     ///
@@ -71,8 +83,17 @@ extension MacFourVerbs {
         }
         switch await sight(part: part, app: app) {
         case .blind(let reply):
+            if reply.detail["status"] == .string("in_process_route"), case .array? = reply.detail["running_apps"] {
+                let front = Self.string(Self.object(reply.detail["frontmost_app"])["name"]) ?? "unknown app"
+                return MacFourVerbsReply(ok: true,
+                    text: "MAC · \(front) in front\n" + Self.runningAppsLine(reply.detail)
+                        + "NativeAgent's window is read in process; no accessibility capture was made.",
+                    detail: reply.detail)
+            }
             return reply
         case .seen(let sighting):
+            let contentRoute = ["com.apple.mail": "mail.*", "com.apple.MobileSMS": "messages.*",
+                                "com.apple.Notes": "notes.*"][sighting.bundleIdentifier ?? ""]
             var lead = "Looking at " + sighting.place + "."
             if let part, let note = sighting.zoomNote {
                 lead = "Zoomed on \"\(part)\" in " + sighting.place + ". " + note
@@ -82,10 +103,11 @@ extension MacFourVerbs {
             }
             return MacFourVerbsReply(
                 ok: true,
-                text: lead + "\n" + sighting.render,
+                text: (sighting.detail["native_page"] != nil ? sighting.render : lead + "\n" + sighting.render)
+                    + (contentRoute.map { "\nUse \($0) for content; this is only the on-screen view." } ?? ""),
                 detail: structured
                     ? sighting.detail.merging(["controls": sighting.controls]) { _, new in new }
-                    : sighting.detail
+                    : sighting.detail.filter { $0.key != "native_page" }
             )
         }
     }
@@ -227,6 +249,8 @@ extension MacFourVerbs {
 
     struct Sighting {
         let render: String
+        /// The screen's content alone — no running-apps, Act or provenance line,
+        /// no frame id — so `wait` matches and compares what the app shows.
         let effectRender: String
         let pointer: MacPointerPosition?
         let place: String
@@ -274,9 +298,11 @@ extension MacFourVerbs {
     /// A resolvable thing on the screen. `label` is the DISPLAY text — what the
     /// renderer printed — so anything redaction withheld cannot be named.
     struct ActTarget: Equatable {
+        var actions: [String]
+        let settableAttributes: [String]
         let sourceAXPath: [Int]?
         let handle: String
-        let label: String?
+        var label: String?
         /// Additional exact natural names for this SAME target. These never
         /// create a second address or carry a second handle; they let transient
         /// state such as keyboard focus name the element already in the model.
@@ -326,9 +352,13 @@ extension MacFourVerbs {
             regionOnly: Bool = false,
             physicalOnly: Bool = false,
             motionUncertain: Bool = false,
-            sourceAXPath: [Int]? = nil
+            sourceAXPath: [Int]? = nil,
+            actions: [String] = [],
+            settableAttributes: [String] = []
         ) {
             self.handle = handle
+            self.actions = actions
+            self.settableAttributes = settableAttributes
             self.sourceAXPath = sourceAXPath
             self.label = label
             self.aliases = aliases
@@ -364,6 +394,7 @@ extension MacFourVerbs {
             // truth about what it is describing.
             var body: [String: JSONValue] = ["grade": .string("look"), "app_map": .bool(true)]
             if let app { body["app"] = .string(app) }
+            if let part { body["section"] = .string(part) }
             if let seek = seek ?? part, !seek.isEmpty { body["seek"] = .string(seek) }
             result = try await host.dispatch(action: "look", body: body)
         } catch {
@@ -375,14 +406,18 @@ extension MacFourVerbs {
         }
         let output = Self.object(result.output)
         if result.error == "self_inspection_unsupported" {
-            return .blind(Self.ownAppRoute())
+            let route = Self.ownAppRoute()
+            return .blind(MacFourVerbsReply(ok: route.ok, text: route.text,
+                detail: route.detail.merging(["frontmost_app": output["frontmost_app"] ?? .null,
+                    "running_apps": output["running_apps"] ?? .null,
+                    "running_apps_omitted": output["running_apps_omitted"] ?? .int(0)]) { current, _ in current }))
         }
         guard result.ok, let frameId = Self.string(output["frame_id"]) else {
             let why = Self.string(output["message"])
                 ?? Self.lookRefusalWords(result.error ?? Self.string(output["status"]) ?? "unknown")
             return .blind(MacFourVerbsReply(
                 ok: false,
-                text: "I can't see the screen right now. " + why,
+                text: Self.runningAppsLine(output) + "I can't see the screen right now. " + why,
                 // The refusal's own words, unwrapped. A caller with a different
                 // lead sentence (the cross-app drag: "I can't drop into Mail")
                 // must not have to strip this one's off the front.
@@ -492,6 +527,7 @@ extension MacFourVerbs {
         var pointer: MacPointerPosition?
         var pointerFrame: MacAXFrame?
         var supplementalDiagnostics: [String: JSONValue] = [:]
+        var nativeAXSupplement: MacFourVerbsSupplement?
         let captureBinding = MacSightCaptureBinding(frameID: frameId)
         let supplement = await MacSightCaptureBinding.$current.withValue(captureBinding) {
             await supplementalSource?.observe(app: app)
@@ -502,6 +538,7 @@ extension MacFourVerbs {
             pointer = supplement.pointer
             pointerFrame = supplement.pointerFrame ?? supplement.visibleFrame
             supplementalDiagnostics = supplement.diagnostics
+            nativeAXSupplement = supplement
             var addedTargets: [ActTarget] = []
             var mergedAXPaths: Set<[Int]> = []
             var addedAXOrdinals: [[Int]: Int] = [:]
@@ -547,7 +584,9 @@ extension MacFourVerbs {
                         regionOnly: existing.regionOnly,
                         physicalOnly: existing.physicalOnly || candidate.physicalOnly,
                         motionUncertain: candidate.motionUncertain,
-                        sourceAXPath: existing.sourceAXPath ?? candidate.sourceAXPath
+                        sourceAXPath: existing.sourceAXPath ?? candidate.sourceAXPath,
+                        actions: sameAXElement ? candidate.actions : existing.actions,
+                        settableAttributes: sameAXElement ? candidate.settableAttributes : existing.settableAttributes
                     )
                     enriched.placeholder = existing.placeholder
                     if duplicateIndex < targets.count {
@@ -578,7 +617,9 @@ extension MacFourVerbs {
                     regionOnly: candidate.regionOnly,
                     physicalOnly: candidate.physicalOnly,
                     motionUncertain: candidate.motionUncertain,
-                    sourceAXPath: candidate.sourceAXPath
+                    sourceAXPath: candidate.sourceAXPath,
+                    actions: candidate.actions,
+                    settableAttributes: candidate.settableAttributes
                 ))
             }
             targets.append(contentsOf: addedTargets)
@@ -645,7 +686,9 @@ extension MacFourVerbs {
                         regionOnly: existing.regionOnly,
                         physicalOnly: existing.physicalOnly,
                         motionUncertain: existing.motionUncertain,
-                        sourceAXPath: existing.sourceAXPath
+                        sourceAXPath: existing.sourceAXPath,
+                        actions: existing.actions,
+                        settableAttributes: existing.settableAttributes
                     )
                     targets[index].placeholder = existing.placeholder
                     full = Self.adding(
@@ -675,7 +718,9 @@ extension MacFourVerbs {
                         regionOnly: existing.regionOnly,
                         physicalOnly: existing.physicalOnly,
                         motionUncertain: existing.motionUncertain,
-                        sourceAXPath: existing.sourceAXPath
+                        sourceAXPath: existing.sourceAXPath,
+                        actions: existing.actions,
+                        settableAttributes: existing.settableAttributes
                     )
                     targets[index].placeholder = existing.placeholder
                 }
@@ -709,31 +754,128 @@ extension MacFourVerbs {
         }
 
         let zoom = part.flatMap { Self.zoom(full, part: $0, options: options) }
-        let rendering = MacScreenRender.rendering(zoom?.screen ?? full, options: zoom?.options ?? options)
-        let pointerLine: String = {
-            guard let pointer else { return "POINTER: position unavailable." }
+        let pointerLine: String? = {
+            guard let pointer else { return nil }
             guard let frame = pointerFrame else { return "POINTER: observed; surface position unavailable." }
             guard pointer.isInside(frame) else { return "POINTER: outside the observed surface." }
             let x = Int(((pointer.x - frame.x) / frame.w * 100).rounded())
             let y = Int(((pointer.y - frame.y) / frame.h * 100).rounded())
             return "POINTER: \(x)%,\(y)% of the observed surface (system position)."
         }()
-        // Her-screen Phase 5 — remembered controls the text render cut.
         let windowKind = Self.string(output["window_kind"])
-        let knownLine = await knownLine(
-            bundle: percept.app?.bundleIdentifier, windowKind: windowKind,
-            live: targets,
-            rendered: zoom == nil ? Self.renderedPaths(full, options: options) : nil
-        )
         // A walk its caps cut must not read as the whole window: say so, and
         // how to reach the rest (a named act searches past the cut).
-        let cutLine: String? = percept.truncated
-            && percept.truncationReasons.contains(where: { $0 == "depth_cap" || $0 == "node_cap" })
-            ? "CUT     the read stopped at its size limit; at least \(percept.skippedAtLeast) more elements "
-                + "weren't read. Name a control and I'll search past the cut."
+        let cutLine: String? = !percept.truncated ? nil
+            : percept.truncationReasons.contains("ax_error")
+            ? "partial: the app didn't answer every accessibility read; this is only the content read so far."
+            : percept.truncationReasons.contains(where: { ["depth_cap", "node_cap", "time_budget"].contains($0) })
+            ? "partial: budget reached; this is only the accessibility content read so far."
             : nil
-        let renderedText = rendering.text + (knownLine.map { $0 + "\n" } ?? "")
-            + (cutLine.map { $0 + "\n" } ?? "") + "\n" + pointerLine
+        let rendererNote = Self.string(Self.object(output["seam"])["renderer_wait_note"])
+        // The AX native page already represents its text, values and controls
+        // together. The legacy render remains the independent pixel surface;
+        // it must never be appended as a second copy of an AX document.
+        guard let value = output["native_page"] else {
+            return .blind(MacFourVerbsReply(ok: false,
+                text: "raw view · accessibility · The look reader did not return a native screen page.",
+                detail: ["error": .string("screen_page_unavailable")]))
+        }
+        var nativePage: NativePage
+        do { nativePage = try JSONDecoder().decode(NativePage.self, from: value.serializedData(pretty: false)) }
+        catch {
+            return .blind(MacFourVerbsReply(ok: false,
+                text: "raw view · accessibility · The native screen page could not be decoded: \(error.localizedDescription)",
+                detail: ["error": .string("screen_page_unavailable")]))
+        }
+        // Resolve the names and presses the native page actually offers,
+        // rather than a same-named decorative element from the raw percept.
+        for thing in nativePage.things {
+            guard let address = try? JSONValue.parse(Data(thing.address.utf8)),
+                  let handle = Self.string(Self.object(address)["handle"]),
+                  let index = targets.firstIndex(where: { $0.handle == handle }) else { continue }
+            targets[index].label = thing.name
+            if thing.verbs.contains("press") { targets[index].actions = ["AXPress"] }
+        }
+        var nativeBlocks = Self.array(output["native_page_blocks"]).map(Self.object)
+        if let nativeAXSupplement {
+            do { try Self.addingNativeAX(nativeAXSupplement, to: &nativePage, blocks: &nativeBlocks, targets: targets, frameID: frameId) }
+            catch {
+                return .blind(MacFourVerbsReply(ok: false,
+                    text: "raw view · accessibility · The supplemental native surfaces could not be compiled: \(error.localizedDescription)",
+                    detail: ["error": .string("screen_page_unavailable")]))
+            }
+        }
+        let fullNativeText = nativePage.text
+        var nativeZoomNote: String?
+        if let part, Self.string(Self.object(output["seam"])["scope_name"]) == part {
+            nativeZoomNote = "Read the named native section; its action addresses are unchanged."
+        } else if let part {
+            var page = nativePage
+            let blocks = nativeBlocks
+            var scopePaths: [[Int]] = []
+            var scopeAddresses: Set<String> = []
+            if case .hit(let target) = Self.resolve(part, among: targets) {
+                if let path = target.sourceAXPath { scopePaths = [path] }
+                else if let ordinal = target.roleOrdinal {
+                    let selector = "\(target.kind) \(ordinal)"
+                    for block in blocks where Self.string(block["target"]) == selector {
+                        if let address = Self.string(block["address"]) { scopeAddresses.insert(address) }
+                    }
+                }
+            } else if let zoom, zoom.scope == .controls {
+                scopePaths = zoom.screen.controls.compactMap(\.sourceAXPath)
+            } else if let zoom, zoom.scope == .readouts {
+                let text = Set(zoom.screen.values.compactMap { $0.text.display })
+                scopePaths = percept.readouts.filter { $0.displayText.map(text.contains) ?? false }.map(\.path)
+            }
+            if scopePaths.isEmpty {
+                let needle = Self.normalize(part)
+                scopePaths = blocks.compactMap { block in
+                    guard let text = Self.string(block["text"]),
+                          Self.normalize(text.trimmingCharacters(in: CharacterSet(charactersIn: "# \n"))) == needle else { return nil }
+                    return Self.path(block["path"])
+                }
+            }
+            if !scopePaths.isEmpty || !scopeAddresses.isEmpty {
+                let selected = blocks.enumerated().filter { index, block in
+                    if index < 2 { return true }
+                    if let address = Self.string(block["address"]), scopeAddresses.contains(address) { return true }
+                    let path = Self.path(block["path"])
+                    return !path.isEmpty && scopePaths.contains { path.starts(with: $0) || $0.starts(with: path) }
+                }.compactMap { Self.string($0.element["text"]) }
+                page.text = selected.joined(separator: "\n")
+                page.things = page.things.filter { page.text.contains("[" + SenseScreenThings.printed($0.address) + "]") }
+                nativePage = page
+                nativeZoomNote = "Read the named native section; its action addresses are unchanged."
+            } else {
+                if zoom?.scope == .visual {
+                    page.text = blocks.prefix(2).compactMap { Self.string($0["text"]) }.joined(separator: "\n")
+                    page.things = []
+                    nativePage = page
+                    nativeZoomNote = "Read the observed visual surface; its existing name and region targets are unchanged."
+                } else {
+                    nativeZoomNote = "No native section is named \"\(part)\"; this is the whole page."
+                }
+            }
+        }
+        let pixelText = MacScreenRender.pixelEvidence(zoom?.screen ?? full)
+        let fullPixelText = MacScreenRender.pixelEvidence(full)
+        let pageText = (nativeZoomNote.map { $0 + "\n" } ?? "") + nativePage.text + pixelText
+        let renderedText = (rendererNote.map { $0 + "\n" } ?? "")
+            + Self.runningAppsLine(output)
+            + pageText
+            + (cutLine.map { $0 + "\n" } ?? "") + (pointerLine.map { "\n" + $0 } ?? "")
+        var pageDetail: [String: JSONValue] = [:]
+        do {
+            var page = nativePage
+            page.text = renderedText
+            do { pageDetail["native_page"] = try JSONValue.parse(JSONEncoder().encode(page)) }
+            catch {
+                return .blind(MacFourVerbsReply(ok: false,
+                    text: "raw view · accessibility · The native screen page could not be encoded: \(error.localizedDescription)",
+                    detail: ["error": .string("screen_page_unavailable")]))
+            }
+        }
         if let name = percept.app?.name {
             // A scroll bar's thumb is a raw position (Freeform · 0.3936617029400535 on
             // home, walk 6), not something the window says: home never shows it.
@@ -742,7 +884,9 @@ extension MacFourVerbs {
         }
         return .seen(Sighting(
             render: renderedText,
-            effectRender: rendering.text,
+            effectRender: ([MacScreenPageCompiler.actLine(frameID: frameId), SenseScreenThings.accessibilityReadLine]
+                .reduce(fullNativeText) { $0.replacingOccurrences(of: "\n" + $1, with: "") } + fullPixelText)
+                .replacingOccurrences(of: frameId, with: "<frame>"),
             pointer: pointer,
             place: Self.place(percept),
             appName: percept.app?.name,
@@ -753,7 +897,7 @@ extension MacFourVerbs {
             windowFrame: Self.frame(output["window_frame"]),
             targets: targets,
             frameId: frameId,
-            zoomNote: zoom?.note,
+            zoomNote: nativeZoomNote ?? zoom?.note,
             controls: .object([
                 "frame_id": .string(frameId),
                 "app": output["app"] ?? .null,
@@ -763,11 +907,15 @@ extension MacFourVerbs {
                 "affordances_omitted": output["affordances_omitted"] ?? .int(0),
             ]),
             detail: [
+                "partial": .bool(cutLine != nil),
+                "truncation_reasons": .array(percept.truncationReasons.map(JSONValue.string)),
                 "bytes": .int(Int64(renderedText.utf8.count)),
-                "rows_dropped": .int(Int64(rendering.rowsDropped)),
-                "controls_dropped": .int(Int64(rendering.controlsDropped)),
+                "rows_dropped": .int(0),
+                "controls_dropped": .int(0),
                 "semantic_targets_omitted": .int(Int64(percept.affordancesOmitted)),
-            ].merging(supplementalDiagnostics) { current, _ in current },
+            ].merging(pageDetail) { _, new in new }
+                .merging(rendererNote.map { ["renderer_wait_note": JSONValue.string($0)] } ?? [:]) { current, _ in current }
+                .merging(supplementalDiagnostics) { current, _ in current },
             frontmostApp: {
                 let front = Self.object(output["frontmost_app"])
                 guard let name = Self.string(front["name"]),

@@ -117,7 +117,7 @@ enum ApprovalDecisionToastPresentation {
     }
 
     static func unavailable(_ error: any Error) -> Toast {
-        .init(kind: .error, text: "Approval update failed: \(error.localizedDescription)")
+        .init(kind: .error, text: UserFacingError.message(error, action: "update that approval"))
     }
 
     @MainActor
@@ -209,14 +209,9 @@ enum ApprovalRequestsLiveRefresh {
 /// Bounded, visible wording for a failed approval read. Retained records are
 /// last-known, not evidence that the approval inbox is currently healthy.
 enum ApprovalLoadFailurePresentation {
-    static let maxDetailCharacters = 240
 
     static func banner(error: any Error, retainedApprovalCount: Int) -> String {
-        let rawDetail = error.localizedDescription
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let detail = rawDetail.isEmpty
-            ? "No further details are available. Try Refresh to check again."
-            : String(rawDetail.prefix(maxDetailCharacters))
+        let detail = UserFacingError.cause(error, action: "load approvals")
         let retained = retainedApprovalCount == 1
             ? "Approvals couldn't refresh — showing 1 previously loaded approval."
             : retainedApprovalCount > 1
@@ -339,7 +334,7 @@ struct ApprovalsView: View {
                     Text("This decision is no longer available.").foregroundStyle(.secondary)
                 }
                 HStack {
-                    GradientText(text: "Approvals", colors: [.orange, .red], font: NativeAgentFont.title)
+                    Text("Approvals").font(NativeAgentFont.title).foregroundStyle(NativeAgentShell.text)
                     Spacer()
                     StatusBadge(
                         text: approvalLoadState.hasLoadedSnapshot ? "\(approvalLoadState.approvals.count) total" : "Not checked",
@@ -506,7 +501,7 @@ struct ApprovalPayloadPreviewView: View {
         }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .houseInset(in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var previewText: some View {
@@ -533,64 +528,68 @@ private struct ApprovalRequestPanel: View {
     }
 
     var body: some View {
-        NativePanel(tint: .orange) {
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                HStack(alignment: .top) {
-                    PulsingDot(color: .orange, size: 8)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(approval.title.isEmpty ? ToolActivityPresentation.title(approval.action)
-                            : ToolActivityPresentation.approvalText(approval.title, tool: approval.action))
-                            .font(NativeAgentFont.section)
-                        Text(ToolActivityPresentation.title(approval.action))
-                            .font(NativeAgentFont.label)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    StatusBadge(text: riskBadge.label, status: riskBadge.status)
-                }
-                if !approval.reason.isEmpty {
-                    Text(ToolActivityPresentation.approvalText(approval.reason, tool: approval.action))
-                        .font(NativeAgentFont.body)
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+            HStack(alignment: .top) {
+                AliveWaitingDot()
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(approval.title.isEmpty ? ToolActivityPresentation.title(approval.action)
+                        : ToolActivityPresentation.approvalText(approval.title, tool: approval.action))
+                        .font(NativeAgentFont.section)
+                    Text(ToolActivityPresentation.title(approval.action))
+                        .font(NativeAgentFont.label)
                         .foregroundStyle(.secondary)
-                        .lineLimit(5)
                 }
-                switch payloadPreview {
-                case .available(let preview):
-                    ApprovalPayloadPreviewView(preview: preview)
-                case .unavailable:
-                    Label(
-                        ApprovalPayloadPreviewPresentation.unavailableText,
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Spacer()
+                StatusBadge(text: riskBadge.label, status: riskBadge.status)
+            }
+            if !approval.reason.isEmpty {
+                Text(ToolActivityPresentation.approvalText(approval.reason, tool: approval.action))
+                    .font(NativeAgentFont.body)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(5)
+            }
+            switch payloadPreview {
+            case .available(let preview):
+                ApprovalPayloadPreviewView(preview: preview)
+            case .unavailable:
+                Label(
+                    ApprovalPayloadPreviewPresentation.unavailableText,
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+            HStack(spacing: NativeAgentSpacing.sm) {
+                Button {
+                    onResolve("approved")
+                } label: {
+                    Label("Approve", systemImage: "checkmark")
                 }
-                HStack(spacing: NativeAgentSpacing.sm) {
-                    Button {
-                        onResolve("approved")
-                    } label: {
-                        Label("Approve", systemImage: "checkmark")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .hazeTinted(.button)
-                    .controlSize(.small)
-                    .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
-                    Button {
-                        onResolve("denied")
-                    } label: {
-                        Label("Deny", systemImage: "xmark")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .tint(.red)
-                    .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
-                    if isDeciding {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
+                .buttonStyle(.borderedProminent)
+                .hazeTinted(.button)
+                .controlSize(.small)
+                .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
+                Button {
+                    onResolve("denied")
+                } label: {
+                    Label("Deny", systemImage: "xmark")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.red)
+                .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
+                if isDeciding {
+                    ProgressView()
+                        .controlSize(.small)
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(NativeAgentSpacing.lg)
+        // A pending decision is the one thing here waiting on him: the
+        // kit's card with its teal glow, the teal dot beside the title.
+        .aliveCard(waiting: true)
+        .accessibilityElement(children: .contain)
     }
 }
 

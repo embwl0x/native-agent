@@ -242,6 +242,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
                 )
             }
         }
+        return try await StandingBotContinuity.withSessionContract(sessionID: sessionId, dataRoot: dataRoot) {
         let admission = try await engine.checkedRouteAdmission(
             for: surface,
             requestedModel: model,
@@ -276,6 +277,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
             let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
             response.requestedModel = requested.isEmpty ? nil : requested
             return response
+        }
         }
         }
         }

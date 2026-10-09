@@ -14,7 +14,7 @@ extension NativeClient {
     }
 
     private static var approvalTransactions: ApprovalTransactionCoordinator {
-        NativeClient(baseURL: "").approvalTransactions
+        NativeClient().approvalTransactions
     }
 
     typealias ApprovalExecutionReconcileKind = ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind

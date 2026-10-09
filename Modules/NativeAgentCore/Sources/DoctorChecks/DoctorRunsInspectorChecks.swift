@@ -70,7 +70,8 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
         if FileManager.default.fileExists(atPath: folder.path), !FileManager.default.isReadableFile(atPath: folder.path) {
             return CheckResult(id: id, title: title, status: "fail",
                 detail: "The saved traces folder (\(folder.lastPathComponent)) exists but cannot be read, so Inspector Replay cannot open it.",
-                human_action: "Restore read permission on data/turn_traces for your user, then run Doctor again.")
+                human_action: "Restore read permission on data/turn_traces for your user, then run Doctor again.",
+                ask: .permission)
         }
         var inspected = 0
         var problems: [String] = []

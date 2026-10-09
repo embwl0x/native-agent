@@ -242,22 +242,28 @@ extension NativeClient {
     ]
 
     static let productionRedactions: [String] = [
+        "senses/ledger/*",
+        "senses/news/*",
         "mcp/servers.json",
         "config/*",
         "secrets/*",
         "oauth_tokens/*",
         "providers/*",
         "codex_home/*",
+        "codex_child_home/*",
         "catalog/.pack_signing_key",
         "raw logs",
     ]
 
     static let supportRedactions: [String] = [
+        "senses/ledger/*",
+        "senses/news/*",
         "config/*",
         "secrets/*",
         "oauth_tokens/*",
         "providers/*",
         "codex_home/*",
+        "codex_child_home/*",
         "catalog/.pack_signing_key",
         "chat transcripts",
         "memory database",

@@ -30,7 +30,11 @@ public enum NativeOAuthFlow {
         case "xai_oauth_direct": path = OAuthCredentialDestinations.xAIProvider(dataRoot: dataRoot)
         default: throw ProviderRoutingError.providerNotFound
         }
-        _ = try ProviderStateValidation.credential(at: path)
+        if normalizedOAuthProviderId(providerId) == "xai_oauth_direct" {
+            _ = try ProviderStateValidation.credentialMetadata(at: path)
+        } else {
+            _ = try ProviderStateValidation.credential(at: path)
+        }
     }
 
     // MARK: - Public entry

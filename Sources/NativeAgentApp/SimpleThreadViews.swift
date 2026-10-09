@@ -159,7 +159,7 @@ struct SimpleContactThread: View {
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         // Lines dissolve before the header, as in the chat.
-        .roomTopChrome(masked: true) {
+        .roomTopChrome {
             SimpleThreadHeader(title: contact.name, subtitle: contact.via) {
                 SimpleAvatar(contact: contact, size: 36)
             }
@@ -174,7 +174,7 @@ struct SimpleContactThread: View {
                     .simpleRoomColumn()
                     .padding(.vertical, 12)
             } else {
-                SimpleComposer(placeholder: "Message \(contact.name)", recipient: contact.name, note: note) { text in
+                SimpleComposer(thread: contact.id, placeholder: "Message \(contact.name)", recipient: contact.name, note: note) { text in
                     await send(text)
                 }
             }
@@ -453,7 +453,7 @@ private struct SimplePendingMessage: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 9)
-                .background(NativeAgentShell.quietFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .houseSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(NativeAgentShell.hairline, style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
@@ -540,13 +540,13 @@ struct SimpleHelperRuns: View {
             .padding(.top, 12)
             .padding(.bottom, 24)
         }
-        .roomTopChrome(masked: true) {
+        .roomTopChrome {
             SimpleThreadHeader(title: name, subtitle: record.definition.paused ? "Paused" : record.cadence) {
                 SimpleClockTile(size: 36)
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            SimpleComposer(placeholder: "Message \(name)", recipient: name, note: note,
+            SimpleComposer(thread: key, placeholder: "Message \(name)", recipient: name, note: note,
                            alternate: ("Ask \(agentName)", askAgent)) { text in
                 await send(text)
             }
@@ -680,6 +680,7 @@ struct SimpleCrewThread: View {
         case "completed": return "Done"
         case "partial": return "Done, some workers fell short"
         case "cancelled": return "Stopped"
+        case "interrupted": return "Interrupted"
         case "failed": return "Didn't finish"
         default: return crew.live ? "Working now" : "Finished"
         }
@@ -721,7 +722,7 @@ struct SimpleCrewThread: View {
             .padding(.bottom, 24)
         }
         .defaultScrollAnchor(.top, for: .alignment)
-        .roomTopChrome(masked: true) {
+        .roomTopChrome {
             SimpleThreadHeader(title: crew.task, subtitle: "\(Self.outcome(crew)) · \(count)") {
                 SimpleClockTile(size: 36, symbol: "person.3", working: crew.live)
             }
@@ -773,11 +774,22 @@ private struct SimpleTranscriptEntry: View {
     }
 }
 
+/// Unsent thread drafts, by thread. Held outside the view tree, so a draft
+/// survives the thread being closed and Simple itself being left (⌘, lands in
+/// Advanced, which unmounts the whole Simple shell). Process lifetime, like
+/// the threads' own in-memory state.
+@MainActor
+enum SimpleThreadDrafts {
+    static var byThread: [String: String] = [:]
+}
+
 /// The chat's message box, for a thread: the same rounded glass (radius 22,
 /// native glass, the haze's faint bottom glow), the same column and gutter,
 /// the draft on top and a row under it with the send arrow on the right.
 /// Return sends; the box clears only once the message is accepted.
 private struct SimpleComposer: View {
+    /// The thread the draft belongs to (`SimpleThreadDrafts`).
+    let thread: String
     let placeholder: String
     var prefill = ""
     /// Who a send goes straight to. Shown the whole time, because the
@@ -859,7 +871,7 @@ private struct SimpleComposer: View {
             }
             HazeBottomGlow(cornerRadius: NativeAgentShellLayout.composerRadius)
         }
-        .glassEffect(reduceTransparency ? .identity : ShellSidebarRail.plateGlass, in: shape)
+        .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
         .overlay {
             if focused, !reduceTransparency {
                 shape.fill(Color.primary.opacity(0.04)).allowsHitTesting(false)
@@ -870,21 +882,30 @@ private struct SimpleComposer: View {
         .onTapGesture { focused = true }
         .simpleRoomColumn(gutter: 0)
         .padding(.bottom, 24)
-        .onAppear { if text.isEmpty { text = prefill } }
-        // A draft belongs to one thread: never carried to another contact.
-        .onChange(of: recipient) { text = prefill }
+        .onAppear { if text.isEmpty { text = SimpleThreadDrafts.byThread[thread] ?? prefill } }
+        // A draft belongs to one thread: never carried to another contact,
+        // and kept for its own thread when this one is left.
+        .onChange(of: thread) { _, next in text = SimpleThreadDrafts.byThread[next] ?? prefill }
+        .onChange(of: text) { _, draft in
+            SimpleThreadDrafts.byThread[thread] = draft == prefill ? nil : draft
+        }
     }
 
     private func submit(_ route: ((String) async -> Bool)? = nil) {
         guard sendable else { return }
         let draft = text
         let destination = recipient
+        let origin = thread
         let message = trimmed
         let deliver = route ?? send
         sending = true
         Task { @MainActor in
             defer { sending = false }
-            if await deliver(message), text == draft, recipient == destination { text = prefill }
+            guard await deliver(message) else { return }
+            // Sent: the thread it came from no longer holds it as a draft,
+            // even if another thread is open now.
+            if SimpleThreadDrafts.byThread[origin] == draft { SimpleThreadDrafts.byThread[origin] = nil }
+            if text == draft, recipient == destination { text = prefill }
         }
     }
 }

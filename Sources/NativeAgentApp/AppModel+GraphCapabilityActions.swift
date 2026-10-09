@@ -59,7 +59,7 @@ extension AppModel {
             graphSearchResults = try await client.searchGraph(query: trimmed).results
             statusText = "Graph search found \(graphSearchResults.count)"
         } catch {
-            statusText = "Graph search failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "search the knowledge graph")
         }
     }
 
@@ -73,8 +73,9 @@ extension AppModel {
             graphLoadError = nil
             statusText = "Knowledge graph refreshed"
         } catch {
-            graphLoadError = error.localizedDescription
-            statusText = "Knowledge graph refresh failed: \(error.localizedDescription)"
+            let line = UserFacingError.message(error, action: "refresh the knowledge graph")
+            graphLoadError = line
+            statusText = line
         }
     }
 
@@ -95,7 +96,7 @@ extension AppModel {
             statusText = CapabilitiesResearchLabPresentation.message(for: outcome).text
             return outcome
         } catch {
-            let outcome = ResearchLabActionOutcome.failed(error.localizedDescription)
+            let outcome = ResearchLabActionOutcome.failed(UserFacingError.cause(error, action: "start the research run"))
             statusText = CapabilitiesResearchLabPresentation.message(for: outcome).text
             return outcome
         }
@@ -111,7 +112,7 @@ extension AppModel {
             return CapabilitiesResearchLabPresentation.list(rows: rows)
         } catch {
             return CapabilitiesResearchLabPresentation.unavailableList(
-                detail: error.localizedDescription,
+                detail: UserFacingError.cause(error, action: "list research runs"),
                 retained: engine.desk.researchRuns
             )
         }
@@ -171,15 +172,15 @@ extension AppModel {
             do {
                 capabilityCatalogSources = try await client.getCapabilityCatalogSources()
             } catch {
-                let detail = error.localizedDescription
-                statusText = "Capability source saved, but catalog reload failed: \(detail)"
+                let detail = UserFacingError.cause(error, action: "reload the catalog")
+                setFailureStatus("Capability source saved, but the catalog couldn't reload. \(detail)", cause: error)
                 return .savedNeedsReload(source, detail)
             }
             statusText = "Capability source saved"
             return .saved(source)
         } catch {
-            let detail = error.localizedDescription
-            statusText = "Source save failed: \(detail)"
+            let detail = UserFacingError.cause(error, action: "save that source")
+            setFailureStatus("Couldn't save that source. " + detail, cause: error)
             return .failed(detail)
         }
     }
@@ -193,7 +194,7 @@ extension AppModel {
                 ? "Capability update checking is unavailable; source versions are not compared."
                 : "Capability updates checked"
         } catch {
-            statusText = "Update check failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "check for updates")
         }
     }
 
@@ -204,7 +205,7 @@ extension AppModel {
             engine.trust.capabilityNetwork = try? await engine.trust.loadCapabilityNetwork()
             statusText = "Capability trust evaluated"
         } catch {
-            statusText = "Trust evaluate failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "evaluate that against trust")
         }
     }
 
@@ -216,7 +217,7 @@ extension AppModel {
             engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
             statusText = "Native action recorded"
         } catch {
-            statusText = "Native action failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "run that action")
         }
     }
 
@@ -254,7 +255,7 @@ extension AppModel {
             statusText = "\(label): \(latestNextGenReceipt?.displayStatus ?? "recorded")"
             return true
         } catch {
-            statusText = "Next-gen probe failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "run the next-gen probe")
             return false
         }
     }
@@ -277,7 +278,7 @@ extension AppModel {
             browserRuntimeStatus = try? await client.getBrowserStatus()
             statusText = "Browser dry run: \(latestBrowserRun?.status ?? "recorded")"
         } catch {
-            statusText = "Browser run failed: \(error.localizedDescription)"
+            setFailureStatus("Browser run failed: " + UserFacingError.cause(error, action: "run the browser"), cause: error)
         }
     }
 
@@ -288,7 +289,7 @@ extension AppModel {
             browserRuntimeStatus = try? await client.getBrowserStatus()
             statusText = "Browser run \(latestBrowserRun?.status ?? "canceled")"
         } catch {
-            statusText = "Browser cancel failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "cancel the browser run")
         }
     }
 
@@ -306,7 +307,7 @@ extension AppModel {
             connectorActionRegistry = try? await client.getConnectorActions()
             statusText = "Connector action: \(latestConnectorActionReceipt?.status ?? "recorded")"
         } catch {
-            statusText = "Connector action failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "run that connector action")
         }
     }
 
@@ -317,7 +318,7 @@ extension AppModel {
             improvementGauntletStatus = try? await client.getImprovementGauntlet()
             statusText = "Gauntlet: \(latestGauntletRun?.status ?? "recorded")"
         } catch {
-            statusText = "Gauntlet failed: \(error.localizedDescription)"
+            setFailureStatus("Gauntlet failed: " + UserFacingError.cause(error, action: "run the gauntlet"), cause: error)
         }
     }
 
@@ -346,7 +347,7 @@ extension AppModel {
             )
             statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
         } catch {
-            capabilityCatalogInstallOutcome = .refused(message: error.localizedDescription)
+            capabilityCatalogInstallOutcome = .refused(message: UserFacingError.cause(error, action: "install the pack"))
             statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
         }
     }
@@ -358,7 +359,7 @@ extension AppModel {
             statusText = "Rolled back \(install.name ?? install.packId)"
             await refreshAll()
         } catch {
-            statusText = "Rollback failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "roll that back")
         }
     }
 
@@ -390,7 +391,7 @@ extension AppModel {
             statusText = "\(label) created and verified: \(export.id)"
             return .verified(export)
         } catch {
-            let detail = error.localizedDescription
+            let detail = UserFacingError.cause(error, action: "create the \(label.lowercased())")
             statusText = "\(label) failed: \(detail)"
             return .failed(support: support, detail: detail)
         }
@@ -405,7 +406,7 @@ extension AppModel {
             statusText = "Improvement started"
             await refreshAll()
         } catch {
-            statusText = "Improvement failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "run the improvement")
         }
     }
 
@@ -418,7 +419,7 @@ extension AppModel {
             statusText = "Continuous self-improvement scheduled"
             await refreshAll()
         } catch {
-            statusText = "Recurring improvement failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "set up the recurring improvement")
         }
     }
 
@@ -431,7 +432,7 @@ extension AppModel {
             statusText = "Harness benchmark \(result.status ?? "completed"): \(passed)/\(total) checks"
             improvementSummary = try? await client.getImprovementSummary()
         } catch {
-            statusText = "Harness benchmark failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "run the harness benchmark")
         }
     }
 

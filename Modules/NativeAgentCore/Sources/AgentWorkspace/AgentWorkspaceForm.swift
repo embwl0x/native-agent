@@ -370,7 +370,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         return args
     }
 
-    /// Explicit input owners only. Generic capability forms, browser leases,
+    /// Explicit input owners only. Generic capability forms, browser page snapshots,
     /// credentials and approval/connection payloads deliberately stay resident.
     var canPersist: Bool {
         let allowed: Set<String> = ["write_file", "save_skill", "commit_memory", "recall_memory", "mail_search",
@@ -379,7 +379,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
             "mac_calendar_create_event", "mac_reminders_create", "mac_reminders_query", "mac_reminders_update", "image_generate", "bot_create", "bot_update"]
         let stableTargets: Set<String> = ["path", "expected_content_sha256", "name", "id", "handle", "memory_id", "message_id", "expected_message_id",
             "thread_id", "conversation_session_id", "agent", "conversation"]
-        let forbidden = ["token", "secret", "password", "credential", "authorization", "cookie", "header", "lease", "approval", "permission", "trust", "provider", "session_grant"]
+        let forbidden = ["token", "secret", "password", "credential", "authorization", "cookie", "header", "approval", "permission", "trust", "provider", "session_grant"]
         return allowed.contains(tool) && Set(bound.keys).isSubset(of: stableTargets)
             && bound.values.allSatisfy { value in
                 if case .string(let text) = value { return text.utf8.count <= 8192 && !text.contains("\0") }

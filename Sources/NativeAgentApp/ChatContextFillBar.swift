@@ -142,40 +142,41 @@ struct ContextFillBar: View {
             if let s = status {
                 VStack(alignment: .trailing, spacing: 1) {
                     Text("\(formatExactTokens(s.used_tokens)) / \(formatExactTokens(s.budget))")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .font(ShellType.captionCodeSemibold)
                         .foregroundStyle(s.context_loaded == true ? .primary : .secondary)
+                        .lineLimit(1)
 
                     HStack(spacing: 5) {
                         Text(s.context_loaded == true ? formatPercent(pct) : "estimate")
                             .foregroundStyle(
                                 s.context_loaded == true
                                     ? fillColor
-                                    : Color.secondary.opacity(0.55)
+                                    : NativeAgentShell.secondary
                             )
                         Text("chat \(ContextFillPresentation.transcriptTokens(s.transcript_tokens))")
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(NativeAgentShell.secondary)
                         Image(systemName: "rectangle.compress.vertical")
-                            .font(.system(size: 7, weight: .semibold))
-                            .foregroundStyle(.tertiary)
+                            .font(ShellType.captionSemibold)
+                            .foregroundStyle(NativeAgentShell.secondary)
                             .accessibilityHidden(true)
                         Text(formatExactTokens(s.auto_compact_threshold))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(NativeAgentShell.secondary)
                         if let delta = s.turn_delta_tokens {
                             Image(systemName: delta >= 0 ? "arrow.up.right" : "arrow.down.right")
-                                .font(.system(size: 7, weight: .bold))
+                                .font(ShellType.captionSemibold)
                             Text(formatSignedTokens(delta))
                         }
                     }
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.captionCode)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-                .frame(width: 220, alignment: .trailing)
+                .frame(width: 280, alignment: .trailing)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(contextAccessibilityLabel(s))
             } else {
-                Text("—").font(.caption2).foregroundStyle(.tertiary).frame(width: 220)
+                Text("—").font(ShellType.captionCode).foregroundStyle(.tertiary).frame(width: 280)
             }
 
             // Compact-now button when the runtime says transcript reduction is
@@ -308,7 +309,7 @@ struct ContextFillBar: View {
             lastError = nil
             lastErrorWasCompaction = false
         } catch {
-            lastError = error.localizedDescription
+            lastError = UserFacingError.cause(error, action: "read how full the context is")
             lastErrorWasCompaction = false
         }
     }
@@ -341,7 +342,7 @@ struct ContextFillBar: View {
             }
             await refresh()
         } catch {
-            lastError = error.localizedDescription
+            lastError = UserFacingError.cause(error, action: "compact this chat")
             lastErrorWasCompaction = true
         }
     }

@@ -59,8 +59,7 @@ public struct HeartbeatNotice: Sendable, Equatable {
 }
 
 /// Small, separate "is anything quietly on fire?" heartbeat (U2b wave 3,
-/// plan design #6). Distinct from the weekly self-improvement pass and the
-/// self-healing hook: this reads a `HEARTBEAT.md` checklist from the persona
+/// plan design #6). Distinct from the weekly self-improvement pass: this reads a `HEARTBEAT.md` checklist from the persona
 /// dir and an app-supplied deterministic assessment. Clean assessments skip
 /// the LLM entirely. Only anomalous assessments ask the app's OWN configured
 /// LLM (routed by the `heartbeat` surface picker — the user's HARD RULE: every LLM
@@ -98,7 +97,7 @@ public struct HeartbeatLoop: LoopRunner {
     public static let surface = "heartbeat"
     /// Default production cadence: twice daily. The loop is a low-noise
     /// sentinel, not a near-real-time monitor; urgent faults are covered by
-    /// Doctor and SelfHealingHook.
+    /// Doctor.
     public static let defaultInterval: TimeInterval = 12 * 60 * 60
 
     private let llm: any LLMClient

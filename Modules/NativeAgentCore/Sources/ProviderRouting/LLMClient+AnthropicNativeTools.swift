@@ -493,6 +493,7 @@ extension AnthropicAdapter {
         let data: Data
         let response: URLResponse
         do {
+            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
             (data, response) = try await session.data(for: req)
         } catch {
             throw mapTransportError(error, fallback: .underlying(
@@ -559,11 +560,11 @@ extension AnthropicAdapter {
 
     // MARK: - Streaming
 
-    /// Mirrors the branch `streamMessages` takes below: only the first-party
-    /// native tool lane parses SSE; kimi-code and every no-tools call are one
-    /// blocking request with a keep-alive heartbeat.
+    /// Mirrors streamMessages: stall-only text authoring and the first-party
+    /// native tool lane parse SSE. Interactive buffered paths stay unchanged.
     public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind {
-        firstPartyAnthropicToolContract && usesNativeToolLane(tools) ? .incremental : .bufferedKeepAlive
+        (firstPartyAnthropicToolContract && usesNativeToolLane(tools))
+            || (ProviderStreamContext.stallOnly && (tools?.isEmpty ?? true)) ? .incremental : .bufferedKeepAlive
     }
 
     /// TWO native-lane transports, chosen by `firstPartyAnthropicToolContract`:
@@ -592,7 +593,10 @@ extension AnthropicAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        if firstPartyAnthropicToolContract, usesNativeToolLane(tools), let tools {
+        // Background text authoring needs actual SSE activity, not a buffered
+        // request with a client-generated heartbeat. No tools are added.
+        if (firstPartyAnthropicToolContract && usesNativeToolLane(tools))
+            || (ProviderStreamContext.stallOnly && (tools?.isEmpty ?? true)) {
             return AsyncThrowingStream<LLMMessageStreamEvent, Error>(
                 bufferingPolicy: .unbounded
             ) { continuation in
@@ -602,7 +606,7 @@ extension AnthropicAdapter {
                             messages: messages,
                             system: system,
                             model: model,
-                            tools: tools,
+                            tools: tools ?? [],
                             continuation: continuation
                         )
                     } catch let err as LLMError {
@@ -723,7 +727,9 @@ extension AnthropicAdapter {
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do {
+            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
             (bytes, response) = try await session.bytes(for: req)
+            if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
         } catch {
             throw mapTransportError(error, fallback: .underlying(
                 message: "connection refused: \(endpoint.host ?? "anthropic")"))
@@ -792,7 +798,7 @@ extension AnthropicAdapter {
                 switch effectiveEvent {
                 case "error":
                     let errObj = obj["error"] as? [String: Any]
-                    throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj ?? [:])))
+                    throw ProviderFailure.wireError(errObj ?? [:])
                 case "message_start":
                     let msg = obj["message"] as? [String: Any]
                     usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))

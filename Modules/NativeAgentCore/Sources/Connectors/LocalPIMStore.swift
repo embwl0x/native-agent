@@ -5,7 +5,7 @@ public enum LocalPIMCalendarAccess { case read, write }
 
 /// Live objects remain confined to the platform store's main-actor session.
 @MainActor public protocol LocalPIMCalendar {
-    var title: String { get }
+    var title: String { get set }
     var calendarIdentifier: String { get }
     var sourceTitle: String { get }
     var allowsContentModifications: Bool { get }
@@ -82,6 +82,8 @@ public protocol LocalPIMReminderRead: SendableMetatype {
     func reminder(withIdentifier id: String) -> Reminder?
     func makeEvent() -> Event
     func makeReminder() -> Reminder
+    func makeReminderCalendar(in calendar: Calendar) -> Calendar
+    func save(_ calendar: Calendar) throws
     func save(_ event: Event) throws
     func save(_ reminder: Reminder) throws
     func remove(_ event: Event) throws

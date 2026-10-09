@@ -198,6 +198,8 @@ struct TelegramView: View {
     @State private var voicePermissionMessage: String?
     @State private var settingsLoaded = false
     @State private var settingsLoading = true
+    @State private var checkingSender = false
+    @State private var senderCheckMessage: String?
 
     private var allowlistPresentation: TelegramAllowlistPresentation {
         telegramAllowlistPresentation(
@@ -338,6 +340,7 @@ struct TelegramView: View {
 
                     if let status = appModel.engine.telegram.status {
                         TelegramMetaRow(label: "Poller", value: status.pollerEnabled ? "Running" : "Disabled")
+                        TelegramMetaRow(label: "Last successful poll", value: status.lastPollAt.map(UserDisplayFormatters.humanizeISOTimestamp) ?? "None")
                         TelegramMetaRow(label: "Last update", value: status.lastSeenUpdateId.map(String.init) ?? "None")
                         TelegramMetaRow(
                             label: "Last reply",
@@ -382,13 +385,8 @@ struct TelegramView: View {
                                 }
                             }
                         }
-                        if status.isTransientPollInterruption {
-                            TelegramNote(
-                                text: "The poller is active and retrying after a transient interruption.",
-                                tone: .quiet
-                            )
-                        } else if let error = status.actionableError {
-                            TelegramNote(text: error, tone: .trouble)
+                        if let message = status.pollStatusMessage {
+                            TelegramNote(text: message, tone: status.isTransientPollInterruption ? .quiet : .trouble)
                         }
                     } else {
                         TelegramNote(
@@ -451,6 +449,22 @@ struct TelegramView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(ShellType.label)
                     }
+                    TelegramNote(text: "To find your ID, leave Telegram off, save the bot token, then send the bot a message in Telegram. Check sender shows its numeric chat ID below. Admit only a sender you recognize, then save with Telegram on.", tone: .quiet)
+                    Button(checkingSender ? "Checking…" : "Check sender") {
+                        checkingSender = true
+                        Task {
+                            defer { checkingSender = false }
+                            do {
+                                let count = try await appModel.client.discoverTelegramSenders(token: appModel.telegramToken)
+                                await appModel.refreshTelegram()
+                                senderCheckMessage = count == 0 ? "No messages found. Send your bot a message, then check again." : "Sender IDs are in Blocked and ignored below. Choose your chat ID and save to admit it."
+                            } catch {
+                                senderCheckMessage = "Could not check senders. Check your bot token and keep Telegram off while checking."
+                            }
+                        }
+                    }
+                    .disabled(checkingSender || appModel.isSavingTelegram || appModel.engine.telegram.status?.enabled == true)
+                    if let senderCheckMessage { TelegramNote(text: senderCheckMessage, tone: .quiet) }
                     if !invalidAllowlistTokens.isEmpty {
                         TelegramNote(
                             text: "These are not usable IDs: \(invalidAllowlistTokens.joined(separator: ", ")). Use the numeric chat or user ID.",
@@ -664,6 +678,13 @@ struct TelegramView: View {
                                     detail: event.textPreview ?? "",
                                     metadata: event.at
                                 )
+                                if let chatID = event.chatId, Int64(chatID) != nil {
+                                    Button("Use chat ID \(chatID)") {
+                                        var ids = appModel.telegramAllowedChats.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map(String.init)
+                                        if !ids.contains(chatID) { ids.append(chatID) }
+                                        appModel.telegramAllowedChats = ids.joined(separator: ", ")
+                                    }
+                                }
                             }
                             let hidden = TelegramPanelPresentation.hiddenCount(total: status.blocked.count, visibleLimit: 6)
                             if hidden > 0 {

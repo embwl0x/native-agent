@@ -174,7 +174,7 @@ public actor EmbeddingModelDownload {
     public func install(createOnly: Bool = false) async throws -> Bool {
         guard !status.running else { return false }
         guard let descriptorURL else {
-            NSLog("[embedding-download] No bundled descriptor; download not required")
+            nativeLog("[embedding-download] No bundled descriptor; download not required")
             return false
         }
         status = Status()

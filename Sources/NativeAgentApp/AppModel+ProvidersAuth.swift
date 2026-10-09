@@ -162,11 +162,12 @@ extension AppModel {
                     applyCanonicalChatBrainSelection(canonical)
                 }
                 let result = ChatBrainSaveResult.failed(
-                    message: error.localizedDescription,
-                    rolledBackTo: canonical
+                    message: UserFacingError.cause(error, action: "save the model choice"),
+                    rolledBackTo: canonical,
+                    cause: error.localizedDescription
                 )
                 chatBrainLastSaveResult = (pending.generation, result)
-                statusText = result.userMessage
+                setFailureStatus(result.userMessage, cause: error)
             }
         }
     }
@@ -277,7 +278,7 @@ extension AppModel {
             return true
         } catch {
             chatProvider = rollbackProvider
-            statusText = "Set chat provider failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "switch the chat provider")
             return false
         }
     }
@@ -328,41 +329,14 @@ extension AppModel {
         do {
             current = try await routing.savedActiveProvidersChecked()
         } catch {
-            statusText = "Provider state unavailable: \(error.localizedDescription)"
+            setFailureStatus(error, action: "read your providers")
             return
         }
         let chatAssignment = (current["chat"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if chatAssignment.isEmpty || !available.contains(chatAssignment) {
-            _ = try? await client.setActiveProvider(surface: "chat", providerId: providerId)
-            // 2026-09-13 review: WRITE the model down as well. The resolver has
-            // no literal to fall back on any more, so "connected but never
-            // chose a model" has to become a real saved choice here — the
-            // account's own default, from its catalog — rather than an empty
-            // Chat choice that would read as "not set up" straight after a
-            // successful sign-in. Everything else follows Chat from this.
-            if var model = await routing.defaultModelForProviderID(providerId),
-               !model.isEmpty {
-                // 2026-09-22: a new ChatGPT account starts on gpt-6-sol, but
-                // only when its signed cache lists it; the catalog's first row
-                // (gpt-5.6-sol) stays the universally safe default.
-                if CodexSelectableModelCatalog.isAccountBackedProvider(providerId),
-                   model == FirstPartyModelCatalog.chatGPTAccountFallbackModels.first?.id,
-                   CodexSelectableModelCatalog.signedCacheLists(
-                       "gpt-6-sol",
-                       providerID: providerId,
-                       cacheURL: providerId == "openai_oauth_direct"
-                           ? CodexSelectableModelCatalog.chatGPTOAuthCacheCandidate(
-                               dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-                           )
-                           : CodexSelectableModelCatalog.cacheCandidate()
-                   ) {
-                    model = "gpt-6-sol"
-                }
-                _ = try? await routing.saveModelConfig(JSONValue.object([
-                    "surface": JSONValue.string("chat"),
-                    "model": JSONValue.string(model),
-                ]))
-            }
+            // Sign-in connects an account. The picker alone selects its model.
+            do { _ = try await client.setActiveProvider(surface: "chat", providerId: providerId) }
+            catch { setFailureStatus(error, action: "select the connected account") }
         }
         // Anything else that is blank already follows Chat. Anything pointing at
         // a provider that is not connected is a leftover, not a choice: clear it

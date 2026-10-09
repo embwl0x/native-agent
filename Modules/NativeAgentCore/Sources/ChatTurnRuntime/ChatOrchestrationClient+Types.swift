@@ -25,6 +25,7 @@ public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
     case badAttachments(detail: String)
     case invalidResponse(status: Int)
     case underlying(String)
+    case helperModelChoice(sessionID: String, reason: String, message: String)
 
     public var errorDescription: String? {
         switch self {
@@ -36,6 +37,8 @@ public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
             return "chat: runtime returned unexpected status \(status)"
         case .underlying(let message):
             return "chat: \(message)"
+        case .helperModelChoice(_, _, let message):
+            return message
         }
     }
 }
@@ -60,6 +63,7 @@ public struct ChatResponse: Sendable, Codable, Equatable {
     /// turn. Nil means the path did not produce authoritative accounting.
     public var providerCallCount: Int?
     public var runtimeStatus: String? = nil
+    public var terminalState: TurnEngineResult.TerminalState? = nil
     public var statusDetail: String? = nil
     /// The approval a bot turn stopped on, when `runtimeStatus` says it is
     /// waiting for one. The approval record stays canonical about whether it
@@ -90,7 +94,8 @@ public struct ChatResponse: Sendable, Codable, Equatable {
         message: ChatMessage? = nil,
         messages: [ChatMessage]? = nil,
         attachments: [MultimodalAttachment]? = nil,
-        providerCallCount: Int? = nil
+        providerCallCount: Int? = nil,
+        terminalState: TurnEngineResult.TerminalState? = nil
     ) {
         self.runId = runId
         self.model = model
@@ -104,6 +109,7 @@ public struct ChatResponse: Sendable, Codable, Equatable {
         self.messages = messages
         self.attachments = attachments
         self.providerCallCount = providerCallCount
+        self.terminalState = terminalState
     }
 }
 
@@ -197,7 +203,8 @@ public protocol ChatOrchestrationClient: Sendable {
         // MACHINE text lands on the user row — the bridge's reply-free
         // transport notices. Only the caller knows; the row cannot be told
         // from its text, and the felt organ was reading notices as User's words.
-        mechanicalRow: CognitiveMechanicalRowKind?
+        mechanicalRow: CognitiveMechanicalRowKind?,
+        awaitingConsumption: Bool
     ) async throws -> EnqueuedUserMessage
 
     /// Her answer from a turn in a contact's own conversation, shown in the

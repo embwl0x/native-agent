@@ -5,9 +5,10 @@ import PersistenceCore
 extension MacFourVerbs {
     // MARK: 4 — PATIENCE
 
-    /// Signals prompt fresh observations. Without a text condition, quiet in
-    /// the observed app can end the wait. With a condition, only a match can:
-    /// coarse fallback reads also catch text changes that emit no AX signal.
+    /// Signals prompt fresh observations. Without a text condition, two equal
+    /// reads end the wait — the app-level observer misses changes inside many
+    /// windows, so its quiet alone never settles. With a condition, only a
+    /// match in the screen's content can.
     public func wait(until: String? = nil, seconds: Double? = nil) async -> MacFourVerbsReply {
         let budget = min(max(seconds ?? Self.defaultWaitSeconds, 0), Self.maxWaitSeconds)
         let needle = until?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -18,8 +19,16 @@ extension MacFourVerbs {
         func cancelled() -> MacFourVerbsReply {
             MacFourVerbsReply(ok: false, text: "I stopped waiting.", detail: ["outcome": .string("cancelled")])
         }
-        func refusal(_ reply: MacFourVerbsReply) -> MacFourVerbsReply {
+        func refusal(_ reply: MacFourVerbsReply) async -> MacFourVerbsReply {
             guard reply.detail["status"] == .string("in_process_route") else { return reply }
+            // A plain "wait N seconds" needs no screen to watch: just wait.
+            if !waitingForText, seconds != nil {
+                let left = budget - elapsedNow()
+                if left > 0 { try? await Task.sleep(nanoseconds: UInt64(left * 1_000_000_000)) }
+                guard !Task.isCancelled else { return cancelled() }
+                return MacFourVerbsReply(ok: true, text: "Waited \(Self.seconds(elapsedNow())) (NativeAgent is in front, so there was no other screen to watch).",
+                                         detail: ["outcome": .string("waited"), "seconds": .double(elapsedNow())])
+            }
             return MacFourVerbsReply(
                 ok: false,
                 text: "wait watches the frontmost external Mac app until its screen settles or the requested text appears; it is not a general sleep. NativeAgent is in front, and screen waiting cannot observe its own app. Use app {page:\"current\"} to inspect NativeAgent, or pass agent: name to wait for a contact's in-flight reply.",
@@ -35,31 +44,24 @@ extension MacFourVerbs {
                 detail: ["outcome": .string("matched"), "seconds": .double(elapsed)]
             )
         }
-        func settled(_ hit: Sighting, _ elapsed: Double, quiet: Bool) -> MacFourVerbsReply {
+        func settled(_ hit: Sighting, _ elapsed: Double) -> MacFourVerbsReply {
             MacFourVerbsReply(
                 ok: true,
                 text: "Settled after \(Self.seconds(elapsed)).\n" + hit.render,
-                detail: [
-                    "outcome": .string("settled"),
-                    "seconds": .double(elapsed),
-                    // How the settle was DECIDED. `quiet` means the
-                    // subscription went silent; `compared` means two renders
-                    // matched.
-                    "settled_by": .string(quiet ? "quiet" : "compared"),
-                ]
+                detail: ["outcome": .string("settled"), "seconds": .double(elapsed)]
             )
         }
 
         // 1 — the baseline. One render, before anything is subscribed to.
         let first: Sighting
         switch await sight(part: nil) {
-        case .blind(let reply): return refusal(reply)
+        case .blind(let reply): return await refusal(reply)
         case .seen(let seen): first = seen
         }
         var last = first
-        var previous = first.render
+        var previous = first.effectRender
         var lastRenderAt = clock.monotonicSeconds()
-        if let needle, !needle.isEmpty, first.render.lowercased().contains(needle) {
+        if let needle, !needle.isEmpty, first.effectRender.lowercased().contains(needle) {
             return matched(first, elapsedNow())
         }
 
@@ -72,10 +74,6 @@ extension MacFourVerbs {
             pid: first.pid
         )
         defer { signals.stop() }
-        // The pre-subscription render may have missed the final change. A
-        // paced fresh read must reconcile each new subscription before quiet
-        // can settle its baseline, including after an app switch.
-        var needsReconciliation = true
 
         while true {
             guard !Task.isCancelled else { return cancelled() }
@@ -98,39 +96,33 @@ extension MacFourVerbs {
                 notBefore: lastRenderAt + Self.settleQuietSeconds
             )
             guard !Task.isCancelled else { return cancelled() }
-            if !fired, signals.isObserving, !waitingForText {
-                // The budget ran out inside a short final window.
-                if window < Self.settleQuietSeconds { break }
-                // Nothing fired for a full quiet window: the screen has stopped
-                // changing. Only a reconciled render can already describe it.
-                if !needsReconciliation {
-                    return settled(last, elapsedNow(), quiet: true)
-                }
-            }
-            // 3 — render ONCE to reconcile a new subscription, because a
-            // signal fired, or because the coarse fallback said to look again.
+            // The budget ran out inside a short final window.
+            if !fired, signals.isObserving, !waitingForText, window < Self.settleQuietSeconds { break }
+            // 3 — render ONCE: a signal fired, a quiet window passed (quiet is
+            // only settled by a read that matches), or the fallback said look.
             switch await sight(part: nil) {
-            case .blind(let reply): return refusal(reply)
+            case .blind(let reply): return await refusal(reply)
             case .seen(let seen): last = seen
             }
             guard !Task.isCancelled else { return cancelled() }
             lastRenderAt = clock.monotonicSeconds()
             let elapsed = elapsedNow()
-            if let needle, !needle.isEmpty, last.render.lowercased().contains(needle) {
+            if let needle, !needle.isEmpty, last.effectRender.lowercased().contains(needle) {
                 return matched(last, elapsed)
             }
-            needsReconciliation = last.pid != observedPID
+            // A new app needs its own subscription and a fresh baseline
+            // before two reads can settle.
+            let needsReconciliation = last.pid != observedPID
             if needsReconciliation {
                 signals.stop()
                 observedPID = last.pid
                 signals = MacWaitSignals(effects: effectObserverSource, activation: appActivationSource, pid: last.pid)
             }
-            if !waitingForText, !needsReconciliation, previous == last.render {
-                // A signal that changed nothing visible, or the fallback's two
-                // identical renders. Either way the screen has settled.
-                return settled(last, elapsed, quiet: false)
+            if !waitingForText, !needsReconciliation, previous == last.effectRender {
+                // Two identical reads of the screen's content: it has settled.
+                return settled(last, elapsed)
             }
-            previous = last.render
+            previous = last.effectRender
         }
 
         let elapsed = elapsedNow()
@@ -171,9 +163,8 @@ extension MacFourVerbs {
 
     static let defaultWaitSeconds: Double = 10
     static let maxWaitSeconds: Double = 60
-    /// Silence this long, with a live subscription, IS a settle. The same
-    /// half-second the old loop encoded as "two identical renders 500 ms
-    /// apart" — the meaning is unchanged, only the evidence got cheaper.
+    /// Silence this long, with a live subscription, earns the settling read:
+    /// "two identical renders 500 ms apart", read only when nothing fired.
     static let settleQuietSeconds: Double = 0.5
     /// The SAFETY NET cadence, used only when no observer could be installed.
     static let fallbackPollSeconds: Double = 5.0

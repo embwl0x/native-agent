@@ -186,10 +186,17 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
     /// The engine's `mechanicalKind` stamp. Decode-only: `systemRow` marks a
     /// persisted turn-failure notice, which is not a reply.
     public var mechanicalKind: String?
+    /// What a failed turn had done when it stopped: a
+    /// `ProviderFailure.WorkState` raw value ("nothing ran", "ran partly",
+    /// "outcome unknown"), or "not sent" when the request provably never left
+    /// this Mac. Decode-only on persisted failure rows; stamped in memory on
+    /// synthetic failure bubbles. The failure card reads it so Retry never
+    /// calls a turn harmless when it may have acted.
+    public var failureWork: String?
 
     // Custom CodingKeys to map camelCase Swift properties → snake_case daemon keys
     enum CodingKeys: String, CodingKey {
-        case model, requestedModel, reasoningEffort, fileAccessMode, codexSandbox, error, partial, cancelled, completionState
+        case model, requestedModel, reasoningEffort, fileAccessMode, codexSandbox, error, partial, cancelled, completionState, failureWork
         case providerRefusal = "provider_refusal"
         case providerRefusalDraft = "provider_refusal_draft"
         case kind
@@ -313,6 +320,7 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
         }
         workingCommentaryChars = chatRowInt(o["workingCommentaryChars"])
         mechanicalKind = chatRowString(o["mechanicalKind"])
+        failureWork = chatRowString(o["failureWork"])
         // A legacy `input` object is shown as its JSON text; otherwise the
         // text the writer stored.
         if case .object(let rawInput)? = o["input"] {

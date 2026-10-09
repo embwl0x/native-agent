@@ -1,47 +1,5 @@
-// Reader protocol + factory for the browser-orchestration STATUS read surface
-// (Subsystem #27 — wave 33 W17). The matching WRITE port (run/cancel) lives in
-// the companion Browser+Writes.swift (wave 34 W17); this file is the STATUS read
-// only.
-//
-// Mirrors the wave-pattern used by SwarmRuns / KnowledgeGraph / MacAssistantStatus:
-//   - a `BrowserStatusReader` protocol with the one read call,
-//   - `SwiftNativeBrowserClient` (reads the local files each call),
-//   - `makeBrowserClient()` factory.
-//
-// The SwiftNative reader returns the SAME envelope the daemon GET route does:
-//   GET /v1/browser/status -> NativeAgentRuntime.browser_status()
-//:
-//     {
-//       "status": "ready",
-//       "profilePath": <str of native_power/browser/profile>,
-//       "sourcePath": <str of native_power/browser/sources>,
-//       "screenshotPath": <str of native_power/browser/screenshots>,
-//       "approvedDomains": <sorted approved_browser_domains()>,
-//       "activeRuns": [run for run in runs if status in {running,waiting_approval}],
-//       "receiptCount": len(last 20 receipts),
-//       "latestReceipt": <newest receipt or null>,
-//       "createdAt": now_iso(),
-//     }
-//
-// PORT STATUS (this file = STATUS read only; see Browser+Writes.swift for the
-// write port, wave 34 W17). The full cluster picture (§6.96 W33/W34 W17, audit
-// re-confirmed §6.220 W40 W19, comment refresh §6.240 W41 W05):
-//   GET  /v1/browser/status -> PORTED-DORMANT (this file).
-//   POST /v1/browser/cancel (cancel_browser_run)  -> PORTED-DORMANT, FULL
-//        (Browser+Writes.swift — self-contained flock'd runs.json R-M-W).
-//   POST /v1/browser/run    (run_browser_action)  -> Core owns the canonical
-//        operation lifecycle and derived receipts. The app target owns only
-//        the approval-gated WKWebView/AppKit effect adapter.
-//
-// FLOCK SYMMETRY (wave 33 W17): the daemon's run_browser_action /
-// cancel_browser_run read-modify-write of native_power/browser/runs.json is
-// wrapped in `with file_lock(self.browser_runs_path)`, and
-// the Swift write port mirrors it via `withFileLock(runsPath)`
-// (Browser+Writes.swift), matching the cross-process sibling-path / LOCK_EX
-// convention in PersistenceCore+FileLock.swift <-> the retired daemon. This
-// STATUS reader is a PURE read (no write-back), so it does NOT take the lock —
-// write_json on the daemon side is atomic (tmp + os.replace) so the read never
-// sees a torn file.
+// Browser status reads atomic owner files without running browser work.
+// Receipt summaries retain artifact paths; full captures stay on disk.
 
 import Foundation
 import NativeAgentCore
@@ -142,25 +100,24 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
             return s == "running" || s == "waiting_approval"
         }
 
-        // receipts = list(reversed(tail_jsonl(self.browser_actions_path, 20)))
-        // -> last 20 receipt lines, NEWEST FIRST. tail_jsonl returns oldest-first
-        // (file order); reversed() makes newest-first.
-        //
-        // R-W17 (gpt-5.5 review #1): match Python's tail_jsonl DEFAULT scan window
-        // of 1 MiB.
-        // browser_status calls `tail_jsonl(self.browser_actions_path, 20)` with
-        // that default, so a huge receipts.jsonl is tail-scanned, NOT fully read.
-        // Passing maxBytes:nil would (a) read the whole file unbounded and (b)
-        // diverge on receiptCount/latestReceipt for >1 MiB logs. 1_048_576 is the
-        // exact daemon default (and the Swift tailJSONL(_:) convenience default).
+        // File order is oldest first; keep the bounded tail read.
         let receiptRead = try await persistence.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
         guard receiptRead.malformedJSONRowCount == 0,
               receiptRead.rows.allSatisfy({ if case .object = $0 { return true }; return false }),
               receiptRead.physicalRowsScanned > 0 || receiptRead.bytesRead == 0 else {
             throw PersistenceCoreError.ioFailure("The browser receipt feed is malformed.")
         }
-        var receipts = receiptRead.rows
-        receipts.reverse()
+        let receipts = receiptRead.rows
+        let artifactKeys: Set<String> = ["url", "title", "ipcUrl", "ipcTitle", "httpStatus", "textPath", "htmlPath", "linksPath", "pngPath", "path", "textChars", "linkCount", "captureRetention", "openError", "canceled"]
+        let receiptKeys = Set(["id", "transitionId", "domain", "status", "opened", "dryRun", "createdAt", "updatedAt", "completedAt", "verificationStatus", "outcomeKind", "errorCode", "sourceReceipt", "screenshotReceipt"])
+            .union(artifactKeys)
+        let latestReceipt = receipts.last.map { value -> JSONValue in
+            guard case .object(let row) = value else { return .null }
+            return .object(row.filter { receiptKeys.contains($0.key) }.mapValues { value in
+                guard case .object(let artifact) = value else { return value }
+                return .object(artifact.filter { artifactKeys.contains($0.key) })
+            })
+        } ?? .null
 
         let approved = try await approvedBrowserDomains()
 
@@ -176,7 +133,8 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
             "domainPolicy": .string("approval_risk_tiering"),
             "activeRuns": .array(activeRuns),
             "receiptCount": .int(Int64(receipts.count)),
-            "latestReceipt": receipts.first ?? .null,
+            "receiptPath": .string(receiptsPath.path),
+            "latestReceipt": latestReceipt,
             "createdAt": .string(Self.nowISO(now())),
         ])
     }

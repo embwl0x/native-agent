@@ -7,14 +7,15 @@ enum AgentWorkspaceMessages {
     static func project(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
         let compose = AgentWorkspaceButton(label: "Compose message", action: .configure(tool: "messages_send", input: [:], title: "Compose message"))
         let openApp = AgentWorkspaceButton(label: "Open Messages view", action: .perform(tool: "go", input: ["name": .string("Messages")], title: "Messages view", textField: nil, isEffect: true))
+        let rowsKey = input["from_me"] == nil ? "threads" : "messages"
         guard case .object(var content) = result, content["status"] == .string("completed"),
-              case .array(let rows)? = content["threads"] else {
+              case .array(let rows)? = content[rowsKey] else {
             var failure: [String: JSONValue]
             if case .object(let value) = result { failure = value } else { failure = ["result": result] }
             failure["history_note"] = .string("The conversation reader is unavailable. Open Messages view remains available; it does not itself select a particular thread.")
             return .init(title: "Messages", content: .object(failure), items: [], actions: [openApp, compose])
         }
-        content.removeValue(forKey: "threads")
+        content.removeValue(forKey: rowsKey)
         let requested = text(input["thread_id"])
         var items = rows.map { value -> AgentWorkspaceItem in
             guard case .object(let row) = value else { return .init(title: "Conversation", content: value, actions: []) }
@@ -59,7 +60,14 @@ enum AgentWorkspaceMessages {
         content["conversation_note"] = .string(requested == nil
             ? "Open a conversation to read recent messages. Each conversation keeps its exact identity."
             : "This window keeps the exact conversation and its participants. Unavailable message formats are labeled explicitly. Replies recheck participants before sending.")
+        if input["from_me"] != nil { content["conversation_note"] = content["history_ordering"] }
         var actions = [openApp, compose]
+        if requested == nil {
+            if case .int(let next)? = content["next_offset"] {
+                actions.insert(.init(label: "More conversations", action: .open(.record(tool: "messages_recent_threads", input: input.merging(["offset": .int(next)]) { _, new in new }, title: "Messages"))), at: 0)
+            }
+            actions.append(.init(label: "Find messages", action: .perform(tool: "messages_recent_threads", input: [:], title: "Find messages", textField: "query", isEffect: false), needsText: true))
+        }
         if let requested {
             if case .int(let cursor)? = content.removeValue(forKey: "older_before_message_id"), cursor > 0 {
                 actions.append(.init(label: "Older messages", action: .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(requested), "before_message_id": .int(cursor)], title: conversationTitle))))

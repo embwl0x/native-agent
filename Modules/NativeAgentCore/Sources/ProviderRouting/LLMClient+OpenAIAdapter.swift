@@ -83,7 +83,7 @@ public final class OpenAIAdapter: LLMAdapter {
         // An injected session may carry URLSession's 60s default (or none at
         // all); match the OAuth lanes' resolved 240s so a stalled completion
         // fails instead of hanging the turn.
-        req.timeoutInterval = Self.requestTimeoutSeconds
+        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
 
         var messages: [[String: String]] = []
         if let sys = system, !sys.isEmpty {
@@ -163,7 +163,7 @@ public final class OpenAIAdapter: LLMAdapter {
         // An injected session may carry URLSession's 60s default (or none at
         // all); match the OAuth lanes' resolved 240s so a stalled completion
         // fails instead of hanging the turn.
-        req.timeoutInterval = Self.requestTimeoutSeconds
+        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
 
         var body: [String: Any] = [
             "model": model,
@@ -281,7 +281,9 @@ public final class OpenAIAdapter: LLMAdapter {
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
+                        if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                         (bytes, response) = try await session.bytes(for: req)
+                        if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
                     } catch {
                         throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
                     }
@@ -374,7 +376,7 @@ public final class OpenAIAdapter: LLMAdapter {
             case .toolCall(let call):
                 let arguments = String(decoding: call.inputJSON, as: UTF8.self)
                 markers.append("<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(arguments)</tool_use>")
-            case .keepAlive, .replyTextSettled: break
+            case .keepAlive, .replyTextSettled, .toolBoundary: break
             }
         }
         return ([text.trimmingCharacters(in: .whitespacesAndNewlines)] + markers)
@@ -399,7 +401,7 @@ public final class OpenAIAdapter: LLMAdapter {
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         applyStreamingLLMHeaders(to: &req)
-        req.timeoutInterval = Self.requestTimeoutSeconds
+        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
         // Public schemas must encode successfully; do not substitute empty parameters.
         for tool in tools ?? [] {
             _ = try JSONSerialization.jsonObject(with: tool.parametersJSON)
@@ -424,9 +426,11 @@ public final class OpenAIAdapter: LLMAdapter {
             let task = Task {
                 do {
                     try Task.checkCancellation()
-                    let req = try responsesRequest(messages: messages, system: system, model: model, tools: tools)
+                    var req = try responsesRequest(messages: messages, system: system, model: model, tools: tools)
+                    if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                     let requestStartNs = DispatchTime.now().uptimeNanoseconds
                     let (bytes, response) = try await session.bytes(for: req)
+                    if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
                     defer { bytes.task.cancel() }
                     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                     if !(200..<300).contains(status) {

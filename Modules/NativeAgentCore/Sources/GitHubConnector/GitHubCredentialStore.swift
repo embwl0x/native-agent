@@ -424,7 +424,7 @@ public actor GitHubCredentialStore {
                 guard self.generation[account, default: 0] == started else {
                     throw GitHubCredentialVaultError.accountChanged
                 }
-                NSLog("[github] OAuth refresh rejected (%@); clearing the sign-in", code)
+                nativeLog("[github] OAuth refresh rejected (%@); clearing the sign-in", code)
                 try self.vault.delete(service: Self.oauthKeychainService, account: account)
                 return nil
             }

@@ -88,15 +88,14 @@ enum AppUpdateNote {
         notes: [(version: String, body: String)],
         maximumCharacters: Int = AppUpdateNote.maximumNoteCharacters
     ) -> String {
+        guard notes.contains(where: { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            return "NativeAgent version changed: \(from) → \(to). No change summary is available."
+        }
         var text = "NativeAgent updated from \(from) to \(to). What changed:\n"
-        if notes.isEmpty {
-            text += "\nNo release notes shipped for this version.\n"
-        } else {
-            for note in notes {
-                let body = note.body.trimmingCharacters(in: .whitespacesAndNewlines)
-                text += "\n— \(note.version) —\n"
-                text += body.isEmpty ? "(no notes for this version)\n" : body + "\n"
-            }
+        for note in notes {
+            let body = note.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            text += "\n— \(note.version) —\n"
+            text += body.isEmpty ? "(no notes for this version)\n" : body + "\n"
         }
         if text.count > maximumCharacters {
             let kept = String(text.prefix(maximumCharacters))

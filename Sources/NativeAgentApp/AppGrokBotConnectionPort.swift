@@ -22,7 +22,7 @@ struct AppGrokBotConnectionPort: GrokBotConnectionPort {
         try await NativeAgentEngine.live.agents.desktop.grokBootstrap(text, bot: bot)
     }
 
-    func importGrokRoutine(peer: String, dataRoot: URL) async throws {
-        try await NativeAgentEngine.live.agents.desktop.importGrokRoutine(peer: peer, dataRoot: dataRoot)
+    func importGrokRoutine(peer: String, dataRoot: URL, waitForCreation: Bool) async throws {
+        try await NativeAgentEngine.live.agents.desktop.importGrokRoutine(peer: peer, dataRoot: dataRoot, waitForCreation: waitForCreation)
     }
 }

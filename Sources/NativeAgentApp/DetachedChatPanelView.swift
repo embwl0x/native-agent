@@ -235,14 +235,26 @@ struct DetachedChatPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            InboxStripContainer()
+            InboxStripContainer { notes in
+                notes
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.horizontal, 12)
+            }
             messageScrollback
             Divider()
             inputBar
                 .disabled(!sessionIsAvailable)
         }
         .frame(minWidth: 380, minHeight: 280)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .modifier(ChatAttachmentDropTarget(isEnabled: sessionIsAvailable, onDrop: {
+            handleDrop($0)
+            return true
+        }))
+        // Fluid glass: the main window's sheet and haze, not an opaque
+        // window fill. The haze follows this window's own conversation.
+        .background {
+            ShellSheet().overlay { WindowHaze(sessionId: sessionId) }
+        }
         .preferredColorScheme(preferDarkAppearance ? .dark : nil)
         .task(id: sessionId) {
             // Load history into the per-session slot on first appearance.
@@ -357,7 +369,7 @@ struct DetachedChatPanelView: View {
     private var messageScrollback: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
                     if loadPresentation == .stale {
                         Label("History refresh failed; showing last known messages.", systemImage: "exclamationmark.triangle.fill")
                             .font(NativeAgentFont.tag)
@@ -728,15 +740,14 @@ struct DetachedChatPanelView: View {
             ChatQueuedTurnsView(sessionId: sessionId, isBusy: isBusy)
 
             if let toastMessage {
-                Text(toastMessage)
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(.secondary)
+                NoticePill(text: toastMessage)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .transition(NativeAgentMotion.fade)
             }
 
             DetachedChatComposer(
                 draft: panelDraft,
+                sessionId: sessionId,
                 placeholder: "Message \(personaName)…",
                 voiceInput: voiceInput,
                 screenCaptureAllowed: screenCaptureAllowed,
@@ -750,6 +761,7 @@ struct DetachedChatPanelView: View {
                 onToggleVoice: toggleVoice,
                 onCaptureScreen: captureScreen,
                 onAttach: attachFromClipboardOrPickFile,
+                onDrop: handleDrop,
                 onStop: { appModel.stopChatStream(sessionId: sessionId) },
                 onSend: send,
                 onTranscript: { newVal in
@@ -972,8 +984,10 @@ struct DetachedChatPanelView: View {
                 case .rejected(let message):
                     showToast(message)
                 }
-            } catch {
+            } catch let error as NativeScreenCapture.CaptureError {
                 showToast(error.localizedDescription)
+            } catch {
+                showToast(UserFacingError.message(error, action: "send the screenshot"))
             }
         }
     }
@@ -1000,7 +1014,23 @@ struct DetachedChatPanelView: View {
     private func attachFromClipboardOrPickFile() {
         guard ensureSessionIsAvailable() else { return }
         ChatComposerSupport.attachFromClipboardOrPickFile(
-            appendImage: { pendingAttachments.append($0) },
+            appendImage: {
+                guard ensureSessionIsAvailable() else { return }
+                pendingAttachments.append($0)
+            },
+            attachFile: attachLocalFile,
+            showToast: showToast
+        )
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) {
+        guard ensureSessionIsAvailable() else { return }
+        ChatComposerSupport.attachProviders(
+            providers,
+            appendImage: {
+                guard ensureSessionIsAvailable() else { return }
+                pendingAttachments.append($0)
+            },
             attachFile: attachLocalFile,
             showToast: showToast
         )
@@ -1113,6 +1143,7 @@ private struct DetachedScrollAnchorModifier: ViewModifier {
 /// so a keystroke re-runs this and not the panel's transcript (2026-09-22).
 private struct DetachedChatComposer: View {
     let draft: ChatComposerDraft
+    let sessionId: String
     let placeholder: String
     let voiceInput: VoiceInputController
     let screenCaptureAllowed: Bool
@@ -1127,6 +1158,7 @@ private struct DetachedChatComposer: View {
     let onToggleVoice: () -> Void
     let onCaptureScreen: () -> Void
     let onAttach: () -> Void
+    let onDrop: ([NSItemProvider]) -> Void
     let onStop: () -> Void
     let onSend: () -> Void
     let onTranscript: (String) -> Void
@@ -1147,7 +1179,9 @@ private struct DetachedChatComposer: View {
             onAttach: onAttach,
             onStop: onStop,
             onSend: onSend,
-            onFocusRequest: { inputFocused = true }
+            onFocusRequest: { inputFocused = true },
+            isFocused: inputFocused,
+            sessionId: sessionId
         ) {
             TextField(
                 voiceInput.isListening ? "" : placeholder,
@@ -1161,6 +1195,8 @@ private struct DetachedChatComposer: View {
             .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
             .italic(voiceInput.isListening)
             .onSubmit(onSend)
+            .onPasteCommand(of: ChatComposerSupport.attachmentContentTypes, perform: onDrop)
+            .background(ChatAttachmentPasteHandler(isFocused: inputFocused, onPaste: onDrop))
             .onChange(of: voiceInput.transcript) { _, newVal in onTranscript(newVal) }
         }
         .animation(

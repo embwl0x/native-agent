@@ -11,12 +11,14 @@ enum ViewFileRefreshTask {
     static func run(
         paths: [URL],
         stores: Set<StoreChange.Store> = [],
+        notifications: [Notification.Name] = [],
         debounceDelay: Duration = .milliseconds(250),
         refresh: @escaping @MainActor @Sendable () async -> Void
     ) async {
         let events = EventDeadlinePhysiology.storeAndFileEvents(
             paths: paths,
-            stores: stores
+            stores: stores,
+            notifications: notifications
         )
         let debouncer = StoreReloadDebouncer(delay: debounceDelay) {
             await refresh()

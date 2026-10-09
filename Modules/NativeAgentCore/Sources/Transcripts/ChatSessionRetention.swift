@@ -73,14 +73,8 @@ public enum ChatSessionRetention {
     private static let transcriptLockWaitSeconds: TimeInterval = 0
     private static let transcriptLockRetrySeconds: TimeInterval = 0.02
 
-    /// Archived transcripts (`chat/archive/messages/*.jsonl`) older than this are
-    /// pruned. The archive tier was previously UNCAPPED — sessions moved in and
-    /// never left. Conservative default so nothing recent is lost.
-    public static let archivedMessageRetentionSeconds: TimeInterval = 180 * 24 * 60 * 60
-    /// Newest N rows kept in the archived-sessions index
-    /// (`chat/archive/sessions.jsonl`); older rows drop on the next pass. One
-    /// line per archived session, so this bounds a long-lived, append-only index.
-    public static let archivedSessionsIndexMaxLines = 20_000
+    // Archived transcripts and their locator rows are durable history. Only
+    // explicit deletion may remove them; the active index remains bounded.
     /// F6 (2026-08-28): `chat/session_state/<id>/` holds derived per-session
     /// state (`digest.txt` from SessionDigestProvider, `provider_usage.json`
     /// from LLMCallTelemetry). No pruner ever touched it, so archived sessions
@@ -95,7 +89,7 @@ public enum ChatSessionRetention {
     public static let sessionStatePruneMaxPerPass = 200
 
     public nonisolated static func defaultBestEffortFailureLogger(_ message: String) {
-        NSLog("%@", message)
+        nativeLog("%@", message)
     }
 
     public static func enforce(
@@ -103,9 +97,7 @@ public enum ChatSessionRetention {
         now: Date = Date(),
         policy: ChatSessionRetentionPolicy = .default
     ) throws -> ChatSessionRetentionReport {
-        // Bound the archive tier every pass (independent of the hot index; runs
-        // even when there are no sessions to archive). Best-effort: a prune
-        // failure must never block retention.
+        // Retire derived session state independently of the hot index.
         pruneArchive(dataRoot: dataRoot, now: now)
 
         let sessionsPath = dataRoot
@@ -140,7 +132,7 @@ public enum ChatSessionRetention {
             var next = indexedRows
             next.remove(at: index)
             let out = try ChatSessionIndexFile.serializedData(for: next)
-            try out.write(to: sessionsPath, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(out, to: sessionsPath)
             indexedRows = next
         }
         var report = ChatSessionRetentionReport()
@@ -225,6 +217,89 @@ public enum ChatSessionRetention {
         }
     }
 
+    public static func archivedTranscripts(dataRoot: URL) throws -> [String: [URL]] {
+        let index = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
+        let bytes: Data
+        do { bytes = try Data(contentsOf: index) }
+        catch CocoaError.fileReadNoSuchFile { bytes = Data() }
+        func entries(_ directory: URL) throws -> [URL] {
+            do { return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) }
+            catch CocoaError.fileReadNoSuchFile { return [] }
+        }
+        let directory = dataRoot.appendingPathComponent("chat/archive/messages", isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        var files: [String: [URL]] = [:]
+        for line in bytes.split(separator: 10).reversed() {
+            guard case .object(let row) = try JSONValue.parse(Data(line)),
+                  case .string(let id)? = row["id"],
+                  NativeAgentChatSessionID.normalizedPathComponent(id) != nil else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            guard case .string(let relative)? = row["messagesArchivePath"] else { continue }
+            let file = dataRoot.appendingPathComponent(relative).standardizedFileURL
+            guard file.resolvingSymlinksInPath().deletingLastPathComponent() == directory else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            if !files[id, default: []].contains(file) { files[id, default: []].append(file) }
+        }
+        let sessions = dataRoot.appendingPathComponent("chat/sessions", isDirectory: true).resolvingSymlinksInPath()
+        for session in try entries(sessions) {
+            let id = session.lastPathComponent
+            guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil,
+                  try session.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
+            guard session.resolvingSymlinksInPath().deletingLastPathComponent().path == sessions.path else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let backups = try entries(session).filter {
+                $0.lastPathComponent.hasPrefix("messages.compact.") && $0.pathExtension == "jsonl"
+            }.sorted { $0.lastPathComponent > $1.lastPathComponent }
+            for file in backups {
+                guard file.resolvingSymlinksInPath().deletingLastPathComponent().path == session.path else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                files[id, default: []].append(file)
+            }
+        }
+        let originals = dataRoot.appendingPathComponent("chat/archive/originals", isDirectory: true).resolvingSymlinksInPath()
+        for file in try entries(originals) where file.pathExtension == "jsonl" {
+            guard let id = NativeAgentChatSessionID.normalizedPathComponent(file.deletingPathExtension().lastPathComponent),
+                  file.resolvingSymlinksInPath().deletingLastPathComponent().path == originals.path else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            files[id, default: []].append(file)
+        }
+        return files
+    }
+
+    public static func transcriptFiles(
+        dataRoot: URL, sessionId: String? = nil, prefix: String = "", archived: [String: [URL]]
+    ) throws -> [(String, URL)] {
+        let messages = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
+        if let sessionId {
+            guard let id = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+                throw CocoaError(.fileReadInvalidFileName)
+            }
+            let hot = messages.appendingPathComponent("\(id).jsonl")
+            let cold = archived[id] ?? []
+            return ((FileManager.default.fileExists(atPath: hot.path) || cold.isEmpty ? [hot] : []) + cold)
+                .map { (id, $0) }
+        }
+        let hot: [URL]
+        do {
+            let files = try FileManager.default.contentsOfDirectory(
+                at: messages, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+            ).filter { $0.pathExtension == "jsonl" && $0.lastPathComponent.hasPrefix(prefix) }
+            // One stat per file, never one per comparison.
+            let dated: [(url: URL, at: Date)] = files.map { ($0, transcriptModifiedDate($0) ?? .distantPast) }
+            hot = dated.sorted { $0.at == $1.at ? $0.url.lastPathComponent < $1.url.lastPathComponent : $0.at > $1.at }.map(\.url)
+        } catch CocoaError.fileReadNoSuchFile { hot = [] }
+        let coldDated: [(id: String, files: [URL], at: Date)] = archived.filter { $0.key.hasPrefix(prefix) }
+            .map { ($0.key, $0.value, $0.value.first.flatMap(transcriptModifiedDate) ?? .distantPast) }
+        let cold: [(String, URL)] = coldDated.sorted { $0.at == $1.at ? $0.id < $1.id : $0.at > $1.at }
+            .flatMap { entry in entry.files.map { (entry.id, $0) } }
+        return hot.map { ($0.deletingPathExtension().lastPathComponent, $0) } + cold
+    }
+
     /// The row a door (Telegram, Slack) should re-create for `sessionId` when
     /// its map points at a session retention archived: the newest archived
     /// row with its transcript copied back into the hot tier. The archive copy
@@ -253,8 +328,7 @@ public enum ChatSessionRetention {
               case .string(let relative)? = row["messagesArchivePath"] else { return nil }
         let archivedBytes: Data
         do { archivedBytes = try Data(contentsOf: dataRoot.appendingPathComponent(relative)) }
-        // The archive prune (180 days) took the transcript but kept the row:
-        // nothing is left to restore, so the door starts an empty row.
+        // Legacy retention or explicit deletion may have removed the bytes.
         catch CocoaError.fileReadNoSuchFile { return nil }
         let messagesPath = chat
             .appendingPathComponent("messages", isDirectory: true)
@@ -486,8 +560,12 @@ public enum ChatSessionRetention {
         baseArchivedRow["archivedBy"] = .string("chat_session_retention")
         baseArchivedRow["retentionArchivedAt"] = .string(iso8601(now))
         baseArchivedRow["retentionReason"] = .string(reason.rawValue)
+        baseArchivedRow["originalMessagesArchivePath"] = .string("chat/archive/originals/\(safeSessionId).jsonl")
 
         let archived = try withBoundedTranscriptLock(messagesPath) { () throws -> Bool in
+            if reason == .activeCap, ChatSessionIndexFile.hasPendingTranscriptIndexSync(at: messagesPath) {
+                return false
+            }
             // Re-validate the staleEmpty PREMISE under the lock (2026-08-01).
             // The decision came from the pre-lock `sessions.json` snapshot; a
             // writer can append the session's first message and release the
@@ -505,17 +583,11 @@ public enum ChatSessionRetention {
             // the hot transcript, and the writer's index sync then recreates an
             // ACTIVE row for the session with none of its history behind it.
             if reason == .activeCap, let modified = transcriptModifiedDate(messagesPath) {
-                // 2026-09-06: the real invariant, and it does not depend on when
-                // `now` was sampled. `now` is taken by the caller AFTER it holds
-                // `sessions.json.lock` (MessagePersistence), so a writer that
-                // appended, released the transcript lock and is now queued
-                // behind us for the index lock has an mtime EARLIER than `now`
-                // and slipped straight past the pass-start guard. Its index row
-                // still carries the stamp from its previous sync, so a
-                // transcript newer than its own index row is a pending index
-                // sync — never a quiet session, never a victim.
-                if let indexStamp = date(row["updatedAt"]) ?? date(row["createdAt"]),
-                   modified > indexStamp {
+                // A pending writer changes the exact transcript version before
+                // synchronizing the index. Legacy rows stay hot until bounded
+                // reconciliation acknowledges their bytes.
+                guard let version = ChatSessionIndexFile.transcriptVersion(at: messagesPath),
+                      row[ChatSessionIndexFile.acknowledgedTranscriptKey] == version else {
                     return false
                 }
                 // Second line: anything written since this pass began. Two
@@ -540,7 +612,7 @@ public enum ChatSessionRetention {
                     safeSessionId: safeSessionId,
                     now: now
                 )
-                try FileManager.default.copyItem(at: messagesPath, to: destination)
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(contentsOf: messagesPath), to: destination)
                 archivedMessagesPath = destination
             }
 
@@ -657,33 +729,9 @@ public enum ChatSessionRetention {
         return try body()
     }
 
-    /// Prune the archive tier: age-drop transcripts and line-cap the archived
-    /// sessions index. Never throws — pruning is opportunistic cleanup.
-    ///
-    /// PERF (wave 2): `enforce` runs inside the sessions lock on EVERY message
-    /// append, and this pass used to `contentsOfDirectory` + per-file
-    /// `resourceValues` the entire archive transcript tier every time (1530
-    /// files on the live root) plus take the index lock and rewrite-scan a
-    /// 20k-line cap file — all to learn that nothing had aged past a 180-day
-    /// cutoff. It now runs when there is a REASON to:
-    ///
-    ///   • the archive tier CHANGED since the last pass (an archival landed —
-    ///     new transcript file, new index row), or
-    ///   • `pruneMinIntervalSeconds` has elapsed, which is what makes the
-    ///     purely time-driven half (a file crossing the age cutoff, an index
-    ///     that must re-cap) still happen on an idle tier, or
-    ///   • this process has never pruned this root.
-    ///
-    /// Wave-1 FIX-C rejected throttling retention ITSELF because archiving
-    /// removes a row from `sessions.json` and `SessionDigestProvider
-    /// .latestPriorSession` renders the newest remaining row into the next
-    /// session's prompt. That reasoning does not reach here: this function only
-    /// ever touches `chat/archive/**`, which no prompt-assembly path reads. The
-    /// bounded effect of the throttle is that an archived transcript already
-    /// 180 days old may survive up to `pruneMinIntervalSeconds` longer, and the
-    /// archived-sessions index may sit up to that long above its 20k-line cap.
+    /// Archive changes trigger cleanup of disposable session state. Canonical
+    /// transcript bytes and locator rows never expire automatically.
     private static func pruneArchive(dataRoot: URL, now: Date) {
-        let fm = FileManager.default
         let archiveDir = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("archive", isDirectory: true)
@@ -698,45 +746,7 @@ public enum ChatSessionRetention {
         let preScanStamp = archiveTierStamp(archiveDir)
         defer { notePruneCompleted(archiveDir: archiveDir, now: now, stamp: preScanStamp) }
 
-        // 1. Age-prune archived transcript files.
-        let messagesDir = archiveDir.appendingPathComponent("messages", isDirectory: true)
-        if let files = try? fm.contentsOfDirectory(
-            at: messagesDir,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            let cutoff = now.addingTimeInterval(-archivedMessageRetentionSeconds)
-            for file in files where file.pathExtension == "jsonl" {
-                // Undatable files are LEFT (distantFuture) — never delete what we
-                // cannot prove is old.
-                let modified = (try? file.resourceValues(
-                    forKeys: [.contentModificationDateKey]
-                ).contentModificationDate) ?? .distantFuture
-                if modified < cutoff {
-                    try? fm.removeItem(at: file)
-                }
-            }
-        }
-
-        // 2. Line-cap the archived sessions index to the newest N rows — via
-        // the SHARED cap helper, under the same index lock the append path
-        // takes (review round 2, MED: the unlocked read-suffix-write here
-        // could drop a row appended by a concurrent archival).
-        let sessionsIndex = archiveDir.appendingPathComponent("sessions.jsonl")
-        // Guard BEFORE locking: the lock helper mkdir's the lock file's parent,
-        // so taking the lock on a nonexistent index would conjure chat/archive/
-        // as a side effect — and "retention rejected, nothing archived" must
-        // leave no archive dir behind (pinned by ChatSessionIndexFileTests).
-        if FileManager.default.fileExists(atPath: sessionsIndex.path) {
-            _ = try? withBoundedTranscriptLock(sessionsIndex) {
-                _ = try enforceJSONLLineCap(
-                    at: sessionsIndex,
-                    maxLines: archivedSessionsIndexMaxLines
-                )
-            }
-        }
-
-        // 3. F6: sweep orphaned per-session state dirs. Shares this pass's
+        // Sweep orphaned per-session state dirs. Shares this pass's
         // throttle: an archival changes the tier stamp, so the sweep runs on
         // the pass after a session leaves the hot index, and otherwise at most
         // once per interval.
@@ -790,7 +800,7 @@ public enum ChatSessionRetention {
 
     /// Newest mtime among the directory and its immediate children. Undatable
     /// entries read as `distantFuture` — never delete what we cannot prove is
-    /// old (mirrors the archived-transcript age prune above).
+    /// old.
     private static func newestModification(in directory: URL) -> Date {
         func mtime(_ url: URL) -> Date {
             (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
@@ -811,9 +821,7 @@ public enum ChatSessionRetention {
 
     // MARK: - Archive-prune throttle (perf wave 2)
 
-    /// Longest an idle archive tier goes un-pruned. The tier is invisible to
-    /// every prompt-assembly path, so this bounds only how late a 180-day-old
-    /// transcript is deleted and how late the archived index is re-capped.
+    /// Longest derived state goes without an opportunistic cleanup pass.
     public static let pruneMinIntervalSeconds: TimeInterval = 10 * 60
 
     /// The archive tier's cheap change signal: the (mtime, size) of the
@@ -1002,7 +1010,7 @@ public enum ChatSessionRetention {
         line += "\n"
         // The shared append: torn-line repair and O_APPEND. The caller holds
         // the index lock.
-        try SwiftNativePersistenceCore.appendOwnedBytes(Data(line.utf8), to: path)
+        try SwiftNativePersistenceCore.appendOwnedBytes(Data(line.utf8), to: path, durable: true)
     }
 
     private static func relativePath(_ url: URL, under root: URL) -> String {

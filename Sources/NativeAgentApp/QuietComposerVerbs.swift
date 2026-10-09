@@ -39,13 +39,15 @@ enum QuietComposerVerbs {
     /// The verbs, by the plain name the agent calls them.
     static let names = [
         "read", "set_draft", "send", "set_model", "set_think", "set_fast",
-        "open_card", "close_card", "set_page", "show_browser", "set_persona",
+        "open_card", "close_card", "set_page", "show_browser", "show_pane", "hide_pane", "set_persona",
         "speak", "write_scratch", "check_updates",
     ]
 
     /// Verbs that change what is on User's screen: they run only when the
     /// turn reaches User (`reachesUser`), as `speak` does.
-    static let usersScreenVerbs: Set = ["set_page", "open_card", "close_card", "show_browser", "set_persona"]
+    static let usersScreenVerbs: Set = [
+        "set_page", "open_card", "close_card", "show_browser", "show_pane", "hide_pane", "set_persona",
+    ]
 
     /// The panes the one composer shell can show. Context is the ring's own
     /// pane — the last turn's receipt — so it opens like the other three;
@@ -80,7 +82,7 @@ enum QuietComposerVerbs {
         if !sessionId.isEmpty {
             guard case .success(let found) = QuietChatSessionVerbs.resolve(sessionId, appModel: appModel) else {
                 return [
-                    "status": .string("failed"), "reason": .string("unknown_session"),
+                    "status": .string("failed"), "effects": .string("none"), "reason": .string("unknown_session"),
                     "detail": .string("No open conversation has that id or title. chat.list lists them with their ids."),
                 ]
             }
@@ -154,11 +156,12 @@ enum QuietComposerVerbs {
         var changed: Bool
         var element: String
         var detail: String
+        var status: String = "ok"
         /// Non-nil means refused: nothing was changed.
         var refusal: (reason: String, detail: String)?
 
-        static func done(_ element: String, _ detail: String, changed: Bool = true) -> Outcome {
-            Outcome(changed: changed, element: element, detail: detail, refusal: nil)
+        static func done(_ element: String, _ detail: String, changed: Bool = true, status: String = "ok") -> Outcome {
+            Outcome(changed: changed, element: element, detail: detail, status: status, refusal: nil)
         }
 
         static func refuse(_ element: String, _ reason: String, _ detail: String) -> Outcome {
@@ -180,18 +183,25 @@ enum QuietComposerVerbs {
         if !reachesUser, usersScreenVerbs.contains(verb) {
             return ("", .refuse(
                 verb, "users_screen",
-                "That moves User's screen, and he did not start this turn. Ask him, or tell him "
+                "That moves the person's screen, and they did not start this turn. Ask them, or tell them "
                 + "where it is (app {page} reads any page without showing it)."
             ))
         }
         if !reachesUser, verb == "speak" {
             return ("", .refuse(
                 "read aloud", "users_ears",
-                "Speaking out loud interrupts User, and he did not start this turn. Ask him, "
+                "Speaking out loud interrupts the person, and they did not start this turn. Ask them, "
                 + "or say it in your reply."
             ))
         }
         switch verb {
+        case "show_pane":
+            // User closing the pane wins for the rest of that turn.
+            let turnID = appModel.engine.turns.activeTurnIDsBySession[turnSessionId]
+            if WorkPaneState.shared.userClosed(turnID: turnID) {
+                return ("", .refuse("Work pane", "user_closed_pane", "The person closed the Work pane this turn, so it stays closed."))
+            }
+            return ("", nil)
         case "set_draft", "send":
             let element = verb == "send" ? "send button" : "composer draft"
             var sessionID = appModel.activeChatSessionId
@@ -212,8 +222,8 @@ enum QuietComposerVerbs {
                verb == "set_draft" || value.isEmpty {
                 return (sessionID, .refuse(
                     element, "users_draft",
-                    "User is in that conversation, so its draft and attached files are his. "
-                    + (verb == "send" ? "Pass your own text in value." : "Ask him first, or send your own text with send and value.")
+                    "The person is in that conversation, so its draft and attached files are theirs. "
+                    + (verb == "send" ? "Pass your own text in value." : "Ask them first, or send your own text with send and value.")
                 ))
             }
             return (sessionID, nil)
@@ -235,7 +245,7 @@ enum QuietComposerVerbs {
             if !reachesUser, QuietChatSessionVerbs.userIsIn(sessionID, appModel) {
                 return (sessionID, .refuse(
                     "/scratch", "users_draft",
-                    "User is in that conversation, so its scratch is his. Ask him first, or write in a conversation he is not in."
+                    "The person is in that conversation, so its scratch is theirs. Ask them first, or write in a conversation they are not in."
                 ))
             }
             return (sessionID, nil)
@@ -296,6 +306,10 @@ enum QuietComposerVerbs {
         case "show_browser":
             BrowserWindowController.shared.showWindow()
             return .done("Window > Browser", "The browser window is in front.")
+        case "show_pane": return showPane(value, ref: choice)
+        case "hide_pane":
+            WorkPaneState.shared.agentHide()
+            return .done("Work pane", "The Work pane is closed.")
         case "set_persona": return setPersona(value, appModel: appModel)
         case "speak": return await speak(value, appModel: appModel)
         case "write_scratch":
@@ -438,10 +452,11 @@ enum QuietComposerVerbs {
         }
         let changed = appModel.chatFastMode != on
         appModel.chatFastMode = on
-        if case .failed(let message, _) = await appModel.saveChatBrainDefaults() {
-            return .refuse("model card Fast toggle", "fast_write_failed", message)
+        let result = await appModel.saveChatBrainDefaults()
+        if case .failed = result {
+            return .refuse("model card Fast toggle", "fast_write_failed", result.agentMessage)
         }
-        return .done("model card Fast toggle", "Fast is now \(appModel.chatFastMode ? "on" : "off").", changed: changed)
+        return .done("model card Fast toggle", "Fast is now \(appModel.chatFastMode ? "on" : "off") for every chat (app-wide default).", changed: changed)
     }
 
     /// The picker path a person takes: provider AND model in one write,
@@ -517,13 +532,14 @@ enum QuietComposerVerbs {
         }
         let before = appModel.chatReasoningEffort
         appModel.chatReasoningEffort = effort
-        switch await appModel.saveChatBrainDefaults() {
-        case .failed(let message, _):
-            return .refuse("think card", "think_write_failed", message)
+        let result = await appModel.saveChatBrainDefaults()
+        switch result {
+        case .failed:
+            return .refuse("think card", "think_write_failed", result.agentMessage)
         case .saved(let selection), .unchanged(let selection):
             return .done(
                 "think card step \"\(efforts[index].label)\"",
-                "Thinking is now \(selection.reasoningEffort).",
+                "Thinking is now \(selection.reasoningEffort) for every chat (app-wide default).",
                 changed: before != selection.reasoningEffort
             )
         }
@@ -568,6 +584,34 @@ enum QuietComposerVerbs {
         )
     }
 
+    /// The Work pane beside the main window's chat, at one tab. Only
+    /// Advanced has the pane; the fence has already refused a turn User
+    /// closed it during.
+    @MainActor
+    static func showPane(_ raw: String, ref: String) -> Outcome {
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let tab: WorkPaneTab
+        switch key {
+        case "steps": tab = .steps
+        case "screen": tab = .screen
+        case "make":
+            let ref = ref.trimmingCharacters(in: .whitespacesAndNewlines)
+            tab = .make(ref: ref.isEmpty ? nil : ref)
+        default:
+            return .refuse("Work pane", "unknown_view", "No Work pane view is called that. The views are: steps, screen, make.")
+        }
+        let mode = SimpleViewMode.resolved(UserDefaults.standard.string(forKey: SimpleViewMode.key) ?? "")
+        guard mode == SimpleViewMode.advanced else {
+            return .refuse("Work pane", "no_work_pane",
+                           "\(mode.capitalized) view is on screen and has no Work pane, so nothing was opened.")
+        }
+        WorkPaneState.shared.agentShow(tab)
+        // The pane lives on Chat; on another page User sees it when he goes back.
+        let onChat = NativeAgentAppCoordinator.shared.currentPage?.item == .chat
+        return .done("Work pane", "The Work pane is open on \(key)"
+            + (onChat ? "." : ", but the person is on another page; they see it when they go back to Chat."))
+    }
+
     /// Places inside a rail page: a Today sheet, or a page's tab by the key
     /// the page itself stores.
     static let sheets: [String: ActivitySection] = [
@@ -583,6 +627,10 @@ enum QuietComposerVerbs {
         "cognition": (.diagnostics, DiagnosticsView.DiagnosticsMode.cognition.rawValue),
         "inspector": (.diagnostics, DiagnosticsView.DiagnosticsMode.inspector.rawValue),
         "skills": (.diagnostics, "skills"), "tools": (.diagnostics, "tools"),
+        "trust_access": (.trust, TrustTab.access.rawValue),
+        "trust_features": (.trust, TrustTab.features.rawValue),
+        "trust_mac_browser": (.trust, "mac"),
+        "trust_advanced": (.trust, TrustTab.advanced.rawValue),
     ]
 
     /// The rail, delivered straight to the mounted scene. `request` would
@@ -685,7 +733,7 @@ enum QuietComposerVerbs {
         if let failure = voice.consumeError(ownerID: owner) {
             return .refuse("read aloud", "speak_failed", failure)
         }
-        return .done("read aloud", "Reading \(text.count) characters aloud now.")
+        return .done("read aloud", "Started reading \(text.count) characters aloud. Playback completion is not confirmed.", status: "started")
     }
 
     /// `/scratch <key> <value>` into the conversation `fence` picked.
@@ -696,7 +744,7 @@ enum QuietComposerVerbs {
             return .refuse("/scratch", "missing_scratch", "Pass the key (one word) in choice and the text in value.")
         }
         let result = await appModel.writeScratch(key: key, value: value, sessionId: sessionID)
-        guard result.succeeded else { return .refuse("/scratch", "scratch_write_failed", result.userMessage) }
+        guard result.succeeded else { return .refuse("/scratch", "scratch_write_failed", result.agentMessage) }
         return .done("/scratch", "Scratch \(key) is set in \(sessionID); app chat.scratch_read reads it back.")
     }
 }

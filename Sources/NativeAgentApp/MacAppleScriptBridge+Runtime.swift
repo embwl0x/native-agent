@@ -259,6 +259,8 @@ extension MacAppleScriptBridge {
             "integration": .string(integration),
             "reason": .string(reason),
         ]
+        // A refusal or a miss before the change; a send Mail declined may still sit in its Outbox.
+        if reason != "mail_refused_send" { envelope["effects"] = .string("none") }
         if let message = failureWords[reason] { envelope["message"] = .string(message) }
         return .object(envelope)
     }
@@ -288,7 +290,7 @@ extension MacAppleScriptBridge {
         "read_thread_before_reply": "Open the thread first (messages_recent_threads with its thread_id) and pass its participant handles as expected_participants.",
         "invalid_expected_participants": "expected_participants must be the handles from the latest thread read, each once.",
         "participants_changed_read_thread_again": "The people in that thread changed; open it again and reply with the new participants. Nothing was sent.",
-        "no_matching_note": "No note has that title; find it with notes_search and use the title it shows.",
+        "no_matching_note": "No note has that exact id or title; find it with notes_search and copy its full id or title.",
         "invalid_note_body_offset": "Use body_offset with the same note id and next_body_offset from its last read; the offset must be within the current text.",
         "missing_body_append_or_new_title": "Say what to change: body (replace), append, or new_title.",
         "body_and_append_mutually_exclusive": "Use body to replace or append to add, not both.",

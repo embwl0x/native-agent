@@ -71,6 +71,8 @@ extension NativeOAuthFlow {
             ) {
                 guard !OpenAIOAuthDirectAdapter.isUserCodexPath(path) else { continue }
                 if !removeCredentialFile(at: path) { removed = false }
+                // Codex children's access-only copy goes with the sign-in.
+                do { try OpenAIOAuthDirectAdapter.syncCodexChildCopy(from: path) } catch { removed = false }
             }
             // Sign-out must also revoke CLI-session adoption: the shared
             // ~/.codex file is deliberately never deleted (it belongs to the
@@ -91,9 +93,11 @@ extension NativeOAuthFlow {
         default:
             guard normalized == "xai_oauth_direct" else { return false }
             // User, 2026-09-06: same root scoping as the ChatGPT branch above.
-            return removeCredentialFile(
-                at: XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot())
-            )
+            do {
+                try XAIOAuthCredentialStore.remove(at: XAIOAuthDirectAdapter.tokenPath(
+                    dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()))
+                return true
+            } catch { return false }
         }
     }
 
@@ -115,6 +119,13 @@ extension NativeOAuthFlow {
         }
     }
 
+    private static func statusCredentialObject(at path: URL) throws -> [String: Any] {
+        if path.lastPathComponent == "xai_oauth_direct.json" {
+            return try XAIOAuthCredentialStore.read(at: path)
+        }
+        return try NativeOAuthSupport.loadJSONObject(path)
+    }
+
     /// True when the persisted credential carries a non-empty refresh token —
     /// the only thing that makes an expired access token recoverable without
     /// the browser. User, 2026-09-06: the badge promised a refresh on the next
@@ -122,8 +133,7 @@ extension NativeOAuthFlow {
     /// refresh with, so a dead sign-in looked like it would heal itself.
     public static func hasRefreshToken(providerId: String, dataRoot: URL? = nil) -> Bool {
         guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot),
-              let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+              let obj = try? statusCredentialObject(at: path)
         else { return false }
         let candidates = [
             obj["refresh_token"] as? String,
@@ -138,8 +148,7 @@ extension NativeOAuthFlow {
         let provider = normalizedOAuthProviderId(providerId)
         guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot),
               provider != "openai_oauth_direct" || !OpenAIOAuthDirectAdapter.isUserCodexPath(path),
-              let data = try? Data(contentsOf: path),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let object = try? statusCredentialObject(at: path),
               OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet(object, provider: provider)["refresh_token"]) != nil
         else { return false }
         return OAuthRefreshBinding.permitsRefresh(object, provider: provider)
@@ -151,8 +160,7 @@ extension NativeOAuthFlow {
         guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot) else {
             return nil
         }
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let obj = try? statusCredentialObject(at: path)
         else { return nil }
         if let d = parseExpiresAt(obj["expires_at"]) { return d }
         if let tokens = obj["tokens"] as? [String: Any] {
@@ -302,9 +310,8 @@ extension NativeOAuthFlow {
         case "anthropic_oauth_direct":
             return anthropicOAuthCredentialState(dataRoot: dataRoot) == .ready
         case "xai_oauth_direct":
-            guard let data = try? Data(contentsOf: XAIOAuthDirectAdapter.tokenPath(
-                      dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot())),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            guard let obj = try? XAIOAuthCredentialStore.read(at: XAIOAuthDirectAdapter.tokenPath(
+                      dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()))
             else { return false }
             if let s = obj["access_token"] as? String, !s.isEmpty { return true }
             if let nested = (obj["tokens"] as? [String: Any])?["access_token"] as? String,

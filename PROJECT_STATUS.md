@@ -19,11 +19,11 @@ desktop read-only.
 
 | Area | Current source contract |
 |---|---|
-| Releases | Mac 0.4.19 is the current public release (Developer ID signed, notarized, Sparkle). iPhone 0.5.1 (19) is in App Review. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
+| Releases | Mac v0.6.0 is the current public release as of 2026-10-09 (0.5.1 shipped 2026-10-04) (Developer ID signed, notarized, Sparkle). The 2026-10-02 source snapshot recorded iPhone 0.5.1 (19) in App Review. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
 | Agent interface | `app` is the only always-on tool. `app {}` is home; `page`, `item`, `find`, `action` and JavaScriptCore `script` reach capabilities through `AppActionRegistry`. |
 | Discovery | Pages and actions arrive in tool results. Retired tool names are refused with a translated `app` call; there is nothing to load or unload. |
 | Growth and MCP | `tool.propose` → `tool.approve` → `authored.<id>`; mounted MCP tools become `mcp.<server>.<tool>` actions. |
-| Web search | `web.search` tries Codex for general queries and SearXNG for code queries or category/time filters, with an explicit fallback report. |
+| Web search | `web.search` uses Codex with direct web-tool access for general queries and SearXNG for categories or Codex failures. Receipts retain the actual route and Codex failure reason; completed empty searches stay on their route. Time ranges travel with either route. |
 | Memory | MemoryV2 stores durable memories; Fluid Context prepares bounded context. |
 | Work | Desk holds durable work. Helpers run in their own conversations with saved model choices. |
 | Providers | Chat, Work, and Memory and mind are the three routing groups; Work and Memory and mind inherit Chat unless configured. |

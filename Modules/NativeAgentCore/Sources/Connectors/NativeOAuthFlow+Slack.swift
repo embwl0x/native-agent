@@ -1,6 +1,7 @@
 import ProviderRouting
 import Foundation
 import PersistenceCore
+import SlackConnector
 
 extension NativeOAuthFlow {
     /// Store a Slack OAuth token that the user already generated in Slack's app
@@ -16,6 +17,11 @@ extension NativeOAuthFlow {
         validateWithSlack: Bool = true,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> OAuthFlowResult {
+        do { try SlackCredentials.recoverPendingSave(dataRoot: dataRoot) }
+        catch {
+            return OAuthFlowResult(ok: false,
+                error: "Could not save Slack token: \(NativeOAuthSupport.redact(error.localizedDescription))")
+        }
         let providedToken = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
         let token = providedToken.isEmpty
             ? (existingSlackBotToken(dataRoot: dataRoot) ?? "")
@@ -59,25 +65,34 @@ extension NativeOAuthFlow {
             .appendingPathComponent("auth.json")
         let persistence = SwiftNativePersistenceCore()
 
+        // Stage an immutable, verified grant before a durable save intent.
+        // Startup finishes that exact intent before admitting the connection.
         do {
+            try SlackCredentials.recoverPendingSave(dataRoot: root)
             _ = try await ConnectorOAuthRegistry.mutateConnectorRegistryEntry(
                 root: root,
                 provider: "slack",
                 createIfMissing: true,
-                prepare: {
+                publish: { registry, _ in
                     try await persistence.withFileLock(legacyPath) {
                         try await persistence.withFileLock(connectorPath) {
                             // Check both authorities before publishing either destination.
                             var legacy = try ConnectorOAuthRegistry.checkedCredentialObject(at: legacyPath)
                             var connector = try ConnectorOAuthRegistry.checkedCredentialObject(at: connectorPath)
+                            let savedAppToken = appToken.isEmpty
+                                ? try SlackCredentials.read(.app, dataRoot: root, allowMissingGrant: !providedToken.isEmpty)
+                                : appToken
+                            let reference = try SlackCredentials.stageGrant(bot: token, app: savedAppToken, dataRoot: root)
                             for path in [legacyPath, connectorPath] {
                                 var obj = path == legacyPath ? legacy : connector
                                 obj["provider"] = .string("slack")
-                                obj["access_token"] = .string(token)
+                                for key in SlackCredentials.fileKeys.values.joined() { obj[key] = nil }
+                                obj["credential_store"] = .string("keychain")
+                                obj[SlackCredentials.referenceField] = .string(reference)
                                 obj["token_type"] = .string("Bearer")
                                 obj["auth_mode"] = .string("manual_oauth_token")
                                 obj["saved_at"] = .string(now)
-                                mergeSlackSocketModeFields(appToken: appToken, into: &obj)
+                                if !appToken.isEmpty { obj["socket_mode_enabled"] = .bool(true) }
                                 mergeSlackIngressFields(
                                     allowedChannelIds: channels,
                                     allowedUserIds: users,
@@ -88,8 +103,8 @@ extension NativeOAuthFlow {
                                 if path == legacyPath { legacy = obj } else { connector = obj }
                             }
                             connector["validated_at"] = validateWithSlack ? .string(now) : nil
-                            try await persistence.writeJSON(.object(legacy), to: legacyPath)
-                            try await persistence.writeJSON(.object(connector), to: connectorPath)
+                            try SlackCredentials.commitSave(legacy: .object(legacy), connector: .object(connector),
+                                                            registry: registry, dataRoot: root)
                         }
                     }
                 }
@@ -122,24 +137,7 @@ extension NativeOAuthFlow {
     }
 
     private static func existingSlackBotToken(dataRoot: URL) -> String? {
-        let paths = [
-            dataRoot
-                .appendingPathComponent("connectors", isDirectory: true)
-                .appendingPathComponent("slack", isDirectory: true)
-                .appendingPathComponent("auth.json"),
-            dataRoot
-                .appendingPathComponent("oauth_tokens", isDirectory: true)
-                .appendingPathComponent("slack.json"),
-        ]
-        for path in paths {
-            guard let object = try? NativeOAuthSupport.loadJSONObject(path),
-                  let token = object["access_token"] as? String else {
-                continue
-            }
-            let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return trimmed }
-        }
-        return nil
+        try? SlackCredentials.read(.bot, dataRoot: dataRoot)
     }
 
     private static func isPlausibleSlackAppToken(_ token: String) -> Bool {
@@ -189,13 +187,6 @@ extension NativeOAuthFlow {
         for (key, value) in authFields {
             obj[key] = .string(value)
         }
-    }
-
-    private static func mergeSlackSocketModeFields(appToken: String, into obj: inout [String: JSONValue]) {
-        guard !appToken.isEmpty else { return }
-        obj["app_token"] = .string(appToken)
-        obj["socket_mode_app_token"] = .string(appToken)
-        obj["socket_mode_enabled"] = .bool(true)
     }
 
     private static func mergeSlackIngressFields(

@@ -284,13 +284,13 @@ public struct REMProposalStore: Sendable {
               let jv = try? JSONDecoder().decode(JSONValue.self, from: data),
               case .object(let obj) = jv,
               case .array(let rows)? = obj["rows"] else {
-            NSLog("REMProposalStore: base at %@ exists but did not decode — folding feed only",
+            nativeLog("REMProposalStore: base at %@ exists but did not decode — folding feed only",
                   basePath.path)
             return nil
         }
         let decoded = rows.compactMap(Self.decodeRowJSON)
         guard decoded.count == rows.count else {
-            NSLog("REMProposalStore: base at %@ contains malformed rows — folding feed only",
+            nativeLog("REMProposalStore: base at %@ contains malformed rows — folding feed only",
                   basePath.path)
             return nil
         }
@@ -669,7 +669,7 @@ public struct REMProposalStore: Sendable {
         // Skipping compaction just leaves the feed longer until a human or a
         // repair pass restores the base (gpt-5.5 fix round, MED).
         guard let existingBase = readBaseRows() else {
-            NSLog("REMProposalStore: base unreadable — compaction skipped to avoid overwriting folded terminal rows")
+            nativeLog("REMProposalStore: base unreadable — compaction skipped to avoid overwriting folded terminal rows")
             return
         }
         // Merge into the existing base, id-keyed, newest (the just-folded row) wins.

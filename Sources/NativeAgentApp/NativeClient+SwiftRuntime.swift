@@ -534,7 +534,7 @@ extension NativeClient {
     /// response carries is populated — Core's CompiledPersonalityProfile and
     /// the shared PersonalityProfile struct share the same field set 1:1.
     func swiftPersonality() async throws -> PersonalityProfile {
-        let compiled = await PersonaCompiler().compileProfile(
+        let compiled = try PersonaCompiler.compileProfile(
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
         // Shared with the wave-33 W06 write-gate result mapping so the read and
@@ -554,16 +554,7 @@ extension NativeClient {
 
     // MARK: - CompiledPersonality route (gate: .personaEngine)
 
-    /// Build the `/v1/personality/compiled` response in Swift by calling
-    /// `PersonaCompiler.compiledPacket(surface:)`, which mirrors the
-    /// daemon's `compiled_personality_packet` (the retired daemon
-    /// L35508-35553) and the route envelope at L51635-51638. The wire
-    /// shape `{surface, fingerprint, compiled}` is byte-equivalent: the
-    /// `fingerprint` hashes the FULL UNSLICED docs + full profile via the
-    /// same canonical-JSON serializer the daemon uses, and `compiled` is
-    /// rendered as `json.dumps(packet, indent=2)` (ensure_ascii=True,
-    /// insertion-order keys) so the Personality tab text matches byte-
-    /// for-byte.
+    /// Read the shared active persona packet for the requested surface.
     func swiftCompiledPersonality(surface: String) async throws -> CompiledPersonality {
         let compiler: PersonaCompiler
         if let dataRootOverride {

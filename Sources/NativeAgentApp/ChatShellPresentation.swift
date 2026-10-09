@@ -126,13 +126,9 @@ enum ChatShellCopy {
         "Tell me about yourself",
     ]
 
-    // 2026-09-06: the old title claimed a retry ("Trying again…") that no
-    // retry loop was running, and the detail's "nothing was sent" was stated
-    // even for a turn that had already run tools. The title says only what
-    // the transcript proves; no tool calls does not mean the model provider
-    // never received the request.
-    static let errorTitle = "I didn't finish that one."
-    static let errorDetail = "Your message is still in this conversation."
+    // The card's line says what the failed turn provably did — see
+    // `ChatTurnFailure.line`. "I didn't finish that one." said nothing about
+    // whether Retry was safe (Agent, fluid-glass review).
     static let errorStuckLink = "Still stuck? Settings"
     /// After this many failed turns in a row the quiet Settings link appears.
     static let stuckRetryThreshold = 2
@@ -257,15 +253,59 @@ enum ChatShellConversationRow {
     /// The last message is never a source. No summarizer, no model call.
     static func title(for session: ChatSession, openingLine: String?) -> String {
         let stored = stripBridgePrefix(session.title)
-        if !isMachineTitle(stored, session: session) { return clamp(plainText(stored)) }
+        if !isMachineTitle(stored, session: session) { return startedTitle(stored) ?? clamp(plainText(stored)) }
         let opening = stripBridgePrefix(openingLine ?? "")
-        if !opening.isEmpty { return clamp(plainText(opening)) }
+        if !opening.isEmpty { return startedTitle(opening) ?? clamp(plainText(opening)) }
         return "New conversation"
+    }
+
+    /// A conversation the app started for me opens with its own plumbing (a
+    /// wake note, a Codex completion, a helper's brief), and the stored title
+    /// is cut from that. Name it for what it is. Sessions carry no "titled by
+    /// the person" mark, so only the exact machine openings match, case and
+    /// punctuation included: a title the person chose ("Codex turn stalled
+    /// investigation") is never touched.
+    static func startedTitle(_ opening: String) -> String? {
+        let text = opening.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("[Woken by ") {
+            let reason = text.dropFirst("[Woken by ".count)
+            if reason.hasPrefix("my queue") { return "Woke up for my queue" }
+            if reason.hasPrefix("what resolved") { return "Woke up when something finished" }
+            if reason.hasPrefix("something worth sharing") { return "Woke up with something to share" }
+            return "Woke up on my own"
+        }
+        // The first line of `script/wake_reply_delivery.js`'s envelope, and
+        // only that: a full sentence with its full stop.
+        if text.contains(/^Codex (replied to (your message|\d+ queued messages)|(wakeup failed|turn stalled|wakeup produced no reply)( for \d+ queued messages)?)\.(\s|$)/) {
+            return "Codex check-in"
+        }
+        let standing = "Current standing instructions for "
+        if text.hasPrefix(standing) {
+            let rest = text.dropFirst(standing.count)
+            let name = rest.prefix { $0 != ":" && $0 != "\n" }.trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { return "A helper's run" }
+            return clamp(name.lowercased().hasSuffix("helper") ? name : "Helper: \(name)")
+        }
+        return nil
     }
 
     static func preview(for session: ChatSession) -> String {
         plainText(stripBridgePrefix(session.lastMessagePreview ?? ""))
     }
+
+    /// The row's second line: the last thing said, cut at a word to fit
+    /// beside the time. Never the title (Agent, 2026-09-02, above), and empty
+    /// when the last thing said IS the title, so the row keeps its old line.
+    static func listPreview(for session: ChatSession, title: String) -> String {
+        let said = preview(for: session)
+        // A cut title matches on its words so far; a whole one, exactly.
+        let repeats = title.hasSuffix("…")
+            ? title.count > 1 && said.hasPrefix(title.dropLast())
+            : said == title
+        if repeats { return "" }
+        return clamp(said, limit: previewLimit)
+    }
+    static let previewLimit = 26
 
     /// Titles carry whatever the person typed, including markdown. A row is
     /// plain text: backticks, `**bold**`, list bullets and heading hashes are
@@ -332,21 +372,21 @@ enum ChatShellConversationRow {
     }
 
     /// Cut at a word boundary, never mid-word.
-    private static func clamp(_ value: String) -> String {
+    private static func clamp(_ value: String, limit: Int = titleLimit) -> String {
         let flat = value.replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard flat.count > titleLimit else { return flat }
+        guard flat.count > limit else { return flat }
         // One character past the limit tells us whether the cut already fell
         // on a boundary; otherwise back up to the last space inside it.
-        let window = flat.prefix(titleLimit + 1)
+        let window = flat.prefix(limit + 1)
         let head: Substring
         if let space = window.lastIndex(of: " ") {
             head = window[..<space]
         } else {
-            head = flat.prefix(titleLimit)
+            head = flat.prefix(limit)
         }
         let word = head.trimmingCharacters(in: .whitespaces)
-        return String((word.isEmpty ? String(flat.prefix(titleLimit)) : word).trimmingCharacters(in: CharacterSet(charactersIn: " .,;:!?—-"))) + "…"
+        return String((word.isEmpty ? String(flat.prefix(limit)) : word).trimmingCharacters(in: CharacterSet(charactersIn: " .,;:!?—-"))) + "…"
     }
 }
 
@@ -802,10 +842,14 @@ enum ChatShellTroubleState {
     /// it must not raise the orange card. The cancel writer stamps `partial`
     /// alongside `cancelled`, so the cancelled flag has to be read first or
     /// every Stop still reads as a failure.
+    /// The engine's persisted failure row (`mechanicalKind: systemRow`) is a
+    /// failed turn too; without it the card never showed for the failure the
+    /// core itself wrote down.
     static func isFailed(_ message: ChatMessage) -> Bool {
         if message.metadata?.cancelled == true { return false }
         return message.metadata?.error?.isEmpty == false
             || message.metadata?.partial == true
+            || message.metadata?.mechanicalKind == "systemRow"
     }
 
     /// The run of failed assistant turns at the tail of the transcript. Zero
@@ -830,19 +874,6 @@ enum ChatShellTroubleState {
             count += 1
         }
         return count
-    }
-
-    /// Whether the failed turn at the tail actually dispatched a tool. The
-    /// evidence is the turn's own tool receipts — the rows after the last
-    /// thing the person said. Only a turn with none of them may be described
-    /// as having sent nothing anywhere (2026-09-06).
-    static func tailTurnDispatchedTools(_ messages: [ChatMessage]) -> Bool {
-        for message in messages.reversed() {
-            let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if role == "user" { return false }
-            if role == "tool" { return true }
-        }
-        return false
     }
 
     static func showsStuckLink(_ messages: [ChatMessage]) -> Bool {

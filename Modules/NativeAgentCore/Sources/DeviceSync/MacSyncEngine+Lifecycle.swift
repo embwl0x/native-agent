@@ -50,10 +50,12 @@ extension MacSyncEngine {
         startArchiveRetentionWatcher()
         pruneOldArchiveFiles()
         startSnapshotIntegrityFallback()
+        startPresenceBeat()
         startCognitionSnapshotObservation()
         startSchedulerSnapshotObservation()
         startHelpersSnapshotObservation()
         startWorkActivityObservation()
+        startLiveTurnRelay()
         startChatTranscriptSnapshotObservation()
         let generation = snapshotLifecycleGeneration
         Task {
@@ -125,10 +127,12 @@ extension MacSyncEngine {
         // integrity path for an out-of-process change or crash-window event the
         // app could not observe; unchanged passes write nothing and call no LLM.
         startSnapshotIntegrityFallback()
+        startPresenceBeat()
         startCognitionSnapshotObservation()
         startSchedulerSnapshotObservation()
         startHelpersSnapshotObservation()
         startWorkActivityObservation()
+        startLiveTurnRelay()
         startChatTranscriptSnapshotObservation()
 
         // Watch inbox for iOS-deposited action files
@@ -149,12 +153,15 @@ extension MacSyncEngine {
         isActive = false
         workActivityObservationTask?.cancel()
         workActivityObservationTask = nil
+        stopLiveTurnRelay()
         workActivityPublicationTask?.cancel()
-        workActivityPublicationTask = nil
+        // The retiring publisher keeps admission until its physical write ends.
         workActivities.removeAll()
         activeDocsURL = nil
         snapshotIntegrityTask?.cancel()
         snapshotIntegrityTask = nil
+        presenceBeatTask?.cancel()
+        presenceBeatTask = nil
         cognitionSnapshotObservationTask?.cancel()
         cognitionSnapshotObservationTask = nil
         schedulerSnapshotWatcher?.cancel()
@@ -172,7 +179,7 @@ extension MacSyncEngine {
         chatTranscriptSnapshotPublicationTask?.cancel()
         chatTranscriptSnapshotPublicationTask = nil
         chatSnapshotCoalescer.reset()
-        snapshotWriteInFlight = false
+        // The retiring pass owns admission until its physical write returns.
         snapshotWriteQueued = false
         snapshotWriteQueuedNeedsHeavy = false
         snapshotWriteQueuedNeedsMemories = false
@@ -213,6 +220,19 @@ extension MacSyncEngine {
         }
     }
 
+    private func startPresenceBeat() {
+        presenceBeatTask?.cancel()
+        presenceBeatTask = Task { [weak self] in
+            var delay = NAMacPresence.beat
+            while let self, !Task.isCancelled {
+                guard self.isActive else { return }
+                let published = await self.sync.bridge.publishMacPresence()
+                delay = published ? NAMacPresence.beat : min(NAMacPresence.phoneWindow, delay * 2)
+                try? await Task.sleep(for: .seconds(delay))
+            }
+        }
+    }
+
     /// Slow repair for a missed mutation edge or an externally modified
     /// snapshot.  Normal publications remain event-driven; this pass merely
     /// proves that every cached digest still matches the specific file iOS can
@@ -229,7 +249,7 @@ extension MacSyncEngine {
             if FileManager.default.fileExists(atPath: skipsURL.path) {
                 if let data = try? Data(contentsOf: skipsURL),
                    let skips = try? JSONDecoder().decode([String: String].self, from: data) {
-                    hasSkippedGroups = skips.keys.contains { $0 != "_observedAt" }
+                    hasSkippedGroups = skips.keys.contains { !$0.hasPrefix("_") }
                 } else {
                     hasSkippedGroups = true
                 }

@@ -1,7 +1,9 @@
 import Privacy
 import Foundation
+import MemoryV2
 import PersistenceCore
 import DoctorChecks
+import ChatOrchestration
 import ProviderRouting
 import SystemOps
 import MacControl
@@ -139,17 +141,22 @@ extension NativeClient: DoctorActionPort {
             .checkSearXNG(base: base)
     }
 
-    private func doctorSearchContainerName() async throws -> String? {
-        // Discovery/configuration records only an endpoint, not ownership.
-        // No app provisioning path currently records a container name; keep
-        // the human action unless ownership was explicitly configured.
-        let path = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            .appendingPathComponent("research/config.json")
-        let config = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
-        guard case .object(let fields) = config,
-              case .string(let name) = fields["searxng_container_name"],
-              !name.isEmpty else { return nil }
-        return name
+    func doctorProbeCodexSearch() async -> Bool {
+        await WebSearchRoutes.codexSignedIn(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+    }
+
+    /// Doctor state: the local SearXNG URL for which Docker was checked and
+    /// holds no SearXNG container. Automatic runs leave Docker Desktop closed
+    /// until the URL changes or Repair is pressed.
+    private var searchBackendAbsentPath: URL {
+        (dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("doctor/search_backend_absent.json")
+    }
+
+    func doctorSearchBackendAbsent(base: String) -> Bool {
+        guard let data = try? Data(contentsOf: searchBackendAbsentPath),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return object["base"] as? String == base
     }
 
     func doctorRecordRepair(checkID: String, receipt: String, status: String) async throws {
@@ -166,8 +173,13 @@ extension NativeClient: DoctorActionPort {
         guard requestedRoot.resolvingSymlinksInPath().standardizedFileURL
             == PersistenceCore.defaultDataRoot().resolvingSymlinksInPath().standardizedFileURL else { return nil }
         switch check.id {
+        case "live.memory":
+            guard !check.detail.hasPrefix("quick_check on ") else { return nil }
+            return DoctorExecutableRepair(checkID: check.id) {
+                try await SwiftNativeMemoryV2.shared.repairCanonicalAttachment()
+                return .completed("Completed: attached the canonical memory store and reconciled its knowledge graph.")
+            }
         case "live.providers":
-            guard scope == .button else { return nil }
             let pendingPath = requestedRoot.appendingPathComponent("providers/pending-surface-configuration.json")
             let pendingSelection = FileManager.default.fileExists(atPath: pendingPath.path)
             let needsProbe: Bool
@@ -211,17 +223,43 @@ extension NativeClient: DoctorActionPort {
         case DoctorEmbeddingDownloadCheck.id:
             return await DoctorEmbeddingDownloadCheck.repair(dataRoot: requestedRoot, scope: scope)
         case "live.search":
-            guard let base = try? await doctorSearchURL(),
-                  let name = try? await doctorSearchContainerName(),
-                  let container = await SystemDockerPSExecutor().stoppedLocalSearXNG(base: base, containerName: name) else { return nil }
+            // A Codex sign-in is the person's; starting SearXNG doesn't fix it.
+            guard check.ask != .signIn,
+                  let base = (try? await doctorSearchURL())?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !base.isEmpty else { return nil }
+            let mayOpenDockerDesktop = scope == .button || !doctorSearchBackendAbsent(base: base)
+            let absentPath = searchBackendAbsentPath
             return DoctorExecutableRepair(checkID: check.id) {
-                guard try await doctorSearchURL() == base,
-                      try await doctorSearchContainerName() == name else {
-                    return .unverified("Repair skipped: the configured SearXNG URL or container name changed.")
+                let research = SwiftNativeResearchClient(dataRoot: requestedRoot)
+                // A SearXNG already answering (common port or running
+                // container) becomes the search URL.
+                let found = try await research.autodetectSearXNG()
+                if found.found, let url = found.baseURL {
+                    try? FileManager.default.removeItem(at: absentPath)
+                    return .completed("Completed: SearXNG answers at \(url); search now uses it.")
                 }
-                try await SystemDockerPSExecutor().restartLocalSearXNG(base: base, containerName: name, containerID: container)
-                try await Task.sleep(for: .seconds(2))
-                return .completed("Completed: restarted the identified local SearXNG container \(container.prefix(12)); checking the configured endpoint again.")
+                // Otherwise start the stopped local container behind the configured URL.
+                let container: String
+                do {
+                    container = try await SystemDockerPSExecutor()
+                        .startLocalSearXNG(base: base, mayOpenDockerDesktop: mayOpenDockerDesktop)
+                } catch let error as SearXNGStartError where error.noBackend {
+                    try await SwiftNativePersistenceCore().writeJSON(.object([
+                        "base": .string(base), "at": .string(ISO8601DateFormatter().string(from: Date())),
+                    ]), to: absentPath)
+                    return .unverified("No search backend: nothing answers at \(base). \(error.message)")
+                } catch {
+                    return .unverified("Web search is down: nothing answers at \(base). \(error.localizedDescription)")
+                }
+                try? FileManager.default.removeItem(at: absentPath)
+                let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+                repeat {
+                    try await Task.sleep(for: .seconds(2))
+                    if await research.checkSearXNG(base: base) {
+                        return .completed("Completed: started the local SearXNG container \(container.prefix(12)); search answers at \(base).")
+                    }
+                } while ContinuousClock.now < deadline
+                return .unverified("Started the local SearXNG container \(container.prefix(12)), but \(base) did not answer within 30 seconds.")
             }
         case "live.background_loops":
             return nil
@@ -310,6 +348,25 @@ extension NativeClient: DoctorActionPort {
             ("BrowserIPC", browserIPC, true),
         ]
         return bridges.map { ($0.name, ($0.health.failure, $0.health.boundPort, $0.health.isActive, $0.health.port), $0.expected) }
+    }
+
+    func doctorAgentConnectionsCheck() async -> CheckResult {
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        await AgentContactHealth.shared.refresh(dataRoot: root)
+        do {
+            let peers = try AgentPeerStore(dataRoot: root).list()
+            _ = try AgentConversationStore(dataRoot: root).recordsUnlocked()
+            let problems: [String] = AgentLocalHealth.read(root).sorted { $0.key < $1.key }.compactMap { agent, health in
+                guard ["broken", "unverified", "signed_out", "unavailable"].contains(health.status) else { return nil }
+                return health.problem.map { (peers.first { "peer:" + $0.id == agent }?.name ?? agent) + ": " + $0 }
+            }
+            return CheckResult(id: "live.agent_connections", title: "Agent connections", status: problems.isEmpty ? "ok" : "warn",
+                detail: problems.isEmpty ? "No broken reply path is recorded; setup alone does not prove a reply." : problems.joined(separator: "\n"),
+                repair: nil, human_action: problems.isEmpty ? nil : problems.joined(separator: "\n"))
+        } catch {
+            return CheckResult(id: "live.agent_connections", title: "Agent connections", status: "warn",
+                detail: "Agent connection evidence is unavailable. Restore the saved contacts and conversations, then run Doctor.", repair: nil)
+        }
     }
 
     func doctorBackgroundLoopsCheck() async -> CheckResult {

@@ -38,6 +38,7 @@ public enum BotRunAdmissionError: String, Error {
 /// replayed. All runners in this process share admission with tool callers.
 public struct BotRunQueue: Sendable {
     public static let didChange = Notification.Name("StandingBots.scheduleDidChange")
+    public static let alreadyExecutingWords = "This helper is executing its standing job now. Complete the work and return its result in this turn; do not queue or wait on your own Run control."
     private let disk: StandingBotsDisk
     private let dataRoot: URL
     private var path: URL { disk.root.appendingPathComponent("run-queue.json") }
@@ -60,6 +61,37 @@ public struct BotRunQueue: Sendable {
     }
     private static let admission = Admission()
 
+    private struct Claim: Codable {
+        let requestID: UUID
+        let briefVersion: Int
+        let admittedAt: Date
+        var deadlineExceededAt: Date? = nil
+    }
+
+    private func claimRecord(_ id: UUID) -> URL {
+        disk.root.appendingPathComponent(id.uuidString).appendingPathComponent("run-claim.json")
+    }
+
+    /// Called only while holding both the store lock and this bot's writer lock.
+    private func reconcileClaim(_ id: UUID, requests: inout [UUID: QueuedRequest]) throws {
+        let path = claimRecord(id)
+        guard let claim = try disk.read(Claim.self, at: path) else { return }
+        let detail = "Helper admission ended without a settled result. Effects are unknown; do not replay the request."
+        var entry = ShelfEntry(id: claim.requestID, botId: id, briefVersion: claim.briefVersion,
+            runAt: claim.admittedAt, coverageStart: claim.admittedAt, coverageEnd: claim.admittedAt,
+            headline: "Interrupted helper request", findings: "", changedSinceLastGood: "",
+            uncertainties: [detail], runHealth: .partial, spend: ShelfSpend(tokens: nil, seconds: 0))
+        entry.status = .interrupted
+        entry.statusDetail = detail
+        do { try ShelfStore(dataRoot: dataRoot).appendLocked(entry) }
+        catch StandingBotsError.alreadyExists { }
+        if requests[id]?.runID == claim.requestID {
+            requests.removeValue(forKey: id)
+            try disk.write(requests, at: self.path)
+        }
+        try FileManager.default.removeItem(at: path)
+    }
+
     // Serializes the short disk transaction and process-wide active claims.
     private final class Admission: @unchecked Sendable {
         let lock = NSLock()
@@ -76,7 +108,7 @@ public struct BotRunQueue: Sendable {
     /// claim that only its own caller can release, and no deadline could free
     /// it because the wait was not cancellable. Such a claim is refused instead
     /// of parked.
-    @TaskLocal static var ancestry: Set<UUID> = []
+    @TaskLocal public static var ancestry: Set<UUID> = []
     @TaskLocal public static var eventProvenance: BotEventProvenance?
     @TaskLocal public static var eventContext: String?
 
@@ -92,31 +124,35 @@ public struct BotRunQueue: Sendable {
     public func enqueue(bot id: UUID, context: String? = nil,
                         origin: BotRunOrigin = .manual,
                         provenance: BotEventProvenance? = nil) throws -> BotRunReceipt {
-        let runID = UUID()
+        guard !Self.ancestry.contains(id) else {
+            throw StandingBotsError.invalidValue(Self.alreadyExecutingWords)
+        }
+        let receipt: BotRunReceipt
         do {
-            try disk.locked {
+            Self.admission.lock.lock()
+            defer { Self.admission.lock.unlock() }
+            receipt = try disk.locked {
                 let bot = try disk.definition(id).definition
                 guard bot.deleted != true else { throw StandingBotsError.notFound(id) }
                 var requests = try readRequests()
-                guard requests[id] == nil else { throw BotRunAdmissionError.alreadyRunning }
+                if origin == .manual, Self.admission.active[rootKey]?[id] != nil {
+                    guard let claim = try disk.read(Claim.self, at: claimRecord(id)) else {
+                        throw StandingBotsError.corruptStore("exact bot run claim unavailable")
+                    }
+                    return BotRunReceipt(runID: claim.requestID, accepted: false, reason: BotRunAdmissionError.alreadyRunning.rawValue)
+                }
+                if let existing = requests[id] {
+                    return BotRunReceipt(runID: existing.runID, accepted: false, reason: BotRunAdmissionError.alreadyRunning.rawValue)
+                }
+                let runID = UUID()
                 let text = (context?.isEmpty ?? true) ? nil : context
                 requests[id] = QueuedRequest(runID: runID, context: text, origin: origin, provenance: provenance)
                 try disk.write(requests, at: path)
+                return BotRunReceipt(runID: runID, accepted: true, reason: "queued")
             }
-            NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
-            return BotRunReceipt(runID: runID, accepted: true, reason: "queued")
-        } catch let error as BotRunAdmissionError {
-            return BotRunReceipt(runID: runID, accepted: false, reason: error.rawValue)
         }
-    }
-
-    /// The synchronous tool adapter does no HTTP or provider work.
-    public func enqueueRequest(bot id: UUID) throws -> UUID {
-        let receipt = try enqueue(bot: id)
-        guard receipt.accepted else {
-            throw BotRunAdmissionError(rawValue: receipt.reason)!
-        }
-        return receipt.runID
+        if receipt.accepted { NotificationCenter.default.post(name: Self.didChange, object: dataRoot) }
+        return receipt
     }
 
     /// Inside the store lock. Pre-0.4.12 requests decode as a bare run id and
@@ -128,7 +164,21 @@ public struct BotRunQueue: Sendable {
     }
 
     func pending() throws -> [UUID: QueuedRequest] {
-        try disk.locked { try readRequests() }
+        try disk.locked {
+            var requests = try readRequests()
+            for directory in try disk.files(at: disk.root, extension: "") {
+                guard let id = UUID(uuidString: directory.lastPathComponent),
+                      try disk.bytes(at: claimRecord(id)) != nil else { continue }
+                let lock = directory.appendingPathComponent("run.lock")
+                try disk.validatePath(lock)
+                let fd = open(lock.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+                guard fd >= 0 else { throw StandingBotsError.corruptStore("bot run claim unavailable") }
+                defer { close(fd) }
+                if flock(fd, LOCK_EX | LOCK_NB) == 0 { try reconcileClaim(id, requests: &requests) }
+                else if errno != EWOULDBLOCK { throw StandingBotsError.corruptStore("bot run claim unavailable") }
+            }
+            return requests
+        }
     }
 
     public func activeOrQueuedIDs(locked: Bool = true) throws -> Set<UUID> {
@@ -144,7 +194,18 @@ public struct BotRunQueue: Sendable {
         return (Set(Self.admission.active[rootKey]?.keys.map { $0 } ?? []), Set(queued.keys))
     }
 
-    public enum RequestPresence: Sendable { case queued, running, absent }
+    public enum RequestPresence: Sendable { case queued, running, deadlineExceeded, absent }
+
+    func markDeadlineExceeded(bot id: UUID, requestID: UUID) throws {
+        try disk.locked {
+            guard var claim = try disk.read(Claim.self, at: claimRecord(id)), claim.requestID == requestID else {
+                throw StandingBotsError.corruptStore("exact bot run claim unavailable")
+            }
+            claim.deadlineExceededAt = Date()
+            try disk.write(claim, at: claimRecord(id))
+        }
+        NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
+    }
 
     /// Exact queue correlation, plus a conservative live-claim check. A live
     /// writer may be settling the requested shelf row; absence is definitive
@@ -154,18 +215,25 @@ public struct BotRunQueue: Sendable {
         Self.admission.lock.lock()
         defer { Self.admission.lock.unlock() }
         return try disk.locked {
-            if try readRequests()[id]?.runID == requestID { return .queued }
-            if Self.admission.active[rootKey]?[id] != nil { return .running }
+            var requests = try readRequests()
             let claim = disk.root.appendingPathComponent(id.uuidString).appendingPathComponent("run.lock")
             try disk.validatePath(claim)
             let fd = open(claim.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
             if fd < 0 {
-                if errno == ENOENT { return .absent }
+                if errno == ENOENT { return requests[id]?.runID == requestID ? .queued : .absent }
                 throw StandingBotsError.corruptStore("bot run claim unavailable")
             }
             defer { close(fd) }
-            if flock(fd, LOCK_EX | LOCK_NB) == 0 { return .absent }
-            if errno == EWOULDBLOCK { return .running }
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                try reconcileClaim(id, requests: &requests)
+                return requests[id]?.runID == requestID ? .queued : .absent
+            }
+            if errno == EWOULDBLOCK {
+                if let saved = try disk.read(Claim.self, at: claimRecord(id)), saved.requestID == requestID {
+                    return saved.deadlineExceededAt == nil ? .running : .deadlineExceeded
+                }
+                return requests[id]?.runID == requestID ? .queued : .absent
+            }
             throw StandingBotsError.corruptStore("bot run claim unavailable")
         }
     }
@@ -183,13 +251,14 @@ public struct BotRunQueue: Sendable {
 
     /// The claimed definition and the event text the claimed request carried.
     struct ClaimedRun {
+        let runID: UUID
         let bot: BotDefinition
         let context: String?
         let provenance: BotEventProvenance?
     }
 
     func claim(bot id: UUID, requestID: UUID?, manual: Bool = false) throws -> ClaimedRun {
-        try admit(bot: id, runID: requestID, enqueue: false, manual: manual)
+        try admit(bot: id, runID: requestID, manual: manual)
     }
 
     func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false) async throws -> ClaimedRun {
@@ -233,13 +302,13 @@ public struct BotRunQueue: Sendable {
         try disk.locked { try disk.definition(id).definition.budget }
     }
 
-    private func admit(bot id: UUID, runID: UUID?, enqueue: Bool, manual: Bool = false) throws -> ClaimedRun {
+    private func admit(bot id: UUID, runID: UUID?, manual: Bool = false) throws -> ClaimedRun {
         Self.admission.lock.lock()
         defer { Self.admission.lock.unlock() }
         return try disk.locked {
             var requests = try readRequests()
             guard Self.admission.active[rootKey]?[id] == nil,
-                  requests[id] == nil || manual || (!enqueue && requests[id]?.runID == runID) else {
+                  requests[id] == nil || manual || requests[id]?.runID == runID else {
                 throw BotRunAdmissionError.alreadyRunning
             }
             // Never unlink this inode: flock is shared by every process and is
@@ -256,12 +325,17 @@ public struct BotRunQueue: Sendable {
                 if errno == EWOULDBLOCK { throw BotRunAdmissionError.alreadyRunning }
                 throw StandingBotsError.corruptStore("bot run claim unavailable")
             }
+            try reconcileClaim(id, requests: &requests)
+            let bot = try disk.definition(id).definition
             // Claiming a queued request consumes it even if settings now reject
             // it. A budget edit must not leave a request to replay later.
             var context: String? = nil
             var provenance: BotEventProvenance? = nil
-            if !enqueue, let runID {
-                guard requests[id]?.runID == runID else { throw BotRunAdmissionError.alreadyRunning }
+            if let runID, requests[id]?.runID != runID { throw BotRunAdmissionError.alreadyRunning }
+            let admittedID = runID ?? UUID()
+            try disk.write(Claim(requestID: admittedID, briefVersion: bot.briefVersion, admittedAt: Date()),
+                           at: claimRecord(id))
+            if let runID {
                 // Consumed with the request: the text reaches this run only.
                 let request = requests.removeValue(forKey: id)
                 context = request?.context
@@ -270,23 +344,17 @@ public struct BotRunQueue: Sendable {
                 }
                 try disk.write(requests, at: path)
             }
-            let bot = try disk.definition(id).definition
             // A queued deliberate check is independent of scheduled checks.
-            guard !bot.paused || enqueue || runID != nil || manual else { throw BotRunAdmissionError.paused }
+            guard !bot.paused || runID != nil || manual else { throw BotRunAdmissionError.paused }
             guard bot.deleted != true else { throw StandingBotsError.notFound(id) }
-            if enqueue {
-                requests[id] = runID.map { QueuedRequest(runID: $0) }
-                try disk.write(requests, at: path)
-            } else {
-                let metadata = Data("\(getpid()) \(Date().timeIntervalSince1970)\n".utf8)
-                guard ftruncate(descriptor, 0) == 0,
-                      metadata.withUnsafeBytes({ Darwin.write(descriptor, $0.baseAddress, $0.count) }) == metadata.count else {
-                    throw StandingBotsError.corruptStore("bot run claim metadata unavailable")
-                }
-                Self.admission.active[rootKey, default: [:]][id] = descriptor
-                retained = true
+            let metadata = Data("\(getpid()) \(Date().timeIntervalSince1970)\n".utf8)
+            guard ftruncate(descriptor, 0) == 0,
+                  metadata.withUnsafeBytes({ Darwin.write(descriptor, $0.baseAddress, $0.count) }) == metadata.count else {
+                throw StandingBotsError.corruptStore("bot run claim metadata unavailable")
             }
-            return ClaimedRun(bot: bot, context: context, provenance: provenance)
+            Self.admission.active[rootKey, default: [:]][id] = descriptor
+            retained = true
+            return ClaimedRun(runID: admittedID, bot: bot, context: context, provenance: provenance)
         }
     }
 

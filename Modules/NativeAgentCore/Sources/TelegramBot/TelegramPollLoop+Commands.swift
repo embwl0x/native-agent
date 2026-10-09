@@ -93,7 +93,7 @@ extension TelegramPollLoop {
             return false
 
         case .retry:
-            return await handleRetryCommand(update: update, message: message, text: text)
+            return await handleRetryCommand(args: parsed.args, update: update, message: message, text: text)
 
         case .sessions:
             await handleSessionsCommand(update: update, message: message, text: text)
@@ -377,10 +377,65 @@ extension TelegramPollLoop {
     }
 
     private func handleRetryCommand(
+        args: [String],
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String
     ) async -> Bool {
+        let updateInbox = TelegramUpdateInbox(offsetURL: offsetURL)
+        do {
+            var pending: TelegramUpdateClaim?
+            for claim in try await updateInbox.snapshots().reversed()
+                where claim.update.message?.destination == message.destination {
+                if await turnCoordinator.isUpdateProcessing(claim.updateId) {
+                    if claim.assistantDelivery?.isDelivered == false {
+                        pending = claim
+                        break
+                    }
+                    continue
+                }
+                if try await retainedAssistantDelivery(for: claim)?.isDelivered == false {
+                    pending = claim
+                    break
+                }
+            }
+            if let saved = pending {
+                if await turnCoordinator.isUpdateProcessing(saved.updateId) {
+                    await sendCommandReply("I'm still delivering that answer.", kind: "retry_busy", update: update, message: message, text: text)
+                } else {
+                    try await updateInbox.withAssistantDeliveryLock(updateId: saved.updateId) {
+                        let claim = try updateInbox.claim(updateId: saved.updateId)
+                        guard let originalMessage = claim.update.message else {
+                            throw TelegramUpdateInboxError.malformedClaim("\(claim.updateId).json")
+                        }
+                        guard let retained = try await retainedAssistantDelivery(for: claim), !retained.isDelivered else { return }
+                        let delivery = makeAssistantDelivery(
+                            destination: message.destination, turnId: UUID(), errorContext: "retry_saved_reply",
+                            update: claim.update, message: originalMessage, text: nil
+                        )
+                        switch await delivery.finalize(reply: retained.reply, savedDelivery: retained, resendUnknown: args == ["resend"]) {
+                        case .delivered:
+                            await recordReceipt(kind: "retry_reply", update: claim.update, message: originalMessage, text: text, reply: retained.reply)
+                            if let deleteMessage, let cardId = await turnCardRestartRepairer.takeInterruptedCard(chatId: message.chatId) {
+                                try await deleteMessage(token, message.chatId, cardId)
+                            }
+                        case .failed(let reason), .outcomeUnknown(let reason):
+                            await sendCommandReply(reason, kind: "retry_delivery_pending", update: update, message: message, text: text)
+                        }
+                    }
+                }
+                return false
+            }
+            if try await retryApprovalAnswer(args: args, update: update, message: message, text: text) { return false }
+        } catch {
+            await recordError(context: "retry_saved_reply", error: String(describing: error), update: update)
+            await sendCommandReply("I couldn't read the saved answer delivery. Check the Mac error log before retrying.", kind: "retry_unavailable", update: update, message: message, text: text)
+            return false
+        }
+        if args == ["resend"] {
+            await sendCommandReply("There's no saved answer waiting to be delivered.", kind: "retry_unavailable", update: update, message: message, text: text)
+            return false
+        }
         guard chatHandler != nil || progressChatHandler != nil || attachmentChatHandler != nil else {
             await sendCommandReply(
                 "I can't run anything here right now — chat isn't wired up on this surface.",
@@ -391,7 +446,6 @@ extension TelegramPollLoop {
             )
             return false
         }
-        let updateInbox = TelegramUpdateInbox(offsetURL: offsetURL)
         // 2026-09-06: a queued /retry pins the text it resolved to on its
         // durable claim. Restart recovery replays that claim through this
         // handler with an empty in-memory last-message map, so without the
@@ -420,6 +474,18 @@ extension TelegramPollLoop {
                 message: message,
                 text: text
             )
+            return false
+        }
+        let sessionId: String
+        do {
+            if let saved = retryClaim.resolvedSessionId {
+                sessionId = saved
+            } else {
+                sessionId = try await TelegramSessionStore(dataRoot: dataRoot)
+                    .activeSessionId(destination: message.destination)
+            }
+        } catch {
+            await recordError(context: "retry_session", error: String(describing: error), update: update)
             return false
         }
         let retryOperation: @Sendable (UUID) async -> Void = { turnId in
@@ -477,9 +543,13 @@ extension TelegramPollLoop {
                 message: message,
                 commandText: text,
                 retryText: retryText,
-                retryMessage: retryMessage
+                retryMessage: retryMessage,
+                sessionId: sessionId
             )
             do {
+                _ = try await Task {
+                    try await retainedAssistantDelivery(for: updateInbox.claim(updateId: update.updateId))
+                }.value
                 _ = try await updateInbox.transition(
                     updateId: update.updateId,
                     from: [.processing],
@@ -525,7 +595,8 @@ extension TelegramPollLoop {
                 from: [.processing],
                 to: .queued,
                 resolvedRetryText: retryText,
-                resolvedRetryMessage: retryMessage
+                resolvedRetryMessage: retryMessage,
+                resolvedSessionId: sessionId
             )
             guard queued.phase == .queued, queued.resolvedRetryText == retryText else {
                 await sendCommandReply(
@@ -612,7 +683,8 @@ extension TelegramPollLoop {
         message: TelegramMessage,
         commandText: String,
         retryText: String,
-        retryMessage: TelegramMessage?
+        retryMessage: TelegramMessage?,
+        sessionId: String
     ) async {
         let card = makeTurnProgressCard(
             destination: message.destination,
@@ -639,21 +711,35 @@ extension TelegramPollLoop {
             text: commandText
         )
         do {
+            _ = try await TelegramUpdateInbox(offsetURL: offsetURL).transition(
+                updateId: update.updateId, from: [.processing], to: .processing,
+                assistantRunId: turnId.uuidString, assistantSessionId: sessionId
+            )
             var attachments: [TelegramMediaAttachment] = []
-            if let retryMessage, let photo = Self.photoAttachment(from: retryMessage) {
+            if let retryMessage, let attachment = Self.chatAttachment(from: retryMessage) {
                 guard let photoDownloader else {
-                    throw TelegramBotError.underlying("Image ingestion is not configured; the original image could not be retried.")
+                    throw TelegramBotError.underlying("Attachment ingestion is not configured; the original attachment could not be retried.")
                 }
-                let downloaded = try await photoDownloader.download(token: token, attachment: photo, maxBytes: photoMaxBytes)
+                let maxBytes = chatAttachmentMaxBytes(attachment)
+                let downloaded = try await photoDownloader.download(token: token, attachment: attachment, maxBytes: maxBytes)
                 guard let bytes = downloaded.bytes, !bytes.isEmpty else {
                     throw TelegramMediaDownloadError.malformedResponse
                 }
-                guard bytes.count <= photoMaxBytes else {
-                    throw TelegramMediaDownloadError.oversized(reportedBytes: bytes.count, capBytes: photoMaxBytes)
+                guard bytes.count <= maxBytes else {
+                    throw TelegramMediaDownloadError.oversized(reportedBytes: bytes.count, capBytes: maxBytes)
+                }
+                let mime: String
+                if downloaded.kind == "photo" {
+                    mime = Self.imageMime(forFilename: downloaded.captureFilename, fallbackMime: downloaded.mimeType)
+                } else {
+                    guard let resolved = downloaded.chatTypeAndMime else {
+                        throw TelegramMediaDownloadError.malformedResponse
+                    }
+                    mime = resolved.mime
                 }
                 attachments = [TelegramMediaAttachment(
                     kind: downloaded.kind, fileId: downloaded.fileId,
-                    mimeType: Self.imageMime(forFilename: downloaded.captureFilename, fallbackMime: downloaded.mimeType),
+                    mimeType: mime,
                     sizeBytes: bytes.count, bytes: bytes, captureFilename: downloaded.captureFilename
                 )]
             }
@@ -670,34 +756,17 @@ extension TelegramPollLoop {
                 progress: capturingProgress,
                 replyTo: retryMessage?.replyTo,
                 fromUserId: retryMessage?.fromUserId ?? message.fromUserId,
-                suppressUserAppend: true
+                suppressUserAppend: true,
+                sessionId: sessionId,
+                runId: turnId.uuidString
             )
             try Task.checkCancellation()
             if !reply.isEmpty {
-                let deliveryOutcome = await delivery.finalize(reply: reply)
+                let deliveryOutcome = await delivery.finalize(reply: reply, imagePaths: await generatedImages.snapshot())
                 switch deliveryOutcome {
                 case .delivered:
-                    let imagePaths = await generatedImages.snapshot()
-                    switch await deliverGeneratedImages(
-                        imagePaths,
-                        destination: message.destination,
-                        errorContext: "send_generated_image",
-                        update: update,
-                        message: message,
-                        text: commandText
-                    ) {
-                    case .delivered:
-                        await recordReceipt(kind: "retry_reply", update: update, message: message, text: commandText, reply: reply)
-                        await card.transition(.completed(summary: nil))
-                    case .failed(let reason):
-                        await card.transition(.failed(
-                            reason: "I sent the reply, but the images did not go through: \(reason)"
-                        ))
-                    case .outcomeUnknown(let reason):
-                        await card.transition(.outcomeUnknown(
-                            reason: "I sent the reply; I could not confirm the images went through: \(reason)"
-                        ))
-                    }
+                    await recordReceipt(kind: "retry_reply", update: update, message: message, text: commandText, reply: reply)
+                    await card.transition(.completed(summary: nil))
                 case .failed(let reason):
                     await recordError(context: "send_retry_reply", error: reason, update: update, message: message, text: commandText)
                     await card.transition(.failed(reason: "I could not send the reply: \(reason)"))
@@ -711,7 +780,7 @@ extension TelegramPollLoop {
                 let notice = "(the retry came back empty — check the Mac error log)"
                 await recordError(context: "empty_retry", error: "chat handler returned empty output", update: update, message: message, text: commandText)
                 await card.transition(.failed(reason: "the retry came back empty"))
-                await deliverDraftOrSendNotice(
+                await deliverTurnNotice(
                     notice,
                     delivery: delivery,
                     receiptKind: "empty_retry_notice",
@@ -724,12 +793,11 @@ extension TelegramPollLoop {
         } catch is CancellationError {
             let notice = "(Stopped.)"
             // This task is already cancelled; run the terminal UI work in a fresh one.
-            await Task { await card.transition(.canceled(reason: "Stopped by user")) }.value
-            if await Task(operation: { await delivery.abortDelivering(notice: notice) }).value {
-                await recordReceipt(kind: "stopped_notice", update: update, message: message, text: commandText, reply: notice)
-            } else {
-                await recordReceipt(kind: "turn_canceled", update: update, message: message, text: commandText, reply: notice)
-            }
+            await Task {
+                await delivery.stop()
+                await card.transition(.canceled(reason: "Stopped by user"))
+            }.value
+            await recordReceipt(kind: "turn_canceled", update: update, message: message, text: commandText, reply: notice)
         } catch {
             FileHandle.standardError.write(Data("TelegramPollLoop: retry chat handler failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
             await recordError(
@@ -741,16 +809,15 @@ extension TelegramPollLoop {
             )
             await card.transition(.failed(reason: Self.chatErrorNotice(for: error)))
             let notice = Self.chatErrorNotice(for: error)
-            if await delivery.abortDelivering(notice: notice) {
-                await recordReceipt(kind: "error_notice", update: update, message: message, text: commandText, reply: notice)
-            } else {
-                do {
-                    try await sendMessage(token, message.destination, notice)
-                    await recordReceipt(kind: "error_notice", update: update, message: message, text: commandText, reply: notice)
-                } catch {
-                    await recordError(context: "send_error_notice", error: String(describing: error), update: update, message: message, text: commandText)
-                }
-            }
+            await deliverTurnNotice(
+                notice,
+                delivery: delivery,
+                receiptKind: "error_notice",
+                sendErrorContext: "send_error_notice",
+                update: update,
+                message: message,
+                text: commandText
+            )
         }
     }
 
@@ -805,7 +872,7 @@ extension TelegramPollLoop {
     /// whole command now runs off the poll loop instead
     /// (`runCommandDetached`), so the poller stays free AND everything
     /// a command does after its reply happens after the reply is actually out.
-    private func sendCommandReply(
+    func sendCommandReply(
         _ reply: String,
         kind: String,
         update: TelegramUpdate,

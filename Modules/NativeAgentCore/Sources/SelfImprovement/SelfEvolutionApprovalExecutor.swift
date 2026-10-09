@@ -152,7 +152,7 @@ public enum SelfEvolutionApprovalExecutor {
         guard case .object(let payload) = rec.payload,
               case .string(let proposalId)? = payload["proposalId"], !proposalId.isEmpty,
               case .string(let runId)? = payload["runId"], !runId.isEmpty else {
-            NSLog("[selfEvolution] missing proposalId/runId on approval \(rec.id)")
+            nativeLog("[selfEvolution] missing proposalId/runId on approval \(rec.id)")
             try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object(["error": .string("missing proposalId/runId")]),
@@ -256,7 +256,7 @@ public enum SelfEvolutionApprovalExecutor {
                 id: proposalId, to: .staged, require: [.candidateGreen],
                 receipt: "staged by active Full Mac authority")
         } catch {
-            NSLog("[selfEvolution] Full Mac staging failed for %@: %@", proposalId, String(describing: error))
+            nativeLog("[selfEvolution] Full Mac staging failed for %@: %@", proposalId, String(describing: error))
             return
         }
         let timestamp = SwiftNativeManifestSigner.isoTimestamp(Date())
@@ -297,7 +297,7 @@ public enum SelfEvolutionApprovalExecutor {
         deps: SelfEvolutionDeps
     ) async {
         func fail(_ op: String, _ why: String) async {
-            NSLog("[selfEvolution] \(op) failed for \(proposalId): \(why)")
+            nativeLog("[selfEvolution] \(op) failed for \(proposalId): \(why)")
             try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                 id: rec.id,
                 executedAction: .object([
@@ -555,7 +555,7 @@ public enum SelfEvolutionApprovalExecutor {
         let resolved = resolvedApprovals
             .filter { $0.action == selfEvolutionAction }
         for rec in resolved where rec.executedAction == nil {
-            NSLog("[selfEvolution] reconciling unexecuted resolved \(rec.id) "
+            nativeLog("[selfEvolution] reconciling unexecuted resolved \(rec.id) "
                 + "(decision: \(rec.decision ?? "?"))")
             await applyResolvedSelfEvolution(from: rec, deps: deps)
         }
@@ -564,7 +564,7 @@ public enum SelfEvolutionApprovalExecutor {
         let gate = await deps.rebuildGate()
         guard gate.allowed else { return }
         for rec in resolved where isDeferredEvolutionInstall(rec) {
-            NSLog("[selfEvolution] resuming deferred install \(rec.id) — gate now open")
+            nativeLog("[selfEvolution] resuming deferred install \(rec.id) — gate now open")
             await applyResolvedSelfEvolution(from: rec, deps: deps)
         }
     }
@@ -595,7 +595,7 @@ public enum SelfEvolutionApprovalExecutor {
                 currentBundleSha: deps.currentBundleSha(),
                 doctor: deps.doctorState)
         } catch {
-            NSLog("[selfEvolution] verify-at-launch failed: \(String(describing: error))")
+            nativeLog("[selfEvolution] verify-at-launch failed: \(String(describing: error))")
             return
         }
         switch decision {
@@ -726,7 +726,7 @@ public enum SelfEvolutionApprovalExecutor {
                 .appendUnique(card, id: itemId)
             await deps.notify(dataRoot, itemId, title, summary, "self_evolution", severity)
         } catch {
-            NSLog("[selfEvolution] inbox card append failed: \(String(describing: error))")
+            nativeLog("[selfEvolution] inbox card append failed: \(String(describing: error))")
         }
     }
 }

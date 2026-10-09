@@ -281,21 +281,16 @@ public actor AttentionRouter {
         _ text: String
     ) async throws -> Void
 
-    public typealias SurfaceReader = @Sendable () async -> AttentionSurface?
-
     // MARK: - The routing table
     //
     // The whole policy, as a pure function. No I/O, no state — so the table is
     // testable per class × surface without touching a data root.
 
-    /// - Parameter lastActive: User's last-active surface, or nil when it is
-    ///   unknown or too stale to trust.
     public static func delivery(
         importance: AttentionImportance,
-        lastActive: AttentionSurface?,
         origin: AttentionOrigin? = nil
     ) -> AttentionDelivery {
-        allowed(policy(importance: importance, lastActive: lastActive, origin: origin))
+        allowed(policy(importance: importance, origin: origin))
     }
 
     /// The person's channel switches, applied to whatever the table chose.
@@ -326,10 +321,9 @@ public actor AttentionRouter {
     }
 
     /// The whole table, untouched by the switches — kept separate so the
-    /// routing rule stays a pure function of importance and surface.
+    /// routing rule stays a pure function of importance and origin.
     public static func policy(
         importance: AttentionImportance,
-        lastActive: AttentionSurface?,
         origin: AttentionOrigin? = nil
     ) -> AttentionDelivery {
         switch importance {
@@ -350,15 +344,10 @@ public actor AttentionRouter {
             // work, in the thread where it was asked for — not as a decoupled
             // phone push that makes the person go and find what it was about.
             if let origin, origin.canReturnToConversation { return .conversation }
-            // Otherwise reach him where he is; the phone is the fallback that
-            // is always reachable (and where an unknown or stale surface, or a
-            // Mac/iOS origin with no way back in, lands).
-            switch lastActive {
-            case .telegram:
-                return .telegram
-            case .ios, .chat, .slack, .none:
-                return .phone
-            }
+            // Otherwise his phone, with Reply (User, 2026-10-07). Guessing his
+            // door from the newest turn trace sent every knock to Telegram
+            // once he had answered there, and the phone never heard her again.
+            return .phone
         }
     }
 
@@ -441,21 +430,21 @@ public actor AttentionRouter {
             "title": .string(String(title.prefix(160))), "summary": .string(String(body.prefix(500))),
             "held_delivery": .array(ways.map(JSONValue.string))]
         if let approvalID { row["approval_id"] = .string(approvalID) }
-        do { try await LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot)).appendUnique(.object(row), id: id) }
-        catch { NSLog("attention_router: could not hold a quiet-hours knock: %@", error.localizedDescription) }
+        do { try await LiveNotificationInbox.live(dataRoot: dataRoot).appendUnique(.object(row), id: id) }
+        catch { nativeLog("attention_router: could not hold a quiet-hours knock: %@", error.localizedDescription) }
     }
 
     public static func hasHeld(dataRoot: URL) async -> Bool {
-        let rows = (try? await LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot)).rows()) ?? []
+        let rows = (try? await LiveNotificationInbox.live(dataRoot: dataRoot).rows()) ?? []
         return rows.contains { if case .object(let row) = $0 { row["held_delivery"] != nil } else { false } }
     }
 
-    /// Once quiet hours end, each held row's push and banner go out and the
-    /// row keeps no hold. Best effort, once: a failed send is logged, not retried.
+    /// Once quiet hours end, clear only destinations whose transport accepted
+    /// the knock. Failed sends and unavailable approval reads remain held.
     public static func releaseHeld(dataRoot: URL, router: AttentionRouter,
                                    banner: @Sendable (String, String) async -> Bool) async -> Int {
         guard !inQuietHours(at: Date(), dataRoot: dataRoot) else { return 0 }
-        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
         var released = 0
         for case .object(let row) in (try? await inbox.rows()) ?? [] {
             guard case .array(let ways)? = row["held_delivery"], case .string(let id)? = row["id"] else { continue }
@@ -465,18 +454,35 @@ public actor AttentionRouter {
             let approval: String? = if case .string(let value)? = row["approval_id"] { value } else { nil }
             var live = row["status"] != .string("archived") && row["status"] != .string("dismissed")
             if live, let approval {
-                live = (try? await SwiftNativeApprovalInbox(root: dataRoot).get(approval))?.status == "pending"
+                do { live = try await SwiftNativeApprovalInbox(root: dataRoot).get(approval).status == "pending" }
+                catch ApprovalInboxError.notFound { live = false }
+                catch {
+                    nativeLog("attention_router: held approval unavailable: %@", error.localizedDescription)
+                    continue
+                }
             }
+            var remaining = live ? ways : []
             if live, ways.contains(.string("phone")) {
                 do {
-                    try await router.route(eventId: id, importance: .ownerWaiting, title: title, body: body,
+                    let eventID = approval.map { "approval:\($0)" } ?? id
+                    let outcome = try await router.route(eventId: eventID, importance: .ownerWaiting, title: title, body: body,
+                        reason: eventID,
                         userInfo: approval.map { ["screen": "approvals", "source": "approval", "approvalId": $0] }
-                            ?? ["screen": "inbox", "itemId": id], pinnedTo: .phone)
-                } catch { NSLog("attention_router: held push failed: %@", error.localizedDescription) }
+                            ?? ["screen": "inbox", "itemId": id])
+                    if outcome.deliveryProjection.reachedAChannel || outcome.deliveryProjection == .previouslyHandled {
+                        remaining.removeAll { $0 == .string("phone") }
+                    }
+                } catch { nativeLog("attention_router: held push failed: %@", error.localizedDescription) }
             }
-            if live, ways.contains(.string("mac")), !(await banner(title, body)) { NSLog("attention_router: held banner failed") }
-            _ = try? await inbox.patch(id: id, ["held_delivery": .null])
-            released += 1
+            if live, ways.contains(.string("mac")) {
+                if await banner(title, body) { remaining.removeAll { $0 == .string("mac") } }
+                else { nativeLog("attention_router: held banner failed") }
+            }
+            guard remaining != ways else { continue }
+            do {
+                guard try await inbox.patch(id: id, ["held_delivery": remaining.isEmpty ? .null : .array(remaining)]) else { continue }
+                if remaining.isEmpty { released += 1 }
+            } catch { nativeLog("attention_router: could not acknowledge held knock: %@", error.localizedDescription) }
         }
         return released
     }
@@ -532,15 +538,10 @@ public actor AttentionRouter {
     /// so the OLDEST ENTRIES are evicted until the encoding fits.
     static let ledgerMaxBytes = 128 * 1024
 
-    /// Beyond this, a last-active surface is a guess about where User was
-    /// yesterday, not where he is. Stale ⇒ the phone.
-    static let surfaceFreshness: TimeInterval = 12 * 60 * 60
-
     private let dataRoot: URL
     private let phoneSender: PhoneSender
     private let telegramSender: TelegramSender
     private let conversationSender: ConversationSender
-    private let surfaceReader: SurfaceReader
     private var cached: State?
     private var inFlight: [String: Task<AttentionOutcome, Error>] = [:]
     var resultScanInFlight = false
@@ -549,8 +550,7 @@ public actor AttentionRouter {
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        delivery: AttentionDeliveryPorts,
-        surfaceReader: SurfaceReader? = nil
+        delivery: AttentionDeliveryPorts
     ) {
         self.dataRoot = dataRoot
         self.phoneSender = delivery.phone
@@ -562,9 +562,6 @@ public actor AttentionRouter {
         self.conversationSender = { origin, text in
             try await Self.sendToOriginatingConversation(
                 origin, text, dataRoot: dataRoot, delivery: delivery)
-        }
-        self.surfaceReader = surfaceReader ?? {
-            LastActiveSurfaceReader.lastActiveSurface(dataRoot: dataRoot)
         }
     }
 
@@ -609,25 +606,17 @@ public actor AttentionRouter {
         pinnedTo: AttentionDelivery? = nil,
         at date: Date = Date()
     ) async throws -> AttentionOutcome {
-        let lastActive = await surfaceReader()
-        // A caller that knows its origin wins. The newest turn trace still
-        // fills in the PAYLOAD's origin stamp when the caller named none — but
-        // it is NOT a route: answering into "whatever conversation was newest"
-        // put a trigger's title and body into an unrelated Slack channel or
-        // Telegram group. Last-active information may pick a channel KIND
-        // (below, via `lastActive`), never a conversation, so only an EXPLICIT
-        // origin is allowed to choose `.conversation` delivery.
-        let explicitOrigin = origin
-        let origin = origin ?? (importance == .requestedResult ? nil : LastActiveSurfaceReader.lastActiveOrigin(dataRoot: dataRoot))
+        // Only the caller's own origin names a conversation. The newest turn
+        // trace used to fill one in, and answering into "whatever
+        // conversation was newest" put a knock into an unrelated thread.
         // The person's channel switches apply to a PINNED delivery too. A
         // pinned call skips the routing table because the tool's name is its
         // channel contract — but "don't use my phone" is not a routing opinion
         // to be overridden by a tool name, it is the person saying that way out
         // is closed.
         let delivery = Self.allowed(
-            pinnedTo ?? Self.policy(
-                importance: importance, lastActive: lastActive, origin: explicitOrigin),
-            origin: explicitOrigin
+            pinnedTo ?? Self.policy(importance: importance, origin: origin),
+            origin: origin
         )
         guard delivery != .none else { return .routineSuccess }
         // Her resident wake runs in his quiet hours; what it would put in
@@ -671,7 +660,6 @@ public actor AttentionRouter {
             var enriched = userInfo
             enriched["importance"] = importance.rawValue
             enriched["routedTo"] = delivery.rawValue
-            if let lastActive, importance != .requestedResult { enriched["lastActiveSurface"] = lastActive.rawValue }
             // Honest urgency, PROJECTED from the class instead of asserted by
             // the site. `urgency: urgent` is what the phone turns into a
             // time-sensitive delivery that pierces Sleep Focus, so a site is
@@ -692,14 +680,14 @@ public actor AttentionRouter {
 
             var receipt: MobileNotificationDeliveryReceipt?
             var landedOn = delivery
-            if delivery == .conversation, let origin = explicitOrigin {
+            if delivery == .conversation, let origin {
                 do {
                     try await conversationSender(
                         origin, Self.telegramText(title: title, body: body))
                 } catch {
                     // Same contract the Telegram exit has kept: a conversation
                     // that cannot be reached must not swallow the fact.
-                    NSLog("attention_router: conversation send failed, falling back to phone: %@",
+                    nativeLog("attention_router: conversation send failed, falling back to phone: %@",
                           error.localizedDescription)
                     guard NotificationChannelPreference.push() else {
                         await self.recordDeliveryFailure(
@@ -721,7 +709,7 @@ public actor AttentionRouter {
                     // The phone is the fallback, and it is the whole point of
                     // having one: a Telegram outage must not swallow an
                     // owner-waiting fact. Let a phone failure propagate.
-                    NSLog("attention_router: telegram send failed, falling back to phone: %@",
+                    nativeLog("attention_router: telegram send failed, falling back to phone: %@",
                           error.localizedDescription)
                     // ...unless the phone is a channel the person switched off,
                     // in which case there is no fallback to take.
@@ -892,7 +880,7 @@ public actor AttentionRouter {
         body: String,
         error: Error
     ) async {
-        NSLog("attention_router: delivery failed with no channel left, event=%@: %@",
+        nativeLog("attention_router: delivery failed with no channel left, event=%@: %@",
               eventId, error.localizedDescription)
         let row: [String: JSONValue] = [
             "event": .string("attention_router_delivery_failed"),
@@ -943,11 +931,11 @@ public actor AttentionRouter {
             // The bytes stayed put. The atomic write that follows runs in the
             // same directory, so it will fail for the same reason rather than
             // clobbering them — but say so out loud either way.
-            NSLog("attention_router: damaged ledger could not be preserved aside: %@",
+            nativeLog("attention_router: damaged ledger could not be preserved aside: %@",
                   error.localizedDescription)
             return
         }
-        NSLog("attention_router: damaged ledger self-healed; bytes preserved at %@",
+        nativeLog("attention_router: damaged ledger self-healed; bytes preserved at %@",
               aside.lastPathComponent)
         let receipt: [String: JSONValue] = [
             "event": .string("attention_router_ledger_quarantined"),
@@ -993,91 +981,5 @@ public actor AttentionRouter {
         let capped = try Self.encodeWithinByteCap(state)
         try SwiftNativePersistenceCore.writeDataAtomicDurable(capped.data, to: stateURL)
         cached = capped.state
-    }
-}
-
-// MARK: - Last-active surface
-
-/// Reads where User last was from the durable turn-trace feed.
-///
-/// Every turn already stamps `surface` on every trace row, so this needs no new
-/// writer and no new state — it is a bounded TAIL read of the newest
-/// `data/turn_traces/<day>.jsonl`. Only surfaces a human can actually be ON
-/// count: `workshop` and `swarms` rows are Agent working, not User present.
-enum LastActiveSurfaceReader {
-    /// How much of the newest day file to look at. Trace rows are small; this
-    /// covers hundreds of them and keeps a 9 MB day file off the hot path.
-    static let tailBytes = 256 * 1024
-
-    static func lastActiveSurface(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        now: Date = Date(),
-        freshness: TimeInterval = AttentionRouter.surfaceFreshness
-    ) -> AttentionSurface? {
-        lastActiveOrigin(dataRoot: dataRoot, now: now, freshness: freshness)?.surface
-    }
-
-    /// The SAME row, read whole. Every trace row stamps `sessionId` beside
-    /// `surface`; this reader used to take the surface and drop the session on
-    /// the floor, which is why a follow-up could say WHERE he last was but
-    /// never WHICH conversation it was about (2026-09-13).
-    static func lastActiveOrigin(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        now: Date = Date(),
-        freshness: TimeInterval = AttentionRouter.surfaceFreshness
-    ) -> AttentionOrigin? {
-        let directory = dataRoot.appendingPathComponent("turn_traces", isDirectory: true)
-        let names = ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
-            .filter { $0.hasSuffix(".jsonl") }
-            .sorted(by: >)
-        // Two files covers a freshness window that spans local midnight.
-        for name in names.prefix(2) {
-            if let hit = scan(directory.appendingPathComponent(name), now: now, freshness: freshness) {
-                return hit
-            }
-        }
-        return nil
-    }
-
-    private static func scan(_ url: URL, now: Date, freshness: TimeInterval) -> AttentionOrigin? {
-        guard let text = tail(of: url) else { return nil }
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
-            guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let raw = obj["surface"] as? String,
-                  let surface = AttentionSurface(rawValue: raw)
-            else { continue }
-            // A surface User used yesterday is not where he is now. Unknown
-            // beats a confident wrong answer — the fallback is reachable.
-            guard let ts = obj["ts"] as? String, let stamped = parse(ts) else { continue }
-            guard now.timeIntervalSince(stamped) <= freshness else { return nil }
-            // The trace row carries delivery identity for the non-local
-            // surfaces the same way it carries the session; a row that has no
-            // destination still names the conversation, which is what the
-            // payload needs.
-            return AttentionOrigin(
-                surface: surface,
-                sessionId: obj["sessionId"] as? String,
-                destinationId: obj["destinationId"] as? String,
-                threadId: obj["threadId"] as? String
-            )
-        }
-        return nil
-    }
-
-    private static func tail(of url: URL) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let offset = size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0
-        try? handle.seek(toOffset: offset)
-        guard let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
-        // A mid-line start is dropped by the first `split` boundary; a lossy
-        // decode keeps a truncated multi-byte scalar from killing the read.
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    private static func parse(_ value: String) -> Date? {
-        NativeTimestampFormat.parseISO8601FractionalFirst(value)
     }
 }

@@ -55,7 +55,7 @@ enum TurnSettle {
                 if case .string(let value)? = field { return value }; return nil
             }
             return fields["queued"] == .bool(true) || states.contains {
-                ["accepted", "enqueued", "queued", "running", "working", "in_progress", "waiting", "pending", "submitted", "delivering"].contains($0)
+                ["accepted", "enqueued", "queued", "joined", "running", "working", "in_progress", "waiting", "pending", "submitted", "delivering"].contains($0)
             }
         }) { return nil }
         let route = ChatToolSessionContext.replyRoute?.surface ?? surface

@@ -229,7 +229,7 @@ enum MacControlAuditLogRead: Sendable {
                 }
             return .entries(Array(entries.suffix(limit).reversed()), malformedLineCount: malformed)
         } catch {
-            return .unreadable(error.localizedDescription)
+            return .unreadable(UserFacingError.cause(error, action: "read the audit log"))
         }
     }
 }
@@ -319,7 +319,7 @@ enum MacControlSetupStatusBadges {
             } else if savedPolicy.shellAllowed && savedPolicy.fileOpsAllowed
                         && savedPolicy.accessibilityAllowed && savedPolicy.approvalRequiredFor.isEmpty {
                 access = Badge(text: "Full Mac configured", status: "ready")
-                detail = "I can work with files and apps anywhere on this Mac. Destructive shell and system actions still need developer mode."
+                detail = "I can work with files, apps, the shell and system settings anywhere on this Mac, without stopping to ask."
             } else if savedPolicy.fileOpsAllowed || savedPolicy.shellAllowed || savedPolicy.systemControlAllowed
                         || savedPolicy.accessibilityAllowed || savedPolicy.applesScriptAllowed || savedPolicy.jxaAllowed {
                 access = Badge(text: "Assistant configured", status: "ready")
@@ -368,9 +368,18 @@ struct MacControlPermissionsView: View {
     @State private var appleDataProbeStatus: String?
     @State private var assistantWatchRefreshToken = 0
     private let loadsOnAppear: Bool
+    /// Unsaved edits held by the page above (the Trust tabs), so a tab switch
+    /// that rebuilds this view keeps them. Nil where nothing above holds one.
+    private let draft: Binding<TrustMacControlPolicy?>?
 
-    init(loadsOnAppear: Bool = true) {
+    init(loadsOnAppear: Bool = true, draft: Binding<TrustMacControlPolicy?>? = nil) {
         self.loadsOnAppear = loadsOnAppear
+        self.draft = draft
+    }
+
+    /// Hand the unsaved edits up, or clear them once nothing is unsaved.
+    private func syncDraft() {
+        draft?.wrappedValue = hasUnsavedChanges ? policy : nil
     }
 
     private var hasUnsavedChanges: Bool {
@@ -392,10 +401,10 @@ struct MacControlPermissionsView: View {
                 TrustFold(isExpanded: $showAdvancedMacControls) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Controls, commands and audit log")
-                            .font(.system(size: 14, weight: .medium))
+                            .font(ShellType.rowTitle)
                             .foregroundStyle(NativeAgentShell.text)
                         Text("Each kind of control, shell commands, what I ask about first, the workbench and the audit log.")
-                            .font(.system(size: 12))
+                            .font(ShellType.rowDetail)
                             .foregroundStyle(NativeAgentShell.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -420,7 +429,11 @@ struct MacControlPermissionsView: View {
         .task {
             guard loadsOnAppear else { return }
             await loadPolicy()
+            // Back on this tab: the edits made before the switch return.
+            if policyReadState == .available, let held = draft?.wrappedValue { policy = held }
         }
+        .onChange(of: policy) { syncDraft() }
+        .onChange(of: savedPolicy) { syncDraft() }
         .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
             if let mp = newPolicy?.macControlPolicy {
                 if !isSaving && !hasUnsavedChanges { policy = mp }
@@ -498,11 +511,11 @@ struct MacControlPermissionsView: View {
             AliveGroupCard {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(Self.plainSetupWord(setupBadges.access.text))
-                        .font(.system(size: 14, weight: .medium))
+                        .font(ShellType.rowTitle)
                         .foregroundStyle(setupBadges.access.status == "failed" ? NativeAgentShell.trouble : NativeAgentShell.text)
                         .accessibilityIdentifier("mac-control.setup.access")
                     Text(setupBadges.detail)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 6) {
@@ -512,7 +525,7 @@ struct MacControlPermissionsView: View {
                         Text(Self.plainSetupWord(setupBadges.receipts.text))
                             .accessibilityIdentifier("mac-control.setup.receipts")
                     }
-                    .font(.system(size: 12))
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     if let applyingPreset {
                         ProgressView("Applying \(applyingPreset.title)…")
@@ -540,13 +553,15 @@ struct MacControlPermissionsView: View {
                                 .controlSize(.small)
                         }
                     }
-                    Text("Set up Mac access picks the Assistant preset, then asks macOS for Calendar and Reminders.")
-                        .font(.system(size: 12))
+                    Text(activePreset == .off || activePreset == .watch
+                         ? "Set up Mac access turns on Assistant, then asks macOS for Calendar and Reminders."
+                         : "Set up Mac access asks macOS for Calendar and Reminders. Your access level stays as it is.")
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     if let appleDataProbeStatus {
                         Text(appleDataProbeStatus)
-                            .font(.system(size: 12))
+                            .font(ShellType.rowDetail)
                             .foregroundStyle(NativeAgentShell.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -554,7 +569,7 @@ struct MacControlPermissionsView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("macOS asks for these separately.")
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                     AliveFlow(spacing: 8, lineSpacing: 8) {
                         Button("Open Accessibility", systemImage: "cursorarrow.motionlines") {
@@ -579,7 +594,7 @@ struct MacControlPermissionsView: View {
                             }
                             if let status = testNotifStatus {
                                 Text(status)
-                                    .font(.system(size: 12))
+                                    .font(ShellType.rowDetail)
                                     .foregroundStyle(NativeAgentShell.secondary)
                             }
                         }
@@ -588,7 +603,7 @@ struct MacControlPermissionsView: View {
 
                 if let err = saveError {
                     Text(err)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.trouble)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -597,18 +612,10 @@ struct MacControlPermissionsView: View {
         .accessibilityElement(children: .contain)
     }
 
-    private func aliveSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(title)
-            AliveGroupCard { content() }
-        }
-        .accessibilityElement(children: .contain)
-    }
-
     @ViewBuilder
     private var advancedMacControlControls: some View {
         VStack(alignment: .leading, spacing: 24) {
-            aliveSection("Mac control") {
+            AdvancedSection(title: "Mac control") {
                 MacControlSwitchRow(
                     title: "Mac control",
                     detail: "I control this Mac with AppleScript, Accessibility, shell commands and more. The presets above choose safe defaults.",
@@ -631,13 +638,13 @@ struct MacControlPermissionsView: View {
                             .controlSize(.small)
                     } else if hasUnsavedChanges {
                         Text("Unsaved changes. Save before using the workbench.")
-                            .font(.system(size: 12))
+                            .font(ShellType.rowDetail)
                             .foregroundStyle(NativeAgentShell.needsYou)
                     }
                 }
             }
 
-            aliveSection("Kinds of control") {
+            AdvancedSection(title: "Kinds of control") {
                 MacControlCategoryRow(
                     label: "Notifications",
                     detail: "I post notifications on this Mac.",
@@ -690,7 +697,7 @@ struct MacControlPermissionsView: View {
                 )
             }
 
-            aliveSection("Shell commands") {
+            AdvancedSection(title: "Shell commands") {
                 MacControlSwitchRow(
                     title: "Shell commands",
                     detail: "I can run any command, as if typed into Terminal. Powerful: keep this off unless you turned on developer mode on purpose.",
@@ -704,9 +711,9 @@ struct MacControlPermissionsView: View {
                 )
             }
 
-            aliveSection("Ask me first about") {
+            AdvancedSection(title: "Ask me first about") {
                 Text("I stop and ask for your approval before I do any of these, however I was asked to.")
-                    .font(.system(size: 12))
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 // Sweep R4 C9 — COPY ONLY. These were rendered as their raw
@@ -737,7 +744,7 @@ struct MacControlPermissionsView: View {
                 }
             }
 
-            aliveSection("iPhone remote control") {
+            AdvancedSection(title: "iPhone remote control") {
                 MacControlSwitchRow(
                     title: "Allow iPhone remote control",
                     detail: policy.enabled
@@ -755,10 +762,10 @@ struct MacControlPermissionsView: View {
 
             MacControlWorkbenchView(policy: policy, policySaved: !hasUnsavedChanges)
 
-            aliveSection("Audit log") {
+            AdvancedSection(title: "Audit log") {
                 HStack(spacing: 12) {
                     Text("Every Mac control action I ran or was blocked from running.")
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 12)
@@ -770,7 +777,7 @@ struct MacControlPermissionsView: View {
             }
 
             Text("None of these settings change until you press Save. After that, the Mac control and shell command switches take effect at the next restart; the rest apply right away.")
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -826,13 +833,16 @@ struct MacControlPermissionsView: View {
                 saveError = "Couldn't apply \(preset.title): saved Trust policy did not include Mac Control settings."
             }
         } catch {
-            saveError = "Couldn't apply \(preset.title): \(error.localizedDescription)"
+            saveError = UserFacingError.message(error, action: "apply \(preset.title)")
         }
     }
 
     private func enableMacAccess() async {
-        await applyIntegrationPreset(.assistant)
-        guard saveError == nil else { return }
+        // Raises Off or Watch to Assistant; never lowers Assistant or Full Mac.
+        if activePreset == .off || activePreset == .watch {
+            await applyIntegrationPreset(.assistant)
+            guard saveError == nil else { return }
+        }
         await probeAppleDataAccess()
     }
 
@@ -861,7 +871,7 @@ struct MacControlPermissionsView: View {
             appleDataProbeStatus = "Calendar \(calendar.status); Reminders \(reminders.status)."
             assistantWatchRefreshToken += 1
         } catch {
-            appleDataProbeStatus = "Apple data probe failed: \(error.localizedDescription)"
+            appleDataProbeStatus = UserFacingError.message(error, action: "check Calendar and Reminders")
             assistantWatchRefreshToken += 1
         }
     }
@@ -909,7 +919,7 @@ struct MacControlPermissionsView: View {
             }
         } catch {
             // Fall through with default-zeroed policy + show inline error
-            saveError = "Couldn't load Mac Control settings: \(error.localizedDescription)"
+            saveError = UserFacingError.message(error, action: "load Mac Control settings")
             policyReadState = .unavailable
         }
     }
@@ -932,7 +942,7 @@ struct MacControlPermissionsView: View {
                 }
             }
         } catch {
-            saveError = error.localizedDescription
+            saveError = UserFacingError.message(error, action: "save Mac Control settings")
         }
         isSaving = false
     }
@@ -945,7 +955,7 @@ struct MacControlPermissionsView: View {
                 .macControlNotify(title: "NativeAgent", message: "Mac Control test")
             testNotifStatus = ok ? "Sent." : "Swift app returned error."
         } catch {
-            testNotifStatus = "Notification error: \(error.localizedDescription)"
+            testNotifStatus = UserFacingError.message(error, action: "send the test notification")
         }
         isTestingNotif = false
     }
@@ -971,7 +981,7 @@ struct MacControlPermissionsView: View {
             auditReadProblem = "Audit source is absent at \(path.path)."
         case .unreadable(let reason):
             auditEntries = []
-            auditReadProblem = "Audit source could not be read: \(reason)"
+            auditReadProblem = "Couldn't read the audit log. \(reason)"
         }
         isLoadingAudit = false
     }
@@ -992,17 +1002,17 @@ private struct MacControlSwitchRow: View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                 if let detail {
                     Text(detail)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if let note {
                     Text(note)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                 }
                 if let caption {
@@ -1055,16 +1065,16 @@ private struct MacControlUnavailableCategoryRow: View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(label)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                 Text(detail)
-                    .font(.system(size: 12))
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 12)
             Text("Not available")
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
         }
         .accessibilityElement(children: .combine)
@@ -1272,13 +1282,13 @@ struct MacControlWorkbenchView: View {
             AliveGroupCard {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Try one Mac control action by hand and see what happens. Shortcuts and system actions are not in this version.")
-                    .font(.system(size: 12))
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if !policySaved {
                     // Waiting on him (an unsaved edit), so teal, not trouble.
                     Label("Save your Mac control settings before trying an action.", systemImage: "lock.fill")
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.needsYou)
                 }
             }
@@ -1332,7 +1342,7 @@ struct MacControlWorkbenchView: View {
                         .toggleStyle(.switch)
                         .hazeTinted()
                         .controlSize(.small)
-                        .font(.system(size: 13))
+                        .font(ShellType.label)
                     HStack {
                         workbenchButton(.fileRead, availability: readAvailability) {
                             await run(path: MacControlWorkbenchAction.fileRead.path, body: [
@@ -1380,7 +1390,7 @@ struct MacControlWorkbenchView: View {
                     Image(systemName: isRunning ? "hourglass" : "terminal")
                         .foregroundStyle(resultColor)
                     Text(resultTitle)
-                        .font(.system(size: 14, weight: .medium))
+                        .font(ShellType.rowTitle)
                         .foregroundStyle(resultColor)
                     Spacer()
                     if isRunning {
@@ -1396,7 +1406,7 @@ struct MacControlWorkbenchView: View {
                 }
                 .frame(minHeight: 90, maxHeight: 180)
                 .padding(10)
-                .background(NativeAgentShell.softFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(NativeAgentShell.softFill, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
             }
             }
         }

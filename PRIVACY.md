@@ -112,9 +112,11 @@ rule expires it, or a bounded subsystem consolidates it. Removing a memory or
 conversation does not necessarily erase an independently created external
 record, provider log, exported file, backup, or previously delivered message.
 
-To disconnect the mobile companion, use **Settings → Re-pair** on iPhone or
-iPad and regenerate the pairing key on the Mac. To remove mobile local data,
-delete the iOS/iPadOS app after disconnecting it. Apple may retain app data in
+**More → Settings → Connection → Diagnostics → Repair connection** removes
+the phone's local pairing key, clears connection delivery history, and opens
+pairing setup. It is a recovery flow, not a general deletion control, and does
+not delete Mac or iCloud data. To remove the mobile app's local container,
+delete the iOS/iPadOS app. Apple may retain app data in
 iCloud or device backups until the user removes it through the applicable
 Apple account or backup controls.
 

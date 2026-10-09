@@ -259,7 +259,7 @@ enum DeskActionRunner {
         } catch {
             return DeskActionOutcome(
                 ok: false,
-                message: "\(action.pendingLabel) failed: \(error.localizedDescription)")
+                message: "\(action.pendingLabel) failed: " + UserFacingError.cause(error, action: "run a Desk action"))
         }
     }
 }

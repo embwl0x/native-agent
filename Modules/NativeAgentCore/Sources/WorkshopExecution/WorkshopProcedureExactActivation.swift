@@ -248,17 +248,122 @@ public enum WorkshopProcedureExactActivationCoordinator {
                 .localFileCopyProposal(dataRoot: dataRoot, artifact: artifact) else { return }
 
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let pending = (try? await inbox.list(filter: ApprovalFilter(
-            status: "pending",
+        guard let prior = try? await inbox.list(filter: ApprovalFilter(
             action: SwiftNativeApprovalInbox.procedureExactActivationApprovalAction
-        ))) ?? []
-        let duplicate = pending.contains { record in
-            guard let pendingProposal = SwiftNativeApprovalInbox
-                .procedureExactActivationProposal(from: record) else { return false }
-            return pendingProposal.procedureID == proposal.procedureID
-                && pendingProposal.artifactID == proposal.artifactID
+        )) else { return }
+        // One card per question. A pending card is the question. An answer
+        // (approved or denied) for the same artifact and implementation
+        // sticks until a further full qualifying set of executions exists;
+        // re-asking an approval the store cannot apply only loops.
+        let alreadyAsked = prior.contains { record in
+            guard let asked = SwiftNativeApprovalInbox
+                .procedureExactActivationProposal(from: record),
+                  asked.procedureID == proposal.procedureID,
+                  asked.artifactID == proposal.artifactID else { return false }
+            if record.status == "pending" { return true }
+            guard record.decision == ApprovalDecision.approved.rawValue
+                    || record.decision == ApprovalDecision.denied.rawValue,
+                  asked.implementationIdentity == proposal.implementationIdentity else {
+                return false
+            }
+            // The same evidence is the same question. New evidence asks again once a
+            // further qualifying set exists; the qualifier reports at most 64, so the cap counts as enough.
+            if proposal.bindingDigest == asked.bindingDigest { return true }
+            return proposal.verifiedExecutionCount < min(asked.verifiedExecutionCount
+                + ProcedureExactActivationProposal.minimumVerifiedExecutions, 64)
         }
-        guard !duplicate else { return }
+        guard !alreadyAsked else { return }
         _ = try? await inbox.stageProcedureExactActivationApproval(proposal)
+    }
+}
+
+/// One-time launch repair for the v1 → v2 procedure identity bump. Each
+/// original-v1 artifact is recompiled from exactly what it was reviewed on —
+/// its source Workshop runs and the owner's approved review card — and handed
+/// to the store's revalidation, which compares every field. Nothing is
+/// activated, approved, or rewritten here; an artifact that cannot be
+/// reproduced stays off, and the returned line says why.
+public enum WorkshopProcedureLegacyRevalidation {
+    public static func runIfNeeded(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> [String] {
+        let marker = dataRoot
+            .appendingPathComponent("living_fabric/procedures/migrations/legacy-revalidation-v1.done")
+        guard !FileManager.default.fileExists(atPath: marker.path) else { return [] }
+        let store = ProcedureArtifactStore(dataRoot: dataRoot)
+        // An unreadable store is retried next launch rather than marked done.
+        guard let artifacts = try? await store.loadInstalledArtifacts() else { return [] }
+        var refusals: [String] = []
+        var retry = false
+        for artifact in artifacts where artifact.requiresLegacyRevalidation {
+            let outcome = await revalidate(artifact, store: store, dataRoot: dataRoot)
+            if outcome.retry { retry = true; continue }
+            if let reason = outcome.refusal {
+                refusals.append(
+                    "A procedure approved \(artifact.reviewerDecision.decidedAt.prefix(10)) stays off: "
+                        + "\(reason). Agent does that task the ordinary way instead "
+                        + "(artifact \(artifact.id.prefix(12)))."
+                )
+            }
+        }
+        // A read that failed is not evidence: try again next launch.
+        guard !retry else { return refusals }
+        try? FileManager.default.createDirectory(
+            at: marker.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try? Data(refusals.joined(separator: "\n").utf8).write(to: marker)
+        return refusals
+    }
+
+    private static func revalidate(
+        _ artifact: DeclarativeProcedureArtifact,
+        store: ProcedureArtifactStore,
+        dataRoot: URL
+    ) async -> (refusal: String?, retry: Bool) {
+        let sources = Set(artifact.sourceTrajectoryIdentities)
+        let runner = SwiftNativeWorkshopRunner(root: dataRoot)
+        var trajectories: [ProcedureTrajectory] = []
+        for record in await runner.listAll()
+        where sources.contains(CausalTransitionEvidence.opaqueIdentity(record.id)) {
+            guard let timeline = try? await runner.readTimeline(record.id) else { return (nil, true) }
+            trajectories += ProcedureTrajectoryExtractor.extract(
+                SwiftNativeWorkshopRunner.causalTransitionEvidence(
+                    executionId: record.id, timeline: timeline, record: record
+                )
+            ).trajectories
+        }
+        guard trajectories.count == sources.count, Set(trajectories.map(\.id)) == sources,
+              let unreviewed = ProcedureCandidateCompiler.evaluate(trajectories: trajectories)
+                .first(where: { $0.id == artifact.procedureShapeIdentity }) else {
+            return ("the Workshop runs it was learned from are no longer all on disk", false)
+        }
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        guard let cards = try? await inbox.list(filter: ApprovalFilter(
+            action: SwiftNativeApprovalInbox.procedureReviewApprovalAction
+        )) else { return (nil, true) }
+        guard let card = cards.first(where: {
+            CausalTransitionEvidence.opaqueIdentity($0.id)
+                == artifact.reviewerDecision.approvalReceiptIdentity
+        }) else {
+            return ("the approval it was reviewed under is no longer in the approval inbox", false)
+        }
+        // The decision is re-minted from the owner's card against the
+        // recomputed evidence, never copied from the artifact under test.
+        guard let decision = try? await inbox.approvedProcedureReviewerDecision(
+            approvalID: card.id,
+            proposal: ProcedureReviewProposal(
+                candidate: unreviewed, scope: artifact.reviewerDecision.scope
+            )
+        ), let reviewed = ProcedureCandidateCompiler.evaluate(
+            trajectories: trajectories, reviewerDecisions: [decision]
+        ).first(where: { $0.id == artifact.procedureShapeIdentity }) else {
+            return ("its approval no longer matches the runs it was learned from", false)
+        }
+        do {
+            try await store.revalidateLegacyArtifact(artifact.id, candidate: reviewed)
+            return (nil, false)
+        } catch {
+            return ("recompiling it from its reviewed runs did not reproduce it exactly", false)
+        }
     }
 }

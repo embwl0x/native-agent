@@ -74,7 +74,7 @@ public enum ChatUpdateNote {
             encoder.outputFormatting = [.sortedKeys]
             try encoder.encode(record).write(to: url, options: [.atomic])
         } catch {
-            NSLog("[update-note] could not write the update note: %@", error.localizedDescription)
+            nativeLog("[update-note] could not write the update note: %@", error.localizedDescription)
         }
     }
 }

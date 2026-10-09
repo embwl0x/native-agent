@@ -7,6 +7,7 @@ import ChatOrchestration
 import PersistenceCore
 import Transcripts
 import StandingBots
+import SwarmRuns
 import NativeAgentShared
 import os
 
@@ -109,8 +110,8 @@ struct SimpleFlight: Equatable, Sendable {
 }
 
 /// A crew the agent sent out (`agent_swarm`): a few workers on one task, for
-/// as long as it runs, then its finished receipt. Read straight from the two
-/// files the executor writes (SwarmRuns is not linked into the app).
+/// as long as it runs, then its finished receipt. Uses the executor's shared
+/// projection of live progress and retained receipts.
 struct SimpleCrew: Identifiable, Equatable, Sendable {
     let id: String
     /// The task, in its first line.
@@ -135,18 +136,10 @@ struct SimpleCrew: Identifiable, Equatable, Sendable {
     var settled: Bool { workers.allSatisfy { $0.status != "working" } }
 
     /// Crews at work now, newest first, then the three most recently finished.
-    nonisolated static func read(root: URL) -> [SimpleCrew] {
-        func rows(_ path: String) -> [[String: Any]] {
-            guard let data = try? Data(contentsOf: root.appendingPathComponent(path)) else { return [] }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
-        }
-        let finished = rows("swarms/runs.json").compactMap { crew($0, live: false) }
-        let done = Set(finished.map(\.id))
-        // A crew whose process ended mid-run never finishes; it is not working.
-        let live = rows("swarms/live.json").filter { row in
-            guard let pid = row["pid"] as? Int else { return false }
-            return kill(pid_t(pid), 0) == 0 || errno != ESRCH
-        }.compactMap { crew($0, live: true) }.filter { !done.contains($0.id) }
+    nonisolated static func read(root: URL) throws -> [SimpleCrew] {
+        let all = try SwiftNativeSwarmRunsReader(runsPath: root.appendingPathComponent("swarms/runs.json")).readCrews()
+        let finished = all.filter { $0["pid"] == nil }.compactMap { crew($0, live: false) }
+        let live = all.filter { $0["pid"] != nil }.compactMap { crew($0, live: true) }
         return live.sorted { $0.at > $1.at } + finished.sorted { $0.at > $1.at }.prefix(3)
     }
 
@@ -268,9 +261,7 @@ final class SimpleViewStore {
         let liveFile = root.appendingPathComponent("agents/conversation-live.json").standardizedFileURL
         let bridges = NativeAgentPaths.bridgeConfigRoot(dataRoot: root)
         let inboxes = ["claude", "codex", "omp"].compactMap { AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: bridges) }
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let dotPaths = [home.appendingPathComponent(".codex/.codex-global-state.json"), home.appendingPathComponent(".codex/ipc/ipc.sock")]
-        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) } + inboxes + dotPaths, emitInitial: true)
+        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) } + inboxes, emitInitial: true)
         let (ticks, tick) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
         // Set by every change, cleared just before a read: a tick buffered
         // while that read's burst settled finds it clear and is skipped.
@@ -290,21 +281,9 @@ final class SimpleViewStore {
             pending.withLock { $0.full = true }
             tick.yield()
         }
-        let dotLaunched = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: nil) { notification in
-            guard (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == "com.openai.codex" else { return }
-            pending.withLock { $0.full = true }
-            tick.yield()
-        }
-        let dotTerminated = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil) { notification in
-            guard (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == "com.openai.codex" else { return }
-            pending.withLock { $0.full = true }
-            tick.yield()
-        }
         var last = Snapshot(contacts: contacts, lines: lines, waiting: waiting, status: status, flights: flights,
                             helpers: helpers, running: running)
         var list: ContactList?
-        var replyDeadline: Task<Void, Never>?
-        defer { replyDeadline?.cancel() }
         await withTaskCancellationHandler {
             for await _ in ticks {
                 guard !Task.isCancelled else { break }
@@ -335,18 +314,6 @@ final class SimpleViewStore {
                     }.value
                     last = next
                     list = contactList
-                    replyDeadline?.cancel()
-                    // Dot's unanswered send expires even when no file changes.
-                    if let deadline = next.contacts.filter({ $0.dot && next.waiting.contains($0.id) })
-                        .compactMap({ next.lines[$0.id]?.last?.at.addingTimeInterval(1800) }).min() {
-                        replyDeadline = Task {
-                            do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
-                            catch { return }
-                            guard !Task.isCancelled else { return }
-                            pending.withLock { $0.full = true }
-                            tick.yield()
-                        }
-                    }
                     if let delta {
                         if let value = delta.contacts { contacts = value }
                         if let value = delta.lines { lines = value }
@@ -359,15 +326,13 @@ final class SimpleViewStore {
                     if !loaded { loaded = true }
                     refreshError = nil
                 } catch {
-                    refreshError = "Couldn't refresh conversations. \(error.localizedDescription)"
+                    refreshError = UserFacingError.message(error, action: "refresh conversations")
                 }
             }
         } onCancel: { events.cancel(); tick.finish() }
         files.cancel()
         NotificationCenter.default.removeObserver(ended)
         NotificationCenter.default.removeObserver(dotChanged)
-        NSWorkspace.shared.notificationCenter.removeObserver(dotLaunched)
-        NSWorkspace.shared.notificationCenter.removeObserver(dotTerminated)
     }
 
     /// Crews on their own watch: runs.json keeps every finished run whole, so
@@ -381,8 +346,10 @@ final class SimpleViewStore {
         await withTaskCancellationHandler {
             for await _ in events.stream {
                 guard !Task.isCancelled else { break }
-                let next = await Task.detached(priority: .utility) { SimpleCrew.read(root: root) }.value
-                if crews != next { crews = next }
+                do {
+                    let next = try await Task.detached(priority: .utility) { try SimpleCrew.read(root: root) }.value
+                    if crews != next { crews = next }
+                } catch { refreshError = UserFacingError.message(error, action: "refresh crews") }
             }
         } onCancel: { events.cancel() }
     }
@@ -420,7 +387,7 @@ final class SimpleViewStore {
         let peersFile = root.appendingPathComponent("agents/peers.json").path
         let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
         let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-        let head = [stamp(peersFile), stamp(AgentLocalHealth.url(root).path), usable.sorted().joined(separator: ","), ChatGPTDotIPCTransport.stamp, ChatGPTDotIPCTransport.detail]
+        let head = [stamp(peersFile), stamp(AgentLocalHealth.url(root).path), usable.sorted().joined(separator: ","), ChatGPTDotIPCTransport.detail]
         if let cached, cached.stamp == head + cached.programs.map(stamp) { return cached }
         // The same contact list the Agents page shows, minus apps that are
         // merely installed: saved contacts, then the usable built-in lanes.
@@ -434,22 +401,25 @@ final class SimpleViewStore {
         let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: usable)
         func key(_ row: AgentContactRow) -> String { row.builtIn ? String(row.id.dropFirst("builtin:".count)) : row.id }
         var seen: Set<String> = []
-        let grouped = rows.sorted { a, b in
-            if a.builtIn != b.builtIn { return a.builtIn }
-            return sendRestriction(a) == nil && sendRestriction(b) != nil
-        }.filter { seen.insert(identity.canonical(key($0))).inserted }
-        var contacts = grouped.map { row in
-            SimpleContact(id: row.builtIn ? String(row.id.dropFirst("builtin:".count)) : row.id,
-                          name: identity.canonical(key(row)) == "claude" ? "Claude" : identity.canonical(key(row)) == "codex" ? "Codex" : row.name,
-                          builtIn: row.builtIn, via: via(row),
-                          sendRestriction: sendRestriction(row),
-                          lastActivityAt: [row.contact?.provenInboundAt, row.contact?.provenOutboundAt]
-                            .compactMap { $0.flatMap { dates.date(from: $0) } }.max(),
-                          appBundleID: appBundleID(row),
-                          link: link(row),
-                          clawd: isClaude(row),
-                          dot: row.contact.map(ChatGPTDotIPCTransport.owns) ?? false,
-                          health: health[key(row)])
+        // Once per row: the restriction reads Keychain and the program's file.
+        let restrictions = rows.map(sendRestriction)
+        let grouped = rows.indices.sorted { a, b in
+            if rows[a].builtIn != rows[b].builtIn { return rows[a].builtIn }
+            return restrictions[a] == nil && restrictions[b] != nil
+        }.filter { seen.insert(identity.canonical(key(rows[$0]))).inserted }
+        var contacts = grouped.map { index in
+            let row = rows[index]
+            return SimpleContact(id: row.builtIn ? String(row.id.dropFirst("builtin:".count)) : row.id,
+                                 name: identity.canonical(key(row)) == "claude" ? "Claude" : identity.canonical(key(row)) == "codex" ? "Codex" : row.name,
+                                 builtIn: row.builtIn, via: via(row),
+                                 sendRestriction: restrictions[index],
+                                 lastActivityAt: [row.contact?.provenInboundAt, row.contact?.provenOutboundAt]
+                                   .compactMap { $0.flatMap { dates.date(from: $0) } }.max(),
+                                 appBundleID: appBundleID(row),
+                                 link: link(row),
+                                 clawd: isClaude(row),
+                                 dot: row.contact.map(ChatGPTDotIPCTransport.owns) ?? false,
+                                 health: health[key(row)])
         }
         // A tint is who a contact is, so it follows the contact, not its row:
         // in stable id order each initials avatar sits three hues of the eight
@@ -514,9 +484,9 @@ final class SimpleViewStore {
         var lines: [String: [SimpleThreadLine]] = [:]
         var replies: [String: [SimpleThreadLine]] = [:]
         var latest: [String: AgentConversationRecord] = [:]
-        var lastActive = Dictionary(uniqueKeysWithValues: contacts.compactMap { contact in
+        var lastActive = Dictionary(contacts.compactMap { contact in
             contact.lastActivityAt.map { (contact.id, $0) }
-        })
+        }, uniquingKeysWith: { first, _ in first })
         for record in records {
             // Dot sends straight through; his old record is no part of his thread.
             guard let id = owner(record.agent), !dots.contains(id) else { continue }
@@ -549,7 +519,7 @@ final class SimpleViewStore {
         }
         // Everything a contact and the agent said to each other, from its own session.
         for contact in contacts {
-            let said = ContactThread.mergedLines(dataRoot: root, owner: contact.builtIn ? contact.id : String(contact.id.dropFirst(5)))
+            let said = try ContactThread.mergedLines(dataRoot: root, owner: contact.builtIn ? contact.id : String(contact.id.dropFirst(5)))
             if !said.isEmpty {
                 lines[contact.id] = said.map { SimpleThreadLine(id: $0.id, fromAgent: $0.mine, text: $0.text, at: $0.at, byPerson: $0.byPerson,
                                                              door: $0.door, fetched: $0.fetched) }
@@ -595,12 +565,12 @@ final class SimpleViewStore {
         for contact in contacts where latest[contact.id] == nil && lines[contact.id]?.last?.fetched == true {
             status[contact.id] = .read
         }
-        // Dot has no record: a reply is owed while the newest line is a send to
-        // him. His replies are pulled in with no end, but after half an hour
-        // with none the row says so instead of waiting on.
+        // Dot's thread owns its wait; every view uses the same reply projection.
         for id in dots {
             guard let last = lines[id]?.last, last.fromAgent else { continue }
-            if Date().timeIntervalSince(last.at) < 1800 { waiting.insert(id) } else { status[id] = .failed }
+            if case .object(let reply) = AgentConversationView.dotReply(.object([:]), sentAt: last.at), reply["terminal"] == .bool(true) {
+                status[id] = .failed
+            } else { waiting.insert(id) }
         }
         let hub = AgentConversationLiveStore(dataRoot: root)
         var flights: [String: SimpleFlight] = [:]
@@ -784,7 +754,7 @@ private struct SimpleSettingsMenuItems: View {
                     .tag(color.rawValue)
             }
         } label: {
-            Label("Colour", systemImage: "paintpalette")
+            Label("Color", systemImage: "paintpalette")
         }
         // The warmth only lands in dark mode (MoodTintGate).
         if scheme == .dark {
@@ -809,13 +779,63 @@ private struct SimpleSettingsMenuItems: View {
     }
 }
 
-/// The floating plate: the agent, then Agents, then Helpers.
+/// Advanced's Connectors ▸ Agents: Simple's lists — the agent's threads with
+/// each agent, the helpers it talks to, the crews at work — beside the open
+/// one, so the full app can do what Simple does. Nothing open is the
+/// connection setup the tab always had.
+struct AgentThreadsTab: View {
+    private struct Watch: Equatable { let root: URL; let helpers: [UUID] }
+
+    @Environment(AppModel.self) private var appModel
+    @State private var store = SimpleViewStore()
+    @State private var pane: SimpleShellView.Pane = .agent
+
+    private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
+    private func openChat() { NativeAgentAppCoordinator.shared.request(.sidebar(.chat)) }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            SimpleSidebar(store: store, pane: $pane, embedded: true)
+            Group {
+                switch pane {
+                case .agent:
+                    AgentContactsSection()
+                case .contact(let id):
+                    if let contact = store.contacts.first(where: { $0.id == id }) {
+                        SimpleContactThread(contact: contact, store: store, openChat: openChat).id(contact.id)
+                    } else { Color.clear.onAppear { pane = .agent } }
+                case .helper(let id):
+                    if let helper = store.helpers.first(where: { $0.id == id }) {
+                        SimpleHelperRuns(record: helper, store: store, openChat: openChat).id(helper.id)
+                    } else { Color.clear.onAppear { pane = .agent } }
+                case .crew(let id):
+                    if let crew = store.crews.first(where: { $0.id == id }) {
+                        SimpleCrewThread(crew: crew).id(crew.id)
+                    } else { Color.clear.onAppear { pane = .agent } }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .task(id: Watch(root: root, helpers: store.helpers.map(\.id))) {
+            await store.watch(root: root, helpers: store.helpers.map(\.id))
+        }
+        .task(id: root) { await store.watchCrews(root: root) }
+        // An offscreen drawing waits for the first read, so the lists are there.
+        .quietReadTask(live: false) {
+            while !store.loaded, !Task.isCancelled { try? await Task.sleep(nanoseconds: 50_000_000) }
+        }
+    }
+}
+
+/// The agent's card, then Agents, then Helpers, on the room's one sheet
+/// (Sidebar C, User 10-04): no plate; a hairline parts it from the chat.
+/// Embedded in Advanced's Agents tab, a Connections row stands in for the
+/// card and the settings menu stays with Simple.
 private struct SimpleSidebar: View {
     let store: SimpleViewStore
     @Binding var pane: SimpleShellView.Pane
+    var embedded = false
     @Environment(AppModel.self) private var appModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.controlActiveState) private var activeState
     @State private var showQuiet = false
     @State private var showCrews = false
@@ -829,9 +849,6 @@ private struct SimpleSidebar: View {
     static let rowName = Font.system(size: 14, weight: .medium)
     static let rowLine = Font.system(size: 12)
     private var agentName: String { AgentVoice(name: appModel.agentDisplayName).name }
-    private var plate: RoundedRectangle {
-        RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous)
-    }
 
     var body: some View {
         // Talked to, newest first; the rest fold at the end.
@@ -841,14 +858,24 @@ private struct SimpleSidebar: View {
         // selection, arrow keys and folds.
         // Her card is home, not a row: it wears its own quiet wash instead
         // of the system's blue block (User 09-27: tune her back after native).
-        List(selection: Binding<SimpleShellView.Pane?>(get: { pane == .agent ? nil : pane },
+        List(selection: Binding<SimpleShellView.Pane?>(get: { pane == .agent && !embedded ? nil : pane },
                                                        set: { if let next = $0 { pane = next } })) {
+            if embedded {
+                row(.agent) {
+                    HStack(spacing: 10) {
+                        SimpleClockTile(size: 30, symbol: "link", working: false)
+                        rowText("Connections", "Connect, test or disconnect", selected: pane == .agent)
+                    }
+                }
+                .padding(.bottom, Self.sectionGap)
+            } else {
             Button { pane = .agent } label: {
                 SimpleAgentCard(selected: pane == .agent).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .selectionDisabled()
                 .padding(.bottom, Self.sectionGap)
+            }
             Section {
                 if let error = store.refreshError { quiet(error) }
                 if store.loaded && store.contacts.isEmpty {
@@ -897,31 +924,24 @@ private struct SimpleSidebar: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
-        // Below the traffic lights, which sit on the plate's top edge.
-        .contentMargins(.top, 30, for: .scrollContent)
+        // The list starts below the title strip, so no row ever scrolls up
+        // under the traffic lights; its first row sits 12 lower still.
+        .contentMargins(.top, 12, for: .scrollContent)
+        .padding(.top, embedded ? 0 : NativeAgentShellLayout.titleBarInset)
         .scrollIndicators(.never)
-        // Settings stays on the plate's foot: under the lists while there is
+        // Settings stays at the sidebar's foot: under the lists while there is
         // room, and in a short window the lists scroll beneath it, its own
-        // coat keeping it legible, not a second glass on the plate's glass
-        // (User, 09-24). An inset, not safeAreaBar: that pinned the main thread
+        // coat keeping it legible, not a second glass (User, 09-24). An inset, not safeAreaBar: that pinned the main thread
         // at 100% in this window on 09-23 (f24194bb0).
-        .safeAreaInset(edge: .bottom, spacing: 0) { settingsRow }
-        .frame(width: Self.width)
+        .safeAreaInset(edge: .bottom, spacing: 0) { if !embedded { settingsRow } }
+        .padding(.leading, embedded ? 0 : NativeAgentShellLayout.railPlateInset)
+        .frame(width: Self.width + (embedded ? 0 : NativeAgentShellLayout.railPlateInset))
         .frame(maxHeight: .infinity)
-        .clipShape(plate)
-        // The rail's plate, exactly: the same glass, radius and inset, and the
-        // same shimmer while the agent thinks.
-        .background { ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.railPlateRadius) }
-        .glassEffect(reduceTransparency ? .identity : ShellSidebarRail.plateGlass, in: plate)
-        // A window in the background loses the glass's own rim, and the plate
-        // read as a flat slab; the hairline keeps its rounded edge there.
-        .overlay {
-            if activeState == .inactive || reduceTransparency {
-                plate.strokeBorder(NativeAgentShell.hairline, lineWidth: 1).allowsHitTesting(false)
-            }
+        // Sidebar C: on the window's sheet, edge to edge, parted from the
+        // chat by one hairline. Her card is the one glass piece.
+        .overlay(alignment: .trailing) {
+            Rectangle().fill(NativeAgentShell.hairline).frame(width: 1).allowsHitTesting(false)
         }
-        .padding([.top, .bottom, .leading], NativeAgentShellLayout.railPlateInset)
-        .padding(.trailing, 6)
         .onAppear { now = Date() }
         .onChange(of: activeState) { now = Date() }
         .onChange(of: store.helpers) { now = Date() }
@@ -1007,8 +1027,13 @@ private struct SimpleSidebar: View {
         return row(.contact(contact.id)) {
             HStack(spacing: 10) {
                 SimpleAvatar(contact: contact, size: 30)
-                    .overlay { if store.waiting.contains(contact.id) { WorkingRim(cornerRadius: 15) } }
                 rowText(contact.name, line, selected: selected)
+            }
+        }
+        // Working with her: the whole row wears the moving rim.
+        .background {
+            if store.waiting.contains(contact.id) || store.flights[contact.id]?.working == true {
+                WorkingRim(cornerRadius: 10).padding(.horizontal, -6).padding(.vertical, 1)
             }
         }
         .accessibilityLabel("\(contact.name), \(line)")
@@ -1043,13 +1068,13 @@ private struct SimpleSidebar: View {
         let delivery: String? = switch store.status[contact.id] {
         case .delivered?: "Delivered"
         case .read?: "Read"
-        case .failed?: "No reply came back"
+        case .failed?: "No reply"
         case .notDelivered?: "Not delivered"
         default: nil
         }
         // Ready: its zero-token check passed just now (program runs, app
         // installed, signed in, Dot's chat followable), not a model round-trip.
-        let word = moving ?? delivery ?? (contact.health.map { $0.current && $0.status == "ready" } == true ? "Ready" : nil)
+        let word = moving ?? delivery ?? contact.health?.word
         let latest = store.lines[contact.id]?.last { line in
             !contact.recoveredFailure || !AgentLocalHealth.authenticationFailure(.string(line.text))
         }
@@ -1112,24 +1137,39 @@ private struct SimpleSidebar: View {
     }
 }
 
-/// The agent at the top of the plate: name, a breathing orb in the haze
-/// colour, and what the agent is doing now, never a quote of what it said.
+/// The agent at the top of the sidebar, the sidebar's one glass piece
+/// (Sidebar C): name, a breathing orb in the haze colour, and what the agent
+/// is doing now, never a quote of what it said. The card shimmers for her
+/// whole turn (ThinkingGlow); the transcript's live line narrates the steps.
 /// Its own view so the turn-state reads stay out of the rest of the sidebar.
 private struct SimpleAgentCard: View {
     let selected: Bool
     @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.controlActiveState) private var activeState
+
+    static let radius: CGFloat = 14
 
     /// The mockup's serif title: the one name in the window with presence.
     static let nameFont = Font.system(size: 28, weight: .semibold, design: .serif)
 
+    /// "Working · with Codex" while she works with another agent, else
     /// "Thinking…" / "Replying…" while a turn runs; "Waiting on you" (the
     /// teal, its one job) while the Desk's Needs you holds anything;
-    /// otherwise "Here".
+    /// otherwise "Here". Never her steps: the live line has those.
     private var doing: (text: String, waiting: Bool) {
+        if appModel.isBusy || appModel.isChatStreaming,
+           let presentation = appModel.engine.turns.lifecycle(for: appModel.activeChatSessionId)?.presentation,
+           !presentation.isTerminal, presentation.phase == .delegation,
+           let partner = presentation.delegateName, !partner.isEmpty {
+            return ("Working · with \(partner)", false)
+        }
         if appModel.isThinkingBeforeReply { return ("Thinking…", false) }
         if appModel.isBusy || appModel.isChatStreaming { return ("Replying…", false) }
         return (appModel.ownerWaitingCount ?? 0) > 0 ? ("Waiting on you", true) : ("Here", false)
     }
+
+    private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: Self.radius, style: .continuous) }
 
     var body: some View {
         let name = AgentVoice(name: appModel.agentDisplayName).name
@@ -1157,11 +1197,17 @@ private struct SimpleAgentCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 6)
-        .background {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(selected ? NativeAgentShell.softFill : .clear)
-                .padding(.horizontal, -8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background { shape.fill(selected ? NativeAgentShell.softFill : .clear) }
+        .background { ThinkingGlow(kind: .shimmer, cornerRadius: Self.radius, wholeTurn: true) }
+        .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
+        // A background window loses the glass's own rim; the hairline keeps
+        // the card's edge there.
+        .overlay {
+            if activeState == .inactive || reduceTransparency {
+                shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1).allowsHitTesting(false)
+            }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(name). \(line.text)")

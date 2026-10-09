@@ -63,13 +63,17 @@ permission to mutate them. Unknown or stale evidence must remain uncertain.
 **Turn projection.** `NativeCognitionRuntime.prepareTurnProjection` samples
 the body and canonical substrate affect at one fixed time, obtains an organism
 frozen read, and prepares the capsule from that projection. The result contains
-both capsule and behavior posture. `commitTurnProjection` advances presentation
-cadence only for the injected live value.
+both capsule and behavior posture. `commitTurnProjection` advances the
+presentation clock after a successful live turn, even with an empty capsule;
+previews and failed turns do not consume cadence. Candidates that are not shown
+remain owed rather than counting as presented.
 
 **Felt state.** `CognitiveSubstrate+CapsuleFeltSignals.swift` maps projected
 chemistry into the felt fingerprint. `OrganismChemistry.bodyLine` can supply a
-bounded `- Body:` line. Unchanged body lines are suppressed between presentation
-windows. The capsule's fitter may omit lines that do not fit its budget.
+bounded `- Body:` candidate. Ordinary turns select one non-rut felt cue or none,
+with an optional separate Sound rut line; private reflection is cadence-exempt.
+Unchanged body lines are suppressed between presentation windows. Losing the
+cue slot or fitting budget does not count a body line as presented.
 
 **Attention.** The kernel publishes predicted tool groups from pending tool
 expectations. `NativeCognitionRuntime.attentionSignals` reads the resident

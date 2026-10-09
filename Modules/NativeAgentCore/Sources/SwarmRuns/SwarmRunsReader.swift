@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-/// Read-only inspection of retained swarm receipts.
+/// Shared crew projection and inspection of retained swarm receipts.
 public struct SwiftNativeSwarmRunsReader: Sendable {
     public static let maximumStoreBytes = 64 * 1_024 * 1_024
     /// Absolute path to `<dataRoot>/swarms/runs.json`.
@@ -10,6 +10,141 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
 
     public init(runsPath: URL) {
         self.runsPath = runsPath
+    }
+
+    /// Recovery records uncertainty, never reruns a worker. Receipt durability
+    /// precedes removal from the board; an interrupted rewrite is idempotent.
+    public func readCrews(locked: Bool = true) throws -> [[String: Any]] {
+        let live = try liveRows(locked: locked)
+        let runs = try Self.rows(at: runsPath)
+        let done = Set(runs.compactMap { $0["id"] as? String })
+        return live.filter { !done.contains($0["id"] as? String ?? "") } + runs
+    }
+
+    func liveRows(locked: Bool = true) throws -> [[String: Any]] {
+        let livePath = runsPath.deletingLastPathComponent().appendingPathComponent("live.json")
+        func project() throws -> [[String: Any]] {
+            let live = try Self.rows(at: livePath)
+            var working: [[String: Any]] = []
+            var ids = Set<String>()
+            for row in live {
+                guard let id = row["id"] as? String, !id.isEmpty, ids.insert(id).inserted,
+                      let workers = row["workers"] as? [[String: Any]],
+                      workers.allSatisfy({ worker in
+                          guard let status = worker["status"] as? String else { return false }
+                          return !["completed", "failed", "cancelled"].contains(status) || worker["output"] is String
+                              || (status == "failed" && worker["error"] is String)
+                      }) else {
+                    throw PersistenceCoreError.ioFailure("Swarm live store malformed; repair swarms/live.json without discarding retained worker results.")
+                }
+                if row["pid"] == nil, ["completed", "partial", "failed", "cancelled", "interrupted"].contains(row["status"] as? String ?? "") {
+                    if locked { try persist(JSONValue(fromFoundation: row)) }
+                    else { working.append(row) }
+                    continue
+                }
+                guard let pid = row["pid"] as? Int, pid > 0, pid <= Int(Int32.max) else {
+                    throw PersistenceCoreError.ioFailure("Swarm live store malformed; repair swarms/live.json without discarding retained worker results.")
+                }
+                if kill(pid_t(pid), 0) == 0 || errno != ESRCH {
+                    working.append(row)
+                    continue
+                }
+                var receipt = row
+                receipt.removeValue(forKey: "pid")
+                receipt["status"] = "interrupted"
+                receipt["completedAt"] = AgentSwarmClock.nowISO()
+                receipt["error"] = "Crew process ended before its terminal receipt; unsettled worker effects and synthesis are unknown. Inspect retained reports before starting new work; workers were not replayed."
+                receipt["workers"] = workers.enumerated().map { index, worker in
+                    var result = worker
+                    if result["id"] == nil { result["id"] = "\(id)-\(String(format: "%02d", index + 1))" }
+                    if !["completed", "failed", "cancelled"].contains(result["status"] as? String ?? "") {
+                        result["status"] = "unknown"
+                        result["output"] = result["output"] ?? ""
+                        result["error"] = "Worker did not settle before its crew process ended; effects are unknown."
+                    }
+                    return result
+                }
+                if row["synthesis"] == nil, row["synthesize"] as? Bool != false {
+                    receipt["synthesis"] = ["status": "unknown", "output": "", "error": "Synthesis did not settle before its crew process ended; its outcome is unknown."]
+                }
+                if locked { try persist(JSONValue(fromFoundation: receipt)) }
+                else { working.append(receipt) }
+            }
+            if locked, live.count != working.count {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONValue(fromFoundation: working).serializedData(pretty: true), to: livePath)
+            }
+            return working
+        }
+        if locked { return try CredentialFileLock.withLock(livePath, project) }
+        return try project()
+    }
+
+    static func rows(at path: URL) throws -> [[String: Any]] {
+        let values: [Any]
+        do { values = try readArray(at: path) ?? [] }
+        catch PersistenceCoreError.ioFailure("receipt_store_malformed") {
+            throw PersistenceCoreError.ioFailure("Swarm store malformed at \(path.path); repair the retained store before continuing.")
+        }
+        catch {
+            throw PersistenceCoreError.ioFailure("Swarm store unreadable at \(path.path); restore access before continuing.")
+        }
+        guard let rows = values as? [[String: Any]] else {
+            throw PersistenceCoreError.ioFailure("Swarm store malformed at \(path.path); repair the retained store before continuing.")
+        }
+        return rows
+    }
+
+    private static func readArray(at path: URL) throws -> [Any]? {
+        let data: Data
+        var identifiedFile = false
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+            identifiedFile = true
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw PersistenceCoreError.ioFailure("receipt_store_unreadable")
+            }
+            let handle = try FileHandle(forReadingFrom: path)
+            defer { try? handle.close() }
+            let length = try handle.seekToEnd()
+            guard length <= UInt64(maximumStoreBytes) else { throw PersistenceCoreError.ioFailure("receipt_store_too_large") }
+            try handle.seek(toOffset: 0)
+            data = try handle.read(upToCount: Int(length) + 1) ?? Data()
+            guard data.count == Int(length) else { throw PersistenceCoreError.ioFailure("receipt_store_changed_during_read") }
+        }
+        catch let error as PersistenceCoreError { throw error }
+        catch {
+            let error = error as NSError
+            if !identifiedFile, error.domain == NSCocoaErrorDomain, [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code) { return nil }
+            throw PersistenceCoreError.ioFailure("receipt_store_unreadable")
+        }
+        guard let rows = (try? JSONSerialization.jsonObject(with: data)) as? [Any] else {
+            throw PersistenceCoreError.ioFailure("receipt_store_malformed")
+        }
+        return rows
+    }
+
+    func persist(_ record: JSONValue) throws {
+        try CredentialFileLock.withLock(runsPath) {
+            var existing = try Self.rows(at: runsPath).map { JSONValue(fromFoundation: $0) }
+            if case .object(let object) = record, existing.contains(where: {
+                if case .object(let saved) = $0 { return saved["id"] == object["id"] }
+                return false
+            }) { return }
+            existing.insert(record, at: 0)
+            var bytes = 2, retained = 0
+            for row in existing.prefix(1_000) {
+                let data = try row.serializedData(pretty: true)
+                let lines = data.reduce(1) { $1 == 0x0A ? $0 + 1 : $0 }
+                let rowBytes = data.count + 2 * lines + 2
+                guard bytes + rowBytes <= Self.maximumStoreBytes else { break }
+                bytes += rowBytes
+                retained += 1
+            }
+            guard retained > 0 else {
+                throw PersistenceCoreError.ioFailure("Swarm receipt exceeds the retained evidence byte budget; existing evidence was not replaced.")
+            }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONValue.array(Array(existing.prefix(retained))).serializedData(pretty: true), to: runsPath)
+        }
     }
 
     /// The shared receipt path for execution and inspection.
@@ -35,31 +170,14 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
             if skippedMalformedRows > 0 { object["skipped_malformed_rows"] = .int(Int64(skippedMalformedRows)) }
             return .object(object)
         }
-        let cap = Self.maximumStoreBytes
-        let data: Data
-        var identifiedFile = false
+        let rows: [JSONValue]
         do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: runsPath.path)
-            identifiedFile = true
-            guard attributes[.type] as? FileAttributeType == .typeRegular else {
-                return envelope("unavailable", "receipt_store_unreadable")
-            }
-            let handle = try FileHandle(forReadingFrom: runsPath)
-            defer { try? handle.close() }
-            let length = try handle.seekToEnd()
-            guard length <= UInt64(cap) else { return envelope("unavailable", "receipt_store_too_large") }
-            try handle.seek(toOffset: 0)
-            data = try handle.read(upToCount: Int(length) + 1) ?? Data()
-            guard data.count == Int(length) else { return envelope("unavailable", "receipt_store_changed_during_read") }
+            guard let values = try Self.readArray(at: runsPath) else { return envelope("not_found", "receipt_store_missing") }
+            rows = values.map { JSONValue(fromFoundation: $0) }
+        } catch PersistenceCoreError.ioFailure(let reason) {
+            return envelope("unavailable", reason)
         } catch {
-            let error = error as NSError
-            if !identifiedFile, error.domain == NSCocoaErrorDomain && [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code) {
-                return envelope("not_found", "receipt_store_missing")
-            }
             return envelope("unavailable", "receipt_store_unreadable")
-        }
-        guard let parsed = try? JSONValue.parse(data), case .array(let rows) = parsed else {
-            return envelope("unavailable", "receipt_store_malformed")
         }
         var matching: [(receipt: [String: JSONValue], reports: [RetainedSwarmReport])] = []
         var validRows = 0

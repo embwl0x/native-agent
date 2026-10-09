@@ -2,6 +2,7 @@ import Foundation
 import CoreGraphics
 import NativeAgentCore
 import PersistenceCore
+import MacControl
 
 // MARK: - FUSION: CGImage → vision rows
 //

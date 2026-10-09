@@ -88,6 +88,8 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     public var updatedAt: String?
     public var archived: Bool?
     public var messageCount: Int?
+    public var firstMessageAt: String? = nil
+    public var lastMessageAt: String? = nil
     public var lastMessagePreview: String?
     public var summary: String?
     /// Optional lineage/project metadata stored on the canonical session row.
@@ -368,6 +370,28 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     /// live question raised again in a later turn. Nil when it was only ever
     /// asked once.
     public var lastRequestedAt: String?
+    public var executionOutcome: String?
+    public var executionSummary: String?
+
+    public var executionFailed: Bool { executionOutcome == "failed" || executionOutcome == "timeout" }
+    public var isExpired: Bool {
+        [status, decision ?? ""].contains { ["orphaned", "expired"].contains($0.lowercased()) }
+    }
+    public func expirationGuidance(agentName: String) -> String? {
+        isExpired ? "Ask \(agentName) to raise this request again if you still want it." : nil
+    }
+
+    public var decisionSummary: String {
+        if isExpired { return "Expired before a decision" }
+        let word: String
+        switch (decision ?? status).lowercased() {
+        case "approve", "approved": word = "Approved"
+        case "deny", "denied", "reject", "rejected": word = "Denied"
+        case "cancel", "canceled", "cancelled": word = "Canceled"
+        default: word = "Resolved"
+        }
+        return executionFailed ? word + " · execution failed" : word
+    }
 
     public init(
         id: String,
@@ -383,7 +407,9 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
         localOnly: Bool? = nil,
         remoteResolvable: Bool? = nil,
         chatOriginSessionId: String? = nil,
-        lastRequestedAt: String? = nil
+        lastRequestedAt: String? = nil,
+        executionOutcome: String? = nil,
+        executionSummary: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -399,6 +425,8 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
         self.remoteResolvable = remoteResolvable
         self.chatOriginSessionId = chatOriginSessionId
         self.lastRequestedAt = lastRequestedAt
+        self.executionOutcome = executionOutcome
+        self.executionSummary = executionSummary
     }
 }
 

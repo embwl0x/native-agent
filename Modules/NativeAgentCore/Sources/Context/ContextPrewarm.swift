@@ -3,10 +3,7 @@ import Foundation
 
 public enum ContextPrewarmHintKind: String, CaseIterable, Codable, Sendable, Comparable {
     case session
-    case desk
     case workshopExecution = "mission" // compatibility wire ID
-    case file
-    case toolResult = "tool_result"
     case cognitive
     case organism
 
@@ -96,26 +93,6 @@ public struct ContextSessionPrewarmHint: Equatable, Sendable {
     }
 }
 
-public struct ContextDeskPrewarmHint: Equatable, Sendable {
-    public let metadata: ContextPrewarmHintMetadata
-
-    public init(
-        deskID: String,
-        eventID: String,
-        revision: Int64,
-        priority: Int = 0,
-        candidates: [ContextPrewarmCandidate]
-    ) {
-        self.metadata = ContextPrewarmHintMetadata(
-            scope: ContextPrewarmScope(kind: .desk, id: deskID),
-            eventID: eventID,
-            revision: revision,
-            priority: priority,
-            candidates: candidates
-        )
-    }
-}
-
 public struct ContextWorkshopPrewarmHint: Equatable, Sendable {
     public let metadata: ContextPrewarmHintMetadata
 
@@ -128,54 +105,6 @@ public struct ContextWorkshopPrewarmHint: Equatable, Sendable {
     ) {
         self.metadata = ContextPrewarmHintMetadata(
             scope: ContextPrewarmScope(kind: .workshopExecution, id: executionID),
-            eventID: eventID,
-            revision: revision,
-            priority: priority,
-            candidates: candidates
-        )
-    }
-}
-
-public struct ContextFilePrewarmHint: Equatable, Sendable {
-    public let sourceID: ContextSourceID
-    public let contentFingerprint: String
-    public let metadata: ContextPrewarmHintMetadata
-
-    public init(
-        sourceID: ContextSourceID,
-        contentFingerprint: String,
-        eventID: String,
-        revision: Int64,
-        priority: Int = 0,
-        candidates: [ContextPrewarmCandidate]
-    ) {
-        self.sourceID = sourceID
-        self.contentFingerprint = contentFingerprint
-        self.metadata = ContextPrewarmHintMetadata(
-            scope: ContextPrewarmScope(kind: .file, id: sourceID.rawValue),
-            eventID: eventID,
-            revision: revision,
-            priority: priority,
-            candidates: candidates
-        )
-    }
-}
-
-public struct ContextToolResultPrewarmHint: Equatable, Sendable {
-    public let resultFingerprint: String
-    public let metadata: ContextPrewarmHintMetadata
-
-    public init(
-        toolCallID: String,
-        resultFingerprint: String,
-        eventID: String,
-        revision: Int64,
-        priority: Int = 0,
-        candidates: [ContextPrewarmCandidate]
-    ) {
-        self.resultFingerprint = resultFingerprint
-        self.metadata = ContextPrewarmHintMetadata(
-            scope: ContextPrewarmScope(kind: .toolResult, id: toolCallID),
             eventID: eventID,
             revision: revision,
             priority: priority,
@@ -241,10 +170,7 @@ public struct ContextPrewarmCancellation: Equatable, Sendable {
 
 public enum ContextPrewarmEvent: Equatable, Sendable {
     case session(ContextSessionPrewarmHint)
-    case desk(ContextDeskPrewarmHint)
     case workshopExecution(ContextWorkshopPrewarmHint)
-    case file(ContextFilePrewarmHint)
-    case toolResult(ContextToolResultPrewarmHint)
     case cognitive(ContextCognitivePrewarmHint)
     case organism(ContextOrganismPrewarmHint)
     case cancel(ContextPrewarmCancellation)
@@ -252,10 +178,7 @@ public enum ContextPrewarmEvent: Equatable, Sendable {
     fileprivate var metadata: ContextPrewarmHintMetadata? {
         switch self {
         case .session(let hint): hint.metadata
-        case .desk(let hint): hint.metadata
         case .workshopExecution(let hint): hint.metadata
-        case .file(let hint): hint.metadata
-        case .toolResult(let hint): hint.metadata
         case .cognitive(let hint): hint.metadata
         case .organism(let hint): hint.metadata
         case .cancel: nil

@@ -46,16 +46,11 @@ public struct GrokRequestStore: Sendable {
             return request
         }
     }
-    public func read(_ id: String, peer: String, now: Date = Date()) throws -> GrokPendingRequest {
-        let file = try url(id)
-        return try CredentialFileLock.withLock(file) {
-            var value = try load(file)
-            guard value.peerID == peer else { throw GrokLinkCredential.Failure.invalid }
-            if value.expiresAt < now && ["sending", "accepted", "outcome_unknown"].contains(value.state) {
-                value.state = "no answer in time"
-            }
-            return value
-        }
+    public func read(_ id: String, peer: String) throws -> GrokPendingRequest {
+        guard UUID(uuidString: id)?.uuidString.lowercased() == id else { throw GrokLinkCredential.Failure.invalid }
+        let value = try load(root.appendingPathComponent(id + ".json"))
+        guard value.peerID == peer else { throw GrokLinkCredential.Failure.invalid }
+        return value
     }
     private func load(_ file: URL) throws -> GrokPendingRequest {
         let data = try Data(contentsOf: file)
@@ -63,6 +58,16 @@ public struct GrokRequestStore: Sendable {
         var value = try JSONDecoder().decode(GrokPendingRequest.self, from: data)
         value.state = GrokBotRoute.normalizedStatus(value.state)
         return value
+    }
+    public func expiredUnanswered(peer: String, now: Date = Date()) throws -> GrokPendingRequest? {
+        guard FileManager.default.fileExists(atPath: root.path) else { return nil }
+        let latest = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+            .map { try load($0) }.filter { $0.peerID == peer }.max { $0.expiresAt < $1.expiresAt }
+        guard let latest, latest.expiresAt < now, latest.expiresAt > now.addingTimeInterval(-7 * 86_400),
+              ["sending", "accepted", "outcome_unknown", "no answer in time"].contains(latest.state), latest.reply == nil,
+              latest.handOver != "connection bootstrap requested; no resend" else { return nil }
+        return latest
     }
     @discardableResult public func update(_ id: String, peer: String, _ edit: (inout GrokPendingRequest) throws -> Void) throws -> GrokPendingRequest {
         let file = try url(id)
@@ -169,7 +174,7 @@ public enum GrokBotRoute {
 
     public static let bundleID = "com.anysphere.sand"
     public static func routineName(_ peer: String) -> String { "NativeAgent reply " + peer }
-    public static let securePasteBlocker = "Grok Bot's Routines panel did not expose one unambiguous webhook URL and readable key through Accessibility. Setup stopped. Paste the URL and key together in the secure field on this card; never in chat."
+    public static let securePasteBlocker = "Grok Bot's Routines panel did not expose one unambiguous webhook URL and readable key through Accessibility. Setup stopped. Paste the URL and key together in the secure field at Agents → Grok Bot → Routine credentials; never in chat."
     public static func instruction(peer: String, command: String) -> String {
         // Only app-owned fixed arguments form the command. Reply data is stdin.
         let quoted = "'" + command.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -184,16 +189,16 @@ public enum GrokBotRoute {
         var fields: [String: JSONValue] = ["agent": .string("peer:" + pending.peerID), "transport": .string("grokBot"),
             "message_id": .string(pending.messageID), "conversation_id": .string(pending.conversationID),
             "status": .string(normalizedStatus(pending.state)), "completed": .bool(pending.state == "answered"),
+            "reply_deadline": .string(ISO8601DateFormatter().string(from: pending.expiresAt)),
             "automatic_resend": .bool(false),
             "detail": .string(pending.state == "accepted" ? "Accepted, waiting for Grok. The run started; it has not answered. Its answer arrives by itself as the next turn in this conversation, so end this turn now without waiting, checking or reading for it. If none comes, Grok Bot may be waiting for the person to approve the local reply command."
-                : pending.state == "no answer in time" ? "No answer in time. Check Grok Bot for a local run not approved or usage exhausted; this app cannot infer those from silence. Do not resend automatically."
                 : normalizedStatus(pending.state) == "outcome_unknown" ? "outcome unknown"
                 : pending.state)]
         // Evidence travels with the claim: "answered" carries Grok's own words.
         if let reply = pending.reply { fields["reply"] = .string(reply); fields["untrusted_remote_data"] = .bool(true) }
         // Saved is not the same as handed to her: say which.
         if let handOver = pending.handOver { fields["hand_over"] = .string(handOver) }
-        return .object(fields)
+        return AgentConversationView.expiringReply(.object(fields))
     }
     public static func send(peer: AgentPeerContact, text: String, conversation: String, messageID: String,
                             dataRoot: URL, credential: GrokLinkCredential, quiet: Bool = false,

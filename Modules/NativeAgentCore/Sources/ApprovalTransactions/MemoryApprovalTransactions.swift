@@ -98,7 +98,7 @@ public enum MemoryApprovalTransactions {
                         + (outcome.failed.isEmpty ? "" : ", \(outcome.failed.count) FAILED"),
                     root: dataRoot)
             } catch {
-                NSLog("[kindBackfill] apply failed: \(String(describing: error))")
+                nativeLog("[kindBackfill] apply failed: \(String(describing: error))")
                 MemoryKindBackfill.clearStamp(dataRoot: dataRoot)
                 try? await ApprovalExecutionAnnotation.annotateApprovalExecution(
                     id: rec.id,
@@ -178,7 +178,7 @@ public enum MemoryApprovalTransactions {
         do {
             storage = try await Self.kindBackfillStorage(dataRoot: dataRoot)
         } catch {
-            NSLog("[kindBackfill] storage open failed; staging skipped: \(String(describing: error))")
+            nativeLog("[kindBackfill] storage open failed; staging skipped: \(String(describing: error))")
             return
         }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)

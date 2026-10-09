@@ -26,7 +26,7 @@ artifacts, and local signing material are intentionally ignored.
 Start with the [Documentation and Repository Guide](docs/README.md), then read
 the relevant owner section in the [Architecture Blueprint](docs/ARCHITECTURE_BLUEPRINT.md).
 [North Star](docs/NORTHSTAR.md) and [Project Direction](docs/PROJECT_DIRECTION.md)
-explain intent; the [capability snapshot](PROJECT_STATUS.md#capability-snapshot)
+explain intent; the [project status](PROJECT_STATUS.md#where-things-stand)
 records implementation boundaries. Maintainer checkouts additionally have
 task-specific as-built maps under `docs/build_plans/`; public exports omit
 private plans and handoffs.
@@ -47,8 +47,9 @@ docs when changing ownership, state roots, policy, or a cross-surface contract.
   local bridges, and Workshop where the contract is shared.
 - TrustCenter, approvals, Full Mac, connector proof, signed mobile actions, and
   external-send confirmation remain authoritative.
-- Add focused tests at persistence, identity, authorization, routing, and
-  lifecycle boundaries.
+- Follow [AGENTS.md](AGENTS.md): build, install, and check the requested behavior
+  in the working app. Do not create or run separate automated tests, test-only
+  builds, harnesses, simulations, or stress/load campaigns.
 - Preserve unrelated work in a dirty tree.
 
 ## Privacy and secret guard
@@ -75,8 +76,11 @@ checked.
 
 ## Build
 
-The repository has no automated test suite. Assemble the coherent change,
-build the integrated target, then prove the finished workflow in the real app.
+The repository has no automated test suite. For source changes, assemble the
+coherent change, build the integrated target, install it, and check the requested
+behavior in the installed app. Keep checks small and directly tied to the change.
+Documentation-only changes need a direct readback of the changed text, not an
+app build or test run.
 
 ```bash
 swift build --jobs 4 --force-resolved-versions --skip-update
@@ -118,3 +122,6 @@ make_public_export.sh
 See [docs/release_setup.md](docs/release_setup.md). Never publish `data/`,
 `.runtime/`, `workspace/`, private persona files, OAuth tokens, Apple signing
 material, generated context databases, or local receipts.
+
+The compatibility-named `test-receipt.json` records artifact-only release
+evidence; it does not attest automated tests or installed-app behavior.

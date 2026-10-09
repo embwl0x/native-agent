@@ -22,7 +22,11 @@ extension AppModel: FirstRunWelcomePort {
 
     @discardableResult
     func maybeSendFirstRunGreeting() async -> FirstRunGreetingOutcome {
-        await firstRunWelcomeTransaction.maybeSendFirstRunGreeting(port: self)
+        let outcome = await firstRunWelcomeTransaction.maybeSendFirstRunGreeting(port: self)
+        // `.delivered` means the greeting turn has finished, whichever trigger
+        // started it — only now may macOS post its "Login Item Added" banner.
+        if case .delivered = outcome { AppDelegate.registerLoginItemInBackground() }
+        return outcome
     }
 
     static func hasConversationRows(_ messages: [ChatMessage]) -> Bool {

@@ -55,13 +55,19 @@ public let memoryBM25LexicalBoost: Double = 0.25
 
 /// Pure decay math, separated for testability.
 public enum MemoryRecallScoring {
+    private static let preferredSkillLimit = 1
+
+    /// A fully judged ranking prefix can settle the answer only when later
+    /// facts cannot replace deferred skill hints in the final selection.
+    public static func hasEnoughPreferredRecallResults(facts: Int, skills: Int, limit: Int) -> Bool {
+        limit > 0 && facts + min(skills, preferredSkillLimit) >= limit
+    }
+
     // Cached formatters — this runs per-candidate inside the recall hot loop;
     // allocating ISO8601DateFormatter per call is the only real cost there
-    // (gpt-5.5 wave1 finding 5). ISO8601DateFormatter is documented
-    // thread-safe.
-    // nonisolated(unsafe): ISO8601DateFormatter is documented thread-safe
-    // (unlike DateFormatter pre-iOS7); the class just isn't marked Sendable.
-    // Configured once here and never mutated after init.
+    // (gpt-5.5 wave1 finding 5). Configured once, never mutated, and only
+    // used under `formatterLock`: recall runs from several tasks at once.
+    private static let formatterLock = NSLock()
     nonisolated(unsafe) private static let fractionalFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -75,7 +81,8 @@ public enum MemoryRecallScoring {
 
     /// Parse either ISO8601 variant the codebase writes (fractional + plain).
     public static func parseTimestamp(_ s: String) -> Date? {
-        fractionalFormatter.date(from: s) ?? plainFormatter.date(from: s)
+        formatterLock.lock(); defer { formatterLock.unlock() }
+        return fractionalFormatter.date(from: s) ?? plainFormatter.date(from: s)
     }
 
     /// Multiplier in (0, 1]: pow(0.5, age/halfLife) for kinds with a configured
@@ -114,7 +121,6 @@ public enum MemoryRecallScoring {
         // Skills are discovery hints, not the answer corpus. One preferred
         // slot (2026-09-22: a third took 4 of 12 recall slots); scarce-fact /
         // skill-only results still fill from deferred hints.
-        let preferredSkillLimit = 1
         var out: [Candidates.Element] = []
         var deferredSkills: [Candidates.Element] = []
         var skillCount = 0

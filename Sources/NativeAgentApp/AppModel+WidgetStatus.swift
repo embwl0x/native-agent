@@ -19,6 +19,8 @@ extension AppModel {
             let board = await engine.desk.loadBoard(includeOverview: true)
             let overview = board.overview!
             setIfChanged(\.ownerWaitingCount, overview.unavailable.isEmpty ? overview.needsYouCount : nil)
+            setIfChanged(\.ownerWaitingKinds, overview.unavailable.isEmpty && overview.omittedNeedsYou == 0
+                ? Dictionary(grouping: overview.needsYou, by: \.reference.kind).mapValues(\.count) : nil)
             if let items = board.deskState?.items { await engine.deviceSync?.evaluateNeedsUser(items: items) }
             if #available(macOS 27, *) { await publishWidgetStatus(board) }
         } while workStatusDirty
@@ -49,6 +51,9 @@ extension AppModel {
                 return movement.lastMovementAt <= now && now.timeIntervalSince(movement.lastMovementAt) < DeskActivityState.movementWindow
             }
             let evidence = DeskMovementPresentation.evidence(executions.items)
+            // Each item's activity once, and only if the chain below gets that
+            // far; it was re-derived for every item in each of six passes.
+            lazy var activities = desk.map { ($0, DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now)) }
             let work = executions.items.filter({
                 DeskActivityState.execution(.init(deskHandle: $0.deskHandle, status: $0.status, updatedAt: $0.updatedAt, lastMovementAt: $0.lastMovementAt), now: now) == .working
             }).max(by: { ($0.lastMovementAt ?? "") < ($1.lastMovementAt ?? "") })
@@ -66,17 +71,17 @@ extension AppModel {
                 activityExpiresAt = DeskActivityState.movementDate(work.lastMovementAt)?.addingTimeInterval(DeskActivityState.movementWindow)
             } else if !busy.isEmpty {
                 status = "Activity unconfirmed"
-            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .stale }) {
+            } else if activities.contains(where: { $0.1 == .stale }) {
                 status = "Stale work — activity unconfirmed"
-            } else if desk.contains(where: { !$0.status.isTerminal && DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .unknown }) {
+            } else if activities.contains(where: { !$0.0.status.isTerminal && $0.1 == .unknown }) {
                 status = "Activity unknown"
-            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .queued }) {
+            } else if activities.contains(where: { $0.1 == .queued }) {
                 status = "Work queued"
-            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .watching }) {
+            } else if activities.contains(where: { $0.1 == .watching }) {
                 status = "Watching"
-            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .deferred }) {
+            } else if activities.contains(where: { $0.1 == .deferred }) {
                 status = "Work deferred"
-            } else if desk.contains(where: { DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now) == .blocked }) {
+            } else if activities.contains(where: { $0.1 == .blocked }) {
                 status = "Work blocked"
             } else {
                 status = "Activity unknown"

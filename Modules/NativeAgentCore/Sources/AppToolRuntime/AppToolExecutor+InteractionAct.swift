@@ -622,7 +622,7 @@ extension AppToolExecutor {
                     onlyAddingAxes: true
                 )
             } catch {
-                NSLog("[interaction_act] grant failed for \(capability): \(error)")
+                nativeLog("[interaction_act] grant failed for \(capability): \(error)")
             }
         }
         await Self.applyMacControlCategoryGrant(
@@ -644,7 +644,7 @@ extension AppToolExecutor {
     ) async {
         guard !categories.isEmpty else { return }
         guard InlineInteractionRegistry.macControlPostureAllowsCategories(dataRoot: dataRoot) else {
-            NSLog("[\(logTag)] mac control grant refused: posture does not allow categories")
+            nativeLog("[\(logTag)] mac control grant refused: posture does not allow categories")
             return
         }
         var block: [String: Any] = ["enabled": true]
@@ -675,7 +675,7 @@ extension AppToolExecutor {
             )
             appModel.applySavedTrustPolicy(saved, status: "Mac control policy saved")
         } catch {
-            NSLog("[\(logTag)] mac control grant failed: \(error)")
+            nativeLog("[\(logTag)] mac control grant failed: \(error)")
         }
     }
 
@@ -706,7 +706,7 @@ extension AppToolExecutor {
         } catch {
             // The resolver re-reads the owner, so a refused write fails the
             // card in the owner's own words rather than settling it.
-            NSLog("[\(logTag)] capability flag write failed for \(policyKey): \(error)")
+            nativeLog("[\(logTag)] capability flag write failed for \(policyKey): \(error)")
         }
     }
 
@@ -782,7 +782,7 @@ extension AppToolExecutor {
         // state after the write — the same trail app_page_read page=chat now
         // shows, out of the same live objects.
         var body = await appModel.composerState(sessionId: sessionId)
-        body["status"] = .string("ok")
+        body["status"] = .string(outcome.status)
         body["target"] = .string("composer")
         body["verb"] = .string(verb)
         body["element"] = .string(outcome.element)
@@ -828,6 +828,11 @@ extension AppToolExecutor {
     private func composerGate(
         verb: String, input: [String: JSONValue], host: any QuietToolHost
     ) async -> Result<(QuietPosture?, [URL]), GateRefusal> {
+        if verb == "send", ChatToolSessionContext.forbidsSending(ChatToolSessionContext.userText ?? ""),
+           let refusal = await AppDoorReentry.validate?("interaction_act",
+                input.merging(["target": .string("composer"), "verb": .string("send")]) { _, new in new }) {
+            return .failure(GateRefusal(answer: refusal))
+        }
         let dataRoot = host.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         var posture: QuietPosture?
         if verb != "check_updates" {
@@ -875,7 +880,7 @@ extension AppToolExecutor {
         }
     }
 
-    private struct AttachmentRefusal: Error { let reason: String; let detail: String }
+    struct AttachmentRefusal: Error { let reason: String; let detail: String }
 
     private static func attachmentPaths(_ value: JSONValue?) -> [String] {
         switch value {
@@ -887,8 +892,8 @@ extension AppToolExecutor {
 
     /// The fence `read_file` keeps, for a file the agent attaches: it must sit
     /// in a Trust workspace root unless this Mac is in Full Mac. A relative
-    /// path is read against her workspace, as `read_file` reads it.
-    private static func fencedAttachment(
+    /// path is read against her workspace, as `read_file` reads it. make.add keeps it too.
+    static func fencedAttachment(
         _ raw: String, fullMac: Bool, dataRoot: URL
     ) async -> Result<URL, AttachmentRefusal> {
         let expanded = HomePath.expand(raw)

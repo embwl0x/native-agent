@@ -81,12 +81,13 @@ extension BackgroundLoopsAssembly {
                 )
             },
             approvalResolver: { id, decision, provenance in
-                _ = try await NativeClient(baseURL: "").resolveApproval(
+                _ = try await NativeClient().resolveApproval(
                     id: id, decision: decision.rawValue, provenance: provenance
                 )
             }
         )
         TelegramApprovalFilerRef.shared.configure(approvalFiler)
+        Task { await ApprovalChatCards.promptPending(dataRoot: dataRoot, telegram: approvalFiler) }
         // Keep the exact Telegram profile and approval filer resident for the
         // loop lifetime. Routing/policy remain per-turn snapshots; only the
         // stateless orchestration graph and schema caches are reused.
@@ -247,6 +248,9 @@ final class TelegramApprovalFilerRef: @unchecked Sendable {
     private let lock = NSLock()
     private var filer: TelegramApprovalFiler?
 
-    func configure(_ filer: TelegramApprovalFiler) { lock.withLock { self.filer = filer } }
+    func configure(_ filer: TelegramApprovalFiler) {
+        lock.withLock { self.filer = filer }
+        ApprovalChatCards.useTelegram(filer)
+    }
     func current() -> TelegramApprovalFiler? { lock.withLock { filer } }
 }

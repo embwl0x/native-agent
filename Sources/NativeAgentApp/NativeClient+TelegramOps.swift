@@ -14,6 +14,7 @@ enum TelegramConfigurationError: Error, Equatable, LocalizedError, Sendable {
     case invalidAllowedUserID(String)
     case existingConfigurationUnreadable
     case persistenceFailed(String)
+    case destinationRequired
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +26,8 @@ enum TelegramConfigurationError: Error, Equatable, LocalizedError, Sendable {
             return "saved Telegram settings are unreadable; refusing to overwrite them"
         case .persistenceFailed(let detail):
             return "Telegram settings could not be saved: \(detail)"
+        case .destinationRequired:
+            return "Add an allowed chat or user ID before turning Telegram on. Send your bot a message, then use Check sender in Telegram setup to find your ID."
         }
     }
 }
@@ -50,9 +53,10 @@ extension NativeClient {
         // the existing on-disk token so the IDs the user just edited don't
         // wipe out the stored token. Clear is still explicit via clearToken.
         let root = dataRoot ?? dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        try Self.validateExistingTelegramConfiguration(at: root)
-        let existing = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root)
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let existing = try TelegramBot.TelegramConfig.loadSavedConfiguration(
+            dataRoot: root, resolveCredential: !clearToken && trimmedToken.isEmpty
+        )
         let effectiveToken: String = {
             if clearToken { return "" }
             if !trimmedToken.isEmpty { return trimmedToken }
@@ -71,6 +75,9 @@ extension NativeClient {
         // and an empty effectiveToken both force enabled=false; otherwise the
         // caller's explicit `enabled` arg wins.
         let effectiveEnabled = !clearToken && !effectiveToken.isEmpty && enabled
+        guard !effectiveEnabled || !chatIds.isEmpty || !userIds.isEmpty else {
+            throw TelegramConfigurationError.destinationRequired
+        }
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedEffort = reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
         let migratedModel = trimmedModel.isEmpty ? existing?.model : trimmedModel
@@ -113,6 +120,19 @@ extension NativeClient {
         }
     }
 
+    /// One owner-requested read, with no command dispatch or sender admission.
+    func discoverTelegramSenders(token: String) async throws -> Int {
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let saved = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: root)
+        guard saved?.enabled != true else {
+            throw TelegramConfigurationError.persistenceFailed("Turn Telegram off and save before checking senders; the active poller already records blocked senders.")
+        }
+        let typed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effective = typed.isEmpty ? (saved?.botToken ?? "") : typed
+        guard !effective.isEmpty else { throw TelegramConfigurationError.persistenceFailed("Enter or save your bot token first.") }
+        return try await TelegramPollLoop.discoverSenders(token: effective, dataRoot: root)
+    }
+
     private static func telegramIDs(
         _ rawIDs: [String],
         invalid: (String) -> TelegramConfigurationError
@@ -126,27 +146,6 @@ extension NativeClient {
             ids.insert(id)
         }
         return ids
-    }
-
-    /// A present configuration is authority data, not an invitation to
-    /// bootstrap over corrupt bytes. `TelegramConfig.loadFromDisk` deliberately
-    /// returns nil for both absent and invalid files, so distinguish those
-    /// cases before inheriting a saved token or replacing the configuration.
-    private static func validateExistingTelegramConfiguration(at root: URL) throws {
-        try TelegramBot.TelegramConfig.validateSavedConfiguration(dataRoot: root)
-        let url = root
-            .appendingPathComponent("telegram", isDirectory: true)
-            .appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        guard let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let fields = object as? [String: Any],
-              let token = (fields["bot_token"] ?? fields["token"]) as? String
-        else {
-            throw TelegramConfigurationError.existingConfigurationUnreadable
-        }
-        // Empty is a valid explicit-clear state. A non-string token is not.
-        _ = token
     }
 
     func testTelegram(

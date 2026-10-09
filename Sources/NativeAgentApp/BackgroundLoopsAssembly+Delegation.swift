@@ -17,9 +17,8 @@ extension BackgroundLoopsAssembly {
 }
 
 extension AppBackgroundWorkPort: DelegationBackgroundWorkPort {
-    func retryRequestedResults(dataRoot: URL) async {
-        do { try await AttentionRouter.shared.retryRequestedResults(dataRoot: dataRoot) }
-        catch { NSLog("requested_result: delegation delivery retry failed: %@", error.localizedDescription) }
+    func retryRequestedResults(dataRoot: URL) async throws {
+        try await AttentionRouter.shared.retryRequestedResults(dataRoot: dataRoot)
     }
 
     var agentSubject: String { AgentVoice.live.subject }

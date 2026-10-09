@@ -6,6 +6,7 @@ import CryptoKit
 #endif
 #if canImport(AppKit)
 import AppKit
+import IOKit.hidsystem
 #endif
 
 extension SwiftNativeMacControl {
@@ -261,6 +262,79 @@ extension SwiftNativeMacControl {
         )
     }
 
+    func handleVolume(_ body: [String: JSONValue]) async throws -> MacControlResult {
+        let level = Self.intValue(body, "level"), adjust = Self.intValue(body, "adjust")
+        guard !(level != nil && adjust != nil),
+              level.map({ (0...100).contains($0) }) ?? true,
+              adjust.map({ (-100...100).contains($0) }) ?? true else {
+            throw MacControlError.missingField("level 0–100 or adjust −100–100, not both")
+        }
+        var commands: [String] = []
+        if let level { commands.append("set volume output volume \(level)") }
+        if let adjust {
+            commands.append("set v to (output volume of (get volume settings)) + (\(adjust))")
+            commands.append("if v < 0 then set v to 0")
+            commands.append("if v > 100 then set v to 100")
+            commands.append("set volume output volume v")
+        }
+        if case .bool(let muted)? = body["muted"] { commands.append("set volume output muted \(muted)") }
+        commands.append("return ((output volume of (get volume settings)) as string) & \"|||\" & ((output muted of (get volume settings)) as string)")
+        let started = now()
+        let raw = try await appleScriptAdapter.run(script: commands.joined(separator: "\n"))
+        let parts = raw.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "|||")
+        guard parts.count == 2, let observed = Int(parts[0]), ["true", "false"].contains(parts[1]) else {
+            throw MacControlError.malformedResponse("volume readback")
+        }
+        return MacControlResult(ok: true, action: "volume",
+            output: .object(["level": .int(Int64(observed)), "muted": .bool(parts[1] == "true"),
+                             "effects": .string(commands.count == 1 ? "none" : "occurred")]),
+            error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true)
+    }
+
+    func handleMedia(_ body: [String: JSONValue]) async throws -> MacControlResult {
+        guard let action = body.stringValue("action")?.lowercased(),
+              ["play", "resume", "pause", "toggle", "next", "skip", "previous"].contains(action) else {
+            throw MacControlError.missingField("action: play, resume, pause, toggle, next, skip or previous")
+        }
+        #if canImport(AppKit)
+        let started = now()
+        func states() async throws -> [String: JSONValue] {
+            var result: [String: JSONValue] = [:]
+            for (name, id) in [("Music", "com.apple.Music"), ("Spotify", "com.spotify.client")] {
+                guard !NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty else { continue }
+                do {
+                    let state = try await appleScriptAdapter.run(script: """
+                    if application id "\(id)" is running then
+                        tell application id "\(id)" to return player state as text
+                    end if
+                    """)
+                    result[name] = .object(["player_state": .string(state.isEmpty ? "not_running" : state)])
+                } catch is CancellationError { throw CancellationError() }
+                catch { result[name] = .object(["error": .string(error.localizedDescription)]) }
+            }
+            return result
+        }
+        let before = try await states()
+        let key = ["next", "skip"].contains(action) ? NX_KEYTYPE_NEXT : action == "previous" ? NX_KEYTYPE_PREVIOUS : NX_KEYTYPE_PLAY
+        let events = [0xA, 0xB].compactMap { state in
+            NSEvent.otherEvent(with: .systemDefined, location: .zero,
+                modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(state << 8)), timestamp: 0,
+                windowNumber: 0, context: nil, subtype: 8, data1: (Int(key) << 16) | (state << 8), data2: -1)?.cgEvent
+        }
+        guard events.count == 2 else { throw MacControlError.malformedResponse("system media key could not be created") }
+        try Task.checkCancellation()
+        for event in events { event.post(tap: .cghidEventTap) }
+        let after = try await states()
+        return MacControlResult(ok: true, action: "media",
+            output: .object(["action": .string(action), "key_sent": .string(key == NX_KEYTYPE_PLAY ? "play_pause" : action == "previous" ? "previous" : "next"),
+                "before": .object(before), "after": .object(after), "playback_state_confirmed": .bool(false),
+                "message": .string("System media key sent to the Now Playing app. Play/pause is a toggle. Music and Spotify states, when available, are observations; the Now Playing owner and other apps' playback state cannot be confirmed.")]),
+            error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true)
+        #else
+        throw MacControlError.malformedResponse("system media keys require macOS")
+        #endif
+    }
+
     // MARK: applescript
 
     func handleAppleScript(_ body: [String: JSONValue]) async throws -> MacControlResult {
@@ -314,7 +388,7 @@ extension SwiftNativeMacControl {
         if let rawPid = Self.intValue(body, "pid") {
             return await handleFocusExact(pid: Int32(clamping: rawPid), body: body)
         }
-        if let continuation = MacWorkContinuation.current, continuation.isPending {
+        if let continuation = MacWorkContinuation.current, continuation.isPending, body["background"] != .bool(true) {
             if let refusal = continuation.refusal() {
                 return MacControlResult(ok: false, action: "focus_app",
                     output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
@@ -331,6 +405,15 @@ extension SwiftNativeMacControl {
         let started = now()
         do {
             try Task.checkCancellation()
+            // `go` without front: running already, or launched behind.
+            if body["background"] == .bool(true) {
+                let result = try await appControlAdapter.launchApp(named: app)
+                return MacControlResult(
+                    ok: true, action: "focus_app",
+                    output: appControlOutput(result, status: result.launched ? "launched" : "running", verified: false),
+                    error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true
+                )
+            }
             let result = try await appControlAdapter.focusApp(named: app)
             // A cold launch takes a few seconds to come forward; look again
             // briefly before calling the switch failed.
@@ -499,7 +582,7 @@ extension SwiftNativeMacControl {
             throw MacControlError.missingField("url")
         }
         let started = now()
-        let accepted = await openTargetAdapter.requestOpen(url)
+        let accepted = await openTargetAdapter.requestOpen(url, background: body["background"] == .bool(true))
         return MacControlResult(
             ok: accepted,
             action: "open_target",
@@ -598,12 +681,20 @@ extension SwiftNativeMacControl {
             .filter { MacControlSensitivePathFence.reason(forPath: $0) == nil }
             .prefix(limit)
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
+        let iso = ISO8601DateFormatter()
+        let files: [JSONValue] = lines.map { path in
+            let dates = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.contentModificationDateKey, .addedToDirectoryDateKey])
+            return .object(["path": .string(path),
+                "modified_at": dates?.contentModificationDate.map { .string(iso.string(from: $0)) } ?? .null,
+                "added_at": dates?.addedToDirectoryDate.map { .string(iso.string(from: $0)) } ?? .null])
+        }
         return MacControlResult(
             ok: result.exitCode == 0 && !result.timedOut,
             action: "spotlight",
             output: .object([
                 "query": .string(query),
                 "results": .array(lines.map { .string($0) }),
+                "files": .array(files),
                 "count": .int(Int64(lines.count)),
                 "timed_out": .bool(result.timedOut),
                 "stdout_truncated": .bool(result.stdoutTruncated),

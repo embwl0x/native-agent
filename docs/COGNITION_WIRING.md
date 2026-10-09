@@ -39,7 +39,8 @@ flowchart TD
     E --> SUB["CognitiveSubstrate"]
     E --> BUS["SomaticSignalBus"]
     BUS --> O["OrganismKernel"]
-    T --> A["Shared after-turn interpretation"]
+    T --> N["After-turn novelty gate"]
+    N -->|admitted| A["Shared after-turn interpretation"]
     A --> Q["Memory proposals"]
     Q -->|review| M
     A -->|affect| SUB
@@ -61,9 +62,9 @@ flowchart TD
 | Turn lifecycle → core execution | `EngineRuntime/EngineTurns.swift` exposes `TurnsFacade` and its `MacChatTurnRuntime`; `ChatTurnRuntime/ChatOrchestration+TurnEngine.swift` prepares provider/context inputs. | Core admission, cancellation and checked provider routing. |
 | Persisted turn → cognitive event | `ChatTurnRuntime/ChatOrchestrationClient+MessagePersistence.swift` → `Cognition/NativeCognitionRuntime.observe`. | Redacted evidence and explicit turn kind/origin; exact replay does not repeat state changes. |
 | Cognitive event → body | `CognitiveSubstrate/Organism/OrganismSignalBus.swift` → `CognitiveSomaticSignalAdapter` → `OrganismKernel.ingest`. | Bounded metadata; debug/verification and body-originated resolution events are excluded. |
-| Shared interpretation → facts, moments, affect and care | `MemoryV2/MemoryV2+AdaptivePromoter.swift` calls `ChatTurnRuntime/MindMemoryManager.swift`; callbacks installed by `NativeCognitionRuntime.refreshConfiguration` finish cognition processing. | Lane switches, origin matching, candidate screening, proposal review and caring encounter admission. |
+| Shared interpretation → facts, moments, affect and care | `MemoryV2/MemoryV2+AdaptivePromoter.swift` calls `ChatTurnRuntime/MindMemoryManager.swift`; callbacks installed by `NativeCognitionRuntime.refreshConfiguration` finish cognition processing. | Novelty gate before at most one shared model call; lane switches, origin matching, candidate screening, proposal review and caring encounter admission. |
 | Memory → selected context | `ContextFlow/NativeMemoryContextProjection.swift` → Context selector → prepared turn. | Record disclosure, lifecycle eligibility, selection and character budgets. |
-| Body + substrate → capsule/posture | `NativeCognitionRuntime.prepareTurnProjection` → substrate frozen capsule preparation. | One fixed-time projection; presentation is committed after injection. |
+| Body + substrate → capsule/posture | `NativeCognitionRuntime.prepareTurnProjection` → substrate frozen capsule preparation. | One fixed-time projection; successful live turns commit presentation cadence even with an empty capsule, without counting unshown cues as presented. |
 | Selected memory IDs → felt continuity | `ContextFlow/NativeContextMemoryProvenance.swift` → turn delivery accounting → assistant event `memoryRecordIds` → substrate. | Identity stays attached to the exact generation lease; missing mappings do not invent provenance. |
 | Body posture → background work | `OrganismBehaviorPosture.loopBudget` → `NativeCognitionRuntime.backgroundCognitionGate`. | Low-power, thermal and per-lane conserve checks; no chat-admission veto. |
 | Dream/REM commit → replay and reflection | `Cognition/NativeCognitionRuntime+Organism.swift` handles `dreamCompleted`/`remIntegrated`, awaits replay, then schedules reflection. | Replay deadline, reflection single-flight, configuration and resource gates. |
@@ -72,8 +73,11 @@ flowchart TD
 
 Ordinary lived user turns defer their conversational affect interpretation in
 `CognitiveSubstrate+Ingest.swift`. After the turn,
-`AdaptiveMemoryPromoter` asks `MindMemoryManager.interpret` once for fact
-decisions, a possible moment, affect and caring. The available reply supplies
+`AdaptiveMemoryPromoter` first applies `MemoryV2/AfterTurnNoveltyGate.swift`.
+A skip makes no interpretation call, records `noveltySkipReason` and finishes
+the deferred turn with `noveltySkipped=true`. Otherwise it asks
+`MindMemoryManager.interpret` at most once for fact decisions, a possible
+moment, affect and caring. The available reply supplies
 context; affect and caring judge the incoming speaker's words.
 
 `CognitiveSubstrate+CaringEvent.swift` matches the result to the originating
@@ -116,6 +120,15 @@ recall list is empty on that path; a context preparation error fails the turn.
 `app` action `context.expand` reads deeper into a pointer offered by the
 prepared turn, under its generation lease and expansion bounds.
 
+With the default personal recall floor of 0.20, `moment`, `relationship` and
+`lesson_origin` memory atoms leave ordinary competition. The selector reserves
+at most one personal memory row whose query cosine exceeds its own baseline
+by that floor; otherwise none. The baseline is its mean cosine to the
+generation's ordinary memory atoms. This uses an existing memory row and
+character budget, retaining disclosure and provenance checks. A floor of zero
+returns these atoms to ordinary competition. See
+[personality-ablation.md](personality-ablation.md) for the mechanism checklist.
+
 <a id="the-felt-fingerprint--how-you-feel-2026-07-08"></a>
 ## The felt fingerprint — "How you feel:"
 
@@ -125,11 +138,15 @@ substrate affect and optional organism chemistry;
 `CognitiveSubstrate+FeltFingerprint.swift` selects words with intensity and
 compatibility gates.
 
-The body can color the fingerprint and contribute a `- Body:` line.
-Standing views, rumination and Sound have their own bounded capsule inputs and
-cadence. A line removed by fitting must not count as presented.
-`NativeCognitionRuntime.commitTurnProjection` advances live presentation
-state only for the injected projection; previews do not consume that cadence.
+The body can color the fingerprint and contribute a `- Body:` candidate.
+The arbiter chooses one non-rut felt cue or none: settling, since-gap recall,
+reminded-of recall, a relevant view/thread, dream, fingerprint, reflection
+takeaway, body, then Sound echo. An optional separate Sound line can address a
+verbal rut. Private reflection is cadence-exempt and can retain multiple lines.
+`NativeCognitionRuntime.commitTurnProjection` advances the presentation clock
+after a successful live turn, even with an empty capsule. Candidates that lose
+the slot or budget remain owed; they do not count as presented. Previews and
+failed turns do not consume that cadence.
 
 ## Convergence (deliberate ownership)
 

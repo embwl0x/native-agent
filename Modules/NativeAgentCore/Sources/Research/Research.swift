@@ -125,22 +125,32 @@ public struct ResearchFetchRecord: Sendable, Equatable {
             "url": .string(url),
             "text": .string(text),
             "createdAt": .string(createdAt),
+            "untrusted_remote_data": .bool(!text.isEmpty),
         ]
         if let coverage { fields["coverage"] = coverage }
+        if !text.isEmpty {
+            fields["untrusted_remote_data"] = .bool(true)
+            fields["agent"] = .string("web")
+        }
         if let sourceReceipt { fields["source_receipt"] = sourceReceipt }
         if case .object(let details)? = coverage,
            case .string(let extraction)? = details["extraction_status"] {
             switch extraction {
-            case "unsupported_content_type", "unsupported_text_encoding":
+            case "unsupported_content_type", "unsupported_text_encoding",
+                 "file_too_large", "unreadable_document", "encrypted_document", "no_text_in_document":
                 // HTTP receipt success is not successful readable extraction.
                 // Keep that transport evidence in coverage while stating the
                 // actual read outcome at the ordinary tool-result boundary.
                 fields["status"] = .string("failed")
                 fields["reason"] = .string(extraction)
-            case "html_text", "plain_text", "empty_text":
+            case "html_text", "plain_text", "empty_text", "pdf_text":
                 if case .bool(let complete)? = details["complete"] {
                     fields["status"] = .string(complete ? "completed" : (text.isEmpty ? "failed" : "partial"))
                     if !complete && text.isEmpty { fields["reason"] = .string("incomplete_empty_extraction") }
+                }
+                if details["thin_page"] == .bool(true) {
+                    fields["reason"] = .string("thin_page")
+                    fields["hint"] = details["hint"]
                 }
             default: break
             }
@@ -257,6 +267,7 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
     case notConfigured
     /// Non-2xx response or unparseable body.
     case malformedResponse(String)
+    case httpStatus(Int)
     case transport(String)
     case localServerNotRunning(String)
 
@@ -268,6 +279,13 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
             return "Web search is not configured. Open a known website in Browser, or set up a search connection."
         case .malformedResponse(let detail):
             return "The source could not be read: \(detail.prefix(400)). Check the address or open it in Browser."
+        case .httpStatus(let status):
+            return "HTTP \(status) refused this public read."
+        case .transport(let detail) where detail.range(of: #"Code=-120[0-6]\b"#, options: .regularExpression) != nil:
+            // 10-08: a search hit was a lookalike mirror; its certificate failed
+            // and the raw NSError dump read as "the site is down".
+            return "The site's security certificate is not valid for this address, so nothing was read. It may not be "
+                + "the site it looks like; prefer the official domain."
         case .transport(let detail):
             return "The source could not be reached: \(detail.prefix(400)). Check the connection or open it in Browser."
         case .localServerNotRunning:

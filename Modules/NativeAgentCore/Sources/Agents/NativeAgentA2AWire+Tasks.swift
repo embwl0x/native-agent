@@ -7,6 +7,7 @@ import Darwin
 import CoreFoundation
 import ProviderRouting
 import CryptoKit
+import SQLite3
 
 public enum AgentContactTaskState: String, Codable, Sendable {
     case submitted, working, inputRequired = "input-required", completed, failed, canceled
@@ -235,7 +236,7 @@ public actor AgentContactTasks {
             var existing = stat()
             guard records[id] == nil,
                   Darwin.lstat(retainedURL(id: id, owner: principal.id).path, &existing) != 0,
-                  errno == ENOENT else {
+                  errno == ENOENT, try archivedTask(id: id, owner: principal.id) == nil else {
                 throw AgentContactFailure(code: -32602, message: "That request already has retained task evidence. Read its result; do not resend.")
             }
             if records.count >= capacity {
@@ -297,6 +298,8 @@ public actor AgentContactTasks {
         }
         completions[artifactID] = accepted
         task.delegatedCompletions = completions
+        // A late completion is a new retained payload, not an expired receipt.
+        task.replyPayloadExpired = nil
         task.updated = Date()
         guard try JSONEncoder().encode(task).count <= AgentContactPart.maximumOutputBytes * 2 else {
             throw AgentContactFailure(code: -32602, message: "The retained reply reached its size limit")
@@ -314,6 +317,7 @@ public actor AgentContactTasks {
         guard NativeAgentA2AWire.locator(id) != nil else { throw AgentContactFailure.missing }
         let url = retainedURL(id: id, owner: owner)
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        if fd < 0, errno == ENOENT, let task = try archivedTask(id: id, owner: owner) { return task }
         guard fd >= 0 else { throw AgentContactFailure.missing }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
@@ -457,6 +461,16 @@ public actor AgentContactTasks {
     }
 
     private func retain(_ task: AgentContactTask) throws {
+        if task.state.terminal, task.replyPayloadExpired == true || !task.hasReplyPayload {
+            var receipt = task
+            receipt.replyPayloadExpired = true
+            try archiveTasks([receipt])
+            let url = retainedURL(id: task.id, owner: task.owner)
+            if Darwin.unlink(url.path) != 0, errno != ENOENT {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            return
+        }
         let url = retainedURL(id: task.id, owner: task.owner)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
@@ -473,6 +487,7 @@ public actor AgentContactTasks {
     private func compactReplyPayloads() throws {
         let directory = dataRoot.appendingPathComponent("agents/a2a-replies")
         var retained: [(URL, Date)] = []
+        var expired: [(URL, AgentContactTask)] = []
         for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
             where url.pathExtension == "json" {
             var info = stat()
@@ -480,7 +495,17 @@ public actor AgentContactTasks {
                   info.st_size <= AgentContactPart.maximumOutputBytes * 2,
                   let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url)),
                   retainedURL(id: task.id, owner: task.owner) == url,
-                  task.state.terminal, task.hasReplyPayload else { continue }
+                  task.state.terminal else { continue }
+            if task.replyPayloadExpired == true {
+                expired.append((url, task))
+                continue
+            }
+            if !task.hasReplyPayload {
+                var receipt = task
+                receipt.replyPayloadExpired = true
+                expired.append((url, receipt))
+                continue
+            }
             retained.append((url, task.updated))
         }
         for (url, updated) in retained.sorted(by: { $0.1 < $1.1 }).prefix(max(0, retained.count - capacity)) {
@@ -496,8 +521,113 @@ public actor AgentContactTasks {
             compact.failure = nil
             compact.replyPayloadExpired = true
             compact.detail = "The saved reply has expired. This task's outcome is retained; do not resend automatically."
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(compact), to: url)
-            records[compact.id]?.task = compact
+            expired.append((url, compact))
+        }
+        // Commit all indexed receipts before deleting their payload files.
+        // A crash between these steps leaves a repeatable migration.
+        if !expired.isEmpty {
+            try archiveTasks(expired.map(\.1))
+            for (url, task) in expired {
+                try FileManager.default.removeItem(at: url)
+                records[task.id]?.task = task
+            }
+        }
+    }
+
+    private func withReceiptDatabase<Value>(_ body: (OpaquePointer) throws -> Value) throws -> Value {
+        let directory = dataRoot.appendingPathComponent("agents/a2a-receipts")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let url = directory.appendingPathComponent("outcomes.sqlite")
+        var info = stat()
+        let exists = Darwin.lstat(url.path, &info) == 0
+        guard exists ? info.st_mode & S_IFMT == S_IFREG && info.st_size > 0 : errno == ENOENT else {
+            throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
+        }
+        var handle: OpaquePointer?
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOFOLLOW | (exists ? 0 : SQLITE_OPEN_CREATE)
+        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK,
+              let database = handle else {
+            if let handle { sqlite3_close(handle) }
+            throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
+        }
+        defer { sqlite3_close(database) }
+        if !exists {
+            guard sqlite3_exec(database, "CREATE TABLE outcomes (key TEXT PRIMARY KEY, receipt BLOB NOT NULL)", nil, nil, nil) == SQLITE_OK else {
+                throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
+            }
+        }
+        var schema: OpaquePointer?
+        defer { sqlite3_finalize(schema) }
+        guard sqlite3_prepare_v2(database, "SELECT key, receipt FROM outcomes LIMIT 0", -1, &schema, nil) == SQLITE_OK,
+              sqlite3_step(schema) == SQLITE_DONE else {
+            throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        guard sqlite3_exec(database, "PRAGMA synchronous=FULL", nil, nil, nil) == SQLITE_OK else {
+            throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
+        }
+        return try body(database)
+    }
+
+    private func archivedTask(id: String, owner: String) throws -> AgentContactTask? {
+        let url = dataRoot.appendingPathComponent("agents/a2a-receipts/outcomes.sqlite")
+        var info = stat()
+        if Darwin.lstat(url.path, &info) != 0, errno == ENOENT { return nil }
+        return try withReceiptDatabase { database in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(database, "SELECT receipt FROM outcomes WHERE key = ?", -1, &statement, nil) == SQLITE_OK else {
+                throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
+            }
+            defer { sqlite3_finalize(statement) }
+            let key = retainedURL(id: id, owner: owner).deletingPathExtension().lastPathComponent
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            guard sqlite3_bind_text(statement, 1, key, -1, transient) == SQLITE_OK else {
+                throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
+            }
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { return nil }
+            let count = Int(sqlite3_column_bytes(statement, 0))
+            guard result == SQLITE_ROW, count > 0, count <= AgentContactPart.maximumOutputBytes * 2,
+                  let bytes = sqlite3_column_blob(statement, 0),
+                  let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(bytes: bytes, count: count)),
+                  task.id == id, task.owner == owner, task.state.terminal, task.replyPayloadExpired == true else {
+                throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
+            }
+            return task
+        }
+    }
+
+    private func archiveTasks(_ tasks: [AgentContactTask]) throws {
+        try withReceiptDatabase { database in
+            guard sqlite3_exec(database, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+                throw AgentContactFailure(code: -32603, message: "The reply could not be saved. Do not resend automatically.")
+            }
+            var committed = false
+            defer { if !committed { sqlite3_exec(database, "ROLLBACK", nil, nil, nil) } }
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(database, "INSERT INTO outcomes (key, receipt) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET receipt = excluded.receipt", -1, &statement, nil) == SQLITE_OK else {
+                throw AgentContactFailure(code: -32603, message: "The reply could not be saved. Do not resend automatically.")
+            }
+            defer { sqlite3_finalize(statement) }
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            for task in tasks {
+                let key = retainedURL(id: task.id, owner: task.owner).deletingPathExtension().lastPathComponent
+                let data = try JSONEncoder().encode(task)
+                sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
+                let bound = data.withUnsafeBytes { bytes in
+                    sqlite3_bind_blob(statement, 2, bytes.baseAddress, Int32(bytes.count), transient)
+                }
+                guard sqlite3_bind_text(statement, 1, key, -1, transient) == SQLITE_OK,
+                      bound == SQLITE_OK, sqlite3_step(statement) == SQLITE_DONE else {
+                    throw AgentContactFailure(code: -32603, message: "The reply could not be saved. Do not resend automatically.")
+                }
+            }
+            guard sqlite3_exec(database, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+                throw AgentContactFailure(code: -32603, message: "The reply could not be saved. Do not resend automatically.")
+            }
+            committed = true
         }
     }
 
@@ -759,7 +889,16 @@ public actor AgentContactTasks {
 
     private func finish(_ id: String, outcome: AgentContactOutcome) {
         guard var record = records[id], !record.task.state.terminal else { return }
-        let parts = outcome.parts.compactMap { $0.accepted(in: record.acceptedOutputModes) }
+        var parts = outcome.parts.compactMap { $0.accepted(in: record.acceptedOutputModes) }
+        if outcome.state == .failed, parts.isEmpty, !record.cancelling {
+            if let recovered = try? canonicalReply(record.task) {
+                parts = recovered.outcome.parts.compactMap { $0.accepted(in: record.acceptedOutputModes) }
+            }
+            if parts.isEmpty, !record.task.text.isEmpty,
+               let draft = AgentContactPart.text(record.task.text).accepted(in: record.acceptedOutputModes) {
+                parts = [draft]
+            }
+        }
         record.task.state = record.cancelling ? .canceled : outcome.state
         record.task.detail = outcome.detail ?? record.task.detail
         record.task.failure = outcome.failure

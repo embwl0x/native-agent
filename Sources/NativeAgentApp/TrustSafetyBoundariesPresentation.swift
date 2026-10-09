@@ -37,7 +37,11 @@ enum TrustSafetyBoundariesPresentation {
         return State(
             rows: [
                 fileAccessRow(accessMode: accessMode),
-                toolsRow(policy.toolPolicy),
+                // No "Runnable tools" row: `toolPolicy` (auto-run, promote,
+                // risky-tool approval) is read by no gate. Execution follows
+                // toolAutonomy, autonomyDefault and Full Mac, which the
+                // guardrail summary already says; a line here could claim a
+                // boundary the gate does not hold.
                 externalSendRow(policy.connectorPolicy, fullMacActive: AppModel.fullMacGrantIsActive(policy)),
                 macControlRow(TrustGuardrailSummary.effectiveMacControlPolicy(policy)),
                 receiptsRow(policy.workshopPolicy),
@@ -71,55 +75,11 @@ enum TrustSafetyBoundariesPresentation {
         }
     }
 
-    private static func toolsRow(_ tools: TrustToolPolicy?) -> TrustSafetyBoundaryRow {
-        guard let tools,
-              let autoRun = tools.autoRunSafeTools,
-              let riskyApproval = tools.riskyToolApproval else {
-            return TrustSafetyBoundaryRow(
-                id: "tools", title: "Runnable tools", detail: "Tool execution policy is unavailable, so automatic tool boundaries are not confirmed.",
-                systemImage: "hammer", tone: .unavailable
-            )
-        }
-
-        guard autoRun else {
-            return TrustSafetyBoundaryRow(
-                id: "tools", title: "Runnable tools", detail: "Automatic runs for safe tools are off.",
-                systemImage: "hammer", tone: .neutral
-            )
-        }
-
-        let promotion = tools.autoPromoteSafeTools == true
-            ? "Validated safe tools may be promoted and run automatically."
-            : "Already-approved safe tools may run automatically."
-        switch riskyApproval.lowercased() {
-        case "deny":
-            return TrustSafetyBoundaryRow(
-                id: "tools", title: "Runnable tools", detail: promotion + " Risky tools are refused.",
-                systemImage: "hammer", tone: .caution
-            )
-        case "ask", "approval", "approve":
-            return TrustSafetyBoundaryRow(
-                id: "tools", title: "Runnable tools", detail: promotion + " Risky tools stop for approval.",
-                systemImage: "hammer", tone: .caution
-            )
-        case "allow":
-            return TrustSafetyBoundaryRow(
-                id: "tools", title: "Runnable tools", detail: promotion + " Risky tools may also run without an approval stop.",
-                systemImage: "hammer.fill", tone: .danger
-            )
-        default:
-            return TrustSafetyBoundaryRow(
-                id: "tools", title: "Runnable tools", detail: "Risky-tool approval policy \(riskyApproval) is not recognized; automatic boundaries are not confirmed.",
-                systemImage: "hammer", tone: .unavailable
-            )
-        }
-    }
-
     private static func externalSendRow(_ connectors: TrustConnectorPolicy?, fullMacActive: Bool) -> TrustSafetyBoundaryRow {
         if fullMacActive {
             return TrustSafetyBoundaryRow(
                 id: "external_send", title: "External messages",
-                detail: "Admitted Full Mac actions can send messages without an additional app approval. Your connected accounts' own limits still apply. Agents you enabled in Trust inherit your authority. Other agents do not, and their requests can require approval.",
+                detail: "Under Full Mac I can send messages without asking you first. Your connected accounts' own limits still apply. Agents you enabled in Trust inherit your authority. Other agents do not, and their requests can require approval.",
                 systemImage: "paperplane.fill", tone: .caution
             )
         }
@@ -162,16 +122,24 @@ enum TrustSafetyBoundariesPresentation {
             )
         }
 
-        let unguarded = grantedRiskCategories(mac).filter { !mac.approvalRequiredFor.contains($0.key) }
-        if unguarded.isEmpty {
-            return TrustSafetyBoundaryRow(
-                id: "mac_control", title: "Mac control", detail: "Enabled categories: \(TrustGuardrailSummary.sentenceList(granted)). Every enabled risky category requires approval.",
-                systemImage: "macbook", tone: .caution
-            )
-        }
+        // Each granted category is named once, in the words
+        // `grantedMacCategories` uses: either it runs without asking or it
+        // asks first. AppleScript and JavaScript are one "App automation".
+        let riskName = ["shell": "Terminal commands", "file_ops": "Files anywhere on this Mac",
+                        "applescript": "App automation", "jxa": "App automation",
+                        "accessibility": "Clicking and typing"]
+        let risky = grantedRiskCategories(mac)
+        let unguarded = Set(risky.filter { !mac.approvalRequiredFor.contains($0.key) }.compactMap { riskName[$0.key] })
+        let guarded = Set(risky.compactMap { riskName[$0.key] }).subtracting(unguarded)
+        let asks = granted.filter(guarded.contains)
+        let free = granted.filter { !guarded.contains($0) }
+        let detail = [free.isEmpty ? nil : "Runs without asking: \(TrustGuardrailSummary.sentenceList(free)).",
+                      asks.isEmpty ? nil : "Asks you first: \(TrustGuardrailSummary.sentenceList(asks))."]
+            .compactMap { $0 }.joined(separator: " ")
         return TrustSafetyBoundaryRow(
-            id: "mac_control", title: "Mac control", detail: "Enabled categories: \(TrustGuardrailSummary.sentenceList(granted)). These can run without an approval stop: \(unguarded.map(\.title).joined(separator: "; ")).",
-            systemImage: "macbook.badge.exclamationmark", tone: .danger
+            id: "mac_control", title: "Mac control", detail: detail,
+            systemImage: unguarded.isEmpty ? "macbook" : "macbook.badge.exclamationmark",
+            tone: unguarded.isEmpty ? .caution : .danger
         )
     }
 
@@ -191,16 +159,16 @@ enum TrustSafetyBoundariesPresentation {
     private static func receiptsRow(_ workshop: TrustWorkshopPolicy?) -> TrustSafetyBoundaryRow {
         guard let required = workshop?.requireReceipts else {
             return TrustSafetyBoundaryRow(
-                id: "receipts", title: "Workshop receipts", detail: "The workflow receipt policy is unavailable.",
+                id: "receipts", title: "Workflow records", detail: "The workflow record setting is unavailable.",
                 systemImage: "doc.text.magnifyingglass", tone: .unavailable
             )
         }
         return TrustSafetyBoundaryRow(
             id: "receipts",
-            title: "Workshop receipts",
+            title: "Workflow records",
             detail: required
-                ? "Workshop executions must leave receipts for later review."
-                : "Workshop executions are not required to leave receipts.",
+                ? "Every workflow run leaves a record you can check later."
+                : "Workflow runs do not have to leave a record.",
             systemImage: "doc.text.magnifyingglass",
             tone: required ? .neutral : .danger
         )

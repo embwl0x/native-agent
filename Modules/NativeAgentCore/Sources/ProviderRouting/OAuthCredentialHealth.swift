@@ -20,9 +20,15 @@ public struct OAuthCredentialHealth: Sendable {
 public enum ProviderOAuthCredentialMaintenance {
     public static func status(provider: String, root: URL) throws -> OAuthCredentialHealth {
         let path = credentialPath(provider: provider, root: root)
-        let data = try Data(contentsOf: path)
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw CocoaError(.fileReadCorruptFile)
+        let object: [String: Any]
+        if provider == "xai_oauth_direct" {
+            object = try XAIOAuthCredentialStore.read(at: path)
+        } else {
+            let data = try Data(contentsOf: path)
+            guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            object = parsed
         }
         let nested = object["tokens"] as? [String: Any] ?? [:]
         // ChatGPT's adapter accepts only the nested Codex credential shape.
@@ -58,9 +64,10 @@ public enum ProviderOAuthCredentialMaintenance {
             canRefresh: canRefresh,
             requiresRefresh: (provider == "openai_oauth_direct" && expiry == nil)
                 || (provider == "anthropic_oauth_direct" && access.isEmpty)
-                // ChatGPT can use current access without a refresh binding. The
-                // binding still gates canRefresh and the adapter's refresh path.
-                || (provider != "openai_oauth_direct" && hasRefresh && !boundRefresh)
+                // An unbound refresh token can't refresh once access expires:
+                // say so now as a sign-in, not when memory starts failing
+                // (ChatGPT, 10-06: 17 h of silent memory loss).
+                || (hasRefresh && !boundRefresh)
         )
     }
 

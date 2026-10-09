@@ -36,6 +36,8 @@ public final class MacSyncEngine: ObservableObject {
     /// by app/store mutation seams; unchanged passes write nothing and make no
     /// provider calls.
     var snapshotIntegrityTask: Task<Void, Never>?
+    /// The phone's evidence the Mac is up between publications (`NAMacPresence`).
+    var presenceBeatTask: Task<Void, Never>?
     /// Payload-free resident-state subscription. This closes the normal
     /// cognition/organism -> iOS snapshot path without shortening the slow
     /// integrity fallback or adding a polling loop.
@@ -44,6 +46,8 @@ public final class MacSyncEngine: ObservableObject {
     var workActivityObservationTask: Task<Void, Never>?
     var workActivityPublicationTask: Task<Void, Never>?
     var workActivities: [String: MobileWorkActivity] = [:]
+    /// Relays turns another door started in the anchored conversation.
+    var liveTurnRelayTask: Task<Void, Never>?
     var workActivityVersion: UInt64 = 0
     /// Existing chat completion notifications drive one bounded transcript
     /// projection pass. The short coalescer absorbs completion fan-out (for
@@ -246,6 +250,8 @@ public final class MacSyncEngine: ObservableObject {
         /// writes and can step backwards. `nil` (older Mac builds, or a row
         /// never written since this shipped) is never authority to clear.
         var transcriptGeneration: Int?
+        /// The Mac holds rows older than this window (`chat_history_page`).
+        var hasOlder = false
     }
 
     /// One session's published transcript held for reuse (see

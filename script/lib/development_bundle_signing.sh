@@ -44,6 +44,17 @@ nativeagent_resolve_development_signing_identity() {
 
 _nativeagent_sign_nested_plain() {
   local bundle="$1" identity="$2"
+  local signing_root
+  signing_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+  codesign --force --sign "$identity" --options runtime --timestamp=none \
+    "$bundle/Contents/MacOS/codex" || return 1
+  if [[ ! -f "$bundle/Contents/MacOS/NativeAgentSenseHost" ]]; then
+    echo '[sign] Missing NativeAgentSenseHost helper' >&2
+    return 1
+  fi
+  codesign --force --sign "$identity" --options runtime --timestamp=none \
+    --entitlements "$signing_root/Config/NativeAgentSenseHost.entitlements" \
+    "$bundle/Contents/MacOS/NativeAgentSenseHost" || return 1
   if [[ -f "$bundle/Contents/MacOS/nativeagent-link" ]]; then
     codesign --force --sign "$identity" --options runtime --timestamp=none \
       "$bundle/Contents/MacOS/nativeagent-link" || return 1

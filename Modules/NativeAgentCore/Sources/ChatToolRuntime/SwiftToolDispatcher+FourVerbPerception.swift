@@ -8,6 +8,7 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import VisionPerception
+import Senses
 
 struct MacVisualWindowRecord: Sendable, Equatable {
     let ownerPID: Int32
@@ -38,6 +39,9 @@ struct SystemMacVisualObstructionProbe: MacVisualObstructionProbing {
             [.optionOnScreenOnly], kCGNullWindowID
         ) as? [[String: Any]] else { return [] }
         let windows = raw.compactMap { value -> MacVisualWindowRecord? in
+            // Her clicks pass through Shotgun, so it covers nothing of hers.
+            if let number = value[kCGWindowNumber as String] as? Int,
+               PersonOnlyWindows.contains(number: number) { return nil }
             guard let pid = value[kCGWindowOwnerPID as String] as? Int,
                   let layer = value[kCGWindowLayer as String] as? Int,
                   let bounds = value[kCGWindowBounds as String] as? NSDictionary,
@@ -120,7 +124,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         await observe(app: nil)
     }
 
-    func rejected() { pixels?.discard() }
+    func rejected() { pixels?.discard(); SenseAppReadCapture.current?.discardWindowText() }
 
     func observe(app requestedApp: String?) async -> MacFourVerbsSupplement? {
         let observationStartedNs = DispatchTime.now().uptimeNanoseconds
@@ -207,6 +211,15 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             return min(1, (dominantImageFrame.w * dominantImageFrame.h) / visibleArea)
         }()
         let targetPID = Int32(number(app["pid"]) ?? 0)
+        // Chromium content belongs to the renderer's AX read, including a
+        // pending/stalled read. Neither a capped visible-text list nor a large
+        // image inside a readable document may replace that read with pixels.
+        let chromium = MacChromiumAccessibility.looksChromium(bundleId: bundleIdentifier, pid: targetPID, snapshot: nil)
+        let thinReason = chromium || output["accessibility_complete"] == .bool(false) ? nil : Self.thinAccessibilityReason(
+            accessibilityTrusted: accessibilityTrusted, marks: marks, texts: array(output["text"]),
+            windowArea: visibleFrame.map { $0.w * $0.h } ?? 0, canvasFraction: dominantImageFraction,
+            sourceTextCount: number(output["accessibility_text_count"]).map(Int.init),
+            sourceTextCharacters: number(output["accessibility_text_characters"]).map(Int.init))
         let obstructions = (dominantImageFrame ?? visibleFrame).map {
             // Independent-window capture contains no covering app pixels.
             // It remains a background observation, not permission to act.
@@ -217,13 +230,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             let title = displayText(output["window_title"]) ?? ""
             let windowFrame = visibleFrame.map { "\(Int($0.x)),\(Int($0.y)),\(Int($0.w))x\(Int($0.h))" } ?? ""
             pixels.record(
-                reason: Self.thinAccessibilityReason(
-                    accessibilityTrusted: accessibilityTrusted,
-                    marks: marks,
-                    texts: array(output["text"]),
-                    windowArea: visibleFrame.map { $0.w * $0.h } ?? 0,
-                    canvasFraction: dominantImageFraction
-                ),
+                reason: thinReason,
                 screenRecording: bool(output["screen_recording_trusted"]) ?? false,
                 png: string(output["image"]),
                 unavailable: string(output["image_unavailable_reason"]),
@@ -236,7 +243,9 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 window: [bundleIdentifier ?? "", appName ?? "", title, windowFrame].joined(separator: "|")
             )
         }
-        guard Self.shouldCompilePixelPerception(
+        // Chromium renderer content belongs to AX. A pending AX tree is
+        // reported as such; pixels never quietly replace that mechanism.
+        guard !chromium, thinReason != nil, Self.shouldCompilePixelPerception(
             accessibilityTrusted: accessibilityTrusted,
             markCount: marks.count,
             dominantImageFraction: dominantImageFraction
@@ -444,11 +453,22 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         marks: [JSONValue],
         texts: [JSONValue],
         windowArea: Double,
-        canvasFraction: Double?
+        canvasFraction: Double?,
+        sourceTextCount: Int? = nil,
+        sourceTextCharacters: Int? = nil
     ) -> String? {
         guard accessibilityTrusted else { return "no accessibility read" }
-        // AXImage/AXCanvas, or a childless AXWebArea, covering half the window.
+        // A dominant AXImage/AXCanvas (or childless AXWebArea) is unreadable
+        // content even when its surrounding toolbar has plenty of words.
+        // Chromium renderer reads are retained by the caller; window-wide
+        // text counts can only grade windows without a dominant visual body.
         if (canvasFraction ?? 0) >= 0.5 { return "canvas" }
+        if (sourceTextCharacters ?? 0) >= 80 || (sourceTextCount ?? 0) >= 4 { return nil }
+        let visibleCharacters = texts.reduce(0) { total, value in
+            guard case .object(let item) = value, case .string(let text)? = item["text"] else { return total }
+            return total + text.count
+        }
+        if visibleCharacters >= 80 { return nil }
         let unnamedRoles: Set<String> = ["AXGroup", "AXScrollArea", "AXSplitGroup",
                                          "AXLayoutArea", "AXUnknown", "AXWebArea"]
         let roles = marks.compactMap { value -> (role: String, named: Bool)? in
@@ -509,7 +529,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                     label: label, kind: "menu item", states: states, provenance: .ax
                 ))
                 targets.append(MacFourVerbsSupplementalTarget(
-                    label: label, kind: "menu item", frame: rect, provenance: .ax, enabled: enabled
+                    label: label, kind: "menu item", frame: rect, provenance: .ax, enabled: enabled, role: "AXMenuItem",
+                    actions: array(item["actions"]).compactMap(string)
                 ))
             }
         }
@@ -562,7 +583,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 mark: Int(number),
                 ordinal: isRow ? rows.count : nil,
                 sourceAXPath: sourceAXPath,
-                enabled: enabled
+                enabled: enabled,
+                role: role,
+                actions: array(mark["actions"]).compactMap(string),
+                settableAttributes: array(mark["settable_attributes"]).compactMap(string)
             ))
         }
 

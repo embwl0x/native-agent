@@ -220,13 +220,17 @@ package actor ProviderToolResultRecoveryStore {
         turnId: String?,
         query: String? = nil
     ) -> JSONValue {
-        let result = readPage(handle: handle, page: page, sessionId: sessionId, turnId: turnId, query: query)
+        var result = readPage(handle: handle, page: page, sessionId: sessionId, turnId: turnId, query: query)
         if let scope = Scope(sessionId: sessionId, turnId: turnId),
-           case .object(let object) = result, object["status"] == .string("completed") {
+           case .object(var object) = result, object["status"] == .string("completed") {
             let next: Int?
             if case .int(let value)? = object["next_page"] { next = Int(exactly: value) }
             else { next = nil }
             readCursors[scope] = ReadCursor(handle: handle, nextPage: next, query: query)
+            object["full_result_retained"] = .bool(true)
+            object["next_call"] = next == nil ? .null : .object(["tool": .string("app"), "input": .object([
+                "action": .string("result.page"), "args": .object(["continue": .bool(true), "result_handle": .string(handle)])])])
+            result = .object(object)
         }
         return result
     }
@@ -236,12 +240,14 @@ package actor ProviderToolResultRecoveryStore {
     package func continueReading(handle: String?, sessionId: String?, turnId: String?) -> JSONValue {
         cleanupExpired(now: Date())
         guard let scope = Scope(sessionId: sessionId, turnId: turnId) else {
-            return .object(["status": .string("failed"), "reason": .string("missing_result_scope")])
+            return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("missing_result_scope"),
+                "detail": .string("Continuing a result works inside the chat turn that read it; this call has no such turn.")])
         }
         if let cursor = readCursors[scope], handle == nil || handle == cursor.handle {
             guard let next = cursor.nextPage else {
                 return .object(["status": .string("completed"), "result_handle": .string(cursor.handle),
                     "has_more": .bool(false), "reading_complete": .bool(true),
+                    "full_result_retained": .bool(true), "next_call": .null,
                     "recovery_only": .bool(true),
                     "verification_scope": .string("retained_tool_response_not_external_outcome"),
                     "original_result_class": .string(entries[cursor.handle]?.resultClass.rawValue ?? "unknown"),
@@ -254,10 +260,11 @@ package actor ProviderToolResultRecoveryStore {
         guard candidates.count == 1, let entry = candidates.first else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string(candidates.isEmpty ? "result_handle_unavailable" : "choose_result"),
                 "results": .array(candidates.map { .object(["result_handle": .string($0.handle), "tool": .string($0.toolName)]) }),
                 "recovery_hint": .string(candidates.isEmpty
-                    ? "No matching retained result is readable in this turn. Inspect its durable receipt or original status; never repeat a write to recover output."
+                    ? "No matching retained result is readable in this turn. Inline results are not retained; handles expire at turn end. Follow the original read's next arguments if it has more; never repeat a write to recover output."
                     : "Several results are retained. Choose result_handle once; subsequent continue reads keep its position."),
             ])
         }
@@ -417,14 +424,14 @@ package actor ProviderToolResultRecoveryStore {
 extension SwiftToolDispatcher {
     package func impl_tool_result_page(input: [String: JSONValue]) async -> JSONValue {
         if input["continue"] == .bool(true) {
-            // Blank defaults a strict schema fills in (page 0, query "", raw false) select nothing.
+            // Continue owns the position, even when a page is also supplied.
             let blank: (JSONValue?) -> Bool = {
                 if case .string(let text)? = $0 { return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 return [nil, .null, .int(0), .bool(false)].contains($0)
             }
-            guard ["page", "query", "raw"].allSatisfy({ blank(input[$0]) }) else {
+            guard ["query", "raw"].allSatisfy({ blank(input[$0]) }) else {
                 return .object(["status": .string("failed"), "reason": .string("conflicting_read_selection"),
-                    "recovery_hint": .string("Use continue:true alone (optional result_handle), or select an explicit page/query/raw mode. Continue retains the previous mode and position.")])
+                    "recovery_hint": .string("Use continue:true with optional result_handle and page, or omit continue to select an explicit page/query/raw mode. Continue ignores page and retains the previous mode and position.")])
             }
             let handle = jsonString(input["result_handle"])?.trimmingCharacters(in: .whitespacesAndNewlines)
             return await ProviderToolResultRecoveryStore.shared.continueReading(
@@ -434,6 +441,7 @@ extension SwiftToolDispatcher {
         guard case .string(let handle)? = input["result_handle"], !handle.isEmpty else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("missing_result_handle"),
                 "recovery_hint": .string("Copy result_handle from the earlier bounded_tool_result response in this turn."),
             ])
@@ -451,6 +459,7 @@ extension SwiftToolDispatcher {
         guard let page, page >= 0 else {
             return .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("invalid_page"),
                 "recovery_hint": .string("Set page to a whole number starting at 0, or copy next_page from the previous response. Keep result_handle, query and raw unchanged; do not rerun the original operation."),
             ])

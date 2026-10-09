@@ -50,30 +50,27 @@ extension View {
 private let simpleTopFade: CGFloat = 24
 
 extension View {
-    /// A scroll view's pinned top chrome, in its top inset. Simple view's
-    /// header has no backing (a sheet read as a band) and cannot be a
-    /// `safeAreaBar` (it pinned the main thread), so the scrolled words are
-    /// alpha-masked instead. The mask sits inside the inset: its frame is the
-    /// scroll view's safe area, below the header and the title strip, so a
-    /// line fades out over the last `simpleTopFade` points before the header
-    /// and is gone under it. The header is outside the mask and keeps its
-    /// hits. The mask reaches through the bottom inset so lines still pass
-    /// under the composer. Static geometry. Advanced keeps the plain inset.
-    @ViewBuilder
-    func roomTopChrome<Chrome: View>(masked: Bool, @ViewBuilder _ chrome: () -> Chrome) -> some View {
-        if masked {
-            mask(alignment: .top) {
-                VStack(spacing: 0) {
-                    LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                        .frame(height: simpleTopFade)
-                    Color.black
-                }
-                .ignoresSafeArea(edges: .bottom)
+    /// A scroll view's pinned top chrome, in its top inset. The header
+    /// cannot be a `safeAreaBar` (it pinned the main thread), and the
+    /// system's scroll edge effect does not act under a plain inset, so the
+    /// scrolled words are alpha-masked instead, in Simple and Advanced alike
+    /// (Advanced's sheet let lines show through under the header). The mask
+    /// sits inside the inset: its frame is the scroll view's safe area, below
+    /// the header and the title strip, so a line fades out over the last
+    /// `simpleTopFade` points before the header and is gone under it. The
+    /// header is outside the mask and keeps its hits. The mask reaches
+    /// through the bottom inset so lines still pass under the composer.
+    /// Static geometry.
+    func roomTopChrome<Chrome: View>(@ViewBuilder _ chrome: () -> Chrome) -> some View {
+        mask(alignment: .top) {
+            VStack(spacing: 0) {
+                LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                    .frame(height: simpleTopFade)
+                Color.black
             }
-            .safeAreaInset(edge: .top, spacing: 0, content: chrome)
-        } else {
-            safeAreaInset(edge: .top, spacing: 0, content: chrome)
+            .ignoresSafeArea(edges: .bottom)
         }
+        .safeAreaInset(edge: .top, spacing: 0, content: chrome)
     }
 }
 

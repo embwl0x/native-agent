@@ -57,8 +57,8 @@ public final class MacChatSessionTransactions {
         sessions.first(where: { isMainAppSourceKey($0.sourceKey) && $0.archived != true })
     }
 
-    public func create(store: any MacChatSessionStore) async throws -> NativeAgentShared.ChatSession {
-        try await store.create(title: "New Chat", sourceKey: "app")
+    public func create(store: any MacChatSessionStore, title: String = "New Chat") async throws -> NativeAgentShared.ChatSession {
+        try await store.create(title: title, sourceKey: "app")
     }
 
     public func select<Port: MacChatSessionSelectionPort>(

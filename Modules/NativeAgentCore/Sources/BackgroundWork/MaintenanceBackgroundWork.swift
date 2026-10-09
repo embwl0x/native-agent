@@ -9,6 +9,7 @@ import TurnTrace
 import ApprovalInbox
 import WorkshopExecution
 import SelfImprovement
+import NotificationInbox
 
 // MARK: - Maintenance Loops
 
@@ -293,17 +294,36 @@ public struct MaintenanceBackgroundWork: Sendable {
             totalOverBudget: report.totalOverBudget,
             truncated: report.truncated,
             depthTruncated: report.depthTruncated,
+            readFailed: report.readFailed,
             largeDirectories: report.largeDirectories.filter {
                 FileManager.default.fileExists(
                     atPath: dataRoot.appendingPathComponent($0.relativePath).path)
-            }
+            },
+            staticModelBytes: report.staticModelBytes
         )
-        guard report.tripped else { return true }
+        guard report.tripped else {
+            guard !report.truncated, !report.depthTruncated, !report.readFailed else { return true }
+            do {
+                let now = Date()
+                _ = try await LiveNotificationInbox.live(dataRoot: dataRoot).archiveActive(
+                    ids: [diskHygieneCardId], readAt: now.ISO8601Format(), createdNoLaterThan: now,
+                    metadata: ["automatically_resolved": .bool(true)]
+                )
+                return true
+            } catch {
+                nativeLog("Disk hygiene: resolved notice could not be archived: %@", String(describing: error))
+                return false
+            }
+        }
         let now = ISO8601DateFormatter().string(from: Date())
         var lines: [String] = []
         if report.totalOverBudget {
-            lines.append("data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes)) "
+            lines.append("data/ dynamic storage is \(DataRootDiskHygiene.humanSize(report.dynamicBytes)) "
                 + "(over the \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget).")
+        }
+        if report.staticModelBytes > 0 {
+            lines.append("Required embedding model: \(DataRootDiskHygiene.humanSize(report.staticModelBytes)) "
+                + "(accounted separately from dynamic storage).")
         }
         for offender in report.largeDirectories.prefix(10) {
             // A residue store is listed at ANY size and is not a "large branch"
@@ -325,7 +345,7 @@ public struct MaintenanceBackgroundWork: Sendable {
             + lines.joined(separator: "\n")
             + "\n\nClean Up moves only disposable residue to the Trash (recoverable). Other app data is kept.")
         let summary = report.totalOverBudget
-            ? "data/ is \(DataRootDiskHygiene.humanSize(report.totalBytes)); "
+            ? "data/ dynamic storage is \(DataRootDiskHygiene.humanSize(report.dynamicBytes)); "
                 + "\(report.largeFiles.count) large file(s), "
                 + "\(report.largeDirectories.count) large director(ies)"
             : "\(report.largeFiles.count) large file(s), "
@@ -393,7 +413,7 @@ public struct MaintenanceBackgroundWork: Sendable {
             summary = "Nothing to clean — no disposable residue right now"
             lines.append("A fresh scan found no disposable residue. Other app data was kept"
                 + (report.totalOverBudget
-                    ? ", but data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes)) "
+                    ? ", but data/ dynamic storage is \(DataRootDiskHygiene.humanSize(report.dynamicBytes)) "
                         + "(over the \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget) — worth a look by hand."
                     : "; data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes))."))
         } else {
@@ -488,6 +508,7 @@ public struct MaintenanceBackgroundWork: Sendable {
                     }
                     var replacement = card
                     if preserveStatusWhenDetailUnchanged,
+                       obj["automatically_resolved"] != .bool(true),
                        case .object(var newObj) = card,
                        case .string(let newDetail)? = newObj["detail"],
                        case .string(let oldDetail)? = obj["detail"],
@@ -566,18 +587,18 @@ private struct TurnTraceRetentionRunner: LoopRunner {
             // still reported through the NSLog lines and the tick outcome below,
             // which is what anyone actually reads.
             if traceReport.removedDays > 0 || traceReport.removedLocks > 0 {
-                NSLog("turn_trace_retention: removed %d day file(s) and %d lock(s), kept %d day(s)",
+                nativeLog("turn_trace_retention: removed %d day file(s) and %d lock(s), kept %d day(s)",
                       traceReport.removedDays, traceReport.removedLocks, traceReport.keptDays)
             }
             if lockReport.reaped > 0 || lockReport.deferred > 0 || lockReport.failures > 0 {
-                NSLog("file_lock_sidecar_lifecycle: reaped %d orphan lock(s), deferred %d, failures %d",
+                nativeLog("file_lock_sidecar_lifecycle: reaped %d orphan lock(s), deferred %d, failures %d",
                       lockReport.reaped, lockReport.deferred, lockReport.failures)
             }
             if lockReport.failures > 0 {
                 return .failed(error: "lock-sidecar sweep had \(lockReport.failures) failed candidate(s)")
             }
             if backupReport.removed > 0 || backupReport.failures > 0 || backupReport.truncated {
-                NSLog("chat_compaction_backup_retention: removed %d backup(s), scanned %d session(s), failures %d, truncated %@",
+                nativeLog("chat_compaction_backup_retention: removed %d backup(s), scanned %d session(s), failures %d, truncated %@",
                       backupReport.removed, backupReport.sessionsScanned, backupReport.failures,
                       backupReport.truncated.description)
             }
@@ -608,7 +629,7 @@ private struct TurnTraceRetentionRunner: LoopRunner {
                 result: "maintenance retention removed \(swept) artifact(s)"
                     + "\(bounded)\(backupBounded)\(legacyContext)")
         } catch {
-            NSLog("turn_trace_retention: sweep failed: %@", String(describing: error))
+            nativeLog("turn_trace_retention: sweep failed: %@", String(describing: error))
             return .failed(error: String(describing: error))
         }
     }
@@ -661,10 +682,10 @@ private struct OffDiskBackupRunner: LoopRunner {
                 parent: parent,
                 now: now
             )
-            NSLog("offdisk_backup: wrote %@ (%@)", folder.path, trigger)
+            nativeLog("offdisk_backup: wrote %@ (%@)", folder.path, trigger)
             return .completed(result: "off-disk backup \(folder.lastPathComponent) (\(trigger))")
         } catch {
-            NSLog("offdisk_backup: FAILED — Agent has no fresh off-disk copy: %@", String(describing: error))
+            nativeLog("offdisk_backup: FAILED — Agent has no fresh off-disk copy: %@", String(describing: error))
             return .failed(error: "off-disk backup failed: \(error.localizedDescription)")
         }
     }

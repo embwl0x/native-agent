@@ -467,7 +467,7 @@ private enum ProviderDesignSample {
 #endif
 
 /// Provider ids, states and auth modes as words.
-private enum ProviderWords {
+enum ProviderWords {
     static func state(_ raw: String) -> String {
         switch raw {
         case "ready": return "Ready"

@@ -83,7 +83,7 @@ import MacIntegration
 // STEP-5 INTERACTION: results are still appended as ONE user message per
 // iteration, so IntraTurnToolResultClearing ages a parallel batch exactly
 // like a serial one (the sweep counts tool-result MESSAGES, not blocks).
-enum ParallelToolDispatch {
+public enum ParallelToolDispatch {
     /// Concurrency cap per iteration. Anything beyond this queues behind the
     /// window (completion-ordered refill).
     static let maxConcurrentPerIteration = 4
@@ -198,7 +198,7 @@ enum ParallelToolDispatch {
 
     /// The predicate. Input is the INTERNAL tool name (post
     /// ProviderToolNameMap reverse-mapping), matching what dispatch sees.
-    static func isParallelSafe(internalToolName name: String) -> Bool {
+    public static func isParallelSafe(internalToolName name: String) -> Bool {
         // Rule 1: external MCP tools — unknowable side effects.
         if name.hasPrefix("mcp__") { return false }
         // Rule 2 carve-out: the audited READ half of the Full-Mac file

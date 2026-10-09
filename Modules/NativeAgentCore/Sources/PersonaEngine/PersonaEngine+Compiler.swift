@@ -326,8 +326,7 @@ public actor PersonaCompiler {
 
     // MARK: Public API
 
-    /// Honours a per-turn persona override
-    /// (Mac UI's `UserDefaults["chatPersona"]`). When `personaOverride` names
+    /// Honours the shared persona selection. When the selected name identifies
     /// a subdir under the persona root that contains at least one marker doc,
     /// that subdir wins over the on-disk `active.json` / scan resolution.
     /// Override resolution failures fall through to the normal resolver — a
@@ -380,12 +379,14 @@ public actor PersonaCompiler {
         if let surfaceBody = try readSurfaceOverride(root: root, surface: surface) {
             activeDocs["surface:\(surface)"] = surfaceBody
         }
+        // An unreadable profile omits the line; her documents still carry her name.
+        activeDocs["IDENTITY"] = try? Self.identityPrompt(dataRoot: await engine.dataRootURL)
         let compiledSystemPrompt = Self.renderPrompt(
             documents: activeDocs, surface: surface, userMemoryCore: userMemoryCore
         )
 
         // Fingerprint — SHA-256 over (sorted ids + their contents + surface).
-        let fingerprint = computeFingerprint(activeDocs: activeDocs, surface: surface)
+        let fingerprint = Self.fingerprint(documents: activeDocs, surface: surface)
 
         let packet = PersonalityPacket(
             surface: surface,
@@ -418,7 +419,7 @@ public actor PersonaCompiler {
         userMemoryCore: [String]? = nil
     ) -> String {
         let surfaceID = surface.map { "surface:\($0)" }
-        let order = canonicalDocOrder + (surfaceID.map { [$0] } ?? [])
+        let order = ["IDENTITY"] + canonicalDocOrder + (surfaceID.map { [$0] } ?? [])
         return order.compactMap { id -> String? in
             guard let document = documents[id] else { return nil }
             let body = id == "USER"
@@ -428,6 +429,11 @@ public actor PersonaCompiler {
             }
             return body.isEmpty ? nil : "# \(id)\n\(body)"
         }.joined(separator: "\n\n")
+    }
+
+    public static func identityPrompt(dataRoot: URL) throws -> String {
+        let name = agentDisplayName(profile: try compileProfile(dataRoot: dataRoot))
+        return "Your name is \(name). This saved name is authoritative even when your personal documents use an earlier name."
     }
 
     /// ContextFlow source discovery using the exact same active/custom/surface
@@ -491,40 +497,35 @@ public actor PersonaCompiler {
         )
     }
 
-    /// Returns the structured personality profile that the daemon's
-    /// `/v1/personality` endpoint serves. Mirrors Python `personality()` at
-    /// the retired daemon: read `<dataRoot>/memory/profile.json`,
-    /// normalize via `normalize_personality` (L35035-35079) seeded with
-    /// `default_personality()` (L34989-35033). Missing file → defaults.
-    /// Malformed JSON → defaults. Missing fields → defaults per field.
-    ///
-    /// Custom-persona override semantics: `personaKind` outside
-    /// {male, female, ai, custom} falls back to default; "ai" canonicalises
-    /// to "AI", others Title-cased.
-    public func compileProfile(
+    /// Only missing storage receives defaults when compiling authoritative identity.
+    public nonisolated static func compileProfile(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> CompiledPersonalityProfile {
-        return Self.loadProfile(dataRoot: dataRoot)
-    }
-
-    /// Non-isolated load path so callers that already serialize themselves
-    /// (e.g. SwiftNativePersonaEngine.listPersonaDocSpecs) can read the
-    /// profile without spinning up a PersonaCompiler actor + crossing the
-    /// boundary. Identical semantics to `compileProfile`.
-    public nonisolated static func loadProfile(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> CompiledPersonalityProfile {
+    ) throws -> CompiledPersonalityProfile {
         let profileURL = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("profile.json")
-        let raw: [String: Any]
-        if let data = try? Data(contentsOf: profileURL),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            raw = obj
-        } else {
-            raw = [:]
+        do {
+            let data = try Data(contentsOf: profileURL)
+            guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw PersonaEngineError.underlying("The profile must be a JSON object.")
+            }
+            guard raw["name"] == nil || raw["name"] is String else {
+                throw PersonaEngineError.underlying("The profile name must be text.")
+            }
+            return normalize(raw: raw, defaults: .defaults)
+        } catch CocoaError.fileReadNoSuchFile {
+            return normalize(raw: [:], defaults: .defaults)
+        } catch {
+            throw PersonaEngineError.underlying("The saved personality profile is unavailable. Repair or restore access to memory/profile.json before continuing. \(error.localizedDescription)")
         }
-        return normalize(raw: raw, defaults: .defaults)
+    }
+
+    /// Legacy display and trait readers retain their default-seeded projection.
+    /// Authoritative identity and profile editing use the checked compiler.
+    public nonisolated static func loadProfile(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> CompiledPersonalityProfile {
+        (try? compileProfile(dataRoot: dataRoot)) ?? .defaults
     }
 
     // MARK: - agent_display_name() mirror
@@ -591,6 +592,20 @@ public actor PersonaCompiler {
     /// at least one canonical doc.
     private static let personaMarkerDocs: Set<String> = ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"]
 
+    public static func customPersonaNames(root: URL) throws -> [String] {
+        try customPersonaDirectories(root: root, fileManager: .default).map(\.lastPathComponent)
+    }
+
+    private static func customPersonaDirectories(root: URL, fileManager: FileManager) throws -> [URL] {
+        try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey],
+                                           options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants])
+            .filter { dir in
+                (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                    && (try? selectedPersonaDirectory(name: dir.lastPathComponent, root: root)) != nil
+                    && subdirHasMarker(dir, fileManager: fileManager)
+            }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
     /// Returns (kind, id, customSubdirURL?). Selection order:
     ///   1. `<root>/active.json` { "persona": "<Name>" } if present + dir
     ///      exists + dir has at least one marker doc → Custom.
@@ -602,10 +617,10 @@ public actor PersonaCompiler {
         personaOverride: String?,
         fileManager: FileManager
     ) throws -> (kind: String, id: String, subdir: URL?) {
-        // 0. Per-turn override (Mac UI chatPersona pick). Trim, then look
+        // 0. Shared selection. Trim, then look
         //    for a subdir with at least one marker doc. Misses fall through
         //    to the normal resolver so a typo can't blank the persona.
-        if let raw = personaOverride {
+        if let raw = personaOverride ?? PersonaSelection.current() {
             let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !name.isEmpty {
                 let candidate = try selectedPersonaDirectory(name: name, root: root)
@@ -645,18 +660,8 @@ public actor PersonaCompiler {
             }
         }
         // 2. Scan immediate subdirs.
-        let entries = (try? fileManager.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
-        )) ?? []
-        let dirs = entries
-            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for dir in dirs {
-            guard let candidate = try? selectedPersonaDirectory(name: dir.lastPathComponent, root: root),
-                  subdirHasMarker(candidate, fileManager: fileManager) else { continue }
-            return ("Custom", dir.lastPathComponent, candidate)
+        if let dir = try? customPersonaDirectories(root: root, fileManager: fileManager).first {
+            return ("Custom", dir.lastPathComponent, try selectedPersonaDirectory(name: dir.lastPathComponent, root: root))
         }
         // 3. Default
         return ("Default", "canonical", nil)
@@ -712,13 +717,18 @@ public actor PersonaCompiler {
         }
     }
 
-    private func computeFingerprint(activeDocs: [String: String], surface: String) -> String {
+    public static func fingerprint(documents: [String: String], surface: String) -> String {
+        var documents = documents
+        let surfaceID = "surface:\(surface)"
+        if let guidance = documents.removeValue(forKey: surfaceID) {
+            documents["surfaceGuidance"] = renderPrompt(documents: [surfaceID: guidance], surface: surface)
+        }
         var hasher = SHA256()
-        let ids = activeDocs.keys.sorted()
+        let ids = documents.keys.sorted()
         for id in ids {
             hasher.update(data: Data(id.utf8))
             hasher.update(data: Data([0x1F])) // unit separator
-            hasher.update(data: Data((activeDocs[id] ?? "").utf8))
+            hasher.update(data: Data((documents[id] ?? "").utf8))
             hasher.update(data: Data([0x1E])) // record separator
         }
         hasher.update(data: Data("surface=".utf8))
@@ -781,54 +791,13 @@ extension PersonaCompiler {
         "Run chat calibration after major voice edits.",
     ]
 
-    /// Builds a `CompiledGrowthSummary` by compiling the chat-surface packet
-    /// (for fingerprint), reading the profile.json persona kind (for
-    /// activeKind), counting non-empty lines in GROWTH.md, and asking the
-    /// caller for the persona-feedback memory count.
-    ///
-    /// W39 W05 / §6.200 #5 parity fix: `activeKind` MUST mirror the daemon's
-    /// `personality_growth_summary`, which sets
-    /// `"activeKind": self.personality().get("personaKind")` — the
-    /// PROFILE.JSON `personaKind` field (default "AI", allowlist
-    /// {male,female,ai,custom}), NOT the compiled packet's filesystem-derived
-    /// `personaKind` (which defaults to "Default"/"Custom" via
-    /// resolveActivePersona). Using `packet.personaKind` here produced
-    /// `activeKind == "Default"` for the common no-custom-persona-dir profile
-    /// while the daemon returned "AI" — a live `.personaEngine` parity bug.
-    /// `loadProfile().personaKind` is the exact mirror of `personality()`.
-    /// Builds a `CompiledGrowthSummary` mirroring the daemon's
-    /// `personality_growth_summary()` field-for-field:
-    ///
-    ///   * `activeKind`  = `self.personality().get("personaKind")` — i.e. the
-    ///     NORMALIZED profile's persona kind (default `"AI"` when profile.json is
-    ///     absent), NOT the prompt-builder's active-persona resolution. The
-    ///     `compile(surface:)` packet's `personaKind` comes from
-    ///     `resolveActivePersona` which returns `"Default"` for a canonical
-    ///     (non-custom-subdir) persona — a value the daemon NEVER emits here
-    ///     (§6.200 #5). Sourced from `loadProfile().personaKind` instead.
-    ///   * `fingerprint` = `self.compiled_personality_packet("chat").fingerprint`
-    ///     — the SURFACE-INDEPENDENT byte-equivalent `persona_fingerprint`
-    ///     (`compiledPacket`), NOT the `compile(surface:)` packet's
-    ///     surface-SCOPED `computeFingerprint` (which would disagree with the
-    ///     chat-orchestration fingerprint — the same divergence §6.97 documents).
-    ///   * `growthWeek` = the seven-day readout, supplied by the caller
-    ///     (2026-09-13). Empty when no provider is wired, which reads honestly
-    ///     as "nothing to report" rather than as a zero count.
-    ///   * `feedbackMemories` supplied by the caller via `feedbackMemoryProvider`.
+    /// Growth diagnostics use the shared active chat persona.
     public func growthSummary(
         feedbackMemoryProvider: (@Sendable () async throws -> Int)? = nil,
         growthWeekProvider: (@Sendable () async throws -> [String])? = nil,
         now: () -> Date = Date.init
     ) async throws -> CompiledGrowthSummary {
-        // activeKind: normalized profile persona kind (default "AI"), mirroring
-        // the daemon's `self.personality().get("personaKind")` — surface-/
-        // prompt-builder-independent.
-        let dataRoot = await engine.dataRootURL
-        let activeKind = PersonaCompiler.loadProfile(dataRoot: dataRoot).personaKind
-
-        // fingerprint: the byte-equivalent SURFACE-INDEPENDENT daemon packet
-        // fingerprint, matching `compiled_personality_packet("chat")`.
-        let wire = try await compiledPacket(surface: "chat")
+        let packet = try await compile(surface: "chat")
 
         // growthWeek: the substrate's own seven-day readout. NOT derived from
         // GROWTH.md at all — the file's length was never the question.
@@ -848,8 +817,8 @@ extension PersonaCompiler {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return CompiledGrowthSummary(
             engineVersion: "2.0",
-            activeKind: activeKind,
-            fingerprint: wire.fingerprint,
+            activeKind: packet.personaKind,
+            fingerprint: packet.fingerprint,
             growthWeek: growthWeek,
             feedbackMemories: feedbackCount,
             nextActions: Self.growthNextActions,

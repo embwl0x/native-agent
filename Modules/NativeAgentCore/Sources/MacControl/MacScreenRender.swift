@@ -484,6 +484,28 @@ public enum MacScreenRender {
         rendering(screen, options: options).text
     }
 
+    /// Add only independently recognized pixel evidence to the AX page. No
+    /// second screen title, AX control census or repeated raw text channel.
+    static func pixelEvidence(_ screen: Screen) -> String {
+        let wide = Options(maxRows: Int.max, maxControls: Int.max, maxValues: Int.max, maxWhereSteps: Int.max, maxLabelChars: Int.max / 2)
+        var lines: [String] = []
+        for content in screen.contents {
+            let rows = content.rows.filter { $0.provenance.isVision }
+            guard !rows.isEmpty || content.kind == .canvas else { continue }
+            let onlyPixels = Content(kind: content.kind, noun: content.noun, rows: rows, totalRows: rows.count,
+                scrollable: content.scrollable, canvas: content.canvas)
+            lines.append(contentsOf: contentBlock(onlyPixels, options: wide).lines)
+        }
+        let controls = screen.controls.filter { $0.provenance.isVision }
+        let values = screen.values.filter { $0.provenance.isVision }
+        let onlyPixels = Screen(appName: nil, controls: controls, totalControls: controls.count, values: values, totalValues: values.count)
+        if !controls.isEmpty { lines.append(contentsOf: controlBlock(onlyPixels, options: wide).lines) }
+        if !values.isEmpty { lines.append(contentsOf: valueBlock(onlyPixels, options: wide).lines) }
+        guard !lines.isEmpty else { return "" }
+        return "\nraw view · on-device screen recognition · These regions are exposed as pixels, with the recognition confidence shown.\n"
+            + lines.joined(separator: "\n")
+    }
+
     /// The same render, with the budget accounting the caller may want to log.
     public static func rendering(_ screen: Screen, options: Options = .default) -> Rendering {
         var lines: [String] = []
@@ -863,7 +885,9 @@ public enum MacScreenRender {
     public static func kindName(role: String) -> String {
         if let known = kindNames[role] { return known }
         let stripped = role.hasPrefix("AX") ? String(role.dropFirst(2)) : role
-        return stripped.isEmpty ? "unknown" : stripped.lowercased()
+        return stripped.isEmpty ? "unknown" : stripped.replacingOccurrences(
+            of: "([a-z])([A-Z])", with: "$1 $2", options: .regularExpression
+        ).lowercased()
     }
 
     // MARK: - The AX adapter
@@ -952,6 +976,7 @@ public enum MacScreenRender {
                 var states: [String] = []
                 if !affordance.enabled { states.append("disabled") }
                 if affordance.selected == true { states.append("selected") }
+                if let state = affordance.state { states.append(state) }
                 if affordance.secret { states.append("secure") }
                 if isTextEntry(affordance.role), affordance.value == nil, affordance.labelSource != "value" {
                     states.append("empty")

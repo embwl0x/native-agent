@@ -68,6 +68,9 @@ public struct QuietSetting: Sendable {
 
     public let id: String
     public let page: String
+    /// The page's tab the control is on, by the key the page stores; nil is
+    /// the page's first tab. ⌘K opens the control there.
+    public private(set) var tab: String?
     public let label: String
     public let kind: Kind
     /// Non-empty for `.choice`. Stated in the catalog so a set never has to
@@ -131,6 +134,13 @@ public struct QuietSetting: Sendable {
         }
     }
 
+    /// The same control, on `tab` of its page.
+    public func onTab(_ tab: String) -> QuietSetting {
+        var row = self
+        row.tab = tab
+        return row
+    }
+
     /// Whether a set would be accepted RIGHT NOW. `fullMac` is the posture read
     /// fresh off the saved policy, so the catalog's `writable` and the answer
     /// `app_setting_set` gives are one answer.
@@ -179,10 +189,17 @@ public enum QuietSettings {
     /// there a raise is hers too (User, 10-02), so `usersCall` refuses nothing.
     @TaskLocal public static var fullMac = false
 
+    /// User himself, from his signed phone: what is User's call is his to move,
+    /// as it is on the Mac's own pages.
+    @TaskLocal public static var byOwner = false
+
+    /// A quoted request may restore the switch's last receipted agent change.
+    @TaskLocal public static var restoringPreviousValue = false
+
     /// Why a raise is refused below Full Mac: Trust going up is User's (his
     /// floor), said with where he does it.
     public static func usersCall(_ change: String, _ whereUserDoesIt: String) -> QuietSettingError? {
-        fullMac ? nil : .users("\(change) raises Trust, so it is User's call. Ask him to do it: \(whereUserDoesIt).")
+        fullMac || byOwner || restoringPreviousValue ? nil : .users("\(change) raises Trust, so it is the owner's call. Ask them to do it: \(whereUserDoesIt).")
     }
 
     /// A switch the agent may move only the safe way (Agent, 2026-10-01, under
@@ -204,7 +221,7 @@ public enum QuietSettings {
         }
         return QuietSetting(
             id: id, page: page, label: label, kind: .boolean,
-            note: ["You may turn this \(way); turning it \(safe ? "off" : "on") is User's below Full Mac.", note]
+            note: ["You may turn this \(way); turning it \(safe ? "off" : "on") is the owner's below Full Mac.", note]
                 .filter { !$0.isEmpty }.joined(separator: " "),
             read: { .bool(await read($0)) },
             write: { host, value in
@@ -241,7 +258,7 @@ public enum QuietSettings {
         }
         return QuietSetting(
             id: id, page: page, label: label, kind: .list,
-            note: ["You may remove entries; adding one is User's below Full Mac. Send the whole list you want.", note]
+            note: ["You may remove entries; adding one is the owner's below Full Mac. Send the whole list you want.", note]
                 .filter { !$0.isEmpty }.joined(separator: " "),
             read: { .array(await read($0).map { .string($0) }) },
             write: { host, value in
@@ -418,10 +435,11 @@ public enum QuietSettings {
     /// One inner-life lane. Like its switch on the page, it cannot be turned on
     /// while the inner life itself is off — it runs inside it.
     private static func cognitionLane(
-        id: String, label: String, key: String, defaultOn: Bool, lane: QuietCognitionLane
+        id: String, page: String = "settings", label: String, key: String, defaultOn: Bool,
+        lane: QuietCognitionLane
     ) -> QuietSetting {
         liveBool(
-            id: id, page: "settings", label: label, key: key, defaultOn: defaultOn,
+            id: id, page: page, label: label, key: key, defaultOn: defaultOn,
             note: "Runs inside the inner life (settings.inner_life).",
             apply: { appModel, enabled in
                 if enabled, !storedBool("cognitiveSubstrateEnabled", true) {
@@ -524,6 +542,13 @@ public enum QuietSettings {
 
     /// One Mac-control verb, written through the page's own policy writer.
     private static func macControlVerb(
+        id: String, label: String, field: String,
+        get: @escaping @Sendable (TrustMacControlPolicy) -> Bool
+    ) -> QuietSetting {
+        macControlVerbRow(id: id, label: label, field: field, get: get).onTab("mac")
+    }
+
+    private static func macControlVerbRow(
         id: String, label: String, field: String,
         get: @escaping @Sendable (TrustMacControlPolicy) -> Bool
     ) -> QuietSetting {
@@ -636,9 +661,7 @@ public enum QuietSettings {
             page: "providers",
             label: label,
             kind: .boolean,
-            note: "true is the row's Use Chat's choice button: every \(group.title) activity except Chat itself "
-                + "drops its own model and follows Chat's. To give \(group.title) a model of its own, set "
-                + "providers.\(group.id)_model instead.",
+            note: "true: every \(group.title) activity but Chat follows Chat's model; providers.\(group.id)_model gives it its own.",
             read: { _ in
                 guard let snapshot = try? await SwiftNativeProviderRouting(
                     dataRoot: PersistenceCore.defaultDataRoot()).checkedRoutingSnapshot() else { return .null }
@@ -691,10 +714,7 @@ public enum QuietSettings {
             liveChoices: { host in
                 await offeredModels(host(), providerID: await leadProvider(group)).map(\.id)
             },
-            note: "Covers \(group.surfaces.joined(separator: ", ")). "
-                + "The choices are the models the group's account offers; another account's models "
-                + "need providers.\(group.id)_account first. Thinking and fast carry over when the "
-                + "new model takes them, as on the page.",
+            note: "Covers \(group.surfaces.joined(separator: ", ")). Another account's models need providers.\(group.id)_account first.",
             read: { _ in
                 guard let preference = await currentPreference(surface: group.surfaces.first ?? group.id) else {
                     return .string("")
@@ -744,8 +764,6 @@ public enum QuietSettings {
             label: "\(group.title) thinking",
             kind: .choice,
             liveChoices: { await groupEfforts(group, $0()) },
-            note: "How hard the \(group.title) group thinks. The choices are the levels its current "
-                + "model takes.",
             read: { _ in .string(await currentPreference(surface: group.surfaces.first ?? group.id)?.reasoningEffort ?? "") },
             write: { appModel, value in
                 let lead = group.surfaces.first ?? group.id
@@ -776,8 +794,7 @@ public enum QuietSettings {
             page: "providers",
             label: "\(group.title) fast",
             kind: .boolean,
-            note: "Only a model whose catalog offers the fast tier can be set fast. The read-back "
-                + "is the resolved value, so a model without it reads false.",
+            note: "Only a model with a fast tier can be fast; others read false.",
             read: { _ in
                 .bool(await currentPreference(surface: group.surfaces.first ?? group.id)?
                     .serviceTier == "priority")
@@ -839,10 +856,7 @@ public enum QuietSettings {
             label: "\(group.title) account",
             kind: .choice,
             liveChoices: { await connectedAccountIDs($0()) },
-            note: "The connected account these surfaces run on, from the same menu the page "
-                + "offers — an account that is not connected is not one of them. Changing it "
-                + "keeps the current model when that account serves it, and otherwise moves to "
-                + "the first model the account offers.",
+            note: "Keeps the model when the new account serves it, else takes the account's first model.",
             read: { _ in
                 let providers = await SwiftNativeProviderRouting(dataRoot: PersistenceCore.defaultDataRoot())
                     .activeProvidersForSurfaces()
@@ -893,7 +907,7 @@ public enum QuietSettings {
                             "\(account) doesn't offer \(preference.model), the model \(group.title) is on, so "
                             + "nothing was changed. \(account) offers: \(offered.joined(separator: ", ")). Set "
                             + "providers.\(group.id)_model to one of those the current account also runs, then "
-                            + "move; if there is none, ask User to move it in Providers.")
+                            + "move; if there is none, ask the owner to move it in Providers.")
                     }
                     try await writeGroupSelection(
                         appModel, group: group, providerID: account, model: preference.model,
@@ -1332,7 +1346,7 @@ public enum QuietSettings {
                 )
                 appModel.applySavedTrustPolicy(saved, status: "Unattended work saved")
             }
-        ))
+        ).onTab("features"))
         rows.append(fullMacPosture(
             id: "trust.developer_mode", label: "Developer mode", kind: .boolean,
             note: "Carries the destructive-action, shell and system-control gates with it, "
@@ -1376,7 +1390,7 @@ public enum QuietSettings {
                 let enabled = try boolValue(value, "Mac control")
                 try await saveMacControl(appModel, field: "enabled", enabled: enabled, "Mac control")
             }
-        ))
+        ).onTab("mac"))
         rows.append(macControlVerb(
             id: "applescript", label: "Mac control: AppleScript", field: "applescript_allowed",
             get: { $0.applesScriptAllowed }))
@@ -1416,7 +1430,7 @@ public enum QuietSettings {
         ] as [(String, String, String, KeyPath<TrustMultimodalPolicy, Bool> & Sendable, String)] {
             rows.append(lowerOnly(
                 id: "trust.\(id)", page: "trust", label: label,
-                whereUserDoesIt: "Trust → \(label)", note: note,
+                whereUserDoesIt: "Trust → Features → \(label)", note: note,
                 read: { $0.trustPolicy?.multimodalPolicy?[keyPath: keyPath] ?? false },
                 write: { appModel, enabled in
                     guard appModel.trustPolicy?.multimodalPolicy != nil else {
@@ -1429,13 +1443,13 @@ public enum QuietSettings {
                             let current: JSONValue? = if case .object(let block)? = locked["multimodalPolicy"] {
                                 block[field]
                             } else { nil }
-                            if enabled, current != .bool(true), !AppToolExecutor.lockedPolicyIsFullMac(locked) {
-                                throw QuietSettingError.users("Turning \(label) on raises Trust, so it is User's call. Ask him to do it: Trust → \(label).")
+                            if enabled, current != .bool(true), !QuietSettings.restoringPreviousValue, !AppToolExecutor.lockedPolicyIsFullMac(locked) {
+                                throw QuietSettingError.users("Turning \(label) on raises Trust, so it is the owner's call. Ask them to do it: Trust → Features → \(label).")
                             }
                         })
                     appModel.applySavedTrustPolicy(saved, status: "Multimodal policy saved")
                 }
-            ))
+            ).onTab("features"))
         }
 
         // ── Notifications ───────────────────────────────────────────────────
@@ -1492,11 +1506,11 @@ public enum QuietSettings {
 
         // ── Personality / memories ──────────────────────────────────────────
         rows.append(defaultsBool(
-            id: "personality.self_improvement", page: "personality",
-            label: "Personal growth runs on its own", key: "selfImprovementEnabled", defaultOn: true
+            id: "personality.self_improvement", page: "settings",
+            label: "Weekly self-improvement pass", key: "selfImprovementEnabled", defaultOn: true
         ))
         rows.append(QuietSetting(
-            id: "personality.dreams", page: "personality", label: "Dreams at night",
+            id: "personality.dreams", page: "settings", label: "Dreams at night",
             kind: .boolean,
             note: "One switch over two policy gates (personalityPolicy.dream_cycle_enabled and "
                 + "trainingPolicy.dream_scheduler), which move together. The read-back is the "
@@ -1511,11 +1525,11 @@ public enum QuietSettings {
             }
         ))
         rows.append(QuietSetting(
-            id: "personality.rem_cycle", page: "personality",
-            label: "Weekly dream consolidation (REM)", kind: .boolean,
+            id: "personality.rem_cycle", page: "settings",
+            label: "Weekly dream consolidation", kind: .boolean,
             read: { appModel in .bool(appModel.trustPolicy?.trainingPolicy?.rem_cycle_enabled ?? true) },
             write: { appModel, value in
-                let enabled = try boolValue(value, "Weekly dream consolidation (REM)")
+                let enabled = try boolValue(value, "Weekly dream consolidation")
                 guard await appModel.setRemCycleEnabled(enabled) else {
                     throw QuietSettingError.unavailable(
                         appModel.dreamError ?? "The weekly consolidation setting could not be saved.")
@@ -1575,7 +1589,7 @@ public enum QuietSettings {
             }
         ))
         rows.append(QuietSetting(
-            id: "memories.knowledge_graph", page: "memories", label: "Knowledge graph",
+            id: "memories.knowledge_graph", page: "settings", label: "Knowledge graph",
             kind: .boolean,
             read: { appModel in .bool(appModel.trustPolicy?.memoryPolicy?.knowledge_graph_enabled ?? true) },
             write: { appModel, value in
@@ -1587,7 +1601,7 @@ public enum QuietSettings {
             }
         ))
         rows.append(QuietSetting(
-            id: "memories.cross_session", page: "memories", label: "Remember across conversations",
+            id: "memories.cross_session", page: "settings", label: "Remember across conversations",
             kind: .boolean,
             note: "Brings in what is relevant from every past conversation, not just this one.",
             read: { appModel in .bool((appModel.trustPolicy?.memoryPolicy ?? TrustMemoryPolicy()).cross_session_recall) },
@@ -1599,7 +1613,7 @@ public enum QuietSettings {
             }
         ))
         rows.append(QuietSetting(
-            id: "memories.consolidation", page: "memories", label: "Memory consolidation",
+            id: "memories.consolidation", page: "settings", label: "Memory consolidation",
             kind: .boolean,
             note: "Once a week, what keeps coming up is gathered into fewer, stronger memories offered "
                 + "for review. Off also stops keeping consolidated memories without asking, as on the page.",
@@ -1612,7 +1626,7 @@ public enum QuietSettings {
             }
         ))
         rows.append(QuietSetting(
-            id: "memories.auto_keep_consolidated", page: "memories",
+            id: "memories.auto_keep_consolidated", page: "settings",
             label: "Keep consolidated memories without asking", kind: .boolean,
             note: "What the consolidation pass gathers goes in without asking first. A merge only "
                 + "archives the memories it replaces, never deletes them, and the whole pass waits "
@@ -1629,7 +1643,7 @@ public enum QuietSettings {
             }
         ))
         rows.append(QuietSetting(
-            id: "memories.recur_to_facts", page: "memories", label: "Memories that recur become facts",
+            id: "memories.recur_to_facts", page: "settings", label: "Memories that recur become facts",
             kind: .boolean,
             note: "What keeps coming back is proposed as a durable fact to accept.",
             read: { appModel in .bool((appModel.trustPolicy?.memoryPolicy ?? TrustMemoryPolicy()).adaptive_promotion) },
@@ -1643,7 +1657,7 @@ public enum QuietSettings {
             }
         ))
         rows.append(QuietSetting(
-            id: "memories.hygiene", page: "memories", label: "Memory hygiene",
+            id: "memories.hygiene", page: "settings", label: "Memory hygiene",
             kind: .boolean,
             note: "Tidies old, noisy and duplicate memories on a schedule.",
             read: { appModel in .bool((appModel.trustPolicy?.memoryPolicy ?? TrustMemoryPolicy()).hygiene_enabled) },
@@ -1715,35 +1729,35 @@ public enum QuietSettings {
             }
         ))
         rows.append(cognitionLane(
-            id: "settings.inner_life_capsule", label: "Inner life in the chat header",
+            id: "settings.inner_life_capsule", page: "diagnostics", label: "Give me a thought summary",
             key: "cognitiveSubstrateCapsuleEnabled", defaultOn: true, lane: .capsule
         ))
         rows.append(cognitionLane(
-            id: "settings.inner_life_background", label: "Inner life keeps running in the background",
+            id: "settings.inner_life_background", page: "diagnostics", label: "Keep thinking in the background",
             key: "cognitiveSubstrateBackgroundEnabled", defaultOn: true, lane: .background
         ))
         rows.append(cognitionLane(
-            id: "settings.reflection", label: "Reflection",
+            id: "settings.reflection", label: "Reflection between conversations",
             key: "cognitiveSubstrateReflectionEnabled", defaultOn: false, lane: .reflection
         ))
         rows.append(QuietSetting(
-            id: "settings.daily_reflection_budget", page: "settings",
-            label: "Daily reflection budget", kind: .number,
+            id: "settings.daily_reflection_budget", page: "diagnostics",
+            label: "Reflections in 24 hours", kind: .number,
             note: "Reflections in any 24 hours, 0 to 8 — the Cognition page's stepper.",
             read: { _ in
                 .int(Int64(UserDefaults.standard.object(
                     forKey: "cognitiveSubstrateDailyReflectionBudget") as? Int ?? 2))
             },
             write: { appModel, value in
-                let budget = try intValue(value, "Daily reflection budget")
+                let budget = try intValue(value, "Reflections in 24 hours")
                 guard (0...8).contains(budget) else {
-                    throw QuietSettingError.badValue("Daily reflection budget takes 0 to 8.")
+                    throw QuietSettingError.badValue("Reflections in 24 hours takes 0 to 8.")
                 }
                 await appModel.setReflectionBudget(budget)
             }
         ))
         rows.append(cognitionLane(
-            id: "settings.organism_kernel", label: "Organism kernel",
+            id: "settings.organism_kernel", label: "Moods, energy, and a clock of my own",
             key: "organismKernelEnabled", defaultOn: false, lane: .organism
         ))
         rows.append(QuietSetting(
@@ -1780,23 +1794,6 @@ public enum QuietSettings {
                 }
                 UserDefaults.standard.set(enabled, forKey: "studioWanderEnabled")
                 await NativeCognitionRuntime.reloadStudioWanderInstallation()
-            }
-        ))
-        rows.append(QuietSetting(
-            id: "settings.memory_mode", page: "settings",
-            label: "Memory mode", kind: .choice, choices: ["performance", "balanced", "low_memory"],
-            note: "How much of the recall model stays loaded: performance keeps it, low_memory gives "
-                + "its memory back soonest.",
-            read: { appModel in .string((try? await appModel.memoryMode()) ?? "") },
-            write: { appModel, value in
-                let mode = try choiceValue(value, "Memory mode", ["performance", "balanced", "low_memory"])
-                do {
-                    try await appModel.setMemoryMode(mode)
-                } catch {
-                    throw QuietSettingError.unavailable(
-                        "Memory mode was not changed: \(error.localizedDescription). Check \(AppToolExecutor.doorDoctor) for "
-                        + "the embeddings service, then try again.")
-                }
             }
         ))
 
@@ -1842,7 +1839,7 @@ public enum QuietSettings {
                 }
                 appModel.applySavedTrustPolicy(saved, status: "Desk execution policy saved")
             }
-        ))
+        ).onTab("features"))
         rows.append(QuietSetting(
             id: "research.search_url", page: "desk", label: "Search service",
             kind: .text,

@@ -79,7 +79,6 @@ enum ComposerContextReceiptState: Equatable, Sendable {
 enum ComposerContextReceiptReader {
     private static let snapshotKind = "context.snapshot"
     private static let callKind = "llm.call"
-    private static let maxErrorChars = 160
     /// The default 2,000-row tail ends before a session's latest turn on a
     /// busy day (live 09-24: the card showed a turn five hours old beside the
     /// footer of the newest one).
@@ -127,7 +126,7 @@ enum ComposerContextReceiptReader {
             }
             return projected
         } catch {
-            return .unavailable(String("\(error)".prefix(maxErrorChars)))
+            return .unavailable(UserFacingError.cause(error, action: "read the turn trace"))
         }
     }
 

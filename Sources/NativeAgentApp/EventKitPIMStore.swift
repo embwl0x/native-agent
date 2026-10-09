@@ -62,6 +62,12 @@ final class EventKitPIMStore: LocalPIMStore {
 
     func makeEvent() -> Event { Event(EKEvent(eventStore: store)) }
     func makeReminder() -> Reminder { Reminder(EKReminder(eventStore: store)) }
+    func makeReminderCalendar(in calendar: Calendar) -> Calendar {
+        let list = EKCalendar(for: .reminder, eventStore: store)
+        list.source = calendar.raw.source
+        return Calendar(list)
+    }
+    func save(_ calendar: Calendar) throws { try store.saveCalendar(calendar.raw, commit: true) }
     func save(_ event: Event) throws { try store.save(event.raw, span: .thisEvent, commit: true) }
     func save(_ reminder: Reminder) throws { try store.save(reminder.raw, commit: true) }
     func remove(_ event: Event) throws { try store.remove(event.raw, span: .thisEvent, commit: true) }
@@ -139,7 +145,7 @@ struct EventKitPIMReminderRead: LocalPIMReminderRead {
 struct EventKitPIMCalendar: LocalPIMCalendar {
     let raw: EKCalendar
     init(_ raw: EKCalendar) { self.raw = raw }
-    var title: String { raw.title }
+    var title: String { get { raw.title } nonmutating set { raw.title = newValue } }
     var calendarIdentifier: String { raw.calendarIdentifier }
     var sourceTitle: String { raw.source.title }
     var allowsContentModifications: Bool { raw.allowsContentModifications }

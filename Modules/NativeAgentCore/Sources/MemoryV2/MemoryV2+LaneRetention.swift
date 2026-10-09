@@ -61,6 +61,7 @@ extension SwiftNativeMemoryV2 {
     /// Newest-first identity handles for one lane's rows, ACTIVE only, bounded
     /// by `limit`. The retention-sweep read path — never the recall path.
     public func memoryHandles(sourcePrefix: String, limit: Int? = nil) async throws -> [MemoryLaneHandle] {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         return try await storage.memoryHandles(sourcePrefix: sourcePrefix, limit: limit)
     }

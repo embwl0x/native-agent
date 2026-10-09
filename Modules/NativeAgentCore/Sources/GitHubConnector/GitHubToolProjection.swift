@@ -64,6 +64,18 @@ enum GitHubToolProjection {
         ]
     }
 
+    /// Repository search: one compact row per repository.
+    static func repositorySearchResult(_ raw: Any, limit: Int) -> [String: Any] {
+        let object = raw as? [String: Any] ?? [:]
+        let source = object["items"] as? [[String: Any]] ?? []
+        let rows = source.prefix(limit).map {
+            selecting($0, keys: ["full_name", "description", "html_url", "stargazers_count", "language", "updated_at", "archived", "fork"])
+        }
+        let total = integer(object["total_count"]) ?? rows.count
+        return ["total_count": total, "items": rows, "returned_count": rows.count,
+                "results_truncated": total > rows.count]
+    }
+
     static func user(_ raw: Any?) -> [String: Any] {
         guard let object = raw as? [String: Any] else { return [:] }
         return selecting(object, keys: ["login", "id", "type", "name", "html_url"])
@@ -78,6 +90,28 @@ enum GitHubToolProjection {
         ])
         let owner = user(object["owner"])
         if !owner.isEmpty { out["owner"] = owner }
+        return out
+    }
+
+    static func workflowRun(_ object: [String: Any]) -> [String: Any] {
+        var out = selecting(object, keys: ["id", "name", "event", "head_branch", "status", "conclusion", "created_at", "updated_at", "html_url"])
+        out["conclusion"] = object["conclusion"] ?? NSNull()
+        if let commit = object["head_commit"] as? [String: Any], let message = commit["message"] as? String {
+            out["head_commit_message"] = bounded(message, limit: 500)
+            out["head_commit_message_truncated"] = message.count > 500
+        }
+        return out
+    }
+
+    static func failedJob(_ object: [String: Any]) -> [String: Any] {
+        var out = selecting(object, keys: ["id", "name", "status", "conclusion", "html_url"])
+        let failed = (object["steps"] as? [[String: Any]] ?? []).filter { $0["conclusion"] as? String == "failure" }
+        out["failed_steps"] = failed.prefix(20).map { step in
+            var row = selecting(step, keys: ["number", "conclusion"])
+            if let name = step["name"] as? String { row["name"] = bounded(name, limit: 250) }
+            return row
+        }
+        out["failed_steps_truncated"] = failed.count > 20
         return out
     }
 

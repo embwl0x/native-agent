@@ -212,7 +212,7 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
             )
         let boundary = """
         # Background Personality Context
-        You are \(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) doing app-owned NativeAgent background work for the user. Keep the same identity, voice, care, and boundaries as normal chat. Preserve each background loop's specific instructions below; do not dispatch actions or mutate identity unless that loop explicitly stages a reviewable proposal.
+        You are doing app-owned NativeAgent background work for the user. Keep the same identity, voice, care, and boundaries as normal chat. Preserve each background loop's specific instructions below; do not dispatch actions or mutate identity unless that loop explicitly stages a reviewable proposal.
         """
         var sections = [compiled, boundary]
         if let organismPosture, !organismPosture.isEmpty {

@@ -1,4 +1,5 @@
 import Foundation
+import ChatSessionWork
 import ToolRegistry
 import NativeAgentCore
 import PersistenceCore
@@ -161,6 +162,10 @@ extension SwiftToolDispatcher {
             "process_id": .int(Int64(pid)),
             "tool_state": .string("app is your one tool; app {find} finds an action by what you want done. Request detail=full for diagnostic roots, MCP names, and outcome population health"),
         ]
+        if case .object(let stamp) = provider, case .string(let model)? = stamp["model"] {
+            response["context_window"] = .object(ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
+                forModel: model, providerID: jsonString(stamp["name"]), dataRoot: dataRoot))
+        }
         if !sessionId.isEmpty {
             // session_id stays as a compatibility alias, but now names the
             // same authoritative conversation scope used by traces,
@@ -231,6 +236,7 @@ extension SwiftToolDispatcher {
             "version": .string(identity.version),
             "exactSourceRevision": identity.exactSourceRevision.map(JSONValue.string) ?? .null,
             "sourceDirty": .bool(identity.sourceDirty),
+            "sourceContentID": identity.sourceContentID.map(JSONValue.string) ?? .null,
             "pid": .int(Int64(pid)),
         ])
     }

@@ -150,6 +150,14 @@ enum MacPIMConnectorActions {
         try await Actions.remindersCreate(input: input)
     }
 
+    static func remindersListRename(input: [String: JSONValue]) async throws -> JSONValue {
+        try await Actions.remindersListWrite(input: input, rename: true)
+    }
+
+    static func remindersListCreate(input: [String: JSONValue]) async throws -> JSONValue {
+        try await Actions.remindersListWrite(input: input, rename: false)
+    }
+
     static func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue {
         try await Actions.remindersComplete(input: input)
     }
@@ -167,13 +175,13 @@ enum MacPIMConnectorActions {
     /// wizard vocabulary: "granted" | "denied" | "restricted" | "limited" |
     /// "not_determined". Does NOT trigger a prompt. `.writeOnly` is mapped to
     /// "limited" since it is a partial grant.
-    public static func currentCalendarAuthorizationStatus() -> String {
+    public nonisolated static func currentCalendarAuthorizationStatus() -> String {
         ekStatusToWizardString(EKEventStore.authorizationStatus(for: .event))
     }
 
     /// Returns the current Reminders (EKReminder) authorization status in the
     /// wizard vocabulary. Does NOT trigger a prompt.
-    public static func currentReminderAuthorizationStatus() -> String {
+    public nonisolated static func currentReminderAuthorizationStatus() -> String {
         ekStatusToWizardString(EKEventStore.authorizationStatus(for: .reminder))
     }
 
@@ -198,7 +206,7 @@ enum MacPIMConnectorActions {
         return currentReminderAuthorizationStatus()
     }
 
-    private static func ekStatusToWizardString(_ status: EKAuthorizationStatus) -> String {
+    private nonisolated static func ekStatusToWizardString(_ status: EKAuthorizationStatus) -> String {
         switch status {
         case .authorized, .fullAccess:
             return "granted"

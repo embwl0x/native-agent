@@ -83,7 +83,7 @@ extension AppModel {
             statusText = "Personality saved"
             await refreshAll()
         } catch {
-            statusText = "Personality save failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "save the personality")
             throw error
         }
     }
@@ -111,8 +111,8 @@ extension AppModel {
             statusText = "Name saved as \(saved.name)"
             return .saved(saved)
         } catch {
-            let detail = error.localizedDescription
-            statusText = "Name save failed: \(detail)"
+            let detail = UserFacingError.cause(error, action: "save the name")
+            setFailureStatus("Couldn't save the name. " + detail, cause: error)
             return .failed(detail)
         }
     }
@@ -157,8 +157,8 @@ extension AppModel {
                 : "Support diagnostics refreshed"
             return .loaded(diagnostics, reusedDoctorReport: reuse != nil)
         } catch {
-            let detail = error.localizedDescription
-            statusText = "Support diagnostics failed: \(detail)"
+            let detail = UserFacingError.cause(error, action: "gather support diagnostics")
+            setFailureStatus("Couldn't gather support diagnostics. " + detail, cause: error)
             return .failed(detail)
         }
     }
@@ -178,11 +178,8 @@ extension AppModel {
             statusText = "Personality documents reloaded"
             return .loaded(documentCount: personalityDocs.count)
         } catch {
-            let rawDetail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-            let detail = rawDetail.isEmpty
-                ? "The persona document reader returned no diagnostic details."
-                : rawDetail
-            statusText = "Personality docs load failed: \(detail)"
+            let detail = UserFacingError.cause(error, action: "load the personality docs")
+            setFailureStatus("Couldn't load the personality docs. " + detail, cause: error)
             return .failed(detail: detail, retainedDocumentCount: personalityDocs.count)
         }
     }
@@ -201,7 +198,7 @@ extension AppModel {
             statusText = "\(saved.filename) saved"
             return true
         } catch {
-            statusText = "Personality doc save failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "save that personality doc")
             return false
         }
     }
@@ -262,23 +259,26 @@ extension AppModel {
     // ride decodeLogged, which logs the endpoint + error and records it in
     // lastRefreshError instead of fabricating an empty success.
     @MainActor
-    func loadMemoryProposals() async {
-        engine.memory.proposals = await decodeLogged("getMemoryProposals", default: []) {
+    func loadMemoryProposals(animateDecision: Bool = false) async {
+        let proposals = await decodeLogged("getMemoryProposals", default: []) {
             try await engine.memory.proposals(status: "pending")
+        }
+        withAnimation(animateDecision ? NativeAgentMotion.arrive : nil) {
+            engine.memory.proposals = proposals
         }
     }
 
     @MainActor
     func approveMemoryProposal(id: String) async throws {
         _ = try await engine.memory.accept(proposalID: id)
-        await loadMemoryProposals()
+        await loadMemoryProposals(animateDecision: true)
         engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
     }
 
     @MainActor
     func rejectMemoryProposal(id: String, reason: String = "") async throws {
         try await engine.memory.reject(proposalID: id, reason: reason)
-        await loadMemoryProposals()
+        await loadMemoryProposals(animateDecision: true)
         engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
     }
 
@@ -306,7 +306,7 @@ extension AppModel {
         do {
             return try await engine.cognitionView.dreamDiary(limit: limit)
         } catch {
-            dreamError = "Load dream diary failed: \(error.localizedDescription)"
+            dreamError = UserFacingError.message(error, action: "load the dream diary")
             return nil
         }
     }
@@ -318,7 +318,7 @@ extension AppModel {
         do {
             return try await engine.cognitionView.dreamEntry(date: date)
         } catch {
-            dreamError = "Load entry \(date) failed: \(error.localizedDescription)"
+            dreamError = UserFacingError.message(error, action: "load the entry for \(date)")
             return nil
         }
     }
@@ -339,8 +339,8 @@ extension AppModel {
             }
             return feedback
         } catch {
-            let feedback = DreamsREMActionFeedback.failed(error.localizedDescription)
-            dreamError = "REM cycle failed: \(feedback.message)"
+            let feedback = DreamsREMActionFeedback.failed(UserFacingError.message(error, action: "run the REM cycle"))
+            dreamError = feedback.message
             statusText = "REM cycle failed"
             return feedback
         }
@@ -357,7 +357,7 @@ extension AppModel {
             statusText = enabled ? "Dream cycle enabled" : "Dream cycle disabled"
             return true
         } catch {
-            dreamError = "Save dream cycle toggle failed: \(error.localizedDescription)"
+            dreamError = UserFacingError.message(error, action: "save the dream cycle setting")
             return false
         }
     }
@@ -373,7 +373,7 @@ extension AppModel {
             statusText = enabled ? "REM cycle enabled" : "REM cycle disabled"
             return true
         } catch {
-            dreamError = "Save REM cycle toggle failed: \(error.localizedDescription)"
+            dreamError = UserFacingError.message(error, action: "save the REM cycle setting")
             return false
         }
     }
@@ -446,7 +446,7 @@ extension AppModel {
             statusText = Self.dreamRunStatusText(result)
             return true
         } catch {
-            dreamError = "Dream cycle failed: \(error.localizedDescription)"
+            dreamError = UserFacingError.message(error, action: "run the dream cycle")
             statusText = "Dream cycle failed"
             return false
         }
@@ -482,7 +482,7 @@ extension AppModel {
                 await loadTrainingProposals()
             }
         } catch {
-            selfImprovementError = "Approve failed: \(error.localizedDescription)"
+            selfImprovementError = UserFacingError.message(error, action: "approve that proposal")
         }
     }
 
@@ -493,7 +493,7 @@ extension AppModel {
             statusText = "Proposal rejected"
             await loadTrainingProposals()
         } catch {
-            selfImprovementError = "Reject failed: \(error.localizedDescription)"
+            selfImprovementError = UserFacingError.message(error, action: "reject that proposal")
         }
     }
 
@@ -509,7 +509,7 @@ extension AppModel {
             let savedPolicy = try await client.postTrustWrite(body: body)
             applySavedTrustPolicy(savedPolicy, status: "Trust policy saved")
         } catch {
-            statusText = "Trust save failed: \(error.localizedDescription)"
+            setFailureStatus(error, action: "save trust settings")
         }
     }
 }

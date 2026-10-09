@@ -494,7 +494,7 @@ public enum StudioCanonTending {
                 audit: audit
             )
         } catch {
-            NSLog("[StudioCanon] Tending deferred: %@", error.localizedDescription)
+            nativeLog("[StudioCanon] Tending deferred: %@", error.localizedDescription)
             return .idle
         }
     }
@@ -527,7 +527,7 @@ public enum StudioCanonTending {
         }
         try? await SwiftNativePersistenceCore().writeJSON(.object(payload), to: path)
         guard !report.isConsistent else { return }
-        NSLog(
+        nativeLog(
             "[studio] RELATIONS INCONSISTENT — %d relation(s) on the journal have no graph edge "
                 + "citing them back. NOT repaired (a repair would invent a claim she never made). "
                 + "First: %@",

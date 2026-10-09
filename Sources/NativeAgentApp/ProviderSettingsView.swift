@@ -14,9 +14,8 @@ struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: Vie
 
     private var identity: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            // Wide enough for the longest account name plus the menu chrome:
-            // a chosen account is never shown abbreviated.
-            field("Provider", content: provider).frame(width: 180)
+            // Room for the account's display name and native menu chrome.
+            field("Provider", content: provider).frame(width: 260)
             field("Model", content: model).frame(width: 150)
         }
     }
@@ -37,7 +36,7 @@ struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: Vie
                 fast()
             }
         }
-        .font(.system(size: 12, weight: .medium))
+        .font(ShellType.rowDetail.weight(.medium))
         .controlSize(.small)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -45,7 +44,7 @@ struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: Vie
         VStack(alignment: .leading, spacing: 3) {
             // SwiftUI's hierarchical .secondary is a fraction of primary and
             // cannot answer for itself on a card; the measured token can.
-            Text(title).font(.system(size: 10)).foregroundStyle(NativeAgentShell.secondary)
+            Text(title).font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
             content().labelsHidden().frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -178,14 +177,9 @@ struct ProviderSettingsView: View {
 
     // Opaque local surfaces keep secondary text legible over the shell wallpaper.
     private var secondaryInk: Color { colorScheme == .dark ? Color(white: 0.82) : Color(white: 0.28) }
-    /// Alive glass (2026-09-23): the page's cards wear the Today/Desk card
-    /// surface — a fill, never glassEffect.
+    /// The page's cards share the house glass used by Today and Desk.
     private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content()
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .aliveCard()
-            .accessibilityElement(children: .contain)
+        ProviderCard(content: content)
     }
 
     private var surfaceGroups: [ProviderSettingsSurfaceGroup] {
@@ -559,12 +553,12 @@ struct ProviderSettingsView: View {
             } label: {
                 HStack {
                     Text(provider.display_name)
-                        .font(.system(size: 14, weight: .medium))
+                        .font(ShellType.rowTitle)
                         .foregroundStyle(NativeAgentShell.text)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
                     Text(provider.auth_modes.contains("api_key") ? "API key" : "Sign in")
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                     Image(systemName: "chevron.right")
                         .font(ShellType.captionSemibold)
@@ -579,14 +573,14 @@ struct ProviderSettingsView: View {
             HStack(alignment: .center, spacing: 8) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(provider.display_name)
-                        .font(.system(size: 14, weight: .medium))
+                        .font(ShellType.rowTitle)
                         .foregroundStyle(NativeAgentShell.text)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(ProviderAccountStateLinePresentation.line(
                         state: provider.auth_status.state,
                         detail: provider.auth_status.detail,
                         failedTest: failedTests[provider.provider_id]))
-                        .font(.system(size: 12)).foregroundStyle(NativeAgentShell.secondary)
+                        .font(ShellType.rowDetail).foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(provider.auth_modes.map { mode in
                         switch mode {
@@ -595,7 +589,7 @@ struct ProviderSettingsView: View {
                         default: mode.replacingOccurrences(of: "_", with: " ")
                         }
                     }.joined(separator: " · "))
-                        .font(.system(size: 12)).foregroundStyle(NativeAgentShell.secondary)
+                        .font(ShellType.rowDetail).foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
@@ -622,9 +616,9 @@ struct ProviderSettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                ProviderSection(label: "Accounts & API keys") {
+                AdvancedSection(title: "Accounts & API keys", card: .bare) {
                     VStack(alignment: .leading, spacing: 8) {
-                        if isLoading {
+                        if isLoading && providers.isEmpty {
                             card {
                                 HStack(spacing: 8) {
                                     ProgressView()
@@ -668,6 +662,12 @@ struct ProviderSettingsView: View {
                         .buttonStyle(.bordered)
                         .font(ShellType.labelMedium)
                         .disabled(isLoading)
+                        if !providers.isEmpty, let providerLoadError {
+                            Text(providerLoadError)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.trouble)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
                     }
                 }
@@ -723,7 +723,7 @@ struct ProviderSettingsView: View {
                 // panel duplicated the Telegram settings surface — two write
                 // paths to telegram/config.json that didn't refresh each other.
                 // Telegram settings own the config; this is now a pointer.
-                ProviderSection(label: "Telegram") {
+                AdvancedSection(title: "Telegram", card: .bare) {
                     card {
                         VStack(alignment: .leading, spacing: 12) {
                             ProviderCardTitle(
@@ -828,7 +828,7 @@ struct ProviderSettingsView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(group.title)
-                .font(.system(size: 14, weight: .semibold))
+                .font(ShellType.rowTitle.weight(.semibold))
                 .foregroundStyle(NativeAgentShell.text)
             if mixed {
                 Text("Mixed").font(ShellType.caption).foregroundStyle(secondaryInk)
@@ -999,7 +999,7 @@ struct ProviderSettingsView: View {
             }
         } catch {
             await loadProviders()
-            statusText = "Default could not be restored: \(error.localizedDescription)"
+            statusText = UserFacingError.message(error, action: "restore the default")
         }
     }
 
@@ -1124,7 +1124,7 @@ struct ProviderSettingsView: View {
             providerLoadError = nil
         case let .failed(detail):
             providerLoadError = detail
-            statusText = "Load failed: \(detail)"
+            statusText = "Couldn't read the accounts. \(detail)"
         }
     }
 
@@ -1317,7 +1317,7 @@ struct ProviderSettingsView: View {
             guard groupSaveTokens[group.id] == token else { return }
             finishGroupSave(group)
             await loadProviders()
-            statusText = "Model settings could not be saved: \(error.localizedDescription)"
+            statusText = UserFacingError.message(error, action: "save model settings")
         }
     }
 

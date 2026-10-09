@@ -125,7 +125,7 @@ extension NativeOAuthFlow {
                     _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path)
                 }
             },
-            publish: publish
+            publish: { _, writeRegistry in try await publish(writeRegistry) }
         ) { entry in
             entry["id"] = .string("github")
             entry["name"] = .string("GitHub")

@@ -2,9 +2,91 @@ import AgentWorkspace
 import Foundation
 import PersistenceCore
 
-/// Presentation only over an already-authorized read. No transcript, latest-
+/// Agent evidence and presentation over an already-authorized read. No transcript, latest-
 /// conversation lookup, semantic completion inference, or execution lives here.
 public enum AgentConversationView {
+    public static let claudeWorklogURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/state/claude-worklog.jsonl")
+
+    public static func claudeWorklogTail(_ url: URL) throws -> [[String: Any]] {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let start = size > 65_536 ? size - 65_536 : 0
+        try handle.seek(toOffset: start)
+        let tail = String(decoding: try handle.read(upToCount: 65_536) ?? Data(), as: UTF8.self)
+        let lines = tail.split(separator: "\n", omittingEmptySubsequences: false)
+        return (start > 0 ? lines.dropFirst() : lines[...]).compactMap {
+            try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
+        }
+    }
+
+    public static func claudeWorklog(input: [String: JSONValue] = [:]) -> JSONValue {
+        let iso = ISO8601DateFormatter()
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions.insert(.withFractionalSeconds)
+        func date(_ text: String) -> Date? { iso.date(from: text) ?? fractional.date(from: text) }
+        var since: Date?
+        if case .string(let text)? = input["since"], !text.isEmpty {
+            since = text == "today" ? Calendar.current.startOfDay(for: Date()) : date(text)
+            guard since != nil else {
+                return .object(["status": .string("failed"), "detail": .string("since must be today or an ISO 8601 timestamp with timezone.")])
+            }
+        }
+        var limit = 10
+        if let value = input["limit"], value != .null {
+            guard case .int(let count) = value, (1...50).contains(count) else {
+                return .object(["status": .string("failed"), "detail": .string("limit must be an integer from 1 to 50.")])
+            }
+            limit = Int(count)
+        }
+        let rows: [[String: Any]]
+        do { rows = try claudeWorklogTail(claudeWorklogURL) }
+        catch CocoaError.fileReadNoSuchFile {
+            return .object(["status": .string("absent"), "detail": .string("Claude has no worklog.")])
+        } catch {
+            return .object(["status": .string("unavailable"), "detail": .string("Claude's worklog could not be read. Check its file permissions.")])
+        }
+        let entries = rows.compactMap { row -> (Date, JSONValue)? in
+            guard let ts = row["ts"] as? String, let at = date(ts),
+                  since.map({ at >= $0 }) ?? true,
+                  let summary = row["summary"] as? String, let kind = row["kind"] as? String else { return nil }
+            return (at, .object([
+                "time": .string(ts), "kind": .string(String(kind.prefix(80))),
+                "summary": .string(String(summary.prefix(600))),
+                "refs": .array((row["refs"] as? [String] ?? []).prefix(5).map { .string(String($0.prefix(200))) }),
+            ]))
+        }.sorted { $0.0 > $1.0 }.prefix(limit).map(\.1)
+        return .object(["status": .string("ok"), "agent": .string("claude"),
+            "entries": .array(entries), "order": .string("newest_first"),
+            "coverage": .string("Recent worklog tail (up to 64 KiB), not full history."),
+            "untrusted_remote_data": .bool(true),
+            "detail": .string(entries.isEmpty ? "No recent worklog entries match this read." : "Claude's recorded work; not independently verified.")])
+    }
+
+    public static func dotReply(_ receipt: JSONValue, sentAt: Date?) -> JSONValue {
+        guard let sentAt, case .object(var fields) = receipt else { return receipt }
+        fields["status"] = .string("waiting")
+        fields["reply_deadline"] = .string(ISO8601DateFormatter().string(from: sentAt.addingTimeInterval(1800)))
+        return expiringReply(.object(fields))
+    }
+
+    package static func expiringReply(_ receipt: JSONValue) -> JSONValue {
+        guard case .object(var fields) = receipt, fields["reply"] == nil, fields["answer"] == nil,
+              fields["terminal"] != .bool(true), fields["completed"] != .bool(true),
+              case .string(let status)? = fields["status"],
+              ["sending", "waiting", "enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending", "delivered_live", "delivery_unknown", "outcome_unknown", "no_reply"].contains(status),
+              case .string(let stamp)? = fields["reply_deadline"],
+              let deadline = ISO8601DateFormatter().date(from: stamp), deadline <= Date() else { return receipt }
+        fields["status"] = .string("no_reply_expired")
+        fields["reply_state"] = .string("no_reply_expired")
+        fields["terminal"] = .bool(true)
+        fields["automatic_resend"] = .bool(false)
+        fields["ended_at"] = .string(stamp)
+        fields["detail"] = .string("No reply arrived before the reply deadline. Sending again is your choice; any late answer still arrives.")
+        return .object(fields)
+    }
+
     public static func read(_ receipt: JSONValue, agent: String, input: [String: JSONValue]) -> JSONValue {
         guard input["details"] != .bool(true), case .object(let raw) = receipt else { return receipt }
         // Preserve refusals and desktop interaction instructions verbatim.
@@ -67,7 +149,7 @@ public enum AgentConversationView {
         let task = text(row, "task_id")
         var value: [String: JSONValue] = [
             "from": .string(text(row, "agent_name") ?? agent),
-            "reply_state": .string(body == nil ? "no_reply_observed" : kind == "bot_preview" ? "preview_only" : "reply_received"),
+            "reply_state": body == nil ? row["reply_state"] ?? .string("no_reply_observed") : .string(kind == "bot_preview" ? "preview_only" : "reply_received"),
             "execution_state": evidence["original_status"] ?? row["run_status"] ?? row["status"] ?? row["state"] ?? .string("unknown")
         ]
         // Her side of the exchange first, so a thread reads as ask and answer.

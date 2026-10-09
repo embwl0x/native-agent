@@ -24,7 +24,6 @@ public final class DeviceSync {
     public lazy var engine = MacSyncEngine(sync: self, stateDataRootOverride: nil)
     public lazy var relay = MacSyncMobileNotificationRelay(sync: self)
     public lazy var pairedPhones = PairedPhoneStore(url: dataRoot.appendingPathComponent("paired_phones.json"))
-    public lazy var macIntegrationPermissions = MacIntegrationICloudBridge(sync: self)
 
     public nonisolated init(dataRoot: URL, host: any DeviceSyncHost, cognition: NativeCognitionRuntime) {
         self.dataRoot = dataRoot

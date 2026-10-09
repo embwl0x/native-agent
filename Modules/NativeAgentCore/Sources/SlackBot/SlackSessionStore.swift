@@ -160,13 +160,8 @@ struct SlackSessionStore: Sendable {
                 sessions.removeValue(forKey: binding.key)
             }
         }
-        let archiveCutoff = now.addingTimeInterval(-ChatSessionRetention.archivedMessageRetentionSeconds)
-        let retained = archived.filter { updatedAt($0.value) >= archiveCutoff }
-            .sorted {
-                let lhs = updatedAt($0.value), rhs = updatedAt($1.value)
-                return lhs == rhs ? $0.key < $1.key : lhs > rhs
-            }.prefix(1_000)
-        archived = Dictionary(uniqueKeysWithValues: retained.map { ($0.key, $0.value) })
+        // Cold bindings are durable locators for retained conversations. The
+        // hot thread map stays bounded; old conversations remain resumable.
     }
 
     private func ensureSessionRow(id: String, inbound: SlackInboundMessage) async throws {

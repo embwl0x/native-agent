@@ -336,7 +336,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         """)
 
         // 2. Errors logged this week.
-        for feed in SelfHealingHook.errorFeeds {
+        for feed in ErrorFeeds.errorFeeds {
             sections.append(Self.recentLines(
                 at: feed.url(dataRoot: dataRoot),
                 since: weekAgo, label: "\(feed.label) error log (last 7 days)", limit: 30, fm: fm

@@ -193,7 +193,8 @@ public actor SessionHistoryReader {
         limit: Int? = nil,
         excludingRunId: String? = nil,
         strictEvidence: Bool = false,
-        maximumBytes: Int? = nil
+        maximumBytes: Int? = nil,
+        transcriptURL: URL? = nil
     ) async throws -> SessionHistoryReadResult {
         guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
             return SessionHistoryReadResult(
@@ -204,10 +205,16 @@ public actor SessionHistoryReader {
         let excludedRunId = excludingRunId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shouldExcludeRun = excludedRunId?.isEmpty == false
-        let path = dataRoot
+        let path = transcriptURL ?? dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeId).jsonl")
+        let parent = path.resolvingSymlinksInPath().deletingLastPathComponent()
+        let compacted = path.lastPathComponent.hasPrefix("messages.compact.") && path.pathExtension == "jsonl"
+            && parent == dataRoot.appendingPathComponent("chat/sessions/\(safeId)").resolvingSymlinksInPath()
+        guard compacted || ["chat/messages", "chat/archive/messages", "chat/archive/originals"].contains(where: {
+            parent == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath()
+        }) else { throw CocoaError(.fileReadNoPermission) }
         if !strictEvidence, !FileManager.default.fileExists(atPath: path.path) {
             return SessionHistoryReadResult(
                 messages: [],
@@ -425,7 +432,8 @@ public actor SessionHistoryReader {
         )
         let decodeResult = Self.decodeMessages(
             from: head.lines + tail.lines,
-            excludingRunId: shouldExcludeRun ? excludedRunId : nil
+            excludingRunId: shouldExcludeRun ? excludedRunId : nil,
+            excludingAwaitingConsumption: true
         )
         let decoded = decodeResult.messages
         var seen: Set<String> = []
@@ -498,7 +506,8 @@ public actor SessionHistoryReader {
         }
         let decodeResult = Self.decodeMessages(
             from: lineRead.lines,
-            excludingRunId: shouldExcludeRun ? excludedRunId : nil
+            excludingRunId: shouldExcludeRun ? excludedRunId : nil,
+            excludingAwaitingConsumption: true
         )
         let decoded = decodeResult.messages
         var seen: Set<String> = []
@@ -709,7 +718,8 @@ public actor SessionHistoryReader {
 
     private nonisolated static func decodeMessages(
         from lines: [String],
-        excludingRunId: String?
+        excludingRunId: String?,
+        excludingAwaitingConsumption: Bool = false
     ) -> (
         messages: [ChatMessage],
         excludedByRunId: Int,
@@ -733,6 +743,8 @@ public actor SessionHistoryReader {
                 invalidShapeCount += 1
                 continue
             }
+            if excludingAwaitingConsumption, case .object(let metadata)? = obj["metadata"],
+               metadata["awaitingConsumption"] == .bool(true) { continue }
             if let excludingRunId,
                message(parsed, hasRunId: excludingRunId) {
                 excludedCount += 1

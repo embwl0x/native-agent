@@ -392,8 +392,10 @@ struct DeskPageView: View {
 
     @State private var overviewSelection: WorkOverviewRow?
     @State private var snapshot = DeskPageSnapshot.empty
+    @State private var readCount = 0
     @State private var now = Date()
     @State private var openFolds: Set<String> = []
+    @State private var projectRows: [ProjectRow] = []
     @State private var sheet: DeskPageSheet?
     @State private var actionNotice: DeskActionNotice?
     @State private var actionInFlight: String?
@@ -447,8 +449,9 @@ struct DeskPageView: View {
                     } label: { Image(systemName: "arrow.clockwise") }
                     .accessibilityLabel("Refresh Desk")
                     .help("Refresh the desk")
+                    .disabled(readCount > 0)
                     Button("Find item", systemImage: "magnifyingglass") { showingPalette = true }
-                        .keyboardShortcut("k", modifiers: [.command, .shift])
+                        .help("Find an item (⌘K)")
                         .accessibilityIdentifier("desk.find-item")
                     Button("Reminders", systemImage: DeskItemPresentation.nagBellSymbol(config: nagConfig, now: now)) {
                         showingNags = true
@@ -479,6 +482,11 @@ struct DeskPageView: View {
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("desk.open-research")
                 }
+
+                PageReadStatus(
+                    isReading: !snapshot.loaded || readCount > 0,
+                    text: !snapshot.loaded ? "Reading the Desk…" : readCount > 0 ? "Refreshing the Desk…" : nil
+                )
 
                 ForEach(laneTrouble, id: \.self) { trouble in
                     Text(trouble)
@@ -545,7 +553,6 @@ struct DeskPageView: View {
             }
             .padding(.horizontal, 20)
             .padding(.top, TodayMetrics.topPadding)
-            .motionArrival(when: snapshot.loaded)
             .padding(.bottom, 32)
             .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
             .frame(maxWidth: .infinity)
@@ -581,12 +588,18 @@ struct DeskPageView: View {
                         .id(item.handle)
                 }
             }
-            .background(.regularMaterial)
+            .houseSurface(in: Rectangle())
         }
+        // The one ⌘K palette, with the Desk's rows and verbs in it.
         .sheet(isPresented: $showingPalette) {
-            DeskCommandPaletteView(rows: paletteRows, selectedHandle: selectedHandle,
-                                   onSelect: select,
-                                   onCommand: applyPaletteCommand, isPresented: $showingPalette)
+            CommandPaletteView(
+                isPresented: $showingPalette,
+                desk: DeskPaletteScope(rows: paletteRows, selectedHandle: selectedHandle,
+                                       onSelect: select, onCommand: applyPaletteCommand))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openCommandPaletteRequest)) { _ in
+            guard !quietOffscreenRead else { return }
+            showingPalette = true
         }
         .onChange(of: showingPalette) { _, open in
             guard !open, let handle = watcherSelection else { return }
@@ -595,11 +608,13 @@ struct DeskPageView: View {
         .task {
             guard !quietOffscreenRead else { return }
             liveUpdatesMounted = true
+            appModel.deskHoldsCommandPalette = true
             bindLiveUpdates()
         }
         .onDisappear {
             guard !quietOffscreenRead else { return }
             liveUpdatesMounted = false
+            appModel.deskHoldsCommandPalette = false
             DeskLiveReloader.shared.deactivate(subscriber: liveSubscriberID)
         }
         .onChange(of: scenePhase) {
@@ -612,7 +627,7 @@ struct DeskPageView: View {
         // stores are re-read.
         // This is also first paint — one task, owned by the view, instead of a
         // detached `Task {}` from onChange that outlived it.
-        .liveTask(id: rootRouteVersion) {
+        .quietReadTask(id: rootRouteVersion) {
             openFolds.removeAll()
             revealCounts.removeAll()
             selectedHandle = nil
@@ -688,11 +703,11 @@ struct DeskPageView: View {
                             inspect(row.reference.id)
                         } else { overviewSelection = row }
                     } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(row.title).font(.headline).foregroundStyle(NativeAgentShell.text)
-                            Text(row.summary).foregroundStyle(NativeAgentShell.secondary).lineLimit(3)
+                        VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
+                            Text(row.title).font(ShellType.rowTitle).foregroundStyle(NativeAgentShell.text)
+                            Text(row.summary).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).lineLimit(3)
                             Text([row.stateLabel(at: now), row.location].compactMap { $0 }.joined(separator: " · "))
-                                .font(.caption).foregroundStyle(NativeAgentShell.secondary)
+                                .font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                     }
@@ -755,7 +770,9 @@ struct DeskPageView: View {
     /// The project and the run it spawned were on two different surfaces (and
     /// the run under a second, Workshop-named item); joined by `deskHandle`,
     /// they read as one piece of work again.
-    private var projectRows: [ProjectRow] {
+    /// Derived once per load: `body` asked for it several times per redraw,
+    /// and each ask rebuilt every row and parsed every timestamp.
+    private func computeProjectRows() -> [ProjectRow] {
         guard snapshot.deskUnavailable == nil else { return [] }
         let state = deskState
         let plan = snapshot.plan
@@ -856,7 +873,7 @@ struct DeskPageView: View {
             return "It finished without writing down a result."
         default:
             do { return try execution.result.serialize(pretty: true) }
-            catch { return "Result unavailable: \(error.localizedDescription)" }
+            catch { return UserFacingError.message(error, action: "show the result") }
         }
     }
 
@@ -977,7 +994,7 @@ struct DeskPageView: View {
     }
 
     private func toggleFold(_ key: String) {
-        withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion)) {
+        withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)) {
             if openFolds.contains(key) { openFolds.remove(key) } else { openFolds.insert(key) }
         }
     }
@@ -1005,7 +1022,7 @@ struct DeskPageView: View {
             .accessibilityIdentifier("desk.fold")
             foldContent(count.id)
         }
-        .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+        .transition(NativeAgentMotion.arrivalFade)
     }
 
     @ViewBuilder
@@ -1215,7 +1232,7 @@ struct DeskPageView: View {
         Button { inspect(item.handle) } label: {
             DeskPageDetailRow(title: DeskPageContent.title(item),
                               line: DeskPageContent.itemDetail(item),
-                              meta: "\(item.status.rawValue) · \(item.project)")
+                              meta: "\(item.status.displayLabel) · \(item.project)")
         }
         .buttonStyle(.plain)
         .id("desk:\(item.handle)")
@@ -1368,7 +1385,7 @@ struct DeskPageView: View {
     /// there at all.
     @MainActor
     private func openPendingDeskItem(_ scroller: ScrollViewProxy, giveUpIfMissing: Bool = false) {
-        guard let handle = appModel.pendingDeskHandle else { return }
+        guard !quietOffscreenRead, let handle = appModel.pendingDeskHandle else { return }
         guard snapshot.loaded, items.contains(where: { $0.handle == handle }) else {
             if giveUpIfMissing { appModel.pendingDeskHandle = nil }
             return
@@ -1397,7 +1414,7 @@ struct DeskPageView: View {
                 paths: try Self.liveUpdatePaths(dataRoot: PersistenceCore.defaultDataRoot()),
                 reload: { _ = await reload() })
         } catch {
-            liveUpdateError = "Desk live updates are unavailable: \(error.localizedDescription)"
+            liveUpdateError = UserFacingError.message(error, action: "turn on Desk live updates")
         }
     }
 
@@ -1442,6 +1459,8 @@ struct DeskPageView: View {
     @discardableResult
     @MainActor
     private func reload() async -> Bool {
+        readCount += 1
+        defer { readCount -= 1 }
         // Taken BEFORE the awaits, checked after: a read that lost the race
         // publishes nothing at all, rather than half-replacing the board.
         let token = loadGate.begin()
@@ -1472,6 +1491,7 @@ struct DeskPageView: View {
         guard !Task.isCancelled, loadGate.accepts(token) else { return false }
         now = presentationNow
         snapshot = loaded
+        projectRows = computeProjectRows()
         nagConfig = loadedNags
         herHour = loadedHour.state
         if !quietOffscreenRead, liveUpdatesMounted {
@@ -1601,41 +1621,6 @@ struct PageSheetHost<Content: View>: View {
 
 // MARK: - Row furniture
 
-/// One thing in motion: a ring, the name, one line. Fixed height, so the grid
-/// reads as a grid.
-struct DeskWorkingCard: View {
-    let title: String
-    let detail: String
-    let fraction: Double?
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            AliveProgressRing(fraction: fraction)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(TodayWords.bounded(title, limit: 48))
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(NativeAgentShell.text)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                if !detail.isEmpty {
-                    Text(TodayWords.bounded(detail, limit: 64))
-                        .font(.system(size: 12))
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 74)
-        .aliveCard()
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("desk.row")
-    }
-}
-
 /// One project inside the Projects card: the name (the way into Chat about
 /// it), its next step, and a bar when the board counts its parts.
 struct DeskProjectRow: View {
@@ -1716,60 +1701,5 @@ struct DeskPageDetailRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("desk.detail-row")
-    }
-}
-
-/// One thing waiting on him, named, with its one action beside it.
-struct DeskPageWaitingRow: View {
-    let title: String
-    let line: String
-    let actionTitle: String
-    let isBusy: Bool
-    let action: () -> Void
-    /// Closing an item he already dealt with somewhere else. It is not the
-    /// row's job — answering is — so it lives on the row's menu rather than
-    /// adding a second button to the page's most crowded card.
-    var alreadyHandled: (() -> Void)? = nil
-    var details: (() -> Void)? = nil
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            AliveWaitingDot()
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title.isEmpty ? "Something needs you" : TodayWords.bounded(title, limit: 80))
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(NativeAgentShell.text)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                if !line.isEmpty {
-                    Text(TodayWords.bounded(line, limit: 100))
-                        .font(.system(size: 13))
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-            }
-            .frame(height: line.isEmpty ? TodayMetrics.rowContentHeightSingle : TodayMetrics.rowContentHeight,
-                   alignment: .leading)
-            Spacer(minLength: 12)
-            if isBusy {
-                ProgressView().controlSize(.small)
-            } else {
-                Button(actionTitle, action: action)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .hazeTinted(.button)
-                    .accessibilityIdentifier("desk.waiting.action")
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .contextMenu {
-            if let details { Button("Details and actions", action: details) }
-            if let alreadyHandled {
-                Button("I already handled this", action: alreadyHandled)
-                    .accessibilityIdentifier("desk.waiting.close")
-            }
-        }
     }
 }

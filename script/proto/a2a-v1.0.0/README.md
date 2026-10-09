@@ -11,5 +11,6 @@ the included LICENSE and source copyright notices apply.
 Run `script/regenerate_a2a_grpc.sh` with protoc 33.4, SwiftProtobuf's
 `protoc-gen-swift` 1.38.1 and grpc-swift-protobuf's `protoc-gen-grpc-swift-2`
 2.4.1. Generated public messages and service/client interfaces live in
-ChatOrchestration so the app server and outbound client share one schema.
+`Modules/NativeAgentCore/Sources/AgentLinkTransport/Generated/` so the app
+server and outbound client share one schema.
 Annotations are compiler inputs only and do not add generated runtime targets.

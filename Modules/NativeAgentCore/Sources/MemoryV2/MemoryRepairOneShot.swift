@@ -40,91 +40,15 @@ public enum MemoryRepairOneShot {
     static let truncatedRowsKind = "memory.repair.truncated_rows"
     static let legacyNoteDupsKind = "memory.repair.legacy_note_dups"
 
-    // MARK: - Suggested completions (LLM-suggested, human-approved)
-    //
-    // Full-text repairs for the 5 known truncated rows. These are
-    // LLM-SUGGESTED completions of the chopped final sentence — the approval
-    // card shows current vs. proposed verbatim, and only the texts carried
-    // in the approved card's payload are ever written. Keyed by row id so a
-    // content drift since staging is detected as stale and skipped.
-    static let truncatedRowSuggestedCompletions: [String: String] = [:]
-
-    /// Detection window for the daemon-era cap: content length in 199...200
-    /// and created on these days. Both gates must hit — plenty of healthy
-    /// rows are short; only the known daemon-era window is repairable.
-    static let truncatedLengths: Set<Int> = [199, 200]
-    static let truncatedCreatedDayPrefixes = ["2026-05-16", "2026-05-17"]
-
     // MARK: - Boot entry point
 
     /// Idempotent: safe to call on every app launch. Stages at most one
     /// approval card per repair kind, ever (stamp + pending-approval scan).
     public static func stageIfNeeded(dataRoot: URL, presentation: any MemoryRepairPresentationPort) async {
-        _ = await stageTruncatedRowsRepair(dataRoot: dataRoot, presentation: presentation)
         _ = await stageLegacyNoteDupPurge(dataRoot: dataRoot, presentation: presentation)
     }
 
-    // MARK: - Staging (a): truncated-row repair card
-
-    /// Returns the approval id when a card exists after this call (fresh or
-    /// reused), nil when there was nothing to stage or staging failed
-    /// (failed staging leaves no stamp — retried next launch).
-    @discardableResult
-    static func stageTruncatedRowsRepair(
-        dataRoot: URL,
-        presentation: any MemoryRepairPresentationPort,
-        suggestions: [String: String] = truncatedRowSuggestedCompletions
-    ) async -> String? {
-        if let stamped = readStamp(kind: truncatedRowsKind, dataRoot: dataRoot) { return stamped }
-
-        // Detect repairable rows: daemon-era cap signature AND a suggestion
-        // to propose. Detection failure (no sqlite yet, cold install) → skip.
-        let rows: [(id: String, current: String, proposed: String)]
-        do {
-            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            let actives = try await storage.listMemories(persona: nil, status: "active", limit: nil)
-            rows = actives.compactMap { m in
-                guard truncatedLengths.contains(m.content.count),
-                      truncatedCreatedDayPrefixes.contains(where: { m.createdAt.hasPrefix($0) }),
-                      let proposed = suggestions[m.id]
-                else { return nil }
-                return (id: m.id, current: m.content, proposed: proposed)
-            }
-            .sorted { $0.id < $1.id }
-        } catch {
-            return nil
-        }
-        guard !rows.isEmpty else { return nil }
-
-        let payload: JSONValue = .object([
-            "kind": .string(truncatedRowsKind),
-            "store": .string("memory/memory.sqlite"),
-            "rows": .array(rows.map { row in
-                .object([
-                    "id": .string(row.id),
-                    "current_text": .string(row.current),
-                    "proposed_text": .string(row.proposed),
-                ])
-            }),
-        ])
-        let title = "Memory repair: complete \(rows.count) truncated memories"
-        let reason = "These rows still carry the retired daemon's 200-char hard cap and end "
-            + "mid-sentence. Approve to replace each with the LLM-suggested completed text shown "
-            + "(store backed up first, written through the normal memory write path); deny to "
-            + "leave them exactly as they are."
-        let summary = rows.map { "• …\(String($0.current.suffix(60))) → …\(String($0.proposed.suffix(80)))" }
-            .joined(separator: "\n")
-        let detail = rows.map { "[\($0.id)]\nCURRENT: \($0.current)\nPROPOSED: \($0.proposed)" }
-            .joined(separator: "\n\n")
-        return await stage(
-            kind: truncatedRowsKind, dataRoot: dataRoot, presentation: presentation,
-            title: title, reason: reason, payload: payload,
-            cardSummary: summary, cardDetail: detail,
-            relatedPath: dataRoot.appendingPathComponent("memory/memory.sqlite").path
-        )
-    }
-
-    // MARK: - Staging (b): legacy note dup-purge card
+    // MARK: - Staging: legacy note dup-purge card
 
     @discardableResult
     static func stageLegacyNoteDupPurge(dataRoot: URL, presentation: any MemoryRepairPresentationPort) async -> String? {
@@ -212,7 +136,7 @@ public enum MemoryRepairOneShot {
         do {
             pending = try await inbox.list(filter: ApprovalFilter(status: "pending", action: action))
         } catch {
-            NSLog("[memoryRepair] dedupe scan failed for \(kind): \(String(describing: error))")
+            nativeLog("[memoryRepair] dedupe scan failed for \(kind): \(String(describing: error))")
             return nil
         }
         if let existing = pending.first(where: { payloadKind($0.payload) == kind }) {
@@ -223,7 +147,7 @@ public enum MemoryRepairOneShot {
                 writeStamp(kind: kind, approvalId: existing.id, dataRoot: dataRoot)
                 return existing.id
             } catch {
-                NSLog("[memoryRepair] card ensure failed for \(kind): \(String(describing: error))")
+                nativeLog("[memoryRepair] card ensure failed for \(kind): \(String(describing: error))")
                 return nil
             }
         }
@@ -244,7 +168,7 @@ public enum MemoryRepairOneShot {
             writeStamp(kind: kind, approvalId: rec.id, dataRoot: dataRoot)
             return rec.id
         } catch {
-            NSLog("[memoryRepair] stage failed for \(kind): \(String(describing: error))")
+            nativeLog("[memoryRepair] stage failed for \(kind): \(String(describing: error))")
             return nil
         }
     }
@@ -297,7 +221,7 @@ public enum MemoryRepairOneShot {
               rec.status == "resolved",
               let decision = rec.decision else { return }
         guard let kind = MemoryRepairOneShot.payloadKind(rec.payload) else {
-            NSLog("[memoryRepair] missing payload kind on approval \(rec.id)")
+            nativeLog("[memoryRepair] missing payload kind on approval \(rec.id)")
             _ = try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                 rec.id,
                 executedAction: .object(["error": .string("missing payload kind")]),
@@ -342,14 +266,14 @@ public enum MemoryRepairOneShot {
                                 + "\(outcome.kept) rows kept — backup at \(outcome.backupPath)"
                             : "legacy note purge: no duplicates remained at apply time; file untouched")
                 default:
-                    NSLog("[memoryRepair] unknown repair kind: \(kind)")
+                    nativeLog("[memoryRepair] unknown repair kind: \(kind)")
                     _ = try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                         rec.id,
                         executedAction: .object(["kind": .string(kind), "error": .string("unknown kind")]),
                         detail: "memory repair FAILED: unknown repair kind '\(kind)'")
                 }
             } catch {
-                NSLog("[memoryRepair] apply failed for \(kind): \(String(describing: error))")
+                nativeLog("[memoryRepair] apply failed for \(kind): \(String(describing: error))")
                 // The approval record is terminal; clear the staging stamp so
                 // the next launch re-detects whatever is still broken and
                 // stages a fresh card instead of dead-ending.
@@ -546,7 +470,7 @@ public enum MemoryRepairOneShot {
                 at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
             try stamp.serializedData(pretty: true).write(to: path, options: .atomic)
         } catch {
-            NSLog("[memoryRepair] stamp write failed for \(kind): \(String(describing: error))")
+            nativeLog("[memoryRepair] stamp write failed for \(kind): \(String(describing: error))")
         }
     }
 

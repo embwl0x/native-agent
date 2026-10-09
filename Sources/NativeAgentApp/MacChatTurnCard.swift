@@ -63,6 +63,13 @@ struct MacChatTurnCardModel: Sendable, Equatable {
     /// turn (and every test that builds a model by hand) wants.
     var clock: Clock? = nil
 
+    /// Fluid glass A1: she is thinking and nothing has been said or done
+    /// yet. The title line becomes "Thinking… 0:08", counting from here.
+    var thinkingSince: Date? = nil
+    /// Her reply text is arriving and nothing else is going on: the line
+    /// that said "Thinking…" says how long she thought.
+    var isReplying = false
+
     /// Raw inputs for the trailing readout. Deliberately the same three
     /// timestamps the projection uses, so the self-advancing readout and a
     /// re-projection can never disagree about what second it is.
@@ -214,6 +221,10 @@ enum MacChatTurnCardProjection {
         // Keep the decision reachable, but acknowledge Stop until the turn
         // actually settles even when an approval is still pending.
         let ownedApproval = approvalOwnsCard && !cancellationPending ? approval : nil
+        // Plain work: no approval, no Stop pending, no tool or delegate line.
+        let plain = !isTerminal && ownedApproval == nil && !cancellationPending
+            && presentation.currentAction == nil
+            && (phase == .acknowledged || phase == .working)
         return MacChatTurnCardModel(
             identity: state.identity,
             phase: phase,
@@ -242,7 +253,9 @@ enum MacChatTurnCardProjection {
                 endedAt: presentation.endedAt,
                 lastMovementAt: presentation.lastMovementAt,
                 isTerminal: isTerminal
-            )
+            ),
+            thinkingSince: plain && presentation.streamedTextLength == 0 ? presentation.startedAt : nil,
+            isReplying: plain && presentation.streamedTextLength > 0
         )
     }
 
@@ -484,6 +497,15 @@ struct MacChatTurnCard: View {
     var isResolvingApproval: Bool = false
 
     @State private var isShowingPreviewSheet = false
+    /// How long she thought before her first words, measured when the
+    /// thinking line ends. The card is keyed by turn, so this is per turn.
+    @State private var thoughtFor: TimeInterval?
+
+    /// "Thought for 8s" while her reply streams, in place of "is working…".
+    private var thoughtTitle: String? {
+        guard model.isReplying, let thoughtFor else { return nil }
+        return "Thought for \(MacChatTurnCardFormat.duration(max(1, thoughtFor)))"
+    }
 
     /// Thumbnail geometry. 16:10 — a window shape, not a square — and sized to
     /// the height the card ALREADY has: its two text rows (title, then the
@@ -502,13 +524,17 @@ struct MacChatTurnCard: View {
     /// every turn that never touches the four verbs, and the card then renders
     /// exactly as it always has.
     var preview: MacChatScreenPreview? = nil
+    /// The main window's Work pane shows the screen full width, so there the
+    /// caption opens it and the thumbnail and its sheet step aside. Nil in a
+    /// detached window, which has no pane and keeps both.
+    var onOpenScreen: (() -> Void)? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var tint: Color {
         switch model.tone {
         // A running turn is not "waiting on you", so it never wears the
-        // teal accent (2026-09-23): a neutral dot on untinted glass.
+        // teal accent (2026-09-23): a neutral dot on house glass.
         case .working: return NativeAgentShell.secondary
         case .attention: return NativeAgentTheme.warn
         case .failed: return NativeAgentTheme.fail
@@ -519,9 +545,7 @@ struct MacChatTurnCard: View {
     }
 
     var body: some View {
-        // lightweight: the card floats over the transcript in the main window;
-        // clear glass keeps any text it momentarily overlaps legible.
-        GlassCard(tint: model.tone == .working ? nil : tint, lightweight: true) {
+        GlassCard(tint: model.tone == .working ? nil : tint) {
             HStack(alignment: .center, spacing: NativeAgentSpacing.md) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
@@ -529,25 +553,34 @@ struct MacChatTurnCard: View {
                         .frame(width: 12, alignment: .center)
                         .allowsHitTesting(false)
 
-                    Text(model.title)
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(model.isTerminal ? AnyShapeStyle(tint) : AnyShapeStyle(.primary))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .layoutPriority(2)
-                        // Text glyphs have their own hit regions; a drag that
-                        // starts on the title must reach the transcript below.
-                        .allowsHitTesting(false)
+                    Group {
+                        if let since = model.thinkingSince {
+                            MacChatTurnThinkingTitle(since: since)
+                        } else {
+                            Text(thoughtTitle ?? model.title)
+                                .font(NativeAgentFont.label)
+                                .foregroundStyle(model.isTerminal ? AnyShapeStyle(tint) : AnyShapeStyle(.primary))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                    }
+                    .layoutPriority(2)
+                    // Text glyphs have their own hit regions; a drag that
+                    // starts on the title must reach the transcript below.
+                    .allowsHitTesting(false)
 
                     Spacer(minLength: NativeAgentSpacing.sm)
 
-                    MacChatTurnCardMetaText(
-                        clock: model.clock,
-                        isTerminal: model.isTerminal,
-                        fallback: meta,
-                        fallbackSpoken: model.spokenMeta
-                    )
-                    .allowsHitTesting(false)
+                    // The thinking line carries its own clock.
+                    if model.thinkingSince == nil {
+                        MacChatTurnCardMetaText(
+                            clock: model.clock,
+                            isTerminal: model.isTerminal,
+                            fallback: meta,
+                            fallbackSpoken: model.spokenMeta
+                        )
+                        .allowsHitTesting(false)
+                    }
 
                     // Controls outrank ALL text at narrow widths: at the
                     // detached-window floor (380pt) with a long meta readout,
@@ -627,13 +660,29 @@ struct MacChatTurnCard: View {
                 }
 
                 if let detail = detailLine, !detail.isEmpty {
-                    Text(detail)
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .help(detail)
+                    if showsPreviewPane, model.approval == nil, let onOpenScreen {
+                        Button(action: onOpenScreen) {
+                            Text(detail)
+                                .font(NativeAgentFont.tag)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        .buttonStyle(.plain)
+                        .help("See it in the Work pane")
+                        .accessibilityLabel("What I am looking at: \(detail)")
+                        .accessibilityHint("Opens the Work pane on Screen")
+                        .accessibilityIdentifier("chat.turn.preview")
                         .padding(.leading, 12 + NativeAgentSpacing.sm)
+                    } else {
+                        Text(detail)
+                            .font(NativeAgentFont.tag)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(detail)
+                            .padding(.leading, 12 + NativeAgentSpacing.sm)
+                    }
                 }
 
                 // 2026-09-06: what the tool would run with. A decision asked
@@ -652,12 +701,15 @@ struct MacChatTurnCard: View {
                 }
             }
 
-            if showsPreviewPane, let preview, let image = preview.image {
+            if showsPreviewPane, onOpenScreen == nil, let preview, let image = preview.image {
                 thumbnail(preview, image: image)
             }
             }
         }
         .sheet(isPresented: $isShowingPreviewSheet) { previewSheet }
+        .onChange(of: model.thinkingSince) { since, now in
+            if let since, now == nil { thoughtFor = Date().timeIntervalSince(since) }
+        }
         // The empty container path also excluded its borderless buttons from
         // mouse hit testing, even though accessibility could activate them.
         // Keep the inset card's bounds hittable; settled cards remain inert.
@@ -839,6 +891,47 @@ struct MacChatTurnCardMetaText: View {
     }
 }
 
+/// Fluid glass A1: "Thinking… 0:08", the card's title while she thinks before
+/// saying or doing anything. A soft light crosses the word every 2s (none
+/// under Reduce Motion); the clock is the system's timer text, so it advances
+/// without re-rendering anything. When she starts, the card's title says
+/// "Thought for 8s" while her reply streams.
+struct MacChatTurnThinkingTitle: View {
+    let since: Date
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var sweep = false
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.xs) {
+            Text("Thinking\u{2026}")
+                .foregroundStyle(NativeAgentShell.secondary)
+                .overlay {
+                    if !reduceMotion {
+                        GeometryReader { geometry in
+                            let band = max(24, geometry.size.width * 0.6)
+                            LinearGradient(
+                                colors: [.clear, NativeAgentShell.text, .clear],
+                                startPoint: .leading, endPoint: .trailing
+                            )
+                            .frame(width: band)
+                            .offset(x: sweep ? geometry.size.width : -band)
+                        }
+                        .mask { Text("Thinking\u{2026}") }
+                    }
+                }
+                .onAppear {
+                    withAnimation(.linear(duration: 2).repeatForever(autoreverses: false)) { sweep = true }
+                }
+            Text(timerInterval: since...Date.distantFuture, countsDown: false)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .monospacedDigit()
+        }
+        .font(NativeAgentFont.label)
+        .lineLimit(1)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// Composes the card from the lifecycle owner for one exact session.
 ///
 /// The clock: a live card advances on a single SwiftUI `TimelineView`
@@ -849,6 +942,8 @@ struct MacChatTurnCardHost: View {
     @Environment(AppModel.self) private var appModel
     let sessionId: String
     var onStop: (() -> Void)?
+    /// The main window passes its Work pane; detached windows pass nothing.
+    var onOpenScreen: (() -> Void)? = nil
 
     /// Seconds between re-projections of the card. Only the derived `.stalled`
     /// phase depends on the clock here; the readout keeps its own second.
@@ -903,7 +998,8 @@ struct MacChatTurnCardHost: View {
                 // Present only while this session's turn is actually driving the
                 // Mac; the app clears the slot when the turn opens and when its
                 // intake closes, so a settled card never carries a frame.
-                preview: appModel.engine.turns.screenPreview(for: sessionId)
+                preview: appModel.engine.turns.screenPreview(for: sessionId),
+                onOpenScreen: onOpenScreen
             )
         }
     }
@@ -917,9 +1013,13 @@ struct MacChatTurnCardHost: View {
         Task { @MainActor in
             do {
                 _ = try await appModel.resolveApproval(id: approvalId, decision: decision)
+            } catch ApprovalInboxError.alreadyResolved {
+                // Stale card: re-read the inbox so it settles to the real decision.
+                appModel.engine.approvals.records = (try? await appModel.engine.approvals.list())
+                    ?? appModel.engine.approvals.records
             } catch {
                 appModel.systemToasts.push(
-                    error: "Approval failed: \(error.localizedDescription)"
+                    error: UserFacingError.message(error, action: "record that decision")
                 )
             }
             await appModel.refreshSidebarActivityBadge()

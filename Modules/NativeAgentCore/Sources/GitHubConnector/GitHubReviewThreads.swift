@@ -132,7 +132,7 @@ extension GitHubConnectorActions {
         current: [GitHubCommandReviewThreadEvidence],
         previous: [GitHubCommandReviewThreadEvidence]?
     ) -> [GitHubCommandReviewThreadEvidence] {
-        let prior = Dictionary(uniqueKeysWithValues: (previous ?? []).map { ($0.threadId, $0) })
+        let prior = Dictionary((previous ?? []).map { ($0.threadId, $0) }, uniquingKeysWith: { first, _ in first })
         return current.map { thread in
             let old = prior[thread.threadId]
             let generation: Int
@@ -529,7 +529,7 @@ private extension GitHubConnectorActions {
                 rateLimitRemaining: remaining
             ) {
                 await GitHubRateLimitGate.shared.trip(seconds: backoff)
-                NSLog("[github] GraphQL secondary rate limit — backing off %ds", Int(backoff))
+                nativeLog("[github] GraphQL secondary rate limit — backing off %ds", Int(backoff))
             }
             throw GitHubConnectorError.http(
                 status: http.statusCode,

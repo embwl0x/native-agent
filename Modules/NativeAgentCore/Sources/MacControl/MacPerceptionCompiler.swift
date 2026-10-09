@@ -190,6 +190,7 @@ public struct MacLookAffordance: Sendable, Equatable {
     public let secret: Bool
     public let enabled: Bool
     public let selected: Bool?
+    public let state: String?
     public let frame: MacAXFrame?
     public let path: [Int]
     /// The label/value as the compiler already redacted them under the FULL
@@ -231,7 +232,8 @@ public struct MacLookAffordance: Sendable, Equatable {
         valueJSON: JSONValue? = nil,
         handleAmbiguity: String? = nil,
         placeholder: String? = nil,
-        placeholderJSON: JSONValue? = nil
+        placeholderJSON: JSONValue? = nil,
+        state: String? = nil
     ) {
         self.handleAmbiguity = handleAmbiguity
         self.placeholder = placeholder
@@ -245,6 +247,7 @@ public struct MacLookAffordance: Sendable, Equatable {
         self.secret = secret
         self.enabled = enabled
         self.selected = selected
+        self.state = state
         self.frame = frame
         self.path = path
         self.labelJSON = labelJSON
@@ -292,6 +295,7 @@ public struct MacLookAffordance: Sendable, Equatable {
         }
         if secret { object["secret_field"] = .bool(true) }
         if let selected { object["selected"] = .bool(selected) }
+        if let state { object["state"] = .string(state) }
         if let handleAmbiguity {
             object["handle_ambiguous"] = .bool(true)
             object["handle_ambiguity"] = .string(handleAmbiguity)
@@ -863,6 +867,7 @@ public enum MacPerceptionCompiler {
     /// `MacScreenViewBuilder.isMarkable`, narrowed: this list is what she can
     /// ACT on, so scroll containers are landmarks here rather than affordances.
     public static let interactiveRoles: Set<String> = [
+        "AXButton", "AXSwitch", "AXSearchField",
         "AXTextField", "AXTextArea", "AXLink", "AXCheckBox", "AXPopUpButton",
         "AXComboBox", "AXSlider", "AXRadioButton", "AXMenuButton", "AXTab",
         "AXMenuItem",
@@ -948,8 +953,10 @@ public enum MacPerceptionCompiler {
             return MacAXNode(attributes: MacAXAttributes(
                 role: a.role, subrole: a.subrole, title: caption, value: a.value, enabled: a.enabled,
                 selected: a.selected, frame: a.frame, actions: a.actions,
-                placeholder: a.placeholder, selectionRange: a.selectionRange
-            ), path: node.path)
+                placeholder: a.placeholder, selectionRange: a.selectionRange, state: a.state,
+                liveRegion: a.liveRegion, valueIsHelp: a.valueIsHelp,
+                titleIsHelp: a.titleIsHelp, displayTitle: a.displayTitle
+            ), path: node.path, element: node.element)
         }
         guard changed else { return snapshot }
         return MacAXTreeSnapshot(nodes: nodes, truncated: snapshot.truncated,
@@ -991,7 +998,7 @@ public enum MacPerceptionCompiler {
             }
             return MacScreenViewTextRedaction.redactedNodeString(
                 text,
-                valueChars: affordanceValueChars,
+                valueChars: uncapped ? max(1, text.count) : affordanceValueChars,
                 frame: node.attributes.frame,
                 under: caption,
                 enclosing: MacScreenViewTextRedaction.enclosingKinds(
@@ -1009,11 +1016,12 @@ public enum MacPerceptionCompiler {
             childrenByParent[key(Array(node.path.dropLast())), default: []].append(node)
         }
 
-        // finding B — the identity of a TITLE-LESS container, from the first
-        // text it contains. Bounded to 2 levels and 3 scanned descendants,
-        // depth-first (Finder's shape is AXRow > AXCell > AXStaticText, so a
-        // breadth-first scan would burn its budget on empty sibling cells and
-        // never reach the filename).
+        // finding B — the identity of a TITLE-LESS container, from the text it
+        // contains two levels down (Finder's shape is AXRow > AXCell >
+        // AXStaticText). The row's OWN text, all of it: a child control's
+        // label ("Delete" in every row) is skipped and the whole text is
+        // hashed, so two records sharing a sender, a prefix or a button stay
+        // distinct. A recycled row that shows another record is a new handle.
         func contentName(of node: MacAXNode) -> String? {
             let attributes = node.attributes
             guard MacLookHandle.contentIdentityRoles.contains(attributes.role) else { return nil }
@@ -1022,25 +1030,18 @@ public enum MacPerceptionCompiler {
             // "Medium" then "Large" must keep one handle.
             guard cleaned(attributes.title) == nil else { return nil }
             guard !(isInteractive(attributes) && cleaned(attributes.value) != nil) else { return nil }
-            var budget = 3
-            func scan(_ path: [Int], depth: Int) -> String? {
-                guard depth < 2 else { return nil }
-                for child in childrenByParent[key(path)] ?? [] {
-                    guard budget > 0 else { return nil }
-                    budget -= 1
+            var texts: [String] = []
+            func scan(_ path: [Int], depth: Int) {
+                guard depth < 2 else { return }
+                for child in childrenByParent[key(path)] ?? [] where !controlRoles.contains(child.attributes.role) {
                     if let text = cleaned(child.attributes.title) ?? cleaned(child.attributes.value) {
-                        return text
-                    }
-                    if let deeper = scan(child.path, depth: depth + 1) { return deeper }
+                        texts.append(text)
+                    } else { scan(child.path, depth: depth + 1) }
                 }
-                return nil
             }
-            guard let raw = scan(node.path, depth: 0) else { return nil }
-            return String(
-                raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
-                    .prefix(MacLookHandle.ancestorLabelChars)
-            )
+            scan(node.path, depth: 0)
+            guard !texts.isEmpty else { return nil }
+            return MacLookHandle.token(fingerprint: texts.joined(separator: "\n").lowercased())
         }
 
         // An ancestor contributes its title, or — when it has none — the same
@@ -1216,7 +1217,7 @@ public enum MacPerceptionCompiler {
             guard isInteractive(attributes) else { continue }
             interactiveCount += 1
 
-            let title = cleaned(attributes.title)
+            let title = attributes.title == attributes.role ? nil : cleaned(attributes.title)
             let value = cleaned(attributes.value)
             let label: String
             let labelSource: String
@@ -1271,7 +1272,8 @@ public enum MacPerceptionCompiler {
                 valueJSON: shownValue.map { redacted($0, of: node, under: title, isValue: true) },
                 handleAmbiguity: ambiguity(at: node.path),
                 placeholder: cleaned(attributes.placeholder),
-                placeholderJSON: cleaned(attributes.placeholder).map { redacted($0, of: node, under: nil) }
+                placeholderJSON: cleaned(attributes.placeholder).map { redacted($0, of: node, under: nil) },
+                state: attributes.state
             ))
         }
 
@@ -1425,7 +1427,7 @@ public enum MacPerceptionCompiler {
             }
             .map(\.element)
         var readoutsOmitted = 0
-        if readouts.count > maxReadouts {
+        if !uncapped, readouts.count > maxReadouts {
             readoutsOmitted = readouts.count - maxReadouts
             readouts = Array(readouts.prefix(maxReadouts))
         }
@@ -1669,6 +1671,8 @@ public struct MacLookFrame: Sendable, Equatable {
     /// record (its diff simply cannot claim incomparability rather than
     /// inventing one).
     public let caps: MacLookCompileCaps?
+    /// Identity revalidation and post-action reads retain the sight's scope.
+    public let completeWindow: Bool
 
     public init(
         frameId: String,
@@ -1683,11 +1687,13 @@ public struct MacLookFrame: Sendable, Equatable {
         modalPath: [Int]? = nil,
         readouts: [String: MacLookReadoutRecord] = [:],
         windowIdentity: MacAXWindowIdentity? = nil,
-        caps: MacLookCompileCaps? = nil
+        caps: MacLookCompileCaps? = nil,
+        completeWindow: Bool = false
     ) {
         self.windowIdentity = windowIdentity
         self.readouts = readouts
         self.caps = caps
+        self.completeWindow = completeWindow
         self.frameId = frameId
         self.capturedAt = capturedAt
         self.appName = appName
@@ -1789,7 +1795,8 @@ public struct MacLookFrame: Sendable, Equatable {
         windowTitle: String?,
         rendered: Int? = nil,
         windowIdentity: MacAXWindowIdentity? = nil,
-        caps: MacLookCompileCaps? = nil
+        caps: MacLookCompileCaps? = nil,
+        completeWindow: Bool = false
     ) -> MacLookFrame {
         MacLookFrame(
             frameId: frameId,
@@ -1808,7 +1815,8 @@ public struct MacLookFrame: Sendable, Equatable {
             // caller adds the caps it asked for (a compile that ran under a
             // lowered max_affordances/max_nodes/max_depth is not comparable
             // with one that did not).
-            caps: caps ?? MacLookCompileCaps(truncated: percept.truncated)
+            caps: caps ?? MacLookCompileCaps(truncated: percept.truncated),
+            completeWindow: completeWindow
         )
     }
 
@@ -1980,52 +1988,34 @@ public actor MacLookFrameStore {
 /// frame has expired — rather than by a timer, because a timer would be exactly
 /// the resident background thing this plan forbids.
 public enum MacChromiumAccessibility {
+    /// The previously measured cold-renderer allowance is now an INACTIVITY
+    /// window. Observed renderer nodes/text growth renews it without any
+    /// total duration ceiling; AX notifications only trigger another read.
+    static let rendererStallSeconds: TimeInterval = 6
+
     public enum Flag: String, CaseIterable, Sendable {
         case enhancedUserInterface = "AXEnhancedUserInterface"
         case manualAccessibility = "AXManualAccessibility"
     }
 
-    /// Known Chromium/Electron-family bundle ids on User's Mac.
-    public static let bundleIdentifiers: Set<String> = [
-        "com.google.Chrome",
-        "com.anthropic.claudefordesktop",
-        "com.microsoft.VSCode",
-        "com.tinyspeck.slackmacgap",
-        "com.spotify.client",
-        "com.hnc.Discord",
-        "notion.id",
-        "com.figma.Desktop",
-        "md.obsidian",
-    ]
-
-    /// Roles a Chromium shell exposes before the flag: a window, a couple of
-    /// groups, and essentially nothing else. Used as the by-shape fallback for
-    /// an Electron app not on the list above.
-    public static let shellNodeCeiling = 24
-
-    /// Does this walk look like an un-enhanced Chromium shell? True when the
-    /// bundle id is known, OR the window exposed no `AXWebArea` and came back
-    /// implausibly small for an app window.
+    /// Renderer identity comes from the running app's bundle, not its name or
+    /// a thin-tree guess (a small native window can legitimately be thin).
     public static func looksChromium(bundleId: String?, pid: Int32? = nil, snapshot: MacAXTreeSnapshot?) -> Bool {
-        if let bundleId, bundleIdentifiers.contains(bundleId) { return true }
-        // 2026-09-28: any app that ships a Chromium renderer, listed or not.
-        // Hermes with only Enhanced left on showed a window of buttons — never
-        // a bare shell — so the by-shape test below stopped waking it.
-        if let pid, !(bundleId?.hasPrefix("com.apple.") ?? false), shipsChromium(pid: pid) { return true }
-        // Apple's own processes are never Chromium shells. Without this the
-        // shell heuristic matched `com.apple.loginwindow` (a locked screen:
-        // one window, zero controls) on 2026-08-22 and every glance at the
-        // lock screen paid the 4 s enhanced-AX settle for nothing.
-        if let bundleId, bundleId.hasPrefix("com.apple.") { return false }
-        guard let snapshot else { return false }
-        let hasWebArea = snapshot.nodes.contains { $0.attributes.role == "AXWebArea" }
-        guard !hasWebArea, snapshot.nodes.count <= shellNodeCeiling, !snapshot.truncated else { return false }
-        // …and it must actually be a SHELL. A small native window (a Mail
-        // compose sheet is 12 nodes) has real controls; an un-enhanced
-        // Chromium window has a window, a couple of groups and nothing to
-        // press. Without this the flag would be set on Mail and Finder.
-        return !snapshot.nodes.contains { MacPerceptionCompiler.isInteractive($0.attributes) }
+        // Browser identity is available before Chromium builds any AXWebArea.
+        // Do not make renderer activation depend on the tree it activates or
+        // on browser helper layout (which changes between distributions).
+        if let bundleId, chromiumBrowserBundles.contains(bundleId) { return true }
+        guard let pid else { return false }
+        return shipsChromium(pid: pid)
     }
+
+    private static let chromiumBrowserBundles: Set<String> = [
+        "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.dev", "com.google.Chrome.canary",
+        "org.chromium.Chromium", "com.brave.Browser", "com.brave.Browser.beta", "com.brave.Browser.nightly",
+        "com.microsoft.edgemac", "com.microsoft.edgemac.Beta", "com.microsoft.edgemac.Dev", "com.microsoft.edgemac.Canary",
+        "com.operasoftware.Opera", "com.operasoftware.OperaNext", "com.operasoftware.OperaDeveloper",
+        "com.vivaldi.Vivaldi", "company.thebrowser.Browser",
+    ]
 
     private static let shipsChromiumCache = OSAllocatedUnfairLock(initialState: [String: Bool]())
 
@@ -2055,11 +2045,6 @@ public enum MacChromiumAccessibility {
         snapshot?.nodes.contains { $0.attributes.role == "AXWebArea" } ?? false
     }
 
-    /// Bounded settle after the flag. The spike measured ~4 s to a full web
-    /// tree; 2 s was too short on one read. The poll exits the moment the tree
-    /// is populated, so the ceiling only costs time when nothing arrives.
-    public static let settleSeconds: Double = 6.0
-    public static let pollSeconds: Double = 0.5
 }
 
 /// Which apps and flags this module changed, so the next look can clear only
@@ -2102,8 +2087,10 @@ public extension SystemMacAXElementSource {
             let app = AXUIElementCreateApplication(pid)
             let value: CFTypeRef = (enabled ? kCFBooleanTrue : kCFBooleanFalse)
             for flag in MacChromiumAccessibility.Flag.allCases where flags.contains(flag) {
+                guard MacAXAttributeRead.prepare(app) else { break }
                 _ = AXUIElementSetAttributeValue(app, flag.rawValue as CFString, value)
             }
+            if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(app, 0) }
             return readsEnhancedAccessibility(app: app)
         }
     }
@@ -2120,10 +2107,7 @@ public extension SystemMacAXElementSource {
     private static func readsEnhancedAccessibility(app: AXUIElement) -> [MacChromiumAccessibility.Flag: Bool] {
         var flags: [MacChromiumAccessibility.Flag: Bool] = [:]
         for flag in MacChromiumAccessibility.Flag.allCases {
-            var raw: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(app, flag.rawValue as CFString, &raw) == .success,
-                  let raw, CFGetTypeID(raw) == CFBooleanGetTypeID() else { continue }
-            flags[flag] = CFBooleanGetValue((raw as! CFBoolean))
+            if let value = MacAXAttributeRead.copyBool(app, flag.rawValue) { flags[flag] = value }
         }
         return flags
     }

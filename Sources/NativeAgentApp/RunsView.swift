@@ -451,8 +451,7 @@ private struct RunDetailSheet: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(NativeAgentSpacing.md)
-                .background(.quaternary.opacity(0.5),
-                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .houseInset(in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
     }
 }

@@ -29,6 +29,8 @@ public struct AgentRoundTripProof: Codable, Sendable, Equatable {
     public let version: String?
     public let workspace: String
     public let credentialKey: String?
+    public var appBundlePath: String?
+    public var appVersion: String?
 }
 
 struct AgentConnectionProbe: Codable, Sendable, Equatable {
@@ -41,6 +43,23 @@ struct AgentConnectionProbe: Codable, Sendable, Equatable {
 
 /// Configuration only: neither presence, trust, nor permission to send a message.
 public struct AgentPeerContact: Codable, Sendable, Equatable {
+    var appBundleIDs: [String] {
+        if let bundle = AgentPeerStore.desktopBundleID(endpoint) { return [bundle] }
+        guard [.grokBot, .desktopChat, .mcpHost].contains(transport) else { return [] }
+        return AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.bundleIDs } ?? []
+    }
+
+    func stampApp(_ proof: inout AgentRoundTripProof) {
+        guard let app = appBundleIDs.compactMap(AgentHostRow.applicationURL).first else { return }
+        proof.appBundlePath = app.path
+        proof.appVersion = Self.appVersion(at: app.path)
+    }
+
+    static func appVersion(at path: String) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path).appendingPathComponent("Contents/Info.plist")),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return nil }
+        return info["CFBundleShortVersionString"] as? String
+    }
     /// Stable, canonical lowercase UUID. Names are presentation, never identity.
     public var id: String
     public var name: String
@@ -128,8 +147,9 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
 
     /// The exact program approved for this contact, re-verified now — what a
     /// Full Mac launch runs. nil: none was approved, or it changed since.
+    /// Hashed in full every time: this is the check right before that launch.
     public var verifiedExecutablePath: String? {
-        guard let receipt = acpExecutable, receipt.isCurrent else { return nil }
+        guard let receipt = acpExecutable, (try? receipt.verify()) != nil else { return nil }
         return receipt.path
     }
 
@@ -205,6 +225,15 @@ public struct AgentPeerStore: Sendable {
     public func list() throws -> [AgentPeerContact] {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) { try read() }
+    }
+
+    /// Names for turn orientation: checked owner state, without a lock or probe.
+    package func connectedNames() throws -> [String] {
+        let peers = try read()
+        return peers.filter {
+            $0.grokSetup != "disconnected" && $0.state == .connected
+                && AgentPeerCredentials.isAvailable($0, peers: peers)
+        }.map(\.name).sorted()
     }
 
     package func namesMentioned(in text: String) throws -> [String] {
@@ -289,16 +318,19 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// Re-approve the program behind a command contact's approved path. Under
-    /// the store lock, so a contact disconnected meanwhile is never written
-    /// back; false when the contact or its approved path is no longer that.
-    @discardableResult public func approveExecutable(peerID: String, path: String) throws -> Bool {
+    /// Re-approve the program behind a command or ACP contact's approved path.
+    /// Under the store lock, so a contact disconnected meanwhile is never
+    /// written back; false when the contact or its approved path is no longer that.
+    @discardableResult public func approveExecutable(peerID: String, path: String, version: String? = nil) throws -> Bool {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
-            guard let index = peers.firstIndex(where: { $0.id == peerID && $0.transport == .mcpHost }) else { return false }
-            peers[index].approvedExecutablePath = path
-            peers[index].acpExecutable = try AgentACPExecutable.capture(path: path)
+            guard let index = peers.firstIndex(where: { $0.id == peerID && [.mcpHost, .acp].contains($0.transport) }) else { return false }
+            var receipt = try AgentACPExecutable.capture(path: path)
+            receipt.version = version
+            // An ACP contact's approval is its receipt's own resolved path (approvedACPExecutable).
+            peers[index].approvedExecutablePath = peers[index].transport == .acp ? receipt.path : path
+            peers[index].acpExecutable = receipt
             try write(peers)
             return true
         }
@@ -359,6 +391,7 @@ public struct AgentPeerStore: Sendable {
             if arrived, let at = probe.receivedAt {
                 peers[index].mcpReturnProof = AgentRoundTripProof(at: at, endpoint: peer.endpoint,
                     executable: nil, version: nil, workspace: workspace, credentialKey: peer.credentialKey)
+                peer.stampApp(&peers[index].mcpReturnProof!)
                 peers[index].unavailableAt = nil
             }
             try write(peers)
@@ -375,9 +408,10 @@ public struct AgentPeerStore: Sendable {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return }
             let peer = peers[index]
-            let proof = AgentRoundTripProof(
+            var proof = AgentRoundTripProof(
                 at: ISO8601DateFormatter().string(from: Date()), endpoint: peer.endpoint,
                 executable: executable, version: version, workspace: workspace, credentialKey: peer.credentialKey)
+            peer.stampApp(&proof)
             peers[index].roundTripProof = proof
             peers[index].unavailableAt = nil
             try write(peers)

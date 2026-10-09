@@ -112,6 +112,32 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     public static func groups(containingAny filenames: Set<String>) -> Set<Self> {
         Set(allCases.filter { !filenames.isDisjoint(with: $0.filenames) })
     }
+
+    public static func stalePageMessage(_ group: String, recovery: String? = nil) -> String {
+        return "\(snapshotPageName(group)) hasn’t updated; the last received data is still available. "
+            + (recovery ?? "Open Connection in Settings to check the Mac link.")
+    }
+
+    public static func snapshotPageName(_ filename: String) -> String {
+        let group = filename.replacingOccurrences(of: ".json", with: "")
+        let known = [
+            "desk": "Desk", "desk_bounds": "Desk", "desk_details": "Desk", "work_overview": "Desk",
+            "scheduler": "Scheduler", "memories": "Memories", "inbox": "Inbox",
+            "approvals": "Approvals", "workshop_tasks": "Workshop", "work_activity": "Activity",
+            "providers": "Providers", "connectors": "Connectors", "health": "Health", "trust_policy": "Trust",
+            "sessions": "Chat", "chat_sessions": "Chat", "chat_transcripts": "Chat",
+            "chat_anchor": "Chat", "pinned_chat_sessions": "Chat", "memory_proposals": "Memory proposals",
+            "organism_living_status": "Status", "helpers_agents": "Helpers and Agents", "telegram": "Telegram",
+            "skills_snapshot": "Skills & Tools", "tools_snapshot": "Skills & Tools", "model_preferences": "Providers",
+        ]
+        return known[group] ?? group.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    public static func stalenessMessages(_ markers: [String: String]) -> [String: String] {
+        markers.filter { !$0.key.hasPrefix("_") }.reduce(into: [:]) { messages, entry in
+            messages[entry.key] = markers["_message.\(entry.key)"] ?? stalePageMessage(entry.key)
+        }
+    }
 }
 
 private struct NAMobileSnapshotPayload: Codable {

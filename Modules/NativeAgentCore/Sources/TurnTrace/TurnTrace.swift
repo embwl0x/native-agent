@@ -275,13 +275,13 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "schema", "phase", "status", "name", "tool", "stage",
                 "milestone", "provider", "model", "resultClass",
                 "durationMs", "elapsedMs", "inputTokens", "outputTokens",
-                "argKeys",
+                "argKeys", "shown", "receipt",
                 // Context snapshots can include bounded previews that are
                 // intentionally much larger than one trace row. Keep their
                 // scalar integrity facts when that preview is summarized so
                 // the canonical row stays queryable rather than leaving a
                 // JSON fragment whose surviving keys depend on sort order.
-                "containsCognitiveSubstrate", "cognitiveCapsuleBytes",
+                "containsCognitiveSubstrate", "cognitiveCapsuleBytes", "cognitiveCue",
                 "toolSchemaCount", "toolSchemaParameterBytes",
                 "toolSchemaMaterialBytes", "toolSchemaFingerprintSHA256",
                 "promptFingerprintSHA256", "systemTotalBytes",
@@ -302,7 +302,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
             for key in stableKeys {
                 guard let field = object[key],
                       let bytes = try? field.serializedData(pretty: false),
-                      bytes.count <= 1_024 else { continue }
+                      bytes.count <= (key == "receipt" ? 8_192 : 1_024) else { continue }
                 summary[key] = field
             }
         }
@@ -1141,7 +1141,7 @@ public struct TurnTracePersistLane: Sendable {
         )
         return root
             .appendingPathComponent("turn_traces", isDirectory: true)
-            .appendingPathComponent("\(Self.dayFormatter.string(from: date)).jsonl")
+            .appendingPathComponent("\(Self.dayString(from: date)).jsonl")
     }
 
     /// Doctor button path for a damaged day file. The persisted trace owner
@@ -1330,13 +1330,28 @@ public struct TurnTracePersistLane: Sendable {
         }
     }
 
-    static let dayFormatter: DateFormatter = {
+    /// Every lane and the sweep share one day formatter, from many tasks at
+    /// once, so it is only used under `dayLock`.
+    private static let dayLock = NSLock()
+    private static let dayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone.current
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
+
+    static func dayString(from date: Date) -> String {
+        dayLock.withLock { dayFormatter.string(from: date) }
+    }
+
+    static func day(from string: String) -> Date? {
+        dayLock.withLock { dayFormatter.date(from: string) }
+    }
+
+    static var dayTimeZone: TimeZone {
+        dayLock.withLock { dayFormatter.timeZone }
+    }
 }
 
 // MARK: - Bounded recent turn-trace reader
@@ -1351,10 +1366,16 @@ public struct TurnTraceRecentReader: Sendable {
     public struct Snapshot: Sendable {
         public let sourceURL: URL
         public let events: [TurnTraceEvent]
+        public let sourceURLs: [URL]
+        public let truncated: Bool
+        public let oldestRetainedDay: Date?
 
-        public init(sourceURL: URL, events: [TurnTraceEvent]) {
+        public init(sourceURL: URL, events: [TurnTraceEvent], sourceURLs: [URL] = [], truncated: Bool = false, oldestRetainedDay: Date? = nil) {
             self.sourceURL = sourceURL
             self.events = events
+            self.sourceURLs = sourceURLs.isEmpty ? [sourceURL] : sourceURLs
+            self.truncated = truncated
+            self.oldestRetainedDay = oldestRetainedDay
         }
     }
 
@@ -1369,26 +1390,115 @@ public struct TurnTraceRecentReader: Sendable {
         self.rowLimit = rowLimit
     }
 
-    /// Reads only the bounded tail of the current local-day trace file.
-    /// A missing file is an honest empty snapshot; IO errors are surfaced.
-    public func read(now: Date = Date()) async throws -> Snapshot {
+    /// Unwindowed history shares a tail budget; since reads the complete retained window.
+    public func read(now: Date = Date(), history: Bool = false, since: Date? = nil) async throws -> Snapshot {
         let sourceURL = lane.path(for: now)
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory),
-           isDirectory.boolValue {
-            throw PersistenceCoreError.ioFailure(
-                "turn trace path is a directory: \(sourceURL.path)"
-            )
+        let paths: [URL]
+        var oldestRetainedDay: Date?
+        if let since {
+            let directory = sourceURL.deletingLastPathComponent()
+            let entries = FileManager.default.fileExists(atPath: directory.path)
+                ? try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) : []
+            let days = entries.compactMap { path -> (URL, Date)? in
+                guard path.pathExtension == "jsonl",
+                      let day = TurnTracePersistLane.day(from: path.deletingPathExtension().lastPathComponent), day <= now else { return nil }
+                return (path, day)
+            }
+            oldestRetainedDay = days.map(\.1).min()
+            paths = days.filter { $0.1 >= Calendar.current.startOfDay(for: since) }
+                .map(\.0).sorted { $0.lastPathComponent > $1.lastPathComponent }
+        } else {
+            paths = (0..<(history ? TurnTraceRetention.defaultKeepDays : 1)).compactMap {
+                Calendar.current.date(byAdding: .day, value: -$0, to: now).map { lane.path(for: $0) }
+            }
         }
-        let rows = try await persistence.tailJSONL(
-            sourceURL,
-            limit: rowLimit,
-            maxBytes: Self.maxBytes
-        )
-        return Snapshot(
-            sourceURL: sourceURL,
-            events: rows.compactMap(TurnTraceEvent.init(jsonRow:))
-        )
+        var events: [TurnTraceEvent] = []
+        var sources: [URL] = []
+        var remainingRows = rowLimit
+        var remainingBytes = Self.maxBytes
+        var truncated = false
+        for path in paths {
+            guard since != nil || (remainingRows > 0 && remainingBytes > 0) else { truncated = true; break }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory) else { continue }
+            if isDirectory.boolValue {
+                throw PersistenceCoreError.ioFailure("turn trace path is a directory: \(path.path)")
+            }
+            if let since {
+                sources.append(path)
+                let receipt = try await persistence.readJSONLReporting(path)
+                // A torn line (e.g. a write cut by a crash) marks the window incomplete; it must not hide the rest.
+                if receipt.report.malformedLineCount > 0 { truncated = true }
+                for row in receipt.rows {
+                    guard case .object(let object) = row, case .string(let ts)? = object["ts"],
+                          let stamp = TurnTraceEvent.parseISO8601(ts),
+                          let event = TurnTraceEvent(jsonRow: row) else { truncated = true; continue }
+                    guard stamp >= since, stamp <= now else { continue }
+                    events.append(event)
+                }
+                continue
+            }
+            let receipt = try await persistence.tailJSONLReadReceipt(path, limit: remainingRows, maxBytes: remainingBytes)
+            sources.append(path)
+            events += receipt.rows.compactMap(TurnTraceEvent.init(jsonRow:))
+            remainingRows -= receipt.physicalRowsScanned
+            remainingBytes -= receipt.bytesRead
+            truncated = truncated || receipt.truncatedToByteWindow || remainingRows <= 0
+        }
+        return Snapshot(sourceURL: sourceURL, events: events, sourceURLs: sources, truncated: truncated, oldestRetainedDay: oldestRetainedDay)
+    }
+
+    public func usage(since: Date, now: Date = Date(), by: String = "model") async throws -> JSONValue {
+        let snapshot = try await read(now: now, since: since)
+        let metrics = ["inputTokens", "cacheReadInputTokens", "outputTokens", "durationMs"]
+        let zero = Dictionary(uniqueKeysWithValues: (["calls"] + metrics).map { ($0, Int64(0)) })
+        var totals = zero
+        var groups: [String: [String: Int64]] = [:]
+        var missing: [String: [String: Int64]] = [:]
+        var totalMissing: [String: Int64] = [:]
+        for event in snapshot.events where event.kind == "llm.call" {
+            guard case .object(let payload) = event.payload else { continue }
+            let key: String
+            if by == "day" { key = TurnTracePersistLane.dayString(from: event.ts) }
+            else if case .string(let value)? = payload[by], !value.isEmpty { key = value }
+            else { key = "unknown" }
+            groups[key, default: zero]["calls", default: 0] += 1
+            totals["calls", default: 0] += 1
+            for metric in metrics {
+                guard case .int(let value)? = payload[metric], value >= 0 else {
+                    missing[key, default: [:]][metric, default: 0] += 1
+                    totalMissing[metric, default: 0] += 1
+                    continue
+                }
+                groups[key, default: zero][metric, default: 0] += value
+                totals[metric, default: 0] += value
+            }
+        }
+        func counts(_ values: [String: Int64], missing: [String: Int64]) -> [String: JSONValue] {
+            var row = values.mapValues(JSONValue.int)
+            row["missing_fields"] = .object(missing.mapValues(JSONValue.int))
+            return row
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions.insert(.withFractionalSeconds)
+        let predatesRetention = snapshot.oldestRetainedDay.map { since < $0 } ?? false
+        return .object([
+            "status": .string("ok"), "by": .string(by),
+            "since": .string(formatter.string(from: since)), "until": .string(formatter.string(from: now)),
+            "covered_since": snapshot.oldestRetainedDay.map { .string(formatter.string(from: max(since, $0))) } ?? .null,
+            "oldest_retained_day": snapshot.oldestRetainedDay.map { .string(TurnTracePersistLane.dayString(from: $0)) } ?? .null,
+            "predates_retention": .bool(predatesRetention),
+            "coverage": .string(snapshot.oldestRetainedDay == nil ? "No retained trace day files are available." : predatesRetention
+                ? "The requested window predates retained trace files; earlier usage is unavailable."
+                : "The requested window is within retained trace day files."),
+            "measurement": .string("Exact sums of recorded llm.call values in retained rows. missing_fields counts calls without a nonnegative integer measurement; those values are not estimated. Input and cached input are separate recorded counters. Daily trace files also have row and size retention limits."),
+            "totals": .object(counts(totals, missing: totalMissing)),
+            "groups": .array(groups.keys.sorted().map { key in
+                var row = counts(groups[key]!, missing: missing[key] ?? [:])
+                row[by] = .string(key)
+                return .object(row)
+            }),
+        ])
     }
 }
 

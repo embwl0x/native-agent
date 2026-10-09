@@ -16,7 +16,7 @@ extension KnowledgeGraphView {
             policyReadError = nil
             return true
         } catch {
-            policyReadError = error.localizedDescription
+            policyReadError = UserFacingError.message(error, action: "read the trust policy")
             return false
         }
     }

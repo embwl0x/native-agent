@@ -78,10 +78,10 @@ enum SlimSettingsStatusLinePresentation {
 
         switch runtimeOK {
         case true:
-            if let error {
+            if error != nil {
                 return State(
                     text: "App is online; some app data is unavailable",
-                    detail: "Last refresh error: \(bounded(error))",
+                    detail: refreshDetail,
                     tone: .warning,
                     systemImage: "exclamationmark.triangle.fill"
                 )
@@ -95,15 +95,15 @@ enum SlimSettingsStatusLinePresentation {
         case false:
             return State(
                 text: "App reported a problem",
-                detail: error.map { "Last refresh error: \(bounded($0))" },
+                detail: error == nil ? nil : refreshDetail,
                 tone: .failure,
                 systemImage: "xmark.octagon.fill"
             )
         case nil:
-            if let error {
+            if error != nil {
                 return State(
                     text: "App status is unavailable",
-                    detail: "Last refresh error: \(bounded(error))",
+                    detail: refreshDetail,
                     tone: .failure,
                     systemImage: "xmark.octagon.fill"
                 )
@@ -123,11 +123,8 @@ enum SlimSettingsStatusLinePresentation {
         return text.isEmpty ? nil : text
     }
 
-    private static func bounded(_ text: String) -> String {
-        let maximumVisibleCharacters = 240
-        guard text.count > maximumVisibleCharacters else { return text }
-        return String(text.prefix(maximumVisibleCharacters)) + "…"
-    }
+    /// The failed reads are named in the log (refreshAll), not here.
+    private static let refreshDetail = "Some sections didn't refresh. The details are in the log."
 }
 
 /// Feed availability, automatic-check preference and manual-check readiness
@@ -222,7 +219,7 @@ struct EmbeddingsSettingsActionPresentation {
     static func refreshFailed(_ error: any Error, preserving status: EmbeddingsStatus?) -> Update {
         Update(
             status: status,
-            errorMessage: "Status check failed: \(error.localizedDescription)"
+            errorMessage: UserFacingError.message(error, action: "check memory status")
         )
     }
 
@@ -238,7 +235,7 @@ struct EmbeddingsSettingsActionPresentation {
     static func releaseFailed(_ error: any Error, preserving status: EmbeddingsStatus?) -> Update {
         Update(
             status: status,
-            errorMessage: "Release failed: \(error.localizedDescription)"
+            errorMessage: UserFacingError.message(error, action: "release memory")
         )
     }
 }

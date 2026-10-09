@@ -96,7 +96,7 @@ extension AppModel {
                         id: "runtime",
                         label: "Runtime",
                         status: "error",
-                        detail: "Health check failed: \(error.localizedDescription)",
+                        detail: UserFacingError.message(error, action: "run the health check"),
                         fixAction: "doctor"
                     )
                 ],
@@ -117,7 +117,7 @@ extension AppModel {
                 // doesn't show outdated/phantom approvals.
                 print("[NativeAgent] getApprovals failed: \(error)")
                 engine.approvals.records = []
-                statusText = "Approvals unavailable: \(error.localizedDescription)"
+                setFailureStatus(error, action: "load approvals")
             }
         }
     }

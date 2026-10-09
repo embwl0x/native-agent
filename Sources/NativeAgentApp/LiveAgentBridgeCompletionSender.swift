@@ -18,6 +18,7 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
   enum DeliveryError: LocalizedError {
     case telegramNotConfigured
     case telegramReplyNotAuthorized
+    case telegramTransport(String)
     case invalidTelegramDestination
     case invalidTelegramThread(String)
     case missingSlackDestination
@@ -30,6 +31,7 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       switch self {
       case .telegramNotConfigured: return "Telegram is not enabled or has no bot token."
       case .telegramReplyNotAuthorized: return "The originating Telegram reply is no longer authorized."
+      case .telegramTransport(let detail): return detail
       case .invalidTelegramDestination:
         return "The originating Telegram chat id is missing or invalid."
       case .invalidTelegramThread(let raw):
@@ -128,6 +130,8 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       return .rejected(reason: "telegram_not_configured", retryable: false)
     } catch DeliveryError.telegramReplyNotAuthorized {
       return .rejected(reason: "telegram_reply_not_authorized", retryable: false)
+    } catch DeliveryError.telegramTransport(let detail) {
+      return .ambiguous(reason: detail)
     } catch DeliveryError.invalidTelegramDestination {
       return .rejected(reason: "invalid_telegram_destination", retryable: false)
     } catch DeliveryError.invalidTelegramThread(let raw) {
@@ -197,20 +201,34 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
         threadId = parsed
       }
       let destination = TelegramDestination(chatId: chatId, threadId: threadId)
-      switch artifact.payload {
-      case .text(let text):
-        let send = silentTelegram ? TelegramPollLoop.defaultSendSilentMessage : TelegramPollLoop.defaultSendMessage
-        try await send(config.botToken, destination, TelegramPollLoop.cleanedPlainText(text))
-      case .attachment(let attachment):
-        guard let path = attachment.path else { throw DeliveryError.emptyCompletion }
-        try await TelegramPollLoop.defaultSendPhoto(
-          config.botToken,
-          destination,
-          path,
-          attachment.name
-        )
-      case .iosBundle, .iosNotification:
-        throw DeliveryError.emptyCompletion
+      do {
+        switch artifact.payload {
+        case .text(let text):
+          let send = silentTelegram ? TelegramPollLoop.defaultSendSilentMessage : TelegramPollLoop.defaultSendMessage
+          try await send(config.botToken, destination, TelegramPollLoop.cleanedPlainText(text))
+        case .attachment(let attachment):
+          guard let path = attachment.path else { throw DeliveryError.emptyCompletion }
+          try await TelegramPollLoop.defaultSendPhoto(
+            config.botToken,
+            destination,
+            path,
+            attachment.name
+          )
+        case .iosBundle, .iosNotification:
+          throw DeliveryError.emptyCompletion
+        }
+      } catch let error as DeliveryError {
+        throw error
+      } catch {
+        // Scrub the exact credential used by this send, even if it is malformed.
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        guard let encodedToken = config.botToken.addingPercentEncoding(withAllowedCharacters: allowed) else {
+          throw DeliveryError.telegramTransport("Telegram delivery failed; bot token could not be encoded for redaction.")
+        }
+        let detail = String(describing: error)
+          .replacingOccurrences(of: config.botToken, with: "[REDACTED_TELEGRAM_TOKEN]")
+          .replacingOccurrences(of: encodedToken, with: "[REDACTED_TELEGRAM_TOKEN]")
+        throw DeliveryError.telegramTransport(TurnSecretRedactor.redactText(detail))
       }
     case "slack":
       guard let channel = route.destinationId, !channel.isEmpty else {
@@ -389,19 +407,26 @@ enum AnchorReplyMirror {
       let relay = await MainActor.run { NativeAgentEngine.liveDeviceSync.relay }
       await relay.sendICloudReplyPushNotification(text: text, sessionID: sessionId, correlationID: rowId, kind: "reply")
     }
-    guard let telegram = boundTelegramChat(sessionId: sessionId, dataRoot: dataRoot) else { return }
+    let telegram: TelegramDestination
+    do {
+      guard let destination = try await TelegramSessionStore(dataRoot: dataRoot).outboundDestination(sessionId: sessionId) else { return }
+      telegram = destination
+    } catch {
+      nativeLog("[anchor-mirror] could not resolve Telegram destination: %@", error.localizedDescription)
+      return
+    }
     do {
       try await lifecycle.cacheResponse(
         ChatOrchestration.ChatResponse(runId: deliveryId, model: "anchor-mirror", output: text, sessionId: sessionId),
         deliveryId: deliveryId, requestDigest: digest)
     } catch {
-      NSLog("[anchor-mirror] could not record reply %@: %@", rowId, error.localizedDescription)
+      nativeLog("[anchor-mirror] could not record reply %@: %@", rowId, error.localizedDescription)
       return
     }
     let delivery = await AgentBridgeCompletionRouter.deliver(
       deliveryId: deliveryId, requestDigest: digest, text: "[\(door)]\n\(text)", attachments: [],
       route: AgentBridgeCompletionRoute(surface: "telegram", sessionId: sessionId,
-                                        destinationId: telegram.chat, threadId: telegram.thread),
+                                        destinationId: String(telegram.chatId), threadId: telegram.threadId.map(String.init)),
       sender: LiveAgentBridgeCompletionSender(dataRoot: dataRoot, silentTelegram: door == "Mac",
                                               authorizeTelegramReply: { config, chatID in
         TelegramPollLoop.inboundAuthorizationDecision(
@@ -411,7 +436,7 @@ enum AnchorReplyMirror {
       }), lifecycle: lifecycle,
       notifyRequestedResult: false)
     if delivery.status != "completed" {
-      NSLog("[anchor-mirror] Telegram copy of %@ %@: %@", rowId, delivery.status, delivery.reason ?? "")
+      nativeLog("[anchor-mirror] Telegram copy of %@ %@: %@", rowId, delivery.status, delivery.reason ?? "")
     }
   }
 
@@ -421,16 +446,4 @@ enum AnchorReplyMirror {
     return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
   }
 
-  /// The Telegram chat (and forum topic) whose map points at this session.
-  private static func boundTelegramChat(sessionId: String, dataRoot: URL) -> (chat: String, thread: String?)? {
-    guard let data = try? Data(contentsOf: dataRoot.appendingPathComponent("telegram/session_map.json")),
-          case .object(let root)? = try? JSONValue.parse(data),
-          case .object(let chats)? = root["chats"],
-          let key = chats.first(where: {
-            if case .object(let entry) = $0.value { return entry["activeSessionId"] == .string(sessionId) }
-            return false
-          })?.key else { return nil }
-    let parts = key.split(separator: ":", maxSplits: 1).map(String.init)
-    return (parts[0], parts.count > 1 ? parts[1] : nil)
-  }
 }

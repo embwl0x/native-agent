@@ -10,25 +10,19 @@ extension MacFourVerbs {
 
     /// Get her THERE. A running app is raised through the existing focus organ,
     /// an installed one is launched, a path or a URL is opened. The reply is
-    /// where she landed, as `screen()`.
+    /// where she landed, as `screen()`. Without `front` nothing is activated:
+    /// the app is launched or opened behind, and the reply reads its window.
+    /// A launch is awaited to its real completion (a cold start can take
+    /// longer than a read); each landing read carries its own AX deadline.
     public func go(_ name: String, front: Bool = false) async -> MacFourVerbsReply {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return MacFourVerbsReply(ok: false, text: "Where to? Give me an app, a folder, a file or a link.")
         }
-
-        guard front else {
-            let reason = "opening or switching to \(trimmed) brings an app to the front"
-            return MacFourVerbsReply(
-                ok: false,
-                text: "I need the screen because " + reason + ". Nothing was opened or brought forward. "
-                    + "Only use front:true when the task explicitly asks to bring it forward.",
-                detail: [
-                    "error": .string("needs_front"), "status": .string("needs_front"),
-                    "needs_front_reason": .string(reason), "user_front_changed": .bool(false),
-                ]
-            )
-        }
+        let behind: [String: JSONValue] = front ? [:] : ["background": .bool(true)]
+        func opening(_ url: URL) -> [String: JSONValue] { behind.merging(["url": .string(url.absoluteString)]) { _, new in new } }
+        // Read the recipient even while foreground activation is settling.
+        var landingApp: String?
 
         // AppKit cannot raise an app over loginwindow. In User's ordinary setup
         // that is the screensaver layer, and the existing wake organ is the
@@ -36,7 +30,7 @@ extension MacFourVerbs {
         // discover a fifth tool or translate `loginwindow` into that action.
         // The look owner wakes only while that layer covers the screen and
         // keeps all wake/injection gates below this surface.
-        if case .blind(let readiness) = await sight(part: nil),
+        if front, case .blind(let readiness) = await sight(part: nil),
            readiness.detail["error"] == .string("display_obstructed")
             || readiness.detail["error"] == .string("mac_locked") {
             return readiness
@@ -48,28 +42,42 @@ extension MacFourVerbs {
         var settlesAsynchronously = false
         if let url = Self.webURL(trimmed) ?? Self.settingsPaneURL(trimmed) {
             do {
-                result = try await host.dispatch(action: "open_target", body: ["url": .string(url.absoluteString)])
+                result = try await host.dispatch(action: "open_target", body: opening(url))
             } catch {
                 return await landingFailure("I couldn't ask the Mac to open that link.")
             }
             moved = "The Mac accepted the request to open \(trimmed)."
+            landingApp = Self.handlerApp(url)
             settlesAsynchronously = true
-        } else if let path = Self.filePath(trimmed) {
+        } else if let path = Self.filePath(trimmed) ?? namedLocationRoots.first(where: {
+            $0.lastPathComponent.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+        }) {
             do {
-                result = try await host.dispatch(action: "open_target", body: ["url": .string(path.absoluteString)])
+                result = try await host.dispatch(action: "open_target", body: opening(path))
             } catch {
                 return await landingFailure("I couldn't ask the Mac to open that path.")
             }
             moved = "The Mac accepted the request to open \(path.path)."
+            landingApp = Self.handlerApp(path)
+            verificationDestination = path.path
             settlesAsynchronously = true
         } else {
             do {
                 // The existing app-control organ both launches and raises, then
                 // independently verifies that the requested app is frontmost.
-                let appResult = try await host.dispatch(action: "focus_app", body: ["app": .string(trimmed)])
+                // Behind, it launches without activating and raises nothing.
+                let appResult = try await host.dispatch(
+                    action: "focus_app", body: behind.merging(["app": .string(trimmed)]) { _, new in new })
                 if appResult.ok {
                     result = appResult
-                    moved = "Switched to \(trimmed)."
+                    let out = Self.object(appResult.output)
+                    // Arrival is checked against the app that was resolved,
+                    // never a name that merely contains the one asked for.
+                    verificationDestination = Self.string(out["bundle_identifier"]) ?? trimmed
+                    landingApp = verificationDestination
+                    moved = front ? "Switched to \(trimmed)."
+                        : out["launched"] == .bool(true) ? "Launched \(trimmed) behind; nothing came to the front."
+                        : "\(trimmed) is running behind; nothing came to the front."
                     settlesAsynchronously = true
                 } else {
                     // Search folders only when no such app exists. An app that
@@ -79,11 +87,9 @@ extension MacFourVerbs {
                     if case .object(let out) = appResult.output, out["status"] == .string("failed") { appMissing = true }
                     switch !appMissing ? NamedFolderResolution.none : Self.namedFolder(trimmed, under: namedLocationRoots) {
                     case .unique(let folder):
-                        result = try await host.dispatch(
-                            action: "open_target",
-                            body: ["url": .string(folder.absoluteString)]
-                        )
+                        result = try await host.dispatch(action: "open_target", body: opening(folder))
                         moved = "The Mac accepted the request to open \(folder.path)."
+                        landingApp = Self.handlerApp(folder)
                         verificationDestination = folder.path
                         settlesAsynchronously = true
                     case .ambiguous(let parents):
@@ -93,6 +99,11 @@ extension MacFourVerbs {
                             detail: ["error": .string("named_location_ambiguous")]
                         )
                     case .none:
+                        // Say why the switch failed (e.g. the person took the Mac back), not just "unconfirmed".
+                        if let why = appResult.error, !why.isEmpty, !why.contains("app_not_found") {
+                            return MacFourVerbsReply(ok: false, text: "I couldn't switch to \(trimmed): \(why)",
+                                                     detail: Self.operationDetail(appResult))
+                        }
                         result = appResult
                         moved = "Switched to \(trimmed)."
                     }
@@ -101,26 +112,32 @@ extension MacFourVerbs {
                 return await landingFailure("I couldn't switch to \(trimmed).")
             }
         }
-        var landing = await sight(part: nil)
+        guard !Task.isCancelled else { return MacFourVerbsReply(ok: false, text: "I stopped waiting for the app.") }
+        if !front, landingApp == nil {
+            return MacFourVerbsReply(ok: result.ok, text: result.ok ? moved + " Nothing came to the front."
+                : "I couldn't complete the request to go to \(trimmed).", detail: Self.operationDetail(result))
+        }
+        let windowless: JSONValue = .string(landingApp == nil ? "no_frontmost_window" : "no_window_in_app")
+        var landing = await sight(part: nil, app: landingApp)
         let needsSettlement: Bool
         switch landing {
         case .seen(let first): needsSettlement = Self.destination(verificationDestination, matches: first) != true
-        case .blind(let reply): needsSettlement = reply.detail["error"] == .string("no_frontmost_window")
+        case .blind(let reply): needsSettlement = landingApp != nil || reply.detail["error"] == windowless
         }
         if settlesAsynchronously, needsSettlement {
             await clock.sleep(seconds: 0.5)
-            landing = await sight(part: nil)
+            landing = await sight(part: nil, app: landingApp)
         }
         // 2026-09-22: an app raised with every window closed stays windowless
         // until reopened. Opening its bundle while it runs makes Launch
         // Services send kAEReopenApplication, the Dock-click event. Once.
-        if case .blind(let reply) = landing, reply.detail["error"] == .string("no_frontmost_window"),
+        if !Task.isCancelled, case .blind(let reply) = landing, reply.detail["error"] == windowless,
            result.ok, result.action == "focus_app",
            case .object(let out) = result.output, case .string(let bundle)? = out["bundle_identifier"],
            let appURL = Self.applicationURL(bundleIdentifier: bundle) {
-            _ = try? await host.dispatch(action: "open_target", body: ["url": .string(appURL.absoluteString)])
+            _ = try? await host.dispatch(action: "open_target", body: opening(appURL))
             await clock.sleep(seconds: 0.5)
-            landing = await sight(part: nil)
+            landing = await sight(part: nil, app: landingApp)
         }
         switch landing {
         case .blind(let reply):
@@ -137,12 +154,13 @@ extension MacFourVerbs {
             let landed = Self.destination(verificationDestination, matches: hit)
             var detail = Self.operationDetail(result).merging(hit.detail) { current, _ in current }
             detail["observed_destination"] = landed.map(JSONValue.bool) ?? .null
-            if landed == true, result.ok {
+            // The fresh screen is the proof: already in front counts as arrived.
+            if landed == true {
                 detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
                 detail["verification_evidence"] = .string("fresh_screen_destination_match")
                 return MacFourVerbsReply(
                     ok: true,
-                    text: moved + " Now looking at " + hit.place + ".\n" + hit.render,
+                    text: (result.ok ? moved : "\(trimmed) is in front.") + " Now looking at " + hit.place + ".\n" + hit.render,
                     detail: detail
                 )
             }
@@ -167,8 +185,18 @@ extension MacFourVerbs {
     // MARK: - Where "there" is
     //
     // Three shapes, tested in order, with no app-name branch anywhere: a URL
-    // with a web scheme, a filesystem path, then a NAME (running first, then
-    // installed). A string that is none of those is not guessed at.
+    // with a web scheme, a path or common home folder, then an app NAME
+    // (running first, then installed). Other folder names use the bounded search.
+
+    /// The app that receives this link or path, independent of activation.
+    static func handlerApp(_ url: URL) -> String? {
+        #if canImport(AppKit)
+        if url.isFileURL, url.pathExtension.lowercased() == "app" { return Bundle(url: url)?.bundleIdentifier }
+        return NSWorkspace.shared.urlForApplication(toOpen: url).flatMap { Bundle(url: $0)?.bundleIdentifier }
+        #else
+        return nil
+        #endif
+    }
 
     static func applicationURL(bundleIdentifier: String) -> URL? {
         #if canImport(AppKit)
@@ -271,7 +299,7 @@ extension MacFourVerbs {
         let wanted = normalize(requested)
         if let bundle = sighting.bundleIdentifier, bundle.lowercased() == requested.lowercased() { return true }
         guard !wanted.isEmpty, let app = sighting.appName.map(normalize) else { return nil }
-        return app.contains(wanted) || wanted.contains(app)
+        return app == wanted
     }
 
     private func landingFailure(

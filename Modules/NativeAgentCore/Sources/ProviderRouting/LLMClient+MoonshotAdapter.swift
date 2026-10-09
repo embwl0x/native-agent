@@ -64,7 +64,7 @@ public final class MoonshotAdapter: LLMAdapter {
         let key = try apiKey()
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 300
+        request.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : 300
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -146,7 +146,9 @@ public final class MoonshotAdapter: LLMAdapter {
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
+                        if ProviderStreamContext.stallOnly { request.timeoutInterval = .infinity }
                         (bytes, response) = try await session.bytes(for: request)
+                        if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
                     } catch {
                         throw mapTransportError(error, fallback: .transient(message: "connection failed: \(endpoint.host ?? "moonshot")"))
                     }

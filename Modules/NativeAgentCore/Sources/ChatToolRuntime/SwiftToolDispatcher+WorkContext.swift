@@ -3,15 +3,16 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
+import MacIntegration
 
 /// Read-time query shaping only, never a semantic decision or another memory
 /// index. Keep a one-letter subject such as X while dropping conversational
 /// scaffolding that would otherwise match nearly every transcript.
 
 extension SwiftToolDispatcher {
-    /// One lazy read brings current work and supporting conversation together.
-    /// Desk/history remain the owners; no execution, memory write or replay.
-    func impl_work_context(input: [String: JSONValue]) async throws -> JSONValue {
+    /// One lazy read brings work, conversation and Mail evidence together.
+    /// Their existing readers remain the owners; no memory write or replay.
+    func impl_work_context(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let rawQuery = try requireString(input, "query").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawQuery.isEmpty, rawQuery.count <= 400 else {
             throw AutonomyGateError.toolDenied(reason: "work_context: give a work topic in 1–400 characters")
@@ -52,6 +53,7 @@ extension SwiftToolDispatcher {
             historyInput["session_id"] = .string(session)
         }
 
+        async let mail = workContextMail(query: query, surface: surface)
         var deskResult: JSONValue
         var historyResult: JSONValue
         var partial = false
@@ -144,15 +146,52 @@ extension SwiftToolDispatcher {
                 "next_read": Self.workContextRead("search_chat_history", historyInput)
             ])
         }
+        let mailResult = try await mail
+        if case .object(let lane) = mailResult,
+           lane["status"] != .string("completed") || lane["accounts_not_listed"] != nil { partial = true }
         return .object([
             "status": .string(partial ? "partial" : "ok"),
             "query": .string(rawQuery), "matched_topic": .string(query.text),
             "request": .object(continuation),
             "current_work": deskResult, "supporting_history": historyResult,
-            "matching_policy": .string("Whole topic words within 64 words; at least 60 percent topic coverage. Incidental paths do not establish a topic match unless the query asks for a path."),
-            "coverage": .string("Bounded lexical recall of live Desk titles, projects, summaries and latest notes, plus saved chat message content. Memory, archived Desk records, files and external systems were not searched. No matches do not establish absence."),
+            "mail": mailResult,
+            "matching_policy": .string("Desk and chat: whole topic words within 64 words; at least 60 percent topic coverage. Incidental paths do not establish a topic match unless the query asks for a path. Mail: OR matching against sender and subject metadata only."),
+            "coverage": .string("Bounded lexical recall of live Desk titles, projects, summaries and latest notes, plus saved chat message content. Mail searches sender and subject for significant query words with OR matching: newest first, up to five inbox messages from the last 90 days, within 1.5 seconds when Mail Read is allowed and ready. Mail bodies, Messages, Notes, memory, archived Desk records, files and other external systems were not searched. No matches do not establish absence."),
             "next_step": .string("Use the current record and dated excerpts to orient; open their exact read locators where agreement, completion or authority needs confirmation. Nothing was resumed or repeated."),
         ])
+    }
+
+    private func workContextMail(query: WorkContextQuery, surface: String) async throws -> JSONValue {
+        let since = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-90 * 86_400))
+        let input: [String: JSONValue] = ["query": .array(query.terms.map(JSONValue.string)),
+            "sort": .string("newest"), "limit": .int(5), "since": .string(since)]
+        let outcome = await raceAgainstTimeout(seconds: 1.5) { [self] in
+            let readiness = try await macIntegrationPermissionStore.readinessChecked()
+            let admitted = await fullMacYoloAdmitted(tool: "mail_search", surface: surface)
+            guard await macIntegrationPermissionStore.allows(MacIntegrationID.mail, mode: .read, fullMacAdmitted: admitted) else {
+                return JSONValue.object(["status": .string("unavailable"), "message": .string(
+                    readiness.refusal(integration: MacIntegrationID.mail, mode: .read)
+                    ?? "Mail Read is off or unavailable; Mail was not searched.")])
+            }
+            guard let bridge = macIntegrationBridge else {
+                return .object(["status": .string("unavailable"),
+                    "message": .string("Mail is not ready: the app's Mail reader is unavailable; Mail was not searched.")])
+            }
+            try Task.checkCancellation()
+            return try await bridge.mailSearch(input: input)
+        }
+        switch outcome {
+        case .value(let result):
+            try Task.checkCancellation()
+            return AgentWorkspace.attachReadReferences(tool: "mail_search", input: input, result: result, dataRoot: dataRoot)
+        case .timedOut:
+            return .object(["status": .string("skipped"),
+                "message": .string("Mail search exceeded 1.5 seconds and was skipped; Desk and chat results are retained. No Mail matches were established.")])
+        case .failure(let message):
+            return .object(["status": .string("unavailable"),
+                "message": .string("Mail search is unavailable: " + String(message.prefix(600)))])
+        case .cancelled: throw CancellationError()
+        }
     }
 
     private static func workContextRead(_ tool: String, _ arguments: [String: JSONValue]) -> JSONValue {

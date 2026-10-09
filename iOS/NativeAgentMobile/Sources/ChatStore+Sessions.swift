@@ -42,7 +42,15 @@ extension ChatStore {
         }
         setSelectedSessionID(clean)
         loadSelectedSession(
-            loadTranscript: { sessionID in await client.readChatTranscript(sessionID: sessionID) },
+            loadTranscript: { [weak self] sessionID in
+                let read = await client.readChatTranscript(sessionID: sessionID)
+                guard read == .unavailable, let sessionID else { return read }
+                // Outside the Mac's published window: ask the Mac for the
+                // newest page instead of showing "Not here yet".
+                let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: sessionID)
+                if page.hasOlder { self?.pagedSessionsWithOlder.insert(sessionID) }
+                return .published(page.messages, generation: nil)
+            },
             fallbackMessages: fallbackMessages
         )
     }
@@ -132,7 +140,6 @@ extension ChatStore {
         // 2026-09-06: both sets name rows of the session being left.
         macPublishedMessageIDs.removeAll()
         regeneratedAwayAssistantIDs.removeAll()
-        cancelAllTypewriters()
         isPollingFallback = false
         errorBanner = nil
         // The in-flight turn (if any) was just cancelled above; a brand-new
@@ -194,7 +201,6 @@ extension ChatStore {
         // 2026-09-06: both sets name rows of the session being left.
         macPublishedMessageIDs.removeAll()
         regeneratedAwayAssistantIDs.removeAll()
-        cancelAllTypewriters()
         isPollingFallback = false
         isSwitchingSession = true
         sessionSwitchGeneration &+= 1

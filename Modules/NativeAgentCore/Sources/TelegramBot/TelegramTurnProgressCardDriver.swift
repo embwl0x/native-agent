@@ -13,8 +13,8 @@ struct TelegramTurnProgressCardDriverSnapshot: Sendable, Equatable {
 }
 
 /// Owns the single ordinary Telegram message used to present one accepted
-/// turn's lifecycle. Card transport is deliberately best-effort: failures are
-/// recorded and presentation stops without affecting the assistant reply.
+/// turn's lifecycle. Its heartbeat coalesces transient misses while active;
+/// the ledger owns terminal delivery repair.
 actor TelegramTurnProgressCardDriver {
     static let defaultMinimumEditInterval: TimeInterval = 5
     static let defaultHeartbeatNanoseconds: UInt64 = 7_000_000_000
@@ -198,10 +198,8 @@ actor TelegramTurnProgressCardDriver {
         state = next
         if state.isTerminal {
             detailsVisible = false
-            // 2026-09-22: release, don't cancel. Cancelling killed a heartbeat
-            // edit already on the wire (CancellationError), which marked the
-            // card broken and dropped the terminal edit — the card stuck on
-            // "Still on it." The loop exits on its own once it sees terminal.
+            // Let an edit already on the wire finish; terminal repair belongs
+            // to the ledger after this turn releases its driver.
             heartbeatTask = nil
             resolveTerminalWaiters(state.phase)
             let now = clock()
@@ -228,8 +226,7 @@ actor TelegramTurnProgressCardDriver {
         }
     }
 
-    /// Explicit seam used by the automatic heartbeat and deterministic tests.
-    /// It refreshes elapsed/stall presentation without manufacturing movement.
+    /// Refresh elapsed/stall presentation while the turn is active.
     @discardableResult
     func heartbeat() async -> Bool {
         guard !state.isTerminal, !transportFailed, messageId != nil else {
@@ -341,63 +338,33 @@ actor TelegramTurnProgressCardDriver {
             return
         }
 
-        // 2026-09-22: a delivered reply is the whole story, so the card goes
-        // instead of leaving "Done." above it. A failed delete falls back to
-        // the terminal edit below.
-        if renderedIsTerminal, state.phase == .completed, let deleteCard {
-            do {
-                try await deleteCard(token, destination.chatId, messageId)
-                lastRenderedText = rendered
-                lastEditAt = now
-                editInFlight = false
-                pendingFlush = false
-                pendingForcedFlush = false
-                await removeTerminalLedgerRow(ifSentTerminal: true)
-                return
-            } catch {
-                await reportFailure(step: "delete", error: error)
-            }
-        }
-
         let markup = state.isTerminal || replyTextSettled
             ? TelegramTurnControlCallback.clearedReplyMarkup
             : TelegramTurnControlCallback.replyMarkup(turnId: turnId)
 
+        let deleting = renderedIsTerminal && state.phase == .completed && deleteCard != nil
+        // Cadence bounds attempts as well as successful edits during an outage.
+        lastEditAt = now
         do {
-            try await editCard(token, destination.chatId, messageId, rendered, markup)
-            lastRenderedText = rendered
-            lastEditAt = now
-        } catch {
-            // Editing an existing message is idempotent, so one delayed
-            // transport retry is safe. A semantic Telegram rejection is not a
-            // transient transport miss and is left unreplayed.
-            guard Self.shouldRetryEdit(after: error) else {
-                transportFailed = true
-                stopHeartbeat()
-                editInFlight = false
-                await reportFailure(step: "edit", error: error)
-                return
-            }
-            do {
-                try await sleeper(1_000_000_000)
-            } catch {
-                transportFailed = true
-                stopHeartbeat()
-                editInFlight = false
-                await reportFailure(step: "edit", error: error)
-                return
-            }
-            do {
+            if deleting, let deleteCard {
+                do {
+                    try await deleteCard(token, destination.chatId, messageId)
+                } catch let failure as TelegramAPIFailure
+                    where failure.telegramDescription?.localizedCaseInsensitiveContains("message to delete not found") == true {}
+            } else {
                 try await editCard(token, destination.chatId, messageId, rendered, markup)
-                lastRenderedText = rendered
-                lastEditAt = clock()
-            } catch {
+            }
+            lastRenderedText = rendered
+        } catch {
+            if !Self.shouldRetryEdit(after: error) {
                 transportFailed = true
                 stopHeartbeat()
-                editInFlight = false
-                await reportFailure(step: "edit retry", error: error)
-                return
             }
+            editInFlight = false
+            pendingFlush = false
+            pendingForcedFlush = false
+            await reportFailure(step: deleting ? "delete" : "edit", error: error)
+            return
         }
         editInFlight = false
         await removeTerminalLedgerRow(ifSentTerminal: renderedIsTerminal)
@@ -416,9 +383,9 @@ actor TelegramTurnProgressCardDriver {
               !terminalLedgerRowRemoved,
               !transportFailed,
               messageId != nil else { return }
-        terminalLedgerRowRemoved = true
         do {
             try await removePersistedCard(turnId)
+            terminalLedgerRowRemoved = true
         } catch {
             await reportFailure(step: "terminal persistence cleanup", error: error)
         }
@@ -455,8 +422,10 @@ actor TelegramTurnProgressCardDriver {
 
     private static func shouldRetryEdit(after error: Error) -> Bool {
         if error is CancellationError { return false }
-        if error is TelegramAPIFailure { return false }
-        return true
+        guard let failure = error as? TelegramAPIFailure else { return true }
+        if failure.errorCode == 429 || failure.httpStatus == 429 { return true }
+        if let code = failure.errorCode, code >= 500 { return true }
+        return !TelegramAssistantDeliveryDriver.isKnownNotDelivered(error)
     }
 
     private func reportFailure(step: String, error: Error) async {

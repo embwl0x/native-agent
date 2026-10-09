@@ -9,6 +9,7 @@ struct MobileTrustEditor: View {
     @State private var showConfirmation = false
     @State private var isSaving = false
     @State private var feedback: String?
+    @State private var showsPermissionLevel = false
 
     private var current: TrustPolicy { policy }
     private var effectiveLevel: String? {
@@ -21,6 +22,23 @@ struct MobileTrustEditor: View {
     private var fullMacConfirmation: Bool {
         if case .preset(.fullMac, _) = pending { return true }
         return false
+    }
+
+    private var currentPreset: MobileTrustAction.Preset? {
+        if effectiveLevel == "full_mac_os", current.effectiveOutsideDefault == "allow" { return .fullMac }
+        guard current.effectiveRequireBackups == true,
+              current.developerMode == false,
+              current.filePolicy?.allowDestructiveActions == false,
+              current.macControlPolicy?.shellAllowed == false,
+              current.macControlPolicy?.systemControlAllowed == false else { return nil }
+        if current.permissionLevel == "strict", current.autonomyDefault == "supervised",
+           current.effectiveOutsideDefault == "deny" { return .safe }
+        guard current.permissionLevel == "balanced", current.autonomyDefault == "workspace_autonomous" else { return nil }
+        switch current.effectiveOutsideDefault {
+        case "deny": return .workMode
+        case "ask": return .builder
+        default: return nil
+        }
     }
 
     var body: some View {
@@ -42,12 +60,20 @@ struct MobileTrustEditor: View {
     private var sections: some View {
         if !pairingStore.isPaired { AliveUnpairedReason() }
         AliveSection("Access and policy") {
-            Menu("Choose trust preset") {
+            Menu(currentPreset?.title ?? "Custom") {
                 ForEach(MobileTrustAction.Preset.allCases, id: \.rawValue) { preset in
-                    Button(preset.title) { propose(.preset(preset, confirmed: false)) }
+                    Button { propose(.preset(preset, confirmed: false)) } label: {
+                        if currentPreset == preset {
+                            Label(preset.title, systemImage: "checkmark")
+                        } else {
+                            Text(preset.title)
+                        }
+                        Text(preset.summary)
+                    }
                 }
             }
             .aliveRow()
+            .frame(minHeight: 44)
             .disabled(isSaving || !pairingStore.isPaired)
             AliveDivider()
             AliveValueRow(label: "Level", value: effectiveLevel.map(label) ?? TrustPolicySummaryPresentation.unknownValue)
@@ -55,17 +81,21 @@ struct MobileTrustEditor: View {
                 Text("Full Mac stays on until you change it.").aliveRow()
             }
         }
-        AliveSection("Permission level") {
-            choice("Level", field: .permissionLevel, value: effectiveLevel)
-            AliveDivider()
-            choice("Autonomy default", field: .autonomyDefault, value: current.autonomyDefault)
-            AliveDivider()
-            choice("Outside default", field: .outsideDefault,
-                   value: effectiveLevel == "full_mac_os" ? "allow" : current.effectiveOutsideDefault)
-            AliveDivider()
-            toggle("Developer mode", field: .developerMode, value: current.developerMode)
-            AliveDivider()
-            toggle("Require backups", field: .requireBackups, value: current.effectiveRequireBackups)
+        AliveSection(nil) {
+            DisclosureGroup("Permission level", isExpanded: $showsPermissionLevel) {
+                choice("Level", field: .permissionLevel, value: effectiveLevel)
+                AliveDivider()
+                choice("Autonomy default", field: .autonomyDefault, value: current.autonomyDefault)
+                AliveDivider()
+                choice("Outside default", field: .outsideDefault,
+                       value: effectiveLevel == "full_mac_os" ? "allow" : current.effectiveOutsideDefault)
+                AliveDivider()
+                toggle("Developer mode", field: .developerMode, value: current.developerMode)
+                AliveDivider()
+                toggle("Require backups", field: .requireBackups, value: current.effectiveRequireBackups)
+            }
+            .aliveRow()
+            .frame(minHeight: 44)
         }
         .disabled(isSaving || !pairingStore.isPaired)
         AliveSection("Desk") {
@@ -105,6 +135,7 @@ struct MobileTrustEditor: View {
             ForEach(field.values, id: \.self) { Text(label($0)).tag($0) }
         }
         .aliveRow()
+        .frame(minHeight: 44)
     }
 
     @ViewBuilder
@@ -113,7 +144,7 @@ struct MobileTrustEditor: View {
             Toggle(title, isOn: Binding(
                 get: { value },
                 set: { propose(.policy(field, value: String($0), confirmed: false)) }
-            )).aliveRow()
+            )).aliveRow().frame(minHeight: 44)
         } else {
             AliveValueRow(label: title, value: TrustPolicySummaryPresentation.unknownValue)
         }

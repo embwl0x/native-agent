@@ -1,6 +1,7 @@
 import Context
 import DreamREMCycle
 import Foundation
+import Senses
 import MemoryV2
 import NativeAgentCore
 import PersonaEngine
@@ -70,10 +71,7 @@ actor PersonaContextFlowProvider:
         compiler: PersonaCompiler? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         personaOverride: @escaping @Sendable () -> String? = {
-            UserDefaults.standard.string(forKey: "chatPersona").flatMap {
-                let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-                return value.isEmpty ? nil : value
-            }
+            PersonaSelection.current()
         }
     ) {
         let standardizedRoot = dataRoot.standardizedFileURL
@@ -418,9 +416,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         self.memoryProvenanceIndex = memoryProvenanceIndex ?? MemoryAtomRecordIndex()
         let pickerDefaults = defaultsOverride ?? SendableUserDefaults(value: .standard)
         self.personaOverride = personaOverride ?? {
-            let value = pickerDefaults.value.string(forKey: "chatPersona")?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return value.isEmpty ? nil : value
+            PersonaSelection.current(defaults: pickerDefaults.value)
         }
     }
 
@@ -440,7 +436,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         lastMemoryPressureReceipt = nil
         let configuration = resolvedConfiguration()
         guard configuration.mode != .off else {
-            NSLog("[context-flow] disabled until onboarding or explicit enablement")
+            nativeLog("[context-flow] disabled until onboarding or explicit enablement")
             finishStartup()
             return
         }
@@ -476,7 +472,8 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                 ),
                 NativeResidentWorkContextProjection(dataRoot: dataRoot),
                 NativeKnowledgeGraphContextProjection(dataRoot: dataRoot),
-                NativeStudioContextProjection(dataRoot: dataRoot)]
+                NativeStudioContextProjection(dataRoot: dataRoot),
+                SensesContextProjection()]
             )
             memoryRuntime = memory
             self.coordinator = coordinator
@@ -491,7 +488,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             installMemoryPressureSource()
             await coordinator.start()
             let health = await coordinator.health()
-            NSLog(
+            nativeLog(
                 "[context-flow] started mode=%@ generation=%lld sources=%d arena_bytes=%d",
                 configuration.mode.rawValue,
                 health.activeArenaGenerationID ?? 0,
@@ -511,7 +508,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             await memoryPressureObserver?.stop()
             residentWorkObservationTask?.cancel()
             residentWorkObservationTask = nil
-            NSLog("[context-flow] start failed closed: %@", String(describing: error))
+            nativeLog("[context-flow] start failed closed: %@", String(describing: error))
         }
         finishStartup()
     }
@@ -825,7 +822,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             // index cannot name. Every miss (total or partial) means those
             // records' use_count/activation loop silently starves. Preserve a
             // payload-free diagnostic for observability and log the counts.
-            NSLog(
+            nativeLog(
                 "[context-flow] memory provenance MISS: resolved %d of %d packet memory atoms, index size %d",
                 resolution.resolvedMemoryAtomCount,
                 resolution.requestedMemoryAtomCount,
@@ -1129,7 +1126,7 @@ actor REMPinRebuildCoalescer {
                 do {
                     try REMConsolidator.emitREMPinsIndex(dataRoot: dataRoot)
                 } catch {
-                    NSLog("[rem-pins] rebuild after a persona write failed: %@",
+                    nativeLog("[rem-pins] rebuild after a persona write failed: %@",
                           String(describing: error))
                 }
             }.value

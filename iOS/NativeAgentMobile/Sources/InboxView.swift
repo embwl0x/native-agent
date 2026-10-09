@@ -93,7 +93,8 @@ final class InboxStore: ObservableObject {
     func act(id: String, client: MacBridgeClient, pairingStore: PairingStore) async {
         guard pairingStore.usesICloudTransport else { bannerError = "Pair to view"; return }
         do {
-            _ = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: "act")
+            let response = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: "act")
+            openInteraction(response, id: id, actionID: "act")
             await refresh(client: client, pairingStore: pairingStore)
         } catch {
             bannerError = "Failed to act: \(error.localizedDescription)"
@@ -103,12 +104,20 @@ final class InboxStore: ObservableObject {
     func performAction(id: String, actionID: String, client: MacBridgeClient, pairingStore: PairingStore) async {
         guard pairingStore.usesICloudTransport else { bannerError = "Pair to view"; return }
         do {
-            _ = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: actionID)
+            let response = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: actionID)
+            openInteraction(response, id: id, actionID: actionID)
             applySuccessfulLocalAction(id: id, actionID: actionID)
             await refresh(client: client, pairingStore: pairingStore)
         } catch {
             bannerError = "Failed: \(error.localizedDescription)"
         }
+    }
+
+    private func openInteraction(_ response: [String: String]?, id: String, actionID: String) {
+        guard id.hasPrefix("interaction:"), actionID == "act", let session = response?["sessionID"] else { return }
+        MobileNotifiedChatSessionIntent.stage(session)
+        NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: "chat")
+        NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil, userInfo: ["screen": "chat"])
     }
 
     /// Project an already accepted Mac action while the next signed snapshot

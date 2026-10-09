@@ -14,7 +14,9 @@ final class BoundedResearchDownload: NSObject, URLSessionDataDelegate, @unchecke
     private var body = Data()
     private var observedBytes = 0
 
-    init(limit: Int) { self.limit = limit }
+    init(limit: Int) {
+        self.limit = limit
+    }
 
     func start(request: URLRequest, configuration: URLSessionConfiguration,
                continuation: CheckedContinuation<ResearchHTTPResponse, Error>) {

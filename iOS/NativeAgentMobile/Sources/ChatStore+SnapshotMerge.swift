@@ -86,22 +86,9 @@ extension ChatStore {
         return preserved
     }
 
-    // Stale-snapshot guard (2026-06-11, ledger ff7b6657): an iCloud snapshot can be
-    // built BEFORE recently-resolved turns sync back from the Mac. Replacing the
-    // list with such a snapshot makes live messages vanish until the next snapshot
-    // catches up. Three realities shape the merge:
-    //   1. Bridge-resolved replies keep their LOCAL placeholder UUID forever
-    //      (finishPlaceholder), so snapshot ids never match them — equivalence
-    //      falls back to content.
-    //   2. Mac snapshots are a suffix(80) window with content truncated at 6,000
-    //      chars + a marker (MacSyncEngine.compactTranscriptMessages), so local
-    //      history can legitimately be longer than the snapshot, and long
-    //      messages only prefix-match.
-    //   3. There are no tombstones, so "missing from snapshot" is ambiguous
-    //      between "not synced yet" and "aged out / cleared on the Mac" — only
-    //      RECENTLY arrived local messages are preserved (the stale window is
-    //      seconds to minutes); older ones defer to the snapshot, which matches
-    //      the pre-fix replace semantics.
+    // Receipts keep their placeholder UUID until the snapshot publishes the
+    // same terminal run. Preserve them across older snapshots and truncated
+    // windows; equal answer text is not turn identity.
 
     /// When each message id first appeared locally. Maintained from the messages
     /// didSet so every append path (send, bridge resolve, snapshot apply, cache
@@ -137,6 +124,13 @@ extension ChatStore {
     private func snapshotMessageMatches(_ snapshot: ChatMessage, local: ChatMessage) -> Bool {
         if snapshot.id == local.id { return true }
         guard snapshot.role == local.role else { return false }
+        if local.role == .assistant {
+            return local.interaction == nil && local.interactionDescriptor == nil
+                && snapshot.interaction == nil && snapshot.interactionDescriptor == nil
+                && ((snapshot.isTerminalReply && local.isTerminalReply)
+                    || (snapshot.completionState == "failed" && local.completionState == "failed"))
+                && local.runId != nil && snapshot.runId == local.runId
+        }
         if local.role == .user {
             guard publishedAttachmentsMatch(snapshot.attachments, local.attachments) else { return false }
             // Attachment-only sends may carry empty text — attachments equality
@@ -152,11 +146,23 @@ extension ChatStore {
     /// Snapshot attachments retain authority; only bytes for the same id carry over.
     private func preservingLocalDetails(_ local: ChatMessage, in snapshot: ChatMessage) -> ChatMessage {
         var matched = snapshot
+        if snapshot.id == local.id || (local.runId != nil && local.runId == snapshot.runId) {
+            matched.toolEvents = local.toolEvents
+        }
         // A matching Mac row completes the receipt's publication handoff.
         matched.awaitingMacTranscript = false
-        if matched.text.hasSuffix(Self.snapshotTruncationMarker) {
-            matched.text = local.text
+        // A live turn still streaming keeps streaming into the row that
+        // replaced its bubble (a long reply matches its truncated snapshot copy).
+        if snapshot.id != local.id, let run = liveTurnBubbles.first(where: { $0.value == local.id })?.key {
+            liveTurnBubbles[run] = snapshot.id
         }
+        if matched.text.hasSuffix(Self.snapshotTruncationMarker) {
+            let prefix = String(matched.text.dropLast(Self.snapshotTruncationMarker.count))
+            if local.text.count > prefix.count, local.text.hasPrefix(prefix) {
+                matched.text = local.text
+            }
+        }
+        matched.failureDetail = snapshot.failureDetail ?? local.failureDetail
         for index in matched.attachments.indices where matched.attachments[index].base64 == nil {
             let id = matched.attachments[index].id
             matched.attachments[index].base64 = local.attachments.first(where: { $0.id == id })?.base64
@@ -201,16 +207,23 @@ extension ChatStore {
             if local.isStreaming { continue }                  // pending machinery owns these
             if pendingPlaceholderIds.contains(local.id) { continue }
             if pendingUserIds.contains(local.id) { continue }
-            if let j = macMessages[cursor...].firstIndex(where: { snapshotMessageMatches($0, local: local) }) {
+            // A paged row is the Mac's own row: it matches by id, never by
+            // text, so an old "OK" cannot bind to a newer one.
+            let paged = pagedHistoryIDs.contains(local.id)
+            func matches(_ row: ChatMessage) -> Bool {
+                paged ? row.id == local.id : snapshotMessageMatches(row, local: local)
+            }
+            if let j = macMessages[cursor...].firstIndex(where: matches) {
                 for flushed in macMessages[cursor..<j] {
                     merged.append(flushed)
                     unconsumedFlushedIds.insert(flushed.id)
                 }
                 merged.append(preservingLocalDetails(local, in: macMessages[j]))
                 cursor = macMessages.index(after: j)
-            } else if local.awaitingMacTranscript || retainedIDs.contains(local.id) || (localArrivalDates[local.id] ?? .distantPast) >= preserveFloor {
+            } else if local.awaitingMacTranscript || retainedIDs.contains(local.id) || paged
+                        || (localArrivalDates[local.id] ?? .distantPast) >= preserveFloor {
                 if let twinIndex = merged.firstIndex(where: {
-                    unconsumedFlushedIds.contains($0.id) && snapshotMessageMatches($0, local: local)
+                    unconsumedFlushedIds.contains($0.id) && matches($0)
                 }) {
                     unconsumedFlushedIds.remove(merged[twinIndex].id) // local is that row's twin
                     merged[twinIndex] = preservingLocalDetails(local, in: merged[twinIndex])
@@ -231,26 +244,7 @@ extension ChatStore {
             }
             merged.append(candidate)
         }
-        return carryForwardToolEvents(into: merged)
-    }
-
-    /// The Mac transcript carries no per-tool events (tools aren't modeled as
-    /// iOS messages), so a snapshot refresh would wipe the locally-tracked
-    /// toolEvents. Re-attach them by id ONLY — a deterministic match that can
-    /// never lend a turn's events to the wrong message. The placeholder→Mac
-    /// reply handoff (where the ids differ) is done at the finalize points that
-    /// actually know that mapping (resolvePendingReplyFromMac / refresh),
-    /// not guessed by text here.
-    private func carryForwardToolEvents(into merged: [ChatMessage]) -> [ChatMessage] {
-        let byId = Dictionary(
-            messages.filter { !$0.toolEvents.isEmpty }.map { ($0.id, $0.toolEvents) },
-            uniquingKeysWith: { first, _ in first })
-        guard !byId.isEmpty else { return merged }
-        var result = merged
-        for i in result.indices where result[i].toolEvents.isEmpty {
-            if let ev = byId[result[i].id] { result[i].toolEvents = ev }
-        }
-        return result
+        return merged
     }
 
     /// Move the events that accumulated on a streaming placeholder onto whatever
@@ -332,48 +326,14 @@ extension ChatStore {
     }
 
     private func macAssistantReply(for pendingId: String, in macMessages: [ChatMessage]) -> ChatMessage? {
-        // Positional containment gate: a reply to the pending send can only sit
-        // AFTER the pending user message in the snapshot (the Mac transcript is
-        // append-ordered). A stale snapshot either lacks the pending user
-        // message entirely (→ nil) or contains it with no assistant after it
-        // yet (→ nil). Without this, the snapshot's copy of the PREVIOUS reply
-        // (under its Mac id, unknown locally because bridge-resolved replies
-        // keep their placeholder UUID) mis-resolved the CURRENT pending send —
-        // and the real reply was then dropped by the resolvedICloudReplyIds
-        // guard. Anchoring on position (not content-suppression of known reply
-        // texts) keeps legitimately repeated replies ("ok") resolvable.
-        // 2026-09-06: an assistant row the phone removed for a regenerate is
-        // absent locally by construction, so "absent locally" alone would let a
-        // stale snapshot answer the regeneration with the very answer being
-        // replaced. Exclude those ids from every candidate lane below.
-        let localAssistantIDs = Set(messages.filter { $0.role == .assistant && !$0.isStreaming }.map(\.id))
-            .union(regeneratedAwayAssistantIDs)
-        if let pendingUser = pendingUserMessage(for: pendingId) {
-            guard let userIndex = indexOfUserOccurrence(pendingUser, in: macMessages) else {
-                return nil
-            }
-            let start = macMessages.index(after: userIndex)
-            let end = macMessages[start...].firstIndex(where: { $0.role == .user }) ?? macMessages.endIndex
-            let tail = macMessages[start..<end]
-            return tail.last(where: { $0.role == .assistant && !localAssistantIDs.contains($0.id) })
+        macMessages.last {
+            $0.runId == pendingId && $0.isTerminalReply && !regeneratedAwayAssistantIDs.contains($0.id)
         }
-        // Regeneration has no appended user. Only a sole, retained request
-        // can own the last user interval without an explicit anchor.
-        guard !regeneratedAwayAssistantIDs.isEmpty,
-              pendingSendArgs[pendingId] != nil,
-              pendingICloudPlaceholders.count == 1 else { return nil }
-        if let lastUserIndex = macMessages.lastIndex(where: { $0.role == .user }) {
-            let tail = macMessages[macMessages.index(after: lastUserIndex)...]
-            if let reply = tail.last(where: { $0.role == .assistant && !localAssistantIDs.contains($0.id) }) {
-                return reply
-            }
-        }
-        return macMessages.last(where: { $0.role == .assistant && !localAssistantIDs.contains($0.id) })
     }
 
     func resolvePendingReplyFromMac(_ macMessages: [ChatMessage]) -> Bool {
-        let matches = pendingICloudPlaceholders.keys.sorted().compactMap { pendingId -> (String, UUID, ChatMessage, [ToolEvent])? in
-            guard let placeholderId = pendingICloudPlaceholders[pendingId],
+        let matches = Set(pendingICloudPlaceholders.keys).union(timedOutPendingIds.keys).sorted().compactMap { pendingId -> (String, UUID, ChatMessage, [ToolEvent])? in
+            guard let placeholderId = pendingICloudPlaceholders[pendingId] ?? timedOutPendingIds[pendingId],
                   let reply = macAssistantReply(for: pendingId, in: macMessages) else { return nil }
             let events = messages.first(where: { $0.id == placeholderId })?.toolEvents ?? []
             return (pendingId, placeholderId, reply, events)
@@ -384,9 +344,9 @@ extension ChatStore {
         for (pendingId, placeholderId, _, _) in matches {
             markICloudReplyResolved(pendingId)
             pendingICloudPlaceholders.removeValue(forKey: pendingId)
+            timedOutPendingIds.removeValue(forKey: pendingId)
             cancelReplyWaits(for: pendingId)
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
-            cancelTypewriter(placeholderId)
             messages.removeAll { $0.id == placeholderId }
         }
         messages = mergedMacMessagesPreservingPending(macMessages)

@@ -67,8 +67,6 @@ public enum ChatSurfaceBackgroundWork {
             } else {
                 sessionId = try await telegramSessions.activeSessionId(destination: destination)
             }
-            let persona = (try? await telegramSessions.persona(destination: destination))
-                ?? NativeAgentNotificationDefaults.agentDisplayName(dataRoot: dataRoot)
             let effectiveText = TelegramReplyPromptRenderer.messageWithReplyContext(
                 text: text,
                 replyTo: context.replyTo
@@ -80,20 +78,19 @@ public enum ChatSurfaceBackgroundWork {
                 // answer in. Nil keeps the historical whole-chat route.
                 threadId: destination.threadId.map(String.init)
             )
-            // Convert downloaded Telegram images into the Mac-path attachment
-            // shape. Mirrors ChatView.swift's MultimodalAttachment(type:"image",
-            // base64:, mime:, byteSize:) exactly so the existing vision path
-            // consumes them with no special-casing.
+            // Downloaded Telegram files use the same attachment types as Mac
+            // chat, so document ingestion and its Trust policy stay in Core.
             // Qualify as ChatOrchestration.MultimodalAttachment: an unqualified
             // `MultimodalAttachment` resolves to NativeAgentShared's same-named
             // type, which `client.chat` does NOT accept (mirrors NativeClient's
             // explicit qualification at its chat call site).
             let chatAttachments: [ChatOrchestration.MultimodalAttachment] = mediaAttachments.compactMap { media in
                 guard let bytes = media.bytes, !bytes.isEmpty else { return nil }
+                guard let resolved = media.chatTypeAndMime else { return nil }
                 return ChatOrchestration.MultimodalAttachment(
-                    type: "image",
+                    type: resolved.type,
                     base64: bytes.base64EncodedString(),
-                    mime: media.mimeType ?? "image/jpeg",
+                    mime: resolved.mime,
                     name: media.captureFilename,
                     byteSize: bytes.count
                 )
@@ -108,13 +105,14 @@ public enum ChatSurfaceBackgroundWork {
                 // The facade freezes provider/model/effort/tier before branch
                 // selection and context assembly.
                 attachments: chatAttachments,
-                persona: persona,
+                persona: nil,
                 surface: "telegram",
                 suppressUserAppend: context.suppressUserAppend,
                 verifiedSessionID: sessionId,
                 verifiedChatID: String(chatId),
                 verifiedUserID: context.fromUserId.map(String.init),
-                replyRoute: replyRoute
+                replyRoute: replyRoute,
+                pinnedRunID: context.runId
             )
             // Telegram's activity line reads an app call as the action it ran.
             let shown = ShownToolNames()
@@ -132,7 +130,7 @@ public enum ChatSurfaceBackgroundWork {
                             let call = shown.use(name, input: input)
                             await progress(.toolUse(name: call.name, input: call.input))
                         case .toolResult(let name, let output):
-                            await progress(.toolResult(name: shown.result(name), output: output))
+                            await progress(.toolResult(name: shown.result(name).name, output: output))
                         case .notice(let kind, let text):
                             // invoke_claude start/heartbeat/timeout — surface on
                             // Telegram so the user sees live progress instead of a silent

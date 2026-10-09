@@ -33,6 +33,7 @@ extension TurnContext {
             surface: surface,
             personaID: personaID,
             personaDocs: personaDocs,
+            personaFingerprint: personaFingerprint,
             recalled: recalled,
             modelId: modelId,
             reasoningEffort: reasoningEffort,
@@ -145,7 +146,7 @@ extension SwiftNativeTurnEngine {
         let recalledIds = ctx.resolvedRecalledIds
         await ctx.fluidContextTurn?.recordOutcome(.completed)
         await queuePromises(in: reply, dispatches: dispatches, surface: surface)
-        Self.noticeRepeatedWork(dispatches: dispatches, surface: surface, root: remPinsDataRoot)
+        Self.noticeRepeatedWork(dispatches: dispatches, surface: surface, root: remPinsDataRoot, sessionId: sessionId)
         // NOT run here (Astra audit 2, finding 4, 2026-09-11): this used to hold
         // the TurnEngineResult — and therefore the caller's assistant-row persist
         // and output milestone — for the whole promotion, 8-10 s on live bridge
@@ -214,12 +215,12 @@ extension SwiftNativeTurnEngine {
                 _ = try await MyQueue.add(DeskStep(words: words, when: "own_turn", peers: steer.sources, elevated: steer.elevated,
                                                    session: ChatToolSessionContext.verifiedSessionId), store: store)
             } catch {
-                NSLog("[my-queue] a stopped skill run was not queued: \(error)")
+                nativeLog("[my-queue] a stopped skill run was not queued: \(error)")
             }
         }
         guard doors.contains(surface.lowercased()),
               !dispatches.contains(where: { $0.name == "app" && $0.input["action"] == .string("queue.add") }) else { return }
-        do { try await MyQueue.expireInferred(store: store) } catch { NSLog("[my-queue] expiry failed: \(error)") }
+        do { try await MyQueue.expireInferred(store: store) } catch { nativeLog("[my-queue] expiry failed: \(error)") }
         let promises = ToolCallParser.crossTurnDeferrals(reply)
         guard !promises.isEmpty else { return }
         let card = dispatches.last { ChatToolOutcome.isWaitingApproval($0.result) }.flatMap { dispatch -> String? in
@@ -235,21 +236,20 @@ extension SwiftNativeTurnEngine {
                                                    peers: steer.sources, elevated: steer.elevated,
                                                    session: ChatToolSessionContext.verifiedSessionId), store: store)
             } catch {
-                NSLog("[my-queue] a promise was not queued: \(error)")
+                nativeLog("[my-queue] a promise was not queued: \(error)")
             }
         }
     }
 
-    /// Result of a shared post-dispatch round: `.stopLoop` when the no-progress
-    /// guard tripped (caller breaks BEFORE the next-iteration prep, exactly as
-    /// the inlined code did), `.continueLoop` otherwise.
+    /// A stopped dispatch round carries its actual cause: takeover, a needed
+    /// interaction, or the no-progress guard. Otherwise it continues.
     ///
     /// `madeProgress` is the whole-turn wall-clock budget's extension signal:
     /// true when at least ONE dispatch in the round returned a real result
     /// (`ChatToolOutcome.outputLooksSuccessful` — the same classification that
     /// sets the provider's tool_result `is_error` bit). An all-errored round is
     /// exactly the stuck case the budget exists to kill, so it extends nothing.
-    enum ToolDispatchRoundOutcome { case continueLoop(madeProgress: Bool), stopLoop }
+    enum ToolDispatchRoundOutcome { case continueLoop(madeProgress: Bool), stopLoop(TurnEngineResult.TerminalReason) }
 
     /// Post-provider-call round of the structured loop: mint the
     /// assistant message (prose + tool_use blocks, synthesizing collision-free
@@ -274,7 +274,8 @@ extension SwiftNativeTurnEngine {
         cancelFlagPath: URL? = nil,
         /// Set on the marker protocol: the round replays as the model's own
         /// text and its results come back as one text message (8b carrier).
-        markerCodec: TextMarkerCodec? = nil
+        markerCodec: TextMarkerCodec? = nil,
+        toolBoundaryReason: LLMToolBoundaryReason? = nil
     ) async throws -> ToolDispatchRoundOutcome {
         // Append the assistant turn that contained the tool calls. Strip any
         // <tool_use> markers from the surfaced text so the assistant text block
@@ -320,6 +321,7 @@ extension SwiftNativeTurnEngine {
             providerCalls: providerCalls,
             pairedIds: pairedIds,
             providerTools: providerTools,
+            priorDispatches: dispatches,
             modelId: ctx.modelId,
             surface: surface,
             sessionId: sessionId,
@@ -350,7 +352,7 @@ extension SwiftNativeTurnEngine {
                 )
                 resultIndex += 1
             }
-            if resultIndex > 0 { markerCodec.closeRound(&carrier) }
+            if resultIndex > 0 { markerCodec.closeRound(&carrier, boundaryReason: toolBoundaryReason) }
             toolResultBlocks = (carrier.isEmpty ? [] : [.text(carrier)]) + images
         }
         dispatches.append(contentsOf: iterationRecords)
@@ -360,7 +362,7 @@ extension SwiftNativeTurnEngine {
             let ran = ToolNameAliases.ranTool($0.name, input: $0.input)
             return Self.driverTakeoverReceipt($0.result) != nil
                 || (!MacAttentionSessionStore.shared.currentDriverAllowed
-                    && (["act", "go"].contains(ran) || ran.contains("chrome"))
+                    && ["act", "go"].contains(ran)
                     && ChatToolOutcome.wasCancelled($0.result))
         }) {
             let stoppedName = ToolNameAliases.ranTool(stopped.name, input: stopped.input)
@@ -382,8 +384,8 @@ extension SwiftNativeTurnEngine {
                 }
             }
             if stoppedName.contains("chrome") {
-                let lease: String? = if case .string(let value)? = receipt["leaseId"] ?? stoppedInput["lease_id"] { value } else { nil }
-                if let page = ChromePageMirror.page(lease: lease, session: sessionId) {
+                let tab: Int64? = if case .int(let value)? = receipt["tabId"] ?? stoppedInput["tab_id"] { value } else { nil }
+                if let page = ChromePageMirror.page(tab: tab, session: sessionId) {
                     lines.append("Chrome page: " + page.title + " · " + page.url)
                     let node = receipt["nodeId"] ?? receipt["targetNodeId"] ?? stoppedInput["node_id"]
                     if (receipt["snapshotId"] ?? stoppedInput["snapshot_id"]) == .string(page.snapshotID),
@@ -397,9 +399,9 @@ extension SwiftNativeTurnEngine {
                 + "\nInput already sent may have changed the app; unfinished work remains unverified. Under Full Mac I'll pick it up when you ask; otherwise I'll wait until you return Mac control with Let agent use Mac."
             loopRecoveryReply = handback
             await progress?(.notice(kind: "mac_handback", text: handback))
-            return .stopLoop
+            return .stopLoop(.humanTakeover)
         }
-        if surface == "bot", iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
+        if StandingBotContinuity.isHelperTurn, iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
             ChatTurnExecution.current?.waitForApproval()
         }
         // Setup and permission cards leave this item skipped while the turn
@@ -408,7 +410,7 @@ extension SwiftNativeTurnEngine {
             .compactMap({ InlineInteractionNeed.interaction(in: $0.result) })
             .first(where: InlineInteractionNeed.blocksTurn) {
             ChatTurnExecution.current?.waitForInteraction(waiting)
-            return .stopLoop
+            return .stopLoop(.interactionRequired)
         }
         // Whole-turn budget extension signal (see ToolDispatchRoundOutcome).
         // User, 2026-09-06: an approval FILED is not a tool that ran, so it does
@@ -448,7 +450,7 @@ extension SwiftNativeTurnEngine {
         }
         conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
         LocalToolImage.boundConversation(&conversation)
-        if loopRecoveryReply != nil { return .stopLoop }
+        if loopRecoveryReply != nil { return .stopLoop(.noProgress) }
         return .continueLoop(madeProgress: madeProgress)
     }
 
@@ -590,6 +592,9 @@ extension SwiftNativeTurnEngine {
         dispatches: [TurnEngineResult.ToolDispatchRecord],
         startNs: UInt64,
         providerCallCount: Int,
+        userMessage: String,
+        sessionId: String?,
+        surface: String,
         codec: ToolCallCodec = .native
     ) async -> TurnEngineResult {
         // 2026-09-23: keep the prose before any repetition loop, and say why.
@@ -597,15 +602,21 @@ extension SwiftNativeTurnEngine {
         let prefix = codec.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(kept))
         let prose = LLMCallContext.turnTokenBudget != nil ? prefix : prefix.trimmingCharacters(in: .whitespacesAndNewlines)
         await ctx.fluidContextTurn?.recordOutcome(.abandoned)
+        let reply = LLMCallContext.turnTokenBudget != nil ? prose : (prose.isEmpty ? notice : prose + "\n\n" + notice)
+        let promotionTicket = deferMemoryPromotion(
+            userMessage: userMessage, assistantMessage: reply, toolDispatches: dispatches,
+            sessionId: sessionId, surface: surface
+        )
         return TurnEngineResult(
-            reply: LLMCallContext.turnTokenBudget != nil ? prose : (prose.isEmpty ? notice : prose + "\n\n" + notice),
+            reply: reply,
             modelUsed: ctx.modelId,
             recalledIds: ctx.resolvedRecalledIds,
             toolDispatches: dispatches,
             elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
             rawLLMResponse: partial,
             providerCallCount: providerCallCount,
-            completionState: .incomplete
+            completionState: .incomplete,
+            memoryPromotionTicket: promotionTicket
         )
     }
 }

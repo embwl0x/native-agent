@@ -236,13 +236,13 @@ public final class FirstRunWelcomeTransaction {
         do {
             try data.write(to: url, options: [.atomic])
         } catch {
-            NSLog("[first-run-welcome] could not write the met marker: %@", error.localizedDescription)
+            nativeLog("[first-run-welcome] could not write the met marker: %@", error.localizedDescription)
             return false
         }
         // Verify by reading back, not by trusting the write: this is the record
         // that stops a second greeting forever.
         guard let readBack = try? Data(contentsOf: url), !readBack.isEmpty else {
-            NSLog("[first-run-welcome] met marker did not read back; keeping the in-flight marker")
+            nativeLog("[first-run-welcome] met marker did not read back; keeping the in-flight marker")
             return false
         }
         return true
@@ -365,7 +365,7 @@ public final class FirstRunWelcomeTransaction {
             )
             return true
         } catch {
-            NSLog("[first-run-welcome] could not claim pending greeting: %@", error.localizedDescription)
+            nativeLog("[first-run-welcome] could not claim pending greeting: %@", error.localizedDescription)
             return false
         }
     }
@@ -386,7 +386,7 @@ public final class FirstRunWelcomeTransaction {
                 try files.moveItem(at: firstRunWelcomeInFlightMarkerURL(port: port), to: firstRunWelcomeMarkerURL(port: port))
             }
         } catch {
-            NSLog("[first-run-welcome] could not restore rejected greeting: %@", error.localizedDescription)
+            nativeLog("[first-run-welcome] could not restore rejected greeting: %@", error.localizedDescription)
         }
     }
 
@@ -468,7 +468,7 @@ public final class FirstRunWelcomeTransaction {
     @MainActor
     private func sendFirstRunGreetingIfEligible(_ kickoff: String, port: some FirstRunWelcomePort) async -> FirstRunGreetingOutcome {
         if firstRunWelcomeMarkerState(port: port) == .inFlight {
-            NSLog("[first-run-welcome] prior greeting outcome is unknown; suppressing duplicate")
+            nativeLog("[first-run-welcome] prior greeting outcome is unknown; suppressing duplicate")
             return .priorOutcomeUnknown
         }
         guard firstRunWelcomeMarkerState(port: port) == .pending, !firstRunGreetingInFlight else { return .notArmed }
@@ -498,7 +498,7 @@ public final class FirstRunWelcomeTransaction {
         }
         guard claimFirstRunWelcomeMarker(port: port) else { return .claimFailed }
 
-        NSLog("[first-run-welcome] firing greeting into session %@", sid)
+        nativeLog("[first-run-welcome] firing greeting into session %@", sid)
 
         // The pending marker moved to the durable in-flight marker before this
         // handoff. A crash during delivery therefore leaves an honest unknown
@@ -519,7 +519,7 @@ public final class FirstRunWelcomeTransaction {
             return .queued(sessionId: sid)
         case .rejected(let message):
             restoreFirstRunWelcomeMarkerAfterRejectedSend(port: port)
-            NSLog("[first-run-welcome] greeting send rejected, restoring marker: %@", message)
+            nativeLog("[first-run-welcome] greeting send rejected, restoring marker: %@", message)
             return .rejected(message: message)
         }
     }

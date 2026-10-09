@@ -386,6 +386,7 @@ struct MacSyncErrorBanner: View {
     @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var dismissedMessage: String?
     @State private var isExpanded = false
+    @State private var showsConnection = false
 
     private var message: String? {
         MacSyncErrorBannerPresentation.visibleMessage(
@@ -418,6 +419,9 @@ struct MacSyncErrorBanner: View {
                     .accessibilityLabel("Sync warning: \(message)")
                     .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
                     .accessibilityHint(isExpanded ? "Collapses the warning" : "Reads the full warning")
+                    Button("Connection") { showsConnection = true }
+                        .font(.footnote)
+                        .buttonStyle(.plain)
                     Button {
                         dismissedMessage = message
                         isExpanded = false
@@ -443,6 +447,9 @@ struct MacSyncErrorBanner: View {
             }
         }
         .animation(AppMotion.snappy, value: sync.syncError)
+        .sheet(isPresented: $showsConnection) {
+            NavigationStack { SettingsViewFull(opensConnection: true) }
+        }
         .animation(AppMotion.snappy, value: isExpanded)
         // The latch must only survive as long as the condition does. Without
         // this, dismissing "snapshots still downloading", letting a sync

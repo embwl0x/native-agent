@@ -200,19 +200,19 @@ extension SwiftToolDispatcher {
             switch self {
             case .malformed(let expectedAgent):
                 return .object([
-                    "status": .string("failed"),
+                    "status": .string("failed"), "effects": .string("none"),
                     "reason": .string("invalid_conversation_id"),
                     "fix": .string("Pass the exact \(expectedAgent.rawValue):… conversationId returned by the first builder message."),
                 ])
             case .invalidMode:
                 return .object([
-                    "status": .string("failed"),
+                    "status": .string("failed"), "effects": .string("none"),
                     "reason": .string("invalid_conversation_mode"),
                     "fix": .string("Use conversation_mode='new' with no conversation_id, or conversation_mode='resume' with the exact returned conversationId."),
                 ])
             case .modeConflict(let mode):
                 return .object([
-                    "status": .string("failed"),
+                    "status": .string("failed"), "effects": .string("none"),
                     "reason": .string("conversation_mode_conflict"),
                     "conversationMode": .string(mode.rawValue),
                     "fix": .string(mode == .new
@@ -221,7 +221,7 @@ extension SwiftToolDispatcher {
                 ])
             case .agentMismatch(let expected, let actual):
                 return .object([
-                    "status": .string("failed"),
+                    "status": .string("failed"), "effects": .string("none"),
                     "reason": .string("conversation_agent_mismatch"),
                     "expectedAgent": .string(expected.rawValue),
                     "actualAgent": .string(actual),
@@ -229,7 +229,7 @@ extension SwiftToolDispatcher {
                 ])
             case .topicMismatch(let conversationId, let topic):
                 return .object([
-                    "status": .string("failed"),
+                    "status": .string("failed"), "effects": .string("none"),
                     "reason": .string("conversation_topic_mismatch"),
                     "conversationId": .string(conversationId),
                     "topic": .string(topic),
@@ -413,6 +413,7 @@ extension SwiftToolDispatcher {
         guard case .bool(let requested) = value else {
             return .failure(BuilderReviewPairError(value: .object([
                 "status": .string("failed"),
+                "effects": .string("none"),
                 "reason": .string("invalid_pair_reviewer"),
                 "fix": .string("pair_reviewer must be true or false."),
             ])))
@@ -834,9 +835,9 @@ extension SwiftToolDispatcher {
         environment.merge(InstallPaths.current.bridgeEnvironment(configRoot: builderWorktreeConfigRoot)) { _, path in path }
         guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
             var failure: [String: JSONValue] = [
-                "status": .string("failed"), "reason": .string("node_runtime_not_found"), "helper": .string(helper.path),
+                "status": .string("failed"), "effects": .string("none"), "reason": .string("node_runtime_not_found"), "helper": .string(helper.path),
             ]
-            if cli != "omp" { failure["fix"] = .string("Install Node.js, then restart NativeAgent.") }
+            failure["fix"] = .string("Install Node.js, then restart NativeAgent.")
             return .object(failure)
         }
         environment.merge(launchEnvironment) { _, finished in finished }
@@ -888,7 +889,7 @@ extension SwiftToolDispatcher {
                 "reason": .string("helper_cancelled"),
                 "helper": .string(helper.path),
                 "admissionOutcome": .string("unknown"),
-                "note": .string("The helper was cancelled after possible dispatch. Inspect the original message's delegation status before any resend."),
+                "message": .string("The helper was cancelled after possible dispatch. Inspect the original message's delegation status before any resend."),
             ])
         } catch {
             return .object([

@@ -70,16 +70,11 @@ extension ChatView {
     @ViewBuilder
     var shellConversationsColumn: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                // Agent, 2026-09-03: SF Rounded appeared exactly once in the
-                // shell, here, 288pt from a system-face "Agent" of the same
-                // rank. Every column header is now the system face at 20
-                // semibold.
+            HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                 Text(ChatShellCopy.conversationsTitle)
-                    .font(ShellType.title)
+                    .font(ShellType.columnTitle)
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.8)
                 Spacer(minLength: 4)
                 // Agent, 2026-09-02, glyph diet: an archive box and a plus
                 // over a list of conversations are a guess each. Same two
@@ -130,8 +125,11 @@ extension ChatView {
             // User 09-27: all controls Mac native — the system sidebar list:
             // its own selection, arrow keys and collapsible sections.
             let sections = shellConversationSections
+            // A screenshot's copy draws the selection itself (below): the
+            // list's own highlight is a vibrancy view, which a bitmap capture
+            // draws as a solid black slab.
             List(selection: Binding<String?>(
-                get: { appModel.activeChatSessionId },
+                get: { quietOffscreenRead ? nil : appModel.activeChatSessionId },
                 set: { id in
                     guard let id, id != appModel.activeChatSessionId, renamingSessionId == nil,
                           let session = (sections.rows + sections.briefs + sections.working)
@@ -183,10 +181,7 @@ extension ChatView {
         // The column is 288 wide edge to edge — the measured number. The
         // source used to say 264, which was the content inside the gutter.
         .frame(width: NativeAgentShellLayout.conversationsWidth)
-        // The shell baseline: 20 semibold in a 24pt-tall head row, 22 down
-        // from the title strip, puts "Conversations" on window y 72 with
-        // "Chat" and the room header.
-        .padding(.top, 22)
+        .padding(.top, NativeAgentShellLayout.columnHeaderTopInset)
         .padding(.bottom, 16)
         // User, 2026-09-03: the same move the rail made. The
         // NSVisualEffectView under a 0.28 colour coat could not adapt to what
@@ -276,6 +271,11 @@ extension ChatView {
             Divider()
             detachedSessionMenu(sessionID: session.id)
         }
+        .listRowBackground(quietOffscreenRead && session.id == appModel.activeChatSessionId
+            ? RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color(nsColor: .unemphasizedSelectedContentBackgroundColor))
+                .padding(.horizontal, 10)
+            : nil)
         .help("\(ChatShellConversationRow.title(for: session))\n\nRight-click to rename, pin, or detach")
         .id(ChatSidebarSessionRowIdentity(sessionID: session.id, pinned: isPinned))
     }
@@ -346,7 +346,8 @@ extension ChatView {
                 && appModel.currentChatTaskSessionId == appModel.activeChatSessionId,
             highlightedMessageID: showTranscriptSearch ? transcriptSearch.selectedMessageID : nil,
             animatesArrival: animatesMessageArrival,
-            latestRequest: transcriptLatestRequest
+            latestRequest: transcriptLatestRequest,
+            onPagedBackChange: { [scrollCoordinator] in scrollCoordinator.transcriptPagedBack = $0 }
         )
         // The join. The transcript asks for the cards belonging to a row; the
         // binding answers from the persisted interactions of this session, and
@@ -377,10 +378,12 @@ extension ChatView {
                     latestPillLabel
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
+                        // A quiet screenshot takes the opaque pill, as the
+                        // composer does: tinted glass blanks the capture.
                         .background {
-                            if reduceTransparency { Capsule().fill(NativeAgentShell.room) }
+                            if reduceTransparency || quietOffscreenRead { Capsule().fill(NativeAgentShell.room) }
                         }
-                        .glassEffect(reduceTransparency ? .identity : .regular.interactive(), in: Capsule())
+                        .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate.interactive(), in: Capsule())
                 }
                 .buttonStyle(.borderless)
                 .accessibilityIdentifier("chat.latest")

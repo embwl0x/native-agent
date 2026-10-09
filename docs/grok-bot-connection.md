@@ -5,7 +5,7 @@ The `grok-bot` row in `AgentHostDirectory` uses the installed app with bundle ID
 
 ## Connect
 
-Use `app {"action":"agent.connect","args":{"name":"Grok Bot"}}`.
+Use `app {"action":"agent.connect","args":{"agent":"Grok Bot"}}`.
 Sign in to Grok Bot and grant NativeAgent Accessibility access if required.
 Approve Grok's own routine/local-execution requests when it asks. Its approval policy is
 independent of NativeAgent Full Mac: ask-every-time requires a person for each

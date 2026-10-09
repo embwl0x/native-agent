@@ -74,6 +74,15 @@ enum BackgroundLoopsAssembly {
                                      contextFlow: NativeContextFlowRuntime(dataRoot: standardized))
     }
 
+    /// Body work shares the resident turn provider assembly and its exact
+    /// credential/routing resolution, without adding a persona prompt.
+    /// Background calls carry the same idle and wall as resident turns, so one
+    /// stalled call cannot hold the memory promotion chain forever.
+    static func makeProviderLLMClient(dataRoot: URL = PersistenceCore.defaultDataRoot(),
+                                      lifecycleObserver: NativeCognitionRuntime? = nil) -> any LLMClient {
+        makeResidentProviderLLMClient(dataRoot: dataRoot, lifecycleObserver: lifecycleObserver)
+    }
+
     static func makeSharedLLMClient(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         cognitionRuntime: NativeCognitionRuntime? = nil
@@ -87,26 +96,7 @@ enum BackgroundLoopsAssembly {
                 cognitionRuntime: runtime
             )
         }
-        let router = SwiftNativeProviderRouting()
-        let resolvedAuth = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot)
-        let codexEnvironment: [String: String]? = OpenAIOAuthDirectAdapter.hasUsableTokens(at: resolvedAuth)
-            ? CodexAdapter.augmentedProcessEnvironment().merging([
-                "CODEX_HOME": resolvedAuth.deletingLastPathComponent().path,
-            ]) { _, bound in bound }
-            : nil
-        let inner = SwiftNativeLLMClient(
-            router: router,
-            codex: CodexAdapter(processEnvironmentOverride: codexEnvironment),
-            anthropic: AnthropicAdapter(),
-            openAI: OpenAIAdapter(),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(),
-            xaiOAuthDirect: XAIOAuthDirectAdapter(),
-            moonshot: MoonshotAdapter(),
-            kimiCode: AnthropicAdapter.kimiCode(),
-            openRouter: OpenRouterAdapter(),
-            lifecycleObserver: runtime
-        )
+        let inner = makeProviderLLMClient(dataRoot: dataRoot, lifecycleObserver: runtime)
         return PersonaBackedBackgroundLLMClient(
             inner: inner,
             dataRoot: dataRoot,
@@ -158,9 +148,8 @@ enum BackgroundLoopsAssembly {
             // Cue authoring stays available as an explicit/manual seam, but is
             // absent from production scheduling until it has a live consumer.
             // This avoids both unattended model spend and a dead 10-minute wake.
-            // U2b wave 3 lane A: interval health heartbeat + self-healing hook.
+            // U2b wave 3 lane A: interval health heartbeat.
             makeHeartbeatLoop(dataRoot: dataRoot, llm: llm),
-            makeSelfHealingHook(dataRoot: dataRoot, llm: llm),
             // U4 Wave C: autonomy-promotion PROPOSAL loop (cards only; applies
             // human-approved promotions via a re-verifying reconcile).
             makeAutonomyPromotionLoop(dataRoot: dataRoot),

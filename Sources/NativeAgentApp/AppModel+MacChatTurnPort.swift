@@ -3,6 +3,7 @@ import ChatOrchestration
 import NativeAgentShared
 import AppKit
 import MacControl
+import NativeAgentCore
 import TrustCenter
 
 extension AppModel: MacChatTurnPresentationPort {
@@ -10,9 +11,7 @@ extension AppModel: MacChatTurnPresentationPort {
     var knownChatSessionIDs: Set<String> { Set(engine.transcripts.sessions.map(\.id)) }
 
     func captureMacWorkContinuation(_ text: String, taskReference: String) async -> MacWorkContinuation? {
-        let request = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard request.range(of: #"^(?:please )?(?:(?:can|could|will|would) you )?(?:please )?take over(?:$|[\s,:.!?])"#,
-                            options: .regularExpression) != nil else { return nil }
+        guard UserMessageIntentSignals.isTakeOver(text) else { return nil }
         let front = NSWorkspace.shared.frontmostApplication
         let app = front?.processIdentifier == getpid() ? (NSApp.delegate as? AppDelegate)?.previousWorkApp : front
         do {
@@ -85,11 +84,55 @@ extension AppModel: MacChatTurnPresentationPort {
             }
             updateChatMessageContent(id: bubbleId, in: sessionId, content: snapshot)
         case .activity(let activity):
+            if activity.source == .toolResult { placeTurnToolRows(sessionId: activity.identity.sessionId) }
             // Preserve the existing notice/toast contract; tools add no chatter.
             guard case .notice(let kind) = activity.source,
                   let text = activity.userVisibleNoticeText, !text.isEmpty else { return }
             NotificationCenter.default.post(name: .nativeAgentTurnNotice, object: nil,
                 userInfo: ["kind": kind, "text": text, "sessionId": activity.identity.sessionId])
         }
+    }
+
+    /// User, 2026-10-07: her tool rows reached the transcript only at the
+    /// post-turn reload, which slid them in between his message and her
+    /// finished reply — the reply jumped down a row as it landed. Each
+    /// finished tool now places the turn's persisted rows where that reload
+    /// puts them, under the same ids, so the reload moves nothing.
+    func placeTurnToolRows(sessionId: String) {
+        Task { @MainActor in
+            guard let disk = try? await engine.transcripts.loadMessages(sessionId: sessionId, cached: true),
+                  engine.turns.streamingSessions.contains(sessionId),
+                  let bubbleId = engine.turns.streamingBubbleIds[sessionId],
+                  let local = engine.transcripts.messagesBySession[sessionId],
+                  let placed = ChatTurnToolPlacement.placing(disk: disk, into: local, before: bubbleId)
+            else { return }
+            engine.transcripts.setMessages(placed, for: sessionId)
+        }
+    }
+}
+
+enum ChatTurnToolPlacement {
+    /// `local` with the running turn's persisted rows placed just above the
+    /// live reply, in disk order: its tool rows, and any steering message it
+    /// took between them (a user row of its own run id, which splits the fold
+    /// exactly as the reload will). Nil when nothing is new. The turn's rows
+    /// share its run id, which the newest tool row carries; its own user row
+    /// is already on screen. An approval waiting on User stays on the turn
+    /// card until the reload; a mirrored card is never a tool row.
+    static func placing(disk: [ChatMessage], into local: [ChatMessage], before bubbleId: String) -> [ChatMessage]? {
+        guard let run = disk.last(where: { $0.role == "tool" })?.runId,
+              let start = disk.firstIndex(where: { $0.runId == run }) else { return nil }
+        let rows = disk[start...].filter { row in
+            row.role == "tool"
+                ? row.metadata?.isPendingApproval != true && row.metadata?.interactionMirror == nil
+                : row.role == "user" && row.runId != run
+        }
+        let ids = Set(rows.map(\.id))
+        // A slower read of an older file never takes rows away.
+        guard !ids.isSubset(of: Set(local.map(\.id))) else { return nil }
+        var placed = local.filter { !ids.contains($0.id) }
+        guard let reply = placed.firstIndex(where: { $0.id == bubbleId }) else { return nil }
+        placed.insert(contentsOf: rows, at: reply)
+        return placed
     }
 }

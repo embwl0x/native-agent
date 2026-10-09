@@ -454,9 +454,15 @@ public struct LLMStreamToolCall: Sendable, Equatable {
     }
 }
 
+public enum LLMToolBoundaryReason: String, Sendable, Equatable {
+    case repeatedBlock, repeatedAction, fabricatedResult, postCallProse
+}
+
 public enum LLMMessageStreamEvent: Sendable, Equatable {
     case textDelta(String)
     case toolCall(LLMStreamToolCall)
+    /// Complete calls survive; the tail after them was withheld by the client.
+    case toolBoundary(LLMToolBoundaryReason)
     /// Presentation only: the message ended, but the response remains open.
     case replyTextSettled(Bool)
     /// Liveness signal: the provider is producing NON-user-visible output (an

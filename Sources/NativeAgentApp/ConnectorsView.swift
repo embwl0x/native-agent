@@ -273,13 +273,6 @@ struct ConnectorsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                HStack {
-                    Spacer()
-                    Button("Refresh", systemImage: "arrow.clockwise") {
-                        Task { await appModel.refreshForSidebarItem(.connectors) }
-                    }
-                    .accessibilityLabel("Refresh connectors")
-                }
                 if let connectorStatusMessage {
                     ConnectorsNote(
                         text: connectorStatusMessage.text,
@@ -287,13 +280,22 @@ struct ConnectorsView: View {
                     )
                 }
 
-                ConnectorsSection(label: "Accounts") {
+                AdvancedSection(title: "Accounts", card: .bare) {
+                    PageReadStatus(
+                        isReading: accountsReading,
+                        text: accountsReading
+                            ? (appModel.panelRefreshStatus[.connectors] == nil ? "Reading connected accounts…" : "Refreshing connected accounts…")
+                            : accountsReadFailed ? "I couldn't read connected accounts. Try Refresh."
+                            : appModel.panelRefreshStatus[.connectors] == nil ? "Choose Refresh to read connected accounts." : nil
+                    )
                     if registryRowsForDisplay.isEmpty {
-                        ConnectorsCard {
-                            ConnectorsNote(
-                                text: "The accounts I can read and write will be listed here. Refresh to load them.",
-                                color: NativeAgentShell.secondary
-                            )
+                        if !accountsReading && !accountsReadFailed && appModel.panelRefreshStatus[.connectors] != nil {
+                            ConnectorsCard {
+                                ConnectorsNote(
+                                    text: "No accounts connected yet.",
+                                    color: NativeAgentShell.secondary
+                                )
+                            }
                         }
                     } else {
                         // Alive glass (2026-09-23): one group card, a row
@@ -306,7 +308,7 @@ struct ConnectorsView: View {
                     }
                 }
 
-                ConnectorsSection(label: "Folders I may open") {
+                AdvancedSection(title: "Folders I may open", card: .bare) {
                     if appModel.workspaces.isEmpty {
                         ConnectorsCard {
                             ConnectorsNote(
@@ -323,15 +325,15 @@ struct ConnectorsView: View {
                             ForEach(appModel.workspaces) { workspace in
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(workspace.name)
-                                        .font(.system(size: 14, weight: .medium))
+                                        .font(ShellType.rowTitle)
                                         .foregroundStyle(NativeAgentShell.text)
                                     Text(workspace.path)
-                                        .font(.system(size: 12))
+                                        .font(ShellType.rowDetail)
                                         .foregroundStyle(NativeAgentShell.secondary)
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                     Text(workspace.permissions.joined(separator: ", "))
-                                        .font(.system(size: 12))
+                                        .font(ShellType.rowDetail)
                                         .foregroundStyle(NativeAgentShell.secondary)
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -347,7 +349,13 @@ struct ConnectorsView: View {
             .padding(.bottom, 32)
         }
         .navigationTitle("Connectors")
-        .motionArrival(when: appModel.panelRefreshStatus[.connectors] != nil)
+        .pageActions {
+            Button(accountsReading ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise") {
+                Task { await appModel.refreshForSidebarItem(.connectors) }
+            }
+            .accessibilityLabel("Refresh connectors")
+            .disabled(accountsReading)
+        }
         // PATCH-2026-05-07: connector-wizard-b Sheet for ConnectorWizardView
         .sheet(
             isPresented: Binding(
@@ -369,7 +377,7 @@ struct ConnectorsView: View {
     }
 
     private var shareFolderSection: some View {
-        ConnectorsSection(label: "Share a folder") {
+        AdvancedSection(title: "Share a folder", card: .bare) {
             ConnectorsCard {
                 VStack(alignment: .leading, spacing: 12) {
                     ConnectorsField(title: "Name") {
@@ -403,7 +411,7 @@ struct ConnectorsView: View {
     }
 
     private var searchFolderSection: some View {
-        ConnectorsSection(label: "Search the shared folders") {
+        AdvancedSection(title: "Search the shared folders", card: .bare) {
             ConnectorsCard {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 8) {
@@ -479,7 +487,7 @@ struct ConnectorsView: View {
             appModel.statusText = "Workspace search found \(response.results.count)"
             workspaceSearchState = .completed(response.results)
         } catch {
-            appModel.statusText = "Workspace search failed: \(error.localizedDescription)"
+            appModel.setFailureStatus(error, action: "search the workspace")
             workspaceSearchState = .failed
         }
     }
@@ -496,15 +504,13 @@ struct ConnectorsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .center, spacing: 8) {
                     Text(connector.name)
-                        .font(.system(size: 14, weight: .medium))
+                        .font(ShellType.rowTitle)
                         .foregroundStyle(NativeAgentShell.text)
                     Spacer(minLength: 8)
                     ConnectorsStatusPill(text: renderedStatusText, tone: uiState.statusColor)
                 }
-                Text(connector.id == "shortcuts"
-                     ? "Run Apple Shortcuts for Desk tasks, Diagnostics, status, and chat."
-                     : connector.description)
-                    .font(.system(size: 12))
+                Text(Self.plainDescription(connector))
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let runtimeStatus = connector.runtimeStatus,
@@ -517,11 +523,12 @@ struct ConnectorsView: View {
                     let runtimeConnected = runtimeStatus == "connected"
                     Text(runtimeLabel)
                         .font(ShellType.caption)
-                        .foregroundStyle(runtimeConnected ? NativeAgentShell.secondary : NativeAgentShell.trouble)
+                        .foregroundStyle(runtimeConnected ? NativeAgentShell.text.opacity(0.85) : NativeAgentShell.trouble)
                 }
                 HStack(spacing: 12) {
                     if let label = Self.accessLabel(connector.riskClass) { Text(label) }
                     Text(connector.enabled ? "On" : "Off")
+                        .foregroundStyle(NativeAgentShell.text.opacity(0.85))
                     Spacer(minLength: 8)
                     if let primaryTitle = actionPolicy.primaryTitle {
                         Button(primaryTitle) {
@@ -580,6 +587,14 @@ struct ConnectorsView: View {
             writable: writable,
             outcome: outcome
         )
+    }
+
+    private var accountsReading: Bool {
+        appModel.panelRefreshCounts[.connectors, default: 0] > 0
+    }
+
+    private var accountsReadFailed: Bool {
+        appModel.panelRefreshStatus[.connectors]?.failedEndpoints.contains("connectors") == true
     }
 
     private var registryRowsForDisplay: [ConnectorRecord] {
@@ -664,6 +679,19 @@ struct ConnectorsView: View {
         }
     }
 
+    /// The registry's description, except where it is written for the
+    /// plumbing rather than for User.
+    static func plainDescription(_ connector: ConnectorRecord) -> String {
+        switch connector.id {
+        case "shortcuts": "Run Apple Shortcuts for Desk tasks, Diagnostics, status, and chat."
+        case "agentmail": "My own email inbox. I can read and search it, and send mail from it."
+        case "telegram": "Talk with me from Telegram. Only people and group chats you approve can message me, and everyone in an approved group can."
+        case "browser": "I browse in a window you can watch, and keep a record of what I looked at."
+        case "local_files": "Folders you have approved as workspaces, which I can search and read."
+        default: connector.description
+        }
+    }
+
     private func connectorActionPolicy(_ connector: ConnectorRecord) -> ConnectorRowActionPolicy {
         ConnectorRowActionPolicy.resolve(
             id: connector.id,
@@ -699,20 +727,8 @@ struct ConnectorsView: View {
 
 // MARK: - Page kit
 //
-// The page's own small vocabulary: an eyebrow over a run, the card a row or a
-// group of controls sits in, and the two quiet line shapes.
-
-struct ConnectorsSection<Content: View>: View {
-    let label: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(label)
-            content
-        }
-    }
-}
+// The page's own small vocabulary: the card a row or a group of controls sits
+// in, and the two quiet line shapes.
 
 struct ConnectorsCard<Content: View>: View {
     @ViewBuilder var content: Content
@@ -741,7 +757,7 @@ struct ConnectorsStatusPill: View {
                 .frame(width: 6, height: 6)
                 .accessibilityHidden(true)
             Text(text)
-                .font(.system(size: 12, weight: .medium))
+                .font(ShellType.rowDetail.weight(.medium))
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
         }

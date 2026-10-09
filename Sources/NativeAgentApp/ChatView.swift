@@ -33,9 +33,9 @@ let chatSessionDropTypes: [UTType] = [chatSessionDragType, .plainText]
 /// `@State` on ChatView. Every card layout pass then invalidated ChatView.body,
 /// and with it the whole transcript, which is why streaming got laggier.
 ///
-/// The height lives here instead. The card WRITES it; only the bottom-anchor
-/// spacer and the Latest pill READ it, each inside its own small view, so a card
-/// that grows mid-turn re-lays out those two and nothing else. ChatView.body
+/// The height lives here instead. The card WRITES it; only the Latest pill
+/// READS it, inside its own small modifier, so a card that grows mid-turn
+/// re-lays out the pill and nothing else. ChatView.body
 /// must never read `clearance` — that is the whole point of this type.
 @MainActor
 @Observable
@@ -85,47 +85,22 @@ final class ChatTurnCardClearance {
 }
 
 /// The transcript's bottom spacer: the scroll target, and the one gap between
-/// the last line and whatever floats under it. Its own view so the re-arm
-/// sentinel lands here and not in ChatView.body.
+/// the last line and whatever floats under it.
+///
+/// Its height is the margin and nothing else. The card and the composer are
+/// the scroll view's two bottom `safeAreaInset`s, and an inset already holds
+/// the content clear of itself — at rest and for `scrollTo(anchor: .bottom)`
+/// alike (measured 2026-10-07 on macOS 27: the spacer's bottom lands on the
+/// insets' top edge either way). Reserving the composer here as well counted
+/// it twice and left ~146pt of nothing above the chat box (User's 09-15
+/// "window of nothing", back in a smaller form).
 struct ChatTranscriptBottomAnchor: View {
     let anchorID: String
-    /// Read HERE and nowhere in ChatView.body: a card that grows mid-turn
-    /// re-lays out this spacer and leaves the transcript alone.
-    let store: ChatTurnCardClearance
     let onVisibilityChange: (Bool) -> Void
 
-    /// 2026-09-17: the two bottom `safeAreaInset`s hold the content clear of
-    /// themselves only where the scroll view comes to REST. A programmatic
-    /// `scrollTo(anchor: .bottom)` aligns this spacer's bottom to the scroll
-    /// view's FRAME bottom, which is below both insets, so every auto-follow
-    /// scroll drags the last bubble that far under the working card. Whether
-    /// that shows depends on whether the transcript has the scroll range to
-    /// be dragged — on a tall window a short thread has none and the card
-    /// looked fine; at 1280x800 it has, and the card's title wraps to a
-    /// second line on top of it, so the last user bubble ended up half
-    /// hidden. While a card is on screen the spacer covers what floats under
-    /// it; with no card it is the composer's own measured height plus that
-    /// gap — the flat margin only held while a card was on screen, so Latest,
-    /// switching conversations and opening a chat all dragged the newest
-    /// bubble under the composer. This is the rule the Latest pill already
-    /// uses, so the pill and the transcript clear the same box.
-    private var height: CGFloat {
-        store.showsCard
-            ? store.clearance
-            : store.idleClearance(floor: NativeAgentShellLayout.composerClearanceMargin)
-    }
-
     var body: some View {
-        // User, 2026-09-15: this used to be `store.clearance` — the card's
-        // height PLUS the composer's PLUS the margin. Both of those are the
-        // scroll view's two bottom `safeAreaInset`s, and an inset already
-        // holds the content clear of itself: measured at rest, the insets put
-        // the content bottom 192pt up and the spacer added 204pt more, so the
-        // last line sat 341pt above the chat box on a 1000pt window — User's
-        // "a third of the window of nothing". The spacer's only job is the gap
-        // between that last line and whatever floats under it.
         Color.clear
-            .frame(height: height)
+            .frame(height: NativeAgentShellLayout.composerClearanceMargin)
             .id(anchorID)
             // Re-arm sentinel: the spacer is in the viewport only when the
             // reader is at the bottom. In a plain VStack it always exists, so
@@ -134,8 +109,8 @@ struct ChatTranscriptBottomAnchor: View {
     }
 }
 
-/// The Latest pill's bottom inset. Same reason as the spacer above: the
-/// clearance read is confined to a modifier body.
+/// The Latest pill's bottom inset. The clearance read is confined to a
+/// modifier body.
 struct ChatTurnCardClearancePadding: ViewModifier {
     let store: ChatTurnCardClearance
     let idle: CGFloat
@@ -158,10 +133,9 @@ enum ChatViewportPresentation {
     }
 
     /// Agent, 2026-09-02: the thread scrolled under the glass composer and the
-    /// newest message sat half behind it. The transcript's bottom spacer IS
-    /// the scroll target (`scrollTo(bottomAnchor, anchor: .bottom)` aligns it
-    /// to the bottom of the scroll view's own frame, not to its safe area), so
-    /// the clearance has to cover whatever floats there. The old shell's
+    /// newest message sat half behind it. Only the Latest pill reads this
+    /// now: it is an `.overlay` aligned to the scroll view's own frame, not to
+    /// its safe area, so its clearance has to cover whatever floats there. The old shell's
     /// composer fitted inside the 80pt turn-card floor; the new shell's — a
     /// 16pt input, a control row and a 24pt bottom margin — does not.
     ///
@@ -169,7 +143,7 @@ enum ChatViewportPresentation {
     /// margin is the gap left above it.
     ///
     /// 2026-09-14: the card and the composer are TWO stacked bottom
-    /// `safeAreaInset`s, so the spacer must cover BOTH — hence a sum, not a
+    /// `safeAreaInset`s, so the pill must clear BOTH — hence a sum, not a
     /// max. a76fa0fa7 dropped the composer from this sum because the composer
     /// was a `safeAreaBar` at the time and "the safeAreaBar clears it"; three
     /// commits later 241c8baa4 put the composer back to a plain inset for
@@ -376,6 +350,8 @@ struct ChatSidebarSessionRowIdentity: Hashable, Sendable {
 struct ChatTurnCardInset: View {
     @Environment(AppModel.self) var appModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Simple view has no Work pane, so its card keeps the thumbnail.
+    @Environment(\.chatHidesConversationList) private var hidesConversationList
     let store: ChatTurnCardClearance
 
     var body: some View {
@@ -385,7 +361,10 @@ struct ChatTurnCardInset: View {
                 // detached window composes this exact host.
                 // No Stop here: the composer's Stop, in the send slot, is
                 // the one stop control (2026-09-23).
-                MacChatTurnCardHost(sessionId: appModel.activeChatSessionId)
+                MacChatTurnCardHost(
+                    sessionId: appModel.activeChatSessionId,
+                    onOpenScreen: hidesConversationList ? nil : { WorkPaneState.shared.userShow(.screen) }
+                )
                 // User, 2026-09-03: the working card shares the
                 // composer's frame, edge to edge.
                 .padding(.horizontal, NativeAgentShellLayout.roomGutter)
@@ -406,7 +385,7 @@ struct ChatTurnCardInset: View {
         )
         // The reservation is whatever this actually drew. The write
         // goes to the observable, which ChatView.body does not read,
-        // so measuring the card costs the spacer a relayout and
+        // so measuring the card costs the Latest pill a relayout and
         // costs the transcript nothing.
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
             store.measuredHeight = height
@@ -464,6 +443,10 @@ struct ChatView: View {
     @Environment(\.chatPageIsVisible) var chatPageIsVisible
     /// Simple view shows this page without its conversation list (SimpleViewMode).
     @Environment(\.chatHidesConversationList) var hidesConversationList
+    /// ⌘0: the conversations column goes with the rail (WorkPane.swift).
+    @AppStorage(WorkPaneState.sidebarsHiddenKey) var sidebarsHidden = false
+    /// The Work pane beside the chat; main window only, so never in Simple.
+    @AppStorage(WorkPaneState.openKey) var workPaneOpen = false
     /// The conversation list's travelling selection bar (ChatView+ShellColumn).
     @Namespace var shellConversationBar
     /// The inline cards of the open conversation, read back from the
@@ -578,7 +561,7 @@ struct ChatView: View {
     /// size -> bar height) that pinned the main thread at 99%.
     ///
     /// User, 2026-09-13: this is deliberately NOT `@State` on ChatView. The card
-    /// writes it and only the bottom-anchor spacer and the Latest pill read it,
+    /// writes it and only the Latest pill reads it,
     /// so a card layout pass no longer re-runs this body and the transcript
     /// under it. Nothing in ChatView.body may read `.clearance`.
     @State var turnCardClearanceStore = ChatTurnCardClearance()
@@ -608,9 +591,9 @@ struct ChatView: View {
     // Sprint 3.3 — screen capture
     @State var isCapturing = false
     @State var toasts = ChatToastQueue()
-    // Slow-turn advisories belong to the conversation viewport, not the
-    // app-wide bottom toast lane. A dedicated center preserves the shared
-    // visual/dismiss behavior while letting the message area own placement.
+    // Slow-turn advisories belong to this conversation: a dedicated center
+    // lets a session switch or a finished turn clear them without touching
+    // app-wide toasts. Both draw in the one notice lane (NoticeLaneRoomKey).
     @StateObject var turnNoticeToasts = SystemToastCenter()
     // N34: FocusState so we can refocus the text field after slash-command insertion.
     @FocusState var inputFocused: Bool
@@ -640,7 +623,6 @@ struct ChatView: View {
     /// A session is primed from its already-loaded transcript once. Until then
     /// auto-read must not mistake old history for a newly appended reply.
     @State var autoReadPrimedSessionIds: Set<String> = []
-    @State var pinnedSessionDropTargeted = false
     /// D1: `hasAnyUsableProvider()` stats credential files on disk, so it must
     /// not be called from `body` (which re-runs at token rate). Cached here and
     /// refreshed at the three moments the answer can change for this view:
@@ -780,8 +762,34 @@ struct ChatView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            if !hidesConversationList { shellConversationsColumn }
+            if !hidesConversationList && !sidebarsHidden { shellConversationsColumn }
             chatColumn
+                // The chat gives the pane its width down to this floor (the
+                // detached window's); past it the pane narrows instead.
+                .frame(minWidth: 380)
+                .modifier(ChatAttachmentDropTarget(
+                    isEnabled: chatPageIsVisible,
+                    contentTypes: ChatComposerSupport.attachmentContentTypes + chatSessionDropTypes,
+                    onDrop: { providers in
+                        let attachments = providers.filter { provider in
+                            ChatComposerSupport.attachmentContentTypes.contains {
+                                provider.hasItemConformingToTypeIdentifier($0.identifier)
+                            }
+                        }
+                        guard !attachments.isEmpty else {
+                            return handlePinnedSessionDrop(providers: providers)
+                        }
+                        handleDrop(providers: attachments)
+                        return true
+                    }
+                ))
+            if !hidesConversationList && workPaneOpen {
+                WorkPane()
+                    .layoutPriority(1)
+                    .transition(NativeAgentMotion.fade)
+            }
+            // The offscreen copy a quiet read mounts never opens the pane.
+            if !hidesConversationList && !quietOffscreenRead { WorkPaneAutoOpen() }
             // D4: the three token-rate read-aloud triggers used to hang off
             // THIS view's modifier chain, so every streamed delta re-evaluated
             // `chatMessages.last?.content` alongside the whole root body (and
@@ -1027,7 +1035,7 @@ struct ChatView: View {
                         // end of every update, forever, with no app code on
                         // the stack. A VStack has no prefetch; long threads
                         // are windowed (ChatMessageListView.windowSize).
-                        ChatTranscriptStack(alignment: .leading, spacing: 12) {
+                        ChatTranscriptStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
                             if appModel.chatMessages.isEmpty {
                                 switch ChatEmptyStateMode.mode(
                                     hasUsableProvider: hasUsableProvider
@@ -1072,17 +1080,23 @@ struct ChatView: View {
                                 // transcript owner, including search row IDs and
                                 // selected-result highlighting.
                                 transcriptList
+                                    .environment(\.troubleCardOwnsRetry, true)
                                 // ui-simplify 2026-09-02: one orange card, in
                                 // the room, saying what happened AND what did
-                                // not. The queue behind the composer already
-                                // holds the message; this is the sentence that
-                                // tells the person so.
-                                if shellHasTrouble {
+                                // not. Fluid glass: it says what the failed
+                                // turn provably did, and carries the Retry.
+                                if let tail = ChatTurnFailure.read(appModel.chatMessages) {
                                     ShellTroubleCard(
+                                        message: tail.message,
+                                        failure: tail.failure,
                                         showsStuckLink: ChatShellTroubleState
                                             .showsStuckLink(appModel.chatMessages),
-                                        showsNothingSentLine: !ChatShellTroubleState
-                                            .tailTurnDispatchedTools(appModel.chatMessages),
+                                        onRetry: {
+                                            Task { await appModel.regenerateAssistantMessage(tail.message) }
+                                        },
+                                        onContinue: {
+                                            Task { await appModel.continueFailedTurn(tail.message) }
+                                        },
                                         onOpenSettings: {
                                             inlineCards.openPage(.settings)
                                         }
@@ -1094,10 +1108,7 @@ struct ChatView: View {
                             // target, which padding below the anchor would not
                             // be. Its height is the spacer's own business —
                             // see ChatTranscriptBottomAnchor.
-                            ChatTranscriptBottomAnchor(
-                                anchorID: bottomAnchor,
-                                store: turnCardClearanceStore
-                            ) { visible in
+                            ChatTranscriptBottomAnchor(anchorID: bottomAnchor) { visible in
                                 scrollCoordinator.setBottomSpacerVisible(visible)
                             }
                         }
@@ -1115,6 +1126,18 @@ struct ChatView: View {
                         .padding(.trailing, NativeAgentShellLayout.roomTrailingInset)
                         .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
                     }
+                    // Fluid glass, switching conversations: each conversation
+                    // gets its own scroll view, and a new scroll view starts
+                    // at its bottom (`.initialOffset` below) on its first
+                    // layout pass. The old one used to be reused, so the new
+                    // chat was drawn at the old chat's offset and then chased
+                    // to the bottom by scroll commands for up to 3 s. The old
+                    // transcript stays up until the new one is laid out where
+                    // it rests; then the old goes in that frame and the new
+                    // fades in, so two transcripts never draw over each other.
+                    .id(appModel.activeChatSessionId)
+                    .transition(NativeAgentMotion.fadeIn)
+                    .defaultScrollAnchor(.bottom, for: .initialOffset)
                     // User, 2026-09-03: the hand-rolled top fade is gone. macOS
                     // 26 does this natively and better — it blurs and drops the
                     // opacity of what passes under the chrome instead of only
@@ -1148,11 +1171,6 @@ struct ChatView: View {
                             scrollCoordinator.disarmFollow()
                         }
                     )
-                    .onDrop(
-                        of: chatSessionDropTypes,
-                        isTargeted: $pinnedSessionDropTargeted,
-                        perform: handlePinnedSessionDrop
-                    )
                     .background(
                         ScrollWheelCatcher(isActive: chatPageIsVisible) { deltaY in
                             switch ChatViewportPresentation.scrollFollowAction(
@@ -1167,11 +1185,19 @@ struct ChatView: View {
                                 // follow (standard chat UX — the user's catch
                                 // 2026-06-12: once follow disarmed, streaming
                                 // grew below the fold and only the small
-                                // "Latest" pill could recover it). Snap flush
-                                // so the next delta continues from the bottom.
-                                transcriptLatestRequest &+= 1
+                                // "Latest" pill could recover it). Fluid
+                                // glass: no snap. The reader is already at
+                                // the bottom and still scrolling; a forced
+                                // jump here moved the transcript under them
+                                // as the pill left. Paged back to an earlier
+                                // page, its bottom is not the live one: ask
+                                // for the latest page, which clears the anchor
+                                // and scrolls there, or replies would stream
+                                // in off the page.
+                                if scrollCoordinator.transcriptPagedBack {
+                                    transcriptLatestRequest &+= 1
+                                }
                                 scrollCoordinator.forceFollow()
-                                scrollToBottom(proxy, animated: false, delay: 0, force: true)
                             case .none:
                                 break
                             }
@@ -1182,48 +1208,51 @@ struct ChatView: View {
                     // over the transcript and the transcript scrolls under it,
                     // which is the only arrangement the scroll edge effect
                     // above can act on.
-                    // Simple view: no sheet; the transcript is alpha-masked so
-                    // lines dissolve before the header (`roomTopChrome`).
-                    .roomTopChrome(masked: hidesConversationList) {
+                    // The transcript is alpha-masked so lines dissolve before
+                    // the header (`roomTopChrome`); Simple has no sheet.
+                    .roomTopChrome {
                         VStack(spacing: 0) {
-                            // ui-simplify 2026-09-02 (Lane A): her name in
-                            // the rounded display face and ONE status dot.
-                            // Simple drops the posture line: the composer
-                            // already says it.
-                            ShellRoomHeader(
-                                name: appModel.agentDisplayName,
-                                status: shellStatus,
-                                trustPolicy: appModel.engine.trust.policy,
-                                showsPosture: !hidesConversationList,
-                                onNewChat: hidesConversationList
-                                    ? { Task { await appModel.newChatSession() } }
-                                    : nil
-                            )
-                            // Agent, 2026-09-03: with the transcript
-                            // running under it the header needs material.
-                            // User, 2026-09-03: and that material is the
-                            // window's one sheet, not a plate of its own —
-                            // the same glass and coat as the room, reaching
-                            // the window's top edge because the transcript
-                            // runs through the title strip too. Words
-                            // dissolve into it under the soft edge.
-                            // Agent, 2026-09-03: the header keeps its own
-                            // sheet. Behind-window material composites the
-                            // desktop, not the layers under it, so this is
-                            // the same glass as the window's, not a second
-                            // coat — and without it a faded line of the
-                            // transcript sat above her name in the title
-                            // strip on every scroll (fcab4f85).
-                            .background {
-                                // Simple: no sheet here; over the haze it
-                                // read as a lighter band with a seam.
-                                if !hidesConversationList {
-                                    ShellSheet()
-                                        .ignoresSafeArea(edges: .top)
+                            // Fluid glass A2: the inbox strip hands the
+                            // header its unread notes as one capsule; other
+                            // chats' approvals and cards stay below it.
+                            InboxStripContainer { notes in
+                                // ui-simplify 2026-09-02 (Lane A): her name in
+                                // the rounded display face and ONE status dot.
+                                // The posture line is the composer's to say.
+                                ShellRoomHeader(
+                                    name: appModel.agentDisplayName,
+                                    status: shellStatus,
+                                    onNewChat: hidesConversationList
+                                        ? { Task { await appModel.newChatSession() } }
+                                        : nil,
+                                    notes: notes,
+                                    work: hidesConversationList ? nil : WorkPaneHeaderButton()
+                                )
+                                // Agent, 2026-09-03: with the transcript
+                                // running under it the header needs material.
+                                // User, 2026-09-03: and that material is the
+                                // window's one sheet, not a plate of its own —
+                                // the same glass and coat as the room, reaching
+                                // the window's top edge because the transcript
+                                // runs through the title strip too. Words
+                                // dissolve into it under the soft edge.
+                                // Agent, 2026-09-03: the header keeps its own
+                                // sheet. Behind-window material composites the
+                                // desktop, not the layers under it, so this is
+                                // the same glass as the window's, not a second
+                                // coat — and without it a faded line of the
+                                // transcript sat above her name in the title
+                                // strip on every scroll (fcab4f85).
+                                .background {
+                                    // Simple: no sheet here; over the haze it
+                                    // read as a lighter band with a seam.
+                                    if !hidesConversationList {
+                                        ShellSheet()
+                                            .ignoresSafeArea(edges: .top)
+                                    }
                                 }
                             }
-                            InboxStripContainer()
-                                .environment(appModel)
+                            .environment(appModel)
                             if showTranscriptSearch {
                                 MacChatTranscriptSearchBar(
                                     controller: transcriptSearch,
@@ -1234,6 +1263,11 @@ struct ChatView: View {
                                     reduceMotion ? NativeAgentMotion.fade : NativeAgentMotion.reveal(anchor: .top)
                                 )
                             }
+                        }
+                        // The one notice lane hangs under this chrome while
+                        // the chat is in front (ContentView draws it).
+                        .anchorPreference(key: NoticeLaneRoomKey.self, value: .bounds) {
+                            chatPageIsVisible ? NoticeLaneRoom(anchor: $0, notices: turnNoticeToasts) : nil
                         }
                     }
                     .overlay(alignment: .bottomTrailing) { latestPillOverlay(proxy) }
@@ -1293,41 +1327,20 @@ struct ChatView: View {
                         showTranscriptSearch = false
                         transcriptSearch.reset(for: appModel.activeChatSessionId)
                         turnNoticeToasts.dismissAll()
-                        transcriptLatestRequest &+= 1
                         scrollCoordinator.forceFollow()
                         renameTitle = activeSession?.title ?? ""
-                        scrollToBottom(proxy, animated: false, delay: 0.05, force: true)
                     }
-                    // session-switch scroll fix 2026-05-23: activeChatSessionId
-                    // flips IMMEDIATELY (sync) but chatMessages is loaded
-                    // async by selectChatSession (network round-trip), so the
-                    // scroll above lands on an empty LazyVStack. When the
-                    // first message id changes, content has actually swapped
-                    // — force a scroll with enough delay for the LazyVStack
-                    // to lay out the new messages.
+                    // Fluid glass: the 0.12 / 0.5 / 1.4 / 3 s scroll ladder
+                    // that used to run here was the late jump. It chased a
+                    // LazyVStack that laid out after the first scroll (the
+                    // transcript has been a VStack since 09-04) and images
+                    // that grew after the words (the `.sizeChanges` bottom
+                    // anchor holds the bottom through any growth since
+                    // 09-13), so all it still did was move the view seconds
+                    // after it had settled.
                     .onChange(of: appModel.chatMessages.first?.id) { _, _ in
                         primeAutoReadForCurrentSessionIfNeeded()
-                        if showTranscriptSearch {
-                            refreshTranscriptSearchIfPresented()
-                        } else {
-                            // User, 2026-09-02, "the chat is blank": on a cold
-                            // launch a long thread's LazyVStack lays out after
-                            // the first scroll lands, and the viewport parks
-                            // on nothing until the person scrolls. Late
-                            // settles cover the layout, and the last one
-                            // covers images, which load after the words and
-                            // push the bottom down.
-                            // 2026-09-06: one ladder, one serial. As four
-                            // separate forced calls each cancelled the one
-                            // before it, so only the three-second settle ever
-                            // ran — and it ran even if the reader had scrolled
-                            // up in the meantime.
-                            scrollCoordinator.scrollToBottomSettles(
-                                proxy,
-                                bottomAnchor: bottomAnchor,
-                                delays: [0.12, 0.5, 1.4, 3.0]
-                            )
-                        }
+                        refreshTranscriptSearchIfPresented()
                     }
                     // Layout growth above owns follow, including late wraps,
                     // images and card resizing. Only an open search needs to
@@ -1471,107 +1484,77 @@ struct ChatView: View {
 
                 // PATCH-2026-05-09: chat-ux-polish — polished composer area
                 VStack(spacing: NativeAgentSpacing.xs) {
-                    ChatQueuedTurnsView(
-                        sessionId: appModel.activeChatSessionId,
-                        isBusy: appModel.isBusy || appModel.isChatStreaming
-                    )
-                    .frame(maxWidth: NativeAgentLayout.maxReadableChatWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal)
-
-                    // Attachment thumbnail strip
-                    if !pendingAttachments.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: NativeAgentSpacing.sm) {
-                                ForEach(pendingAttachments) { att in
-                                    AttachmentChip(attachment: att) {
-                                        pendingAttachments.removeAll { $0.id == att.id }
-                                    }
-                                }
-                            }
-                            .padding(.horizontal)
-                        }
-                        if pendingAttachments.count >= 2 {
-                            Text("\(appModel.agentDisplayName) will treat these as one combined input.")
-                                .font(NativeAgentFont.tag)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal)
-                        }
-                    }
-
-                    // PATCH-2026-05-13: parallel-sessions — banner now counts
-                    // OTHER sessions still streaming. With per-session state,
-                    // the user can keep typing here while N background sessions
-                    // run; this banner is just a friendly nudge.
-                    MacChatOtherSessionsBanner(
-                        otherRunning: appModel.otherRunningChatSessionIDs,
-                        routes: runningSessionRoutes,
-                        onGoTo: goToRunningSession,
-                        onStop: { appModel.stopChatStream(sessionId: $0) }
-                    )
-
                     // Toast
                     if let toast = ChatComposerBottomToastPresentation.visibleEntry(from: toasts) {
-                        Text(toast)
-                            .font(NativeAgentFont.tag)
-                            .foregroundStyle(.secondary)
+                        NoticePill(text: toast)
                             .padding(.horizontal)
                             .transition(NativeAgentMotion.fade)
                             .accessibilityIdentifier("chat.composer.bottom-toast")
                     }
 
-                    // PATCH-2026-05-09: nextgen-surface — suggested action chips above composer
-                    if appModel.nextGenSummary != nil {
-                        NextGenActionChipsRow(appModel: appModel)
-                            .frame(maxWidth: NativeAgentLayout.maxReadableChatWidth)
-                            .frame(maxWidth: .infinity)
-                            .padding(.horizontal)
-                            .transition(NativeAgentMotion.reveal(anchor: .bottom))
-                    }
-
                     let screenCaptureAllowed = appModel.engine.trust.policy?.multimodalPolicy?.screen_capture == true
                     let activeSessionIsRunning = appModel.isBusy || appModel.isChatStreaming
 
-                    // User, 2026-09-13: the text field and everything that reads
-                    // the in-progress text live in this child, so a keystroke
-                    // invalidates it and nothing else. Inlined here, the read
-                    // of `text` for `canSend` made every character re-run this
-                    // whole body — transcript diff, bubbles and session list.
-                    ChatComposerInput(
-                        draft: draft,
-                        placeholder: shellComposerPlaceholder,
-                        recipient: hidesConversationList ? appModel.agentAddressName : nil,
-                        voiceInput: voiceInput,
-                        capabilitiesStore: capabilitiesStore,
-                        voiceSessionId: voiceSessionId,
-                        activeSessionId: appModel.activeChatSessionId,
-                        screenCaptureAllowed: screenCaptureAllowed,
-                        screenCaptureDisabled: activeSessionIsRunning || isCapturing || !screenCaptureAllowed,
-                        pendingAttachmentCount: pendingAttachments.count,
-                        hasPendingAttachments: !pendingAttachments.isEmpty,
-                        isRunning: activeSessionIsRunning,
-                        hasQueuedTurns: !appModel.engine.turns.queued(for: appModel.activeChatSessionId).isEmpty,
-                        isQueuePaused: appModel.engine.turns.isQueuePaused(appModel.activeChatSessionId),
-                        isCapturing: isCapturing,
-                        // Sol, 2026-09-15: a turn sent while the routing write
-                        // is still in flight can consume the previous snapshot.
-                        isRoutingSaving: appModel.isSavingChatBrain,
-                        inputFocused: $inputFocused,
-                        onToggleVoice: toggleVoice,
-                        onCaptureScreen: captureScreen,
-                        onAttach: attachFromClipboardOrPickFile,
-                        onStop: { appModel.stopChatStream() },
-                        onSend: send,
-                        onSlashCommand: { handleSlashCommand($0) },
-                        onDrop: { handleDrop(providers: $0) },
-                        onToast: { showToast($0) },
-                        composeVoiceDraft: { composeVoiceDraft($0) }
-                    )
-                    // The composer publishes an open card's height here so the
-                    // Latest pill can clear it. Optional in the environment, so
-                    // the detached panel and the snapshot hosts are untouched.
-                    .environment(turnCardClearanceStore)
-                    .environment(composerCardState)
+                    // Fluid glass A2: the tray (queued sends, attachments,
+                    // other running chats, suggested actions) and the composer
+                    // are one glass object — one container, so the tray fuses
+                    // to the composer's top edge and morphs as items come and
+                    // go — at one width, the room column.
+                    GlassEffectContainer(spacing: ChatComposerTray.gap * 2) {
+                        VStack(spacing: 0) {
+                            ChatComposerTray(
+                                sessionId: appModel.activeChatSessionId,
+                                isBusy: activeSessionIsRunning,
+                                attachments: pendingAttachments,
+                                onRemoveAttachment: { id in pendingAttachments.removeAll { $0.id == id } },
+                                otherRunning: appModel.otherRunningChatSessionIDs,
+                                routes: runningSessionRoutes,
+                                onGoTo: goToRunningSession,
+                                onStop: { appModel.stopChatStream(sessionId: $0) }
+                            )
+
+                            // User, 2026-09-13: the text field and everything that reads
+                            // the in-progress text live in this child, so a keystroke
+                            // invalidates it and nothing else. Inlined here, the read
+                            // of `text` for `canSend` made every character re-run this
+                            // whole body — transcript diff, bubbles and session list.
+                            ChatComposerInput(
+                                draft: draft,
+                                placeholder: shellComposerPlaceholder,
+                                isActive: chatPageIsVisible,
+                                recipient: hidesConversationList ? appModel.agentAddressName : nil,
+                                voiceInput: voiceInput,
+                                capabilitiesStore: capabilitiesStore,
+                                voiceSessionId: voiceSessionId,
+                                activeSessionId: appModel.activeChatSessionId,
+                                screenCaptureAllowed: screenCaptureAllowed,
+                                screenCaptureDisabled: activeSessionIsRunning || isCapturing || !screenCaptureAllowed,
+                                pendingAttachmentCount: pendingAttachments.count,
+                                hasPendingAttachments: !pendingAttachments.isEmpty,
+                                isRunning: activeSessionIsRunning,
+                                hasQueuedTurns: !appModel.engine.turns.queued(for: appModel.activeChatSessionId).isEmpty,
+                                isQueuePaused: appModel.engine.turns.isQueuePaused(appModel.activeChatSessionId),
+                                isCapturing: isCapturing,
+                                // Sol, 2026-09-15: a turn sent while the routing write
+                                // is still in flight can consume the previous snapshot.
+                                isRoutingSaving: appModel.isSavingChatBrain,
+                                inputFocused: $inputFocused,
+                                onToggleVoice: toggleVoice,
+                                onCaptureScreen: captureScreen,
+                                onAttach: attachFromClipboardOrPickFile,
+                                onStop: { appModel.stopChatStream() },
+                                onSend: send,
+                                onSlashCommand: { handleSlashCommand($0) },
+                                onDrop: { handleDrop(providers: $0) },
+                                composeVoiceDraft: { composeVoiceDraft($0) }
+                            )
+                            // The composer publishes an open card's height here so the
+                            // Latest pill can clear it. Optional in the environment, so
+                            // the detached panel and the snapshot hosts are untouched.
+                            .environment(turnCardClearanceStore)
+                            .environment(composerCardState)
+                        }
+                    }
                     // Cap the composer width and center it on the chat column
                     // instead of spanning the whole window; it still grows
                     // upward via the TextField's 1...5 lineLimit.
@@ -1589,7 +1572,7 @@ struct ChatView: View {
                 // The reservation is whatever the composer actually drew, the
                 // same way the card above measures itself. The write goes to
                 // the observable, which ChatView.body does not read, so this
-                // costs the bottom spacer a relayout and the transcript
+                // costs the Latest pill a relayout and the transcript
                 // nothing — which is what makes measuring safe here after
                 // a76fa0fa7.
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
@@ -1605,13 +1588,6 @@ struct ChatView: View {
                     columnWidth: NativeAgentShellLayout.roomColumn,
                     leadingInset: NativeAgentShellLayout.roomLeadingInset
                 )
-                }
-                // The slow-turn advisory is centered against the conversation
-                // viewport itself. It floats at the top of the message area,
-                // so resizing the split view/window keeps it centered and it
-                // never covers the composer or changes transcript layout.
-                .overlay(alignment: .top) {
-                    SystemToastBar(center: turnNoticeToasts, placement: .top)
                 }
                 // The composer's settings card. It is drawn HERE, after both
                 // safe-area insets, because a card offset up out of the
@@ -1639,11 +1615,6 @@ struct ChatView: View {
         }
         // The window's sheet (ShellFrame) is the ground.
         .contentShape(Rectangle())
-        .onDrop(
-            of: chatSessionDropTypes,
-            isTargeted: $pinnedSessionDropTargeted,
-            perform: handlePinnedSessionDrop
-        )
         // PATCH-2026-06-06: chat-upgrades — bump the scroll-serial on disappear
         // so any in-flight DispatchQueue.main.asyncAfter scroll closures bail
         // out through the scroll coordinator serial check. Belt-and-braces
@@ -1770,6 +1741,12 @@ private struct TranscriptChangeRefresh: ViewModifier {
             .receive(on: DispatchQueue.main)) { note in
             guard let changed = note.object as? String, changed == appModel.activeChatSessionId else { return }
             Task { await appModel.refreshChatMessagesAfterTurn(sessionId: changed) }
+        }
+        // ...and while a turn from another door is working, the card says so,
+        // including one already running when a conversation is opened.
+        .task { OtherDoorTurns.shared.start(appModel) }
+        .onChange(of: appModel.activeChatSessionId, initial: true) { _, sessionId in
+            OtherDoorTurns.shared.show(sessionId, appModel)
         }
     }
 }

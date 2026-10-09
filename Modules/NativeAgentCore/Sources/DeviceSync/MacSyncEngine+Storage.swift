@@ -125,7 +125,7 @@ extension MacSyncEngine {
             messages.append(
                 "\(markers.count) iPhone command(s) completed but could not be filed; they will not be run again."
             )
-            NSLog("[MacSyncEngine] loaded %d completed-but-unarchived marker(s): %@",
+            nativeLog("[MacSyncEngine] loaded %d completed-but-unarchived marker(s): %@",
                   markers.count, markers.joined(separator: ", "))
         }
 
@@ -143,7 +143,7 @@ extension MacSyncEngine {
             for id in ids where !stored.contains(id) { merged.append(id) }
             return (merged, false, messages.isEmpty ? nil : messages.joined(separator: " "))
         } catch {
-            NSLog("[MacSyncEngine] processed_ids.json UNREADABLE (%@) — keeping %d in-memory id(s); not trusting the empty read",
+            nativeLog("[MacSyncEngine] processed_ids.json UNREADABLE (%@) — keeping %d in-memory id(s); not trusting the empty read",
                   error.localizedDescription, ids.count)
             // Preserve the bytes before any later save overwrites them: this is
             // both the recovery evidence and the durable signal Doctor reports.
@@ -181,7 +181,7 @@ extension MacSyncEngine {
             try data.write(to: url, options: .atomic)
             return true
         } catch {
-            NSLog("[MacSyncEngine] processed_ids.json save FAILED: %@", error.localizedDescription)
+            nativeLog("[MacSyncEngine] processed_ids.json save FAILED: %@", error.localizedDescription)
             return false
         }
     }
@@ -218,7 +218,7 @@ extension MacSyncEngine {
             try data.write(to: url, options: .atomic)
             return true
         } catch {
-            NSLog("[MacSyncEngine] could not write completed-unarchived marker for %@: %@",
+            nativeLog("[MacSyncEngine] could not write completed-unarchived marker for %@: %@",
                   msgId, error.localizedDescription)
             return false
         }
@@ -263,7 +263,7 @@ extension MacSyncEngine {
         let message = marked
             ? "Command \(msgId) finished but its completion record could not be filed (\(reason)). It is marked completed and will not run again."
             : "Command \(msgId) finished but NEITHER its completion record NOR the fallback marker could be written (\(reason)). It could run again on restart — free disk space and check iCloud permissions."
-        NSLog("MacSyncEngine.commitCompletionBookkeeping: %@", message)
+        nativeLog("MacSyncEngine.commitCompletionBookkeeping: %@", message)
         return CompletionCommit(
             clean: false,
             markerWritten: marked,
@@ -417,7 +417,7 @@ extension MacSyncEngine {
                 in: transactionDir,
                 validatedID: id
               ) else {
-            NSLog("[MacSyncEngine] Refused transaction write for invalid remote id")
+            nativeLog("[MacSyncEngine] Refused transaction write for invalid remote id")
             return false
         }
         let now = ISO8601DateFormatter().string(from: Date())
@@ -437,14 +437,14 @@ extension MacSyncEngine {
             case .missing:
                 existing = nil
             case .failed:
-                NSLog("[MacSyncEngine] Ledger row for %@ unreadable; left intact rather than overwritten", id)
+                nativeLog("[MacSyncEngine] Ledger row for %@ unreadable; left intact rather than overwritten", id)
                 return false
             case .data(let data):
                 guard let decoded = try? JSONDecoder().decode(
                     ICloudTransactionRecord.self,
                     from: data
                 ) else {
-                    NSLog("[MacSyncEngine] Ledger row for %@ did not decode; left intact rather than overwritten", id)
+                    nativeLog("[MacSyncEngine] Ledger row for %@ did not decode; left intact rather than overwritten", id)
                     return false
                 }
                 existing = decoded
@@ -468,7 +468,7 @@ extension MacSyncEngine {
             return Self.coordinatedWrite(data: data, to: url)
         }.value
         if !wrote {
-            NSLog("[MacSyncEngine] Transaction ledger write failed for %@ (state %@)", id, state)
+            nativeLog("[MacSyncEngine] Transaction ledger write failed for %@ (state %@)", id, state)
         }
         return wrote
     }
@@ -555,12 +555,12 @@ extension MacSyncEngine {
                 try data.write(to: writeURL, options: .atomic)
                 wrote = true
             } catch {
-                NSLog("[MacSyncEngine] coordinated write failed for %@: %@",
+                nativeLog("[MacSyncEngine] coordinated write failed for %@: %@",
                       writeURL.lastPathComponent, String(describing: error))
             }
         }
         if let coordError {
-            NSLog("[MacSyncEngine] file coordination failed for %@: %@",
+            nativeLog("[MacSyncEngine] file coordination failed for %@: %@",
                   url.lastPathComponent, coordError.localizedDescription)
             return false
         }
@@ -831,7 +831,7 @@ extension MacSyncEngine {
             } catch {
                 if isNoSuchFileError(error) { return true }
                 failed = true
-                NSLog("[MacSyncEngine] Archive cleanup failed for %@: %@", url.lastPathComponent, error.localizedDescription)
+                nativeLog("[MacSyncEngine] Archive cleanup failed for %@: %@", url.lastPathComponent, error.localizedDescription)
                 return false
             }
         }

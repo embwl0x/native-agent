@@ -95,6 +95,21 @@ extension InboxItemRecord {
             hasLinkedApproval: hasLinkedApproval
         )
     }
+
+    /// The badge said as a word: "MORNING-BRIEF" is "Morning brief".
+    var sourceWord: String {
+        let label = sourceBadgeLabel
+        guard label != "REM" else { return label }
+        let words = label.replacingOccurrences(of: "-", with: " ").lowercased()
+        return words.prefix(1).uppercased() + words.dropFirst()
+    }
+
+    /// "Idea · Actionable" over the detail sheet's title.
+    var detailEyebrow: String {
+        let level = severity.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !level.isEmpty, level.lowercased() != "info" else { return sourceWord }
+        return "\(sourceWord) · \(AdvancedStatusWords.label(level))"
+    }
 }
 
 /// Canonical, bounded source-to-badge projection used by every Inbox item.
@@ -296,86 +311,41 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
     }
 }
 
-// MARK: - Compact inbox strip (shown above chat messages)
+// MARK: - Notes capsule (fluid glass A2: one notice lane)
 
-/// The compact strip is deliberately a projection of the unread set, rather
-/// than two independently filtered collections. That makes the visible cards
-/// and the overflow badge account for the same bounded result.
-struct InboxStripDisplay: Equatable {
-    static let visibleLimit = 3
-
-    let visibleItems: [InboxItemRecord]
-    let overflowCount: Int
-    let unreadCount: Int
-
-    init(items: [InboxItemRecord]) {
-        let unreadItems = items.filter(\.isUnread)
-        unreadCount = unreadItems.count
-        visibleItems = Array(unreadItems.prefix(Self.visibleLimit))
-        overflowCount = max(0, unreadCount - visibleItems.count)
-    }
-
-    var isQuiet: Bool { unreadCount == 0 }
-}
-
-struct InboxStripView: View {
+/// Unread notes as one small glass capsule in the chat header, shown only
+/// while something is unread. It opens a list, newest first; a row opens the
+/// note's detail and its actions. Nothing stacks over the transcript.
+struct InboxNotesCapsule: View {
     let items: [InboxItemRecord]
     let onAction: @MainActor (String, String) async throws -> Void
 
+    @State private var showsList = false
     @State private var selectedItem: InboxItemRecord?
     @State private var actionFlight = InboxRowActionFlight()
-    /// User, 2026-10-04: out of the way, and it stays out of the way.
-    @AppStorage("chat.notesRowHidden") private var hidden = false
 
-    private var display: InboxStripDisplay {
-        InboxStripDisplay(items: items)
-    }
+    private static let rowHeight: CGFloat = 44
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if !display.isQuiet, hidden {
-                Button("\(display.unreadCount) \(display.unreadCount == 1 ? "note" : "notes") · Show") { hidden = false }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 4)
-            } else if !display.isQuiet {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(display.visibleItems) { item in
-                            InboxCardView(item: item) {
-                                selectedItem = item
-                            }
-                        }
-                        if display.overflowCount > 0 {
-                            Text("+\(display.overflowCount) more")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 6)
-                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-                        }
-                        // One click clears the row: every note here is marked read
-                        // and stays in Notifications, nothing is lost.
-                        Button("Clear") {
-                            let ids = items.filter(\.isUnread).map(\.id)
-                            Task { for id in ids { try? await onAction(id, "read") } }
-                        }
-                        .buttonStyle(.plain)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .help("Mark these read. They stay in Notifications.")
-                        Button("Hide") { hidden = true }
-                            .buttonStyle(.plain)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .help("Keep notes out of the way until you show them again.")
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 6)
+        // Newest first: the inbox already lists that way.
+        let unread = items.filter(\.isUnread)
+        ZStack {
+            if !unread.isEmpty {
+                Button { showsList.toggle() } label: {
+                    Text("\(unread.count) \(unread.count == 1 ? "update" : "updates")")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 2)
+                        .houseSurface(in: Capsule(), interactive: true)
+                }
+                .buttonStyle(.plain)
+                .help("Unread notes")
+                .accessibilityLabel("\(unread.count) unread \(unread.count == 1 ? "update" : "updates")")
+                .accessibilityIdentifier("chat.notes.capsule")
+                .transition(NativeAgentMotion.fade)
+                .popover(isPresented: $showsList, arrowEdge: .bottom) {
+                    list(unread)
                 }
             }
         }
@@ -393,54 +363,68 @@ struct InboxStripView: View {
             .presentationDetents([.medium, .large])
         }
     }
-}
 
-// MARK: - Single inbox card
-// PATCH-2026-05-07: polish-InboxView GlassCard tinted by severity, PulsingDot for unread
-
-struct InboxCardView: View {
-    let item: InboxItemRecord
-    let onTap: () -> Void
-
-    var body: some View {
-        Button(action: onTap) {
-            GlassCard(tint: item.severityColor) {
-                HStack(alignment: .top, spacing: 8) {
-                    ZStack {
-                        Image(systemName: item.sourceIcon)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(item.severityColor)
-                            .frame(width: 18)
-                            .padding(.top, 1)
-                        if item.isUnread {
-                            PulsingDot(color: item.severityColor, size: 6)
-                                .offset(x: 8, y: -6)
+    private func list(_ unread: [InboxItemRecord]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Updates")
+                    .font(ShellType.labelSemibold)
+                Spacer()
+                // Marked read, they stay in Notifications; nothing is lost.
+                Button("Mark all read") {
+                    showsList = false
+                    let ids = unread.map(\.id)
+                    Task { for id in ids { try? await onAction(id, "read") } }
+                }
+                .buttonStyle(.link)
+                .font(ShellType.label)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(unread) { item in
+                        Button {
+                            showsList = false
+                            // Let the popover close before the sheet opens.
+                            DispatchQueue.main.async { selectedItem = item }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: item.sourceIcon)
+                                    .foregroundStyle(item.severityColor)
+                                    .frame(width: 16)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.title)
+                                        .font(ShellType.labelSemibold)
+                                        .lineLimit(1)
+                                    Text(item.summary)
+                                        .font(ShellType.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 12)
+                            .frame(height: Self.rowHeight)
+                            .contentShape(Rectangle())
                         }
-                    }
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.title)
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(1)
-                            .foregroundStyle(.primary)
-
-                        Text(item.summary)
-                            .font(.caption2)
-                            .lineLimit(2)
-                            .foregroundStyle(.secondary)
+                        .buttonStyle(.plain)
                     }
                 }
-                .frame(width: 200, alignment: .leading)
             }
+            .frame(height: min(CGFloat(unread.count), 8) * Self.rowHeight)
         }
-        .buttonStyle(.naFeel)
-        .frame(width: 224)
+        .frame(width: 320)
     }
 }
 
 // MARK: - Detail sheet
-// PATCH-2026-05-07: polish-InboxView AuroraBackground + GlassCard header in detail sheet
 
+/// One note, read in full: what it is, what it says, the files and related
+/// notes it points at, and its actions along the bottom. The shell's type and
+/// the alive kit's cards on the sheet; a failed action is one line above the
+/// buttons, not an alert.
 struct InboxItemDetailSheet: View {
     let item: InboxItemRecord
     var allItems: [InboxItemRecord] = []
@@ -461,151 +445,118 @@ struct InboxItemDetailSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                AuroraBackground(colors: [item.severityColor, .purple])
-                    .opacity(0.12)
-                    .ignoresSafeArea()
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        // Header card
-                        GlassCard(tint: item.severityColor) {
-                            HStack(alignment: .top, spacing: 12) {
-                                Image(systemName: item.sourceIcon)
-                                    .font(.title2)
-                                    .foregroundStyle(item.severityColor)
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(item.title)
-                                        .font(NativeAgentFont.section)
-                                    Text(item.sourceBadgeLabel)
-                                        .font(NativeAgentFont.label)
-                                        .foregroundStyle(item.severityColor)
-                                }
-                                Spacer()
-                                StatusBadge(text: item.severity, status: item.severity == "actionable" ? "warn" : "info")
-                            }
-                        }
-
-                        NativePanel(tint: item.severityColor) {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text(item.summary)
-                                    .font(NativeAgentFont.body)
-                                    .foregroundStyle(.primary)
-
-                                if let detail = item.detail, !detail.isEmpty {
-                                    Text(detail)
-                                        .font(.callout)
-                                        .foregroundStyle(.secondary)
-                                        .padding(.top, 4)
-                                }
-                            }
-                        }
-
-                        if let paths = item.related_paths, !paths.isEmpty {
-                            NativePanel(title: "Related Files", systemImage: "doc.text", tint: .blue) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    ForEach(paths.prefix(5), id: \.self) { p in
-                                        Text(p)
-                                            .font(NativeAgentFont.mono)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-
-                        if let onOpenGroup, !relatedGroups.isEmpty {
-                            NativePanel(title: "Review Groups", systemImage: "tray.full", tint: item.severityColor) {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    ForEach(relatedGroups) { group in
-                                        Button {
-                                            onOpenGroup(group)
-                                            if closesOnGroupSelection { onClose() }
-                                        } label: {
-                                            HStack(spacing: 10) {
-                                                Image(systemName: "tray.full")
-                                                    .foregroundStyle(item.severityColor)
-                                                VStack(alignment: .leading, spacing: 2) {
-                                                    Text(group.title)
-                                                        .font(NativeAgentFont.label)
-                                                        .foregroundStyle(.primary)
-                                                        .multilineTextAlignment(.leading)
-                                                    Text("\(group.displayCount) item\(group.displayCount == 1 ? "" : "s")")
-                                                        .font(.caption2)
-                                                        .foregroundStyle(.secondary)
-                                                }
-                                                Spacer()
-                                                Image(systemName: "chevron.right")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.tertiary)
-                                            }
-                                            .padding(.horizontal, 10)
-                                            .padding(.vertical, 8)
-                                            .background(item.severityColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-                                        }
-                                        .buttonStyle(.naFeel)
-                                    }
-                                }
-                            }
-                        }
-
-                        // Action buttons
-                        if !visibleActions.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 10) {
-                                    ForEach(visibleActions, id: \.id) { action in
-                                        if isPrimaryAction(action.id) {
-                                            Button(action.label) {
-                                                perform(action.id, closesOnSuccess: true)
-                                            }
-                                            .buttonStyle(.borderedProminent)
-                                            .tint(.orange)
-                                            .disabled(isActing)
-                                        } else {
-                                            Button(action.label) {
-                                                perform(action.id, closesOnSuccess: true)
-                                            }
-                                            .buttonStyle(.bordered)
-                                            .disabled(isActing)
-                                        }
-                                    }
-                                }
-                            }
-                            .padding(.top, 8)
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                    VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                        AliveEyebrow(item.detailEyebrow)
+                        Text(item.title)
+                            .font(ShellType.title)
+                            .foregroundStyle(NativeAgentShell.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityAddTraits(.isHeader)
+                        Text(item.summary)
+                            .font(ShellType.body)
+                            .foregroundStyle(NativeAgentShell.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let detail = item.detail, !detail.isEmpty {
+                            Text(detail)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    .padding(20)
-                }
-            }
-            .navigationTitle("Inbox item")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    // `.onAppear` below already marks the item read when the
-                    // sheet opens; marking it again on Close double-fired the
-                    // read action for every sheet the user opened.
-                    Button("Close") { onClose() }
-                }
-            }
-        }
-        .onAppear { perform("read", closesOnSuccess: false) }
-        .alert(
-            "Inbox action failed",
-            isPresented: Binding(
-                get: { actionError != nil },
-                set: { if !$0 { actionError = nil } }
-            ),
-            actions: { Button("OK", role: .cancel) { actionError = nil } },
-            message: { Text(actionError ?? "") }
-        )
-    }
 
-    private func isPrimaryAction(_ actionID: String) -> Bool {
-        actionID == "act" || actionID == "approve" || actionID == "open_approvals" || actionID == "repair"
+                    if let paths = item.related_paths, !paths.isEmpty {
+                        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                            AliveEyebrow("Files")
+                            AliveGroupCard {
+                                ForEach(paths.prefix(5), id: \.self) { path in
+                                    Text(path)
+                                        .font(ShellType.code)
+                                        .foregroundStyle(NativeAgentShell.secondary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                        }
+                    }
+
+                    if let onOpenGroup, !relatedGroups.isEmpty {
+                        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                            AliveEyebrow("Related notes")
+                            AliveGroupCard {
+                                ForEach(relatedGroups) { group in
+                                    Button {
+                                        onOpenGroup(group)
+                                        if closesOnGroupSelection { onClose() }
+                                    } label: {
+                                        HStack(spacing: NativeAgentSpacing.sm) {
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(group.title)
+                                                    .font(ShellType.labelMedium)
+                                                    .foregroundStyle(NativeAgentShell.text)
+                                                    .multilineTextAlignment(.leading)
+                                                Text("\(group.displayCount) \(group.displayCount == 1 ? "note" : "notes")")
+                                                    .font(ShellType.caption)
+                                                    .foregroundStyle(NativeAgentShell.secondary)
+                                            }
+                                            Spacer(minLength: 0)
+                                            Image(systemName: "chevron.right")
+                                                .font(ShellType.caption)
+                                                .foregroundStyle(NativeAgentShell.secondary)
+                                                .accessibilityHidden(true)
+                                        }
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(NativeAgentSpacing.xl)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+                if let actionError {
+                    Text(actionError)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(spacing: NativeAgentSpacing.sm) {
+                    // `.onAppear` below already marks the item read when the
+                    // sheet opens; Close only closes.
+                    Button("Close") { onClose() }
+                        .keyboardShortcut(.cancelAction)
+                    Spacer(minLength: 0)
+                    ForEach(visibleActions.filter { !InboxActionWords.isPrimary($0.id) }, id: \.id) { action in
+                        Button(action.label) { perform(action.id, closesOnSuccess: true) }
+                            .disabled(isActing)
+                    }
+                    ForEach(visibleActions.filter { InboxActionWords.isPrimary($0.id) }, id: \.id) { action in
+                        Button(action.label) { perform(action.id, closesOnSuccess: true) }
+                            .buttonStyle(.borderedProminent)
+                            .hazeTinted(.button)
+                            .disabled(isActing)
+                    }
+                }
+                .controlSize(.large)
+            }
+            .padding(.horizontal, NativeAgentSpacing.xl)
+            .padding(.vertical, NativeAgentSpacing.lg)
+        }
+        .frame(minWidth: 460, idealWidth: 560, minHeight: 320, idealHeight: 480)
+        .animation(NativeAgentMotion.standard, value: actionError)
+        .onAppear { perform("read", closesOnSuccess: false) }
     }
 
     private func perform(_ actionID: String, closesOnSuccess: Bool) {
         guard !isActing else { return }
         isActing = true
+        actionError = nil
         Task { @MainActor in
             defer { isActing = false }
             let outcome = await onAction(actionID)
@@ -615,14 +566,35 @@ struct InboxItemDetailSheet: View {
             ) {
             case .dismiss:
                 onClose()
-            case .showError(let message):
-                actionError = message
+            case .showError:
+                actionError = InboxActionWords.failure(actionID)
             case .keepOpen:
                 break
             }
         }
     }
 
+}
+
+/// What a note's action buttons say, and what a failed one says: what didn't
+/// happen and what to do, never the writer's own error text.
+enum InboxActionWords {
+    static func isPrimary(_ actionID: String) -> Bool {
+        actionID == "act" || actionID == "approve" || actionID == "open_approvals" || actionID == "repair"
+    }
+
+    static func failure(_ actionID: String) -> String {
+        let what: String
+        switch actionID {
+        case "read": what = "mark this note read"
+        case "archive": what = "archive this note"
+        case "dismiss": what = "dismiss this note"
+        case "approve": what = "approve this"
+        case "reject", "deny": what = "decline this"
+        default: what = "do that"
+        }
+        return "Couldn't \(what). Try again in a moment."
+    }
 }
 
 /// A sheet only dismisses after its action's durable write succeeds. Failures
@@ -810,24 +782,16 @@ enum InboxAppModelMirror {
     }
 }
 
-/// Visible, bounded wording for a failed inbox read. When a refresh fails over
-/// already rendered cards, say so plainly: those cards are last-known data,
-/// not proof that the current inbox is healthy.
+/// Visible wording for a failed inbox read, one line: what happened and what
+/// to do. When a refresh fails over already rendered cards, say so plainly:
+/// those cards are last-known data, not proof the inbox is current. The
+/// reader's own error text goes to the log, not the page.
 enum InboxLoadFailurePresentation {
-    static let maxDetailCharacters = 240
-
     static func banner(error: any Error, retainedItemCount: Int) -> String {
-        let rawDetail = error.localizedDescription
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let detail = rawDetail.isEmpty
-            ? "The inbox reader returned no error details."
-            : String(rawDetail.prefix(maxDetailCharacters))
-        let retained = retainedItemCount == 1
-            ? "Inbox couldn't refresh — showing 1 previously loaded item."
-            : retainedItemCount > 1
-                ? "Inbox couldn't refresh — showing \(retainedItemCount) previously loaded items."
-                : "Inbox couldn't load."
-        return "\(retained) \(detail)"
+        nativeLog("%@", "[inbox] read failed: \(error.localizedDescription)")
+        return retainedItemCount > 0
+            ? "Couldn't refresh, so these notes may be out of date. Try Refresh."
+            : "Couldn't read your notes. Try Refresh."
     }
 }
 
@@ -944,111 +908,78 @@ struct InboxView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                GradientText(
-                    text: "Inbox",
-                    colors: [.orange, .pink],
-                    font: NativeAgentFont.title
-                )
-                Spacer()
-                Toggle("All", isOn: $showAll)
-                    .toggleStyle(.button)
-                    .font(.caption)
-                    .controlSize(.small)
-                Button { Task { await load() } } label: {
-                    Image(systemName: "arrow.clockwise")
+            // The sheet around this page already says what it is; one row of
+            // controls, then the notes.
+            HStack(spacing: NativeAgentSpacing.md) {
+                // G12: the segmented control. Unread counts live ON the
+                // segments so the System lane is never a silent hiding place.
+                Picker("Notification category", selection: $lane) {
+                    ForEach(InboxLanePresentation.pickerLanes) { candidate in
+                        Text(laneLabel(candidate)).tag(candidate)
+                    }
                 }
-                .disabled(inboxLoadState.isLoading)
-                .help("Refresh inbox")
-                .accessibilityLabel("Refresh inbox")
+                .accessibilityLabel("Notification category")
+                .pickerStyle(.segmented)
+                .hazeTinted(.segments)
+                .labelsHidden()
+                .fixedSize()
+                Spacer(minLength: 0)
                 if inboxLoadState.isLoading {
                     ProgressView().controlSize(.small)
                 }
+                Toggle("Show archived", isOn: $showAll)
+                    .toggleStyle(.checkbox)
+                    .help("Also show notes you archived or dismissed")
+                Button("Refresh") { Task { await load() } }
+                    .disabled(inboxLoadState.isLoading)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-
-            // G12: the segmented control. Unread counts live ON the segments so
-            // the System lane is never a silent hiding place — User can see it
-            // has three things in it without switching to it.
-            Picker("Notification category", selection: $lane) {
-                ForEach(InboxLanePresentation.pickerLanes) { candidate in
-                    Text(laneLabel(candidate)).tag(candidate)
-                }
-            }
-            .accessibilityLabel("Notification category")
-            .pickerStyle(.segmented)
-            .hazeTinted(.segments)
-            .labelsHidden()
-            .padding(.horizontal, 16)
-            .padding(.bottom, 8)
-
-            if let err = inboxLoadState.errorText {
-                Text(err).font(NativeAgentFont.label).foregroundStyle(NativeAgentTheme.fail).padding(.horizontal)
-            }
-
-            if let groupFilter {
-                HStack(spacing: 10) {
-                    Image(systemName: "line.3.horizontal.decrease.circle")
-                        .foregroundStyle(.blue)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(groupFilter.title)
-                            .font(NativeAgentFont.label.weight(.semibold))
-                        Text("\(displayItems.filter { $0.isUnread }.count) unread, \(displayItems.filter { !$0.isUnread }.count) earlier")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Clear") { self.groupFilter = nil }
-                        .font(.caption)
-                }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 8)
-            }
+            .font(ShellType.label)
+            .padding(.horizontal, NativeAgentSpacing.xl)
+            .padding(.vertical, NativeAgentSpacing.md)
 
             Divider()
 
-            // Lane-aware: an empty "For you" lane with a full System lane must
-            // not render a blank List. It says which lane is empty and, when
-            // the other one has something, points at it.
-            switch inboxLoadState.contentPresentation(hasVisibleItems: !prioritySections.isEmpty) {
-            case .loading:
-                ProgressView("Loading inbox")
-                    .frame(maxWidth: .infinity, minHeight: 200)
-            case .unavailable:
-                NativeEmptyState(
-                    title: "Inbox unavailable",
-                    detail: "These notifications could not be checked. Retry to see what needs your attention.",
-                    systemImage: "exclamationmark.triangle",
-                    actionTitle: "Retry",
-                    actionImage: "arrow.clockwise",
-                    action: { Task { await load() } }
-                )
-                .frame(minHeight: 200)
-            case .empty:
-                NativeEmptyState(
-                    title: lane == .forYou ? "Nothing for you right now" : "No system notices",
-                    detail: emptyStateDetail,
-                    systemImage: "tray",
-                    actionTitle: nil, actionImage: nil, action: nil
-                )
-                .frame(minHeight: 200)
-            case .content:
-                List {
-                    // Outstanding requests sit above notification history and
-                    // stay there once read. Only resolving them clears them.
-                    if !prioritySections.needsYou.isEmpty {
-                        Section("Needs you") {
-                            ForEach(prioritySections.needsYou) { row($0) }
-                        }
+            ScrollView {
+                VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                    if let groupFilter {
+                        groupFilterRow(groupFilter)
                     }
-                    if !prioritySections.rest.isEmpty {
-                        Section(prioritySections.needsYou.isEmpty ? "" : lane.title) {
-                            ForEach(prioritySections.rest) { row($0) }
+                    // Lane-aware: an empty "For you" lane with a full System
+                    // lane says which lane is empty and points at the other.
+                    switch inboxLoadState.contentPresentation(hasVisibleItems: !prioritySections.isEmpty) {
+                    case .loading:
+                        AdvancedWaitingLine("Reading your notes…")
+                    case .unavailable:
+                        AdvancedEmptyState(
+                            title: "Couldn't read your notes",
+                            detail: "Try again to see what needs you.",
+                            actionTitle: "Try again",
+                            action: { Task { await load() } }
+                        )
+                    case .empty:
+                        AdvancedEmptyState(
+                            title: lane == .forYou ? "Nothing for you right now" : "No system notes",
+                            detail: emptyStateDetail
+                        )
+                    case .content:
+                        if let err = inboxLoadState.errorText {
+                            Text(err)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.trouble)
+                        }
+                        // Outstanding requests sit above notification history
+                        // and stay there once read. Only resolving them clears
+                        // them.
+                        if !prioritySections.needsYou.isEmpty {
+                            section("Needs you", prioritySections.needsYou, waiting: true)
+                        }
+                        if !prioritySections.rest.isEmpty {
+                            section(prioritySections.needsYou.isEmpty ? nil : lane.title, prioritySections.rest)
                         }
                     }
                 }
-                .listStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(NativeAgentSpacing.xl)
             }
         }
         .task { await load() }
@@ -1057,9 +988,38 @@ struct InboxView: View {
         }
     }
 
-    private func row(_ item: InboxItemRecord) -> some View {
+    private func groupFilterRow(_ group: InboxRelatedGroup) -> some View {
+        HStack(spacing: NativeAgentSpacing.md) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(group.title)
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Text("\(displayItems.filter { $0.isUnread }.count) unread, \(displayItems.filter { !$0.isUnread }.count) earlier")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            Spacer(minLength: 0)
+            Button("Show all notes") { self.groupFilter = nil }
+                .controlSize(.small)
+        }
+        .padding(.horizontal, AliveMetrics.rowInsetH)
+        .padding(.vertical, AliveMetrics.rowInsetV)
+        .aliveCard()
+    }
+
+    private func section(_ title: String?, _ items: [InboxItemRecord], waiting: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            if let title { AliveEyebrow(title) }
+            LazyVStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                ForEach(items) { row($0, waiting: waiting) }
+            }
+        }
+    }
+
+    private func row(_ item: InboxItemRecord, waiting: Bool) -> some View {
         InboxListRow(
             item: item,
+            waiting: waiting,
             allItems: inboxLoadState.items,
             client: client,
             onAction: { Task { await loadAndSync() } },
@@ -1100,9 +1060,9 @@ struct InboxView: View {
         let other: InboxLane = lane == .forYou ? .system : .forYou
         let otherCount = InboxLanePresentation.unreadVisibleCount(in: other, items: inboxLoadState.items)
         if otherCount > 0 {
-            return "\(otherCount) item(s) are waiting in \(other.title)."
+            return "\(otherCount) unread \(otherCount == 1 ? "note is" : "notes are") in \(other.title)."
         }
-        return "When \(appModel.personality?.name ?? "your agent") notices something useful, it will appear here."
+        return "When I notice something useful, I'll leave it here."
     }
 
     /// Unread count per lane, over the same visibility rules the list uses —
@@ -1157,8 +1117,9 @@ final class InboxRowActionFlight {
             try await operation()
             return .succeeded
         } catch {
-            let message = "Inbox action failed: \(error.localizedDescription)"
-            return .failed(message: message)
+            // The writer's text goes to the log; the page says what to do.
+            nativeLog("%@", "[inbox] action failed: \(error.localizedDescription)")
+            return .failed(message: "That didn't go through. Try again in a moment.")
         }
     }
 }
@@ -1186,9 +1147,11 @@ enum InboxRowActionCompletion {
     }
 }
 
-// PATCH-2026-05-07: polish-InboxView GlassCard list rows tinted by severity, PulsingDot for unread
+/// One note on the Inbox page: an alive card, with the soft teal top only
+/// when it waits on the person. Tapping it opens the detail sheet.
 struct InboxListRow: View {
     let item: InboxItemRecord
+    var waiting = false
     let allItems: [InboxItemRecord]
     let client: NativeClient
     let onAction: () -> Void
@@ -1201,11 +1164,8 @@ struct InboxListRow: View {
     // The shared action flight owns the row's visible busy state and terminal
     // outcome, rather than relying on a button-local best-effort guard.
     @State private var actionFlight = InboxRowActionFlight()
-    // gpt-5.5 review-2 R2-#1 follow-up: ContentView's InboxStripView already
-    // surfaces inbox-action errors (e.g. the new -410 "primary-action resolver
-    // not wired" from inboxAction(act:)). The main InboxView used `try?` and
-    // swallowed everything — the user pressed "Act," saw the row dismiss,
-    // and never learned the action didn't fire. Mirror the strip pattern.
+    // A failed action stays visible as one line under the row's buttons; the
+    // row never dismisses on a write that didn't land.
     @State private var actionError: String? = nil
 
     private var visibleActions: [InboxActionRecord] {
@@ -1222,72 +1182,69 @@ struct InboxListRow: View {
     }
 
     private var ordinaryRow: some View {
-        GlassCard(tint: item.isUnread ? item.severityColor : nil, scrollRow: true) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .top, spacing: 10) {
-                    ZStack(alignment: .topTrailing) {
-                        Image(systemName: item.sourceIcon)
-                            .font(.body)
-                            .foregroundStyle(item.severityColor)
-                            .frame(width: 22)
-                            .padding(.top, 2)
-                        if item.isUnread {
-                            PulsingDot(color: item.severityColor, size: 6)
-                                .offset(x: 6, y: -2)
-                        }
-                    }
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(item.title)
-                            .font(NativeAgentFont.body.weight(item.isUnread ? .semibold : .regular))
-                            .foregroundStyle(.primary)
-                        Text(item.summary)
-                            .font(NativeAgentFont.label)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-
-                    Spacer()
-
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+            HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.title)
+                        .font(item.isUnread ? ShellType.bodySemibold : ShellType.body)
+                        .foregroundStyle(NativeAgentShell.text)
+                    Text(item.summary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .lineLimit(2)
+                    Text(item.isUnread ? "New · \(item.sourceWord)" : item.sourceWord)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .accessibilityHidden(true)
+            }
 
-                if !visibleActions.isEmpty {
-                    // One main button, the rest in the Mac's own menu (User 09-27:
-                    // all controls native; no sideways-scrolling button strip).
-                    let primary = visibleActions.filter { isPrimaryAction($0.id) }
-                    let others = visibleActions.filter { !isPrimaryAction($0.id) }
-                    HStack(spacing: 8) {
-                        ForEach(primary, id: \.id) { action in
-                            Button(action.label) { runAction(action.id) }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-                                .disabled(actionFlight.isInFlight)
-                        }
-                        if !others.isEmpty {
-                            Menu {
-                                ForEach(others, id: \.id) { action in
-                                    Button(action.label) { runAction(action.id) }
-                                }
-                            } label: {
-                                Label(primary.isEmpty ? "Actions" : "More", systemImage: "ellipsis.circle")
-                            }
-                            .menuStyle(.button)
-                            .buttonStyle(.bordered)
+            if !visibleActions.isEmpty {
+                // One main button, the rest in the Mac's own menu (User 09-27:
+                // all controls native; no sideways-scrolling button strip).
+                let primary = visibleActions.filter { InboxActionWords.isPrimary($0.id) }
+                let others = visibleActions.filter { !InboxActionWords.isPrimary($0.id) }
+                HStack(spacing: NativeAgentSpacing.sm) {
+                    ForEach(primary, id: \.id) { action in
+                        Button(action.label) { runAction(action.id) }
+                            .buttonStyle(.borderedProminent)
+                            .hazeTinted(.button)
                             .controlSize(.small)
-                            .fixedSize()
                             .disabled(actionFlight.isInFlight)
+                    }
+                    if !others.isEmpty {
+                        Menu {
+                            ForEach(others, id: \.id) { action in
+                                Button(action.label) { runAction(action.id) }
+                            }
+                        } label: {
+                            Text(primary.isEmpty ? "Actions" : "More")
                         }
+                        .menuStyle(.button)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .fixedSize()
+                        .disabled(actionFlight.isInFlight)
                     }
                 }
             }
+
+            if let actionError {
+                Text(actionError)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+            }
         }
-        .naInteractive()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, AliveMetrics.rowInsetH)
+        .padding(.vertical, AliveMetrics.rowInsetV)
+        .aliveCard(waiting: waiting)
+        .contentShape(Rectangle())
         .onTapGesture { showDetail = true }
-        .listRowBackground(Color.clear)
-        .listRowSeparator(.hidden)
         .sheet(isPresented: $showDetail) {
             InboxItemDetailSheet(
                 item: item,
@@ -1300,25 +1257,13 @@ struct InboxListRow: View {
             )
             .presentationDetents([.medium, .large])
         }
-        .alert(
-            "Inbox action failed",
-            isPresented: Binding(
-                get: { actionError != nil },
-                set: { if !$0 { actionError = nil } }
-            ),
-            actions: { Button("OK", role: .cancel) { actionError = nil } },
-            message: { Text(actionError ?? "") }
-        )
-    }
-
-    private func isPrimaryAction(_ actionID: String) -> Bool {
-        actionID == "act" || actionID == "approve" || actionID == "open_approvals" || actionID == "repair"
     }
 
     private func runAction(_ actionID: String) {
+        actionError = nil
         Task { @MainActor in
             let outcome = await performAction(actionID)
-            if case .failed(let message) = outcome { actionError = message }
+            if case .failed = outcome { actionError = InboxActionWords.failure(actionID) }
         }
     }
 

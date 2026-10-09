@@ -80,11 +80,10 @@ public final class TurnsFacade {
     /// session id. They stay outside the transcript/provider path until they
     /// become active, so queued text cannot race or duplicate the running turn.
     public var queuedBySession: [String: [QueuedChatTurn]] {
-        get { runtime.queuedBySession }
-        set { runtime.queuedBySession = newValue }
+        runtime.queuedBySession
     }
     /// A manual Stop pauses automatic queue drain for that session. Natural
-    /// completion drains immediately; Steer explicitly unpauses and promotes.
+    /// completion drains immediately; Send now explicitly unpauses and promotes.
     public var pausedQueueSessions: Set<String> {
         get { runtime.pausedQueueSessions }
         set { runtime.pausedQueueSessions = newValue }
@@ -182,6 +181,11 @@ public final class TurnsFacade {
     public func queued(for sessionId: String) -> [QueuedChatTurn] {
         guard !sessionId.isEmpty else { return [] }
         return queuedBySession[sessionId] ?? []
+    }
+
+    /// Steered: offered to the running turn, still queued until it takes it.
+    public func isSteering(_ turnId: String) -> Bool {
+        runtime.steeringTurnIDs.contains(turnId)
     }
 
     public func isQueuePaused(_ sessionId: String) -> Bool {

@@ -12,6 +12,8 @@ extension Color {
 /// Shared iOS vocabulary: native type and materials with the Mac's quiet hierarchy.
 /// Content stays quiet; Liquid Glass belongs to floating controls and navigation.
 enum NativeAgentMobileTheme {
+    static var plateGlass: Glass { .clear.tint(.black.opacity(0.28)) }
+
     enum Colors {
         static let canvas = adaptive(dark: 0x211F1D, light: 0xF6F4F1)
         static let contentSurface = adaptive(dark: 0x292725, light: 0xFFFFFF)
@@ -76,8 +78,6 @@ enum NativeAgentMobileTheme {
 
     enum Layout {
         static let roomColumn: CGFloat = 740
-        static let replyMaxWidth: CGFloat = 708
-        static let userBubbleMaxWidth: CGFloat = 640
         static let replyLineSpacing: CGFloat = 8
         static let controlHeight: CGFloat = 44
         static let hairline: CGFloat = 1
@@ -185,7 +185,7 @@ private struct MobileGlassSurface: ViewModifier {
             content.background(NativeAgentMobileTheme.Colors.navigationGlass, in: shape)
                 .overlay(shape.strokeBorder(contrast == .increased ? Color.primary.opacity(0.5) : NativeAgentMobileTheme.Colors.hairline, lineWidth: 1))
         } else {
-            content.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
+            content.glassEffect(interactive ? NativeAgentMobileTheme.plateGlass.interactive() : NativeAgentMobileTheme.plateGlass, in: shape)
         }
         }
     }

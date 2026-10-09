@@ -43,20 +43,13 @@ package struct ToolCallProtocolViolation: Equatable {
 
     package var modelFeedback: String {
         if kind == .malformedToolUseMarker {
-            return """
-            NativeAgent tool protocol error: your previous response contained a truncated or malformed tool call. That response was not delivered and no tool was executed. Resend it now as one valid tool call in the format this conversation uses (on the text protocol, exactly <tool_use name="TOOL">{JSON object}</tool_use>). If no tool is needed, answer the user directly.
-            """
+            return "Your reply contained broken tool-call text. No call from it ran. Use this conversation's tool-call format to make the needed call now."
         }
-        return """
-        NativeAgent tool protocol error: your previous response looked like a tool call but used Markdown formatting instead of the executable tool protocol. That response was not delivered and no tool was executed. Retry now by emitting only one or more exact <tool_use name="tool_name">{"arg":"value"}</tool_use> markers, with no Tool Call header, code fence, inline-code/emphasis wrapper, or invented Tool Result. If no tool is needed, answer the user directly.
-        """
+        return "Your reply formatted a tool call as Markdown. No call from it ran. Use this conversation's tool-call format to make the needed call now."
     }
 
     package var terminalReply: String {
-        if kind == .malformedToolUseMarker {
-            return "(tool protocol error: the model repeatedly emitted a malformed tool call; no malformed call was delivered or executed)"
-        }
-        return "(tool protocol error: the model repeatedly formatted a tool call as Markdown; no formatted call was delivered or executed)"
+        return "Stopped: the model did not recover its tool call. The requested work is incomplete."
     }
 }
 
@@ -65,10 +58,9 @@ package enum ToolCallParser {
     /// function_call), then `<tool_use id="..." name="...">{json}</tool_use>`
     /// markers (both adapters emit this format), then bare JSON content
     /// blocks `{"type":"tool_use","id":...,"name":"...","input":{...}}`.
-    /// `parseInvoke`: only the text tool lane asks for Claude's `<invoke>`
-    /// form (2026-09-22) — on any other lane it is a quoted example.
+    /// `parseInvoke`: only the text tool lane runs Claude's `<invoke>` form.
     package static func parse(_ raw: String, parseInvoke: Bool = false) -> [ParsedToolCall] {
-        guard formattedToolCallViolation(in: raw) == nil else { return [] }
+        guard formattedToolCallViolation(in: raw, parseInvoke: parseInvoke) == nil else { return [] }
         if let openai = parseOpenAI(raw) {
             let executable = executableCalls(openai)
             if !executable.isEmpty { return executable }
@@ -91,19 +83,6 @@ package enum ToolCallParser {
             return cut + "\n</function_calls>"
         }
         return cut
-    }
-
-    static func parseIncludingIgnorable(_ raw: String) -> [ParsedToolCall] {
-        guard formattedToolCallViolation(in: raw) == nil else { return [] }
-        if let openai = parseOpenAI(raw), !openai.isEmpty { return openai }
-        let anth = parseAnthropic(raw)
-        if !anth.isEmpty { return anth }
-        return []
-    }
-
-    package static func containsOnlyIgnorableCalls(_ raw: String) -> Bool {
-        let calls = parseIncludingIgnorable(raw)
-        return !calls.isEmpty && executableCalls(calls).isEmpty
     }
 
     /// Strip `<tool_use ...>...</tool_use>` markers from a raw response so the
@@ -426,26 +405,32 @@ package enum ToolCallParser {
         return trimmed.isEmpty ||
             trimmed == "..." ||
             trimmed == "…" ||
+            trimmed == "_fn_placeholder" ||
+            trimmed == "_call_placeholder" ||
             trimmed == "tool_name" ||
             trimmed == "<tool_name>"
     }
 
-    /// Markdown pseudo-tool calls are never executable. They previously fell
-    /// through as ordinary assistant prose, which made a failed action look
-    /// successful to both the model and the user. Keep the executable parser
-    /// strict and let each tool-loop owner feed `modelFeedback` into its next
-    /// provider call instead of surfacing the malformed response.
+    /// Broken or formatted calls never execute or settle as ordinary prose.
+    /// The shared loop gives one format nudge before settling incomplete.
     package static func formattedToolCallViolation(
-        in raw: String, toolNames: Set<String> = []
+        in raw: String, toolNames: Set<String> = [], parseInvoke: Bool = false
     ) -> ToolCallProtocolViolation? {
-        // Live Telegram incident (2026-08-14): the provider emitted
-        // `ool_use name="commit_memory">…</tool_use>`, dropping the opening
-        // `<t`. It was neither executable nor caught by the exact-marker
-        // detector, so it shipped as assistant prose. Require an opening-line
-        // protocol shape, a name attribute, and the real closing tag; ordinary
-        // discussion of the word "tool_use" remains valid prose.
-        let malformedOpeningPattern = #"(?is)(?:^|[\r\n])[ \t]*(?:tool_use|ool_use)[ \t]+(?:id=\"[^\"]*\"[ \t]+)?name=\"[^\"]+\"[ \t]*>[\s\S]*?</tool_use>"#
-        if regexMatches(malformedOpeningPattern, in: raw) {
+        // Remove complete calls before looking for orphan tags or placeholders.
+        // Their arguments may legitimately contain these strings.
+        // Fenced code is quoted text, never a call.
+        let unfenced = raw.replacingOccurrences(
+            of: #"(?s)```.*?```|~~~.*?~~~"#, with: "", options: .regularExpression)
+        let remainder = stripToolUseMarkers(unfenced)
+        let orphanPattern = #"(?im)^[ \t]*(?:</?(?:tool_use|invoke|parameter)\b|_?(?:tool_use|ool_use)\b[ \t>])"#
+        let protocolOnlyPattern = #"(?is)^\s*(?:(?:</?(?:parse|function_(?:calls|results?)|tool_results?|result)\b[^>]*>|<parse_error>.*?</parse_error>|<reasoning_effort>[^<]*</reasoning_effort>|_\w+_placeholder)\s*)+$"#
+        let openAI = parseOpenAI(raw)
+        let calls = openAI ?? parseAnthropic(raw, parseInvoke: true)
+        if regexMatches(orphanPattern, in: remainder)
+            || regexMatches(protocolOnlyPattern, in: unfenced)
+            || (!parseInvoke && regexMatches(#"(?im)^[ \t]*(?:<function_calls>\s*)?<invoke\b"#, in: raw))
+            || (openAI != nil && calls.isEmpty)
+            || (!calls.isEmpty && executableCalls(calls).isEmpty) {
             return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
         }
 
@@ -505,18 +490,21 @@ package enum ToolCallParser {
         return nil
     }
 
-    /// Earliest text that could become an executable or malformed tool
-    /// protocol block. Streaming paths hold this suffix until the completed
-    /// iteration can be parsed, so marker-shaped text never reaches a draft.
-    package static func earliestPotentialProtocolMarker(in raw: String, invoke: Bool = false) -> Range<String.Index>? {
-        var needles = [
-            "<tool", "tool_use name=\"", "ool_use name=\"",
-            "**tool call", "__tool call", "tool call:",
-        ]
-        // 2026-09-22: Claude's own call form, which only the text tool lane runs.
-        if invoke { needles += ["<function_calls", "<invoke"] }
-        var candidates = needles.compactMap { needle in
+    package static let protocolMarkerStarts = [
+        "<tool", "tool_use", "ool_use",
+        "**tool call", "__tool call", "tool call:",
+        "<function_calls", "</function_calls", "<invoke", "<parameter", "</tool_use", "</invoke", "</parameter",
+        "_tool_use", "_fn_placeholder", "_call_placeholder", "<reasoning_effort", "<parse", "</parse",
+        "<function_result", "</function_result", "</tool_result", "<result", "</result",
+    ]
+
+    /// Hold potential call text until the complete round can be checked.
+    package static func earliestPotentialProtocolMarker(in raw: String) -> Range<String.Index>? {
+        var candidates = protocolMarkerStarts.compactMap { needle in
             raw.range(of: needle, options: [.caseInsensitive])
+        }
+        if let placeholder = raw.range(of: #"(?m)^[ \t]*_\w*placeholder"#, options: .regularExpression) {
+            candidates.append(placeholder)
         }
         if let tool = raw.range(of: "<tool", options: [.caseInsensitive]) {
             let prefix = raw[..<tool.lowerBound]
@@ -532,8 +520,8 @@ package enum ToolCallParser {
     }
 
     /// Visible prose preceding the earliest possible protocol marker, unchanged if absent.
-    package static func visiblePrefix(in raw: String, invoke: Bool = false) -> String {
-        if let marker = earliestPotentialProtocolMarker(in: raw, invoke: invoke) {
+    package static func visiblePrefix(in raw: String) -> String {
+        if let marker = earliestPotentialProtocolMarker(in: raw) {
             return String(raw[..<marker.lowerBound])
         }
         return raw

@@ -36,7 +36,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// Production uses the shared persisted authority; injected executors
     /// may carry a hermetic real store without replacing the gate itself.
     private let macIntegrationPermissionStore: MacIntegrationPermissionStore
-    private let doctorStatusProvider: @Sendable (_ repair: Bool) async throws -> JSONValue
+    private let doctorStatusProvider: @Sendable (_ repair: Bool?) async throws -> JSONValue
     private let telegramStatusProvider: @Sendable () async throws -> JSONValue
     private let humanConversationReplyHandler: @Sendable ([String: JSONValue]) async throws -> JSONValue
     /// Deny, or under Full Mac approve (true), a Desk task's waiting step:
@@ -53,7 +53,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         mobileNotificationSender: @escaping @Sendable (String, String, [String: String]) async throws -> MobileNotificationDeliveryReceipt,
         macNotificationSender: @escaping @Sendable (String, String) async throws -> NativeAgentNotificationPostResult,
         macIntegrationPermissionStore: MacIntegrationPermissionStore,
-        doctorStatusProvider: @escaping @Sendable (_ repair: Bool) async throws -> JSONValue,
+        doctorStatusProvider: @escaping @Sendable (_ repair: Bool?) async throws -> JSONValue,
         telegramStatusProvider: @escaping @Sendable () async throws -> JSONValue,
         humanConversationReplyHandler: @escaping @Sendable ([String: JSONValue]) async throws -> JSONValue,
         workshopStepDecider: @escaping @Sendable (String, Bool) async throws -> JSONValue,
@@ -66,9 +66,12 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         // Register a closure, not a static table dependency: app's schema
         // already reads AppActions during descriptor assembly below.
         RunawayOutputDetector.registerAppReadOnlyCalls { input in
-            guard Self.doorText(input["script"]).isEmpty else { return false }
+            guard input["script"] == nil || input["script"] == .null || input["script"] == .string("") else { return false }
             let action = Self.doorText(input["action"])
-            if !action.isEmpty { return AppActions.action(action)?.read == true }
+            if !action.isEmpty {
+                let args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
+                return AppActions.action(action)?.readOnly(args: args) == true
+            }
             guard !Self.opensHomeItem(input) else { return false }
             return true // home, page/item reads, and find
         }
@@ -99,13 +102,13 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     public static let browserToolNames = [
         "browser.chrome_setup",
         "browser.chrome_status",
+        "browser.chrome_reload_extension",
         "browser.status",
         "browser.open_url",
         "browser.read_text",
         "browser.read_links",
         "browser.screenshot",
-        "browser.chrome_acquire",
-        "browser.chrome_renew",
+        "browser.chrome_close_tab",
         "browser.chrome_navigate",
         "browser.chrome_snapshot",
         "browser.chrome_click",
@@ -118,7 +121,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         "browser.chrome_drag",
         "browser.chrome_wait",
         "browser.chrome_scroll",
-        "browser.chrome_release",
+        "browser.chrome_media",
     ]
     /// name → bucket, in family order. Every name is canonical
     /// (ToolNameAliases). The app itself is the one `app` door; the browser
@@ -177,7 +180,8 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             return try await runAppDoor(input: input, surface: surface)
         default:
             return .object([
-                "status": .string("failed"), "reason": .string("not_in_dispatch_table"), "tool": .string(tool),
+                "status": .string("failed"), "effects": .string("none"), "reason": .string("not_in_dispatch_table"), "tool": .string(tool),
+                "detail": .string("\(tool) has no handler in this build, so nothing ran. app {find} shows what is available."),
             ])
         }
     }
@@ -276,14 +280,13 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// Doctor's checks or Telegram's status, read and changing nothing: the
     /// `app` door's diagnostics/doctor and telegram/status item reads.
     func healthRead(_ item: String) async throws -> JSONValue {
-        item == "doctor" ? try await doctorStatusProvider(false) : try await telegramStatusProvider()
+        item == "doctor" ? try await doctorStatusProvider(nil) : try await telegramStatusProvider()
     }
 
     private static func healthResult(_ result: JSONValue, surface: String) -> JSONValue {
         guard case .object(var object) = result else { return result }
         object["runtime"] = .string("swift-native")
         object["surface"] = .string(surface)
-        object["read_only"] = .bool(false)
         return .object(object)
     }
 
@@ -314,19 +317,33 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         // origin and Full Mac checks).
         if action.tool == "app_setting_set" { return await runAppSettingSet(input: input, surface: surface) }
         if action.isCard { return await runCardAction(input: input, surface: surface) }
-        if !action.safe, let refusal = await Self.quietChangesRefusal() { return refusal }
+        if !action.safe, !action.readOnly(args: input), let refusal = await Self.quietChangesRefusal() { return refusal }
         let verb = Self.inputString(action.input["verb"]) ?? ""
         switch action.tool {
+        case "read_file" where action.id == "chrome.history":
+            return try await runChromeHistory(input: input, surface: surface)
+        case "claude_worklog":
+            return AgentConversationView.claudeWorklog(input: input)
+        case "photos_read":
+            return await runPhotosRead(verb: verb, input: input)
+        case "weather_forecast":
+            return try await runWeatherForecast(input: input)
+        case "sense_act":
+            return await runSenseAct(input: input)
+        case "sense_make":
+            return await runSenseMake(input: input)
         case "app_page_screenshot":
             return await presentation.pageScreenshot(input: input)
+        case "make_studio":
+            return await runMake(verb: verb, input: input)
         case "doctor_status":
-            return Self.healthResult(try await doctorStatusProvider(true), surface: surface)
+            return Self.healthResult(try await doctorStatusProvider(input["repair"] == .bool(true)), surface: surface)
         case "my_queue":
             return await runMyQueue(verb: verb, input: input, surface: surface)
         case "workshop_reject":
             let id = Self.inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !id.isEmpty else {
-                return .object(["status": .string("failed"), "reason": .string("invalid_input"),
+                return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("invalid_input"),
                     "detail": .string("Pass id: the execution id of a Desk task whose status is blocked_on_approval in app workshop.status.")])
             }
             // desk.approve: User's, so only Full Mac reaches it (the door).
@@ -406,21 +423,48 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// fences). Nil when nothing would.
     @MainActor
     func foldedRefusal(_ action: AppAction, input: [String: JSONValue], surface: String) async -> JSONValue? {
-        // A folded tool's checks are its own call's, made when it runs.
-        if action.isFold { return nil }
+        if action.tool == "request_interaction" {
+            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            if case .object(var refusal) = await SwiftToolDispatcher.requestedInteraction(input: input, dataRoot: root),
+               refusal["status"] == .string("failed") {
+                if case .string(let path)? = refusal["argument_path"] {
+                    refusal["argument_path"] = .string("args" + path.dropFirst())
+                }
+                return .object(refusal)
+            }
+        }
+        if action.isFold { return await AppDoorReentry.validate?(action.tool, input) }
         if action.isCard { return await cardRefusal(input: input, surface: surface) }
         if action.tool == "app_setting_set" { return await settingRefusal(input: input) }
         if !action.safe, let refusal = await Self.quietChangesRefusal() { return refusal }
+        if action.tool == "rewrite_memory" {
+            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            do {
+                _ = try await MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
+                    .rewriteTarget(input: input, surface: surface,
+                        persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID))
+            } catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
+        }
+        if action.tool == "mind_run", let verb = Self.inputString(action.input["verb"]),
+           ["reject", "undo", "revise"].contains(verb),
+           case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance() {
+            return Self.failure(refusal.rawValue,
+                "mind.\(verb): \(refusal.spoken). It is done from inside your own conversation, in your own turn.")
+        }
+        if action.tool == "upkeep" {
+            guard let host = quietHost() else { return Self.unattachedFailure() }
+            return await host.upkeepFence(verb: Self.inputString(action.input["verb"]) ?? "", input: input)
+        }
         // Turning a skill or tool on, back or back a version: whose it is turns
         // on the script's origin, the steer and Trust. The real call's own
         // checks, run as a preview, say whose it is and what it would leave
         // (status `would`, for the door to say).
-        if ["skill.enable", "skill.restore", "skill.rollback", "tool.restore", "tool.rollback"].contains(action.id) {
+        if ["skill.enable", "skill.restore", "skill.rollback", "tool.restore", "tool.rollback", "tool.approve"].contains(action.id) {
             guard let host = quietHost() else { return Self.unattachedFailure() }
             let asked = await host.manageSkill(verb: Self.inputString(action.input["verb"]) ?? "",
                                                input: input.merging(["preview": .bool(true)]) { $1 },
                                                steer: Self.skillSteer(surface: surface))
-            let would = asked.fields.filter { $0.key.hasPrefix("would_") || $0.key == "versions" }
+            let would = asked.fields.filter { $0.key.hasPrefix("would_") || ["versions", "tools"].contains($0.key) }
             guard !asked.ok else {
                 return .object(would.merging(["status": .string("would"), "detail": .string(asked.detail)]) { $1 })
             }

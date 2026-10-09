@@ -26,7 +26,7 @@ public enum InstalledSkillInventory {
     /// registry cannot be mistaken for permission to expose its loose bodies.
     public static func list(dataRoot: URL, sourceRoot: URL? = nil, personaRoot: URL? = nil) -> [JSONValue] {
         (try? entries(dataRoot: dataRoot, sourceRoot: sourceRoot, personaRoot: personaRoot))?.map { entry in
-            var row = entry.row.filter { ["id", "name", "description", "triggers", "status", "source", "signature"].contains($0.key) }
+            var row = entry.row.filter { ["id", "name", "description", "triggers", "status", "source", "signature", "overrides"].contains($0.key) }
             if let script = entry.row["script"] { row["signature"] = .string(SkillScript.signature(script)) } // rows saved before input.x
             if row["source"] != .string("runtime_registry") {
                 row["status"] = .string("installed")
@@ -54,7 +54,12 @@ public enum InstalledSkillInventory {
             registry = try SkillsRegistry.decode(raw)
         }
         var result: [Entry] = []
-        var seen: Set<String> = []
+        // A registry row claims its handles from loose bodies. It hides a
+        // built-in (persona body) of the same name too, unless it is her
+        // version of that built-in and not on (drafted, off, archived): then
+        // the built-in is still the one in use.
+        var claimed: Set<String> = []
+        var hides: Set<String> = []
         let base = sourceRoot ?? registryURL?.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         for value in registry {
             guard case .object(var row) = value else {
@@ -63,20 +68,36 @@ public enum InstalledSkillInventory {
             let id = string(row["id"]) ?? ""
             let name = string(row["name"]) ?? id
             var candidates: [URL] = []
+            var handles = Set([id, name].filter { !$0.isEmpty }.map { $0.lowercased() })
             if let raw = string(row["bodyPath"]), !raw.isEmpty {
                 let expanded = (raw as NSString).expandingTildeInPath
                 let url = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded) : base?.appendingPathComponent(expanded)
                 if let url { candidates.append(url) }
-                seen.insert(URL(fileURLWithPath: expanded).deletingPathExtension().lastPathComponent.lowercased())
+                handles.insert(URL(fileURLWithPath: expanded).deletingPathExtension().lastPathComponent.lowercased())
             }
             for handle in [id, name] where safeHandle(handle) {
                 candidates += bodiesDirs.map { $0.appendingPathComponent("\(handle).md") }
             }
-            if !id.isEmpty { seen.insert(id.lowercased()) }
-            if !name.isEmpty { seen.insert(name.lowercased()) }
+            claimed.formUnion(handles)
             let bodyURL = candidates.first { readableBody(at: $0, roots: bodiesDirs) != nil }
             if let bodyURL, let body = readableBody(at: bodyURL, roots: bodiesDirs),
-               !SkillBodyHygiene.violations(in: body).isEmpty { continue }
+               !SkillBodyHygiene.violations(in: body).isEmpty {
+                hides.formUnion(handles)
+                continue
+            }
+            // Her version of a built-in (a persona body of the same name): it
+            // wins by name while it is on, and the built-in file stays as it ships.
+            if let bodyURL, let runtime = bodiesDirs.first, readableBody(at: bodyURL, roots: [runtime]) != nil,
+               [name, id].contains(where: { handle in
+                   safeHandle(handle) && bodiesDirs.dropFirst().contains {
+                       readableBody(at: $0.appendingPathComponent("\(handle).md"), roots: bodiesDirs) != nil
+                   }
+               }) {
+                row["overrides"] = .string("built_in")
+            }
+            if row["overrides"] == nil || isAvailable(row) {
+                hides.formUnion(handles)
+            }
             row["source"] = .string("runtime_registry")
             result.append(Entry(row: row, bodyURL: bodyURL))
         }
@@ -85,10 +106,11 @@ public enum InstalledSkillInventory {
             let files = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
             for url in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where url.pathExtension.lowercased() == "md" {
                 let name = url.deletingPathExtension().lastPathComponent
-                guard !seen.contains(name.lowercased()),
+                guard !(index == 0 ? claimed : hides).contains(name.lowercased()),
                       let body = readableBody(at: url, roots: bodiesDirs),
                       SkillBodyHygiene.violations(in: body).isEmpty else { continue }
-                seen.insert(name.lowercased())
+                claimed.insert(name.lowercased())
+                hides.insert(name.lowercased())
                 result.append(Entry(row: [
                     "id": .string(name), "name": .string(name),
                     "description": .string(String((SkillBodyHygiene.firstUsefulLine(in: body) ?? "Skill body.").prefix(240))),
@@ -98,7 +120,14 @@ public enum InstalledSkillInventory {
                 ], bodyURL: url))
             }
         }
-        return result.sorted { $0.name == $1.name ? $0.id < $1.id : $0.name < $1.name }
+        // The one name two entries share (in any case) is her version of a
+        // built-in that is not on, and the built-in: the built-in, on, comes first.
+        return result.sorted {
+            let (a, b) = ($0.name.lowercased(), $1.name.lowercased())
+            if a != b { return a < b }
+            if $0.isAvailable != $1.isAvailable { return $0.isAvailable }
+            return $0.name == $1.name ? $0.id < $1.id : $0.name < $1.name
+        }
     }
 
     public static func match(_ name: String, in entries: [Entry]) -> Entry? {
@@ -130,6 +159,7 @@ public enum InstalledSkillInventory {
 /// script and header, given by whoever may admit what steered it. Every field
 /// here fails closed: missing or malformed means not runnable.
 public enum SkillScript {
+    public static let interpreterRevision = 2
     public static let sourceLimit = 8 * 1024
     public static let stepLimit = 50
     public static let actionLimit = 50
@@ -205,20 +235,7 @@ public enum SkillScript {
     public static func undeclared(_ script: JSONValue) -> [String] {
         guard case .object(let fields) = script, let source = string(fields["source"]),
               let regex = try? NSRegularExpression(pattern: #"\bapp\s*\.\s*(\w+)\s*\.\s*(\w+)\s*\("#) else { return [] }
-        // The code alone: // and /* */ comments dropped, each string kept as its quotes.
-        var code = "", quote: Character?, comment: Character?, escaped = false, last: Character = " "
-        for char in source {
-            defer { last = char }
-            if comment == "/" { if char == "\n" { comment = nil; code.append(char) }; continue }
-            if comment == "*" { if last == "*", char == "/" { comment = nil }; continue }
-            if let open = quote {
-                if escaped { escaped = false } else if char == "\\" { escaped = true } else if char == open { quote = nil; code.append(char) }
-                continue
-            }
-            if last == "/", code.last == "/", char == "/" || char == "*" { code.removeLast(); comment = char; continue }
-            if char == "\"" || char == "'" || char == "`" { quote = char }
-            code.append(char)
-        }
+        let code = codeMask(source)
         let declared = Set(strings(fields["actions"]))
         let verbs: Set<String> = ["read", "find", "log", "expect", "expect_fail", "decide", "step"]
         var found: [String] = []
@@ -238,6 +255,111 @@ public enum SkillScript {
             if !declared.contains(id), !found.contains(id) { found.append(id) }
         }
         return found
+    }
+
+    /// Keep offsets and lines while hiding literal text; template expressions are code.
+    private static func codeMask(_ source: String) -> String {
+        let text = Array(source.utf16)
+        var masked = text, i = 0
+        func word(_ c: UInt16) -> Bool { c >= 128 || (48...57).contains(c) || (65...90).contains(c) || (97...122).contains(c) || c == 95 || c == 36 }
+        func hide(_ start: Int) { for n in start..<i where text[n] != 10 && text[n] != 13 { masked[n] = 32 } }
+        func literal(_ delimiter: UInt16) {
+            let start = i
+            i += 1
+            var bracket = false
+            while i < text.count {
+                let c = text[i]; i += 1
+                if c == 92 { i = min(i + 1, text.count); continue }
+                if delimiter == 47, c == 91 { bracket = true }
+                if delimiter == 47, c == 93 { bracket = false }
+                if c == delimiter, !bracket { break }
+            }
+            if delimiter == 47 { while i < text.count, word(text[i]) { i += 1 } }
+            hide(start)
+        }
+        func code(_ interpolation: Bool = false) {
+            var regexAllowed = true, previous = "", parens: [Bool] = [], braces: [Bool] = []
+            while i < text.count {
+                let c = text[i], next = i + 1 < text.count ? text[i + 1] : 0
+                if c == 32 || c == 9 || c == 10 || c == 13 { i += 1; continue }
+                if c == 47, next == 47 || next == 42 {
+                    let start = i; i += 2
+                    while i < text.count {
+                        if next == 47, text[i] == 10 || text[i] == 13 { break }
+                        if next == 42, text[i] == 42, i + 1 < text.count, text[i + 1] == 47 { i += 2; break }
+                        i += 1
+                    }
+                    hide(start); continue
+                }
+                if c == 34 || c == 39 || (c == 47 && regexAllowed) {
+                    literal(c); regexAllowed = false; previous = "literal"; continue
+                }
+                if c == 96 {
+                    var start = i; i += 1
+                    while i < text.count {
+                        if text[i] == 92 { i = min(i + 2, text.count); continue }
+                        if text[i] == 96 { i += 1; hide(start); break }
+                        if text[i] == 36, i + 1 < text.count, text[i + 1] == 123 {
+                            i += 2; hide(start); code(true); start = i; continue
+                        }
+                        i += 1
+                    }
+                    hide(start); regexAllowed = false; previous = "literal"; continue
+                }
+                if word(c) {
+                    let start = i
+                    while i < text.count, word(text[i]) { i += 1 }
+                    previous = String(decoding: text[start..<i], as: UTF16.self)
+                    regexAllowed = ["return", "throw", "case", "delete", "void", "typeof", "new", "in", "of", "yield", "await", "else", "do"].contains(previous)
+                    continue
+                }
+                if (c == 43 || c == 45), next == c {
+                    i += 2; previous = "increment"; continue
+                }
+                i += 1
+                if c == 123 { braces.append(["=", "(", "[", ",", ":", "?", "return", "yield", "await"].contains(previous) || (interpolation && previous.isEmpty)) }
+                if c == 125 {
+                    if interpolation, braces.isEmpty { masked[i - 1] = 32; return }
+                    regexAllowed = !(braces.popLast() ?? false)
+                    previous = "}"; continue
+                }
+                if c == 40 { parens.append(["if", "while", "for", "with", "switch", "catch"].contains(previous)) }
+                regexAllowed = c == 41 ? (parens.popLast() ?? false) : ![93, 46].contains(c)
+                previous = String(decoding: [c], as: UTF16.self)
+            }
+        }
+        code()
+        return String(decoding: masked, as: UTF16.self)
+    }
+
+    /// Revision 1 ignored await. Keep the old source's lines and every literal byte.
+    static func legacySource(_ source: String) -> String {
+        let code = codeMask(source)
+        let tokens = try! NSRegularExpression(pattern: #"\bawait(?=\s)"#)
+        var text = Array(source.utf16)
+        for token in tokens.matches(in: code, range: NSRange(code.startIndex..., in: code)) {
+            guard let following = UnicodeScalar(UInt32(text[NSMaxRange(token.range)])),
+                  CharacterSet.whitespacesAndNewlines.contains(following) else { continue }
+            let prefix = (code as NSString).substring(to: token.range.location).trimmingCharacters(in: .whitespacesAndNewlines)
+            if prefix.hasSuffix(".") { continue }
+            for n in token.range.location..<NSMaxRange(token.range) { text[n] = 32 }
+        }
+        return String(decoding: text, as: UTF16.self)
+    }
+
+    @discardableResult
+    static func normalizeInterpreter(_ row: inout [String: JSONValue]) -> Bool {
+        guard case .object(var script)? = row["script"], case .string(let source)? = script["source"],
+              row["actionPin"]?.objectValue?["interpreter"] != .int(Int64(interpreterRevision)) else { return false }
+        let normalized = legacySource(source)
+        script["source"] = .string(normalized)
+        row["script"] = .object(script)
+        var pin = normalized == source ? row["actionPin"]?.objectValue ?? [:] : [:]
+        pin["digest"] = .string(digest(row["script"]) ?? "")
+        pin["interpreter"] = .int(Int64(interpreterRevision))
+        row["actionPin"] = .object(pin)
+        // Revision 1 also stripped literal/comment text. Every affected digest needs review.
+        return source.range(of: #"\bawait\s+"#, options: .regularExpression) != nil
     }
 
     /// SHA-256 of the stored script and header, canonical JSON (sorted keys).
@@ -335,6 +457,8 @@ public enum SkillScript {
     /// never makes a script runnable.
     public static func isRunnable(_ row: [String: JSONValue]) -> Bool {
         ["active", "installed"].contains(string(row["status"])?.lowercased() ?? "") && admitted(row)
+            && row["actionPin"]?.objectValue?["interpreter"] == .int(Int64(interpreterRevision))
+            && row["actionPin"]?.objectValue?["digest"] == digest(row["script"]).map(JSONValue.string)
     }
 
     /// The origin a row already carries, as one to merge: none for a row that
@@ -362,6 +486,8 @@ public enum SkillScript {
         if digest(script) != digest(before?["script"]) {
             row.removeValue(forKey: "admission")
             row["status"] = .string("draft")
+            row["actionPin"] = .object(["digest": .string(digest(script) ?? ""),
+                "interpreter": .int(Int64(interpreterRevision))])
         } else {
             row["admission"] = before?["admission"]
         }

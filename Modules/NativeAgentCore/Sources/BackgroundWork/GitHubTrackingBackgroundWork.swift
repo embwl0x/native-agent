@@ -69,7 +69,7 @@ private struct GitHubTrackingRunner: EventDeadlineLoopRunner {
                 dataRoot: dataRoot
             )
         } catch {
-            NSLog("GitHub tracking deadline unavailable: %@", error.localizedDescription)
+            nativeLog("GitHub tracking deadline unavailable: %@", error.localizedDescription)
             return nil
         }
     }
@@ -95,7 +95,7 @@ private struct GitHubTrackingRunner: EventDeadlineLoopRunner {
                 : .skipped(reason: "GitHub tracking not due or unchanged")
         } catch {
             // Typed GitHub errors never contain the PAT or request headers.
-            NSLog("github_tracking: refresh failed: \(error.localizedDescription)")
+            nativeLog("github_tracking: refresh failed: \(error.localizedDescription)")
             return .failed(error: error.localizedDescription)
         }
     }

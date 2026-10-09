@@ -13,11 +13,12 @@ Permanent public identifiers:
 Run the fail-closed readiness check from the repository root:
 
 ```bash
-NATIVEAGENT_PRODUCTION_CLOUDKIT_SCHEMA=/secure/path/production.ckdb \
-  ./script/ios_release.sh --preflight
+export NATIVEAGENT_PRODUCTION_CLOUDKIT_SCHEMA=/secure/path/production.ckdb
+./script/ios_release.sh --preflight
 ```
 
-When the preflight is green, create an archive and an IPA without uploading:
+When the preflight is green, create an archive and an IPA in the same shell
+without uploading. This command runs preflight again and needs the exported path:
 
 ```bash
 ./script/ios_release.sh --archive --export

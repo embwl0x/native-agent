@@ -113,7 +113,7 @@ extension NativeOAuthFlow {
             }
         } catch {
             return OAuthFlowResult(ok: false,
-                error: "Could not write xAI token file: \(error.localizedDescription)")
+                error: "Could not save xAI credentials in Keychain: \(error.localizedDescription)")
         }
 
         return OAuthFlowResult(ok: true, error: nil)
@@ -204,7 +204,7 @@ extension NativeOAuthFlow {
         }
         let path = OAuthCredentialDestinations.xAIProvider(dataRoot: dataRoot)
         try ProviderStateValidation.credential(tokens)
-        try NativeOAuthSupport.updateProviderCredential(at: path) { existing in
+        try NativeOAuthSupport.updateProviderCredential(at: path, replacingXAIGrant: true) { existing in
             // 2026-09-06: optional identity and expiry fields belong to this sign-in.
             // Keeping an old refresh token can switch a new account back on refresh.
             for key in ["tokens", "refresh_token", "id_token", "expires_in", "expires_at",

@@ -1,6 +1,7 @@
 import Foundation
 import KnowledgeGraph
 import MemoryV2
+import NativeAgentCore
 import PersistenceCore
 
 // User, 2026-09-05: "make it so she can do it." The agent's memory tools were
@@ -92,11 +93,13 @@ public struct MemoryCuration: Sendable {
     public func listMemories(input: [String: JSONValue], surface: String, persona: String?) async throws -> JSONValue {
         let offset = max(0, curationInt(input, "offset") ?? 0)
         let limit = min(100, max(1, curationInt(input, "limit") ?? 50))
-        let sort = curationString(input, "sort") ?? "newest_first"
+        let requestedSort = curationString(input, "sort")?.lowercased() ?? "newest_first"
+        let sort = ["newest": "newest_first", "latest": "newest_first", "oldest": "oldest_first"][requestedSort] ?? requestedSort
         guard ["newest_first", "oldest_first"].contains(sort) else {
             return curationRefusal("sort must be newest_first or oldest_first; keep the same sort when following next_after_id.")
         }
-        let status = curationString(input, "status") ?? "active"
+        let requestedStatus = curationString(input, "status")?.lowercased() ?? "active"
+        let status = ["kept": "active", "saved": "active", "current": "active"][requestedStatus] ?? requestedStatus
         guard ["active", "archived"].contains(status) else {
             return curationRefusal("status must be active or archived.")
         }
@@ -162,12 +165,20 @@ public struct MemoryCuration: Sendable {
         }()
         let page = ordered.dropFirst(start).prefix(limit)
         let rows: [JSONValue] = page.map { record in
+            MemoryDataProvenance.consume(record.extras, dataRoot: dataRoot)
             var row: [String: JSONValue] = [
                 "id": .string(record.id),
                 "text": .string(record.text),
                 "created_at": .string(record.createdAt),
             ]
+            row.merge(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot)) { _, value in value }
             if let kind = record.memoryKind { row["kind"] = .string(kind) }
+            if let warning = MemorySenseProvenance.warning(in: record.extras) {
+                row["sense_warning"] = .string(warning)
+            }
+            if case .object(let metadata)? = record.extras, let versions = metadata["sense_versions"] {
+                row["sense_versions"] = versions
+            }
             if let status = record.status { row["status"] = .string(status) }
             if let source = record.sourceRunId { row["source"] = .string(source) }
             if record.pinned == true { row["pinned"] = .bool(true) }
@@ -203,41 +214,48 @@ public struct MemoryCuration: Sendable {
         return .object(out)
     }
 
-    /// Change one memory in one update: its text (same row, same id, same
-    /// provenance; the embedding is recomputed by the owner), its pin, and/or
-    /// restore it from archived to active.
-    public func rewriteMemory(input: [String: JSONValue], surface: String, persona: String?) async throws -> JSONValue {
+    public func rewriteTarget(input: [String: JSONValue], surface: String, persona: String?) async throws -> MemoryRecord {
         guard let id = curationString(input, "id") else {
-            return curationRefusal("memory.rewrite needs the memory 'id' from memory.list or recall_memory.")
+            throw ToolFailureError("memory.rewrite needs the memory 'id' from memory.list or recall_memory.", effects: .none)
         }
         let text = curationString(input, "text")
         let pinned = curationBool(input, "pinned")
         let restore = curationBool(input, "restore") == true
         guard text != nil || pinned != nil || restore else {
-            return curationRefusal("memory.rewrite needs 'text' (the thing itself, one or two sentences), 'pinned' (true or false), or 'restore': true.")
+            throw ToolFailureError("memory.rewrite needs 'text' (the thing itself, one or two sentences), 'pinned' (true or false), or 'restore': true.", effects: .none)
         }
-        let row: MemoryRecord?
-        do {
-            row = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-                .memory(id: id).map(MemoryRecord.init(stored:))
-        } catch {
-            return .object(["status": .string("failed"), "reason": .string("\(error)")])
-        }
+        let row = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+            .memory(id: id).map(MemoryRecord.init(stored:))
         guard let row, MemoryRecordDisclosurePolicy.classify(
             personaID: row.personaId, status: Self.isRecoverable(row) ? "active" : row.status,
             lifecycle: Self.isRecoverable(row) ? nil : row.lifecycle,
             tags: row.tags, metadata: row.extras
         )?.permits(surface: surface, personaID: persona) == true else {
-            return curationRefusal("No memory with that id is available on this surface; nothing changed.")
+            throw ToolFailureError("No memory with that id is available on this surface; nothing changed.", effects: .none)
         }
+        if restore, !Self.isRecoverable(row) {
+            throw ToolFailureError("No archived or corrected memory with that id, so there is nothing to restore. memory.list status archived shows the ones that can come back.", effects: .none)
+        }
+        return row
+    }
+
+    /// Change one memory in one update: its text (same row, same id, same
+    /// provenance; the embedding is recomputed by the owner), its pin, and/or
+    /// restore it from archived to active.
+    public func rewriteMemory(input: [String: JSONValue], surface: String, persona: String?) async throws -> JSONValue {
+        let row: MemoryRecord
+        do { row = try await rewriteTarget(input: input, surface: surface, persona: persona) }
+        catch let error as ToolFailureError { return curationRefusal(error.localizedDescription) }
+        catch { return .object(["status": .string("failed"), "reason": .string("\(error)")]) }
+        let text = curationString(input, "text")
+        let pinned = curationBool(input, "pinned")
+        let restore = curationBool(input, "restore") == true
         var update: [String: JSONValue] = [:]
+        MemoryDataProvenance.consume(row.extras, dataRoot: dataRoot)
+        if case .object(let stamped)? = MemoryDataProvenance.stamping(.object(update)) { update = stamped }
         if let text { update["text"] = .string(text) }
         if let pinned { update["pinned"] = .bool(pinned) }
         if restore {
-            // The same rows memory.list status archived walks.
-            guard Self.isRecoverable(row) else {
-                return curationRefusal("No archived or corrected memory with that id, so there is nothing to restore. memory.list status archived shows the ones that can come back.")
-            }
             update["status"] = .string("active")
             if MemoryLifecycle.normalized(row.lifecycle) == MemoryLifecycle.corrected {
                 update["lifecycle"] = .string(MemoryLifecycle.confirmed)
@@ -251,14 +269,16 @@ public struct MemoryCuration: Sendable {
             if text == nil { update["text"] = .string(row.text) }
         }
         do {
-            let updated = try await memoryV2.updateMemory(id: id, update: .object(update))
-            return .object([
+            let updated = try await memoryV2.updateMemory(id: row.id, update: .object(update))
+            var result: [String: JSONValue] = [
                 "status": .string("ok"),
                 "id": .string(updated.id),
                 "text": .string(updated.text),
                 "pinned": .bool(updated.pinned == true),
                 "memory_status": .string(updated.status ?? "active"),
-            ])
+            ]
+            result.merge(MemoryDataProvenance.fields(in: updated.extras, dataRoot: dataRoot)) { _, value in value }
+            return .object(result)
         } catch MemoryV2Error.recordNotFound {
             return .object(["status": .string("failed"), "reason": .string("No memory with that id.")])
         } catch MemoryV2Error.underlying(let reason) where reason.hasPrefix("tombstoned") {

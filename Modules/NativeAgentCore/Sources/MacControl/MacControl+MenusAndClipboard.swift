@@ -106,7 +106,8 @@ extension SwiftNativeMacControl {
         let reading = MacMenuBar.read(
             source: accessibilitySource, pid: app.processIdentifier,
             top: wantedLevels.count > 1 ? wantedLevels.first : nil,
-            until: wanted == nil && wantedChord != nil ? hasChord : nil
+            until: wanted == nil && wantedChord != nil ? hasChord : nil,
+            depth: wanted == nil && wantedChord == nil ? MacMenuBar.maxPathDepth : MacMenuBar.findPathDepth
         )
         // A background app's menus report stale enabled states (File › Save
         // "disabled" on an edited document), so they are not claimed.
@@ -140,7 +141,7 @@ extension SwiftNativeMacControl {
             output["found"] = .array(hits.prefix(3).map { item in
                 var row: [String: JSONValue] = [
                     "path": MacScreenViewTextRedaction.redactedLegendString(
-                        item.display, valueChars: MacMenuBar.maxTitleChars * MacMenuBar.maxPathDepth
+                        item.display, valueChars: MacMenuBar.maxTitleChars * MacMenuBar.findPathDepth
                     ),
                 ]
                 if statesKnown { row["enabled"] = .bool(item.enabled) }
@@ -224,7 +225,8 @@ extension SwiftNativeMacControl {
         // Her-screen 09-24 — a path walks only its own top-level menu.
         let reading = MacMenuBar.read(
             source: accessibilitySource, pid: app.processIdentifier,
-            top: MacMenuBar.components(requested).first
+            top: MacMenuBar.components(requested).first,
+            depth: MacMenuBar.findPathDepth
         )
         if let unavailable = reading.unavailable {
             return refuse(
@@ -366,7 +368,7 @@ extension SwiftNativeMacControl {
                 "app": app.toJSON(),
                 "path": MacScreenViewTextRedaction.redactedLegendString(
                     item.display,
-                    valueChars: MacMenuBar.maxTitleChars * MacMenuBar.maxPathDepth
+                    valueChars: MacMenuBar.maxTitleChars * MacMenuBar.findPathDepth
                 ),
                 "opens_submenu": .bool(item.hasSubmenu),
                 // The press ran the app's handler. Whether the INTENDED

@@ -284,6 +284,10 @@ struct NativeAgentMobileApp: App {
     private func refreshOnForeground() {
         PhoneTurnActivity.shared.resume()
         guard pairingStore.usesICloudTransport else { return }
+        // The Mac's beat is re-read on activation (iCloudBridge); until it
+        // lands, an old sighting reads as finding the Mac, not losing it.
+        bridgeClient.connectingStartedAt = Date()
+        bridgeClient.refreshBridgeStatus()
         PhonePlaces.shared.resume()
         Task { @MainActor in
             await iCloudSyncEngine.shared.refreshSnapshots()
@@ -307,6 +311,9 @@ struct NativeAgentMobileApp: App {
                             bridgeClient.onNetworkPathRestored = { [weak chatStore = chatStore] in
                                 chatStore?.recoverQueuedSendTransport()
                                 PhoneTurnActivity.shared.resume()
+                            }
+                            iCloudBridge.shared.onTransportSucceeded = { [weak chatStore = chatStore] in
+                                chatStore?.recoverQueuedSendTransport()
                             }
                             configureNotifications()
                             configureTransport()

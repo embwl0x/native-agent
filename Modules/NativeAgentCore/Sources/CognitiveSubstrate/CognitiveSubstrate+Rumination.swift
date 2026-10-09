@@ -666,7 +666,7 @@ extension CognitiveSubstrate {
         do {
             try await persistPendingRuminationReleases()
         } catch {
-            NSLog("[cognition] rumination release not saved: %@", "\(error)")
+            nativeLog("[cognition] rumination release not saved: %@", "\(error)")
             return []
         }
         pendingRuminationReleases.removeAll { pending in

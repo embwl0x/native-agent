@@ -41,7 +41,7 @@ enum KnowledgeGraphMaintenancePresentation {
                 ? .noCandidates
                 : .candidates(report.candidates)
         } catch {
-            return .failed("Orphan sweep failed: \(error.localizedDescription)")
+            return .failed(UserFacingError.message(error, action: "sweep orphaned entities"))
         }
     }
 
@@ -79,7 +79,7 @@ enum KnowledgeGraphMaintenancePresentation {
                 return .previewDiverged(currentCandidates)
             }
         } catch {
-            return .failed("Orphan sweep failed: \(error.localizedDescription)")
+            return .failed(UserFacingError.message(error, action: "sweep orphaned entities"))
         }
     }
 

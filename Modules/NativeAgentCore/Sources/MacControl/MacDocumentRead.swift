@@ -53,6 +53,7 @@
 
 import Foundation
 import NativeAgentCore
+import Senses
 import PersistenceCore
 
 #if canImport(PDFKit) && os(macOS)
@@ -256,11 +257,11 @@ public enum MacDocumentRead {
             ))
             if shouldStop() { truncated = true; break }
             guard item.depth < maxDepthPerFrame else {
-                if source.childCount(of: item.ref) > 0 { truncated = true }
+                if source.childCount(of: item.ref) != 0 { truncated = true }
                 continue
             }
             let budget = max(0, maxNodesPerFrame - nodes)
-            let total = source.childCount(of: item.ref)
+            guard let total = source.childCount(of: item.ref) else { truncated = true; continue }
             if shouldStop() { truncated = true; break }
             let children = source.children(of: item.ref, limit: budget)
             if total > children.count { truncated = true }
@@ -310,6 +311,9 @@ public enum MacDocumentRead {
                 if kept.count < text.count { truncated = true; break collection }
             }
         }
+        SenseAppReadCapture.current?.appendFrame(nodes: MacScreenViewTextRedaction.redactedNodesJSON(collected,
+            valueChars: max(1, collected.reduce(0) { max($0, max($1.attributes.title?.count ?? 0, $1.attributes.value?.count ?? 0)) })),
+            truncated: truncated)
         return Frame(lines: lines, nodes: nodes, truncated: truncated, secureNodes: secure, didRedact: didRedact)
     }
 
@@ -488,6 +492,7 @@ public enum MacDocumentRead {
     public enum ExtractionFailure: String, Sendable, Equatable, Error {
         case fileTooLarge = "file_too_large"
         case unreadableDocument = "unreadable_document"
+        case fileNotFound = "file_not_found"
         case encryptedDocument = "encrypted_document"
         case noTextInDocument = "no_text_in_document"
         case unsupportedType = "unsupported_document_type"
@@ -587,6 +592,8 @@ public enum MacDocumentRead {
         case .fileTooLarge:
             return "\"\(name)\" is larger than \(maxFileBytes / (1024 * 1024)) MB, "
                 + "which is more than I will read in one go."
+        case .fileNotFound:
+            return "There is no file at \(path). Check the exact path (list the folder with files.list); nothing was read."
         case .unreadableDocument:
             return "I can open \"\(name)\" but I cannot make text out of it — "
                 + "it is damaged or it is not the kind of file its name claims."

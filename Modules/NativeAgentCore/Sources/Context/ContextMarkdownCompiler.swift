@@ -3,28 +3,9 @@ import Foundation
 import NativeAgentCore
 import PersonaEngine
 
-/// One fail-closed secret-shape policy for material entering derived context.
-/// Callers may reject content; this policy never redacts or authorizes it.
-public enum ContextSecretContentPolicy {
-    public static func containsSecretLikeContent(_ source: String) -> Bool {
-        secretPatterns.contains { pattern in
-            source.range(
-                of: pattern,
-                options: [.regularExpression, .caseInsensitive]
-            ) != nil
-        }
-    }
-
-    private static let secretPatterns = [
-        #"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----"#,
-        #"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b"#,
-        #"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"#,
-        #"\bgh[pousr]_[A-Za-z0-9]{20,}\b"#,
-        #"\bBearer[ \t]+[A-Za-z0-9._~+/=-]{20,}"#,
-        #"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"#,
-        #"(?m)^\s*(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|password|passwd|client[_ -]?secret)\s*[:=]\s*[\"']?[A-Za-z0-9_./+~=-]{12,}"#,
-    ]
-}
+// Preserve the Context module's public policy name while readers/helpers use
+// the same owner before composing source fragments into derived text.
+public typealias ContextSecretContentPolicy = NativeAgentCore.ContextSecretContentPolicy
 
 public protocol ContextMarkdownEmbeddingProvider: Sendable {
     var modelFingerprint: String { get }

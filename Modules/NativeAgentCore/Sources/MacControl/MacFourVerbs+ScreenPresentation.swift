@@ -1,14 +1,148 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Senses
 
 extension MacFourVerbs {
+    /// Merge every acquired pathless AX surface (notably open menus) into the
+    /// native representation, ahead of the document; the window compiler owns
+    /// every window-relative row. Pixel evidence stays with its own renderer.
+    static func addingNativeAX(_ supplement: MacFourVerbsSupplement, to page: inout NativePage,
+                               blocks: inout [[String: JSONValue]], targets: [ActTarget], frameID: String) throws {
+        let bundle = if case .app(let bundle) = page.corner { bundle } else { "*" }
+        var additions: [([String: JSONValue], NativeThing?)] = []
+        func add(_ text: String, thing: NativeThing? = nil, target: String? = nil) {
+            var block: [String: JSONValue] = ["text": .string(text), "path": .array([])]
+            if let thing { block["address"] = .string(thing.address) }
+            if let target { block["target"] = .string(target) }
+            additions.append((block, thing))
+        }
+        for value in supplement.values where !value.provenance.isVision {
+            add(value.text.display ?? (value.text.withheld ? "⟨redacted⟩" : ""))
+        }
+        var represented = Set(page.things.map(\.address))
+        var usedControls: Set<Int> = []
+        for candidate in supplement.targets where !candidate.provenance.isVision {
+            // The complete window compiler owns window-relative AX rows,
+            // including deliberately folded wrappers/decorations. A second
+            // mark list cannot reintroduce their discarded action handles.
+            // Pathless menus/popovers remain independent supplemental surfaces.
+            if candidate.sourceAXPath != nil { continue }
+            guard candidate.role != nil,
+                  let index = supplementalDuplicateIndex(candidate, among: targets) else {
+                // Still on screen: readable content, offered without verbs
+                // because it cannot be bound to exactly one acting target.
+                if let label = candidate.label?.display ?? (candidate.label?.withheld == true ? "⟨redacted⟩" : nil) {
+                    add(label)
+                }
+                continue
+            }
+            let target = targets[index]
+            let selector = target.roleOrdinal.map { "\(target.kind) \($0)" } ?? target.label
+            let address: String
+            if !target.handle.isEmpty {
+                address = try JSONValue.object(["app": .string(bundle), "frame_id": .string(frameID),
+                    "handle": .string(target.handle)]).serialize(pretty: false)
+            } else if let selector {
+                // Native popup items have no window handle or view mark.
+                // Their existing action mechanism resolves a current target;
+                // never invent a window-relative AX path for them.
+                var selection: [String: JSONValue] = ["app": .string(bundle), "__sense_screen_frame": .string(frameID),
+                    "target": .string(selector)]
+                if let label = target.label { selection["label"] = .string(label) }
+                address = try JSONValue.object(selection).serialize(pretty: false)
+            } else {
+                if let label = target.label { add(label) }
+                continue
+            }
+            let controlIndex = supplement.controls.indices.first { index in
+                let control = supplement.controls[index]
+                return !usedControls.contains(index) && control.provenance == .ax && control.sourceAXPath == candidate.sourceAXPath
+                    && control.kind == candidate.kind && control.label == candidate.label
+            }
+            let control = controlIndex.map { supplement.controls[$0] }
+            if let controlIndex { usedControls.insert(controlIndex) }
+            guard represented.insert(address).inserted else {
+                // A popup can also appear inside the window tree. Move its
+                // existing representation to the front, retaining its handle.
+                if let existing = blocks.firstIndex(where: {
+                    Self.string($0["text"])?.contains("[" + SenseScreenThings.printed(address) + "]") == true
+                }) {
+                    additions.append((blocks.remove(at: existing), nil))
+                }
+                continue
+            }
+            let row = supplement.contents.flatMap(\.rows).first {
+                $0.provenance == .ax && $0.sourceAXPath == candidate.sourceAXPath && $0.label == candidate.label
+            }
+            var details = control?.states ?? []
+            if let value = control?.value?.display { details.append(value) }
+            details += row?.detail.compactMap(\.display) ?? []
+            if !target.enabled, !details.contains("disabled") { details.append("disabled") }
+            if target.secret { details.append("secure") }
+            if let abstain = control?.abstain ?? row?.abstain { details.append(abstain) }
+            let name = target.label ?? (candidate.label?.withheld == true ? "⟨redacted⟩" : selector ?? target.kind)
+            let verbs = target.enabled && control?.abstain == nil && row?.abstain == nil
+                ? Self.nativeAXVerbs(target) : []
+            let detail = details.isEmpty ? nil : details.joined(separator: "; ")
+            let thing = NativeThing(name: name, kind: target.kind, address: address, detail: detail, verbs: verbs)
+            add("\(name) (\(target.kind)) [\(SenseScreenThings.printed(address))]"
+                + (detail.map { ": " + $0 } ?? "")
+                + (verbs.isEmpty ? "" : " · " + verbs.joined(separator: ", ")),
+                thing: thing, target: target.handle.isEmpty ? selector : nil)
+        }
+        guard !additions.isEmpty else { return }
+        add("Supplemental native surfaces were read through accessibility; their named targets are re-observed before acting.")
+        // Insert backwards at the same position so acquisition order is retained.
+        for (block, thing) in additions.reversed() {
+            blocks.insert(block, at: min(2, blocks.count))
+            if let thing { page.things.append(thing) }
+        }
+        page.text = blocks.compactMap { Self.string($0["text"]) }.joined(separator: "\n")
+        let positions = page.things.reduce(into: [String: String.Index]()) { positions, thing in
+            positions[thing.address] = page.text.range(of: "[" + SenseScreenThings.printed(thing.address) + "]")?.lowerBound
+        }
+        page.things.sort {
+            (positions[$0.address] ?? page.text.endIndex) < (positions[$1.address] ?? page.text.endIndex)
+        }
+    }
+
+    /// Publish capabilities of the exact route retained by fusion. A region
+    /// cannot be pressed, even when its AX mark advertises AXPress. Mark-only
+    /// dispatch supports AXPress and AXValue; handle dispatch also supports
+    /// focus and typing into a focusable editor. Selection invokes AXPress,
+    /// so a writable selection attribute alone cannot authorize that verb.
+    /// Physical scrolling needs a safe frame.
+    static func nativeAXVerbs(_ target: ActTarget) -> [String] {
+        let scrollable = target.frame != nil && (target.regionOnly || Self.physicalScrollKinds.contains(target.kind))
+            || (!target.isSupplemental && target.actions.contains("AXScrollToVisible"))
+        if target.regionOnly { return scrollable ? ["scroll"] : [] }
+        var verbs: [String] = []
+        if target.actions.contains("AXPress") { verbs.append("press") }
+        if target.physicalOnly { return verbs + (scrollable ? ["scroll"] : []) }
+        if !target.secret, Self.keystrokeEditableKinds.contains(target.kind),
+           target.settableAttributes.contains("AXValue")
+            || (!target.isSupplemental && target.settableAttributes.contains("AXFocused")) { verbs.append("type") }
+        if !target.isSupplemental {
+            if target.actions.contains("AXPress"), target.settableAttributes.contains("AXSelected") { verbs.append("select") }
+            if target.settableAttributes.contains("AXFocused") { verbs.append("focus") }
+        }
+        if scrollable { verbs.append("scroll") }
+        return verbs
+    }
+
     // MARK: - Zoom
 
     struct Zoom {
+        enum Scope { case whole, controls, readouts, visual }
         let screen: MacScreenRender.Screen
         let options: MacScreenRender.Options
         let note: String
+        let scope: Scope
+
+        init(screen: MacScreenRender.Screen, options: MacScreenRender.Options, note: String, scope: Scope = .whole) {
+            self.screen = screen; self.options = options; self.note = note; self.scope = scope
+        }
     }
 
     /// Scoping, WITHOUT renumbering. Controls carry no ordinals, so a control
@@ -70,7 +204,8 @@ extension MacFourVerbs {
                 ),
                 note: "Visual surface retained with \(visualRows + visualControls.count) interpreted region"
                     + (visualRows + visualControls.count == 1 ? "" : "s")
-                    + "; surrounding controls omitted."
+                    + "; surrounding controls omitted.",
+                scope: .visual
             )
         }
 
@@ -98,7 +233,7 @@ extension MacFourVerbs {
                 maxRows: options.maxRows, maxControls: options.maxControls,
                 maxValues: max(options.maxValues, Self.zoomMaxRows), maxWhereSteps: options.maxWhereSteps,
                 maxLabelChars: options.maxLabelChars
-            ), note: "\(matchingValues.count) observed readout\(matchingValues.count == 1 ? "" : "s") match; surrounding controls omitted.")
+            ), note: "\(matchingValues.count) observed readout\(matchingValues.count == 1 ? "" : "s") match; surrounding controls omitted.", scope: .readouts)
         }
 
         if asksForControls || (!matchingControls.isEmpty && matchingRows.isEmpty) {
@@ -132,7 +267,8 @@ extension MacFourVerbs {
                     + (asksForControls && screen.unclassifiedOmittedTargets > 0
                         ? " (\(screen.unclassifiedOmittedTargets) more weren't kept in this read; name one and I'll find it)"
                         : "")
-                    + "; the rest of the screen is unchanged."
+                    + "; the rest of the screen is unchanged.",
+                scope: .controls
             )
         }
 
@@ -193,6 +329,7 @@ extension MacFourVerbs {
         case .click: return "Clicked"
         case .open: return "Opened"
         case .type: return "Typed into"
+        case .focus: return "Focused"
         case .select: return "Selected"
         case .toggle: return "Toggled"
         case .dismiss: return "Dismissed"

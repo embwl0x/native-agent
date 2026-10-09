@@ -2,10 +2,8 @@ import MacIntegration
 
 /// Shared tool policy tables; turn intent is not inferred from message text.
 public enum ToolPreloadHeuristics {
-    /// The built-in SearXNG server's tools (MCPDispatcher default server).
-    public static let webSearchTools: Set<String> = [
-        "mcp__searxng-local__search", "mcp__searxng-local__fetch",
-    ]
+    /// The built-in SearXNG server's tool (MCPDispatcher default server).
+    public static let webSearchTools: Set<String> = ["mcp__searxng-local__search"]
 
     /// Dispatch-time Mac Integration permissions, also used by the parallel write veto.
     package static let macIntegrationGates: [String: (integration: String, mode: MacIntegrationPermissionMode)] = [
@@ -21,6 +19,8 @@ public enum ToolPreloadHeuristics {
         "mac_reminders_read": (MacIntegrationID.reminders, .read),
         "mac_reminders_update": (MacIntegrationID.reminders, .write),
         "mac_reminders_create": (MacIntegrationID.reminders, .write),
+        "mac_reminders_list_rename": (MacIntegrationID.reminders, .write),
+        "mac_reminders_list_create": (MacIntegrationID.reminders, .write),
         "mac_reminders_complete": (MacIntegrationID.reminders, .write),
         "mac_reminders_delete": (MacIntegrationID.reminders, .write),
         // mail group
@@ -28,11 +28,13 @@ public enum ToolPreloadHeuristics {
         "mail_read_batch": (MacIntegrationID.mail, .read),
         "mail_triage_batch": (MacIntegrationID.mail, .write),
         "mail_search": (MacIntegrationID.mail, .read),
+        "mail_senders": (MacIntegrationID.mail, .read),
         "mail_send": (MacIntegrationID.mail, .write),
         "mail_mark_read": (MacIntegrationID.mail, .write),
         "mail_archive": (MacIntegrationID.mail, .write),
         "mail_delete": (MacIntegrationID.mail, .write),
         "mail_reply": (MacIntegrationID.mail, .write),
+        "mail_draft": (MacIntegrationID.mail, .write),
         // messages group
         "messages_recent_threads": (MacIntegrationID.messages, .read),
         "messages_send": (MacIntegrationID.messages, .write),
@@ -40,6 +42,7 @@ public enum ToolPreloadHeuristics {
         "notes_search": (MacIntegrationID.notes, .read),
         "notes_create": (MacIntegrationID.notes, .write),
         "notes_update": (MacIntegrationID.notes, .write),
+        "notes_delete": (MacIntegrationID.notes, .write),
         // contacts group
         "contacts_search": (MacIntegrationID.contacts, .read),
         "contacts_create_or_update": (MacIntegrationID.contacts, .write),

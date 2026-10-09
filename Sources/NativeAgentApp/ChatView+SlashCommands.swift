@@ -99,6 +99,12 @@ extension ChatView {
 
     // PATCH-2026-05-08: wave2-chat-ux — slash command handler
     func handleSlashCommand(_ raw: String) {
+        guard !isSubmittingSend else { return }
+        guard !appModel.isSavingChatBrain else { return }
+        guard !isCapturing else {
+            showToast("Screen capture is still in progress")
+            return
+        }
         let commandDraft = text
         let commandSessionId = appModel.activeChatSessionId
         let commandEditedAt = draftEditedAt

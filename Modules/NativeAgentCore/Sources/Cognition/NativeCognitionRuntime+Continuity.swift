@@ -235,12 +235,12 @@ extension NativeCognitionRuntime {
     }
 
     nonisolated static func defaultClaudeWorklog() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/state/claude-worklog.jsonl")
+        AgentConversationView.claudeWorklogURL
     }
 
     /// Claude's worklog: shipped features and fixes, headline only.
     nonisolated static func claudeShipped(_ url: URL, kinds: Set<String> = ["feature", "fix"]) -> [(Date, String)] {
-        claudeWorklogTail(url).compactMap { object -> (Date, String)? in
+        ((try? AgentConversationView.claudeWorklogTail(url)) ?? []).compactMap { object -> (Date, String)? in
             guard kinds.contains(object["kind"] as? String ?? ""),
                   let at = MemoryMoments.parseTimestamp(object["ts"] as? String),
                   let summary = object["summary"] as? String else { return nil }
@@ -251,18 +251,7 @@ extension NativeCognitionRuntime {
     /// Phase 5 E1: Claude's newest worklog line of any kind — User is
     /// probably working with her.
     nonisolated static func claudeLastActivity(_ url: URL) -> Date? {
-        claudeWorklogTail(url).compactMap { MemoryMoments.parseTimestamp($0["ts"] as? String) }.max()
-    }
-
-    nonisolated static func claudeWorklogTail(_ url: URL) -> [[String: Any]] {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        try? handle.seek(toOffset: size > 65_536 ? size - 65_536 : 0)
-        let tail = String(decoding: (try? handle.readToEnd()) ?? Data(), as: UTF8.self)
-        return tail.split(separator: "\n").compactMap {
-            try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
-        }
+        ((try? AgentConversationView.claudeWorklogTail(url)) ?? []).compactMap { MemoryMoments.parseTimestamp($0["ts"] as? String) }.max()
     }
 
     /// Codex's own record of its work (the handoff the `codex.work_journal`

@@ -45,7 +45,7 @@ extension SwiftToolDispatcher {
         codexMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
         ompMessageWakeupHelperOverride: URL? = nil,
         ompMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
-        standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)? = nil,
+        standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)? = nil,
         standingBotSession: BotRunnerSession? = nil
     ) {
         self.init(

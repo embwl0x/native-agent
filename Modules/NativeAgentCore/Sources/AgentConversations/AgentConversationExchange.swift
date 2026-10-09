@@ -22,7 +22,7 @@ extension AgentConversationExchange {
             // A route that watched the answer finish says when (`replied_at`, the
             // last change it saw), not when it noticed it had stopped changing.
             if row.phase != "waiting", settledAt == nil || (!hadReply && reply != nil) {
-                settledAt = reply == nil ? Date() : Self.repliedAt(row.receipt, after: sentAt) ?? Date()
+                settledAt = Self.repliedAt(row.receipt, after: sentAt, key: reply == nil ? "ended_at" : "replied_at") ?? Date()
             }
         }
         phase = Self.state(row.phase)
@@ -109,10 +109,10 @@ extension AgentConversationExchange {
         return ("", true)
     }
 
-    private static func repliedAt(_ receipt: JSONValue?, after sent: Date) -> Date? {
-        guard case .object(let fields)? = receipt, let text = string(fields["replied_at"]) else { return nil }
+    private static func repliedAt(_ receipt: JSONValue?, after sent: Date, key: String) -> Date? {
+        guard case .object(let fields)? = receipt, let text = string(fields[key]) else { return nil }
         let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        iso.formatOptions = key == "ended_at" ? [.withInternetDateTime] : [.withInternetDateTime, .withFractionalSeconds]
         guard let at = iso.date(from: text), at >= sent, at <= Date() else { return nil }
         return at
     }

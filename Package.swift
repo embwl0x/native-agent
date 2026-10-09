@@ -13,7 +13,8 @@ let package = Package(
     products: [
         .executable(name: "nativeagent-link", targets: ["NativeAgentLink"]),
         .executable(name: "NativeAgentApp", targets: ["NativeAgentApp"]),
-        .executable(name: "NativeAgentChromeRelay", targets: ["NativeAgentChromeRelay"])
+        .executable(name: "NativeAgentChromeRelay", targets: ["NativeAgentChromeRelay"]),
+        .executable(name: "NativeAgentSenseHost", targets: ["NativeAgentSenseHost"])
     ],
     dependencies: [
         .package(url: "https://github.com/grpc/grpc-swift-2.git", exact: "2.4.3"),
@@ -30,6 +31,13 @@ let package = Package(
         .package(path: "Modules/NativeAgentCore")
     ],
     targets: [
+        .executableTarget(
+            name: "NativeAgentSenseHost",
+            dependencies: [.product(name: "Senses", package: "NativeAgentCore"),
+                           .product(name: "NativeAgentCore", package: "NativeAgentCore")],
+            path: "Sources/NativeAgentSenseHost",
+            resources: [.copy("../../Resources/Senses")]
+        ),
         .executableTarget(name: "NativeAgentLink", dependencies: [.product(name: "GrokLink", package: "NativeAgentCore"), .product(name: "PersistenceCore", package: "NativeAgentCore")], path: "Sources/NativeAgentLink"),
         .executableTarget(
             name: "NativeAgentChromeRelay",
@@ -66,6 +74,7 @@ let package = Package(
                 .product(name: "PersistenceCore", package: "NativeAgentCore"),
                 .product(name: "Desk", package: "NativeAgentCore"),
                 .product(name: "Studio", package: "NativeAgentCore"),
+                .product(name: "Senses", package: "NativeAgentCore"),
                 .product(name: "TurnTrace", package: "NativeAgentCore"),
                 .product(name: "Transcripts", package: "NativeAgentCore"),
                 .product(name: "Procedures", package: "NativeAgentCore"),
@@ -84,6 +93,7 @@ let package = Package(
                 .product(name: "TriggerScheduler", package: "NativeAgentCore"),
                 .product(name: "SchedulerExecution", package: "NativeAgentCore"),
                 .product(name: "StandingBots", package: "NativeAgentCore"),
+                .product(name: "SwarmRuns", package: "NativeAgentCore"),
                 // WAVE 32 W07 (2026-06-01): WorkshopExecution owns the read-side of
                 // GET /v1/missions, /v1/missions/<id>, /v1/missions/<id>/timeline
                 // (SwiftNativeWorkshopRunner queue + legacy-store reads).

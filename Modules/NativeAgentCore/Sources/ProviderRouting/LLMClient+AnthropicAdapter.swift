@@ -260,7 +260,7 @@ public final class AnthropicAdapter: LLMAdapter {
         // An injected session may carry URLSession's 60s default (or none at
         // all); match the OAuth lanes' resolved 240s so a stalled completion
         // fails instead of hanging the turn.
-        req.timeoutInterval = Self.requestTimeoutSeconds
+        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
 
         var body: [String: Any] = [
             "model": model,
@@ -460,7 +460,7 @@ public final class AnthropicAdapter: LLMAdapter {
         // An injected session may carry URLSession's 60s default (or none at
         // all); match the OAuth lanes' resolved 240s so a stalled completion
         // fails instead of hanging the turn.
-        req.timeoutInterval = Self.requestTimeoutSeconds
+        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
         // clear_at in the body REQUIRES its beta header. Same rule as the
         // OAuth lane: present iff a message carries the flag, absent
         // otherwise, so every pre-existing request stays byte-identical.
@@ -646,7 +646,9 @@ public final class AnthropicAdapter: LLMAdapter {
                 let bytes: URLSession.AsyncBytes
                 let response: URLResponse
                 do {
+                    if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                     (bytes, response) = try await session.bytes(for: req)
+                    if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
                 } catch {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "anthropic")")))
                     return
@@ -712,7 +714,7 @@ public final class AnthropicAdapter: LLMAdapter {
                         case "error":
                             // {"type":"error","error":{"type":"overloaded_error","message":"..."}}
                             let errObj = obj["error"] as? [String: Any]
-                            throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj ?? [:])))
+                            throw ProviderFailure.wireError(errObj ?? [:])
                         case "message_start":
                             let msg = obj["message"] as? [String: Any]
                             usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))

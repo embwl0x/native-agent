@@ -86,7 +86,7 @@ enum AgentWorkspaceWork {
         guard Set(locator.keys) == ["tool", "arguments"], locator["tool"] == .string(tool),
               case .object(let next)? = locator["arguments"] else { return nil }
         let offsets: Set<String> = tool == "desk_read" ? ["offset", "notes_offset", "refs_offset"] : ["desk_offset", "history_offset"]
-        let identities: Set<String> = tool == "desk_read" ? ["handle", "query"] : ["query", "session_id"]
+        let identities: Set<String> = tool == "desk_read" ? ["handle", "query", "updated_on"] : ["query", "session_id"]
         let allowed = offsets.union(identities).union(tool == "desk_read" ? ["structured"] : ["limit"])
         guard offsets.contains(changing), Set(next.keys).isSubset(of: allowed),
               identities.allSatisfy({ normalized(next[$0]) == normalized(input[$0]) }) else { return nil }

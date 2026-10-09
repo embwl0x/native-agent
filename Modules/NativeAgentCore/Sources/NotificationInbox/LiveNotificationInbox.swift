@@ -54,6 +54,13 @@ public actor LiveNotificationInbox {
             .appendingPathComponent("inbox.jsonl")
     }
 
+    /// The live root's shared inbox keeps its parsed rows between calls; a
+    /// fresh instance re-parses the whole feed. Any other root gets its own.
+    public static func live(dataRoot: URL) -> LiveNotificationInbox {
+        let path = livePath(dataRoot: dataRoot)
+        return path == shared.path ? shared : LiveNotificationInbox(path: path)
+    }
+
     /// The uncapped overflow shelf that retention moves rows onto, beside the
     /// feed it belongs to. Never trimmed — it is where "archived" stops meaning
     /// "deleted with a nicer word".
@@ -527,6 +534,13 @@ public actor LiveNotificationInbox {
     ) async throws -> Int {
         let targets = Set(ids.filter { !$0.isEmpty })
         guard !targets.isEmpty else { return 0 }
+        // Every loop asks once at launch and nearly none has a card: answer
+        // from the cached rows while the file is unchanged, without the lock.
+        if let rows = try? rows(), !rows.contains(where: {
+            Line(raw: Data(), row: $0).isActive && Self.id(of: $0).map(targets.contains) == true
+        }) {
+            return 0
+        }
         let now = clock()
         let changed = try await persistence.withFileLock(path) { () async throws -> Int in
             var lines = try Self.readLines(path)
@@ -552,56 +566,6 @@ public actor LiveNotificationInbox {
         }
         if changed > 0 { invalidate() }
         return changed
-    }
-
-    /// Appends one state-transition card while retiring every older active card
-    /// in the same producer-defined group. The latest-state gate, retirement,
-    /// and append share one lock, so concurrent producers cannot leave two
-    /// contradictory states active. Retired rows remain as ordinary history.
-    @discardableResult
-    public func appendReplacingActiveGroup(
-        _ row: JSONValue,
-        id: String,
-        source: String,
-        groupField: String,
-        groupValue: String,
-        stateField: String,
-        transitionAt: String,
-        ifLatestStateAllows: @escaping @Sendable (String?) -> Bool
-    ) async throws -> Bool {
-        guard !id.isEmpty, !source.isEmpty, !groupField.isEmpty,
-              !groupValue.isEmpty, !stateField.isEmpty else { return false }
-        let now = clock()
-        let inserted = try await persistence.withFileLock(path) { () async throws -> Bool in
-            var lines = try Self.readLines(path)
-            guard !lines.contains(where: { Self.id(of: $0.row) == id }) else { return false }
-            let matching = lines.indices.filter { index in
-                guard case .object(let object)? = lines[index].row else { return false }
-                return Self.string(object["source"]) == source
-                    && Self.string(object[groupField]) == groupValue
-            }
-            let latestState = matching.reversed().compactMap { index -> String? in
-                guard case .object(let object)? = lines[index].row else { return nil }
-                return Self.string(object[stateField])
-            }.first
-            guard ifLatestStateAllows(latestState) else { return false }
-
-            for index in matching where lines[index].isActive {
-                guard case .object(var object)? = lines[index].row else { continue }
-                object["status"] = .string("archived")
-                object["read_at"] = .string(transitionAt)
-                let archived = JSONValue.object(object)
-                lines[index] = Line(
-                    raw: Data(try archived.serialize(pretty: false).utf8),
-                    row: archived
-                )
-            }
-            lines.append(Line(raw: Data(try row.serialize(pretty: false).utf8), row: row))
-            try Self.write(retaining: lines, to: path, now: now)
-            return true
-        }
-        if inserted { invalidate() }
-        return inserted
     }
 
     /// One-shot/restart-safe convergence for grouped state streams written by

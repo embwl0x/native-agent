@@ -398,8 +398,8 @@ public enum StudioWanderLane {
 
             If you choose to spend it on a work, meeting it has to be HONEST — get the \
             actual thing in front of you first:
-            - a page: app {action:"browser.open", args:{url:"…", capture_source:true}}, then \
-            app {action:"browser.text"} or app {action:"browser.screenshot"}
+            - a page: app {action:"web.read", args:{url:"…"}}; to see it, \
+            app {action:"browser.open", args:{url:"…"}}, then app {action:"browser.screenshot"}
             - a document or a local file: app {action:"mac.read"}, or \
             app {action:"files.read", args:{path:"…"}}
             - something on the table: app {action:"studio.consult_read", args:{consult_id:"…"}} \

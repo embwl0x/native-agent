@@ -269,6 +269,7 @@ extension SwiftNativeTurnEngine {
         }
 
         if let cognitive {
+            payload["cognitiveCue"] = cognitiveCue(cognitive)
             let cognitivePreview = snapshotPreview(
                 cognitive,
                 maxCharacters: contextSnapshotCognitiveLimit
@@ -498,6 +499,40 @@ extension SwiftNativeTurnEngine {
             let value = trimmed.dropFirst(prefix.count)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    private nonisolated static func cognitiveCue(_ cognitive: String) -> JSONValue? {
+        let text = ChatSecretRedactor.redactText(cognitive)
+            .components(separatedBy: "[OrganismBehavior]")[0]
+        let lines = text.split(separator: "\n").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        var felt = false
+        for (index, line) in lines.enumerated() {
+            if line == "How you feel:" { felt = true; continue }
+            let kind: String
+            let wording: String
+            if line.hasPrefix("- "), let colon = line.firstIndex(of: ":") {
+                kind = line.dropFirst(2)[..<colon].lowercased()
+                    .replacingOccurrences(of: " ", with: "_")
+                wording = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            } else if felt {
+                kind = "felt"
+                wording = line
+            } else { continue }
+            // A Sound cue may carry its own rut nudge on the following line.
+            let measured = kind == "sound"
+                ? ([wording] + lines.dropFirst(index + 1).filter { $0.hasPrefix("- Sound:") })
+                    .joined(separator: " ")
+                : wording
+            guard !measured.isEmpty else { return nil }
+            return .object([
+                "kind": .string(String(decoding: kind.utf8.prefix(32), as: UTF8.self)),
+                "line": .string(String(decoding: measured.utf8.prefix(120), as: UTF8.self)),
+                "truncated": .bool(measured.utf8.count > 120),
+            ])
         }
         return nil
     }

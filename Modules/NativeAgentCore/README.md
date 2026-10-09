@@ -26,9 +26,8 @@ self-improvement, trust, provider routing, background cognition, connectors,
 Workshop, workflows, and the cognition/organism runtime.
 
 `Sources/` groups implementations by module, and `Package.swift` defines the
-actual products and dependency graph. In
-particular, `NativeAgentEvaluation` is evaluation support linked by ChatDrive
-and tests, not a second production cognition owner or a Mac app dependency.
+actual products and dependency graph. `NativeAgentEvaluation` and ChatDrive
+are retired and are not products or dependencies in the current manifests.
 
 ## Runtime status
 

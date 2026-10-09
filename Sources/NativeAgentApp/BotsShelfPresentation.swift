@@ -7,10 +7,10 @@ import ChatOrchestration
 
 /// Option B groups, preserving callers' filtered destinations and the Bots gate.
 enum BotsShelfRailProposal {
-    static func destinations(_ items: [SidebarItem], enabled: Bool) -> [String] {
-        guard enabled else { return items.map(\.rawValue) }
-        return everyday(items).map(\.rawValue) + ["Bots"] + configuration(items).map(\.rawValue)
-            + items.filter { $0 == .settings }.map(\.rawValue)
+    /// The rail top to bottom, Helpers included when it shows. The Navigate
+    /// menu's digits and ⌘K's pages read this, so ⌘N is the Nth rail row.
+    static func ordered(_ items: [SidebarItem], enabled: Bool) -> [SidebarItem] {
+        everyday(items) + (enabled ? [.bots] : []) + configuration(items) + items.filter { $0 == .settings }
     }
 
     static func everyday(_ items: [SidebarItem]) -> [SidebarItem] {

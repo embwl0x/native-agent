@@ -98,16 +98,11 @@ public actor BotRunner {
     private let shelf: ShelfStore
     private let session: BotRunnerSession
     private let dataRoot: URL
-    /// The Bots editor's "Tell me if": called after a standing run the helper
-    /// itself judged to meet its condition. The app owns the notification.
-    private let conditionMet: @Sendable (BotDefinition, ShelfEntry) async -> Void
-    public init(dataRoot: URL, session: @escaping BotRunnerSession,
-                conditionMet: @escaping @Sendable (BotDefinition, ShelfEntry) async -> Void = { _, _ in }) {
+    public init(dataRoot: URL, session: @escaping BotRunnerSession) {
         queue = BotRunQueue(dataRoot: dataRoot)
         shelf = ShelfStore(dataRoot: dataRoot)
         self.dataRoot = dataRoot
         self.session = session
-        self.conditionMet = conditionMet
     }
 
     /// The last line the helper is asked to end a conditioned run with.
@@ -149,7 +144,8 @@ public actor BotRunner {
     /// proceed, having already recorded why — nothing is spent after it.
     @discardableResult
     public func run(bot id: UUID, requestID: UUID? = nil,
-                    holdUnattended: @Sendable (BotDefinition) async -> Bool = { _ in false }) async throws -> ShelfEntry? {
+                    holdUnattended: @Sendable (BotDefinition) async -> Bool = { _ in false },
+                    deadlineExceeded: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ShelfEntry? {
         let claimed: BotRunQueue.ClaimedRun
         do { claimed = try await queue.claimWhenAvailable(bot: id, requestID: requestID) }
         catch BotRunAdmissionError.paused { return nil }
@@ -169,13 +165,15 @@ public actor BotRunner {
         let ask = condition.flatMap { $0.isEmpty ? nil : $0 }.map {
             "\n\nTell me if: \($0)\nEnd your reply with one last line on its own: \(Self.conditionMarker) yes if this run's result meets that condition, otherwise \(Self.conditionMarker) no. The app reads that line to decide whether to notify the person, and removes it."
         } ?? ""
-        let message = bot.brief + woke + (bot.outputFormat.map { "\n\n" + $0 } ?? "") + ask
+        let message = "You are \(bot.name), executing this standing job now. Complete the work and return its result in this turn; do not invoke or wait on your own Run control.\n\n"
+            + bot.brief + woke + (bot.outputFormat.map { "\n\n" + $0 } ?? "") + ask
         // This run is now on the task's stack: anything it reaches that asks
         // for THIS bot again is refused rather than parked on its own claim.
         return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
             try await BotRunQueue.$eventProvenance.withValue(claimed.provenance) {
                 try await BotRunQueue.$eventContext.withValue(claimed.context) {
-                    try await perform(bot, message: message, requestID: requestID, judgesCondition: !ask.isEmpty)
+                    try await perform(bot, message: message, requestID: claimed.runID,
+                                      judgesCondition: !ask.isEmpty, deadlineExceeded: deadlineExceeded)
                 }
             }
         }
@@ -188,20 +186,22 @@ public actor BotRunner {
         guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw StandingBotsError.invalidValue("question is empty")
         }
-        let bot = try await queue.claimWhenAvailable(bot: id, requestID: nil, manual: true).bot
+        let claimed = try await queue.claimWhenAvailable(bot: id, requestID: nil, manual: true)
+        let bot = claimed.bot
         defer { queue.finish(bot: id) }
         guard await BotRunGate.isReady() else { throw BotRunnerError.cannotRun("Provider check is not ready yet.") }
         if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
             throw BotRunnerError.cannotRun(problem)
         }
         return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
-            try await perform(bot, message: question, requestID: nil, asked: true)
+            try await perform(bot, message: question, requestID: claimed.runID, asked: true)
         }
     }
 
     public func resume(bot saved: BotDefinition, message: String,
                        holdUnattended: @Sendable (BotDefinition) async -> Bool) async throws -> ShelfEntry {
-        let bot = try await queue.claimWhenAvailable(bot: saved.id, requestID: nil).bot
+        let claimed = try await queue.claimWhenAvailable(bot: saved.id, requestID: nil)
+        let bot = claimed.bot
         defer { queue.finish(bot: saved.id) }
         guard bot == saved, !bot.paused, !(await holdUnattended(bot)) else { throw BotRunnerError.notPermitted }
         guard await BotRunGate.isReady() else { throw BotRunnerError.cannotRun("Provider check is not ready yet.") }
@@ -209,12 +209,13 @@ public actor BotRunner {
             throw BotRunnerError.cannotRun(problem)
         }
         return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([bot.id])) {
-            try await perform(bot, message: message, requestID: nil)
+            try await perform(bot, message: message, requestID: claimed.runID)
         }
     }
 
-    private func perform(_ bot: BotDefinition, message: String, requestID: UUID?, asked: Bool = false,
-                         judgesCondition: Bool = false) async throws -> ShelfEntry {
+    private func perform(_ bot: BotDefinition, message: String, requestID: UUID, asked: Bool = false,
+                         judgesCondition: Bool = false,
+                         deadlineExceeded: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ShelfEntry {
         let start = Date()
         let clock = ContinuousClock.now
         // A refused daily reservation means the turn never started: it is a run
@@ -228,7 +229,16 @@ public actor BotRunner {
             let session = self.session
             // Cancellation settles the ordinary client's transcript before the
             // claim is released. Never abandon a still-writing session task.
-            outcome = try await BotRunnerDeadline.settled(seconds: bot.budget.seconds) {
+            let queue = self.queue
+            outcome = try await BotRunnerDeadline.settled(seconds: bot.budget.seconds, onDeadline: {
+                do {
+                    try queue.markDeadlineExceeded(bot: bot.id, requestID: requestID)
+                    await deadlineExceeded("\(bot.name) exceeded its run limit; cancellation is still settling.")
+                } catch {
+                    nativeLog("bot deadline claim unavailable: %@", String(describing: error))
+                    await deadlineExceeded("\(bot.name) exceeded its run limit; its claim could not be updated: \(error)")
+                }
+            }) {
                 try await Self.$conditionVerdict.withValue(verdict) {
                     try await session(bot, message)
                 }
@@ -261,7 +271,7 @@ public actor BotRunner {
         // on an answer only a person can give. Same health as an approval.
         case .interrupted, .waitingForApproval, .waitingOnPerson: health = .partial
         }
-        var entry = ShelfEntry(id: requestID ?? UUID(), botId: bot.id, briefVersion: bot.briefVersion,
+        var entry = ShelfEntry(id: requestID, botId: bot.id, briefVersion: bot.briefVersion,
             runAt: start, coverageStart: start, coverageEnd: start,
             headline: BotHeadline.make(from: outcome.reply), findings: outcome.reply, changedSinceLastGood: "",
             uncertainties: outcome.detail.map { [$0] } ?? [],
@@ -275,8 +285,11 @@ public actor BotRunner {
         entry.model = outcome.model ?? bot.model
         entry.approvalID = outcome.approvalID
         if asked { entry.asked = true }
+        if judgesCondition {
+            entry.conditionMet = verdict?.met == nil ? nil : met
+            entry.conditionNotificationTitle = "\(bot.name): \(bot.notificationCondition ?? "")"
+        }
         try shelf.append(entry)
-        if met { await conditionMet(bot, entry) }
         return entry
     }
 }

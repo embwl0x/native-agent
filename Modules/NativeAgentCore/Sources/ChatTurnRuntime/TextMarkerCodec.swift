@@ -102,7 +102,7 @@ struct TextMarkerCodec: Sendable {
             return flush
         }
         let holdFrom: String.Index
-        if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pending, invoke: true) {
+        if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pending) {
             holdFrom = r.lowerBound
         } else {
             let tail = min(16, pending.count)
@@ -134,8 +134,22 @@ struct TextMarkerCodec: Sendable {
 
     /// 2026-09-22: once per round, not per result (51 copies in one turn);
     /// names only the marker form the protocol teaches.
-    func closeRound(_ carrier: inout String) {
-        carrier += "\n\nUse these verified results. If more action is needed, make another tool call (an exact <tool_use name=\"...\">{...}</tool_use> marker); otherwise answer the user directly.\n"
+    func closeRound(_ carrier: inout String, boundaryReason: LLMToolBoundaryReason? = nil) {
+        if let boundaryReason {
+            let reason: String
+            switch boundaryReason {
+            case .repeatedBlock: reason = "a tool call repeated the immediately preceding call"
+            case .repeatedAction: reason = "an action repeated an earlier action in the same reply"
+            case .fabricatedResult: reason = "it contained an invented tool result after a call"
+            case .postCallProse: reason = "it continued with prose after a call before receiving results"
+            }
+            carrier = "NativeAgent stopped this reply because \(reason). The results below account for the retained calls; calls after that boundary did not run. Use these results and make a new call only for work still needed. Do not repeat a completed action.\n" + carrier
+        }
+        carrier += "\n\nUse these verified results. If more work is needed, put the next calls in one <function_calls> block using <tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use>, then end at </function_calls>. Otherwise answer directly.\n"
+    }
+
+    var protocolFailureFeedback: String {
+        "No call from that reply ran. Make the needed call now: <function_calls><tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use></function_calls>. Use the real tool name and arguments. End at </function_calls> and wait for the result."
     }
 
     // MARK: - Bounces
@@ -143,7 +157,7 @@ struct TextMarkerCodec: Sendable {
     /// A round that tried to call a tool in a shape the protocol does not run.
     func malformedCall(in text: String) -> ToolCallProtocolViolation? {
         ToolCallParser.formattedToolCallViolation(
-            in: text, toolNames: catalogNames.union(turnActiveTools))
+            in: text, toolNames: catalogNames.union(turnActiveTools), parseInvoke: true)
     }
 
     /// A call-free round that is in-progress-shaped ("reading the README
@@ -168,21 +182,9 @@ struct TextMarkerCodec: Sendable {
     /// The unfulfilled-promise bounce; `bounce` is 1 or 2.
     func unfulfilledPromiseFeedback(bounce: Int) -> String {
         if bounce == 1 {
-            return "NativeAgent completion contract: your reply describes work "
-                + "as in progress but this runtime has NO background execution — "
-                + "work you narrate without a tool call never happens, and the "
-                + "user is left waiting. Continue NOW in this same turn: "
-                + "emit the next <tool_use name=\"tool_name\">{\"arg\": \"value\"}"
-                + "</tool_use> marker(s), or deliver your complete final answer. "
-                + "Tools ready: \(readyTools)."
+            return "Your reply announced work but made no tool call. Continue in this turn: put the next calls in one <function_calls> block using <tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use>, then end at </function_calls>, or give your complete answer. Tools ready: \(readyTools)."
         }
-        // BYTE-IDENTICAL to the pre-native-lane wording for every text-lane
-        // provider (gpt-5.5 blocking #2).
-        return "SECOND bounce — you again narrated instead of acting. This "
-            + "is your last continuation: either emit the exact tool_use "
-            + "marker for the next step right now, or give the user your "
-            + "complete final answer (including any concrete blocker). Do not "
-            + "describe future work."
+        return "Your reply again announced work without a tool call. This is the last continuation: put the next call in one <function_calls> block using <tool_use name=\"TOOL\">{\"arg\":\"value\"}</tool_use>, then end at </function_calls>, or give your complete answer including any concrete blocker."
     }
 
     // MARK: - Catalog carrier

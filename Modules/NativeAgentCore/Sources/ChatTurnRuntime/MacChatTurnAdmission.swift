@@ -6,20 +6,29 @@ import ChatTurnContracts
 import MacControl
 import NativeAgentCore
 
-public struct QueuedChatTurn: Identifiable, Equatable, Sendable {
+public struct QueuedChatTurn: Identifiable, Equatable, Sendable, Codable {
     public static let maxPerSession = 20
     public let id: String
     public let text: String
-    public let attachments: [NativeAgentShared.MultimodalAttachment]
+    public var attachments: [NativeAgentShared.MultimodalAttachment]
     public let createdAt: Date
     public let hideUserBubble: Bool
     /// A steering append attempt; reconcile commitment before queue replay.
-    public let enqueuedRunID: String?
-    public let macContinuation: MacWorkContinuation?
+    public var enqueuedRunID: String?
+    private var liveContinuation: MacWorkContinuation? = nil
+    public let hadMacContinuation: Bool
+    public var macContinuation: MacWorkContinuation? {
+        liveContinuation ?? (hadMacContinuation ? .unsupported("process_restarted", taskReference: id) : nil)
+    }
     /// Who sent it when it was not User at this Mac (the agent's own
     /// `chat_session`/composer sends). Rides the queue so the row it writes
     /// later still says so.
     public let origin: ChatMessageOrigin?
+    public var startedTurnID: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id, text, attachments, createdAt, hideUserBubble, enqueuedRunID, origin, startedTurnID, hadMacContinuation
+    }
 
     public init(
         id: String = UUID().uuidString,
@@ -37,7 +46,8 @@ public struct QueuedChatTurn: Identifiable, Equatable, Sendable {
         self.createdAt = createdAt
         self.hideUserBubble = hideUserBubble
         self.enqueuedRunID = enqueuedRunID
-        self.macContinuation = macContinuation
+        self.liveContinuation = macContinuation
+        self.hadMacContinuation = macContinuation != nil
         self.origin = origin
     }
 
@@ -47,7 +57,15 @@ public struct QueuedChatTurn: Identifiable, Equatable, Sendable {
         return attachments.count == 1 ? "One attachment" : "\(attachments.count) attachments"
     }
 
-    public var shouldDisplayInSendNextQueue: Bool { !hideUserBubble }
+    public var shouldDisplayInSendNextQueue: Bool { !hideUserBubble && startedTurnID == nil }
+
+    /// Whether Steer can hand this to a running turn. Attachments need a turn
+    /// of their own; the agent's own send would land there as User's words; a
+    /// saved steering row (run id) is replayed, never offered twice.
+    public var canSteerRunningTurn: Bool {
+        startedTurnID == nil && attachments.isEmpty && origin == nil && macContinuation == nil && !hideUserBubble
+            && enqueuedRunID == nil && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 public enum MacChatTurnAcceptance: Equatable, Sendable {
@@ -86,6 +104,7 @@ public extension MacChatTurnPresentationPort {
         fromQueue: Bool = false,
         requireIdleAndEmpty: Bool = false,
         enqueuedRunID: String? = nil,
+        queuedTurnID: String? = nil,
         macContinuation queuedContinuation: MacWorkContinuation? = nil,
         origin: ChatMessageOrigin? = nil
     ) async -> MacChatStartedTurn {
@@ -122,7 +141,9 @@ public extension MacChatTurnPresentationPort {
             }
             return MacChatStartedTurn(acceptance: .accepted(sessionId: targetSessionId), task: task)
         }
-        let requestTurnID = TurnTraceContext.mintTurnId()
+        // A queue storage failure refuses only queueing (below); an idle chat still sends.
+        await macChatTurns.loadQueuedTurnsIfNeeded()
+        let requestTurnID = queuedTurnID ?? TurnTraceContext.mintTurnId()
         let continuation = fromQueue ? queuedContinuation
             : await captureMacWorkContinuation(text, taskReference: requestTurnID)
         let envelope = continuation.map { TurnEnvelope.current(surface: "chat").withMacContinuation($0) }
@@ -168,7 +189,7 @@ public extension MacChatTurnPresentationPort {
             )
         }
         if !fromQueue && (sessionIsRunning || queueDrainIsStarting || !existingQueue.isEmpty) {
-            guard existingQueue.count < QueuedChatTurn.maxPerSession else {
+            guard existingQueue.filter({ $0.startedTurnID == nil }).count < QueuedChatTurn.maxPerSession else {
                 let rejection = rejectMacChatTurn("Send-next queue is full (20 messages)")
                 return MacChatStartedTurn(acceptance: rejection, task: nil)
             }
@@ -179,39 +200,19 @@ public extension MacChatTurnPresentationPort {
                 macContinuation: continuation,
                 origin: origin
             )
-            macChatTurns.queuedBySession[targetSessionId, default: []].append(turn)
-            presentMacChatTurn(.status(existingQueue.isEmpty ? "Message queued to send next" : "Message added to queue"))
-            // Item 5 (third conversation pass): an ordinary follow-up sent while
-            // a turn is working no longer has to wait for it to finish. Offer it
-            // to the running turn, which takes it at its next tool boundary —
-            // before it chooses another action. It stays in the queue (the
-            // visible Next row, Steer and remove included) until the turn
-            // takes it; refused or stranded → it runs exactly as it always
-            // did. Attachments are never steered: their
-            // bytes belong to a turn of their own.
-            // The agent's own send is never folded into a running turn: it
-            // would land there as User's words. Her queued sends do not keep
-            // User's correction from steering his running turn.
-            if continuation == nil, origin == nil, sessionIsRunning,
-               existingQueue.allSatisfy({ $0.origin != nil }), attachments.isEmpty,
-               !hideUserBubble, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Task { @MainActor in
-                    let taken = await ChatTurnSteering.shared.offer(
-                        ChatTurnSteering.Offer(id: turn.id, text: text),
-                        sessionId: targetSessionId
-                    ) {
-                        // Delivered (its transcript row is on disk): leave the queue.
-                        for (sid, turns) in self.macChatTurns.queuedBySession
-                        where turns.contains(where: { $0.id == turn.id }) {
-                            let left = turns.filter { $0.id != turn.id }
-                            self.macChatTurns.queuedBySession[sid] = left.isEmpty ? nil : left
-                        }
-                    }
-                    if taken {
-                        presentMacChatTurn(.status("Sent to the turn in progress"))
-                    }
-                }
+            await macChatTurns.updateQueuedTurns { queues in
+                guard queues[targetSessionId, default: []].filter({ $0.startedTurnID == nil }).count < QueuedChatTurn.maxPerSession else { return }
+                queues[targetSessionId, default: []].append(turn)
             }
+            if let error = macChatTurns.queueStorageError {
+                return MacChatStartedTurn(acceptance: rejectMacChatTurn(error), task: nil)
+            }
+            guard macChatTurns.queuedBySession[targetSessionId]?.contains(where: { $0.id == turn.id }) == true else {
+                return MacChatStartedTurn(acceptance: rejectMacChatTurn("Send-next queue is full (20 messages)"), task: nil)
+            }
+            presentMacChatTurn(.status(existingQueue.isEmpty ? "Message queued to send next" : "Message added to queue"))
+            // User, 2026-10-04: a send while she works waits its turn in the
+            // queue. Handing it to the running turn is his choice (Steer).
             if !sessionIsRunning && !macChatTurns.pausedQueueSessions.contains(targetSessionId) {
                 Task { @MainActor in await drainNextQueuedChatTurnIfPossible(sessionId: targetSessionId) }
             }
@@ -310,24 +311,7 @@ public extension MacChatTurnPresentationPort {
                 await persistChatTurnLifecycleUpdate(identity: closed.identity)
             }
             _ = macChatTurns.finishRuntime(sessionId: cleanupId, generation: generation)
-            // A steering offer the turn ended before it could take is not lost:
-            // it goes back to the head of the queue and runs as an ordinary
-            // turn, which is exactly what it would have done before item 5.
-            // An unsaved offer is still queued unless it was removed or already
-            // started; a saved one (run id) left the queue and always returns.
-            let stranded = await ChatTurnSteering.shared.takeStranded(sessionId: cleanupId)
-            for offer in stranded.reversed() {
-                var turns = macChatTurns.queuedBySession[cleanupId] ?? []
-                let wasQueued = turns.contains { $0.id == offer.id }
-                guard wasQueued || offer.enqueuedRunID != nil else { continue }
-                turns.removeAll { $0.id == offer.id }
-                turns.insert(
-                    QueuedChatTurn(id: offer.id, text: offer.text, attachments: [],
-                                   hideUserBubble: false, enqueuedRunID: offer.enqueuedRunID),
-                    at: 0
-                )
-                macChatTurns.queuedBySession[cleanupId] = turns
-            }
+            await macChatTurns.updateQueuedTurns { $0[cleanupId]?.removeAll { $0.startedTurnID == activityIdentity.turnId } }
             await drainNextQueuedChatTurnIfPossible(sessionId: cleanupId)
         }
         macChatTurns.tasks[targetSessionId] = task
@@ -402,51 +386,107 @@ public extension MacChatTurnPresentationPort {
 
     @MainActor
     func removeQueuedChatTurn(_ turnId: String, sessionId: String) {
-        Task { await ChatTurnSteering.shared.withdraw(id: turnId) }
-        guard var turns = macChatTurns.queuedBySession[sessionId] else { return }
-        turns.removeAll { $0.id == turnId }
-        if turns.isEmpty {
-            macChatTurns.queuedBySession.removeValue(forKey: sessionId)
-        } else {
-            macChatTurns.queuedBySession[sessionId] = turns
+        Task { @MainActor in
+            await macChatTurns.updateQueuedTurns { queues in
+                queues[sessionId]?.removeAll { $0.id == turnId && $0.startedTurnID == nil }
+            }
+            guard macChatTurns.queueStorageError == nil,
+                  macChatTurns.queuedBySession[sessionId]?.contains(where: { $0.id == turnId }) != true else { return }
+            await ChatTurnSteering.shared.withdraw(id: turnId)
+            macChatTurns.steeringTurnIDs.remove(turnId)
         }
     }
 
-    /// Promote one queued turn and interrupt the active response. The ordinary
-    /// Stop path pauses the queue; steering deliberately keeps it live so the
-    /// promoted turn starts only after cancellation persistence has completed.
+    /// Steer: hand one queued message to the running turn, which reads it at
+    /// its next tool boundary. It stays visible in the queue until the turn
+    /// takes it, and leaves only then: the handler refuses delivery when it is
+    /// no longer queued (removed, or started as its own turn), so it is sent
+    /// exactly once. A turn that ends first puts it at the head of the queue.
     @MainActor
     func steerQueuedChatTurn(_ turnId: String, sessionId: String) {
-        guard promoteQueuedChatTurn(turnId, sessionId: sessionId) else { return }
-        macChatTurns.pausedQueueSessions.remove(sessionId)
-        if macChatTurns.tasks[sessionId] != nil || macChatTurns.busySessions.contains(sessionId) || macChatTurns.streamingSessions.contains(sessionId) {
-            stopChatStream(sessionId: sessionId, pauseQueuedTurns: false)
-        } else {
-            Task { @MainActor in await drainNextQueuedChatTurnIfPossible(sessionId: sessionId) }
+        guard let turn = macChatTurns.queuedBySession[sessionId]?.first(where: { $0.id == turnId }),
+              turn.canSteerRunningTurn,
+              macChatTurns.steeringTurnIDs.insert(turnId).inserted else { return }
+        Task { @MainActor in
+            let taken = await ChatTurnSteering.shared.offer(
+                ChatTurnSteering.Offer(id: turnId, text: turn.text,
+                    envelope: TurnEnvelope(surface: "chat"), origin: turn.origin), sessionId: sessionId
+            ) { offer, committed in
+                self.macChatTurns.steeringTurnIDs.remove(turnId)
+                guard let entry = self.macChatTurns.queuedBySession
+                    .first(where: { $0.value.contains { $0.id == turnId } }) else { return false }
+                let saved = await self.macChatTurns.updateQueuedTurns { queues in
+                    if committed {
+                        queues[entry.key]?.removeAll { $0.id == turnId }
+                    } else if let index = queues[entry.key]?.firstIndex(where: {
+                        $0.id == turnId && ($0.startedTurnID == nil || $0.startedTurnID == offer.enqueuedRunID)
+                    }) {
+                        queues[entry.key]?[index].enqueuedRunID = offer.enqueuedRunID
+                        queues[entry.key]?[index].startedTurnID = offer.receivingTurnID ?? offer.enqueuedRunID
+                    }
+                }
+                return saved && (committed || self.macChatTurns.queuedBySession[entry.key]?.contains(where: {
+                    $0.id == turnId && $0.enqueuedRunID == offer.enqueuedRunID
+                        && $0.startedTurnID == (offer.receivingTurnID ?? offer.enqueuedRunID)
+                }) == true)
+            } onReturned: { offer in
+                self.macChatTurns.steeringTurnIDs.remove(offer.id)
+                await self.macChatTurns.updateQueuedTurns { queues in
+                    guard queues[sessionId]?.contains(where: { $0.id == offer.id }) == true || offer.enqueuedRunID != nil else { return }
+                    queues[sessionId]?.removeAll { $0.id == offer.id }
+                    queues[sessionId, default: []].insert(QueuedChatTurn(id: offer.id, text: offer.text,
+                        enqueuedRunID: offer.enqueuedRunID, origin: offer.origin), at: 0)
+                }
+            }
+            if taken {
+                presentMacChatTurn(.status("Steering: it lands at the next step"))
+            } else {
+                macChatTurns.steeringTurnIDs.remove(turnId)
+                presentMacChatTurn(.status("The reply in progress can't take it now; it stays queued"))
+            }
+        }
+    }
+
+    /// Send now: promote one queued turn and interrupt the active response.
+    /// The ordinary Stop path pauses the queue; this deliberately keeps it live
+    /// so the promoted turn starts only after cancellation persistence has completed.
+    @MainActor
+    func sendQueuedChatTurnNow(_ turnId: String, sessionId: String) {
+        Task { @MainActor in
+            guard await promoteQueuedChatTurn(turnId, sessionId: sessionId) else { return }
+            macChatTurns.pausedQueueSessions.remove(sessionId)
+            if macChatTurns.tasks[sessionId] != nil || macChatTurns.busySessions.contains(sessionId) || macChatTurns.streamingSessions.contains(sessionId) {
+                stopChatStream(sessionId: sessionId, pauseQueuedTurns: false)
+            } else {
+                await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
+            }
         }
     }
 
     @MainActor
     func resumeQueuedChatTurns(sessionId: String, startingWith turnId: String? = nil) {
-        if let turnId { _ = promoteQueuedChatTurn(turnId, sessionId: sessionId) }
-        macChatTurns.pausedQueueSessions.remove(sessionId)
-        Task { @MainActor in await drainNextQueuedChatTurnIfPossible(sessionId: sessionId) }
+        Task { @MainActor in
+            await macChatTurns.loadQueuedTurnsIfNeeded()
+            if let turnId, await promoteQueuedChatTurn(turnId, sessionId: sessionId) == false { return }
+            macChatTurns.pausedQueueSessions.remove(sessionId)
+            await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
+        }
     }
 
     @discardableResult
     @MainActor
-    func promoteQueuedChatTurn(_ turnId: String, sessionId: String) -> Bool {
-        guard var turns = macChatTurns.queuedBySession[sessionId],
-              let index = turns.firstIndex(where: { $0.id == turnId })
-        else { return false }
-        let selected = turns.remove(at: index)
-        turns.insert(selected, at: 0)
-        macChatTurns.queuedBySession[sessionId] = turns
-        return true
+    func promoteQueuedChatTurn(_ turnId: String, sessionId: String) async -> Bool {
+        let saved = await macChatTurns.updateQueuedTurns { queues in
+            guard let index = queues[sessionId]?.firstIndex(where: { $0.id == turnId && $0.startedTurnID == nil }),
+                  let selected = queues[sessionId]?.remove(at: index) else { return }
+            queues[sessionId]?.insert(selected, at: 0)
+        }
+        return saved && macChatTurns.queuedBySession[sessionId]?.first?.id == turnId
     }
 
     @MainActor
     func drainNextQueuedChatTurnIfPossible(sessionId: String) async {
+        await macChatTurns.loadQueuedTurnsIfNeeded()
         guard !sessionId.isEmpty,
               !macChatTurns.pausedQueueSessions.contains(sessionId),
               !macChatTurns.drainingQueueSessions.contains(sessionId),
@@ -463,6 +503,14 @@ public extension MacChatTurnPresentationPort {
             }
         }
         var replayRunID = candidate.enqueuedRunID
+        let attachments: [NativeAgentShared.MultimodalAttachment]
+        do {
+            attachments = try await macChatTurns.lifecycleStore.attachments(for: candidate)
+        } catch {
+            macChatTurns.pausedQueueSessions.insert(sessionId)
+            macChatTurns.queuePauseReasons[sessionId] = "Couldn't read a queued attachment. Restore its saved file before resuming: \(error.localizedDescription)"
+            return
+        }
         if let runID = replayRunID {
             do {
                 let committed = try await SwiftNativeChatOrchestrationClient.steeringMessageCommitted(
@@ -483,22 +531,24 @@ public extension MacChatTurnPresentationPort {
         guard !macChatTurns.pausedQueueSessions.contains(sessionId),
               macChatTurns.tasks[sessionId] == nil,
               !macChatTurns.busySessions.contains(sessionId),
-              var turns = macChatTurns.queuedBySession[sessionId],
-              turns.first?.id == candidate.id else { return }
-        turns.removeFirst()
+              macChatTurns.queuedBySession[sessionId]?.first?.id == candidate.id else { return }
+        guard candidate.startedTurnID == nil else { return }
+        macChatTurns.steeringTurnIDs.remove(candidate.id)
         let next = QueuedChatTurn(
-            id: candidate.id, text: candidate.text, attachments: candidate.attachments,
+            id: candidate.id, text: candidate.text, attachments: attachments,
             createdAt: candidate.createdAt, hideUserBubble: candidate.hideUserBubble,
             enqueuedRunID: replayRunID, macContinuation: candidate.macContinuation,
             origin: candidate.origin
         )
-        if turns.isEmpty {
-            macChatTurns.queuedBySession.removeValue(forKey: sessionId)
-        } else {
-            macChatTurns.queuedBySession[sessionId] = turns
-        }
+        guard await macChatTurns.updateQueuedTurns({ queues in
+            guard queues[sessionId]?.first?.id == candidate.id,
+                  queues[sessionId]?[0].startedTurnID == nil else { return }
+            queues[sessionId]?[0].startedTurnID = candidate.id
+        }), macChatTurns.queuedBySession[sessionId]?.first?.startedTurnID == candidate.id else { return }
         let acceptance: MacChatTurnAcceptance
-        if let queuedChatTurnStartOverride = macChatTurns.queuedChatTurnStartOverride {
+        if macChatTurns.pausedQueueSessions.contains(sessionId) {
+            acceptance = .rejected(message: "The queue is paused")
+        } else if let queuedChatTurnStartOverride = macChatTurns.queuedChatTurnStartOverride {
             acceptance = await queuedChatTurnStartOverride(next, sessionId)
         } else {
             // A queued successor keeps its own origin, not the finishing
@@ -513,6 +563,7 @@ public extension MacChatTurnPresentationPort {
                     requireActiveSession: false,
                     fromQueue: true,
                     enqueuedRunID: next.enqueuedRunID,
+                    queuedTurnID: next.id,
                     macContinuation: next.macContinuation,
                     origin: next.origin
                 ).acceptance
@@ -522,7 +573,12 @@ public extension MacChatTurnPresentationPort {
 
         // A session mutation or unexpected competing start won the await.
         // Preserve the user's turn at the head instead of dropping it.
-        macChatTurns.queuedBySession[sessionId, default: []].insert(next, at: 0)
+        await macChatTurns.updateQueuedTurns { queues in
+            queues[sessionId]?.removeAll { $0.id == next.id }
+            var waiting = candidate
+            waiting.startedTurnID = nil
+            queues[sessionId, default: []].insert(waiting, at: 0)
+        }
         macChatTurns.pausedQueueSessions.insert(sessionId)
         // 2026-09-06: carry the rejection's own words to the queue strip. A
         // pause with no stated cause is indistinguishable from one the person
@@ -535,9 +591,11 @@ public extension MacChatTurnPresentationPort {
     }
 
     @MainActor
-    func migrateQueuedChatTurns(from oldSessionId: String, to newSessionId: String) {
-        if let old = macChatTurns.queuedBySession.removeValue(forKey: oldSessionId), !old.isEmpty {
-            macChatTurns.queuedBySession[newSessionId] = old + (macChatTurns.queuedBySession[newSessionId] ?? [])
+    func migrateQueuedChatTurns(from oldSessionId: String, to newSessionId: String) async {
+        await macChatTurns.updateQueuedTurns { queues in
+            if let old = queues.removeValue(forKey: oldSessionId), !old.isEmpty {
+                queues[newSessionId] = old + (queues[newSessionId] ?? [])
+            }
         }
         if macChatTurns.pausedQueueSessions.remove(oldSessionId) != nil {
             macChatTurns.pausedQueueSessions.insert(newSessionId)

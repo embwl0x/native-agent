@@ -140,7 +140,7 @@ public enum LegacyCorrectionScopeMigration {
             storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
             rows = try await storage.listMemories(status: "active")
         } catch {
-            NSLog("[correctionScope] store not ready; migration deferred: \(String(describing: error))")
+            nativeLog("[correctionScope] store not ready; migration deferred: \(String(describing: error))")
             return
         }
 
@@ -201,7 +201,7 @@ public enum LegacyCorrectionScopeMigration {
                 }
             } catch {
                 // A failed write must not be stamped done.
-                NSLog("[correctionScope] write failed for \(row.id); migration deferred: \(String(describing: error))")
+                nativeLog("[correctionScope] write failed for \(row.id); migration deferred: \(String(describing: error))")
                 return
             }
             applied.append(.object([
@@ -238,7 +238,7 @@ public enum LegacyCorrectionScopeMigration {
             // receipt on every launch forever.
             complete: skipped.isEmpty || !anyMatched
         )
-        NSLog("[correctionScope] legacy scope review: scoped=\(applied.count) already_scoped=\(satisfied.count) skipped=\(skipped.count) kept_global=\(keptGlobal.count)")
+        nativeLog("[correctionScope] legacy scope review: scoped=\(applied.count) already_scoped=\(satisfied.count) skipped=\(skipped.count) kept_global=\(keptGlobal.count)")
     }
 
     // MARK: - Paths
@@ -295,7 +295,7 @@ public enum LegacyCorrectionScopeMigration {
                 try await core.writeDataAtomicDurable(Data(stamp.utf8), to: markerPath(dataRoot: dataRoot))
             }
         } catch {
-            NSLog("[correctionScope] receipt/marker write failed: \(String(describing: error))")
+            nativeLog("[correctionScope] receipt/marker write failed: \(String(describing: error))")
         }
     }
 

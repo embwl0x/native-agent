@@ -187,18 +187,11 @@ struct MemoryUpkeepPanel: View {
         #if canImport(CloudKit)
         let statusText = await withCKTimeout("MemoryUpkeepPanel.refreshCloudKitStatus") {
             let status = try await CKContainer.default().accountStatus()
-            switch status {
-            case .available: return "available"
-            case .noAccount: return "noAccount"
-            case .restricted: return "restricted"
-            case .temporarilyUnavailable: return "temporarilyUnavailable"
-            case .couldNotDetermine: return "unknown"
-            @unknown default: return "unknown"
-            }
+            return UserFacingError.iCloudAccount(status)
         }
-        cloudKitStatus = statusText ?? "timeout"
+        cloudKitStatus = statusText ?? UserFacingError.iCloudNoAnswer
         #else
-        cloudKitStatus = "unsupported"
+        cloudKitStatus = "iCloud isn't available"
         #endif
     }
 
@@ -341,7 +334,7 @@ struct MemorySpotlightReindexOperation {
     enum Outcome: Equatable, Sendable {
         case indexed(count: Int)
         case changedDuringReindex
-        case failed(message: String)
+        case failed(message: String, cause: String? = nil)
 
         var userMessage: String {
             switch self {
@@ -349,9 +342,15 @@ struct MemorySpotlightReindexOperation {
                 return "Spotlight reindexed \(count) memories"
             case .changedDuringReindex:
                 return "Memories changed while indexing. Reindex again from the latest saved state."
-            case .failed(let message):
+            case .failed(let message, _):
                 return "Spotlight reindex failed: \(message)"
             }
+        }
+
+        /// What the agent's tool result says: the same line plus the raw cause.
+        var agentMessage: String {
+            if case .failed(_, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
+            return userMessage
         }
     }
 
@@ -399,7 +398,7 @@ struct MemorySpotlightReindexOperation {
             )
             return .indexed(count: batch.count)
         } catch {
-            return .failed(message: error.localizedDescription)
+            return .failed(message: UserFacingError.cause(error, action: "reindex Spotlight"), cause: error.localizedDescription)
         }
     }
 
@@ -641,17 +640,10 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         #if canImport(CloudKit)
         snap.cloudKitAccountStatus = await withCKTimeout("MemoryV2NativeStackSnapshot.cloudKitAccount") {
             let status = try await CKContainer.default().accountStatus()
-            switch status {
-            case .available: return "available"
-            case .noAccount: return "noAccount"
-            case .restricted: return "restricted"
-            case .temporarilyUnavailable: return "temporarilyUnavailable"
-            case .couldNotDetermine: return "unknown"
-            @unknown default: return "unknown"
-            }
-        } ?? "timeout"
+            return UserFacingError.iCloudAccount(status)
+        } ?? UserFacingError.iCloudNoAnswer
         #else
-        snap.cloudKitAccountStatus = "unsupported"
+        snap.cloudKitAccountStatus = "iCloud isn't available"
         #endif
 
         return snap
@@ -921,6 +913,12 @@ private struct MemoryV2NativeStackPanel: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+                ForEach(summaryStatus?.afterTurn?.lines ?? [], id: \.self) { line in
+                    Text(line)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 DisclosureGroup(isExpanded: $showAdvancedDiagnostics) {
                     advancedDiagnostics
                         .padding(.top, 10)
@@ -1004,7 +1002,7 @@ private struct MemoryV2NativeStackPanel: View {
                     detail: snapshot.cloudKitAccountStatus == cloudKitStatus
                         ? "account check"
                         : "account: \(snapshot.cloudKitAccountStatus)",
-                    tint: cloudKitStatus == "available" ? .green : .secondary
+                    tint: cloudKitStatus == UserFacingError.iCloudSignedIn ? .green : .secondary
                 )
             }
             // UI-5: the long-term memory profile's real filename lives here,
@@ -1138,6 +1136,6 @@ private struct MemoryV2SummaryBar: View {
             }
         }
         .padding(10)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .houseInset(in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }

@@ -39,7 +39,7 @@ struct AppSchedulerExecutionPlatform: SchedulerExecutionPlatform {
         id: String, dryRun: Bool, input: [String: JSONValue],
         externalSendIdempotencyKey: String
     ) async throws -> (id: String, status: String) {
-        let receipt = try await NativeClient(baseURL: "").runConnectorAction(
+        let receipt = try await NativeClient().runConnectorAction(
             id: id, dryRun: dryRun, input: input,
             externalSendIdempotencyKey: externalSendIdempotencyKey
         )
@@ -47,27 +47,27 @@ struct AppSchedulerExecutionPlatform: SchedulerExecutionPlatform {
     }
 
     func runDream(force: Bool) async throws -> sending [String: Any] {
-        try await NativeClient(baseURL: "").runDream(force: force)
+        try await NativeClient().runDream(force: force)
     }
 
     func runRem(force: Bool) async throws -> sending [String: Any] {
-        try await NativeClient(baseURL: "").runRem(force: force)
+        try await NativeClient().runRem(force: force)
     }
 
     func startImprovement(objective: String) async throws -> (id: String, status: String?, phase: String?) {
-        let run = try await NativeClient(baseURL: "").startImprovement(objective: objective)
+        let run = try await NativeClient().startImprovement(objective: objective)
         return (run.id, run.status, run.phase)
     }
 
     func runHarnessBenchmark() async throws -> (id: String, status: String?) {
-        let run = try await NativeClient(baseURL: "").runHarnessBenchmark()
+        let run = try await NativeClient().runHarnessBenchmark()
         return (run.id, run.status)
     }
 
     func createWorkshopTask(
         title: String, objective: String, projectSpaceId: String?
     ) async throws -> (id: String, status: String) {
-        let execution = try await NativeClient(baseURL: "").createWorkshopTask(
+        let execution = try await NativeClient().createWorkshopTask(
             title: title, objective: objective, projectSpaceId: projectSpaceId
         )
         return (execution.id, execution.status)

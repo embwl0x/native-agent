@@ -12,52 +12,55 @@ private enum PairingKVSPublishResult: Sendable {
 }
 
 public enum PairingSecretManager {
+    private static let secretService = "NativeAgent.icloud-pairing"
+
+    private static func secretAccount(for url: URL) -> String {
+        SHA256.hash(data: Data(url.standardizedFileURL.path.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
     private static var secretURL: URL {
         PersistenceCore.defaultDataRoot().appendingPathComponent("icloud_pairing_secret.bin")
     }
 
-    /// Loads the exact regular 0600 32-byte secret, or durably creates one when
+    /// Loads the exact device-only Keychain secret, or creates one when
     /// and only when it is missing. Existing invalid state remains untouched
     /// and makes pairing unavailable until the user deliberately repairs it.
     public static func loadOrGenerateSecret() throws -> Data {
         try loadOrGenerateSecret(at: secretURL)
     }
 
-    /// Internal injection seam for exact persistence-boundary tests.
     static func loadOrGenerateSecret(at url: URL) throws -> Data {
-        try CheckedFixedSizeSecretFile.loadOrCreate(at: url, byteCount: 32) {
-            var bytes = [UInt8](repeating: 0, count: 32)
-            let status = SecRandomCopyBytes(kSecRandomDefault, 32, &bytes)
-            guard status == errSecSuccess else {
-                throw NSError(
-                    domain: NSOSStatusErrorDomain,
-                    code: Int(status),
-                    userInfo: [NSLocalizedDescriptionKey: "secure random generation failed"]
-                )
-            }
-            return Data(bytes)
+        try CredentialFileLock.withLock(url) {
+            if let existing = try existingSecret(at: url) { return existing }
+            let secret = try generateSecret()
+            try DeviceSecretKeychain.insert(secret, service: secretService, account: secretAccount(for: url))
+            return secret
         }
     }
 
-    /// Explicit, atomic rotation. The prior canonical bytes remain active if
-    /// generation, persistence, verification, or cleanup fails.
+    /// Explicit Keychain rotation with read-back verification and rollback
+    /// of the prior bytes if verification fails.
     public static func rotateSecret() throws -> Data {
         try rotateSecret(at: secretURL)
     }
 
     static func rotateSecret(at url: URL) throws -> Data {
-        try CheckedFixedSizeSecretFile.replace(at: url, byteCount: 32) {
-            var bytes = [UInt8](repeating: 0, count: 32)
-            let status = SecRandomCopyBytes(kSecRandomDefault, 32, &bytes)
-            guard status == errSecSuccess else {
-                throw NSError(
-                    domain: NSOSStatusErrorDomain,
-                    code: Int(status),
-                    userInfo: [NSLocalizedDescriptionKey: "secure random generation failed"]
-                )
-            }
-            return Data(bytes)
+        try CredentialFileLock.withLock(url) {
+            guard try existingSecret(at: url) != nil else { throw DeviceSecretKeychain.Failure.unavailable }
+            let secret = try generateSecret()
+            try DeviceSecretKeychain.replace(secret, service: secretService, account: secretAccount(for: url))
+            return secret
         }
+    }
+
+    private static func generateSecret() throws -> Data {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, 32, &bytes)
+        guard status == errSecSuccess else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status),
+                          userInfo: [NSLocalizedDescriptionKey: "secure random generation failed"])
+        }
+        return Data(bytes)
     }
 
     /// Base-64 string of the current secret (for display / manual entry on iOS).
@@ -65,20 +68,38 @@ public enum PairingSecretManager {
         try loadOrGenerateSecret().base64EncodedString()
     }
 
-    /// The secret as it already is on disk, or nil when there is none.
+    /// The existing secret, migrating legacy disk material without generating.
     ///
     /// A read must not make the thing it reads. `currentSecretBase64()` goes
     /// through `loadOrGenerateSecret`, which CREATES the canonical pairing
-    /// secret when the file is missing — fine for the page a person opened,
+    /// secret when storage is missing — fine for the page a person opened,
     /// wrong for a quiet offscreen read of Connectors, which would mint
     /// pairing authority nobody asked for.
     public static func existingSecretBase64() throws -> String? {
         try existingSecret(at: secretURL)?.base64EncodedString()
     }
 
-    /// Internal injection seam, matching `loadOrGenerateSecret(at:)`.
     static func existingSecret(at url: URL) throws -> Data? {
-        try CheckedFixedSizeSecretFile.peekExisting(at: url, byteCount: 32)
+        try CredentialFileLock.withLock(url) {
+            let account = secretAccount(for: url)
+            let legacy = try CheckedFixedSizeSecretFile.peekExisting(at: url, byteCount: 32)
+            var current = try DeviceSecretKeychain.read(service: secretService, account: account)
+            if let current, current.count != 32 { throw DeviceSecretKeychain.Failure.unavailable }
+            if let legacy {
+                if let current {
+                    guard current == legacy else { throw DeviceSecretKeychain.Failure.unavailable }
+                } else {
+                    try DeviceSecretKeychain.insert(legacy, service: secretService, account: account)
+                    current = legacy
+                }
+                // Insert verifies the exact Keychain bytes before legacy removal.
+                guard try DeviceSecretKeychain.read(service: secretService, account: account) == legacy else {
+                    throw DeviceSecretKeychain.Failure.unavailable
+                }
+                try FileManager.default.removeItem(at: url)
+            }
+            return current
+        }
     }
 
     // Phase 14e-iCloud HMAC self-heal: monotonic pairing_secret_version stamped
@@ -101,7 +122,7 @@ public enum PairingSecretManager {
         do {
             secret = try loadOrGenerateSecret()
         } catch {
-            NSLog("[PairingBootstrap] Pairing unavailable; refusing KVS publish: \(error.localizedDescription)")
+            nativeLog("[PairingBootstrap] Pairing unavailable; refusing KVS publish: \(error.localizedDescription)")
             return false
         }
         return await publishMaterialToKVS(secret, forceBumpVersion: forceBumpVersion)
@@ -148,10 +169,10 @@ public enum PairingSecretManager {
 
         switch result {
         case .skippedCurrent:
-            NSLog("[PairingBootstrap] KVS already has current HMAC secret — skipping publish")
+            nativeLog("[PairingBootstrap] KVS already has current HMAC secret — skipping publish")
             return true
         case .published(let nextVersion, let synced):
-            NSLog(
+            nativeLog(
                 "[PairingBootstrap] Published HMAC pairing_secret_version=%d to KVS (synchronize=%@)",
                 nextVersion, synced ? "ok" : "deferred"
             )
@@ -172,7 +193,7 @@ public enum PairingSecretManager {
         do {
             secret = try loadOrGenerateSecret()
         } catch {
-            NSLog("[PairingBootstrap] Pairing unavailable; refusing device publish: \(error.localizedDescription)")
+            nativeLog("[PairingBootstrap] Pairing unavailable; refusing device publish: \(error.localizedDescription)")
             return false
         }
         return await publishMaterial(secret, to: transport)
@@ -183,22 +204,24 @@ public enum PairingSecretManager {
         guard secret.count == 32 else { return false }
         do {
             try await transport.publishPairing(secret: secret)
-            NSLog("[PairingBootstrap] Published canonical HMAC material through device transport")
+            nativeLog("[PairingBootstrap] Published canonical HMAC material through device transport")
             return true
         } catch {
-            NSLog("[PairingBootstrap] Device-transport pairing publish failed: \(error.localizedDescription)")
+            nativeLog("[PairingBootstrap] Device-transport pairing publish failed: \(error.localizedDescription)")
             return false
         }
     }
 
-    /// Delete only a currently valid canonical secret after explicit user
-    /// confirmation. Invalid or non-regular state remains preserved.
+    /// Delete only a currently valid canonical Keychain secret after explicit
+    /// user confirmation. Invalid legacy state remains preserved.
     static func deleteSecret() throws {
         try deleteSecret(at: secretURL)
     }
 
     static func deleteSecret(at url: URL) throws {
-        _ = try loadOrGenerateSecret(at: url)
-        try FileManager.default.removeItem(at: url)
+        try CredentialFileLock.withLock(url) {
+            _ = try existingSecret(at: url)
+            try DeviceSecretKeychain.delete(service: secretService, account: secretAccount(for: url))
+        }
     }
 }

@@ -89,19 +89,7 @@ enum SnapshotHealthLog {
     }
 
     static func viewName(for filename: String) -> String {
-        let known = [
-            "desk.json": "Desk", "work_overview.json": "Work overview", "scheduler.json": "Scheduler", "memories.json": "Memories", "inbox.json": "Inbox",
-            "approvals.json": "Approvals", "workshop_tasks.json": "Workshop",
-            "providers.json": "Providers", "connectors.json": "Connectors",
-            "health.json": "Health", "trust_policy.json": "Trust",
-            "chat_sessions.json": "Chats", "memory_proposals.json": "Memory proposals",
-            "organism_living_status.json": "Status"
-        ]
-        if let name = known[filename] { return name }
-        return filename
-            .replacingOccurrences(of: ".json", with: "")
-            .replacingOccurrences(of: "_", with: " ")
-            .capitalized
+        NAMobileSnapshotGroup.snapshotPageName(filename)
     }
 }
 
@@ -314,7 +302,6 @@ extension iCloudSyncEngine {
         let schedulerLoaded = await refreshSchedulerSnapshot()
         let bundle = await Self.loadAllSnapshots(snapshotDir: snapshotDir)
         let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
-        await MacIntegrationPermissionsSync.shared.refreshProjection()
         // Resumption of an @MainActor async func is back on the main actor.
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
@@ -444,7 +431,6 @@ extension iCloudSyncEngine {
         await settleUnobservedActionResponses()
         let bundle = await Self.loadLightweightSnapshots(snapshotDir: snapshotDir)
         let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
-        await MacIntegrationPermissionsSync.shared.refreshProjection()
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         if let v = bundle.trustPolicy { trustPolicy = v }
@@ -505,7 +491,7 @@ extension iCloudSyncEngine {
             in: snapshotDir
         ) else { return }
         guard lifecycle == lifecycleGeneration else { return }
-        staleSnapshotGroups = markers.filter { !$0.key.hasPrefix("_") }
+        staleSnapshotGroups = NAMobileSnapshotGroup.stalenessMessages(markers)
     }
 
     func refreshApprovalsSnapshot() async {
@@ -1115,7 +1101,8 @@ extension iCloudSyncEngine {
             guard !clean.isEmpty else { continue }
             out[clean] = PublishedTranscript(
                 records: row.messages,
-                generation: row.transcriptGeneration
+                generation: row.transcriptGeneration,
+                hasOlder: row.hasOlder ?? false
             )
         }
         return out

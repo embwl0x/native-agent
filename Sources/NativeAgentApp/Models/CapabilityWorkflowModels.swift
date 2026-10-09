@@ -64,11 +64,7 @@ enum IntentRoutePresentation: Equatable {
     }
 
     static func boundedFailure(_ error: Error) -> String {
-        let normalized = error.localizedDescription
-            .split(whereSeparator: { $0.isWhitespace })
-            .joined(separator: " ")
-        guard !normalized.isEmpty else { return "The router did not return an error description." }
-        return normalized.count > 240 ? String(normalized.prefix(240)) + "…" : normalized
+        UserFacingError.cause(error, action: "plan that route")
     }
 }
 

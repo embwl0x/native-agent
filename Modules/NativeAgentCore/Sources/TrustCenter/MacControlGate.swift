@@ -386,7 +386,7 @@ public enum MacControlGate {
     /// diverging from Python's `/private/etc/hosts ...`. We apply the
     /// well-known three-prefix rewrite explicitly to recover parity for
     /// the refusal-string surface AND for workspace-root containment checks.
-    static func resolvedPath(_ raw: String) -> String {
+    public static func resolvedPath(_ raw: String) -> String {
         let expanded = (raw as NSString).expandingTildeInPath
         let url = URL(fileURLWithPath: expanded).standardizedFileURL
         let resolved = url.resolvingSymlinksInPath().path

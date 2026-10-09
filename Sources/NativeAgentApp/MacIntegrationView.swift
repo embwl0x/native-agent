@@ -1,3 +1,4 @@
+import TrustCenter
 // PATCH-2026-06-07: mac-integration-tab — per-integration READ/WRITE permission
 // toggles for Calendar, Reminders, Contacts, Mail, Messages, Notes, Music,
 // Notifications (mac + mobile), Spotlight, Scheduler. Binds against the W1
@@ -129,7 +130,7 @@ private struct MacIntegrationPermissionLoadErrorPanel: View {
     let retry: () -> Void
 
     var body: some View {
-        MacSection(title: "Permissions") {
+        AdvancedSection(title: "Permissions") {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Permission controls unavailable")
                     .font(ShellType.bodySemibold)
@@ -237,6 +238,11 @@ enum MacIntegrationPermissionFailurePresentation {
 }
 
 struct MacIntegrationView: View {
+    /// Trust's one Mac tab: Chrome control and Mac control lead, the per-app
+    /// grants follow. Off where this view stands alone.
+    var showsMacControl = false
+    /// Mac control's unsaved edits, held by Trust's page across tab switches.
+    var macControlDraft: Binding<TrustMacControlPolicy?>? = nil
     @Environment(\.scenePhase) private var scenePhase
     @State private var permissions: [String: MacIntegrationPermission] = [:]
     @State private var isLoading: Bool = true
@@ -262,7 +268,7 @@ struct MacIntegrationView: View {
 
     /// Maps the shared `SystemPermissionStatus` onto the snake_case status
     /// strings this view's badges and Grant/Open-Settings branches already use.
-    private static func badgeKey(_ status: SystemPermissionStatus) -> String {
+    nonisolated private static func badgeKey(_ status: SystemPermissionStatus) -> String {
         switch status {
         case .granted: return "granted"
         case .denied: return "denied"
@@ -275,12 +281,18 @@ struct MacIntegrationView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                if showsMacControl {
+                    AdvancedSection(title: "Chrome control") {
+                        ChromeControlPermissionsView()
+                    }
+                    MacControlPermissionsView(draft: macControlDraft)
+                }
                 Text("Choose which Mac apps and features I can read from or use. Contacts, Mail, Messages and Notes start with read on and write off; turn on write to let me send or change anything there. Changes apply right away.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                MacSection(title: "System permissions") {
+                AdvancedSection(title: "System permissions") {
                     Text("Grant only the access you want to use. You can return here later; ordinary text chat needs none of these permissions.")
                         .font(ShellType.caption)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -353,7 +365,7 @@ struct MacIntegrationView: View {
                         retry: { Task { await loadPermissions() } }
                     )
                 case .controlsAvailable:
-                    MacSection(title: "Apps and features") {
+                    AdvancedSection(title: "Apps and features") {
                         ForEach(MacIntegrationID.all, id: \.self) { id in
                             integrationRow(for: id)
                         }
@@ -366,7 +378,7 @@ struct MacIntegrationView: View {
                 // ops, iOS remote) and the assistant watch live in the Trust
                 // tab — pointed to here so each control has one discoverable
                 // home instead of the old two-tab split.
-                MacSection(title: "Mac control capabilities") {
+                AdvancedSection(title: "Mac control capabilities") {
                     Text("Shell commands, AppleScript, clicking and typing, file operations, iPhone remote control and background watches live on the Trust page under Mac control.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -387,6 +399,13 @@ struct MacIntegrationView: View {
         .liveTask(id: scenePhase) {
             guard scenePhase == .active else { return }
             await loadInitialTCCStatuses()
+        }
+        // A screenshot's offscreen copy reads the same two states — both are
+        // reads, and the TCC probes never prompt — minus the cache write.
+        // Without it every permission drew "Unknown" over a loading line.
+        .quietReadTask(live: false) {
+            await loadPermissions()
+            await loadInitialTCCStatuses(savesCache: false)
         }
         // TCC changes happen outside NativeAgent in System Settings. Returning
         // to the app produces a real scene activation edge, so reread then
@@ -447,10 +466,10 @@ struct MacIntegrationView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(MacIntegrationID.displayName(for: id))
-                    .font(ShellType.bodySemibold)
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                 Text(MacIntegrationID.description(for: id))
-                    .font(ShellType.label)
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -508,7 +527,7 @@ struct MacIntegrationView: View {
         } catch {
             guard generation == permissionLoadGeneration else { return }
             permissions = [:]
-            permissionLoadError = error.localizedDescription
+            permissionLoadError = UserFacingError.message(error, action: "load the saved Mac Integration permissions")
         }
         guard generation == permissionLoadGeneration else { return }
         isLoading = false
@@ -540,15 +559,9 @@ struct MacIntegrationView: View {
                             read: current.read,
                             write: current.write
                         )
-                        // Publish to the phone only after persistence succeeds.
-                        NativeAgentEngine.liveDeviceSync.macIntegrationPermissions.push(
-                            id: id,
-                            read: current.read,
-                            write: current.write
-                        )
                     } catch {
                         permissions[id] = previous
-                        persistenceError = "Failed to save \(MacIntegrationID.displayName(for: id)) permission: \(error.localizedDescription)"
+                        persistenceError = UserFacingError.message(error, action: "save the \(MacIntegrationID.displayName(for: id)) permission")
                     }
                 }
             }
@@ -580,10 +593,10 @@ struct MacIntegrationView: View {
                 .foregroundStyle(NativeAgentShell.secondary)
             VStack(alignment: .leading, spacing: 3) {
                 Text(label)
-                    .font(ShellType.bodySemibold)
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                 Text(frameworkPermission?.purpose ?? "Use \(label) with the read and write access you choose below.")
-                    .font(ShellType.caption)
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -686,7 +699,7 @@ struct MacIntegrationView: View {
         )
     }
 
-    private func loadInitialTCCStatuses() async {
+    private func loadInitialTCCStatuses(savesCache: Bool = true) async {
         // Cold-start cache improves the initial paint but cannot become the
         // truth source: the passive probes below overwrite it as they finish.
         let cachedAppleEvents = Self.loadCachedAppleEventsStatuses()
@@ -697,14 +710,19 @@ struct MacIntegrationView: View {
         // Speech / Microphone: class-level READS only (SFSpeechRecognizer
         // .authorizationStatus / AVCaptureDevice.authorizationStatus). Neither
         // prompts, so they are safe on every appear and refresh tick.
-        tccStatuses[MacIntegrationSystemPermissionPresentation.speechRecognitionKey] = Self.badgeKey(
-            SystemPermissionPreflight.status(.speechRecognition))
-        tccStatuses[MacIntegrationSystemPermissionPresentation.microphoneKey] = Self.badgeKey(
-            SystemPermissionPreflight.status(.microphone))
-
-        tccStatuses[MacIntegrationSystemPermissionPresentation.calendarKey] = MacPIMConnectorActions.currentCalendarAuthorizationStatus()
-        tccStatuses[MacIntegrationSystemPermissionPresentation.remindersKey] = MacPIMConnectorActions.currentReminderAuthorizationStatus()
-        tccStatuses[MacIntegrationSystemPermissionPresentation.contactsKey] = MacContactsAdapter.currentAuthorizationStatus()
+        // Each read asks the permission daemon: all five in one hop off the main actor.
+        let frameworks = await Task.detached(priority: .userInitiated) {
+            [
+                MacIntegrationSystemPermissionPresentation.speechRecognitionKey: Self.badgeKey(
+                    SystemPermissionPreflight.status(.speechRecognition)),
+                MacIntegrationSystemPermissionPresentation.microphoneKey: Self.badgeKey(
+                    SystemPermissionPreflight.status(.microphone)),
+                MacIntegrationSystemPermissionPresentation.calendarKey: MacPIMConnectorActions.currentCalendarAuthorizationStatus(),
+                MacIntegrationSystemPermissionPresentation.remindersKey: MacPIMConnectorActions.currentReminderAuthorizationStatus(),
+                MacIntegrationSystemPermissionPresentation.contactsKey: MacContactsAdapter.currentAuthorizationStatus(),
+            ]
+        }.value
+        tccStatuses.merge(frameworks) { _, read in read }
 
         // 2026-06-07: AppleEvents per-app is now probed PASSIVELY here
         // using AEDeterminePermissionToAutomateTarget(askUserIfNeeded:
@@ -727,7 +745,7 @@ struct MacIntegrationView: View {
         // Still persist the latest values so a cold launch shows correct
         // state even before the first probe completes (the cache acts as
         // a faster initial paint while the real probes run).
-        Self.saveCachedAppleEventsStatuses(tccStatuses)
+        if savesCache { Self.saveCachedAppleEventsStatuses(tccStatuses) }
     }
 
     private func requestFrameworkGrant(_ permission: MacIntegrationFrameworkPermission) async {
@@ -1050,7 +1068,7 @@ struct MacIntegrationView: View {
                 default:
                     status = "unknown"
                 }
-                NSLog("[mac-integration] AE probe \(app) bundle=\(bundleID) result=\(result) status=\(status)")
+                nativeLog("[mac-integration] AE probe \(app) bundle=\(bundleID) result=\(result) status=\(status)")
                 continuation.resume(returning: status)
             }
         }
@@ -1082,17 +1100,3 @@ struct MacIntegrationView: View {
 // the shell's one sheet that read as a stack of plates rather than a page.
 // A section is now the Advanced list's shape — an eyebrow, then one card.
 
-/// One section of the page: an eyebrow over one group card, a hairline
-/// between rows (Alive glass, 2026-09-23 — the Trust tab's kit).
-private struct MacSection<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(title)
-            AliveGroupCard { content }
-        }
-        .accessibilityElement(children: .contain)
-    }
-}

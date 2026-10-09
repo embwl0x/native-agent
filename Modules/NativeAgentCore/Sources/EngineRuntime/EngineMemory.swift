@@ -57,9 +57,10 @@ public final class MemoryFacade {
 
     // MARK: - Reads
 
-    /// Active memories: the newest 200, or the recall-eligible rows for `ids`
-    /// (search resolves hits outside the bounded list).
-    public nonisolated func activeMemories(ids: [String]? = nil) async throws -> [MemoryV2.MemoryRecord] {
+    /// Active memories: the newest `limit` (nil is every one), or the
+    /// recall-eligible rows for `ids` (search resolves hits outside the
+    /// bounded list).
+    public nonisolated func activeMemories(ids: [String]? = nil, limit: Int? = 200) async throws -> [MemoryV2.MemoryRecord] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let stored: [StoredMemory]
         if let ids {
@@ -72,7 +73,7 @@ public final class MemoryFacade {
             }
             stored = matches
         } else {
-            stored = try await storage.listMemories(persona: nil, status: "active", limit: 200)
+            stored = try await storage.listMemories(persona: nil, status: "active", limit: limit)
         }
         return stored.map(MemoryV2.MemoryRecord.init(stored:))
     }

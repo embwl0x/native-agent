@@ -217,7 +217,7 @@ public enum AgentBridgeCompletionRouter {
   public static func isValidIOSDeviceRouteKey(_ raw: String) -> Bool {
     let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !value.isEmpty, value.utf8.count <= 200,
-          !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+          value.rangeOfCharacter(from: .controlCharacters) == nil else {
       return false
     }
     if value == "iphone" { return true }

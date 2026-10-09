@@ -47,7 +47,7 @@ enum AppRelauncher {
         do {
             try task.run()
         } catch {
-            NSLog("[relaunch] failed to spawn relaunch helper for %@: %@", bundlePath, "\(error)")
+            nativeLog("[relaunch] failed to spawn relaunch helper for %@: %@", bundlePath, "\(error)")
             onSpawnFailure()
             return
         }

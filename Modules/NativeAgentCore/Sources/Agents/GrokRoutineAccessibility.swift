@@ -7,6 +7,23 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 
+/// Passive peer reads share a serial lane; no AX handles leave a read.
+public enum DesktopPeerReadLane {
+    private static let queue = DispatchQueue(label: "NativeAgent.desktop-peer-reads", qos: .utility)
+
+    public static func read<Value: Sendable>(_ body: @escaping @Sendable () throws -> Value) async throws -> Value {
+        try Task.checkCancellation()
+        let value = try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do { continuation.resume(returning: try body()) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+        try Task.checkCancellation()
+        return value
+    }
+}
+
 /// Native-only secret transfer. AX values never cross a model, screenshot,
 /// tool result, clipboard, log, approval preview or transcript boundary.
 @MainActor public enum GrokRoutineAccessibility {
@@ -15,7 +32,13 @@ import PersistenceCore
         case permission = "Allow NativeAgent Accessibility access to set up the Grok Bot routine."
         case conversation = "Grok Bot does not expose one unambiguous current chat and empty composer. Open the intended chat with no draft, then Connect again."
         case submission = "Routine request submission is unconfirmed. Check Grok Bot; this app will not resend it automatically."
+        case accessibility = "Grok Bot's web Accessibility tree could not be enabled or read. Check NativeAgent Accessibility access, then Connect again."
+        case mainBot = "Grok Bot's main sidebar chat could not be selected unambiguously. Close any open routine panel, then Connect again."
+        case details = "Grok Bot's Details tab could not be selected unambiguously. Check the main Grok Bot chat, then Connect again."
+        case routines = "Grok Bot's Details tab did not expose one Routines section. Check Grok Bot, then Connect again."
+        case routine = "Grok Bot's NativeAgent reply routine row could not be opened unambiguously. Check Routines for duplicate names, then Connect again."
         case secrets = "Grok Bot's Routines panel did not expose one unambiguous webhook URL and readable key through Accessibility. Close any open routine panel before sending a setup or cleanup request."
+        case missingRoutine = "The NativeAgent reply routine is missing from Grok Bot's Routines panel."
         case cleanup = "Grok Bot's routine panel could not be closed. Close it before continuing."
     }
     static var running: Bool { !NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).isEmpty }
@@ -31,19 +54,24 @@ import PersistenceCore
         if running { try? await Task.sleep(nanoseconds: 4_000_000_000) }
         return running
     }
-    public static func attribute(_ node: AXUIElement, _ name: String) -> CFTypeRef? {
+    nonisolated public static func attribute(_ node: AXUIElement, _ name: String) -> CFTypeRef? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(node, name as CFString, &value) == .success else { return nil }
         return value
     }
-    public static func string(_ node: AXUIElement, _ name: String) -> String {
+    nonisolated public static func string(_ node: AXUIElement, _ name: String) -> String {
         attribute(node, name) as? String ?? ""
     }
-    public static func parent(_ node: AXUIElement) -> AXUIElement? {
+    nonisolated static func label(_ node: AXUIElement) -> String {
+        let title = string(node, kAXTitleAttribute)
+        if !title.isEmpty { return title }
+        return string(node, string(node, kAXRoleAttribute) == kAXStaticTextRole ? kAXValueAttribute : kAXDescriptionAttribute)
+    }
+    nonisolated public static func parent(_ node: AXUIElement) -> AXUIElement? {
         guard let value = attribute(node, kAXParentAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
         return unsafeDowncast(value, to: AXUIElement.self)
     }
-    public static func nodes(_ root: AXUIElement) -> [AXUIElement] {
+    nonisolated public static func nodes(_ root: AXUIElement) -> [AXUIElement] {
         var queue = [root], result: [AXUIElement] = []
         while !queue.isEmpty && result.count < 1500 {
             let node = queue.removeFirst(); result.append(node)
@@ -70,8 +98,7 @@ import PersistenceCore
         // The installed app marks no sidebar button as selected (09-20). The
         // open chat is the conversation; its name is only a label for the person.
         guard selected.count == 1 else { return "Grok Bot" }
-        let name = string(selected[0], kAXTitleAttribute).isEmpty
-            ? string(selected[0], kAXDescriptionAttribute) : string(selected[0], kAXTitleAttribute)
+        let name = label(selected[0])
         return name.isEmpty ? "Grok Bot" : name
     }
     /// Seen on the installed app (09-20): the box has no placeholder attribute;
@@ -101,17 +128,18 @@ import PersistenceCore
     static func awake() async throws -> NSRunningApplication {
         guard await ensureRunning(),
               let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: GrokBotRoute.bundleID) else { throw Blocker.offline }
+        guard AXIsProcessTrusted() else { throw Blocker.permission }
+        guard let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first,
+              AXUIElementSetAttributeValue(AXUIElementCreateApplication(runningApp.processIdentifier),
+                  "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success else { throw Blocker.accessibility }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         let app = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         do { try await waitUntil { NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier } }
         catch { step("Grok Bot never came to the front"); throw error }
-        _ = AXUIElementSetAttributeValue(AXUIElementCreateApplication(app.processIdentifier), "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        for _ in 0..<3 {
-            if (try? await waitUntil { try nodes(window()).contains { string($0, kAXRoleAttribute) == "AXWebArea" } }) != nil { return app }
-        }
-        step("Grok Bot's window could not be read (no web area)")
-        throw Blocker.conversation
+        do { try await waitUntil { try nodes(window()).contains { string($0, kAXRoleAttribute) == "AXWebArea" } } }
+        catch { throw Blocker.accessibility }
+        return app
     }
     /// No model-driven screen access while a secret-bearing panel is open.
     static func requireChatOnly() throws {
@@ -158,6 +186,7 @@ import PersistenceCore
         try [CGEventType.leftMouseDown, .leftMouseUp].map {
             guard let event = CGEvent(mouseEventSource: nil, mouseType: $0, mouseCursorPosition: point, mouseButton: .left) else { throw Blocker.submission }
             event.setIntegerValueField(.mouseEventClickState, value: 1)
+            event.setIntegerValueField(.eventSourceUserData, value: NativeAgentMacEventIdentity.sourceUserData)
             return event
         }
     }
@@ -165,6 +194,7 @@ import PersistenceCore
         try [true, false].map {
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: $0) else { throw Blocker.submission }
             event.flags = flags
+            event.setIntegerValueField(.eventSourceUserData, value: NativeAgentMacEventIdentity.sourceUserData)
             return event
         }
     }
@@ -197,7 +227,7 @@ import PersistenceCore
         if try heading() { return }
         let chats = nodes(try window()).filter {
             guard string($0, kAXRoleAttribute) == kAXButtonRole else { return false }
-            let title = string($0, kAXTitleAttribute).isEmpty ? string($0, kAXDescriptionAttribute) : string($0, kAXTitleAttribute)
+            let title = label($0)
             return title == bot || title.hasPrefix(bot + ", ")
         }
         guard chats.count == 1, AXUIElementPerformAction(chats[0], kAXPressAction as CFString) == .success else {
@@ -205,10 +235,18 @@ import PersistenceCore
         }
         do { try await waitUntil { try heading() } } catch { step("chat \"\(bot)\" did not open"); throw Blocker.conversation }
     }
-    static func send(_ text: String, bot: String) async throws {
+    static func send(_ text: String, bot: String, watchReply: Bool = false) async throws {
         guard !text.isEmpty else { throw Blocker.submission }
         reached = .opening; lastStep = nil; sentLayout = nil
-        try await restoringForeground { try await sendInForeground(text, bot: bot) }
+        let previous = NSWorkspace.shared.frontmostApplication
+        do {
+            try await sendInForeground(text, bot: bot, watchReply: watchReply, previous: previous)
+        } catch {
+            await GrokDesktopReply.abandon(sentLayout?.watchID)
+            await restoreForeground(previous)
+            throw error
+        }
+        if sentLayout?.watchID == nil { await restoreForeground(previous) }
     }
     /// Workspace activation works from a background app where activate() can be
     /// ignored. Await cleanup on success and failure; never steal focus back
@@ -228,7 +266,7 @@ import PersistenceCore
         previousPID != nil && !previousTerminated && previousPID != currentPID
             && currentBundleID == GrokBotRoute.bundleID
     }
-    private static func restoreForeground(_ previous: NSRunningApplication?) async {
+    static func restoreForeground(_ previous: NSRunningApplication?) async {
         let current = NSWorkspace.shared.frontmostApplication
         guard shouldRestoreForeground(previousPID: previous?.processIdentifier,
                                       previousTerminated: previous?.isTerminated ?? true,
@@ -239,7 +277,7 @@ import PersistenceCore
         configuration.activates = true
         _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
     }
-    private static func sendInForeground(_ text: String, bot: String) async throws {
+    private static func sendInForeground(_ text: String, bot: String, watchReply: Bool, previous: NSRunningApplication?) async throws {
         let app = try await awake()
         reached = .conversation
         func requireFrontmost() throws {
@@ -288,6 +326,9 @@ import PersistenceCore
             return !isEmptyBox(value, conversation: bot) && flat(value) == flat(text)
         } } catch { step("the pasted text never appeared in the message box"); throw error }
         try requireFrontmost()
+        if watchReply, let layout = sentLayout {
+            sentLayout?.watchID = try GrokDesktopReply.start(message: text, chat: bot, layout: layout, previous: previous)
+        }
         reached = .submitted
         submit.forEach { NativeAgentMotorEpoch.notePostedHIDEvent(); $0.post(tap: .cghidEventTap) }
         do { try await verifySubmission(text, bot: bot, baseline: baseline) }
@@ -306,9 +347,9 @@ import PersistenceCore
         }
         throw Blocker.submission
     }
-    static func importRoutine(peer: String, dataRoot: URL) async throws {
+    static func importRoutine(peer: String, dataRoot: URL, waitForCreation: Bool) async throws {
         try await restoringForeground {
-            do { try await importRoutineInForeground(peer: peer, dataRoot: dataRoot) }
+            do { try await importRoutineInForeground(peer: peer, dataRoot: dataRoot, waitForCreation: waitForCreation) }
             catch {
                 guard await closeRoutinePanel() else { throw Blocker.cleanup }
                 throw error
@@ -326,35 +367,45 @@ import PersistenceCore
                 @MainActor func button(_ name: String) -> AXUIElement? {
                     let found = tree.filter {
                         string($0, kAXRoleAttribute) == kAXButtonRole
-                            && (string($0, kAXTitleAttribute) == name || string($0, kAXDescriptionAttribute) == name)
+                            && label($0) == name
                     }
                     return found.count == 1 ? found[0] : nil
                 }
+                let routineOpen = tree.contains { string($0, kAXRoleAttribute) == "AXHeading" && label($0).hasPrefix("NativeAgent reply ") }
+                    || (try? requireChatOnly()) == nil
                 let control = button("Back to Routines") ?? button("Back to details") ?? button("Close details")
+                    ?? (routineOpen ? button("Close") : nil)
                 if let control { _ = AXUIElementPerformAction(control, kAXPressAction as CFString) }
-                else if (try? requireChatOnly()) != nil { return true }
+                else if (try? requireChatOnly()) != nil {
+                    // An import may have scrolled the chat back to its routine link.
+                    if let bottom = button("Scroll to bottom") { _ = AXUIElementPerformAction(bottom, kAXPressAction as CFString) }
+                    return true
+                }
                 try? await Task.sleep(for: .milliseconds(100))
             }
             step("the routine panel could not be closed")
             return false
         }.value
     }
-    private static func importRoutineInForeground(peer: String, dataRoot: URL) async throws {
+    private static func importRoutineInForeground(peer: String, dataRoot: URL, waitForCreation: Bool) async throws {
         _ = try await awake()
-        let contact = try? AgentPeerStore(dataRoot: dataRoot).list().first { $0.id == peer }
-        try await openBotChat(contact?.grokConversation ?? "grok")
-        // The path seen on the installed app (09-20), by exact label:
-        //   "View conversation details" -> list "Routines" -> the routine's
-        //   button -> text fields "Webhook URL" and "Webhook key" ->
-        //   "Back to Routines" -> "Close details".
-        // Grok Bot itself cannot read these values; this panel is the only source.
-        // A control is pressed only when the state it leads to is not already
-        // showing, so nothing is toggled shut. Unknown UI stops; nothing is guessed.
-        func label(_ node: AXUIElement) -> String {
-            string(node, kAXTitleAttribute).isEmpty ? string(node, kAXDescriptionAttribute) : string(node, kAXTitleAttribute)
+        // A routine panel left open is closed first rather than stopping setup.
+        if (try? requireChatOnly()) == nil {
+            guard await closeRoutinePanel() else { throw Blocker.cleanup }
         }
-        func buttons(_ tree: [AXUIElement], _ name: String) -> [AXUIElement] {
-            tree.filter { string($0, kAXRoleAttribute) == kAXButtonRole && label($0) == name }
+        do { try await openBotChat("Grok Bot") } catch { throw Blocker.mainBot }
+        try AgentPeerStore(dataRoot: dataRoot).updateGrok(peer) { $0.grokConversation = "Grok Bot" }
+        func section() throws -> AXUIElement? {
+            let found = nodes(try window()).filter {
+                [kAXListRole, kAXGroupRole, "AXHeading", kAXStaticTextRole].contains(string($0, kAXRoleAttribute)) && label($0) == "Routines"
+                    && !(parent($0).map { label($0) == "Routines" } ?? false)
+            }
+            // The heading text and the list both say "Routines"; the list is the section.
+            let lists = found.filter { string($0, kAXRoleAttribute) == kAXListRole }
+            let picked = lists.count == 1 ? lists : found
+            guard picked.count <= 1 else { throw Blocker.routines }
+            guard let node = picked.first else { return nil }
+            return [kAXListRole, kAXGroupRole].contains(string(node, kAXRoleAttribute)) ? node : parent(node)
         }
         func field(_ tree: [AXUIElement], _ name: String) -> String? {
             let found = tree.filter { string($0, kAXRoleAttribute) == kAXTextFieldRole && label($0) == name }
@@ -363,28 +414,76 @@ import PersistenceCore
         }
         func press(_ node: AXUIElement) -> Bool { AXUIElementPerformAction(node, kAXPressAction as CFString) == .success }
         let routine = GrokBotRoute.routineName(peer)
-        var url: String?, key: String?
-        var opened = false
-        // A newly requested routine is asynchronous: Grok Bot took about a
-        // minute to create one. Look for up to two minutes.
-        for _ in 0..<120 {
-            try Task.checkCancellation()
-            let tree = nodes(try window())
-            if let foundURL = field(tree, "Webhook URL"), let foundKey = field(tree, "Webhook key"),
-               tree.contains(where: { string($0, kAXRoleAttribute) == kAXGroupRole && label($0) == routine }) {
-                url = foundURL; key = foundKey; break
-            }
-            let lists = tree.filter { string($0, kAXRoleAttribute) == kAXListRole && label($0) == "Routines" }
-            if lists.count == 1 {
-                let mine = nodes(lists[0]).filter { string($0, kAXRoleAttribute) == kAXButtonRole && label($0).contains(routine) }
-                if mine.count == 1 { _ = press(mine[0]) }
-            } else if let back = buttons(tree, "Back to details").first ?? buttons(tree, "Back to Routines").first {
-                _ = press(back)
-            } else if !opened, let details = buttons(tree, "View conversation details").first, buttons(tree, "Close details").isEmpty {
-                opened = press(details)
-            }
-            try await Task.sleep(for: .seconds(1))
+        // Grok's own chat links the routine it created; that button is unambiguous.
+        // Its Details row no longer opens on press, and later messages push the
+        // link out of the tree, so scroll the chat back until it renders.
+        func link() throws -> AXUIElement? {
+            let found = nodes(try window()).filter { string($0, kAXRoleAttribute) == kAXButtonRole && label($0) == "Open routine " + routine }
+            return found.count == 1 ? found[0] : nil
         }
+        var found = try link()
+        if found == nil, let box = nodes(try window()).first(where: {
+            string($0, kAXRoleAttribute) == kAXTextAreaRole && string($0, kAXDescriptionAttribute).lowercased() == "prompt"
+        }) {
+            let below = try centre(box)
+            let point = CGPoint(x: below.x, y: below.y - 200)
+            if let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
+                move.setIntegerValueField(.eventSourceUserData, value: NativeAgentMacEventIdentity.sourceUserData)
+                NativeAgentMotorEpoch.notePostedHIDEvent(); move.post(tap: .cghidEventTap)
+            }
+            for _ in 0..<40 {
+                guard found == nil, let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: 600, wheel2: 0, wheel3: 0) else { break }
+                wheel.setIntegerValueField(.eventSourceUserData, value: NativeAgentMacEventIdentity.sourceUserData)
+                NativeAgentMotorEpoch.notePostedHIDEvent(); wheel.post(tap: .cghidEventTap)
+                try await Task.sleep(for: .milliseconds(300))
+                found = try link()
+            }
+        }
+        if !(found.map(press) ?? false) {
+            let tabs = nodes(try window()).filter {
+                [kAXButtonRole, kAXRadioButtonRole, "AXTab"].contains(string($0, kAXRoleAttribute)) && label($0) == "Details"
+            }
+            guard tabs.count == 1, press(tabs[0]) else { throw Blocker.details }
+            do { try await waitUntil { try section() != nil } } catch { throw Blocker.routines }
+            // A newly requested routine is asynchronous: Grok Bot took about a
+            // minute to create one. Look for up to two minutes.
+            var rows: [AXUIElement] = []
+            for _ in 0..<(waitForCreation ? 120 : 1) {
+                try Task.checkCancellation()
+                guard let list = try section() else { throw Blocker.routines }
+                let tree = nodes(list)
+                guard tree.count < 1500 else { throw Blocker.routines }
+                let titles = tree.filter { label($0) == routine || label($0).hasPrefix(routine + " ") || label($0).hasPrefix(routine + "\n") }
+                for title in titles {
+                    var node: AXUIElement? = title
+                    while let candidate = node, !CFEqual(candidate, list) {
+                        var actions: CFArray?
+                        if [kAXButtonRole, kAXRowRole, kAXGroupRole].contains(string(candidate, kAXRoleAttribute)),
+                           AXUIElementCopyActionNames(candidate, &actions) == .success,
+                           (actions as? [String] ?? []).contains(kAXPressAction) {
+                            if !rows.contains(where: { CFEqual($0, candidate) }) { rows.append(candidate) }
+                            break
+                        }
+                        node = parent(candidate)
+                    }
+                    guard let node, !CFEqual(node, list) else { throw Blocker.routine }
+                }
+                guard rows.count <= 1 else { throw Blocker.routine }
+                if !rows.isEmpty { break }
+                if !waitForCreation { throw Blocker.missingRoutine }
+                try await Task.sleep(for: .seconds(1))
+            }
+            guard let row = rows.first else { throw Blocker.missingRoutine }
+            guard press(row) else { throw Blocker.routine }
+        }
+        var url: String?, key: String?
+        do { try await waitUntil {
+            let tree = nodes(try window())
+            // The updated panel has no heading named after the routine; its Delete button marks it.
+            guard tree.contains(where: { string($0, kAXRoleAttribute) == kAXButtonRole && label($0) == "Delete routine" }) else { return false }
+            url = field(tree, "Webhook URL"); key = field(tree, "Webhook key")
+            return url != nil && key != nil
+        } } catch { throw Blocker.secrets }
         guard let url, let key else { throw Blocker.secrets }
         try AgentPeerStore(dataRoot: dataRoot).updateGrok(peer) { contact in
             var credential = try GrokLinkCredential.read(peer: peer)

@@ -638,8 +638,9 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
         let startNs = DispatchTime.now().uptimeNanoseconds
         let live = SwarmLiveBoard(runsPath: runsPath, persistence: persistence, id: runId,
                                   objective: request.objective, createdAt: createdAt,
+                                  synthesize: request.synthesize,
                                   pending: request.workers.enumerated().map { $0.element.pendingJSON(index: $0.offset) })
-        await live.put(settled: [:])
+        try await live.put(settled: [:])
         let workerResults = await executeWorkers(request: request, runId: runId, live: live)
         let synthesis = await synthesizeIfNeeded(request: request, workerResults: workerResults, runId: runId)
         let completedAt = AgentSwarmClock.nowISO(now())
@@ -700,7 +701,8 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
             // Task (not detached) preserves the caller's trace/task-local
             // context. This shield contains only persistence, never more work.
             let terminalPersistence = Task {
-                try await persist(result.json)
+                try await live.write(result.json)
+                try SwiftNativeSwarmRunsReader(runsPath: runsPath).persist(result.json)
                 // The summary follows the full receipt under the same shield;
                 // it remains best-effort per RunLedger's existing contract.
                 if let ledgerRoot = runLedgerDataRoot {
@@ -739,14 +741,13 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
             do {
                 try await terminalPersistence.value
             } catch {
-                await live.remove()
                 throw AgentSwarmReceiptPersistenceError(
                     runID: runId, runStatus: runStatus, summary: summary, underlyingError: error
                 )
             }
         }
         // Off the board only once the receipt holds it, so a reader never sees it vanish.
-        await live.remove()
+        try await live.remove()
         return result
     }
 
@@ -771,7 +772,8 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
             while let (idx, result) = await group.next() {
                 results[idx] = result
                 settled[idx] = result.json
-                await live.put(settled: settled)
+                do { try await live.put(settled: settled) }
+                catch { fputs("[SwarmLiveBoard] progress persistence failed for \(runId): \(error)\n", stderr) }
                 if Task.isCancelled {
                     group.cancelAll()
                 } else if nextIndex < request.workers.count {
@@ -982,75 +984,6 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
                 durationSeconds: Date().timeIntervalSince(started)
             )
         }
-    }
-
-    /// Cap on retained swarm-run records in runs.json (loop-A finding,
-    /// 2026-06-13). Each record carries the full workers[] + synthesis, so the
-    /// file is heavyweight; the retired daemon bounded this and no other writer
-    /// does now. Matches the items.jsonl / activity-feed cap.
-    private static let maxRetainedRuns = 1000
-
-    private func persist(_ record: JSONValue) async throws {
-        try await persistence.withFileLock(runsPath) {
-            var existing = try readRetainedRunsForAppend()
-            existing.insert(record, at: 0)
-            // Loop-A finding: keep runs.json bounded. Newest-first insert means
-            // the oldest tail is dropped. Runs under the same flock as the
-            // read-modify-write so a concurrent writer can't interleave.
-            if existing.count > Self.maxRetainedRuns {
-                existing.removeLast(existing.count - Self.maxRetainedRuns)
-            }
-            // Count serialized rows once, including JSON escaping and the
-            // enclosing pretty array's two-space indentation on every line.
-            var bytes = 2
-            var retained = 0
-            for row in existing {
-                let data = try row.serializedData(pretty: true)
-                let lines = data.reduce(1) { $1 == 0x0A ? $0 + 1 : $0 }
-                let rowBytes = data.count + 2 * lines + 2
-                guard bytes + rowBytes <= SwiftNativeSwarmRunsReader.maximumStoreBytes else { break }
-                bytes += rowBytes
-                retained += 1
-            }
-            guard retained > 0 else {
-                throw PersistenceCoreError.ioFailure("Swarm receipt exceeds the retained evidence byte budget; existing evidence was not replaced.")
-            }
-            let payload = try JSONValue.array(Array(existing.prefix(retained))).serializedData(pretty: true)
-            try await persistence.writeDataAtomicDurable(payload, to: runsPath)
-        }
-    }
-
-    /// The ordinary persistence reader intentionally coalesces read/parse
-    /// failures to its default. A receipt append must never use that fallback
-    /// to replace existing evidence. Keep this check inside the writer lock.
-    private func readRetainedRunsForAppend() throws -> [JSONValue] {
-        func unavailable(_ reason: String) -> PersistenceCoreError {
-            .ioFailure("swarm receipt store unavailable (\(reason)); existing evidence was not replaced. Workers have already settled; reconcile their effects before considering another run.")
-        }
-        let attributes: [FileAttributeKey: Any]
-        do {
-            attributes = try FileManager.default.attributesOfItem(atPath: runsPath.path)
-        } catch {
-            let error = error as NSError
-            if error.domain == NSCocoaErrorDomain,
-               [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code) {
-                return []
-            }
-            throw unavailable("unreadable")
-        }
-        // Preserve normal file/symlink reads, but never treat a directory or
-        // another non-file store as a missing receipt collection.
-        guard let type = attributes[.type] as? FileAttributeType,
-              type == .typeRegular || type == .typeSymbolicLink else {
-            throw unavailable("not_a_file")
-        }
-        let data: Data
-        do { data = try Data(contentsOf: runsPath) }
-        catch { throw unavailable("unreadable") }
-        guard let parsed = try? JSONValue.parse(data), case .array(let rows) = parsed else {
-            throw unavailable("malformed")
-        }
-        return rows
     }
 
     private enum DeadlineEvent: Sendable {
@@ -1338,43 +1271,39 @@ public enum AgentSwarmClock {
 
 /// `swarms/live.json`: crews still working, for the Simple view's "Working
 /// now" row. Written when a run starts and as each worker settles; a run leaves
-/// once its receipt is in runs.json. Progress only, never evidence: runs.json
-/// is the record. `pid` lets a reader, and the next write, drop a run whose
-/// process died mid-run.
+/// once its receipt is in runs.json. Retained worker results also let recovery
+/// settle an interrupted crew without replaying work.
 struct SwarmLiveBoard: Sendable {
     let runsPath: URL
     let persistence: any PersistenceCoreProtocol
     let id: String
     let objective: String
     let createdAt: String
+    let synthesize: Bool
     let pending: [JSONValue]
 
     private var path: URL { runsPath.deletingLastPathComponent().appendingPathComponent("live.json") }
 
-    func put(settled: [Int: JSONValue]) async {
+    func put(settled: [Int: JSONValue]) async throws {
         let workers = pending.enumerated().map { settled[$0.offset] ?? $0.element }
-        await write(.object([
+        try await write(.object([
             "id": .string(id), "status": .string("running"), "objective": .string(objective),
             "createdAt": .string(createdAt), "pid": .int(Int64(getpid())), "workers": .array(workers),
+            "synthesize": .bool(synthesize),
         ]))
     }
 
-    func remove() async { await write(nil) }
+    func remove() async throws { try await write(nil) }
 
-    private func write(_ record: JSONValue?) async {
+    func write(_ record: JSONValue?) async throws {
         let path = path, persistence = persistence, id = id
         // Its own task: a cancelled run must still take itself off the board.
-        await Task {
-            try? await persistence.withFileLock(path, waitingAtMost: 5) {
-                var rows: [JSONValue] = []
-                if let data = try? Data(contentsOf: path), case .array(let saved)? = try? JSONValue.parse(data) { rows = saved }
-                rows.removeAll { row in
-                    guard case .object(let object) = row, object["id"] != .string(id),
-                          case .int(let pid)? = object["pid"] else { return true }
-                    return kill(pid_t(pid), 0) != 0 && errno == ESRCH
-                }
+        try await Task {
+            try await persistence.withFileLock(path) {
+                let projected = try SwiftNativeSwarmRunsReader.rows(at: path)
+                var rows = projected.filter { $0["id"] as? String != id }.map { JSONValue(fromFoundation: $0) }
                 if let record { rows.append(record) }
-                try await persistence.writeJSON(.array(rows), to: path)
+                try await persistence.writeDataAtomicDurable(JSONValue.array(rows).serializedData(pretty: true), to: path)
             }
         }.value
     }

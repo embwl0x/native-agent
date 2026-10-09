@@ -760,11 +760,11 @@ public actor ProcedureArtifactStore {
             remaining -= 1
         }
         if removed > 0 {
-            NSLog("ProcedureArtifactStore: retention sweep removed %d unreferenced artifact(s)", removed)
+            nativeLog("ProcedureArtifactStore: retention sweep removed %d unreferenced artifact(s)", removed)
         }
         let reapedLocks = await reapOrphanArtifactLocks(in: artifactsDirectory, cutoff: cutoff)
         if reapedLocks > 0 {
-            NSLog("ProcedureArtifactStore: retention sweep removed %d orphan lock sidecar(s)", reapedLocks)
+            nativeLog("ProcedureArtifactStore: retention sweep removed %d orphan lock sidecar(s)", reapedLocks)
         }
         return removed
     }

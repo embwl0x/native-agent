@@ -54,6 +54,7 @@ extension SwiftNativeChatOrchestrationClient {
             surface: baseContext.surface,
             personaID: baseContext.personaID,
             personaDocs: baseContext.personaDocs,
+            personaFingerprint: baseContext.personaFingerprint,
             recalled: baseContext.recalled,
             modelId: modelOverride.isEmpty ? baseContext.modelId : modelOverride,
             reasoningEffort: effortOverride.isEmpty ? baseContext.reasoningEffort : effortOverride,
@@ -180,10 +181,11 @@ extension SwiftNativeChatOrchestrationClient {
             reasoningEffort: projectedContext.reasoningEffort,
             output: result.reply,
             sessionId: nil,
-            personaFingerprint: Self.personaFingerprint(dataRoot: dataRoot),
+            personaFingerprint: projectedContext.personaFingerprint,
             contextFingerprint: Self.contextFingerprint(recalledIds: result.recalledIds),
             attachments: generatedAttachments.isEmpty ? nil : generatedAttachments,
-            providerCallCount: result.providerCallCount
+            providerCallCount: result.providerCallCount,
+            terminalState: result.resolvedTerminalReason(dataRoot: dataRoot).state
         )
     }
 }

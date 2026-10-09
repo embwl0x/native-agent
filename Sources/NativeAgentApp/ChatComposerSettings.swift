@@ -677,8 +677,8 @@ extension ChatComposerRoutingReading {
     var efforts: [ReasoningEffortOption] {
         let supported = selectedModel?.supportedReasoningEfforts ?? chatComposerFallbackEfforts
         let catalogOptions = Dictionary(
-            uniqueKeysWithValues: (appModel.engine.providers.catalog?.reasoningEfforts ?? []).map { ($0.id, $0) }
-        )
+            (appModel.engine.providers.catalog?.reasoningEfforts ?? []).map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first })
         return supported.map { effort in
             catalogOptions[effort] ?? ReasoningEffortOption(
                 id: effort,
@@ -789,7 +789,7 @@ extension ChatComposerRoutingReading {
                 appModel.chatFastMode = canonical.serviceTier == "priority"
                 return nil
             } catch {
-                appModel.statusText = "Model could not be changed: \(error.localizedDescription)"
+                appModel.setFailureStatus(error, action: "change the model")
                 return error.localizedDescription
             }
         }
@@ -820,14 +820,15 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
     /// Bumped by the draft when Tab should move into the words.
     var focusWordToken: Int
     @State private var showsContextPopover = false
+    /// The hand-back shows only while it would do something.
+    @State private var handoffWouldChange = false
+    @AppStorage(ShotgunController.enabledKey) private var shotgunEnabled = true
 
     /// Sol, 2026-09-15: a bot conversation sends on its OWN model, effort and
     /// Fast, so the words must read the bot's contract — showing (and editing)
     /// the global Chat tuple there was three lies on one row.
     @State var botContract: BotChatContract?
     @FocusState private var focusedWord: ChatComposerCard?
-    /// What `ShellType.label` really measures at the current text size.
-    @ScaledMetric(relativeTo: .body) private var scaledLabelSize: CGFloat = ShellType.labelSize
 
     init(focusWordToken: Int = 0) {
         self.focusWordToken = focusWordToken
@@ -839,13 +840,27 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
 
     var body: some View {
         HStack(spacing: 0) {
-            Button("Let agent use Mac") {
-                guard let generation = MacAttentionSessionStore.shared.userHandoffGeneration() else { return }
-                Task { await MacAttentionSessionStore.shared.giveAgentControl(userGeneration: generation) }
+            // Only while it would change something: a Mac action wants the
+            // driver, User holds it, and the posture is below Full Mac.
+            if handoffWouldChange {
+                Button("Let \(appModel.agentDisplayName) use the Mac") {
+                    guard let generation = MacAttentionSessionStore.shared.userHandoffGeneration() else { return }
+                    Task { await MacAttentionSessionStore.shared.giveAgentControl(userGeneration: generation) }
+                }
+                .buttonStyle(.plain)
+                .font(ShellType.label)
+                .padding(.trailing, 12)
+                .help("Your mouse or keyboard took the Mac back. Control stays yours until you hand it back here.")
             }
-            .buttonStyle(.plain)
-            .font(ShellType.label)
-            .help("Mouse or keyboard use stops the agent's Mac action. Under Full Mac its next act takes control back; otherwise control stays yours until you hand it back here.")
+            // User, 2026-10-04: on, this window steps aside into Shotgun when
+            // she starts driving the Mac; off, she works in the background.
+            Toggle("Shotgun", isOn: $shotgunEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.text.opacity(0.85))
+                .help("On: when I start driving the Mac, this window steps aside into Shotgun, a small chat you can keep typing in. Off: I work in the background and this window stays put. Its shortcut (Settings) or View ▸ Show Shotgun shows it either way.")
+                .accessibilityIdentifier("chat.composer.shotgun")
             Spacer(minLength: 0)
 
             // 2026-09-23: one cluster at the right — ring and percent, model,
@@ -853,8 +868,19 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             // cluster's leading end: in a trailing-aligned row nothing to its
             // right moves when it comes and goes, so it no longer holds an
             // empty slot between the thinking word and the trust word.
+            // One picker: the pill turns Fast off itself, the switch the
+            // model menu carries; it no longer opens the old model pane. A
+            // bot's Fast belongs to the bot, so there it opens Bots, as before.
             if fastIsOn {
-                Button { toggle(.model) } label: {
+                Button {
+                    if isBotConversation {
+                        NotificationCenter.default.post(name: .openCommandRouteRequest, object: "bots")
+                        return
+                    }
+                    guard !appModel.isSavingChatBrain || appModel.chatBrainSaveTask != nil else { return }
+                    appModel.chatFastMode = false
+                    appModel.enqueueChatBrainDefaultsSave()
+                } label: {
                     Text("Fast")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.text)
@@ -865,9 +891,10 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                 }
                 .buttonStyle(.plain)
                 .padding(.trailing, 10)
-                .help("Fast is on. Turn it off in the model card.")
+                .help(isBotConversation ? "Fast is on for this bot. Edit it in Bots." : "Fast is on. Click to turn it off.")
                 .accessibilityIdentifier("chat.composer.fast")
                 .accessibilityLabel("Fast is on")
+                .accessibilityHint(isBotConversation ? "Opens Bots" : "Turns Fast off")
             }
 
             // How full the context is, at a glance — and the receipt behind
@@ -955,7 +982,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
         .font(ShellType.label)
-        .foregroundStyle(NativeAgentShell.secondary)
+        .foregroundStyle(NativeAgentShell.text.opacity(0.85))
 
         .background {
             if let state = cardState {
@@ -971,6 +998,12 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             }
         }
         .task { await appModel.loadProvidersForChat() }
+        // Re-read on every driver change, and when the posture moves.
+        .task(id: activeTrustPreset) {
+            for await _ in await MacAttentionSessionStore.shared.driverChanges() {
+                handoffWouldChange = await MacAttentionSessionStore.shared.handoffWouldChange()
+            }
+        }
         .modifier(ComposerBotContractRefresh(contract: $botContract))
         .onChange(of: focusWordToken) { _, _ in focusedWord = .model }
     }
@@ -988,7 +1021,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
     private var widestEffortWordWidth: CGFloat? {
         let labels = efforts.map(\.label)
         guard !labels.isEmpty else { return nil }
-        let font = NSFont.systemFont(ofSize: scaledLabelSize, weight: .medium)
+        let font = NSFont.systemFont(ofSize: ShellType.labelSize, weight: .medium)
         return labels
             .map { ($0 as NSString).size(withAttributes: [.font: font]).width }
             .max()
@@ -999,7 +1032,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
     /// `.models` are both the model word's pane, so stepping into a provider's
     /// models never unlights the word.
     private func isActive(_ card: ChatComposerCard) -> Bool {
-        cardState?.activePane.word == card
+        card == .context ? showsContextPopover : cardState?.activePane.word == card
     }
 
     /// Punctuation between two hit targets, not a control.
@@ -1011,15 +1044,10 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             .accessibilityHidden(true)
     }
 
-    /// The ring is the context pane's word. It carries the same anchor, the
-    /// same focus ring, the same hover rule and the same keys as the three
-    /// settings words, so the receipt is reachable exactly like they are — and
-    /// it opens the one shell, not a card of its own.
+    /// Mouse and keyboard open the same native context receipt.
     private var contextRing: some View {
         Button {
-            // A native popover (User 09-27): the readout is not a picker, but it
-            // gets the system bubble, its arrow and room past the window edge.
-            if cardState != nil { showsContextPopover.toggle() } else { toggle(.context) }
+            toggleContextPopover()
         } label: {
             ComposerContextRing(sessionId: appModel.activeChatSessionId,
                                 model: isBotConversation ? botContract?.model : nil)
@@ -1036,12 +1064,6 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
         .buttonStyle(.plain)
         .buttonFocusable()
         .focused($focusedWord, equals: .context)
-        // Same rule as the words: hover steers an open shell, never opens one.
-        .onHover { inside in
-            guard inside, let state = cardState, state.activePane.isOpen,
-                  state.activePane.word != .context else { return }
-            open(.context)
-        }
         .accessibilityIdentifier("chat.composer.context")
         .popover(isPresented: $showsContextPopover, arrowEdge: .top) {
             if let state = cardState {
@@ -1055,14 +1077,20 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             ? "Closes the context receipt"
             : "Opens the context receipt for the last turn")
         .anchorPreference(key: ChatComposerWordAnchorKey.self, value: .bounds) { [.context: $0] }
-        .onKeyPress(.space) { toggle(.context); return .handled }
-        .onKeyPress(.return) { toggle(.context); return .handled }
+        .onKeyPress(.space) { toggleContextPopover(); return .handled }
+        .onKeyPress(.return) { toggleContextPopover(); return .handled }
         .onKeyPress(.escape) {
-            guard cardState?.activePane.isOpen == true else { return .ignored }
-            cardState?.dismiss()
+            guard showsContextPopover else { return .ignored }
+            showsContextPopover = false
             return .handled
         }
         .onKeyPress(keys: [.tab, .backTab]) { press in tab(.context, press) }
+    }
+
+    private func toggleContextPopover() {
+        guard cardState != nil else { return }
+        cardState?.dismiss()
+        showsContextPopover.toggle()
     }
 
     /// Tab off a word. With a pane open it walks INTO the pane's first control
@@ -1270,7 +1298,14 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
     /// Show this word's pane in the one shell. Fast switching just writes the
     /// latest pane: the shell animates to it from wherever it is.
     private func open(_ card: ChatComposerCard) {
+        if card == .context {
+            cardState?.dismiss()
+            showsContextPopover = true
+            focusedWord = card
+            return
+        }
         guard let state = cardState else { return }
+        showsContextPopover = false
         guard !isBotConversation || (card != .model && card != .effort) else { return }
         // Agent (a): the live options are what a person came for, so the model
         // word lands on the current provider's models, not a column of names.
@@ -1281,6 +1316,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
     }
 
     private func toggle(_ card: ChatComposerCard) {
+        if card == .context { toggleContextPopover(); return }
         // A bot's model and thinking level belong to the bot, so the words show
         // them and hand the edit to Bots. Trust stays app-wide and opens here.
         if card == .model || card == .effort, isBotConversation {
@@ -2279,15 +2315,9 @@ private struct ShellSurface<S: InsettableShape>: ViewModifier {
         if active {
             content
                 .background {
-                    // On the glass the room fill is the coat UNDER the
-                    // material, and the material's blur is what stops the
-                    // transcript. An offscreen capture has nothing to blur, so
-                    // it substitutes the settled opaque slate every card wears.
-                    shape.fill(quietOffscreenRead
-                               ? TodayPalette.cardFill
-                               : reduceTransparency
-                               ? Color(nsColor: .controlBackgroundColor)
-                               : NativeAgentShell.room.opacity(0.82))
+                    if reduceTransparency || quietOffscreenRead {
+                        shape.fill(quietOffscreenRead ? TodayPalette.cardFill : Color(nsColor: .controlBackgroundColor))
+                    }
                 }
                 .overlay {
                     if reduceTransparency || quietOffscreenRead {
@@ -2295,7 +2325,7 @@ private struct ShellSurface<S: InsettableShape>: ViewModifier {
                                            lineWidth: 1)
                     }
                 }
-                .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : .regular, in: shape)
+                .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate, in: shape)
                 .clipShape(shape)
         } else {
             content
@@ -2307,17 +2337,24 @@ private struct ShellSurface<S: InsettableShape>: ViewModifier {
 /// the column.
 private struct ColumnPanel: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
         content
             .background {
-                shape.fill(reduceTransparency ? Color(nsColor: .controlBackgroundColor) : NativeAgentShell.room.opacity(0.82))
+                if reduceTransparency || quietOffscreenRead {
+                    shape.fill(quietOffscreenRead ? TodayPalette.cardFill : Color(nsColor: .controlBackgroundColor))
+                }
             }
             .overlay {
-                shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1).allowsHitTesting(false)
+                if reduceTransparency || quietOffscreenRead {
+                    shape.strokeBorder(quietOffscreenRead ? TodayPalette.cardStroke : NativeAgentShell.hairline, lineWidth: 1)
+                        .allowsHitTesting(false)
+                }
             }
-            .glassEffect(reduceTransparency ? .identity : .regular, in: shape)
+            // No glass in a quiet screenshot: tinted glass blanks the capture.
+            .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate, in: shape)
             .clipShape(shape)
     }
 }

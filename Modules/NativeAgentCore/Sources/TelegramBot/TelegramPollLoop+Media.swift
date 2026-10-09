@@ -1,20 +1,10 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 
 extension TelegramPollLoop {
-    // MARK: - Inbound photo / image ingestion (telegram-vision-in)
-    //
-    // Recovered from the daemon-era telegram_photo_attachment /
-    // telegram_photo_max_bytes / download_telegram_photo_as_attachment trio
-    // that died with the
-    // daemon. Ported to the Swift poll path: a photo a user sends into Telegram
-    // is downloaded via the existing two-stage TelegramMediaDownloader, then
-    // injected as a native image attachment on the SAME chat turn the Mac UI
-    // already consumes (MultimodalAttachment {type:"image", base64, mime,
-    // byteSize}). The app-layer handler does the TelegramMediaAttachment ->
-    // MultimodalAttachment conversion so this module stays free of a
-    // ChatOrchestration dependency.
+    // MARK: - Inbound chat attachments
 
     /// Default cap for an inbound image download. Telegram bot photos top out
     /// around a few MB, but a user can "send as file" an arbitrarily large
@@ -25,13 +15,13 @@ extension TelegramPollLoop {
     /// loop refuses a getFile-reported oversize BEFORE any byte transfer.
     public static let defaultPhotoMaxBytes = 10 * 1024 * 1024
 
-    /// Extract an inbound image descriptor from a message, or nil for "no image
-    /// here". Telegram sends a `photo` as a LIST of size variants
+    /// Extract a supported chat attachment. Telegram sends a `photo` as a LIST of size variants
     /// (smallest..largest); pick the largest by width*height so the model sees
     /// the best resolution. Also accept an `image/*` `document` — the
-    /// uncompressed "send as file" path. Both shapes live in `message.extras`
+    /// uncompressed "send as file" path, plus PDF and TXT/MD files through the
+    /// shared type resolver. Both shapes live in `message.extras`
     /// (neither `photo` nor `document` is a TelegramMessage known key).
-    static func photoAttachment(from message: TelegramMessage) -> TelegramMediaAttachment? {
+    static func chatAttachment(from message: TelegramMessage) -> TelegramMediaAttachment? {
         guard case .object(let extras)? = message.extras else { return nil }
 
         // photo: list of variants -> largest by pixel count
@@ -66,21 +56,20 @@ extension TelegramPollLoop {
             }
         }
 
-        // image/* document (uncompressed send-as-file)
+        // Documents keep the sender's filename; Telegram's download path may
+        // have a generic extension that does not describe the original file.
         if case .object(let doc)? = extras["document"],
            case .string(let fileId)? = doc["file_id"],
            !fileId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let mime = (_tgJSONString(doc["mime_type"]) ?? "").lowercased()
-            if mime.hasPrefix("image/") {
-                return TelegramMediaAttachment(
-                    kind: "document",
-                    fileId: fileId,
-                    mimeType: mime,
-                    sizeBytes: _tgJSONInt(doc["file_size"]),
-                    bytes: nil,
-                    captureFilename: nil
-                )
-            }
+            let attachment = TelegramMediaAttachment(
+                kind: "document",
+                fileId: fileId,
+                mimeType: _tgJSONString(doc["mime_type"]),
+                sizeBytes: _tgJSONInt(doc["file_size"]),
+                bytes: nil,
+                captureFilename: _tgJSONString(doc["file_name"])
+            )
+            if attachment.chatTypeAndMime != nil { return attachment }
         }
 
         return nil
@@ -97,13 +86,12 @@ extension TelegramPollLoop {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// Only classify unsupported payloads; supported image/voice owners and
+    /// Only classify unsupported payloads; supported chat/voice owners and
     /// the original caption remain authoritative for their existing paths.
     static func unsupportedAttachmentKind(from message: TelegramMessage) -> String? {
         guard case .object(let extras)? = message.extras else { return nil }
         if case .object(_)? = extras["video"] { return "video" }
-        if case .object(let document)? = extras["document"],
-           !(_tgJSONString(document["mime_type"]) ?? "").lowercased().hasPrefix("image/") {
+        if case .object(_)? = extras["document"], chatAttachment(from: message) == nil {
             return "document"
         }
         return nil
@@ -113,7 +101,7 @@ extension TelegramPollLoop {
         await emitAttachmentDroppedTrace(
             kind: kind, reason: "unsupported_attachment_type", chatId: message.chatId, updateId: update.updateId
         )
-        let notice = "I can't read that \(kind) in Telegram. Please send an image or paste the relevant text."
+        let notice = "I can't read that \(kind) in Telegram. Please send an image, PDF, TXT or MD file, or paste the relevant text."
         do {
             try await sendMessage(token, message.destination, notice)
             await recordReceipt(kind: "attachment_dropped", update: update, message: message,
@@ -141,6 +129,12 @@ extension TelegramPollLoop {
         case "heic": return "image/heic"
         default: return "image/jpeg"
         }
+    }
+
+    func chatAttachmentMaxBytes(_ attachment: TelegramMediaAttachment) -> Int {
+        attachment.chatTypeAndMime?.type == "file"
+            ? min(photoMaxBytes, ChatAttachmentTypeResolver.fileByteLimit)
+            : photoMaxBytes
     }
 
     /// Emit a `telegram.attachment_dropped` trace to traces/events.jsonl when an
@@ -186,14 +180,14 @@ extension TelegramPollLoop {
         }
     }
 
-    /// Build a user-visible "couldn't process that image" reply. The reason is
+    /// Build a user-visible attachment refusal. The reason is
     /// token-redacted and trimmed; never echoes raw bytes or the token.
     static func attachmentDroppedNotice(reason: String) -> String {
         let redacted = _tgRedactToken(reason).trimmingCharacters(in: .whitespacesAndNewlines)
         let short = redacted.count > 180 ? String(redacted.prefix(180)) + "..." : redacted
         if short.isEmpty {
-            return "(I couldn't process that image — please try resending it.)"
+            return "(I couldn't process that attachment — please try resending it.)"
         }
-        return "(I couldn't process that image: \(short). Try resending it.)"
+        return "(I couldn't process that attachment: \(short). Try resending it.)"
     }
 }

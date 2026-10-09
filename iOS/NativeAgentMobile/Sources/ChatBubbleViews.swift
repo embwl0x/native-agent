@@ -6,75 +6,126 @@ import NativeAgentShared
 
 struct BubbleView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let message: ChatMessage
     var streamingHint: String = "Typing"
     // Set when this assistant bubble timed out locally. The accessory resumes
     // observation of the same signed event; it never queues a second turn.
     var isTimedOut: Bool = false
     var onRetry: (() -> Void)? = nil
+    /// A turn another door (the Mac, Telegram) is streaming into this chat.
+    /// It paces like her own live reply until its saved answer lands.
+    var isLiveTurn = false
 
     /// The Mac Simple thread: the agent's words are plain large text with
     /// room between the lines, no bubble; the person's own lines are quieter
     /// and smaller, on the same left edge.
     var body: some View {
-        let isUser = message.role == .user
         VStack(alignment: .leading, spacing: 6) {
-            // Collapsed "N tools used" / "N skills used" summary above the
-            // reply once the turn is done (assistant turns only).
+            VStack(alignment: .leading, spacing: 8) {
+                if let card = message.interaction, let descriptor = message.interactionDescriptor,
+                   let session = message.interactionSessionID {
+                    MobileInteractionCard(card: card, descriptor: descriptor, sessionID: session)
+                }
+                ForEach(imageAttachments) { attachment in
+                    AttachmentImagePreview(summary: attachment)
+                }
+                if attachmentCountWithoutPreview > 0 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "photo.fill")
+                        Text(attachmentCountWithoutPreview == 1 ? "1 attachment" : "\(attachmentCountWithoutPreview) attachments")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
+                }
+                if message.interaction == nil && (!message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachments.isEmpty) {
+                    // One view from the wait to the settled reply: the hint
+                    // crossfades to the first paced words, and the streamed
+                    // text crossfades to markdown. The stack takes the
+                    // incoming phase's size, so nothing stacks while it fades.
+                    ChatCrossfadeStack(current: phase) {
+                        if phase == 0 {
+                            waitingHint
+                                .layoutValue(key: ChatCrossfadePhase.self, value: 0)
+                                .transition(.opacity)
+                        }
+                        if phase == 2 {
+                            ChatMarkdownView(blocks: MobileChatMarkdown.blocks(id: message.id, content: message.text))
+                                .layoutValue(key: ChatCrossfadePhase.self, value: 2)
+                                .transition(.opacity)
+                        } else {
+                            plainText
+                                .layoutValue(key: ChatCrossfadePhase.self, value: 1)
+                                .transition(.opacity)
+                        }
+                    }
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: phase)
+                }
+            }
+            if message.role == .assistant, message.completionState == "failed" || message.failureDetail != nil {
+                AliveStatusNote(systemImage: "exclamationmark.circle",
+                    text: message.failureDetail.map { "Interrupted · \($0)" } ?? "Interrupted")
+            }
+            // Collapsed "Used N tools" summary sits BELOW the reply once the
+            // turn is done, so it never pushes the text down at finish.
             if message.role == .assistant, !message.isStreaming, !message.toolEvents.isEmpty {
                 ToolActivityView(events: message.toolEvents, isLive: false)
-            }
-            if message.isStreaming {
-                if !message.toolEvents.isEmpty, message.text.isEmpty {
-                    // Working through tools — flip through them in one line.
-                    ToolActivityView(events: message.toolEvents, isLive: true)
-                } else if message.text.isEmpty {
-                    HStack(spacing: 10) {
-                        HazePulse()
-                        Text(streamingHint)
-                            .mobileTypography(.body)
-                            .foregroundStyle(AlivePalette.secondary)
-                    }
-                    .frame(minHeight: 32, alignment: .leading)
-                } else {
-                    Text(message.text)
-                        .mobileTypography(.body)
-                        .lineSpacing(6)
-                        .foregroundStyle(AlivePalette.text)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(imageAttachments) { attachment in
-                        AttachmentImagePreview(summary: attachment)
-                    }
-                    if attachmentCountWithoutPreview > 0 {
-                        HStack(spacing: 6) {
-                            Image(systemName: "photo.fill")
-                            Text(attachmentCountWithoutPreview == 1 ? "1 attachment" : "\(attachmentCountWithoutPreview) attachments")
-                        }
-                        .font(.footnote)
-                        .foregroundStyle(AlivePalette.secondary)
-                    }
-                    if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachments.isEmpty {
-                        Text(message.text.isEmpty ? " " : message.text)
-                            .font(isUser ? .subheadline : .body)
-                            .lineSpacing(isUser ? 3 : 6)
-                            .foregroundStyle(isUser ? AlivePalette.secondary : AlivePalette.text)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
             }
             // 2026-09-13: "Keep waiting" is gone. Waiting is no longer
             // something the person has to ask for — the phone never stops
             // observing the request it already sent, so there is nothing
             // here to press.
         }
-        .frame(maxWidth: 620, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.trailing, isUser && !dynamicTypeSize.isAccessibilitySize ? 24 : 0)
     }
+
+    /// 0 waiting for the first words, 1 plain (the live reply, the person's
+    /// own lines), 2 a settled reply as markdown.
+    private var phase: Int {
+        if message.isStreaming || isLiveTurn { return message.text.isEmpty ? 0 : 1 }
+        return message.role == .assistant && !message.text.isEmpty ? 2 : 1
+    }
+
+    @ViewBuilder
+    private var waitingHint: some View {
+        if !message.toolEvents.isEmpty {
+            // Working through tools — flip through them in one line.
+            ToolActivityView(events: message.toolEvents, isLive: true)
+        } else {
+            HStack(spacing: 10) {
+                HazePulse()
+                Text(streamingHint)
+                    .mobileTypography(.body)
+                    .foregroundStyle(AlivePalette.secondary)
+            }
+            .frame(minHeight: 32, alignment: .leading)
+        }
+    }
+
+    /// Her reply streams through the paced reveal (about 80 words a second,
+    /// the newest words fading in, finished paragraphs left alone); it is
+    /// mounted from the wait on, so the first batch paces too. The person's
+    /// own lines are plain text.
+    @ViewBuilder
+    private var plainText: some View {
+        Group {
+            if isUser {
+                Text(message.text.isEmpty ? " " : message.text)
+            } else {
+                // The phone's ~1 s batches carry up to ~1,200 characters (up to 4 bytes each).
+                PacedStreamingText(text: message.text, maxLagBytes: 4_800, inline: ChatInlineMarkdown(MobileChatMarkdown.inline))
+            }
+        }
+        .font(isUser ? .subheadline : .body)
+        .lineSpacing(isUser ? 3 : 6)
+        .foregroundStyle(isUser ? AlivePalette.ownLine : AlivePalette.text)
+        .textSelection(.enabled)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var isUser: Bool { message.role == .user }
 
     private var imageAttachments: [ChatAttachmentSummary] {
         ChatAttachmentPresentation.previewableImages(in: message.attachments)
@@ -82,6 +133,145 @@ struct BubbleView: View {
 
     private var attachmentCountWithoutPreview: Int {
         ChatAttachmentPresentation.fallbackCount(in: message.attachments)
+    }
+}
+
+private struct MobileInteractionCard: View {
+    let card: InlineInteraction
+    let descriptor: InlineInteractionDescriptor
+    let sessionID: String
+    @State private var values: [String: String] = [:]
+    @State private var busy = false
+    @State private var response: String?
+    @State private var answeredRevision: Int?
+    @State private var showsTrust = false
+    @State private var showsProviders = false
+    @StateObject private var settingsStore = SettingsStore()
+
+    private var locallyRequired: Bool {
+        [.internetAccounts, .chromeSetup, .pairDevice, .connectorOAuth].contains(descriptor.control)
+    }
+    private var editable: Bool {
+        card.state.name == "pending" || card.state.failureReason != nil || (card.state.name == "running" && locallyRequired)
+    }
+    private var fields: [(String, String, Bool)] {
+        if descriptor.control == .providerAPIKey { return [("value", "API key or setup token", true)] }
+        guard descriptor.control == .connectorManualToken else { return [] }
+        switch descriptor.target {
+        case "slack": return [("token", "Bot token", true), ("app_token", "Socket Mode token (optional)", true),
+                              ("allowed_channels", "Allowed channel IDs", false), ("allowed_users", "Allowed user IDs", false)]
+        case "telegram": return [("token", "Bot token", true), ("allowed_chat_id", "Allowed chat ID (optional)", false)]
+        default: return [("token", "Token", true)]
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(card.title, systemImage: descriptor.icon ?? "questionmark.circle")
+                .font(.headline)
+            Text(card.why)
+            if let outcome = card.state.outcome { Label(outcome.summary, systemImage: "checkmark.circle") }
+            else if card.state == .declined { Text("Not now. " + card.declineConsequence).foregroundStyle(.secondary) }
+            else if card.state == .superseded { Text("Replaced by a newer request.").foregroundStyle(.secondary) }
+            else if card.state.isUnknown { Text("This build cannot answer this card.").foregroundStyle(.secondary) }
+            else {
+                if let reason = card.state.failureReason { Text(reason).foregroundStyle(.orange) }
+                if let note = card.persistenceNote { Text(note).font(.footnote).foregroundStyle(.secondary) }
+                if card.kind == .permission {
+                    Text("Access: " + (card.mode?.phrase ?? "read and write")).font(.footnote)
+                    Text("macOS privacy grants still require approval on the Mac.").font(.footnote).foregroundStyle(.secondary)
+                }
+                if locallyRequired {
+                    Text("Complete this setup on your Mac, then check again here.").font(.footnote)
+                    Button("Check again") { answer("verify") }
+                } else if descriptor.control == .trustPostureRequired {
+                    Button("Review Trust") { showsTrust = true }
+                    Button("Check again") { answer("verify") }
+                } else if descriptor.isActionable {
+                    if descriptor.control == .providerAPIKey || descriptor.control == .providerGroupModel {
+                        Button("Provider settings") { showsProviders = true }
+                        Button("Check again") { answer("verify") }
+                    }
+                    ForEach(fields, id: \.0) { field in
+                        Group {
+                            if field.2 { SecureField(field.1, text: fieldBinding(field.0)) }
+                            else { TextField(field.1, text: fieldBinding(field.0)) }
+                        }
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textFieldStyle(.roundedBorder)
+                    }
+                    if !fields.isEmpty {
+                        Text("Encrypted to your paired Mac. Credentials never enter the conversation.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if card.kind == .choose || card.kind == .modelChoice {
+                        ForEach(card.options.filter { $0.id != "__save_for_group__" }) { option in
+                            Button { answer("primary", choice: option.id) } label: {
+                                VStack(alignment: .leading) {
+                                    Text(option.label)
+                                    if let detail = option.detail { Text(detail).font(.footnote).foregroundStyle(.secondary) }
+                                }
+                            }
+                        }
+                        if card.kind == .modelChoice {
+                            Picker("Applies to", selection: fieldBinding("scope")) {
+                                Text("This request").tag(InlineInteraction.Scope.thisRequestOnly.rawValue)
+                                Text("Keep for this group").tag(InlineInteraction.Scope.persistent.rawValue)
+                            }
+                            .pickerStyle(.menu)
+                        }
+                    } else {
+                        Button(card.primaryActionLabel) { answer("primary") }
+                    }
+                } else { Text(descriptor.unavailableReason ?? "This control is unavailable.") }
+                Button("Not now") { answer("decline") }
+                Text(card.declineConsequence).font(.footnote).foregroundStyle(.secondary)
+            }
+            if busy { ProgressView() }
+            if let response, !response.isEmpty { Text(response).font(.footnote) }
+        }
+        .padding(14)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .disabled(busy || !editable || answeredRevision == card.revision)
+        .onAppear { values["scope"] = (card.primaryScope ?? .thisRequestOnly).rawValue }
+        .onChange(of: card.revision) { _, _ in answeredRevision = nil; response = nil }
+        .sheet(isPresented: $showsTrust) {
+            NavigationStack {
+                TrustPolicyView(store: settingsStore)
+                    .toolbar { Button("Done") { showsTrust = false } }
+                    .task { await settingsStore.refresh() }
+            }
+        }
+        .sheet(isPresented: $showsProviders) {
+            NavigationStack {
+                ProviderSettingsView()
+                    .toolbar { Button("Done") { showsProviders = false } }
+            }
+        }
+    }
+
+    private func fieldBinding(_ key: String) -> Binding<String> {
+        Binding(get: { values[key] ?? "" }, set: { values[key] = $0 })
+    }
+    private func answer(_ action: String, choice: String? = nil) {
+        var input = values
+        if let choice { input["choice"] = choice }
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                let result = try await iCloudSyncEngine.shared.answerInteraction(card, sessionID: sessionID,
+                    actionName: action, values: input)
+                response = result["message"]
+                answeredRevision = card.revision
+                values = [:]
+                await iCloudSyncEngine.shared.refreshChatTranscriptsSnapshot()
+            } catch {
+                response = error.localizedDescription
+                await iCloudSyncEngine.shared.refreshChatTranscriptsSnapshot()
+            }
+        }
     }
 }
 
@@ -126,16 +316,7 @@ private struct AttachmentImagePreview: View {
 // Activity tab uses. Activity → Approvals stays the canonical list.
 
 enum MobileChatApprovalProjection {
-    /// Approvals this conversation raised and nobody has answered yet.
-    ///
-    /// Two fences, both evidence-based:
-    ///
-    /// 1. **Session.** The row must carry this chat's origin session id. An
-    ///    approval with no chat origin (a Workshop step, a memory proposal) is
-    ///    not a chat approval and never enters a chat bubble.
-    /// 2. **Undecided.** Only a pending row is a live question. A decided or
-    ///    unreadable row is finished business and belongs to Activity, which
-    ///    can show its outcome honestly; a bubble cannot.
+    /// Questions, expirations and failed executions belonging to this conversation.
     static func pendingApprovals(
         sessionId: String?,
         approvals: [ApprovalRequest]
@@ -144,8 +325,8 @@ enum MobileChatApprovalProjection {
               !sessionId.isEmpty else { return [] }
         return approvals.filter {
             $0.chatOriginSessionId == sessionId
-                && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "pending"
-                && $0.decision == nil
+                && (($0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "pending"
+                    && $0.decision == nil) || $0.executionFailed || $0.isExpired)
         }
     }
 
@@ -181,6 +362,7 @@ struct InlineChatApprovalCard: View {
     @State private var decisionStatusIsError = false
 
     private var canDecide: Bool { MobileChatApprovalProjection.canDecideOnPhone(approval) }
+    private var pending: Bool { approval.status.lowercased() == "pending" && approval.decision == nil }
 
     private var canSendDecision: Bool {
         pairingStore.isICloudSigned && bridge.available && bridgeClient.bridgeStatus != .deviceOffline
@@ -200,9 +382,8 @@ struct InlineChatApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                AliveStatusDot(state: .waiting)
-                    .scaleEffect(0.75)
-                Text(canDecide ? "I need your OK" : "Agent’s decision")
+                if pending { AliveStatusDot(state: .waiting).scaleEffect(0.75) }
+                Text(pending ? (canDecide ? "I need your OK" : "\(iCloudSyncEngine.shared.agentDisplayName)’s decision") : approval.decisionSummary)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(AlivePalette.secondary)
                 if let riskWords {
@@ -225,18 +406,23 @@ struct InlineChatApprovalCard: View {
             }
             // What will be sent, in plain lines, before Approve.
             PayloadPreview(approval: approval, maxLines: 4)
+            if let summary = approval.expirationGuidance(agentName: iCloudSyncEngine.shared.agentDisplayName) ?? approval.executionSummary {
+                Text(summary)
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
+            }
             if let decisionStatusText {
                 Text(decisionStatusText)
                     .font(.footnote)
                     .foregroundStyle(decisionStatusIsError ? Color.red : AlivePalette.secondary)
             }
-            if !canDecide {
+            if pending && !canDecide {
                 Text(ApprovalText.agentDecision)
                     .font(.footnote)
                     .foregroundStyle(AlivePalette.secondary)
             }
             HStack(spacing: 10) {
-                if canDecide {
+                if pending && canDecide {
                     Button {
                         decide(approve: true)
                     } label: {
@@ -285,14 +471,15 @@ struct InlineChatApprovalCard: View {
         .padding(.horizontal, 16)
         .padding(.top, 14)
         .padding(.bottom, 4)
-        .frame(maxWidth: 620, alignment: .leading)
+        // The transcript column already caps the readable width (roomColumn).
+        .frame(maxWidth: .infinity, alignment: .leading)
         .aliveCard(radius: 20)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Approval needed for \(ApprovalText.title(approval))")
+        .accessibilityLabel("\(pending ? "Approval needed" : approval.decisionSummary) for \(ApprovalText.title(approval))")
     }
 
     private func decide(approve: Bool) {
-        guard canDecide, canSendDecision, !isDeciding else { return }
+        guard pending, canDecide, canSendDecision, !isDeciding else { return }
         #if DEBUG
         // The -chatSampleExtras fixture is for screenshots only; never send it.
         if approval.id == "sample-approval" { return }
@@ -356,7 +543,7 @@ struct ToolActivityView: View {
             HazePulse()
             Group {
                 if let latest {
-                    Text(Self.plainName(latest.name))
+                    Text(latest.activity ?? Self.plainName(latest.name))
                         .id(latest.id)
                         .transition(.asymmetric(
                             insertion: .move(edge: .bottom).combined(with: .opacity),
@@ -415,7 +602,8 @@ struct ToolActivityView: View {
             if expanded.wrappedValue {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(items) { e in
-                        Text(Self.plainName(e.name))
+                        Text(e.outcome.map { ToolActivityPresentation.finished(e.name, outcome: $0, detail: e.resultDetail) }
+                             ?? Self.plainName(e.name))
                             .font(.footnote)
                             .foregroundStyle(AlivePalette.secondary)
                     }

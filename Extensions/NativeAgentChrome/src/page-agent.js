@@ -1,21 +1,42 @@
 (() => {
-  const MAX_AGGREGATE_NODE_TEXT = 200_000;
+  // A repeated attach or concurrent manifest injection replaces the reader
+  // coherently, including its observers, timers and trusted-input listeners.
+  globalThis.__nativeAgentPageAgent?.();
   // Leave ten seconds of the host's thirty-second request deadline for the
   // content reply, extension receipt, and native-messaging transport.
   const MAX_TYPING_DURATION_MS = 20_000;
   const TYPE_YIELD_EVERY = 32;
   const snapshots = new Map();
+  let scrollObservation = null;
+  const documentIdentity = crypto.randomUUID();
+  const elementIdentities = new WeakMap();
+  const elementFragments = new WeakMap();
+  const fragmentCounts = new Map();
+  const allocatedFragments = new Set();
+  let documentLinkTargets = new WeakMap();
   const typingRuns = new Set();
   const waitingRuns = new Set();
+  const cancelledActions = new Set();
   let domGeneration = 0;
+  // Coalesce mutation bursts in the page. This is a publication cadence, not
+  // an action deadline: continuous changes still deliver one notice per turn.
+  const CHANGE_DEBOUNCE_MS = 250;
+  let observedTab = null;
+  let changeTimer = null;
+  const changeObserver = new MutationObserver(queuePageChange);
+  const inputBindings = [];
 
   for (const kind of ["pointerdown", "keydown", "wheel", "touchstart"]) {
-    window.addEventListener(kind, (event) => {
+    const listener = (event) => {
       if (event.isTrusted !== true) return;
+      stopChangeStream();
       snapshots.clear();
+      scrollObservation = null;
       for (const run of typingRuns) run.stopReason = "user_takeover";
       for (const run of waitingRuns) run.stopReason = "user_takeover";
-    }, { capture: true, passive: true });
+    };
+    inputBindings.push([kind, listener]);
+    window.addEventListener(kind, listener, { capture: true, passive: true });
   }
 
   const MUTATION_SCOPE = { subtree: true, childList: true, attributes: true, characterData: true };
@@ -42,16 +63,44 @@
       else snapshots.delete(id);
     }
     if (invalidatedSnapshotIds.length > 0) {
-      if (typeof chrome.runtime?.sendMessage === "function") {
-        void chrome.runtime.sendMessage({
-          type: "nativeagent.page.mutated",
-          snapshotIds: invalidatedSnapshotIds,
-          retainedNavigationNodes,
-        }).catch(() => {});
-      }
+      notifyHost({
+        type: "nativeagent.page.mutated",
+        snapshotIds: invalidatedSnapshotIds,
+        retainedNavigationNodes,
+      });
     }
   });
   domObserver.observe(document, MUTATION_SCOPE);
+
+  function stopChangeStream() {
+    observedTab = null;
+    changeObserver.disconnect();
+    clearTimeout(changeTimer);
+    changeTimer = null;
+  }
+
+  function startChangeStream(message) {
+    const newlyAttached = observedTab?.tabId !== message.tabId;
+    observedTab = { tabId: message.tabId, userSequence: message.userSequence };
+    changeObserver.disconnect();
+    changeObserver.observe(document, MUTATION_SCOPE);
+    for (const root of observedShadowRoots) {
+      if (root.host?.isConnected === true) changeObserver.observe(root, MUTATION_SCOPE);
+    }
+    if (newlyAttached) queuePageChange();
+  }
+
+  function queuePageChange() {
+    if (!observedTab || changeTimer !== null) return;
+    changeTimer = setTimeout(() => {
+      changeTimer = null;
+      if (!observedTab) return;
+      notifyHost({
+        type: "nativeagent.page.changed",
+        tabId: observedTab.tabId, userSequence: observedTab.userSequence,
+      });
+    }, CHANGE_DEBOUNCE_MS);
+  }
 
   function observeShadowRoots(roots) {
     for (const root of roots) {
@@ -59,6 +108,7 @@
       observedShadowRoots.add(root);
       try {
         domObserver.observe(root, MUTATION_SCOPE);
+        if (observedTab) changeObserver.observe(root, MUTATION_SCOPE);
       } catch {
         // A root that cannot be observed simply keeps the old behaviour for
         // its subtree; it must never cost the caller the whole snapshot.
@@ -84,30 +134,47 @@
     if (!stale) return;
     domObserver.disconnect();
     domObserver.observe(document, MUTATION_SCOPE);
+    changeObserver.disconnect();
+    if (observedTab) changeObserver.observe(document, MUTATION_SCOPE);
     for (const root of observedShadowRoots) {
       try {
         domObserver.observe(root, MUTATION_SCOPE);
+        if (observedTab) changeObserver.observe(root, MUTATION_SCOPE);
       } catch {
         observedShadowRoots.delete(root);
       }
     }
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  const messageListener = (message, _sender, sendResponse) => {
     if (!message?.type?.startsWith("nativeagent.page.")) return false;
     try {
       switch (message.type) {
-        case "nativeagent.page.lease.invalidated":
+        case "nativeagent.page.observe":
+          startChangeStream(message);
+          sendResponse({ ok: true, result: { observing: observedTab !== null,
+            ready: document.readyState !== "loading", url: location.href } });
+          break;
+        case "nativeagent.page.tab.invalidated":
+          if (observedTab?.tabId === message.tabId) stopChangeStream();
+          if (scrollObservation?.tabId === message.tabId) scrollObservation = null;
           for (const run of typingRuns) {
-            if (run.leaseId === message.leaseId) run.stopReason = "lease_revoked";
+            if (run.tabId === message.tabId) run.stopReason = "tab_not_owned";
           }
           for (const run of waitingRuns) {
-            if (run.leaseId === message.leaseId) run.stopReason = "lease_revoked";
+            if (run.tabId === message.tabId) run.stopReason = "tab_not_owned";
           }
           for (const [id, snapshot] of snapshots) {
-            if (snapshot.leaseId === message.leaseId) snapshots.delete(id);
+            if (snapshot.tabId === message.tabId) snapshots.delete(id);
           }
           sendResponse({ ok: true, result: { invalidated: true } });
+          break;
+        case "nativeagent.page.action.cancel":
+          cancelledActions.add(message.requestId);
+          if (cancelledActions.size > 128) cancelledActions.delete(cancelledActions.values().next().value);
+          for (const run of typingRuns) if (run.actionId === message.requestId) run.stopReason = "action_cancelled";
+          for (const run of waitingRuns) if (run.actionId === message.requestId) run.stopReason = "action_cancelled";
+          sendResponse({ ok: true, result: { cancelled: true } });
           break;
         case "nativeagent.page.snapshot":
           sendResponse({ ok: true, result: createSnapshot(message) });
@@ -156,6 +223,12 @@
             (error) => sendPageError(sendResponse, error),
           );
           return true;
+        case "nativeagent.page.media":
+          void controlMedia(message).then(
+            (result) => sendResponse({ ok: true, result }),
+            (error) => sendPageError(sendResponse, error),
+          );
+          return true;
         default:
           sendResponse({ ok: false, error: { code: "unknown_page_action", message: "Unknown page action." } });
       }
@@ -163,9 +236,44 @@
       sendPageError(sendResponse, error);
     }
     return false;
-  });
+  };
+  chrome.runtime.onMessage.addListener(messageListener);
+  const runtime = chrome.runtime;
+  const teardown = () => {
+    document.removeEventListener("DOMContentLoaded", announcePageReady);
+    stopChangeStream();
+    domObserver.disconnect();
+    observedShadowRoots.clear();
+    snapshots.clear();
+    scrollObservation = null;
+    for (const [kind, listener] of inputBindings) window.removeEventListener(kind, listener, { capture: true });
+    for (const run of typingRuns) run.stopReason = "tab_not_owned";
+    for (const run of waitingRuns) run.stopReason = "tab_not_owned";
+    // An invalidated extension context has already lost its runtime listener.
+    if (runtime.id) runtime.onMessage.removeListener(messageListener);
+  };
+  globalThis.__nativeAgentPageAgent = teardown;
+
+  // A reloaded or updated extension orphans this copy: its runtime is gone and
+  // every send throws "Extension context invalidated". Stop quietly instead.
+  function notifyHost(message) {
+    if (!chrome.runtime?.id) { teardown(); return; }
+    try { void chrome.runtime.sendMessage(message).catch(() => {}); }
+    catch { teardown(); }
+  }
+
+  // document_start installs the reader before the new page's headings exist.
+  // Announce readiness from the document's own lifecycle, so navigation news
+  // reads its content rather than an empty document still being parsed.
+  function announcePageReady() {
+    notifyHost({ type: "nativeagent.page.ready", url: location.href });
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", announcePageReady, { once: true });
+  else announcePageReady();
 
   function createSnapshot(message) {
+    // Authored anchors and section labels are evidence of this capture only.
+    documentLinkTargets = new WeakMap();
     const maxNodes = clampInteger(message.maxNodes, 1, 500, 120);
     const maxTextChars = clampInteger(message.maxTextChars, 1, 50_000, 12_000);
     const readingScope = message.scope ?? "page";
@@ -179,26 +287,96 @@
     const nodeIdByElement = new Map();
     const nodes = [];
     const truncationReasons = [];
-    const walk = composedElementWalk(document.body, 5_000, true);
+    if (message.readCursor && (message.readCursor.frameURL ?? message.readCursor.url) !== location.href) throw pageError("page_changed", "This continuation belongs to another page. Read the current page again.");
+    const viewportObservationId = message.readCursor?.viewportObservationId;
+    const observation = viewportObservationId ? scrollObservation : null;
+    if (viewportObservationId && (!observation || observation.id !== viewportObservationId
+      || observation.tabId !== message.tabId || (observation.target !== window && !observation.target.isConnected))) {
+      throw pageError("read_address_missing", "The scroll viewport is no longer available. Read the page again.");
+    }
+    const viewportRoot = observation?.target === window ? document.body : observation?.target;
+    languageNavigationCache = new WeakMap();
+    let walk = composedElementWalk(viewportRoot ?? document.body, 5_000, Boolean(observation), message.readCursor?.elementPath);
+    const viewportChanged = observation ? viewportChange(observation.before, captureViewport(observation.target, walk)) : null;
     pruneObservedShadowRoots();
     observeShadowRoots(walk.shadowRoots);
-    const modals = walk.elements.filter((element) => isVisible(element) && isModal(element));
-    const mainRegions = walk.elements.filter((element) => isVisible(element)
+    const modalSelector = "dialog, [role=dialog][aria-modal=true], [role=alertdialog][aria-modal=true]";
+    const modalRoots = new Set([document, ...walk.shadowRoots]);
+    let modals = [...new Set([...modalRoots].flatMap(root => [...root.querySelectorAll(modalSelector)]))]
+      .filter((element) => isVisible(element) && isModal(element));
+    const regionSelector = "main, article, [role=main], [role=article], [role=document], [itemprop~=articleBody]";
+    const regions = [...document.querySelectorAll(regionSelector), ...walk.elements,
+      ...walk.shadowRoots.flatMap(root => [...root.querySelectorAll(regionSelector)])];
+    if (observation) for (let parent = composedParent(viewportRoot); parent; parent = composedParent(parent)) regions.push(parent);
+    const mainRegions = [...new Set(regions)].filter((element) => isVisible(element)
       && (element.tagName?.toLowerCase() === "main" || element.getAttribute?.("role") === "main"));
-    const contentRegions = mainRegions.length ? mainRegions : walk.elements.filter((element) => isVisible(element)
-      && (element.tagName?.toLowerCase() === "article" || element.getAttribute?.("role") === "article"));
+    const articleRegions = [...new Set(regions)].filter((element) => isVisible(element)
+      && element.matches("article, [role=article], [role=document], [itemprop~=articleBody]"));
+    const bodies = articleRegions.filter(element => !articleRegions.some(other => other !== element && withinElement(element, other)));
+    const contentRegions = mainRegions.length ? mainRegions : bodies;
+    // Spend the walk budget inside semantic content, not the surrounding nav.
+    // A single authored body leads the same main; repeated cards keep DOM order.
+    if (readingScope === "main_content" && !observation) {
+      const firstBody = bodies.length === 1 && (!mainRegions.length || mainRegions.some(main => withinElement(bodies[0], main))) ? bodies : [];
+      const roots = [...new Set([...firstBody, ...contentRegions, ...modals])];
+      walk = composedElementWalk(document.body, 5_000, false, message.readCursor?.elementPath, roots, true);
+      observeShadowRoots(walk.shadowRoots);
+      for (const root of walk.shadowRoots) modalRoots.add(root);
+      modals = [...new Set([...modalRoots].flatMap(root => [...root.querySelectorAll(modalSelector)]))]
+        .filter((element) => isVisible(element) && isModal(element));
+    }
+    if (message.readCursor?.elementPath && message.readCursor?.addressFragment) {
+      const target = walk.elements.find(element => stableElementPath(element) === message.readCursor.elementPath);
+      const expected = message.readCursor.addressFragment.replace(/^frame\/\d+\//, "");
+      if (!target || readableElementFragment(target, message.readCursor.name || "") !== expected) {
+        throw pageError("read_address_missing", "This reading place changed or disappeared. Read the current page again.");
+      }
+    }
     // Scope before spending the node/text budget. A long visible sidebar must
     // not consume all available evidence before the adjacent article. The
-    // viewport, shadow walk cap, redaction, and modal action checks still apply.
-    const candidates = readingScope === "page" ? walk.elements : walk.elements.filter((element) =>
+    // shadow walk cap, redaction, and modal action checks still apply. Scroll
+    // readbacks use their observed viewport; ordinary reads retain DOM order.
+    let candidates = readingScope === "page" ? walk.elements : walk.elements.filter((element) =>
       modals.some((modal) => withinElement(element, modal))
       || (contentRegions.some((region) => withinElement(element, region)) && !insideNavigation(element)));
+    if (message.readCursor?.elementOnly === true) {
+      const element = walk.elements.find(element => stableElementPath(element) === message.readCursor.elementPath);
+      if (!element || element.tagName.toLowerCase() !== "select") throw pageError("invalid_read_cursor", "The folded select control is no longer present.");
+      candidates = [element];
+    }
     const glyphCounts = fragmentedTextGlyphCounts(candidates);
     const collapsedText = new Set();
+    let nextRead = null;
     let aggregateNodeText = 0;
     // 2026-09-23: node text honors max_text_chars too; only the summary was
     // bounded, so a 1k-char ask still shipped up to 200k chars of nodes.
-    const nodeTextBudget = Math.min(MAX_AGGREGATE_NODE_TEXT, maxTextChars);
+    // The caller can enlarge both budgets. Oversized controls fold their own
+    // content instead of becoming an impassable page continuation.
+    const nodeByteBudget = Math.max(12_000, maxTextChars);
+    const utf8 = new TextEncoder();
+    let aggregateNodeBytes = 0;
+    let sectionName = bounded(walk.sectionName || document.title, 160);
+    let sectionStart = null, paragraphStart = null, paragraph = null;
+    const representedLinks = new Set();
+    const checkpoint = (element) => ({ element, count: nodes.length, chars: aggregateNodeText,
+      bytes: aggregateNodeBytes, sectionName,
+      hasContent: nodes.some(node => !["heading", "landmark", "article"].includes(node.kind) && (node.text || node.name)) });
+    const foldAtBoundary = () => {
+      // Keep whole sections when they fit. A section larger than a window
+      // advances by whole paragraphs; only a first oversized paragraph splits.
+      const boundary = sectionStart?.hasContent ? sectionStart : paragraphStart?.count > 0 ? paragraphStart : null;
+      if (!boundary) return false;
+      for (const node of nodes.splice(boundary.count)) {
+        const element = elementByNodeId.get(node.nodeId);
+        nodeIdByElement.delete(element); elementByNodeId.delete(node.nodeId);
+        identityByNodeId.delete(node.nodeId); navigationProofs.delete(node.nodeId); selectProofs.delete(node.nodeId);
+        for (const ids of actionNodeIds.values()) ids.delete(node.nodeId);
+      }
+      aggregateNodeText = boundary.chars; aggregateNodeBytes = boundary.bytes;
+      nextRead = { elementPath: stableElementPath(boundary.element), addressFragment: readableElementFragment(boundary.element, boundary.sectionName), textOffset: 0,
+        name: boundary.sectionName };
+      return true;
+    };
     if (walk.truncated) truncationReasons.push("walk_limit");
 
     for (const element of candidates) {
@@ -206,86 +384,153 @@
         for (const child of element.children) collapsedText.add(child);
         continue;
       }
-      if (nodes.length >= maxNodes) {
-        truncationReasons.push("node_limit");
-        break;
-      }
-      if (!isVisible(element) || !intersectsViewport(element)) continue;
+      if (!isPageContentElement(element) || !isVisible(element)) continue;
       const kind = elementKind(element);
-      const fragmented = element.children.length > 0 && glyphCounts.get(element) >= 2;
-      let text = fragmented ? bounded(normalizedText(visibleFragmentedText(element)), 1_000) : snapshotText(element);
+      if (kind === "image" && !meaningfulImageName(element)) continue;
+      if (kind === "link" && representedLinks.has(stableElementPath(element))) continue;
+      const fragmented = element.children.length > 0 && glyphCounts.get(element) >= 2 && !element.closest("pre, code");
+      const fullText = fragmented ? normalizedText(visibleFragmentedText(element)) : snapshotText(element);
+      const textOffset = message.readCursor?.elementPath === stableElementPath(element) ? (message.readCursor.textOffset ?? 0) : 0;
+      if (!Number.isSafeInteger(textOffset) || textOffset < 0 || textOffset > fullText.length) throw pageError("invalid_read_cursor", "The page text continuation is no longer present.");
+      let text = fullText.slice(textOffset);
       let name = bounded(accessibleName(element, text), 500);
       // Layout wrappers repeat the entire feed at every nesting level. Keep
       // semantic containers and controls, and preserve direct/leaf text instead.
-      if (!fragmented && isRedundantLayoutWrapper(element, kind)) continue;
+      if (!fragmented && !text && isRedundantLayoutWrapper(element, kind)) continue;
       if (fragmented) for (const child of element.children) collapsedText.add(child);
       if (fragmented && !text) continue;
       if (!name && !text && kind === "other") continue;
-      const selectInfo = element.tagName.toLowerCase() === "select" ? selectDescription(element) : null;
-      let nodeTextCost = text.length + name.length + (selectInfo ? JSON.stringify(selectInfo).length : 0);
-      // 2026-09-28: its glyphs are already consumed, so a collapsed run that
-      // overruns the budget keeps the part that fits instead of vanishing.
-      if (fragmented && aggregateNodeText + nodeTextCost > nodeTextBudget) {
-        const room = Math.floor((nodeTextBudget - aggregateNodeText) / 2);
-        if (room > 0) {
-          text = text.slice(0, room);
-          name = bounded(accessibleName(element, text), 500);
-          nodeTextCost = text.length + name.length;
-        }
+      const heading = sectionHeading(element);
+      if (heading) { sectionName = bounded(heading, 160); sectionStart = checkpoint(element); }
+      const block = readingBlock(element);
+      if (block !== paragraph) { paragraph = block; paragraphStart = checkpoint(element); }
+      if (nodes.length >= maxNodes) {
+        truncationReasons.push("node_limit");
+        if (!foldAtBoundary()) nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset: 0, name: sectionName };
+        break;
       }
-      if (aggregateNodeText + nodeTextCost > nodeTextBudget) {
-        truncationReasons.push(nodeTextBudget < MAX_AGGREGATE_NODE_TEXT ? "text_limit" : "encoded_size_limit");
-        // 2026-09-23: past the text budget, drop prose but never a control; a
-        // long article or a spent top frame must not hide later buttons/links.
-        const budgetRole = element.getAttribute("role") ?? implicitRole(element);
-        if (!isClickable(element, budgetRole) && !isEditable(element) && !isSelectable(element)
-          && !isCheckable(element, budgetRole)) continue;
-        text = ""; // name stays: action identity checks compare it.
+      const optionOffset = message.readCursor?.elementPath === stableElementPath(element) ? (message.readCursor.optionOffset ?? 0) : 0;
+      let selectInfo = element.tagName.toLowerCase() === "select" ? selectDescription(element, optionOffset) : null;
+      if (selectInfo) name = bounded(accessibleName(element, fullText), 500);
+      let elementMore = null;
+      if (selectInfo && (optionOffset || selectInfo.optionsTruncated
+        || name.length + text.length + JSON.stringify(selectInfo).length > maxTextChars - aggregateNodeText
+        || utf8.encode(name + text + JSON.stringify(selectInfo)).length > nodeByteBudget - aggregateNodeBytes)) {
+        if (!Number.isSafeInteger(optionOffset) || optionOffset < 0 || optionOffset > selectInfo.optionCount) throw pageError("invalid_read_cursor", "The select option continuation is no longer present.");
+        selectInfo.optionOffset = optionOffset;
+        const room = maxTextChars - aggregateNodeText - name.length;
+        const byteRoom = nodeByteBudget - aggregateNodeBytes - utf8.encode(name).length;
+        const offered = selectInfo.options.length;
+        let choices = JSON.stringify(selectInfo);
+        while (selectInfo.options.length && (choices.length > room || utf8.encode(choices).length > byteRoom)) {
+          selectInfo.options.pop();
+          selectInfo.optionsTruncated = true;
+          choices = JSON.stringify(selectInfo);
+        }
+        if (choices.length > room || utf8.encode(choices).length > byteRoom || (offered && !selectInfo.options.length)) {
+          if (foldAtBoundary()) { truncationReasons.push("text_limit"); break; }
+          nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset, optionOffset, ...(message.readCursor?.elementOnly ? { elementOnly: true } : {}), name: sectionName };
+          if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold this control's name and next choice. Increase max_text_chars.");
+          truncationReasons.push("text_limit");
+          break;
+        }
+        const textRoom = room - choices.length, textByteRoom = byteRoom - utf8.encode(choices).length;
+        let end = 0, bytes = 0;
+        for (const character of text) {
+          const size = utf8.encode(character).length;
+          if (end + character.length > textRoom || bytes + size > textByteRoom) break;
+          end += character.length; bytes += size;
+        }
+        const nextOption = optionOffset + selectInfo.options.length;
+        if (end < text.length || nextOption < selectInfo.optionCount) {
+          if (!end && nextOption === optionOffset) {
+            nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset, optionOffset, ...(message.readCursor?.elementOnly ? { elementOnly: true } : {}), name: sectionName };
+            if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold the next character. Increase max_text_chars.");
+            truncationReasons.push("text_limit");
+            break;
+          }
+          elementMore = { url: location.href, elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), elementOnly: true,
+            textOffset: textOffset + end, optionOffset: nextOption, name: sectionName };
+          text = text.slice(0, end);
+        }
+        if (!optionOffset && !elementMore) delete selectInfo.optionOffset;
+      }
+      let nodeTextCost = text.length + name.length + (selectInfo ? JSON.stringify(selectInfo).length : 0);
+      const choiceText = selectInfo ? JSON.stringify(selectInfo) : "";
+      const nameBytes = utf8.encode(name + choiceText).length;
+      const textBytes = utf8.encode(text).length;
+      if (aggregateNodeText + nodeTextCost > maxTextChars || aggregateNodeBytes + nameBytes + textBytes > nodeByteBudget) {
+        truncationReasons.push("text_limit");
+        if (foldAtBoundary()) break;
+        const room = maxTextChars - aggregateNodeText - name.length - choiceText.length;
+        const byteRoom = nodeByteBudget - aggregateNodeBytes - nameBytes;
+        if (room <= 0 || byteRoom <= 0) {
+          nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset, name: sectionName };
+          if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold this element's name and choices. Increase max_text_chars.");
+          break;
+        }
+        let end = 0, bytes = 0;
+        for (const character of text) {
+          const size = utf8.encode(character).length;
+          if (end + character.length > room || bytes + size > byteRoom) break;
+          end += character.length; bytes += size;
+        }
+        if (!end && text.length) {
+          nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset, name: sectionName };
+          if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold the next character. Increase max_text_chars.");
+          break;
+        }
+        text = text.slice(0, end);
+        nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset: textOffset + end, name: sectionName };
       } else {
         aggregateNodeText += nodeTextCost;
+        aggregateNodeBytes += nameBytes + textBytes;
       }
 
       const nodeId = `n${nodes.length + 1}`;
+      if (!elementIdentities.has(element)) elementIdentities.set(element, `${documentIdentity}:${crypto.randomUUID()}`);
       nodeIdByElement.set(element, nodeId);
       elementByNodeId.set(nodeId, element);
       // 2026-09-06: what this id claimed to be, so an action can refuse a node
       // that is now something else. A shadow-root swap keeps the same element
       // object and connection while the label and role move on.
       // Text compaction changes presentation, not the identity used by wait/drop.
-      const identityName = fragmented ? bounded(accessibleName(element, snapshotText(element)), 500) : name;
+      const identityName = bounded(accessibleName(element, snapshotText(element)), 500);
       identityByNodeId.set(nodeId, nodeIdentity(element, identityName));
-      if (selectInfo) selectProofs.set(nodeId, JSON.stringify(selectInfo));
+      if (selectInfo) selectProofs.set(nodeId, {
+        description: JSON.stringify(selectDescription(element, 0, Infinity)),
+        observed: selectInfo.options,
+      });
       const navigationProof = captureNavigationProof(element);
       if (navigationProof) navigationProofs.set(nodeId, navigationProof);
       const rect = element.getBoundingClientRect();
       const role = element.getAttribute("role") ?? implicitRole(element);
-      const actions = [];
-      if (isClickable(element, role)) actions.push("click", "double_click");
-      if (isEditable(element)) actions.push("fill", "type");
-      if (isSelectable(element)) actions.push("select");
-      if (isCheckable(element, role)) actions.push("set_checked");
-      if (isKeypressable(element, role)) actions.push("keypress");
-      if (!isPasswordField(element)) actions.push("wait");
-      if (isScrollable(element)) actions.push("scroll");
-      if (element.draggable === true) actions.push("drag");
-      if (!isPasswordField(element) && !isEditable(element)) actions.push("drop");
-
-      if (isPasswordField(element)) actions.length = 0;
       const blockedByModal = modals.length > 0
         && (modals.length !== 1 || !withinElement(element, modals[0]));
-      if (blockedByModal) actions.length = 0;
+      const actions = snapshotActions(element, role, blockedByModal);
 
       let parent = composedParent(element);
       while (parent && !nodeIdByElement.has(parent)) parent = composedParent(parent);
       nodes.push({
         nodeId,
+        elementIdentity: elementIdentities.get(element),
+        elementPath: stableElementPath(element),
+        addressFragment: readableElementFragment(element, sectionName),
         parentNodeId: parent ? nodeIdByElement.get(parent) : null,
         kind,
         role,
         name,
         text,
+        textOffset,
+        sectionName,
+        sectionPath: sectionStart ? stableElementPath(sectionStart.element) : null,
+        paragraphPath: stableElementPath(paragraph),
+        inlineText: fragmented ? [] : inlineTextWindow(element, textOffset, text.length),
+        inline: ["inline", "inline-block", "contents"].includes(getComputedStyle(element).display),
+        ...readingStructure(element),
         value: safeValue(element),
         ...(selectInfo ? { select: selectInfo } : {}),
+        ...(elementMore ? { more: elementMore } : {}),
         ...(!isPasswordField(element) && element.validity ? {
           formState: {
             required: element.required === true,
@@ -312,6 +557,57 @@
         },
         scrollable: actions.includes("scroll"),
       });
+      // Earlier runs of an oversized paragraph are already read. Do not
+      // replay their links as ordinary rows after its final text window.
+      if (!fragmented) for (const part of inlineText(element)) if (part.elementPath) representedLinks.add(part.elementPath);
+      for (const action of actions) {
+        if (!actionNodeIds.has(action)) actionNodeIds.set(action, new Set());
+        actionNodeIds.get(action).add(nodeId);
+      }
+      if (nextRead) break;
+    }
+    if (!message.readCursor?.elementOnly && !nextRead && walk.nextElement) {
+      const nextSection = bounded(sectionHeading(walk.nextElement) || sectionName, 160);
+      if (!foldAtBoundary()) nextRead = { elementPath: stableElementPath(walk.nextElement), addressFragment: readableElementFragment(walk.nextElement, nextSection), textOffset: 0, name: nextSection };
+    }
+    // A prose row and the links it names are one semantic unit. Retain their
+    // action proofs together, even when the next ordinary row is folded.
+    const inlinePaths = new Set(nodes.flatMap(node => node.inlineText ?? []).map(part => part.elementPath).filter(Boolean));
+    const inlineSections = new Map(nodes.flatMap(node => (node.inlineText ?? [])
+      .filter(part => part.elementPath).map(part => [part.elementPath, node.sectionName])));
+    const inlineElements = new Set(candidates);
+    for (const element of elementByNodeId.values()) for (const link of element.querySelectorAll("a")) inlineElements.add(link);
+    for (const element of inlineElements) {
+      if (nodeIdByElement.has(element) || !inlinePaths.has(stableElementPath(element))) continue;
+      const nodeId = `n${nodes.length + 1}`, text = snapshotText(element), name = bounded(accessibleName(element, text), 500);
+      // A proof is a row like any other: it spends the same node and text
+      // budgets (its name is also its text), and running out is truncation.
+      const proofBytes = 2 * utf8.encode(name).length;
+      if (nodes.length >= maxNodes || aggregateNodeText + 2 * name.length > maxTextChars || aggregateNodeBytes + proofBytes > nodeByteBudget) {
+        truncationReasons.push(nodes.length >= maxNodes ? "node_limit" : "text_limit");
+        break;
+      }
+      aggregateNodeText += 2 * name.length;
+      aggregateNodeBytes += proofBytes;
+      if (!elementIdentities.has(element)) elementIdentities.set(element, `${documentIdentity}:${crypto.randomUUID()}`);
+      nodeIdByElement.set(element, nodeId); elementByNodeId.set(nodeId, element);
+      identityByNodeId.set(nodeId, nodeIdentity(element, name));
+      const navigationProof = captureNavigationProof(element);
+      if (navigationProof) navigationProofs.set(nodeId, navigationProof);
+      const role = element.getAttribute("role") ?? implicitRole(element);
+      const blockedByModal = modals.length > 0 && (modals.length !== 1 || !withinElement(element, modals[0]));
+      const actions = snapshotActions(element, role, blockedByModal);
+      const rect = element.getBoundingClientRect();
+      nodes.push({ nodeId, elementIdentity: elementIdentities.get(element), elementPath: stableElementPath(element),
+        addressFragment: readableElementFragment(element, inlineSections.get(stableElementPath(element)) ?? sectionName),
+        sectionName: inlineSections.get(stableElementPath(element)) ?? sectionName,
+        parentNodeId: null, kind: elementKind(element), role, name, text: name, inlineProof: true, value: null, actions, url: safeURL(element),
+        ...readingStructure(element),
+        states: { disabled: isEffectivelyDisabled(element), blockedByModal,
+          checked: ariaBoolean(element, "aria-checked", "checked"), selected: ariaBoolean(element, "aria-selected", "selected"),
+          expanded: nullableAriaBoolean(element.getAttribute("aria-expanded")), editable: isEditable(element) },
+        level: headingLevel(element), visible: true, scrollable: actions.includes("scroll"), frameId: 0,
+        bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } });
       for (const action of actions) {
         if (!actionNodeIds.has(action)) actionNodeIds.set(action, new Set());
         actionNodeIds.get(action).add(nodeId);
@@ -322,26 +618,30 @@
     // consume the budget before replies. Summarize the same viewport evidence
     // as the nodes. Keep container prose too: an article can have direct text
     // followed by buttons, without a separate text leaf for that prose.
-    const rawSummary = nodes.length ? [...new Set(nodes
-      .map((node) => node.text || node.name).filter(Boolean))].join("\n")
+    const rawSummary = nodes.length ? nodes.filter(node => !node.inlineProof)
+      .map((node) => node.text || node.name).filter(Boolean).join("\n")
       : (!document.body?.children?.length ? normalizedText(document.body?.innerText ?? "") : "");
     const summaryText = bounded(rawSummary, maxTextChars);
     if (summaryText.length < rawSummary.length) truncationReasons.push("text_limit");
     const snapshot = {
       snapshotId,
-      leaseId: message.leaseId,
       tabId: message.tabId,
       userSequence: message.userSequence,
       capturedAt: new Date().toISOString(),
       url: location.href,
       title: bounded(document.title ?? "", 1_024),
+      ...(document.contentType === "application/pdf" || (!normalizedText(document.body?.innerText ?? "")
+        && document.querySelector('embed[type="application/pdf"], object[type="application/pdf"]'))
+        ? { document: { kind: "pdf", status: "unread" } } : {}),
       language: bounded(document.documentElement?.lang ?? navigator.language ?? "", 64),
       rendering: {
         visibility: ["visible", "hidden"].includes(document.visibilityState) ? document.visibilityState : "unknown",
         readyState: ["loading", "interactive", "complete"].includes(document.readyState) ? document.readyState : "unknown",
         scope: "rendered_dom_only",
       },
-      reading: { scope: readingScope, mainContentAvailable: contentRegions.length > 0 },
+      reading: { scope: readingScope, mainContentAvailable: contentRegions.length > 0,
+        sections: [...new Set(nodes.filter(node => !node.inlineProof).map(node => node.sectionName).filter(Boolean))],
+        ...(observation ? { fromViewport: true, viewportChanged } : {}) },
       viewport: {
         width: finite(window.innerWidth),
         height: finite(window.innerHeight),
@@ -357,15 +657,21 @@
         truncationReasons: [...new Set(truncationReasons)],
       },
       nodes,
+      readMore: nextRead ? { url: location.href, ...nextRead, name: bounded(normalizedText(nextRead.name || nextRead.elementPath), 160) } : null,
       frame: {
         name: bounded(frameName(), 500),
         url: location.href,
       },
     };
-    snapshots.clear();
+    if (message.passive === true) {
+      for (const [id, previous] of snapshots) {
+        if (previous.passive === true) snapshots.delete(id);
+      }
+    } else snapshots.clear();
     snapshots.set(snapshotId, {
-      leaseId: message.leaseId, domGeneration, elementByNodeId, actionNodeIds, identityByNodeId,
+      tabId: message.tabId, domGeneration, elementByNodeId, actionNodeIds, identityByNodeId,
       navigationProofs, selectProofs, capturedAt: Date.now(), pageURL: location.href,
+      passive: message.passive === true,
     });
     return snapshot;
   }
@@ -375,8 +681,48 @@
       const tag = current.tagName?.toLowerCase();
       const role = current.getAttribute?.("role");
       if (["nav", "aside"].includes(tag) || ["navigation", "complementary"].includes(role)) return true;
+      if (["ul", "ol"].includes(tag) || role === "list") {
+        if (isLanguageNavigation(current)) return true;
+      }
+      const controlled = current.getAttribute?.("aria-controls")?.trim().split(/\s+/) ?? [];
+      if (controlled.some(id => isLanguageNavigation(current.getRootNode().getElementById?.(id)))) return true;
+      if (tag === "a" && current.hasAttribute("hreflang")) {
+        const peers = [...(composedParent(current)?.children ?? [])];
+        if (peers.every(peer => peer.matches("a[hreflang]")) && new Set(peers.map(peer => peer.hreflang)).size > 1) return true;
+      }
     }
     return false;
+  }
+
+  // One answer per element per capture; lists are asked once per descendant.
+  let languageNavigationCache = new WeakMap();
+  function isLanguageNavigation(element) {
+    if (!element) return false;
+    if (languageNavigationCache.has(element)) return languageNavigationCache.get(element);
+    let result = false;
+    if (element.querySelector("a[hreflang]")) {
+      const links = [...element.querySelectorAll("a[href]")];
+      result = links.length > 0 && links.every(link => link.hasAttribute("hreflang"))
+        && new Set(links.map(link => link.hreflang)).size > 1 && !hasUncontrolledWords(element);
+    }
+    languageNavigationCache.set(element, result);
+    return result;
+  }
+
+  function snapshotActions(element, role, blockedByModal) {
+    if (isPasswordField(element) || blockedByModal) return [];
+    const actions = [];
+    // A text field is clickable too: clicking or double-clicking it is normal.
+    if (isClickable(element, role) || isEditable(element)) actions.push("click", "double_click");
+    if (isEditable(element)) actions.push("fill", "type");
+    if (isSelectable(element)) actions.push("select");
+    if (isCheckable(element, role)) actions.push("set_checked");
+    if (isKeypressable(element, role)) actions.push("keypress");
+    actions.push("wait");
+    if (isScrollable(element)) actions.push("scroll");
+    if (element.draggable === true) actions.push("drag");
+    if (!isEditable(element)) actions.push("drop");
+    return actions;
   }
 
   function clickNode(message) {
@@ -424,16 +770,15 @@
     const parent = composedParent(element);
     const characters = Array.from(message.text);
     const startedAt = performance.now();
-    const leaseExpiresAt = message.leaseExpiresAtMs;
-    const run = { leaseId: snapshot.leaseId, stopReason: null };
+    const run = { tabId: snapshot.tabId, actionId: message.actionId, stopReason: null };
     let typedCount = 0;
     let nextUTF16Offset = 0;
     let appendInFlight = false;
     const valueBefore = readEditableValue(element);
     function currentStopReason() {
       if (run.stopReason) return run.stopReason;
-      if (!Number.isFinite(leaseExpiresAt) || message.leaseId !== snapshot.leaseId) return "lease_unavailable";
-      if (Date.now() >= leaseExpiresAt) return "lease_expired";
+      if (cancelledActions.has(run.actionId)) return "action_cancelled";
+      if (message.tabId !== snapshot.tabId) return "tab_not_owned";
       if (performance.now() - startedAt >= MAX_TYPING_DURATION_MS) return "execution_deadline";
       if (!element.isConnected) return "target_detached";
       if (composedParent(element) !== parent || editableIdentity(element) !== identity) return "target_changed";
@@ -455,10 +800,7 @@
         appendInFlight = false;
         dispatchEditableEvent(element, "input", character);
         if (typedCount < characters.length && (message.delayMs > 0 || typedCount % TYPE_YIELD_EVERY === 0)) {
-          const remaining = Math.min(
-            MAX_TYPING_DURATION_MS - (performance.now() - startedAt),
-            leaseExpiresAt - Date.now(),
-          );
+          const remaining = MAX_TYPING_DURATION_MS - (performance.now() - startedAt);
           await delay(Math.max(0, Math.min(message.delayMs ?? 0, remaining)));
         }
       }
@@ -472,6 +814,7 @@
       run.stopReason = "page_event_failed";
     } finally {
       typingRuns.delete(run);
+      cancelledActions.delete(run.actionId);
     }
     // 2026-09-06: read the field back rather than trusting the loop's count.
     // A sanitising input (number, date, time, week, month) or a page that
@@ -559,14 +902,15 @@
     if (!element.multiple && message.values.length !== 1) {
       throw pageError("invalid_selection", "A single-select node requires exactly one option value.");
     }
-    const description = selectDescription(element);
-    if (requireSnapshot(message.snapshotId).selectProofs.get(message.nodeId) !== JSON.stringify(description)) {
+    const description = selectDescription(element, 0, Infinity);
+    const proof = requireSnapshot(message.snapshotId).selectProofs.get(message.nodeId);
+    if (proof?.description !== JSON.stringify(description)) {
       throw pageError("node_stale", "The select choices changed. Read a fresh snapshot before selecting.");
     }
     for (const value of requested) {
-      const matches = description.options.filter((option) => option.value === value);
+      const matches = proof.observed.filter((option) => option.value === value);
       if (!matches.length) throw pageError("option_not_observed", "The requested value was outside the bounded observed choices.");
-      if (matches.some((option) => option.disabled)) throw pageError("option_disabled", "The requested choice is disabled, including its option group.");
+      if (description.options.some((option) => option.value === value && option.disabled)) throw pageError("option_disabled", "The requested choice is disabled, including its option group.");
     }
     let values;
     try {
@@ -662,14 +1006,14 @@
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "wait");
     const snapshot = requireSnapshot(message.snapshotId);
     const deadline = performance.now() + message.timeoutMs;
-    const run = { leaseId: snapshot.leaseId, stopReason: null };
+    const run = { tabId: snapshot.tabId, actionId: message.actionId, stopReason: null };
     waitingRuns.add(run);
     try {
       while (true) {
-        if (!run.stopReason && (!Number.isFinite(message.leaseExpiresAtMs) || message.leaseId !== snapshot.leaseId)) {
-          run.stopReason = "lease_unavailable";
+        if (cancelledActions.has(run.actionId)) run.stopReason = "action_cancelled";
+        if (!run.stopReason && message.tabId !== snapshot.tabId) {
+          run.stopReason = "tab_not_owned";
         }
-        if (!run.stopReason && Date.now() >= message.leaseExpiresAtMs) run.stopReason = "lease_expired";
         if (run.stopReason) throw pageError(run.stopReason, `The node wait stopped: ${run.stopReason}.`);
         const matched = nodeMatchesState(element, message.state);
         if (matched || performance.now() >= deadline) {
@@ -684,6 +1028,7 @@
       }
     } finally {
       waitingRuns.delete(run);
+      cancelledActions.delete(run.actionId);
     }
   }
 
@@ -754,6 +1099,68 @@
       dropDispatched, dropAcknowledged, reason, inputMechanism: "synthetic_html_drag", verificationRequired: "fresh_snapshot" };
   }
 
+  async function controlMedia(message) {
+    if (cancelledActions.has(message.actionId)) throw pageError("action_cancelled", "Media control was cancelled before acting.");
+    if (message.operation === "seek" && (!Number.isFinite(message.seconds) || message.seconds < 0)) throw pageError("invalid_payload", "Seek requires nonnegative seconds.");
+    const elements = composedElementWalk(document.body, Number.MAX_SAFE_INTEGER).elements;
+    const modals = elements.filter((element) => isVisible(element) && isModal(element));
+    // The one admitted player. Other players, and buttons that merely look
+    // like its controls, belong to the page; the click path reaches those.
+    const media = elements.find((element) => element.matches("audio,video") && !isEffectivelyDisabled(element)
+      && (modals.length === 0 || (modals.length === 1 && withinElement(element, modals[0]))));
+    if (!media) throw pageError("media_unavailable", "No audio/video element is available in this page. Read the page to locate its player.");
+    if (message.operation === "pause" && !media.paused) media.pause();
+    const beforeTime = media.currentTime;
+    let advancing = false, resumed = false;
+    const state = (completed, reason = null) => ({ operation: message.operation, completed,
+      paused: media.paused, currentTime: media.currentTime, beforeTime,
+      currentTimeAdvancing: advancing, playbackStarted: message.operation === "play" && advancing, reason });
+    // The player's own events prove the effect, not an arbitrary sleep.
+    const events = ["play", "playing", "timeupdate", "pause", "ended", "error", "seeked"];
+    return new Promise((resolve) => {
+      let done = false, timer = null;
+      const finish = (completed, reason) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        for (const event of events) media.removeEventListener(event, observe);
+        waitingRuns.delete(run);
+        resolve(state(completed, reason));
+      };
+      const observe = (event) => {
+        if (message.operation === "pause") {
+          advancing ||= media.currentTime !== beforeTime;
+          resumed ||= !media.paused || ["play", "playing"].includes(event.type);
+        } else if (message.operation === "seek") {
+          if (event.type === "seeked") {
+            const landed = Math.abs(media.currentTime - message.seconds) < 0.1;
+            finish(landed, landed ? null : `The player settled at ${media.currentTime} seconds, not the requested position.`);
+          } else if (event.type === "error") finish(false, "The player reported an error before confirming the seek.");
+        } else if (event.type === "timeupdate" && !media.paused && media.currentTime > beforeTime) { advancing = true; finish(true); }
+        else if (["pause", "ended", "error"].includes(event.type)) finish(false, "Playback did not advance before the player stopped.");
+      };
+      const run = { tabId: message.tabId, actionId: message.actionId,
+        set stopReason(reason) { finish(false, reason); } };
+      waitingRuns.add(run);
+      for (const event of events) media.addEventListener(event, observe);
+      if (message.operation === "pause") {
+        // Pause must hold across a bounded observation window, including player-driven resumes.
+        timer = setTimeout(() => {
+          observe({ type: "observed" });
+          const held = media.isConnected && media.paused && !advancing && !resumed;
+          finish(held, held ? null : "Pause was not verified: playback resumed, the clock moved, or the page's media elements changed.");
+        }, 1500);
+        return;
+      }
+      // Buffering or a background tab can hold the clock still: answer before the control deadline.
+      timer = setTimeout(() => finish(false, message.operation === "seek"
+        ? "The player did not confirm the seek within 5 seconds."
+        : `Playback did not advance within 5 seconds (paused: ${media.paused}).`), 5000);
+      if (message.operation === "seek") media.currentTime = message.seconds;
+      else void media.play().catch((error) => finish(false, `Playback was refused: ${error.message}`));
+    });
+  }
+
   async function scrollPage(message) {
     let target = window;
     if (!message.targetNodeId && composedElementWalk(document.body).elements.some((element) => isVisible(element) && isModal(element))) {
@@ -772,6 +1179,8 @@
       y: finite(target === window ? window.scrollY : target.scrollTop),
     });
     const before = position();
+    const observation = { id: crypto.randomUUID(), tabId: message.tabId, target, before: captureViewport(target) };
+    scrollObservation = observation;
     // `auto` inherits CSS smooth scrolling, so its immediate readback can
     // precede the movement. Explicit instant scrolling also works in inactive
     // tabs without waiting on a throttled animation frame.
@@ -792,20 +1201,11 @@
       eventTarget.dispatchEvent(new Event("scroll", { bubbles: target === window }));
       scrollNotification = "supplemental_untrusted_hidden";
     }
-    // Let ordinary scroll handlers and virtualized feeds render before the
-    // caller's next read. No activation, fabricated intersection events, or
-    // promise that the site's network request completed. 2026-09-24: waits on
-    // the page itself — at least 300 ms, then until it has been quiet for
-    // 300 ms after growing, 1.5 s at most.
+    // Yield to the browser's scroll handlers before readback. This task yield
+    // is not a feed-completion deadline: later loads arrive through page news.
     const generation = domGeneration;
     if (movedX !== 0 || movedY !== 0) {
-      const started = Date.now();
-      let seen = domGeneration, quietSince = Date.now();
-      while (Date.now() - started < 1_500) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        if (domGeneration !== seen) { seen = domGeneration; quietSince = Date.now(); continue; }
-        if (Date.now() - started >= 300 && (domGeneration === generation ? Date.now() - started >= 750 : Date.now() - quietSince >= 300)) break;
-      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
     return {
       snapshotId: message.snapshotId ?? null,
@@ -823,7 +1223,32 @@
       atBottom: after.y >= maximumY - 1,
       observationScope: "immediate_position_not_feed_completion",
       contentChangedAfterScroll: domGeneration !== generation,
+      readCursor: { url: location.href, viewportObservationId: observation.id },
     };
+  }
+
+  // Keep the before evidence locally, bound to this exact scroll and tab.
+  // The comparison happens in the read itself, so a load between the action
+  // reply and readback cannot be mistaken for an unchanged viewport.
+  function captureViewport(target, walk = composedElementWalk(target === window ? document.body : target, 5_000, true)) {
+    if (walk.truncated) return null;
+    const rows = walk.elements.map(element => {
+      const rect = element.getBoundingClientRect();
+      const text = snapshotText(element);
+      return { element, content: JSON.stringify([text, accessibleName(element, text), safeValue(element),
+        element.getAttribute("role"), element.getAttribute("aria-expanded"), element.getAttribute("aria-checked"),
+        element.getAttribute("aria-selected"), element.checked, element.selected, isEffectivelyDisabled(element),
+        element.options ? Array.from(element.options, option => option.selected) : null,
+        safeURL(element), rect.x, rect.y, rect.width, rect.height]) };
+    });
+    return { rows, x: target === window ? window.scrollX : target.scrollLeft,
+      y: target === window ? window.scrollY : target.scrollTop };
+  }
+
+  function viewportChange(before, after) {
+    if (!before || !after) return null;
+    return before.x !== after.x || before.y !== after.y || before.rows.length !== after.rows.length
+      || before.rows.some((item, index) => item.element !== after.rows[index].element || item.content !== after.rows[index].content);
   }
 
   function requireSnapshotNode(snapshotId, nodeId) {
@@ -848,11 +1273,83 @@
     // intersects the viewport. Their descendants carry their own text; copying
     // innerText here would smuggle offscreen posts back into every new read.
     const kind = elementKind(element);
+    if (!isPageContentElement(element) || kind === "image") return "";
+    if (isPreformatted(element)) return element.innerText ?? element.textContent ?? "";
+    if (element.tagName === "TIME") return normalizedText(element.innerText ?? element.textContent ?? "");
     const control = ["button", "link", "tab", "menuitem", "heading", "option", "select", "input"].includes(kind);
     const raw = !control && element.children?.length && element.childNodes
-      ? Array.from(element.childNodes).filter((node) => node.nodeType === 3).map((node) => node.textContent ?? "").join(" ")
-      : (element.innerText ?? element.textContent ?? "");
-    return bounded(normalizedText(raw), 1_000);
+      ? inlineText(element).map((part) => part.text).join("")
+      : (["button", "link", "tab", "menuitem", "heading"].includes(kind)
+        ? visibleControlText(element) : (element.innerText ?? element.textContent ?? ""));
+    return element.querySelector("code") && !element.closest("pre") ? raw : normalizedText(raw);
+  }
+
+  // DOM order is the reading order. Inline descendants contribute their text
+  // where they occur; links also retain a structural address for their verb.
+  function inlineText(element) {
+    const parts = [];
+    const preformatted = isPreformatted(element);
+    function visit(parent, link = null, code = false) {
+      for (const child of parent.childNodes ?? []) {
+        if (child.nodeType === 3) parts.push({ text: child.textContent ?? "", ...(link ? { elementPath: stableElementPath(link), href: safeURL(link) } : {}), ...(code ? { code: true } : {}) });
+        else if (child.nodeType === 1) {
+          if (!isPageContentElement(child)) continue;
+          if (elementKind(child) === "image") continue;
+          if (insideNavigation(child) && !insideNavigation(element)) continue;
+          if (child.tagName === "BR") { parts.push({ text: preformatted ? "\n" : " " }); continue; }
+          const style = getComputedStyle(child);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) continue;
+          if (isTextClipped(child, style)) continue;
+          if (preformatted || ["inline", "inline-block", "inline-flex", "contents"].includes(style.display)) visit(child, child.tagName === "A" ? child : link, code || child.tagName === "CODE");
+        }
+      }
+    }
+    visit(element, element.tagName === "A" ? element : null, element.tagName === "CODE");
+    // Match snapshotText's whitespace normalization without losing run positions.
+    let space = true;
+    for (const part of parts) {
+      if (preformatted) continue;
+      if (!part.code) part.text = part.text.replace(/\s+/g, " ");
+      if (space && !part.code) part.text = part.text.replace(/^ /, "");
+      if (part.text) space = !part.code && part.text.endsWith(" ");
+    }
+    if (!preformatted && parts.length && !parts[parts.length - 1].code) parts[parts.length - 1].text = parts[parts.length - 1].text.replace(/ $/, "");
+    const joined = [];
+    for (const part of parts) {
+      const previous = joined[joined.length - 1];
+      if (previous && previous.elementPath === part.elementPath && previous.code === part.code) previous.text += part.text;
+      else joined.push(part);
+    }
+    return joined;
+  }
+
+  function visibleControlText(element) {
+    // Preserve the browser's rendered text (including CSS text transforms)
+    // unless structure proves that it contains clipped or navigation copies.
+    const navigational = insideNavigation(element);
+    if (![...element.querySelectorAll("*")].some(child => isTextClipped(child)
+      || Number(getComputedStyle(child).opacity) === 0 || (insideNavigation(child) && !navigational))) {
+      return element.innerText ?? element.textContent ?? "";
+    }
+    return [...element.childNodes].map(child => {
+      if (child.nodeType === 3) return child.textContent ?? "";
+      if (child.nodeType !== 1 || !isPageContentElement(child) || elementKind(child) === "image") return "";
+      const style = getComputedStyle(child);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0
+        || isTextClipped(child, style) || (insideNavigation(child) && !insideNavigation(element))) return "";
+      if (child.tagName === "BR") return "\n";
+      const value = visibleControlText(child);
+      return ["inline", "inline-block", "inline-flex", "contents"].includes(style.display) ? value : "\n" + value + "\n";
+    }).join("");
+  }
+
+  function inlineTextWindow(element, offset, length) {
+    let position = 0;
+    return inlineText(element).flatMap(part => {
+      const start = position; position += part.text.length;
+      const text = part.text.slice(Math.max(0, offset - start), Math.max(0, Math.min(part.text.length, offset + length - start)));
+      return text ? [{ ...part, text }] : [];
+    });
   }
 
   function fragmentedTextGlyphCounts(elements) {
@@ -864,6 +1361,7 @@
     for (let index = elements.length - 1; index >= 0; index -= 1) {
       const element = elements[index];
       if (elementKind(element) !== "other" || element.getAttribute("role")
+        || ["PRE", "CODE"].includes(element.tagName)
         || element.getAttribute("aria-label") || element.getAttribute("aria-labelledby")
         || element.shadowRoot || element.tagName.toLowerCase() === "slot" || !(element instanceof HTMLElement)
         || element.isContentEditable || isKeypressable(element, "")
@@ -877,7 +1375,6 @@
       // please"); only single-character fragments count toward the run.
       const glyphFragments = fragments.filter((text) => [...text].length === 1).length;
       const count = glyphFragments + children.reduce((sum, child) => sum + counts.get(child), 0);
-      if (count && !intersectsViewport(element)) continue;
       counts.set(element, count);
     }
     return counts;
@@ -893,7 +1390,7 @@
     // Normalize only after joining so spaces between visible glyphs survive.
     // A glyph must be seen AND on screen: a run crossing the viewport edge
     // keeps only what is in view, as each glyph row did before collapsing.
-    return !normalizedText(raw) || (isVisible(element) && intersectsViewport(element)) ? raw : "";
+    return !normalizedText(raw) || isVisible(element) ? raw : "";
   }
 
   function requireActionableSnapshotNode(snapshotId, nodeId, action) {
@@ -994,13 +1491,13 @@
     if (["input", "textarea"].includes(tag)) return "input";
     if (tag === "select") return "select";
     if (tag === "option") return "option";
-    if (tag === "img") return "image";
+    if (tag === "img" || role === "img") return "image";
     if (["ul", "ol"].includes(tag)) return "list";
     if (tag === "li") return "listitem";
     if (tag === "article" || role === "article") return "article";
-    if (tag === "table") return "table";
-    if (tag === "tr") return "row";
-    if (["td", "th"].includes(tag)) return "cell";
+    if (tag === "table" || ["table", "grid", "treegrid"].includes(role)) return "table";
+    if (tag === "tr" || role === "row") return "row";
+    if (["td", "th"].includes(tag) || ["cell", "gridcell", "columnheader", "rowheader"].includes(role)) return "cell";
     if (tag === "dialog" || role === "dialog" || role === "alertdialog") return "dialog";
     if (role === "menu") return "menu";
     if (role === "menuitem") return "menuitem";
@@ -1016,6 +1513,24 @@
   }
 
   function accessibleName(element, fallback) {
+    if (elementKind(element) === "image") return meaningfulImageName(element);
+    // datetime/title are metadata, not another rendering of the visible date.
+    if (element.tagName === "TIME") return fallback;
+    const name = elementAccessibleName(element, fallback);
+    if (elementKind(element) !== "link" || normalizedText(fallback)
+      || ((element.hasAttribute("aria-label") || element.hasAttribute("aria-labelledby")) && normalizedText(name))) return name;
+    // An image link's action belongs to the image's own name/caption. Its
+    // destination remains detail, never a replacement for that visible name.
+    const images = [...element.querySelectorAll("img, [role=img]")].filter(isVisible);
+    if (!images.length) return name;
+    const imageNames = images.map(meaningfulImageName).filter(Boolean).join(" ");
+    if (imageNames) return imageNames;
+    const figure = element.closest("figure");
+    const caption = figure?.querySelector("figcaption");
+    return caption && isVisible(caption) ? normalizedText(caption.innerText ?? caption.textContent ?? "") : name;
+  }
+
+  function elementAccessibleName(element, fallback) {
     const labelIds = element.getAttribute("aria-labelledby")?.trim().split(/\s+/).slice(0, 12) ?? [];
     const root = typeof element.getRootNode === "function" ? element.getRootNode() : document;
     const labelled = labelIds.map((id) => {
@@ -1028,6 +1543,112 @@
       ?? element.getAttribute("title")
       ?? element.labels?.[0]?.innerText
       ?? fallback;
+  }
+
+  // HTML raw-text/inert elements are source, never rendered page prose. In
+  // particular, noscript's textContent may be literal tracking-image markup.
+  function isPageContentElement(element) {
+    return !element.matches("script, style, template, noscript");
+  }
+
+  function meaningfulImageName(element) {
+    for (let current = element; current; current = composedParent(current)) {
+      if (!isPageContentElement(current) || current.hidden || current.getAttribute("aria-hidden") === "true") return "";
+      const style = getComputedStyle(current);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return "";
+    }
+    const role = element.getAttribute("role");
+    if (role === "presentation" || role === "none") return "";
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 1 && rect.height <= 1) return "";
+    if (element.tagName === "IMG" && ((element.naturalWidth === 1 && element.naturalHeight === 1)
+      || (element.getAttribute("width") === "1" && element.getAttribute("height") === "1"))) return "";
+    // An explicitly empty alt is decorative unless ARIA supplies its name.
+    const ariaNamed = element.hasAttribute("aria-label") || element.hasAttribute("aria-labelledby");
+    if (!ariaNamed && !element.getAttribute("alt")) return "";
+    // A failed image's browser replacement is not article content. An
+    // authored caption is captured independently, including on its link.
+    if (element.tagName === "IMG" && element.complete && element.naturalWidth === 0) return "";
+    return normalizedText(elementAccessibleName(element, ""));
+  }
+
+  function sectionHeading(element) {
+    const kind = elementKind(element);
+    if (kind === "heading") return normalizedText(accessibleName(element, snapshotText(element)));
+    return "";
+  }
+
+  function readingStructure(element) {
+    const structure = {};
+    if (isPreformatted(element)) structure.preformatted = true;
+    if (element.tagName === "TIME") structure.time = true;
+    if (elementKind(element) === "link") {
+      const name = normalizedText(accessibleName(element, snapshotText(element)));
+      const heading = element.querySelector("h1,h2,h3,h4,h5,h6,[role=heading]");
+      structure.childTextName = name === normalizedText(visibleControlText(element))
+        || (!!heading && name === normalizedText(accessibleName(heading, snapshotText(heading))));
+      let previous = element.previousSibling, gap = "";
+      while (previous && (previous.nodeType === 8 || (previous.nodeType === 3 && !normalizedText(previous.textContent ?? "")))) {
+        if (previous.nodeType === 3) gap = previous.textContent + gap;
+        previous = previous.previousSibling;
+      }
+      if (previous?.nodeType === 1 && elementKind(previous) === "link" && safeURL(element)
+        && safeURL(previous) === safeURL(element)) {
+        structure.adjacentLinkPath = stableElementPath(previous);
+        structure.adjacentLinkGap = normalizedText(gap) || (gap ? " " : "");
+      }
+    }
+    for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
+      const kind = elementKind(parent);
+      if (!structure.textOwnerPath && (isPreformatted(parent) || parent.tagName === "TIME"
+        || ["button", "tab", "menuitem"].includes(kind))) structure.textOwnerPath = stableElementPath(parent);
+      if (!structure.contentLinkPath && kind === "link"
+        && normalizedText(accessibleName(parent, snapshotText(parent))) === normalizedText(visibleControlText(parent))) {
+        structure.contentLinkPath = stableElementPath(parent);
+      }
+      if (!structure.tableCellPath && kind === "cell") structure.tableCellPath = stableElementPath(parent);
+      if (!structure.tableRowPath && kind === "row") structure.tableRowPath = stableElementPath(parent);
+    }
+    if (elementKind(element) === "cell") {
+      structure.tableCellPath = stableElementPath(element);
+      structure.columnSpan = element.colSpan || Number(element.getAttribute("aria-colspan")) || 1;
+      structure.rowSpan = element.rowSpan || Number(element.getAttribute("aria-rowspan")) || 1;
+    }
+    if (elementKind(element) === "row") structure.tableRowPath = stableElementPath(element);
+    // A sibling action drawn on the heading's line belongs to that heading,
+    // rather than a content row. No control-label vocabulary is involved.
+    for (let current = element; current && current !== document.body; current = composedParent(current)) {
+      const previous = current.previousElementSibling;
+      const headings = previous ? (elementKind(previous) === "heading" ? [previous]
+        : [...previous.children].filter(child => elementKind(child) === "heading")) : [];
+      if (headings.length !== 1) continue;
+      const heading = headings[0], a = heading.getBoundingClientRect(), b = current.getBoundingClientRect();
+      if (Math.min(a.bottom, b.bottom) <= Math.max(a.top, b.top)) continue;
+      if (!isClickable(current, current.getAttribute("role") ?? implicitRole(current))
+        && !current.querySelector("a,button,[role=link],[role=button]")) continue;
+      if (hasUncontrolledWords(current)) continue;
+      structure.sectionControlHeadingPath = stableElementPath(heading);
+      break;
+    }
+    return structure;
+  }
+
+  function isPreformatted(element) {
+    return element.tagName === "PRE" || (element.tagName === "CODE"
+      && !["inline", "inline-block", "inline-flex", "contents"].includes(getComputedStyle(element).display));
+  }
+
+  function hasUncontrolledWords(element) {
+    if (isClickable(element, element.getAttribute("role") ?? implicitRole(element))) return false;
+    return [...element.childNodes].some(child => child.nodeType === 3 ? /[\p{L}\p{N}]/u.test(child.textContent ?? "")
+      : child.nodeType === 1 && isPageContentElement(child) && isVisible(child) && hasUncontrolledWords(child));
+  }
+
+  function readingBlock(element) {
+    for (let current = element; current; current = composedParent(current)) {
+      if (!["inline", "inline-block", "inline-flex", "inline-grid", "contents"].includes(getComputedStyle(current).display)) return current;
+    }
+    return element;
   }
 
   function isRedundantLayoutWrapper(element, kind) {
@@ -1061,13 +1682,53 @@
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
     const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    if (rect.width <= 0 || rect.height <= 0 || isTextClipped(element, style)) return false;
+    for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
+      if (isTextClipped(parent)) return false;
+    }
+    return true;
+  }
+
+  function isTextClipped(element, style = getComputedStyle(element)) {
+    const rectangle = style.clip?.match(/^rect\((.*)\)$/);
+    if (rectangle) {
+      const values = rectangle[1].split(/[\s,]+/).map(Number.parseFloat);
+      if (values.length === 4 && (values[2] <= values[0] || values[1] <= values[3])) return true;
+    }
+    const inset = style.clipPath?.match(/^inset\(([^()]*)\)$/);
+    if (!inset) return false;
+    const parts = inset[1].split(/\s+round\s+/)[0].trim().split(/\s+/);
+    if (parts.length < 1 || parts.length > 4 || parts.some(part => !/^\d+(?:\.\d+)?(?:px|%)?$/.test(part))) return false;
+    const [top, right = top, bottom = top, left = right] = parts;
+    const box = element.getBoundingClientRect();
+    const amount = (part, length) => Number.parseFloat(part) * (part.endsWith("%") ? length / 100 : 1);
+    return amount(top, box.height) + amount(bottom, box.height) >= box.height
+      || amount(left, box.width) + amount(right, box.width) >= box.width;
   }
 
   function intersectsViewport(element) {
     const rect = element.getBoundingClientRect();
-    return rect.x + rect.width > 0 && rect.y + rect.height > 0
-      && rect.x < window.innerWidth && rect.y < window.innerHeight;
+    let left = Math.max(0, rect.x), top = Math.max(0, rect.y);
+    let right = Math.min(window.innerWidth, rect.x + rect.width), bottom = Math.min(window.innerHeight, rect.y + rect.height);
+    // A child can intersect the window while lying outside its scrolled box.
+    // Use the browser's actual clipping ancestors, including shadow hosts.
+    for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
+      // The root and the element that scrolls the viewport clip at the window,
+      // applied above; their boxes move with the document scroll, so applying
+      // them again empties the region after one viewport. A body that scrolls
+      // as its own container is a real clipping ancestor and stays.
+      if (parent === document.documentElement || parent === document.scrollingElement) continue;
+      const style = getComputedStyle(parent), box = parent.getBoundingClientRect();
+      if (["auto", "scroll", "hidden", "clip"].includes(style.overflowX)) {
+        left = Math.max(left, box.x + parent.clientLeft);
+        right = Math.min(right, box.x + parent.clientLeft + parent.clientWidth);
+      }
+      if (["auto", "scroll", "hidden", "clip"].includes(style.overflowY)) {
+        top = Math.max(top, box.y + parent.clientTop);
+        bottom = Math.min(bottom, box.y + parent.clientTop + parent.clientHeight);
+      }
+    }
+    return right > left && bottom > top;
   }
 
   function isModal(element) {
@@ -1104,13 +1765,13 @@
     return element.tagName.toLowerCase() === "select" && !isEffectivelyDisabled(element);
   }
 
-  function selectDescription(element) {
+  function selectDescription(element, offset = 0, limit = 100) {
     const options = Array.from(element.options ?? []);
     return {
       multiple: element.multiple === true,
       optionCount: options.length,
-      optionsTruncated: options.length > 100,
-      options: options.slice(0, 100).map((option) => {
+      optionsTruncated: offset > 0 || offset + limit < options.length,
+      options: options.slice(offset, offset + limit).map((option) => {
         const value = String(option.value);
         const group = option.parentElement?.tagName?.toLowerCase() === "optgroup" ? option.parentElement : null;
         return {
@@ -1333,19 +1994,36 @@
     if (typeof element.setSelectionRange === "function") element.setSelectionRange(caret, caret);
   }
 
-  function composedElementWalk(root, maximum = 5_000, viewportOnly = false) {
+  function composedElementWalk(root, maximum = 5_000, viewportOnly = false, startPath = null, firstRoots = [], rootsOnly = false) {
     if (!root) return { elements: [], truncated: false, shadowRoots: [] };
     const result = [];
     const shadowRoots = [];
-    const stack = Array.from(root.children ?? []).reverse();
+    const stack = viewportOnly ? [root] : [...(rootsOnly ? [] : Array.from(root.children ?? []).reverse()), ...firstRoots.slice().reverse()];
+    const visitedRoots = new Set();
+    let started = !startPath;
+    let sectionName = "";
+    if (firstRoots.length) {
+      const headings = root.querySelectorAll("h1,h2,h3,h4,h5,h6,[role=heading]");
+      for (const heading of headings) {
+        if ((heading.compareDocumentPosition(firstRoots[0]) & Node.DOCUMENT_POSITION_FOLLOWING)
+          && isVisible(heading) && !insideNavigation(heading)) sectionName = sectionHeading(heading);
+      }
+    }
     while (stack.length > 0 && result.length < maximum) {
       const element = stack.pop();
-      // Retained offscreen feed articles must not exhaust the walk budget
-      // before the newly visible replies. Other ancestors may contain fixed
-      // or overflowing children, so they are still traversed.
-      if (viewportOnly && (element.tagName?.toLowerCase() === "article"
-        || element.getAttribute?.("role") === "article") && !intersectsViewport(element)) continue;
-      result.push(element);
+      if (!isPageContentElement(element)) continue;
+      if (firstRoots.includes(element)) {
+        if (visitedRoots.has(element)) continue;
+        visitedRoots.add(element);
+      }
+      if (!started && isVisible(element) && !insideNavigation(element)) {
+        const heading = sectionHeading(element);
+        if (heading) sectionName = heading;
+      }
+      if (!started && stableElementPath(element) === startPath) started = true;
+      // Offscreen retained elements spend neither the walk nor read budget.
+      // Still traverse ancestors: fixed/overflowing descendants may be in view.
+      if (started && (!viewportOnly || (isVisible(element) && intersectsViewport(element)))) result.push(element);
       if (element.shadowRoot) shadowRoots.push(element.shadowRoot);
       const descendants = [
         ...Array.from(element.shadowRoot?.children ?? []),
@@ -1353,13 +2031,92 @@
       ];
       for (let index = descendants.length - 1; index >= 0; index -= 1) stack.push(descendants[index]);
     }
-    return { elements: result, truncated: stack.length > 0, shadowRoots };
+    if (!started) throw pageError("read_address_missing", "The folded element is no longer on this page. Read the page again.");
+    while (stack.length && visitedRoots.has(stack[stack.length - 1])) stack.pop();
+    return { elements: result, truncated: stack.length > 0, shadowRoots, nextElement: stack[stack.length - 1], sectionName };
   }
 
   function composedParent(element) {
     if (element.parentElement) return element.parentElement;
     const root = typeof element.getRootNode === "function" ? element.getRootNode() : null;
     return root?.host ?? null;
+  }
+
+  // A structural address is independent of snapshot budgets and row numbers.
+  // Include shadow boundaries and same-tag sibling positions so repeated
+  // captures can focus the same place without granting action authority.
+  function stableElementPath(element) {
+    const parts = [];
+    for (let current = element; current;) {
+      let ordinal = 1;
+      for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+        if (sibling.localName === current.localName && sibling.namespaceURI === current.namespaceURI) ordinal++;
+      }
+      parts.unshift(`${encodeURIComponent(current.namespaceURI ?? "")}:${encodeURIComponent(current.localName)}[${ordinal}]`);
+      if (current.parentElement) current = current.parentElement;
+      else {
+        const root = current.getRootNode();
+        if (root instanceof ShadowRoot) { parts.unshift("shadow"); current = root.host; }
+        else current = null;
+      }
+    }
+    return parts.join("/");
+  }
+
+  // Read places come from the nearest heading, never a cell/control's text.
+  // Allocation stays stable while the element's semantic place is the
+  // same, independent of row numbers and transport folds. Structural paths
+  // stay private; a reused element with a new heading gets its new place.
+  function readableElementFragment(element, sectionName = "") {
+    const slug = value => normalizedText(value).normalize("NFKC")
+      .replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 96).replace(/-+$/g, "");
+    const heading = sectionHeading(element);
+    const name = heading || accessibleName(element, snapshotText(element));
+    // An id is transport identity unless the page gives it meaning: its
+    // semantic name agrees with it, or a page link actually targets it. This
+    // uses authored relationships rather than guessing generated-id prefixes.
+    const id = element.id || element.getAttribute("name") || "";
+    const semanticID = heading && id && (slug(id).toLocaleLowerCase() === slug(name).toLocaleLowerCase()
+      || isDocumentLinkTarget(element, id));
+    // A unique authored anchor is already its exact document address. It
+    // must not gain an ordinal because a wrapper/heading slug used its label
+    // first. Generated places below avoid the document's real anchor names.
+    const root = element.getRootNode();
+    if (semanticID && root.getElementById?.(id) === element) {
+      allocatedFragments.add(id);
+      elementFragments.set(element, { base: id, fragment: id });
+      return id;
+    }
+    const anchor = semanticID ? id : heading || sectionName || document.title;
+    const base = ((semanticID ? anchor : slug(anchor)) || "page")
+      .slice(0, 96).replace(/-+$/g, "");
+    const retained = elementFragments.get(element);
+    if (retained?.base === base) return retained.fragment;
+    let ordinal = (fragmentCounts.get(base) ?? 0) + 1;
+    let fragment = ordinal === 1 ? base : `${base}-${ordinal}`;
+    while (allocatedFragments.has(fragment) || (root.getElementById?.(fragment) && root.getElementById(fragment) !== element)) {
+      ordinal++; fragment = `${base}-${ordinal}`;
+    }
+    fragmentCounts.set(base, ordinal);
+    allocatedFragments.add(fragment);
+    elementFragments.set(element, { base, fragment });
+    return fragment;
+  }
+
+  function isDocumentLinkTarget(element, id) {
+    const root = element.getRootNode();
+    if (!documentLinkTargets.has(root)) {
+      const targets = new Set(), current = new URL(location.href);
+      for (const link of root.querySelectorAll?.("a[href]") ?? []) {
+        try {
+          const target = new URL(link.getAttribute("href"), location.href);
+          if (target.origin === current.origin && target.pathname === current.pathname && target.search === current.search
+            && target.hash) targets.add(decodeURIComponent(target.hash.slice(1)));
+        } catch { /* Invalid links cannot establish an authored reading place. */ }
+      }
+      documentLinkTargets.set(root, targets);
+    }
+    return documentLinkTargets.get(root).has(id);
   }
 
   function frameName() {

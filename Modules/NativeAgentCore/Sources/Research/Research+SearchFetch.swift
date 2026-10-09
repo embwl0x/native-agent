@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import MacControl
 
 extension SwiftNativeResearchClient {
     static func localServerIsDown(_ error: Error, url: URL) -> Bool {
@@ -94,6 +95,7 @@ extension SwiftNativeResearchClient {
     // MARK: fetch (wave 30 W17)
 
     public func fetchURL(_ url: String) async throws -> ResearchFetchRecord {
+        try Task.checkCancellation()
         // Mirror Python: scheme allow-list (http/https only) ->
         // ValueError("Only http/https URLs are allowed").
         guard let parsed = URL(string: url),
@@ -101,52 +103,102 @@ extension SwiftNativeResearchClient {
               scheme == "http" || scheme == "https" else {
             throw ResearchClientError.malformedResponse("Only http/https URLs are allowed")
         }
-        let response: ResearchHTTPResponse
-        do {
-            response = try await http.getBounded(url: parsed, timeout: 30, maxBytes: 1_000_000)
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            if Task.isCancelled { throw CancellationError() }
-            if Self.localServerIsDown(error, url: parsed) {
-                throw ResearchClientError.localServerNotRunning(parsed.absoluteString)
+        func get(_ target: URL, maxBytes: Int) async throws -> ResearchHTTPResponse {
+            let response: ResearchHTTPResponse
+            do {
+                response = try await http.getBounded(url: target, timeout: 30, maxBytes: maxBytes)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                if Self.localServerIsDown(error, url: target) {
+                    throw ResearchClientError.localServerNotRunning(target.absoluteString)
+                }
+                throw ResearchClientError.transport(String(describing: error))
             }
-            throw ResearchClientError.transport(String(describing: error))
+            try Task.checkCancellation()
+            guard (200...299).contains(response.status) else {
+                throw ResearchClientError.httpStatus(response.status)
+            }
+            return response
         }
-        try Task.checkCancellation()
-        guard (200...299).contains(response.status) else {
-            throw ResearchClientError.malformedResponse("fetch returned HTTP \(response.status)")
+        func mimeOf(_ response: ResearchHTTPResponse) -> String {
+            response.contentType?.split(separator: ";").first?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         }
-        let mime = response.contentType?.split(separator: ";").first?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        var byteLimit = 1_000_000
+        var response = try await get(parsed, maxBytes: byteLimit)
+        var finalURL = response.finalURL
+        // A <meta http-equiv=refresh> page ("Redirecting…") is a redirect a
+        // browser follows; follow one hop, as an HTTP redirect is followed.
+        if mimeOf(response).contains("html"),
+           let next = Self.metaRefreshTarget(String(decoding: response.body, as: UTF8.self), base: finalURL ?? parsed),
+           next.absoluteString != (finalURL ?? parsed).absoluteString {
+            response = try await get(next, maxBytes: byteLimit)
+            finalURL = response.finalURL ?? next
+        }
+        // A PDF is read by the app's PDF reader, under its own size bound.
+        let looksLikePDF = mimeOf(response) == "application/pdf" || response.body.starts(with: Data("%PDF-".utf8))
+        if looksLikePDF, response.truncated {
+            byteLimit = MacDocumentRead.maxFileBytes
+            response = try await get(finalURL ?? parsed, maxBytes: byteLimit)
+            finalURL = response.finalURL ?? finalURL
+        }
+        let mime = mimeOf(response)
         let supported = mime.isEmpty || mime.hasPrefix("text/") || mime == "application/json"
             || mime.hasSuffix("+json") || mime == "application/xml" || mime.hasSuffix("+xml")
             || mime == "application/xhtml+xml"
         // No binary-to-replacement-character conversion masquerading as a read.
-        let looksLikePDF = response.body.starts(with: Data("%PDF-".utf8))
         let decoding = supported && !looksLikePDF
             ? ResearchTextDecoding.decode(response.body, contentType: response.contentType, mime: mime, truncated: response.truncated)
             : ResearchTextDecoding(text: nil, declaredCharset: nil, encoding: nil, source: "not_applicable", discardedTerminalBytes: 0, error: nil)
+        try Task.checkCancellation()
         let html = mime.contains("html")
+        var htmlEvidence: (text: String, scriptCharacters: Int, scripts: Int, canvases: Int, bodyCharacters: Int)?
+        var pdfPages: Int?
+        var textTruncated = false
         let status: String
         let text: String
-        if !supported || looksLikePDF {
+        if looksLikePDF, response.truncated {
+            status = MacDocumentRead.ExtractionFailure.fileTooLarge.rawValue; text = ""
+        } else if looksLikePDF {
+            switch MacDocumentRead.extract(data: response.body, kind: .pdf) {
+            case .success(let document):
+                status = "pdf_text"; text = document.text
+                pdfPages = document.pages; textTruncated = document.truncated
+            case .failure(let failure):
+                status = failure.rawValue; text = ""
+            }
+        } else if !supported {
             status = "unsupported_content_type"; text = ""
         } else if let decoded = decoding.text {
-            text = html ? Self.extractText(fromHTML: decoded) : decoded
+            if html {
+                htmlEvidence = Self.extractHTML(decoded)
+                text = htmlEvidence!.text
+            } else { text = decoded }
             status = text.isEmpty ? "empty_text" : (html ? "html_text" : "plain_text")
         } else {
             status = "unsupported_text_encoding"; text = ""
         }
-        let extracted = status == "html_text" || status == "plain_text" || status == "empty_text"
+        try Task.checkCancellation()
+        let extracted = ["html_text", "plain_text", "empty_text", "pdf_text"].contains(status)
+        // A short document alone is valid; a script-heavy shell or an explicit
+        // JavaScript gate needs a rendered read before claiming page coverage.
+        let thinPage = extracted && (response.status == 203
+            || (htmlEvidence.map { evidence in
+                evidence.bodyCharacters == 0
+                    || (evidence.bodyCharacters < 400 && evidence.scripts > 0)
+                    || ["enable javascript", "javascript is required", "javascript must be enabled", "turn on javascript"]
+                        .contains { text.localizedCaseInsensitiveContains($0) }
+            } ?? false))
         let coverage: JSONValue = .object([
             "requested_url": .string(url),
-            "final_url": response.finalURL.map { .string($0.absoluteString) } ?? .null,
+            "final_url": finalURL.map { .string($0.absoluteString) } ?? .null,
             "content_type": response.contentType.map(JSONValue.string) ?? .null,
             "http_status": .int(Int64(response.status)),
             "retained_body_bytes": .int(Int64(response.body.count)),
             "observed_body_bytes": .int(Int64(response.observedBytes)),
-            "body_byte_limit": .int(1_000_000),
+            "body_byte_limit": .int(Int64(byteLimit)),
             "body_truncated": .bool(response.truncated),
             "response_complete": .bool(!response.truncated),
             "extraction_status": .string(status),
@@ -156,8 +208,15 @@ extension SwiftNativeResearchClient {
             "discarded_terminal_bytes": .int(Int64(decoding.discardedTerminalBytes)),
             "encoding_error": decoding.error.map(JSONValue.string) ?? .null,
             "extracted_characters": .int(Int64(text.count)),
-            "text_truncated": .bool(false),
-            "complete": .bool(!response.truncated && extracted),
+            "html_script_characters": .int(Int64(htmlEvidence?.scriptCharacters ?? 0)),
+            "html_canvas_elements": .int(Int64(htmlEvidence?.canvases ?? 0)),
+            "html_script_elements": .int(Int64(htmlEvidence?.scripts ?? 0)),
+            "html_body_characters": htmlEvidence.map { .int(Int64($0.bodyCharacters)) } ?? .null,
+            "pdf_pages": pdfPages.map { .int(Int64($0)) } ?? .null,
+            "thin_page": .bool(thinPage),
+            "hint": thinPage ? .string("The fetched text is thin or requires JavaScript; it does not establish the rendered page's content. Follow next_call to open and read it in your Chrome tab.") : .null,
+            "text_truncated": .bool(textTruncated),
+            "complete": .bool(!response.truncated && extracted && !thinPage && !textTruncated),
             "note": .string(extracted
                 ? "Text covers the retained response body. Tool-output paging may expose it in sections. Body truncation means the source was not fully read."
                 : "No readable text was extracted. Discover an appropriate reader for this content type or encoding; this is not an empty-page finding."),
@@ -189,8 +248,38 @@ extension SwiftNativeResearchClient {
     }
 
 
+    /// The target of a `<meta http-equiv="refresh" content="N; url=…">` in the
+    /// document head, resolved against the page's URL; nil when the head has
+    /// none or it is not http(s). Comments, scripts and styles are not markup,
+    /// so they are stripped first; a no-JS reader honours one inside noscript.
+    static func metaRefreshTarget(_ document: String, base: URL) -> URL? {
+        var html = document.replacingOccurrences(of: #"<!--[\s\S]*?-->|<(script|style)\b[\s\S]*?</\1\s*>"#,
+                                                 with: "", options: [.regularExpression, .caseInsensitive])
+        if let end = html.range(of: #"</head\s*>|<body\b"#, options: [.regularExpression, .caseInsensitive]) {
+            html = String(html[..<end.lowerBound])
+        }
+        guard let tag = html.range(of: #"<meta\b[^>]*http-equiv\s*=\s*["']?refresh\b[^>]*>"#,
+                                   options: [.regularExpression, .caseInsensitive]),
+              let content = html[tag].range(of: #"content\s*=\s*("[^"]*"|'[^']*')"#,
+                                            options: [.regularExpression, .caseInsensitive]),
+              let marker = html[content].range(of: #"url\s*=\s*"#, options: [.regularExpression, .caseInsensitive])
+        else { return nil }
+        let raw = html[marker.upperBound..<html[content].index(before: content.upperBound)]
+            .trimmingCharacters(in: CharacterSet(charactersIn: "'\" ").union(.whitespacesAndNewlines))
+        guard !raw.isEmpty, let target = URL(string: decodeHTMLEntities(raw), relativeTo: base)?.absoluteURL,
+              ["http", "https"].contains(target.scheme?.lowercased() ?? "") else { return nil }
+        return target
+    }
+
     static func extractText(fromHTML html: String) -> String {
+        extractHTML(html).text
+    }
+
+    private static func extractHTML(_ html: String)
+        -> (text: String, scriptCharacters: Int, scripts: Int, canvases: Int, bodyCharacters: Int) {
         var parts: [String] = []
+        var scriptCharacters = 0, scripts = 0, canvases = 0, bodyCharacters = 0
+        var inHead = false
         let chars = Array(html)
         var i = 0
         let n = chars.count
@@ -206,7 +295,10 @@ extension SwiftNativeResearchClient {
             let collapsed = decoded
                 .split(whereSeparator: { $0.isWhitespace })
                 .joined(separator: " ")
-            if !collapsed.isEmpty { parts.append(collapsed) }
+            if !collapsed.isEmpty {
+                parts.append(collapsed)
+                if !inHead { bodyCharacters += collapsed.count }
+            }
         }
 
         // Parse the tag name out of a `<...>` whose inner text is `inner`
@@ -257,6 +349,10 @@ extension SwiftNativeResearchClient {
                 }
                 let inner = String(chars[(i + 1)..<close])
                 let info = tagInfo(inner)
+                if info.name == "head" { inHead = !info.isEnd }
+                if info.name == "body", !info.isEnd { inHead = false }
+                if info.name == "script", !info.isEnd { scripts += 1 }
+                if info.name == "canvas", !info.isEnd { canvases += 1 }
                 // FIX #1 (wave 30 W17 gpt-5.5 review): script/style/noscript
                 // bodies are CDATA in Python's HTMLParser — `<` inside them is
                 // NOT markup. On an OPENING skip tag (not self-closing), scan
@@ -284,6 +380,7 @@ extension SwiftNativeResearchClient {
                                 k += 1
                             }
                             if matched {
+                                if info.name == "script" { scriptCharacters += j - close - 1 }
                                 // Advance past the closing tag's `>` (Python is
                                 // lenient about attrs/whitespace before `>`).
                                 if let gt = tagEnd(from: j + needle.count) {
@@ -298,6 +395,7 @@ extension SwiftNativeResearchClient {
                         j += 1
                     }
                     if !foundClose {
+                        if info.name == "script" { scriptCharacters += n - close - 1 }
                         // No closing tag: Python treats the rest as the
                         // (never-emitted) skip region — discard to EOF.
                         i = n
@@ -311,7 +409,7 @@ extension SwiftNativeResearchClient {
             }
         }
         if !dataBuf.isEmpty { appendData(dataBuf) }
-        return parts.joined(separator: "\n")
+        return (parts.joined(separator: "\n"), scriptCharacters, scripts, canvases, bodyCharacters)
     }
 
     /// Decode the HTML char-refs Python's HTMLParser resolves with

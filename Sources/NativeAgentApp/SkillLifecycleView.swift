@@ -254,7 +254,7 @@ enum SkillPointerSyncReceiptPresentation {
                 return .unavailable(detail: "The memory check record has a status this page does not recognise.")
             }
         } catch {
-            return .unavailable(detail: "The memory check record could not be read: \(boundedDetail(error.localizedDescription))")
+            return .unavailable(detail: UserFacingError.message(error, action: "read the memory check record"))
         }
     }
 
@@ -535,14 +535,7 @@ private struct SkillRow: View {
         }
         .padding(.vertical, 12).padding(.horizontal, 16)
         .frame(minHeight: 48)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(TodayPalette.cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-        )
+        .aliveCard(radius: TodayMetrics.cardRadius)
         .contentShape(Rectangle())
         .naInteractive(radius: TodayMetrics.cardRadius)
         .onTapGesture { onRead() }
@@ -621,7 +614,7 @@ enum SkillBodyPresentation {
                 truncated: byteCount > Int64(maximumDisplayBytes)
             )
         } catch {
-            return .unavailable("The body file could not be read: \(error.localizedDescription)")
+            return .unavailable(UserFacingError.message(error, action: "read the skill's body file"))
         }
     }
 }
@@ -687,6 +680,7 @@ struct SkillBodySheet: View {
         }
         .padding(20)
         .frame(minWidth: 620, minHeight: 480)
+        .houseSheet()
         .task(id: info.registry.path) {
             let path = info.registry.path
             let dataRoot = dataRoot

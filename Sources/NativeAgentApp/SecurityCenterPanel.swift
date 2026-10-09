@@ -27,8 +27,7 @@ enum SecurityCenterRefreshPresentation {
     }
 
     static func boundedDetail(_ error: any Error) -> String {
-        let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        return detail.isEmpty ? "The security reader returned no details." : String(detail.prefix(240))
+        UserFacingError.cause(error, action: "read security status")
     }
 
     static func message(for state: State) -> String? {
@@ -360,7 +359,7 @@ private struct SecurityFlagRow: View {
             if plain != nil {
                 Text(flag.title)
                     .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
             }
             // The switch already says off; only a live pause earns its line.

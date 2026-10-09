@@ -27,9 +27,7 @@ public struct EmbeddingRuntimeSnapshot: Sendable, Equatable {
 }
 
 public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
-    /// `lowMemory` is resolved from the persisted mode at model-LOAD time and
-    /// handed to the loader so the CoreML model can be constructed with
-    /// `.cpuOnly` compute units (A5.4).
+    /// The legacy loader argument is always false: the model stays on the Neural Engine.
     public typealias Loader = @Sendable (_ lowMemory: Bool) throws -> any EmbeddingProvider
     public typealias AvailabilityProbe = @Sendable () -> Bool
 
@@ -46,13 +44,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
 
     private struct State {
         var coreMLProvider: (any EmbeddingProvider)?
-        /// The `lowMemory` selection the RESIDENT provider was loaded with.
-        /// Meaningless when `coreMLProvider` is nil. Checked on every load
-        /// request so a mode flip that raced a mid-flight load — or an
-        /// external mode.json edit that never went through setMemoryMode —
-        /// can never keep serving a stale-compute-units model (gpt-5.5
-        /// BLOCKING x2, 2026-07-24).
-        var coreMLProviderLowMemory = false
         var lastUsedAt: Date?
         var lastLoadedAt: Date?
         var lastUnloadedAt: Date?
@@ -63,7 +54,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         var generation: UInt64 = 0
         /// Activity and idle scheduling must not invalidate a cold load.
         var loadGeneration: UInt64 = 0
-        var idleUnloadTask: Task<Void, Never>?
     }
 
     private let dataRoot: URL
@@ -73,10 +63,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     private let lock = NSLock()
     private let loadLock = NSLock()
     private var state = State()
-
-    deinit {
-        state.idleUnloadTask?.cancel()
-    }
 
     public init(
         dataRoot: URL,
@@ -160,25 +146,27 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         try await embedWithEpoch(texts).vectors
     }
 
+    /// Residency is independent of whether semantic search is selected.
+    public func warmUp() async throws {
+        if lock.withLock({ state.coreMLProvider != nil }) { return }
+        let provider = try loadCoreMLProvider(config: Self.readConfig(dataRoot: dataRoot))
+        _ = try await provider.embed(["warmup"])
+    }
+
     /// Phase 5 D: embed ONLY on the model already resident — never load it,
     /// never take `loadLock`. Nil when cold, mismatched or mock; the caller
     /// falls back to what it can do without vectors.
     public func embedIfResident(_ texts: [String]) async -> [[Float]]? {
         let config = Self.readConfig(dataRoot: dataRoot)
         guard config.backend != Self.mockBackend, !texts.isEmpty else { return nil }
-        let lowMemory = Self.usesCPUOnlyCompute(mode: config.mode)
-        guard let provider = lock.withLock({
-            state.coreMLProviderLowMemory == lowMemory ? state.coreMLProvider : nil
-        }) else { return nil }
+        guard let provider = lock.withLock({ state.coreMLProvider }) else { return nil }
         noteUse()
-        defer { scheduleIdleUnloadIfNeeded(mode: config.mode) }
         return try? await provider.embed(texts)
     }
 
     public func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
         let config = Self.readConfig(dataRoot: dataRoot)
         guard config.backend != Self.mockBackend else {
-            release(reason: "disabled by user")
             return try await mock.embedWithEpoch(texts)
         }
 
@@ -206,23 +194,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             )
         }
         noteUse()
-        do {
-            let batch = try await provider.embedWithEpoch(texts)
-            scheduleIdleUnloadIfNeeded(mode: config.mode)
-            return batch
-        } catch is CancellationError {
-            // Provider stays hot, but it's now idle — without this a
-            // low-memory-mode model would stay resident indefinitely after
-            // a cancelled embed (gpt-5.5 review nit).
-            scheduleIdleUnloadIfNeeded(mode: config.mode)
-            throw CancellationError()
-        } catch {
-            // Transient predict failure: keep the provider hot, propagate
-            // the real error to the caller (fail-closed, no mock fallback —
-            // the model IS installed and loaded).
-            scheduleIdleUnloadIfNeeded(mode: config.mode)
-            throw error
-        }
+        // Prediction failures and cancellation retain the resident model.
+        return try await provider.embedWithEpoch(texts)
     }
 
     public func snapshot() -> EmbeddingRuntimeSnapshot {
@@ -294,7 +267,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 lastLoadError: state.lastLoadError ?? installedModelProblem,
                 loadCount: state.loadCount,
                 unloadCount: state.unloadCount,
-                idleUnloadSeconds: Self.idleUnloadSeconds(for: config.mode)
+                idleUnloadSeconds: nil
             )
         }
     }
@@ -306,51 +279,22 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             key: "backend",
             value: enabled ? Self.coreMLBackend : Self.mockBackend
         )
-        if !enabled {
-            release(reason: "disabled by user")
-        } else if previous != Self.coreMLBackend {
+        if previous != (enabled ? Self.coreMLBackend : Self.mockBackend) {
             lock.withLock { state.loadGeneration &+= 1 }
         }
-    }
-
-    /// A5.4: whether a given persisted mode should load CoreML with `.cpuOnly`
-    /// compute units. Only `low_memory` does — every other mode (including
-    /// unknown/absent, which normalizes to `performance`) returns false and the
-    /// model load keeps the untouched CoreML default. Pure so the selection is
-    /// pinned by tests rather than inferred from a live model load.
-    public static func usesCPUOnlyCompute(mode: String) -> Bool {
-        normalizeMode(mode) == lowMemoryMode
     }
 
     public func setMemoryMode(_ mode: String) async throws {
-        let previous = Self.readConfig(dataRoot: dataRoot).mode
-        let normalized = Self.normalizeMode(mode)
         try await writeConfigValue(
             path: Self.modePath(dataRoot: dataRoot),
             key: "mode",
-            value: normalized
+            value: Self.performanceMode
         )
-        // Compute units are chosen at model-LOAD time, so a mode change only
-        // reaches CoreML on the next load. When the flip actually changes the
-        // selection (into or out of low_memory) drop the resident model through
-        // the EXISTING release path so the next embed() reloads under the right
-        // units. Flips that don't change the selection (performance <-> balanced)
-        // leave the model hot, exactly as before.
-        let flipsComputeUnits =
-            Self.usesCPUOnlyCompute(mode: previous) != Self.usesCPUOnlyCompute(mode: normalized)
-        if flipsComputeUnits {
-            release(reason: "compute units changed for \(normalized) mode")
-        } else if previous != normalized {
-            lock.withLock { state.loadGeneration &+= 1 }
-        }
-        scheduleIdleUnloadIfNeeded(mode: normalized)
     }
 
     @discardableResult
     public func release(reason: String = "manual release") -> EmbeddingRuntimeSnapshot {
         lock.withLock {
-            state.idleUnloadTask?.cancel()
-            state.idleUnloadTask = nil
             if state.coreMLProvider != nil {
                 state.unloadCount += 1
             }
@@ -369,28 +313,15 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         // and release independent of the expensive synchronous loader.
         loadLock.lock()
         defer { loadLock.unlock() }
-        let lowMemory = Self.usesCPUOnlyCompute(mode: config.mode)
-        // Either nothing is resident, or the resident provider was loaded
-        // under the OTHER compute selection (a flip raced its load, or
-        // mode.json changed externally). Evict a mismatched resident before
-        // loading so this request's selection is what actually serves.
         let (existing, generation) = try lock.withLock {
-            guard Self.readConfig(dataRoot: dataRoot) == config,
-                  config.backend != Self.mockBackend else { throw CancellationError() }
-            if state.coreMLProvider != nil, state.coreMLProviderLowMemory != lowMemory {
-                state.coreMLProvider = nil
-                state.lastUnloadedAt = Date()
-                state.unloadReason = "compute units changed (selection mismatch at load)"
-                state.generation &+= 1
-                state.loadGeneration &+= 1
-            }
+            guard Self.readConfig(dataRoot: dataRoot) == config else { throw CancellationError() }
             return (state.coreMLProvider, state.loadGeneration)
         }
         if let existing { return existing }
         let modelID = resolvedModelID
         let provider: any EmbeddingProvider
         do {
-            provider = try loader(lowMemory)
+            provider = try loader(false)
         } catch {
             // Record failure before admitting another load, so an older
             // failure cannot evict a newer successful model.
@@ -402,7 +333,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                   Self.readConfig(dataRoot: dataRoot) == config,
                   resolvedModelID == modelID else { throw CancellationError() }
             state.coreMLProvider = provider
-            state.coreMLProviderLowMemory = lowMemory
             state.lastLoadedAt = Date()
             state.unloadReason = nil
             state.lastLoadError = nil
@@ -414,8 +344,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
 
     private func noteUse() {
         lock.withLock {
-            state.idleUnloadTask?.cancel()
-            state.idleUnloadTask = nil
             state.lastUsedAt = Date()
             state.generation &+= 1
         }
@@ -438,39 +366,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 ? "load failed; mock embedder active via NATIVE_AGENT_EMBEDDING_MOCK"
                 : "load failed; fail-closed (embed() will throw)"
             state.generation &+= 1
-        }
-    }
-
-    private func scheduleIdleUnloadIfNeeded(mode: String) {
-        lock.withLock {
-            state.idleUnloadTask?.cancel()
-            state.idleUnloadTask = nil
-            state.generation &+= 1
-            guard state.coreMLProvider != nil,
-                  let seconds = Self.idleUnloadSeconds(for: mode) else { return }
-            let generation = state.generation
-            state.idleUnloadTask = Task.detached { [weak self] in
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
-                } catch { return }
-                self?.releaseIfIdle(generation: generation)
-            }
-        }
-    }
-
-    private func releaseIfIdle(generation: UInt64) {
-        lock.withLock {
-            guard state.coreMLProvider != nil else { return }
-            guard state.generation == generation else { return }
-            // The cancellable sleep measures elapsed time; wall-clock changes
-            // must not strand a model after its only unload deadline fires.
-            state.idleUnloadTask = nil
-            state.coreMLProvider = nil
-            state.lastUnloadedAt = Date()
-            state.unloadReason = "idle timeout"
-            state.unloadCount += 1
-            state.generation &+= 1
-            state.loadGeneration &+= 1
         }
     }
 
@@ -500,25 +395,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     private static func normalizeMode(_ mode: String?) -> String {
-        switch mode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case balancedMode:
-            return balancedMode
-        case lowMemoryMode:
-            return lowMemoryMode
-        default:
-            return performanceMode
-        }
-    }
-
-    private static func idleUnloadSeconds(for mode: String) -> Int? {
-        switch normalizeMode(mode) {
-        case performanceMode:
-            return nil
-        case lowMemoryMode:
-            return 45
-        default:
-            return 300
-        }
+        performanceMode
     }
 
     private static func readStringValue(from path: URL, key: String) -> String? {

@@ -30,12 +30,14 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
     private let inner: any ToolDispatchClient
     private let mode: Mode
 
-    /// This wrapper adds no pre-approval rules; it carries the inner
-    /// dispatcher's through, since the approval membrane wraps it and would
-    /// otherwise see nothing to ask.
+    /// Refuse through the same file-access gate before any inner preview
+    /// inspects a target, then carry the inner dispatcher's checks through.
     func preApprovalRefusal(
         tool: String, input: [String: JSONValue], surface: String
     ) async -> JSONValue? {
+        if let error = fileAccessRefusal(tool: tool, input: input) {
+            return ChatToolOutcome.failure(error: error, tool: tool)
+        }
         if let validating = inner as? any PreApprovalToolValidating {
             return await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
         }
@@ -215,9 +217,9 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         return !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    private func fileAccessRefusal(tool: String, input: [String: JSONValue]) -> AutonomyGateError? {
         if isPathfulReadUnderNoFileAccess(tool: tool, input: input) {
-            throw AutonomyGateError.toolDenied(
+            return AutonomyGateError.toolDenied(
                 reason: "fileAccess=none blocks \(tool) with an explicit path; "
                     + "call it with no path to read what is on screen"
             )
@@ -226,8 +228,13 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
             // Name the ACTUAL mode — this gate also fires for read_only, and
             // the old hardcoded "fileAccess=none" string lied in that case.
             let modeName = mode == .readOnly ? "read_only" : "none"
-            throw AutonomyGateError.toolDenied(reason: "fileAccess=\(modeName) blocks \(tool)")
+            return AutonomyGateError.toolDenied(reason: "fileAccess=\(modeName) blocks \(tool)")
         }
+        return nil
+    }
+
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if let error = fileAccessRefusal(tool: tool, input: input) { throw error }
         // User, 2026-09-06: refusing the pathful `read` above is only half of
         // it — the PATHLESS one asks the front window for its `AXDocument` and
         // opens THAT file, a path this gate never sees because it does not
@@ -372,12 +379,12 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         let name = tool.replacingOccurrences(of: ".", with: "_")
         if name.hasPrefix("bot_") || name.hasPrefix("shelf_") { return false }
         return !Set(capabilities).isDisjoint(with: ["ax_injection", "hid_injection", "browser_interaction", "notification", "system_control", "shell", "process_spawn"])
-            || ["browser_open_url", "browser_navigate", "browser_chrome_acquire", "browser_chrome_navigate",
+            || ["browser_open_url", "browser_navigate", "browser_chrome_navigate",
                 "browser_chrome_scroll", "mac_activate_app", "app_activate", "speak", "voice_speak", "sound_play"].contains(name)
     }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        if surface == "bot", let pending = ChatTurnExecution.current?.pendingApproval { return pending }
+        if StandingBotContinuity.isHelperTurn, let pending = ChatTurnExecution.current?.pendingApproval { return pending }
         return try await inner.withToolArguments(tool: tool, input: input) { input in
             try await dispatchNormalized(tool: tool, input: input, surface: surface)
         }
@@ -629,7 +636,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         let securityAsked: Bool
         var securityReasonMayBeReplaced = false
         var decision: AutonomyDecision
-        let botDesktop = surface == "bot" && !approvedReplayAuthorizes && injectionReplayApprovalID == nil
+        let botDesktop = StandingBotContinuity.isHelperTurn && !approvedReplayAuthorizes && injectionReplayApprovalID == nil
             && Self.requiresDesktopInteraction(tool: tool, capabilities: envelope.capabilities)
         if case .deny = autonomyDecision {
             decision = autonomyDecision
@@ -695,15 +702,17 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         case .requireApproval: peerReasonMayReplace = securityReasonMayBeReplaced
         case .deny: peerReasonMayReplace = false
         }
+        var decidedRequester: String?
         if botDesktop, fullMacOn, case .allow = decision {
             try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow,
                 reason: "Agent decided for a helper"))
-            HarnessDecidedRow.post(requester: "a helper", tool: tool, sessionID: verifiedSessionId,
-                                         dataRoot: peerDirectoryDataRoot ?? defaultDataRoot())
+            decidedRequester = "a helper"
         }
         let peerTurnID = ChatToolSessionContext.envelope?.verifiedUserId
         let taint = PeerDataTaint.current
-        let requester = PeerTurnEffectPolicy.peerRequester(
+        // A bridge agent User trusted asks for nothing of its own (User 10-08).
+        let trustedBridge = PeerDataTaint.trustedTurn
+        let requester = trustedBridge && taint?.isTainted != true ? nil : PeerTurnEffectPolicy.peerRequester(
             surface: surface,
             peerID: peerTurnID,
             peerName: peerDisplayName(peerID: peerTurnID),
@@ -740,8 +749,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     if case .allow = decision {
                         try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow,
                             reason: "Agent decided for \(requester)"))
-                        HarnessDecidedRow.post(requester: requester, tool: tool, sessionID: verifiedSessionId,
-                                                     dataRoot: peerDirectoryDataRoot ?? defaultDataRoot())
+                        decidedRequester = requester
                     }
                 } else {
                     decision = .requireApproval(
@@ -785,7 +793,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // the exact post-approval replay; `runInner` refuses without an
             // approval id, so an `.allow` that slipped through from any other
             // source still cannot type.
-            return try await runInner(
+            let result = try await runInner(
                 tool: tool,
                 input: input,
                 surface: surface,
@@ -793,6 +801,12 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 // Reaching .allow IS the person's go-ahead: their approval, or Full Mac.
                 personApprovedHost: namedConnect
             )
+            if let decidedRequester, !trustedBridge,
+               ChatToolOutcome.exactResultClass(result) == .succeeded {
+                HarnessDecidedRow.post(requester: decidedRequester, tool: tool, sessionID: verifiedSessionId,
+                                      dataRoot: peerDirectoryDataRoot ?? defaultDataRoot(), ran: true)
+            }
+            return result
         case .deny(let reason):
             try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: reason))
             throw AutonomyGateError.toolDenied(reason: reason)
@@ -823,10 +837,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 ) {
                     await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
                 }
-                if let refusal { return refusal }
+                if let refusal { return Self.refusedBeforeRunning(refusal) }
             } else if let validating = inner as? any PureToolArgumentValidating,
                       let refusal = await validating.argumentRefusal(tool: tool, input: input) {
-                return refusal
+                return Self.refusedBeforeRunning(refusal)
             }
             let ownsACPConnectCard: Bool
             if tool == "agent_connect", case .string(let name)? = input["name"],
@@ -905,7 +919,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 if case .object(let fields) = pending, fields["not_run_status"] == nil {
                     pending = ToolNotRunStatus.approvalFiled.reporting(pending)
                 }
-                if surface == "bot" { ChatTurnExecution.current?.keepApproval(id: approvalId, pending) }
+                if StandingBotContinuity.isHelperTurn { ChatTurnExecution.current?.keepApproval(id: approvalId, pending) }
                 return pending
             }
             let resolved = try await withFilingSession {
@@ -1078,9 +1092,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // capability left in scope by an enclosing task.
             try await MacInjectionCapabilityContext.$current.withValue(finalCapability) {
                 try await AgentHostConnection.$personApproved.withValue(personApprovedHost) {
-                    try await MacWorkContinuation.$current.withValue(ChatToolSessionContext.envelope?.macContinuation) {
-                        try await inner.dispatch(tool: tool, input: finalInput, surface: surface)
-                    }
+                    try await inner.dispatch(tool: tool, input: finalInput, surface: surface)
                 }
             }
         }
@@ -1140,6 +1152,13 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             surface: surface,
             input: input
         )
+    }
+
+    /// Refused before it ran or a card was filed: nothing changed.
+    private static func refusedBeforeRunning(_ refusal: JSONValue) -> JSONValue {
+        guard case .object(var fields) = refusal, fields["effects"] == nil else { return refusal }
+        fields["effects"] = .string("none")
+        return .object(fields)
     }
 
     private static func jsonString(_ raw: JSONValue?) -> String? {

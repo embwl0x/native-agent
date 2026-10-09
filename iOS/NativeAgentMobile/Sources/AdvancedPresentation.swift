@@ -33,6 +33,7 @@ enum MobileDesignSamples {
         "TrainingProposalSummary": #"[{"id":"design-training","title":"Make project summaries easier to scan","status":"pending","proposed":"Start with the decision, then include the evidence and next step.","rationale":"Keep longer updates useful on a small screen."}]"#,
         "KGEntity": #"[{"id":"design-entity","name":"Weekend research and planning","type":"project","mention_count":12,"aliases":["Reading list"],"summary":"A collection of references and decisions for the next project review."}]"#,
         "SkillManifestEntry": #"[{"id":"design-skill","name":"Research notes and source comparison","description":"Collect useful sources, compare the evidence, and write a concise summary.","source":"learned","state":"active","use_count":8,"version":"1.2"}]"#,
+        "MobileAppSetting": #"[{"id":"chat.file_access","page":"chat","label":"Chat file access","type":"choice","choices":["auto","workspace","read_only","none"],"writable":true,"value":"read_only"},{"id":"chat.quiet_mode","page":"chat","label":"Quiet mode","type":"boolean","choices":[],"writable":true,"value":"true"},{"id":"memories.mode","page":"memories","label":"Memory mode","type":"choice","choices":["performance","balanced","low_memory"],"writable":true,"value":"low_memory"},{"id":"memories.cross_session","page":"memories","label":"Remember across conversations","type":"boolean","choices":[],"writable":true,"value":"false"}]"#,
         "TurnSummaryRecord": #"[{"id":"design-turn","surface":"iPhone conversation","startedAt":810000000,"lastAt":810000008,"eventCount":12,"wallMs":8200,"llmTokens":1240,"ttftMs":430,"kinds":{"reply":1,"tool":2}}]"#
     ]
     #endif
@@ -231,10 +232,6 @@ enum OrganismStatusPresentation {
         value.map(String.init) ?? "Not reported"
     }
 
-    static func canApprove(_ candidate: OrganismLivingReflexCandidateFile) -> Bool {
-        candidate.trustClass == "lowRisk" && candidate.reviewRequired
-    }
-
     static func isStale(generatedAt: Date, now: Date = Date(), maximumAge: TimeInterval = 300) -> Bool {
         now.timeIntervalSince(generatedAt) > maximumAge
     }
@@ -266,25 +263,6 @@ enum OrganismStatusPresentation {
         if seconds < 60 { return "\(seconds)s" }
         if seconds < 3_600 { return "\(seconds / 60)m" }
         return "\(seconds / 3_600)h"
-    }
-
-    struct ReflexCandidateSlice: Equatable {
-        let visible: [OrganismLivingReflexCandidateFile]
-        let hiddenCount: Int
-    }
-
-    static func reflexCandidateSlice(
-        _ candidates: [OrganismLivingReflexCandidateFile],
-        visibleLimit: Int = 6
-    ) -> ReflexCandidateSlice {
-        .init(visible: Array(candidates.prefix(visibleLimit)), hiddenCount: max(0, candidates.count - visibleLimit))
-    }
-
-    static func removingLocallyFinalizedCandidate(
-        id: String,
-        from candidates: [OrganismLivingReflexCandidateFile]
-    ) -> [OrganismLivingReflexCandidateFile] {
-        candidates.filter { $0.id != id }
     }
 
     static func dreamProposalSlice(

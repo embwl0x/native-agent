@@ -138,7 +138,7 @@ final class ChatStore: ObservableObject {
         defaults.set(Array(pausedQueueSessionKeys), forKey: pausedQueueSessionKeysKey)
     }
     // PATCH-2026-05-30: incremental text streaming over iCloud.
-    // The Mac side writes batched text_delta BridgeMessages every ~1.5s during
+    // The Mac side writes batched text_delta BridgeMessages every ~1s during
     // a chat turn so iOS users see Agent "typing" in real time instead of a
     // 20-second wall of silence followed by the whole answer dropping in.
     //
@@ -232,6 +232,9 @@ final class ChatStore: ObservableObject {
 
     func setSelectedSessionID(_ value: String?) {
         let clean = Self.cleanSessionID(value)
+        // A switch reloads from the capped cache, which may have dropped the
+        // older pages: whether the start is reached is asked again.
+        if clean != selectedSessionID { historyExhaustedSessionIDs.removeAll() }
         selectedSessionID = clean
         if let clean {
             defaults.set(clean, forKey: Self.selectedSessionIDKey)
@@ -414,6 +417,17 @@ final class ChatStore: ObservableObject {
     /// reply" — a stale snapshot would otherwise complete the regeneration
     /// with the answer being replaced.
     var regeneratedAwayAssistantIDs: Set<UUID> = []
+    /// Turns another door started in this conversation, by run id, and the
+    /// bubble each one streams into (`receiveLiveTurn`).
+    @Published var liveTurnBubbles: [String: UUID] = [:]
+    /// Rows fetched from the Mac above the snapshot's window. The merge keeps
+    /// them: the snapshot never carries them.
+    var pagedHistoryIDs: Set<UUID> = []
+    @Published var isLoadingHistory = false
+    @Published var historyExhaustedSessionIDs: Set<String> = []
+    /// Sessions opened from a Mac page (no published transcript) whose page
+    /// said there is more before it.
+    var pagedSessionsWithOlder: Set<String> = []
     /// 2026-09-06: the newest Mac transcript version applied per session. An
     /// EMPTY published transcript is authority to clear the visible chat, so it
     /// must be provably newer than what is on screen — two overlapping snapshot
@@ -433,10 +447,6 @@ final class ChatStore: ObservableObject {
     /// didSet so every append path (send, bridge resolve, snapshot apply, cache
     /// load) is covered without instrumenting each call site. Internal for tests.
     var localArrivalDates: [UUID: Date] = [:]
-
-    var typewriterTasks: [UUID: Task<Void, Never>] = [:]
-    var typewriterTargets: [UUID: String] = [:]
-    static let typewriterTickSeconds: TimeInterval = 0.07
 
     /// Timestamp of the last successful (or in-progress) refresh attempt.
     /// Used as a throttle guard — skips if a refresh happened within 2 seconds.

@@ -226,8 +226,8 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
             nextRuleIndex: 0,
             trustCenterAllowed: true,
             preconditionResults: Dictionary(
-                uniqueKeysWithValues: artifact.safety.requiredPreconditions.map { ($0, true) }
-            ),
+                artifact.safety.requiredPreconditions.map { ($0, true) },
+                uniquingKeysWith: { first, _ in first }),
             canonicalApprovalOwnerRechecked: artifact.safety.canonicalApprovalOwner == nil,
             cancellationRequested: false
         )

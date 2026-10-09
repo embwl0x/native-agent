@@ -71,7 +71,9 @@ and returns the health rows. `Sources/NativeAgentApp/AppToolHealthHost.swift`
 binds this read to `runDoctor(repair:false)` and the live checks.
 `doctor.repair` is a separate action, not a read-only probe.
 
-The configured `doctor_auto_run` lane defaults to weekly. Its
+The configured `doctor_auto_run` lane runs at launch, when a health row turns
+from ok to adverse, and weekly; it runs every safe repair and files one inbox
+ask for the sign-ins and permissions it cannot do itself. Its
 `doctor/latest.json` contains:
 
 - `measuredAt`: when measurement began;
@@ -93,7 +95,7 @@ event deadlines, backoff and saved configuration determine actual work.
 
 | loopId | Default wake or backstop | Work |
 |---|---|---|
-| `doctor_auto_run` | Weekly; configured intervals at least 1h | Publish Doctor snapshot. |
+| `doctor_auto_run` | Launch, ok→adverse health reading, weekly; configured intervals at least 1h | Repair, publish Doctor snapshot, file one sign-in/permission ask. |
 | `turn_trace_retention` | 6h | Prune expired trace data, lock sidecars and excess transcript backups. |
 | `offdisk_backup` | Daily | Create an off-disk backup when due or identity changed; skip alternate roots and unavailable iCloud Drive. |
 | `evolution_proposal_retention` | Weekly | Remove expired terminal evolution proposals. |
@@ -107,7 +109,6 @@ event deadlines, backoff and saved configuration determine actual work.
 | `cognition_replay` | Daily | Episodic replay. |
 | `cognition_reflection` | Daily | Budgeted cognitive reflection. |
 | `heartbeat` | 12h | Assess health; surface stable anomaly cards. Clean assessments skip the model. |
-| `self_healing` | Fault events; daily repair | Diagnose faults and stage evolution proposals under unattended-work authority. |
 | `autonomy_promotion_proposals` | Events/deadlines; daily repair | Propose promotions and reconcile approved decisions. |
 | `desk_notify` | Events/deadlines; daily repair | Notify about eligible tracked Desk changes. |
 | `delegation_outcome` | Events/deadlines; 6h repair | Reconcile terminal delegation jobs and their notifications. |

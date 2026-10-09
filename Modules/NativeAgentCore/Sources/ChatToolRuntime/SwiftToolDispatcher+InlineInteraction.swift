@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import MacIntegration
 
 extension SwiftToolDispatcher {
     /// Agent raising a need HERSELF, before hitting a wall.
@@ -20,6 +21,11 @@ extension SwiftToolDispatcher {
     /// control returns a plain failure, so an unsupported ask reads as
     /// unsupported rather than as a card that does nothing.
     func impl_request_interaction(input: [String: JSONValue]) async -> JSONValue {
+        await Self.requestedInteraction(input: input, dataRoot: dataRoot)
+    }
+
+    /// Build and validate the request without filing a card, for dispatch and preview.
+    public static func requestedInteraction(input: [String: JSONValue], dataRoot: URL) async -> JSONValue {
         func text(_ keys: String...) -> String? {
             for key in keys {
                 if case .string(let value)? = input[key] {
@@ -112,6 +118,7 @@ extension SwiftToolDispatcher {
                 declineConsequence: declineConsequence
             )
         case .permission:
+            let access = text("mode", "access").flatMap { InlineInteraction.AccessMode(rawValue: $0) }
             // A chain she can predict is ONE ask. Extra capabilities are
             // canonical ids from the Mac list; anything the registry does not
             // know renders unavailable rather than granting something vague.
@@ -122,13 +129,24 @@ extension SwiftToolDispatcher {
                     return nil
                 }
             }
+            do {
+                let permissions = try await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()
+                for capability in capabilities {
+                    for mode in [MacIntegrationPermissionMode.read, .write]
+                    where access == nil || access?.rawValue == mode.rawValue || access == .readWrite {
+                        if let refusal = permissions.refusal(integration: capability, mode: mode) {
+                            return failed("operator_permission_off", refusal)
+                        }
+                    }
+                }
+            } catch { return failed("permission_settings_unavailable", "Mac permission settings could not be read; the saved switch must be available before requesting access.") }
             // She may say which axis she needs; she cannot widen one. An
             // unknown value reads as "both", which is what the card would have
             // said before this field existed.
             interaction = InlineInteractionRegistry.permission(
                 capabilities,
                 why: why,
-                mode: text("mode", "access").flatMap { InlineInteraction.AccessMode(rawValue: $0) },
+                mode: access,
                 declineConsequence: declineConsequence
             )
         case .modelChoice:

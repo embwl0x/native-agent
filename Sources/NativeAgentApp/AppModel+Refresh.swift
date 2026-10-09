@@ -198,7 +198,7 @@ extension AppModel {
             } catch {
                 fetchedTools = nil
                 if selectedMCPServerId == pendingId {
-                    setIfChanged(\.mcpToolReadState, .unavailable(String(error.localizedDescription.prefix(240))))
+                    setIfChanged(\.mcpToolReadState, .unavailable(UserFacingError.cause(error, action: "read the MCP tools")))
                 }
             }
             if selectedMCPServerId == pendingId {
@@ -210,7 +210,7 @@ extension AppModel {
             } catch {
                 fetchedResources = nil
                 if selectedMCPServerId == pendingId {
-                    setIfChanged(\.mcpResourceReadState, .unavailable(String(error.localizedDescription.prefix(240))))
+                    setIfChanged(\.mcpResourceReadState, .unavailable(UserFacingError.cause(error, action: "read the MCP resources")))
                 }
             }
             if selectedMCPServerId == pendingId {
@@ -354,19 +354,11 @@ extension AppModel {
         await loadProvidersForChat()
         await loadChatState(api: api)
         let fetchedCompiledPersonality = await decodeLogged("getCompiledPersonality") { try await api.getCompiledPersonality(surface: "chat") }
-        // The map's names, paths, and export policy are cheap and sufficient
-        // for a global/status refresh. Recursive file counts are intentionally
-        // lazy: Trust and Settings request them when those surfaces open, while
-        // launch Doctor no longer walks every data subtree during refreshAll.
-        let fetchedPrivacyMap = await decodeLogged("getPrivacyMap") {
-            try await api.getPrivacyMap(includeInventory: false)
-        }
         let telegramBeforeConfig = telegramSettingsDraftSnapshot
         let telegramBaselineConfig = telegramSettingsDraftBaseline
         let fetchedConfig = await decodeLogged("getConfig", { try await api.getConfig() })
         // Apply the fetched UI state in one MainActor turn before publishing the widget.
         setIfChanged(\.compiledPersonality, fetchedCompiledPersonality)
-        setIfChanged(\.privacyMap, fetchedPrivacyMap)
         if let config = fetchedConfig {
             setIfChanged(\.engine.providers.codexAuth, config.codexAuth)
             _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)

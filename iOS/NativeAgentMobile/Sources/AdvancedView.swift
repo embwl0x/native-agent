@@ -98,14 +98,10 @@ struct AdvancedView: View {
                     link("Trust", "What I may do on my own") { TrustHostView() }
                 }
 
+                // One door: Telegram, Providers and every Mac setting
+                // (Mac Integration among them) are inside it.
                 AliveSection("Setup") {
-                    link("Telegram", "Telegram settings on your Mac") { TelegramView() }
-                    AliveDivider()
-                    link("Mac Integration", "Apps on your Mac I can use") { MacIntegrationView() }
-                    AliveDivider()
-                    link("Providers", "The models I think with") { ProviderSettingsView() }
-                    AliveDivider()
-                    link("Settings", "Appearance and the Mac link") { SettingsViewFull() }
+                    link("Settings", "This iPhone, the Mac link and every Mac setting") { SettingsViewFull() }
                 }
 
                 // Opt-in deep surfaces and diagnostics: lower and quieter.
@@ -171,7 +167,6 @@ struct AdvancedView: View {
         case "inbox": InboxView(embedInNavigationStack: false).environmentObject(designInbox)
         case "autonomy": AutonomyView()
         case "mac-tools": MacToolsView()
-        case "mac-integration": MacIntegrationView()
         case "skills": SkillsToolsView(embedInNavigationStack: false)
         case "graph": KnowledgeGraphView()
         case "turns": TurnInspectorView()
@@ -363,9 +358,6 @@ struct StatusDetailView: View {
     @ObservedObject private var cloudReplies = iCloudBridge.shared
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
-    @State private var decidingReflexID: String?
-    @State private var locallyFinalizedReflexIDs = Set<String>()
-    @State private var reflexDecisionErrors: [String: String] = [:]
 
     var body: some View {
         List {
@@ -548,64 +540,6 @@ struct StatusDetailView: View {
                         }
                     }
                 } header: { AliveEyebrow(sync.agentDisplayName) }
-                let candidateSlice: OrganismStatusPresentation.ReflexCandidateSlice = organismState.displaysDetails
-                    ? OrganismStatusPresentation.reflexCandidateSlice(
-                        (organism.reflexCandidates ?? []).filter { !locallyFinalizedReflexIDs.contains($0.id) }
-                    )
-                    : .init(visible: [], hiddenCount: 0)
-                if !candidateSlice.visible.isEmpty {
-                    Section {
-                        ForEach(candidateSlice.visible) { candidate in
-                            VStack(alignment: .leading, spacing: 8) {
-                                MobileAdaptiveRow(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text(candidate.trustClass)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Text("\(Int((candidate.confidence * 100).rounded()))%")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    if candidate.autoActivationAllowed {
-                                        Label("Biasing", systemImage: "checkmark.seal.fill")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                Text(candidate.pattern)
-                                    .font(.callout)
-                                    .foregroundStyle(.primary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                MobileAdaptiveRow(spacing: 12) {
-                                    Button {
-                                        decideReflex(candidate, approve: true)
-                                    } label: {
-                                        Label("Approve", systemImage: "checkmark")
-                                    }
-                                    .aliveSecondaryButton()
-                                    .disabled(!OrganismStatusPresentation.canApprove(candidate) || decidingReflexID == candidate.id)
-
-                                    Button(role: .destructive) {
-                                        decideReflex(candidate, approve: false)
-                                    } label: {
-                                        Label("Retire", systemImage: "archivebox")
-                                    }
-                                    .aliveSecondaryButton()
-                                    .disabled(decidingReflexID == candidate.id)
-                                }
-                            }
-                            .padding(.vertical, 4)
-                            if let error = reflexDecisionErrors[candidate.id] {
-                                Text(error)
-                                    .font(.caption)
-                                    .foregroundStyle(.red)
-                            }
-                        }
-                        if candidateSlice.hiddenCount > 0 {
-                            Text(AliveWords.count(candidateSlice.hiddenCount, "more reflex candidate") + " need review on the Mac.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                    } header: { AliveEyebrow("Reflex review") }
-                }
                 let proposalSlice: OrganismStatusPresentation.DreamProposalSlice = organismState.displaysDetails
                     ? OrganismStatusPresentation.dreamProposalSlice(organism.standingViewProposals ?? [])
                     : .init(visible: [], hiddenCount: 0)
@@ -649,24 +583,6 @@ struct StatusDetailView: View {
         .alivePageChrome(title: "Status", root: false)
         .task { await store.refreshHealth() }
         .refreshable { await store.refreshHealth() }
-    }
-
-    private func decideReflex(_ candidate: OrganismLivingReflexCandidateFile, approve: Bool) {
-        decidingReflexID = candidate.id
-        reflexDecisionErrors.removeValue(forKey: candidate.id)
-        Task {
-            do {
-                if approve {
-                    _ = try await iCloudSyncEngine.shared.approveOrganismReflex(candidateId: candidate.id)
-                } else {
-                    _ = try await iCloudSyncEngine.shared.retireOrganismReflex(candidateId: candidate.id)
-                }
-                locallyFinalizedReflexIDs.insert(candidate.id)
-            } catch {
-                reflexDecisionErrors[candidate.id] = error.localizedDescription
-            }
-            decidingReflexID = nil
-        }
     }
 }
 

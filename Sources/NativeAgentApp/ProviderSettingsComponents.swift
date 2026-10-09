@@ -20,21 +20,14 @@ struct ProviderRowView: View {
                 .font(ShellType.body)
                 .foregroundStyle(NativeAgentShell.tertiary)
                 .frame(width: 24)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(provider.display_name)
-                    .font(ShellType.bodySemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                    .lineLimit(1)
-                Text(provider.auth_modes.joined(separator: " / "))
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(1)
-            }
+            Text(provider.display_name)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
+                .lineLimit(1)
             Spacer(minLength: 8)
-            ProviderStatusWord(
-                text: statusLabel(provider.auth_status.state),
-                kind: statusBadgeKind(provider.auth_status.state)
-            )
+            if let status = statusWord(provider.auth_status.state) {
+                ProviderStatusWord(text: status.text, kind: status.kind)
+            }
             Button("Set up") {
                 onConfigure()
             }
@@ -59,21 +52,12 @@ struct ProviderRowView: View {
         }
     }
 
-    private func statusLabel(_ state: String) -> String {
+    /// A row nobody has set up yet just offers Set up — no warning word.
+    private func statusWord(_ state: String) -> (text: String, kind: String)? {
         switch state {
-        case "ready":       return "Ready"
-        case "needs_key":   return "Needs a key"
-        case "needs_oauth": return "Needs a sign-in"
-        case "error":       return "Not working"
-        default:            return "Not set up"
-        }
-    }
-
-    private func statusBadgeKind(_ state: String) -> String {
-        switch state {
-        case "ready":  return "ok"
-        case "error":  return "error"
-        default:       return "warn"
+        case "ready": return ("Ready", "ok")
+        case "error": return ("Not working", "error")
+        default:      return nil
         }
     }
 }
@@ -328,7 +312,7 @@ struct ProviderConfigSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     if authModePickerState.supportedModes.isEmpty {
-                        ProviderSection(label: "How to sign in") {
+                        AdvancedSection(title: "How to sign in", card: .bare) {
                             ProviderCard {
                                 ProviderCardTitle(
                                     title: "No way in was offered",
@@ -337,7 +321,7 @@ struct ProviderConfigSheet: View {
                             }
                         }
                     } else if authModePickerState.supportedModes.count > 1 {
-                        ProviderSection(label: "How to sign in") {
+                        AdvancedSection(title: "How to sign in", card: .bare) {
                             ProviderCard {
                                 Picker("Mode", selection: Binding(get: { authMode }, set: {
                                     authMode = $0
@@ -366,7 +350,7 @@ struct ProviderConfigSheet: View {
 
                     // API Key input (shown when api_key mode or provider only supports api_key)
                     if authMode == "api_key" {
-                        ProviderSection(label: "Key") {
+                        AdvancedSection(title: "Key", card: .bare) {
                             ProviderCard {
                                 VStack(alignment: .leading, spacing: 12) {
                                     SecureField("Paste the key here", text: Binding(get: { apiKey }, set: {
@@ -374,7 +358,7 @@ struct ProviderConfigSheet: View {
                                         invalidateTestFeedback()
                                     }))
                                         .textFieldStyle(.roundedBorder)
-                                        .font(ProviderType.code)
+                                        .font(ShellType.code)
                                     ProviderNote(text: "The key is kept on this Mac only, readable by you alone, and is never written to a log.")
                                 }
                             }
@@ -382,7 +366,7 @@ struct ProviderConfigSheet: View {
                     }
 
                     if authMode == "oauth" {
-                        ProviderSection(label: "Sign in") {
+                        AdvancedSection(title: "Sign in", card: .bare) {
                             ProviderCard {
                                 VStack(alignment: .leading, spacing: 12) {
                                     if provider.provider_id == "anthropic" {
@@ -414,7 +398,7 @@ struct ProviderConfigSheet: View {
                     }
 
                     if !availableModels.isEmpty {
-                        ProviderSection(label: "Model it falls back to") {
+                        AdvancedSection(title: "Model it falls back to", card: .bare) {
                             ProviderCard {
                                 VStack(alignment: .leading, spacing: 12) {
                                     Picker("Model", selection: $selectedModel) {
@@ -442,7 +426,7 @@ struct ProviderConfigSheet: View {
                         }
                     } else if !selectedModel.isEmpty,
                               let message = modelPickerPresentation.message {
-                        ProviderSection(label: "Model it falls back to") {
+                        AdvancedSection(title: "Model it falls back to", card: .bare) {
                             ProviderCard {
                                 ProviderNote(text: message, color: NativeAgentShell.trouble)
                             }
@@ -450,7 +434,7 @@ struct ProviderConfigSheet: View {
                     }
 
                     if let result = testResult {
-                        ProviderSection(label: "Connection test") {
+                        AdvancedSection(title: "Connection test", card: .bare) {
                             ProviderCard {
                                 VStack(alignment: .leading, spacing: 8) {
                                     if result.tested {
@@ -575,7 +559,7 @@ struct ProviderConfigSheet: View {
                 }
             }())
         } catch {
-            statusText = "Save failed: \(error.localizedDescription)"
+            statusText = UserFacingError.message(error, action: "save \(provider.display_name)")
         }
         isSaving = false
     }
@@ -634,7 +618,7 @@ struct ProviderConfigSheet: View {
             if !testsDraft {
                 verification = .verificationFailed
             }
-            statusText = "Test error: \(error.localizedDescription)"
+            statusText = UserFacingError.message(error, action: "test \(provider.display_name)")
         }
     }
 
@@ -865,7 +849,7 @@ private struct AnthropicMCPStatusPanel: View {
                 testResult = result.detail ?? result.status
             }
         } catch {
-            testResult = "Error: \(error.localizedDescription)"
+            testResult = UserFacingError.message(error, action: "test \(provider.display_name)")
         }
         isTesting = false
     }
@@ -904,27 +888,9 @@ struct AnthropicOAuthDirectPanel: View {
 
 // MARK: - Page kit
 //
-// The page's own small vocabulary: an eyebrow over a run, the card a group of
-// controls sits in, the card's own headline, one quiet line, and the one word
-// that says how an account stands.
-
-/// 13 monospaced, for a value that is a code. `ShellType` carries no
-/// monospaced face, so this derives one from the token size.
-enum ProviderType {
-    static let code = Font.system(size: ShellType.labelSize, design: .monospaced)
-}
-
-struct ProviderSection<Content: View>: View {
-    let label: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(label)
-            content
-        }
-    }
-}
+// The page's own small vocabulary: the card a group of controls sits in, the
+// card's own headline, one quiet line, and the one word that says how an
+// account stands.
 
 struct ProviderCard<Content: View>: View {
     @ViewBuilder var content: Content
@@ -932,7 +898,9 @@ struct ProviderCard<Content: View>: View {
     var body: some View {
         content
             .padding(16)
-            .settingsCardSurface()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .aliveCard()
+            .accessibilityElement(children: .contain)
     }
 }
 

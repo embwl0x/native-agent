@@ -20,11 +20,19 @@ extension SwiftNativeMemoryV2 {
         // behavior on both the fresh-insert and the dedup-merge path.
         extraMetadata: [String: JSONValue] = [:]
     ) async throws -> ProposalRecord {
+        let turnMetadata = try MemorySenseProvenance.stamping(.object(extraMetadata))
+        let extraMetadata: [String: JSONValue]
+        if case .object(let stamped)? = turnMetadata {
+            extraMetadata = stamped
+        } else {
+            extraMetadata = [:]
+        }
         let content = MemoryTextClip.memoryDisplayText(content, kind: kind)
         guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
         if let reason = MemoryCandidateQuality.rejectionReason(text: content, source: source, kind: kind) {
             throw MemoryV2Error.underlying("not durable memory: \(reason)")
         }
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         // Carry the extractor's confidence + kind so acceptProposal stamps them
         // on the memory instead of discarding them (#1). nil → empty metadata.
@@ -96,13 +104,13 @@ extension SwiftNativeMemoryV2 {
                 case .string(let s)?:
                     // 2026-09-06: malformed saved evidence is not absence.
                     guard let count = Int64(s.trimmingCharacters(in: .whitespaces)) else {
-                        NSLog("MemoryV2: refusing proposal merge with invalid recurrence_count; saved evidence retained")
+                        nativeLog("MemoryV2: refusing proposal merge with invalid recurrence_count; saved evidence retained")
                         throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count is not a valid Int64")
                     }
                     return count
                 case nil: return nil
                 default:
-                    NSLog("MemoryV2: refusing proposal merge with invalid recurrence_count type; saved evidence retained")
+                    nativeLog("MemoryV2: refusing proposal merge with invalid recurrence_count type; saved evidence retained")
                     throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count has an invalid type")
                 }
             }
@@ -130,7 +138,10 @@ extension SwiftNativeMemoryV2 {
             }
             // A re-staged moment refreshes its lane fields on the surviving
             // row: the newest telling is the one she will read.
-            for (key, value) in extraMetadata where key != "kind" {
+            for (key, value) in extraMetadata where key != "kind" && key != "sense_versions" {
+                merged[key] = value
+            }
+            for (key, value) in MemorySenseProvenance.merging(existing: existing.metadata, incoming: .object(extraMetadata)) {
                 merged[key] = value
             }
             return merged.isEmpty ? nil : .object(merged)
@@ -203,6 +214,7 @@ extension SwiftNativeMemoryV2 {
     }
 
     public func acceptProposal(id: String) async throws -> MemoryRecord {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         guard let proposal = try await storage.getProposal(id: id) else {
             throw MemoryV2Error.recordNotFound
@@ -286,6 +298,7 @@ extension SwiftNativeMemoryV2 {
         id: String,
         superseding: SupersedingAcceptance
     ) async throws -> MemoryRecord {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         guard let atomic = storage as? AtomicSupersedingAcceptanceStorage else {
             throw MemoryV2Error.underlying(
@@ -299,6 +312,7 @@ extension SwiftNativeMemoryV2 {
     /// Prepare the final words before promotion. No active row or projection
     /// exists until the storage transaction accepts this exact reviewed version.
     public func acceptReviewedMoment(id: String, content: String) async throws -> MemoryRecord {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         guard let proposal = try await storage.getProposal(id: id),
               proposal.status == "pending", MemoryMoments.isMoment(proposal.metadata) else {
@@ -327,6 +341,7 @@ extension SwiftNativeMemoryV2 {
     /// commit together so a concurrent review decision cannot be overwritten.
     @discardableResult
     public func supersedeProposal(id: String, by successorId: String) async throws -> Bool {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         return try await storage.supersedeProposal(id: id, by: successorId)
     }
@@ -357,10 +372,12 @@ extension SwiftNativeMemoryV2 {
     /// The tombstone goes FIRST and is verified gone before the status moves, so
     /// an interrupted run always leaves a row this pass can still find.
     public func repairSupersededTombstones() async {
+        do { try await ensureCanonicalAttachment() }
+        catch { emitDiagnostic("[MemoryV2] Supersession repair attachment failed: \(error)"); return }
         guard let storage else { return }
         if let durable = storage as? MemoryStorageBridge {
             do { try await durable.repairSupersededTombstones() }
-            catch { NSLog("MemoryV2: supersession repair failed: %@", String(describing: error)) }
+            catch { nativeLog("MemoryV2: supersession repair failed: %@", String(describing: error)) }
             return
         }
         // 2026-09-18: launch repair must not decode the lifetime proposal
@@ -425,6 +442,8 @@ extension SwiftNativeMemoryV2 {
     private func writeRecoveredLink(
         on row: ProposalRecord, successor: String, preserveExisting: Bool = true
     ) async {
+        do { try await ensureCanonicalAttachment() }
+        catch { emitDiagnostic("[MemoryV2] Recovered link attachment failed: \(error)"); return }
         guard let storage else { return }
         guard let current = try? await storage.getProposal(id: row.id) else { return }
         if preserveExisting, Self.supersededByMarker(in: current.metadata) != nil { return }
@@ -466,6 +485,7 @@ extension SwiftNativeMemoryV2 {
 
     @discardableResult
     public func rejectProposal(id: String, reason: String? = nil) async throws -> Bool {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         guard let proposal = try await storage.getProposal(id: id) else {
             throw MemoryV2Error.recordNotFound
@@ -486,6 +506,7 @@ extension SwiftNativeMemoryV2 {
     /// back to the manager as competition for its own correction. `nil` status
     /// (the audit listings and the repair itself) is untouched.
     public func listProposals(status: String? = nil) async throws -> [ProposalRecord] {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         let rows = try await storage.listProposals(status: status)
         guard status == "pending" else { return rows }
@@ -496,6 +517,7 @@ extension SwiftNativeMemoryV2 {
     /// offers one (production SQLite does) and falls back to the list path
     /// otherwise, so the answer is identical either way — only the cost differs.
     public func countMomentProposals(status: String? = "pending") async throws -> Int {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         if let counting = storage as? any MomentProposalCountingStorage {
             return try await counting.countMomentProposals(status: status)

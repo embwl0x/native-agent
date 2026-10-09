@@ -177,36 +177,40 @@ public struct StudioWorkingShelf: Sendable {
         return found
     }
 
+    public func validateReplacement(_ slots: [Slot]) async throws {
+        _ = try selections() // Corruption cannot be cleared by a set request.
+        let store = SwiftNativeStudioStore(dataRoot: dataRoot)
+        let entries = try await store.journalEntriesIncludingArchive()
+        for slot in slots {
+            guard let entry = entry(slot.entryID, in: entries), let source = quoteSource(slot, entry: entry) else {
+                throw Refusal(message: "Entry \(slot.entryID) is unavailable or selected_sentence is not one complete sentence verbatim in \(slot.quoteField). Fragments and multiple sentences are not accepted. Choose a shorter existing sentence rather than clipping or rewriting it. The shelf is unchanged.")
+            }
+            // The journal line still says it; she no longer does.
+            if let superseded = supersession(slot, entry: entry, source: source) {
+                let amendment = superseded.first
+                throw Refusal(message: "Entry \(slot.entryID): that sentence was corrected on \(amendment.amendedOn) (\(amendment.reason)) and now reads \"\(amendment.correction)\". Shelve the corrected sentence instead. The shelf is unchanged.")
+            }
+            if entry.correctionsUnreadable {
+                throw Refusal(message: "Entry \(slot.entryID): its corrections could not be read (journal/amendments.jsonl is damaged), so whether that sentence still stands is unknown. The shelf is unchanged.")
+            }
+            var workRefs = entry.artifactRefs
+            if entry.origin.kind == .consult, let id = entry.origin.ref,
+               let consult = try? await store.readConsult(id: id), !consult.descriptionOnly {
+                workRefs.append(contentsOf: consult.artifactRefs)
+            }
+            guard workRefs.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+                throw Refusal(message: "Entry \(slot.entryID): this encounter has no openable work. The shelf is unchanged.")
+            }
+        }
+    }
+
     public func replace(_ value: JSONValue) async throws {
         let slots = try Self.decodeSlots(value)
         let persistence = SwiftNativePersistenceCore()
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         try await persistence.withFileLock(path) {
-            _ = try selections() // Corruption cannot be cleared by a set request.
-            let store = SwiftNativeStudioStore(dataRoot: dataRoot)
-            let entries = try await store.journalEntriesIncludingArchive()
-            for slot in slots {
-                guard let entry = entry(slot.entryID, in: entries), let source = quoteSource(slot, entry: entry) else {
-                    throw Refusal(message: "Entry \(slot.entryID) is unavailable or selected_sentence is not one complete sentence verbatim in \(slot.quoteField). Fragments and multiple sentences are not accepted. Choose a shorter existing sentence rather than clipping or rewriting it. The shelf is unchanged.")
-                }
-                // The journal line still says it; she no longer does.
-                if let superseded = supersession(slot, entry: entry, source: source) {
-                    let amendment = superseded.first
-                    throw Refusal(message: "Entry \(slot.entryID): that sentence was corrected on \(amendment.amendedOn) (\(amendment.reason)) and now reads \"\(amendment.correction)\". Shelve the corrected sentence instead. The shelf is unchanged.")
-                }
-                if entry.correctionsUnreadable {
-                    throw Refusal(message: "Entry \(slot.entryID): its corrections could not be read (journal/amendments.jsonl is damaged), so whether that sentence still stands is unknown. The shelf is unchanged.")
-                }
-                var workRefs = entry.artifactRefs
-                if entry.origin.kind == .consult, let id = entry.origin.ref,
-                   let consult = try? await store.readConsult(id: id), !consult.descriptionOnly {
-                    workRefs.append(contentsOf: consult.artifactRefs)
-                }
-                guard workRefs.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
-                    throw Refusal(message: "Entry \(slot.entryID): this encounter has no openable work. The shelf is unchanged.")
-                }
-            }
+            try await validateReplacement(slots)
             try await persistence.writeJSON(.object(["version": .int(1), "slots": .array(slots.map(\.json))]), to: path)
         }
     }

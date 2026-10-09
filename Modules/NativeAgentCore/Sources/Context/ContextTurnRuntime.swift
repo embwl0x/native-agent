@@ -340,6 +340,8 @@ public final class ContextPreparedTurn: @unchecked Sendable {
     ) async -> Void)?
     private let feedbackLock = NSLock()
     private var outcomeRecorded = false
+    private var deliveryRecorded = false
+    private let deliveryHandler: (@Sendable ([ContextPacketItem]) async -> Void)?
     private var memoryRecordProvenance: [String]?
     private var atomMemoryRecords: [ContextAtomID: String] = [:]
     private var correctedRecordIDs: Set<String> = []
@@ -353,6 +355,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         generation: ContextStoredGeneration,
         need: NeedSignal,
         budgetExpansion: ContextFlowBudgetExpansion? = nil,
+        deliveryHandler: (@Sendable ([ContextPacketItem]) async -> Void)? = nil,
         feedbackHandler: (@Sendable (
             ContextFeedbackSignal,
             [ContextAtomID],
@@ -368,6 +371,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         self.need = need
         self.budgetExpansion = budgetExpansion
         self.feedbackHandler = feedbackHandler
+        self.deliveryHandler = deliveryHandler
     }
 
     /// Packet provenance (2026-07-11): the memory RECORD identities behind this
@@ -423,6 +427,15 @@ public final class ContextPreparedTurn: @unchecked Sendable {
 
     public func recordRetry() async {
         await feedbackHandler?(.retry, packet.receipt.selectedAtomIDs, [packet.receipt.id])
+    }
+
+    public func recordDelivery() async {
+        let first = feedbackLock.withLock {
+            let first = !deliveryRecorded
+            deliveryRecorded = true
+            return first
+        }
+        if first { await deliveryHandler?(packet.selectedItems) }
     }
 
     public func recordOutcome(_ outcome: ContextTurnOutcome) async {

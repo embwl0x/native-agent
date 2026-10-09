@@ -520,6 +520,7 @@ extension SwiftNativeTurnEngine {
             surface: context.surface,
             personaID: context.personaID,
             personaDocs: context.personaDocs,
+            personaFingerprint: context.personaFingerprint,
             recalled: context.recalled,
             modelId: context.modelId,
             reasoningEffort: context.reasoningEffort,

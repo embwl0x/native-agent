@@ -1,3 +1,5 @@
+import NativeAgentShared
+
 public enum TrustPolicyPreset: CaseIterable, Equatable, Sendable {
     case safe
     case work
@@ -18,10 +20,10 @@ public enum TrustPolicyPreset: CaseIterable, Equatable, Sendable {
     /// one thing on one surface and another somewhere else.
     public var summary: String {
         switch self {
-        case .safe: "Read files; no changes or Mac control"
-        case .work: "Edit approved workspaces; no outside writes or shell"
-        case .builder: "Edit workspaces; ask to write outside; no shell"
-        case .fullMac: "Files anywhere, shell, system control, move or trash"
+        case .safe: MobileTrustAction.Preset.safe.summary
+        case .work: MobileTrustAction.Preset.workMode.summary
+        case .builder: MobileTrustAction.Preset.builder.summary
+        case .fullMac: MobileTrustAction.Preset.fullMac.summary
         }
     }
 

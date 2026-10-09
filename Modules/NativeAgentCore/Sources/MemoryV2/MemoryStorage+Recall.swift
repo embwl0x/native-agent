@@ -17,6 +17,17 @@ extension MemoryStorage {
     }
     // MARK: - Recall candidate cache
 
+    public func recallJudgmentGeneration() async throws -> String {
+        let generation = try await dbPool.read { db in
+            guard let value = try Int64.fetchOne(db, sql:
+                "SELECT value FROM memory_metadata WHERE key = 'recall_generation'") else {
+                throw MemoryStorageError.databaseUnavailable("Recall generation is missing.")
+            }
+            return value
+        }
+        return "\(path.path):\(generation)"
+    }
+
     /// Bump the in-actor cache generation and drop the cached candidates. Called
     /// after every successful in-actor write that changes the `memories` table.
     /// recallCandidates() also checks data_version for writes by other connections.
@@ -162,31 +173,23 @@ extension MemoryStorage {
         // persona-clause SQL returned, so BM25 idx alignment + ranking stay
         // byte-identical.
         let scan = try await recallCandidates(queryEpoch: queryEpoch)
-        // 2026-09-06: the query vector is in a different space from the
-        // canonical corpus (a failed launch re-embedding leaves the provider on
-        // the new model and the store on the old epoch). The dense lane has
-        // nothing to say; the lexical lane still answers exact text, so degrade
-        // to it instead of returning silence until the next relaunch.
+        // The canonical embedding owner repairs mismatches before retrying recall.
         guard !scan.epochMismatch else {
-            return (try await recallByKeyword(
-                queryText: queryText, topK: topK, persona: persona
-            ), true)
+            let state = try await embeddingEpochState()
+            throw MemoryStorageError.embeddingEpochMismatch(
+                expected: state.activeEpoch ?? "unknown", actual: queryEpoch?.rawValue
+            )
         }
         let allCandidates = scan.candidates
         let candidates = persona == nil
             ? allCandidates
             : allCandidates.filter { $0.memory.personaId == persona }
         let queryNorm = Self.l2norm(query)
-        // Sweep R4 A5: a COLD embedder (MiniLM not yet warm on the Neural
-        // Engine — reliably the state on the first message after launch) hands
-        // us a zero/empty vector, and this used to return [] — total recall
-        // silence with nothing but a trace flag to show for it. Degrade to the
-        // lexical lane instead: a keyword ranking is worse than semantic, and
-        // enormously better than nothing.
+        // A directionless query cannot honestly answer semantic recall.
         guard queryNorm > 0 else {
-            return (try await recallByKeyword(
-                queryText: queryText, topK: topK, persona: persona
-            ), true)
+            throw MemoryStorageError.embeddingActivationInvalid(
+                .unusableCandidate, "semantic recall query has no usable vector"
+            )
         }
         let now = Date()
         let lexicalScores = MemoryRecallScoring.normalizedBM25Scores(

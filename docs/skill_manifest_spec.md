@@ -11,12 +11,12 @@ Use the single `app` tool:
 | Action | Inputs | Result |
 | --- | --- | --- |
 | `skill.list` | none | Compact names, descriptions, triggers, status and source where available; no bodies. |
-| `skill.read` | `name` | One body, resolved by registered name or id; scripted skills also return their script, admission and versions. |
+| `skill.read` | `name`; optional `step` | One body, resolved by registered name or id; scripted skills also return their script, admission and versions. `step` selects a 1-based script step and its label/guidance; source lines are included when each `app.step` starts its own line, one per step. |
 | `skill.save` | `name`, `description`, `content`; optional `triggers`, `script` | Create or update a procedure through the locked Skills owner. New or changed scripts land drafted. |
 | `skill.enable`, `skill.disable`, `skill.delete`, `skill.restore` | `name`; disable/delete also accept `reason` | Manage the skill through the app's authority checks. Delete moves it to the skill trash. |
 | `skill.run` | `name`, `args`; `preview:true` | Run a runnable script skill strictly: only its declared actions, args checked against its params; a step that can't be taken back, is User's or would card them hands back before it runs. Preview says where each step would hand back or card. |
-| `skill.resume` | `run_id`, `answer` | Continue a run that stopped at `app.decide` or handed a step back, if everything it read still reads the same; the step it stopped at returns `answer`. |
-| `skill.rollback` | `name`; optional `preview:true` | Restore the last clean earlier script, or the previous script if none is kept; it lands drafted and needs activation again. |
+| `skill.resume` | `run_id`, `answer` | Claim a stopped run once and replay its saved path under the same admitted script; eligible reads are rechecked and the stopped call returns `answer`, without executing that call. See recovery below. |
+| `skill.rollback` | `name`; optional `preview:true` | Restore the last clean earlier script, or the previous script if none is kept; it lands drafted and needs activation again. On them version of a built-in with no earlier script, drop theirs so the built-in shows again. |
 
 For example:
 
@@ -77,12 +77,82 @@ Parameters arrive as frozen `input`; `args` is the same object. A runnable
 script must be active and have an admission bound to the SHA-256 digest of its
 normalized script object, including the header. `skill.enable` activates
 Agent's own script on them own turn under Full Mac. Peer-steered, pack-supplied
-or unattested scripts, and activation below Full Mac, require User to review
-and install the exact script on the Skills page. Authenticated agents enabled
+or unattested scripts, and activation below Full Mac, require the owner to review
+and install the exact script on the Skills page or approve its exact-script
+install card in chat on the Mac or paired iPhone. Authenticated agents enabled
 in Trust carry User's authority rather than adding peer steering. A changed
 digest clears admission and returns the script to draft; a stale review cannot
 activate it. Scripts cannot activate other scripts or bypass ordinary Trust
 and domain checks.
+
+## Strict execution and recovery
+
+A script skill runs in confined JavaScriptCore through the app's policy gates.
+Every action must be declared and registry-scriptable. Reads are generally
+eligible; `provider.test` is an explicit read-like exception. Skills cannot
+mutate skills, tools, settings, Trust, approvals, connectors, providers or chat
+controls; send messages; or invoke authored or MCP tools. Dream, REM,
+self-improvement, memory consolidation/hygiene and Doctor repair passes are
+also excluded. A declared irreversible or owner-only step hands back before
+execution, as does a step that would raise an approval or permission prompt.
+A run does not file those cards itself.
+
+For each nonexempt write, first read its page with `app.read`. The run supplies
+the version from its own latest read or successful write. If you explicitly
+pass `expected_version`, it must be one the run observed; a version supplied
+in input is not an own read. Writes without a versioned page are ineligible
+unless the registry exempts them.
+
+For example, save this script with `skill.save` alongside its name,
+description and guidance, then enable it before running it:
+
+```json
+{
+  "script": {
+    "source": "app.step('Read Desk', 'Read before changing it.', {of: 2});\nconst page = app.read('desk');\napp.expect(!!page.version, 'Desk has a checked version');\napp.step('Add note', 'Append only the requested note.');\nreturn app.desk.note({handle: input.handle, text: input.text}, {expected_version: page.version});",
+    "params": {"handle": "string", "text": "string"},
+    "actions": ["desk.note"],
+    "steps": ["Read Desk", "Add note"],
+    "of": 2
+  }
+}
+```
+
+`skill.run {name, args:{handle:"desk.4", text:"Source review complete."}}`
+uses the requested existing item; `preview:true` dispatches no writes.
+The strict-only APIs are:
+
+- `app.step(label, guidance?, {of:n}?)` labels progress and the hand-back.
+- `app.expect(condition, explanation)` stops on a false condition.
+- `app.expect_fail(code, function)` wraps exactly one synchronous app call.
+  It continues only when that call fails with the named code and no effects.
+  A success may already have taken effect and stops the run; nested or async
+  expectations are refused.
+- `app.decide(question, data?)` stops for a decision. On resume it returns
+  the supplied `answer`.
+
+Other failures stop strict runs even if JavaScript catches the error. Check
+the receipt's `changed`, effects and hand-back before continuing: earlier
+effects stay done. For a handed-back action, make the separate app call only
+if it is still wanted and authorized, then supply its answer to `skill.resume`.
+Resume never performs that stopped action for you.
+
+Resume claims and closes the retained run **before** checking that the script
+is unchanged, still runnable and compatible with its input. A failed attempt
+consumes that checkpoint. Replay must follow the same app-call sequence;
+completed writes return saved results instead of executing again. Reads and
+finds are rechecked, except reads superseded by that run's own later writes,
+which replay their saved results. Changed reads or a different path stop
+continuation. A new hand-back can retain another checkpoint; otherwise a
+closed run requires starting again. Inspect already landed effects first to
+avoid repeating them.
+
+Only the newest 50 stopped runs are retained, each at most 256 KiB including
+its sealed journal. An oversized run cannot resume. `skill.rollback` changes
+the script version; it does not undo effects from a run.
+
+Source owners: [AppToolExecutor+SkillRun.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppToolExecutor+SkillRun.swift)
+and [AppScriptRunner.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppScriptRunner.swift).
 
 ## Archive, versions and rollback
 
@@ -101,6 +171,22 @@ clean earlier script, otherwise the previous one, and retains origin history.
 The restored script lands drafted and needs admission again; `preview:true`
 reports the result without changing it. Missing declared actions also suspend
 a script into draft, clearing admission until it is fixed and enabled again.
+
+## Built-in skills and their versions of them
+
+Built-in skills ship in `persona/skills/bodies/` and have no registry row:
+they are never archived for disuse, and switching one off or deleting it is
+User's. Saving a skill under a built-in's name makes their version of it, under
+the built-in's id, in `<data_root>/skills/bodies/`; it keeps the built-in's
+status (a script still lands drafted), and saved without a description it
+keeps the built-in's. While it is on it replaces the built-in for them; while
+it is drafted, off or archived the built-in stays in use. The built-in's file
+stays as it ships. `skill.list`, `skill.read` (with its `status`) and the save
+receipt mark it `overrides: built_in`. Their version follows the lifecycle like
+their other skills: unused for 30 days it is archived and the built-in is in use
+again (`skill.restore` brings theirs back). Switching it off or deleting it
+stays User's, as for the built-in it stands in for; `skill.rollback` drops theirs
+instead.
 
 ## Storage and source ownership
 

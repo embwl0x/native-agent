@@ -9,11 +9,16 @@ public struct AppActionPolicy: Sendable {
     public let isHis: Bool
     public let irreversible: Bool
     public let read: Bool
+    public let readWhen: [String: JSONValue]
     public let secretArgs: [String]
 
-    public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String]) {
+    public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:]) {
         self.isHis = isHis; self.irreversible = irreversible; self.read = read
-        self.secretArgs = secretArgs
+        self.secretArgs = secretArgs; self.readWhen = readWhen
+    }
+
+    public func readOnly(args: [String: JSONValue]) -> Bool {
+        read || (!readWhen.isEmpty && readWhen.allSatisfy { (args[$0.key] ?? .null) == $0.value })
     }
 
     // Installed from AppActions at executor assembly, before any app call or
@@ -29,7 +34,13 @@ public struct AppActionPolicy: Sendable {
         if tool == "app", case .string(let action)? = input["action"] { id = action }
         else if let action = ToolNameAliases.appAction(tool) { id = action }
         else { return nil }
-        return registry.withLock { $0[id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] }
+        guard let policy = registry.withLock({ $0[id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] }) else {
+            return tool == "app" && ToolNameAliases.appFindQuery(input) != nil
+                ? AppActionPolicy(isHis: false, irreversible: false, read: true, secretArgs: []) : nil
+        }
+        let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
+        return AppActionPolicy(isHis: policy.isHis, irreversible: policy.irreversible,
+                               read: policy.readOnly(args: args), secretArgs: policy.secretArgs, readWhen: policy.readWhen)
     }
 
     /// Whether the table is installed yet: before assembly nothing is known.
@@ -223,15 +234,18 @@ extension SwiftNativeSecurityCenter {
         "list_dir",
         "read_file",
         "read_page",
+        "maps_route",
+        "maps_search",
         "write_file",
+        "mail_save_attachment",
+        "mac_screenshot_save",
         // gpt-5.5 review-2 NEEDS_FIX: native file operations the policy
         // preview surfaces (file_move/file_trash → these names). Without
         // registration here SecurityCenter.evaluateTool routed them through
         // the unsigned-high-risk path even though they're built-in Mac
-        // file actions. trash_file already classifies as critical destructive
-        // via the keyword catcher below; move_file gets filesystem_write
-        // (medium) once the `move` keyword is added.
+        // file actions.
         "move_file",
+        "copy_file",
         "trash_file",
         "persona_read",
         "persona_write",
@@ -303,8 +317,8 @@ extension SwiftNativeSecurityCenter {
         "browser.screenshot",
         "browser.chrome_setup",
         "browser.chrome_status",
-        "browser.chrome_acquire",
-        "browser.chrome_renew",
+        "browser.chrome_reload_extension",
+        "browser.chrome_close_tab",
         "browser.chrome_navigate",
         "browser.chrome_snapshot",
         "browser.chrome_click",
@@ -316,7 +330,6 @@ extension SwiftNativeSecurityCenter {
         "browser.chrome_double_click",
         "browser.chrome_wait",
         "browser.chrome_scroll",
-        "browser.chrome_release",
         // The one app door: reads, and actions classified by action id.
         "app",
     ]
@@ -370,6 +383,12 @@ extension SwiftNativeSecurityCenter {
         var risk: SecurityRisk
     }
 
+    public static func sendsExternally(tool: String, input: [String: JSONValue], dataRoot: URL) -> Bool {
+        if tool == "interaction_act", input["target"] == .string("composer"), input["verb"] == .string("send") { return true }
+        if notificationToolNames.contains(tool), !localAgentBridgeToolNames.contains(tool), tool != "bot_ask" { return false }
+        return profile(tool: policyToolName(tool), input: input, dataRoot: dataRoot).capabilities.contains("external_send")
+    }
+
     /// Classify a tool through the same profile owner used by authorization.
     /// This is deliberately pure: it does not read policy, assess origins,
     /// record receipts, or imply that the tool is allowed to run.
@@ -414,7 +433,7 @@ extension SwiftNativeSecurityCenter {
         "chat": "chat_session", "chat.draft": "interaction_act", "chat.send": "interaction_act",
         "chat.model": "interaction_act", "chat.think": "interaction_act", "chat.fast": "interaction_act",
         "chat.open_card": "interaction_act", "chat.close_card": "interaction_act", "chat.speak": "interaction_act",
-        "chat.scratch": "interaction_act", "page.show": "interaction_act", "browser.show": "interaction_act",
+        "chat.scratch": "interaction_act", "page.show": "interaction_act", "browser.show": "interaction_act", "pane": "interaction_act",
         "persona.set": "interaction_act", "app.check_updates": "interaction_act",
         "setting.set": "app_setting_set", "page.screenshot": "app_page_screenshot", "card": "interaction_act",
         "chat.list": "chat_conversations",
@@ -447,6 +466,11 @@ extension SwiftNativeSecurityCenter {
         func add(_ capability: String, _ newRisk: SecurityRisk) {
             capabilities.insert(capability)
             risk = max(risk, newRisk)
+        }
+        if ["maps_route", "maps_search"].contains(tool) {
+            add("network_read", .low)
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
         }
 
         // Local conversation facade calls are translated before this gate;
@@ -556,10 +580,8 @@ extension SwiftNativeSecurityCenter {
             "browser.chrome_snapshot",
             "browser.chrome_wait",
             "browser.chrome_scroll",
-            // A renew moves the lease's own expiry and touches no page state,
-            // so it sits with release rather than with the page verbs.
-            "browser.chrome_renew",
-            "browser.chrome_release",
+            "browser.chrome_media",
+            "browser.chrome_reload_extension",
         ]
         if browserReadTools.contains(tool) {
             add("safe_read", .low)
@@ -579,6 +601,7 @@ extension SwiftNativeSecurityCenter {
             let action = string(input["action"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
             let named = ["action", "script"].contains { key in
                 if case .string(let text)? = input[key] { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                else if key == "script", case .array(let calls)? = input[key] { !calls.isEmpty }
                 else { false }
             }
             let acts = named && input["preview"] != .bool(true)
@@ -658,7 +681,12 @@ extension SwiftNativeSecurityCenter {
             add("network_read", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
-        if tool == "browser.chrome_acquire" || tool == "browser.chrome_navigate" {
+        if tool == "browser.chrome_close_tab" {
+            // The extension checks current NativeAgent group membership.
+            add("app_data_write", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "browser.chrome_navigate" {
             add("network_read", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
@@ -679,6 +707,10 @@ extension SwiftNativeSecurityCenter {
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
 
+        if ["trash_file", "move_file", "copy_file"].contains(tool) {
+            add("filesystem_write", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
         let lower = tool.lowercased()
         // gpt-5.5 review fix (2026-06-08): explicit branch for builder
         // Process-spawn tools. The keyword classifier below catches
@@ -928,6 +960,7 @@ extension SwiftNativeSecurityCenter {
             "messages_recent_threads",
             "mail_list_recent",
             "mail_search",
+            "mail_senders",
         ]
         if (lower.contains("send") || lower.contains("post") || lower.contains("tweet")
             || lower.contains("message") || lower.contains("reply"))

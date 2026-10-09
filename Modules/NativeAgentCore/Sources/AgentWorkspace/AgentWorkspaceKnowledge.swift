@@ -8,7 +8,7 @@ enum AgentWorkspaceKnowledge {
         .init(id: "memory", title: "Memory", summary: "Recall something, inspect its evidence, or record a memory.",
               tool: "recall_memory", searchField: "query", tools: ["recall_memory", "commit_memory"], searchLabel: "Recall something"),
         .init(id: "research", title: "Research", summary: "Search the web, read a source, or investigate in the browser.",
-              tool: nil, tools: ["read_page", "browser.chrome_acquire"]),
+              tool: nil, tools: ["read_page", "browser.chrome_navigate"]),
         .init(id: "skills", title: "Skills", summary: "Open installed guidance or write a new skill.",
               tool: "list_skills", tools: ["list_skills", "read_skill", "save_skill"]),
     ]
@@ -36,8 +36,8 @@ enum AgentWorkspaceKnowledge {
                 .init(label: "Read another web page", action: .perform(tool: "read_page", input: [:], title: "Web source", textField: "url", isEffect: false), needsText: true),
             ]
             if let url = validWebURL(input["url"]) {
-                actions.append(.init(label: "Open in browser", action: .perform(tool: "browser.chrome_acquire",
-                    input: ["mode": .string("create"), "url": .string(url)],
+                actions.append(.init(label: "Open in browser", action: .perform(tool: "browser.chrome_navigate",
+                    input: ["url": .string(url)],
                     title: "Background browser", textField: nil, isEffect: true)))
             }
             return .init(title: "Web source", content: result, items: [], actions: actions)
@@ -46,7 +46,7 @@ enum AgentWorkspaceKnowledge {
     }
 
     /// Search results as rows: each one reads privately (read_page) or,
-    /// only when she picks it, opens in a background Chrome tab.
+    /// only when she picks it, opens in her Chrome tab.
     private static func webSearch(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
         var content = object(result)
         var inner = object(content.removeValue(forKey: "result") ?? .null)
@@ -62,9 +62,9 @@ enum AgentWorkspaceKnowledge {
             let snippet = text(row["snippet"])?.replacingOccurrences(of: #"\s*(…|\.\.\.)?\s*Read more$"#, with: "…", options: .regularExpression)
             return .init(title: String(title.prefix(200)), content: .object(["site": .string(site), "snippet": snippet.map(JSONValue.string) ?? .null]), actions: [
                 .init(label: "Read this page", action: .open(.record(tool: "read_page", input: ["url": .string(url)], title: String(title.prefix(100))))),
-                // `url`, not initial_url: a background tab, never the visible window.
-                .init(label: "Chrome: open it in a background tab", action: .perform(tool: "browser.chrome_acquire",
-                    input: ["mode": .string("create"), "url": .string(url)], title: "Background browser", textField: nil, isEffect: true)),
+                // Navigation reuses this conversation's tab or opens one in her group.
+                .init(label: "Chrome: open it in my tab", action: .perform(tool: "browser.chrome_navigate",
+                    input: ["url": .string(url)], title: "Background browser", textField: nil, isEffect: true)),
             ])
         }
         // A failed search reads as its error, never as "no results".

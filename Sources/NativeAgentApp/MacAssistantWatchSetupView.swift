@@ -26,7 +26,7 @@ final class MacAssistantWatchSetupReadState {
         } catch {
             guard !Task.isCancelled, request == generation else { return false }
             loadState = loadState.afterFailure(
-                "Couldn’t refresh background watches: \(error.localizedDescription)"
+                UserFacingError.message(error, action: "refresh background watches")
             )
             return false
         }
@@ -250,7 +250,7 @@ struct MacAssistantWatchSetupView: View {
                 }
             }
         } catch {
-            mailCheck = ("failed", "Check failed", error.localizedDescription)
+            mailCheck = ("failed", "Check failed", UserFacingError.cause(error, action: "check Mail"))
         }
     }
 
@@ -383,8 +383,8 @@ struct MacAssistantWatchSetupView: View {
         "Run mac.mail_list_recent once from the app to prove Mail.app access.": "Use Check Mail so macOS can ask for access.",
         "Run mac.calendar_list_upcoming once from the app to prove Calendar access.": "Use Check Calendar and Reminders above so macOS can ask for access.",
         "Run mac.reminders_list_due_today once from the app to prove Reminders access.": "Use Check Calendar and Reminders above so macOS can ask for access.",
-        "Open NativeAgent > Mac Integration and click Grant beside Calendar to open the macOS permission prompt.": "Click Grant beside Calendar on the Mac integration tab.",
-        "Open NativeAgent > Mac Integration and click Grant beside Reminders to open the macOS permission prompt.": "Click Grant beside Reminders on the Mac integration tab.",
+        "Open NativeAgent > Mac Integration and click Grant beside Calendar to open the macOS permission prompt.": "Click Grant beside Calendar on Trust's Mac tab.",
+        "Open NativeAgent > Mac Integration and click Grant beside Reminders to open the macOS permission prompt.": "Click Grant beside Reminders on Trust's Mac tab.",
         "Enable Calendar access for NativeAgent in System Settings > Privacy & Security.": "Allow Calendar for NativeAgent in System Settings → Privacy & Security.",
         "Enable Reminders access for NativeAgent in System Settings > Privacy & Security.": "Allow Reminders for NativeAgent in System Settings → Privacy & Security.",
     ]

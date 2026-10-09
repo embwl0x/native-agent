@@ -96,7 +96,7 @@ enum QuietPages {
                   summary: "Projects, dependencies, schedules, pursuits, progress and outcomes."),
         QuietPage(id: "notifications", title: "Notifications", item: .inboxPolicy,
                   summary: "The proactive inbox, its triggers, watched folders, and history."),
-        QuietPage(id: "bots", title: "Bots", item: .bots,
+        QuietPage(id: "bots", title: "Helpers", item: .bots,
                   summary: "Standing briefs on a schedule or an event, and their dated replies."),
         QuietPage(id: "personality", title: "Personality", item: .personality,
                   summary: "Identity, expression, about-you, growth and working-guideline documents; minds and dreams."),
@@ -120,7 +120,7 @@ enum QuietPages {
         // its access or connection, and its actions. A Mac app's page is
         // where User sets its access (Trust → Mac integration).
         QuietPage(id: "mail", title: "Mail", item: .macIntegration,
-                  summary: "Apple Mail, Gmail and AgentMail: read, search, triage, send and reply."),
+                  summary: "Apple Mail (every account added to Mail, Gmail included), the separate Gmail API connector and AgentMail: read, search, triage, send and reply."),
         QuietPage(id: "calendar", title: "Calendar", item: .macIntegration,
                   summary: "Calendar and Google Calendar: events, free/busy, create, change, delete and invitations."),
         QuietPage(id: "reminders", title: "Reminders", item: .macIntegration,
@@ -157,8 +157,10 @@ enum QuietPages {
                   summary: "What the agent can actually do, action by action."),
         QuietPage(id: "diagnostics", title: "Diagnostics", item: .diagnostics,
                   summary: "Doctor, Status, Runs log, Cognition, Inspector, Skills and Tools."),
+        QuietPage(id: "tools", title: "Tools", item: .tools,
+                  summary: "Available tools, their access, and tools the agent wrote.", tab: "tools"),
         QuietPage(id: "settings", title: "Settings", item: .settings,
-                  summary: "Appearance, shortcuts, updates, an inner life, and memory in every reply."),
+                  summary: "Appearance, shortcuts, updates, and the switches for an inner life, dreams and memory."),
     ]
 
     static var ids: [String] { all.map(\.id) }
@@ -180,13 +182,13 @@ enum QuietPages {
         guard !key.isEmpty else { return nil }
         if let exact = all.first(where: { $0.id == key }) { return exact }
         switch key {
-        case "activity": return page(named: "today")
+        case "activity", "approvals", "approval", "pending approvals": return page(named: "today")
         case "inbox", "inbox policy", "inbox_policy", "proactive": return page(named: "notifications")
-        case "memory": return page(named: "memories")
+        case "memory", "moments": return page(named: "memories")
         case "provider", "models": return page(named: "providers")
         case "trust center", "trust_center", "permissions": return page(named: "trust")
         case "setup", "preferences": return page(named: "settings")
-        case "skills", "tools": return page(named: "diagnostics")
+        case "skills": return page(named: "diagnostics")
         case "iphone", "phone", "pair", "pairing devices": return page(named: "pairing")
         default:
             return all.first { $0.title.lowercased() == key || $0.item.rawValue.lowercased() == key }

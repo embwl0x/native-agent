@@ -64,6 +64,8 @@
 	<string>NativeAgent uses the local network to connect the Mac app and trusted companion devices.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>NativeAgent uses your microphone for voice input.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>NativeAgent reads Photos library counts and asset metadata when you ask.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSRemindersFullAccessUsageDescription</key>
@@ -86,6 +88,8 @@
 	<string>$(NATIVEAGENT_MOBILE_SOURCE_KEY)</string>
 	<key>NativeAgentReleasePageURL</key>
 	<string>$(NATIVEAGENT_RELEASE_PAGE_URL)</string>
+	<key>NativeAgentSourceContentID</key>
+	<string>unknown</string>
 	<key>NativeAgentSourceDirty</key>
 	<false/>
 	<key>NativeAgentSourceRevision</key>

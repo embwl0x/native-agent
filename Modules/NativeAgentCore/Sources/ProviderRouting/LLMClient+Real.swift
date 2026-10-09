@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import os
 import PersistenceCore
 import TurnTrace
 
@@ -347,6 +348,20 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         await lifecycleObserver?.observeProviderCall(started.terminal(phase))
     }
 
+    /// Written under the request's identity: no row when the adapter's came first.
+    private func recordFailedCall(_ started: LLMCallLifecycleEvent, error: Error,
+                                  startedAt: TimeInterval, recorded: OSAllocatedUnfairLock<Bool>) async {
+        await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
+        await LLMCallContext.$surface.withValue(started.surface) {
+            await LLMCallTraceRecorder(dataRootOverride: LLMCallContext.traceDataRootOverride).record(
+                provider: started.providerId, model: started.model, streaming: started.streaming,
+                usage: nil, ttftMs: nil,
+                durationMs: Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000),
+                status: "failed", errorDetail: ProviderFailure.diagnosticDescription(error))
+        }
+        }
+    }
+
     /// Adapter choice produced by `resolveAdapterAndModel`. Used by
     /// both `complete()` and `stream()` so the dispatch logic stays in one
     /// place — prior round had a bug where the streaming path skipped the
@@ -615,7 +630,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 ? min(streamGuardConfig.wallTimeout, 300) : streamGuardConfig.wallTimeout,
             remainingTurnSeconds: LLMCallContext.remainingTurnSeconds
         )
-        guard wall > 0 else { return try await work() }
+        guard wall > 0 else {
+            return try await ProviderStreamContext.$stallOnly.withValue(true) { try await work() }
+        }
         // User, 2026-09-06: this used to race the call against a sleep inside a
         // task group. Leaving a group WAITS for its cancelled children, so a
         // provider that ignores cancellation never let the timeout return and
@@ -645,8 +662,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     // timeout surfaced as a user Stop — the turn persisted
                     // "cancelled" for a stop nobody pressed, and the recovery
                     // ladder skipped a retry it was entitled to.
-                    once.resume(.failure(LLMError.transient(
-                        message: "\(label) completion wall timeout after \(Int(wall))s"
+                    once.resume(.failure(ProviderFailure.Diagnostic(
+                        cause: .network, detail: "\(label) completion wall timeout after \(Int(wall))s",
+                        deadlineExpired: true
                     )))
                     child.cancel()
                 }
@@ -746,6 +764,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
         let effectiveModel = resolution.model
         let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
+        let attemptStartedAt = ProcessInfo.processInfo.systemUptime
         let lifecycle = await providerLifecycleStart(
             resolution: resolution,
             surface: surface,
@@ -754,8 +773,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         )
         // U1 step 1: bind the calling surface task-locally so the adapters'
         // llm.call telemetry rows can carry it (no signature changes).
+        let recorded = OSAllocatedUnfairLock(initialState: false)
         do {
-            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in try await LLMCallContext.$surface.withValue(surface) {
+            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) { try await LLMCallContext.$surface.withValue(surface) {
                 try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                 return try await adapter(for: resolution, tools: tools).adapter.complete(
@@ -763,7 +783,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 )
                     }
                 }
-            } } }
+            } } } }
             await providerLifecycleFinish(lifecycle, phase: .succeeded)
             return result
         } catch is CancellationError {
@@ -771,6 +791,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             throw CancellationError()
         } catch {
             await providerLifecycleFinish(lifecycle, phase: .failed)
+            await recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
             throw ProviderFailure.normalize(error)
         }
     }
@@ -796,7 +817,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 case .toolCall(let call):
                     let args = String(decoding: call.inputJSON, as: UTF8.self)
                     result += "\n<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(args)</tool_use>"
-                case .keepAlive, .replyTextSettled: break
+                case .keepAlive, .replyTextSettled, .toolBoundary: break
                 }
             }
             return result
@@ -816,6 +837,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
         let effectiveModel = resolution.model
         let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
+        let attemptStartedAt = ProcessInfo.processInfo.systemUptime
         let lifecycle = await providerLifecycleStart(
             resolution: resolution,
             surface: surface,
@@ -823,8 +845,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             reasoningEffort: controls.effort
         )
         // U1 step 1: bind the calling surface task-locally for telemetry.
+        let recorded = OSAllocatedUnfairLock(initialState: false)
         do {
-            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in try await LLMCallContext.$surface.withValue(surface) {
+            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) { try await LLMCallContext.$surface.withValue(surface) {
                 try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                 return try await adapter(for: resolution, tools: tools).adapter.completeMessages(
@@ -832,7 +855,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 )
                     }
                 }
-            } } }
+            } } } }
             await providerLifecycleFinish(lifecycle, phase: .succeeded)
             return result
         } catch is CancellationError {
@@ -840,6 +863,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             throw CancellationError()
         } catch {
             await providerLifecycleFinish(lifecycle, phase: .failed)
+            await recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
             throw ProviderFailure.normalize(error)
         }
     }
@@ -851,21 +875,6 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         surface: String,
         tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        ProviderRecoveryPolicy.retryOverloadStream(hasOutput: {
-            switch $0 {
-            case .keepAlive, .replyTextSettled: return false
-            case .textDelta(let text): return !text.isEmpty
-            case .toolCall: return true
-            }
-        }) { [self] in
-            streamMessagesAttempt(messages: messages, system: system, model: model, surface: surface, tools: tools)
-        }
-    }
-
-    private func streamMessagesAttempt(
-        messages: [LLMMessage], system: String?, model: String?,
-        surface: String, tools: [LLMToolSchema]?
-    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         // U1 step 1: bind the calling surface task-locally for telemetry.
         // 2026-07-21 audit fix: the binding now lives INSIDE the worker Task
         // via the async withValue overload — it previously wrapped the SYNC
@@ -875,6 +884,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             let task = Task {
                 await LLMCallContext.$surface.withValue(surface) {
                 var lifecycle: LLMCallLifecycleEvent?
+                var emittedOutput = false
+                let attemptStartedAt = ProcessInfo.processInfo.systemUptime
+                let recorded = OSAllocatedUnfairLock(initialState: false)
                 do {
                     let routingSnapshot = try await self.checkedRoutingSnapshot()
                     let resolvedModel = try self.resolveRequestedModel(
@@ -891,16 +903,21 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     )
 
                     func forward(
-                        _ stream: AsyncThrowingStream<LLMMessageStreamEvent, Error>,
+                        makeStream: @escaping @Sendable () -> AsyncThrowingStream<LLMMessageStreamEvent, Error>,
                         providerLabel: String
                     ) async throws {
                         let guardedStream = ProviderStreamGuard.wrap(
-                            stream,
+                            makeUpstream: makeStream,
                             config: streamGuardConfig,
                             providerLabel: providerLabel
                         )
                         for try await event in guardedStream {
                             try Task.checkCancellation()
+                            switch event {
+                            case .keepAlive, .replyTextSettled: break
+                            case .textDelta(let text): emittedOutput = emittedOutput || !text.isEmpty
+                            case .toolCall, .toolBoundary: emittedOutput = true
+                            }
                             if let budget = LLMCallContext.turnTokenBudget {
                                 switch event {
                                 case .textDelta(let delta):
@@ -909,7 +926,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                                 case .toolCall(let call):
                                     _ = budget.take(call.name + String(decoding: call.inputJSON, as: UTF8.self), visible: false)
                                     if !budget.exhausted { continuation.yield(event) }
-                                case .keepAlive, .replyTextSettled: continuation.yield(event)
+                                case .keepAlive, .replyTextSettled, .toolBoundary: continuation.yield(event)
                                 }
                                 if budget.exhausted { throw LLMError.outputLengthLimit(partial: budget.partialReply) }
                             } else { continuation.yield(event) }
@@ -945,13 +962,17 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         reasoningEffort: controls.effort
                     )
                     lifecycle = started
+                    try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
                     try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                     let (adapter, providerLabel) = try self.adapter(for: resolution, tools: tools)
+                    try await ProviderStreamContext.$stallOnly.withValue(streamGuardConfig.wallTimeout == 0) {
                     try await LLMMessagesStreamKind.$current.withValue(adapter.messagesStreamKind(tools: tools)) {
-                    try await forward(adapter.streamMessages(
+                    try await forward(makeStream: { adapter.streamMessages(
                         messages: messages, system: system, model: effectiveModel, tools: tools
-                    ), providerLabel: providerLabel)
+                    ) }, providerLabel: providerLabel)
+                    }
+                    }
                     }
                     }
                     }
@@ -970,8 +991,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 } catch {
                     if let lifecycle {
                         await self.providerLifecycleFinish(lifecycle, phase: .failed)
+                        await self.recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
                     }
-                    continuation.finish(throwing: ProviderFailure.normalize(error))
+                    let failure = ProviderFailure.normalize(error)
+                    continuation.finish(throwing: emittedOutput
+                        ? ProviderRecoveryPolicy.stopOverload(failure, exhausted: false) : failure)
                 }
                 }
             }
@@ -1030,6 +1054,8 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             let task = Task {
                 await LLMCallContext.$surface.withValue(surface) {
                 var lifecycle: LLMCallLifecycleEvent?
+                let attemptStartedAt = ProcessInfo.processInfo.systemUptime
+                let recorded = OSAllocatedUnfairLock(initialState: false)
                 let routingSnapshot: ProviderRoutingSnapshot
                 let resolvedModel: String
                 do {
@@ -1071,21 +1097,23 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     reasoningEffort: controls.effort
                 )
                 lifecycle = started
+                await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
                 await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                 await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
-                let stream: AsyncThrowingStream<String, Error>
+                let adapter: any LLMAdapter
                 let providerLabel: String
                 do {
                     let resolved = try self.adapter(for: resolution, tools: nil)
-                    stream = resolved.adapter.stream(prompt: prompt, system: system, model: effectiveModel)
+                    adapter = resolved.adapter
                     providerLabel = resolved.label
                 } catch {
                     await self.providerLifecycleFinish(started, phase: .failed)
+                    await self.recordFailedCall(started, error: error, startedAt: attemptStartedAt, recorded: recorded)
                     continuation.finish(throwing: ProviderFailure.normalize(error))
                     return
                 }
                 let guardedStream = ProviderStreamGuard.wrap(
-                    stream,
+                    makeUpstream: { adapter.stream(prompt: prompt, system: system, model: effectiveModel) },
                     config: streamGuardConfig,
                     providerLabel: providerLabel
                 )
@@ -1111,8 +1139,10 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 } catch {
                     if let lifecycle {
                         await self.providerLifecycleFinish(lifecycle, phase: .failed)
+                        await self.recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
                     }
                     continuation.finish(throwing: ProviderFailure.normalize(error))
+                }
                 }
                 }
                 }

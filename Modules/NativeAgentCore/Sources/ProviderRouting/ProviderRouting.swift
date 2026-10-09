@@ -506,6 +506,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         try FileManager.default.createDirectory(at: providersDir, withIntermediateDirectories: true)
         try await persistence.withFileLock(path) {
             _ = try ProviderStateValidation.dataIfPresent(at: path)
+            if id == "xai_oauth_direct" { _ = try XAIOAuthCredentialStore.read(at: path) }
             var entry = try Self.loadProviderStateObjectChecked(
                 at: path,
                 description: "provider \(id) configuration"
@@ -538,7 +539,12 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 entry["auth_mode"] = .string(id.contains("oauth") ? "oauth" : "api_key")
             }
             do {
-                try await persistence.writeJSON(.object(entry), to: path)
+                if id == "xai_oauth_direct", entry["access_token"] != nil {
+                    let object = try ProviderStateValidation.credential(data: JSONEncoder().encode(JSONValue.object(entry)))
+                    try XAIOAuthCredentialStore.write(object, to: path)
+                } else {
+                    try await persistence.writeJSON(.object(entry), to: path)
+                }
             } catch {
                 // writeJSON can fail after rename. Delete the new item only
                 // when checked readback proves its reference was not committed.
@@ -558,7 +564,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                         do {
                             try ProviderAPIKeyStore.delete(newReference)
                         } catch {
-                            NSLog("provider_credentials: save failed; unused Keychain item cleanup failed")
+                            nativeLog("provider_credentials: save failed; unused Keychain item cleanup failed")
                         }
                     }
                 }
@@ -569,7 +575,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                     try ProviderAPIKeyStore.delete(oldReference)
                 } catch {
                     // Cleanup cannot turn a committed rotation into a failed save.
-                    NSLog("provider_credentials: key saved; unused Keychain item cleanup failed")
+                    nativeLog("provider_credentials: key saved; unused Keychain item cleanup failed")
                 }
             }
         }
@@ -759,22 +765,16 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                     try selectionValidator?(route, model)
                 }
 
-                // Bare provider switch (setActiveProvider): decide INSIDE this
-                // lock whether the currently pinned model can ride the new
-                // provider — a pre-lock read could race a concurrent explicit
-                // model pick and overwrite it with the provider default. When the
-                // pin is compatible (or absent) the surfaces file is left
-                // byte-identical; only a genuinely incompatible pin is rewritten.
-                var model = model
+                // A bare provider switch preserves a compatible pin and refuses
+                // an incompatible one under the same lock as explicit choices.
                 var surfacesUntouched = false
                 if reconcilePinnedModelWithProvider, model == nil, let providerId {
                     let folded = Self.canonicalizeRootForWrite(surfaceRoot, surface: surface)
                     let (models, _) = Self.parseSurfacesFile(.object(folded))
                     if let pinned = Self.stringFrom(models, key: surface),
                        let inferred = self.inferProviderForModel(pinned),
-                       !Self.providerCanServeModel(providerId, inferredProvider: inferred),
-                       let replacement = self.defaultModelForProvider(providerId) {
-                        model = replacement
+                       !Self.providerCanServeModel(providerId, inferredProvider: inferred) {
+                        throw ProviderRoutingError.configurationFailed("\(providerId) does not serve \(pinned). Choose a model on that account in the picker.")
                     } else {
                         surfacesUntouched = true
                     }
@@ -1521,15 +1521,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             $0.key == "chat" || !retiredPickSurfaces.contains($0.key)
         }
 
-        // User, 2026-09-13: "All model selections should be taken care of at the
-        // picker." Chat's model is the person's own — the pick they saved, or
-        // the route's own "Model it falls back to" / first catalog row, which is
-        // DATA rather than a literal chosen in code. When the first account is
-        // connected, `adoptProviderForBlankSurfaces` writes the model down, so
-        // the only way to reach the empty answer here is an install with no
-        // account at all: that is "not set up", which the page already says by
-        // offering sign-in, and it must not be papered over with a model id
-        // nobody chose.
+        // Chat uses an explicit picker choice, including a saved provider-sheet
+        // choice. Connecting an account without a choice leaves its model unset.
         // The exact connected route, never a family name (third review).
         let chatRoute = activeProviders["chat"] ?? soleConnectedRoute
         // Read defaults from the same cached generation as credential readiness.
@@ -1537,12 +1530,22 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             for: Set(activeProviders.values).union(chatRoute.map { [$0] } ?? []),
             cache: configCache
         )
+        for (surface, route) in activeProviders.merging(chatRoute.map { ["chat": $0] } ?? [:], uniquingKeysWith: { first, _ in first }) {
+            guard Self.stringFrom(parsedSurfaceModels, key: surface) == nil,
+                  case .model(let saved)? = savedDefaults[route] else { continue }
+            let offered = modelsForProvider(route).compactMap { model -> String? in
+                if case .string(let id)? = model["id"] { return id }
+                return nil
+            }
+            if !offered.isEmpty, !offered.contains(saved) {
+                unusablePicks[surface] = "\(saved) isn't offered on \(route). Choose one."
+            }
+        }
         // 2026-09-13 review: a RETIRED Chat pick is not quietly replaced by the
         // route's default — that is a literal by another name, and it hides the
         // fact that the model the person chose is gone. Chat reads "not set up"
         // and `retiredPicks` carries the id so the Providers page and the turn
-        // refusal can both name it. Only a Chat that never chose anything takes
-        // the route's own default.
+        // refusal can both name it. A saved provider-sheet pick is also explicit.
         let chatModelRaw = Self.stringFrom(surfaceModels, key: "chat")
             ?? (unusablePicks["chat"] != nil
                 ? nil
@@ -1697,9 +1700,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             // last resort, for a lane explicitly pointed somewhere before any
             // choice was made anywhere.
             let route = canonical.provider ?? activeProviders[surface]
-            // Nothing chosen anywhere, but this lane has a route: that route's
-            // own default (its saved "Model it falls back to", else the first
-            // row of its catalog). Computed from the route, never named in code.
+            // A provider-only lane may inherit its saved provider-sheet pick.
             //
             // EXCEPT when the reason there is nothing is that the pick was
             // RETIRED (2026-09-13 review): substituting the route's default
@@ -1804,6 +1805,26 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         Self.inferredProviderID(forModel: modelId)
     }
 
+    /// Size background evidence from the selected route's catalog without a
+    /// second read of the saved selection. OpenRouter reads through its own
+    /// catalog (cache, TTL refresh, failure backoff); `catalogFailure` is why
+    /// that list could not be fetched when the model is missing from it.
+    public func catalogContextLength(forModel modelID: String, providerID: String) async
+        -> (contextLength: Int?, catalogFailure: String?) {
+        let openRouter = providerID == "openrouter"
+            ? await OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot) : nil
+        let moonshot = providerID == "moonshot"
+            ? MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() } : nil
+        let rows = modelsForProvider(providerID,
+            openRouterModels: openRouter?.models.map { $0.providerJSON() }, moonshotModels: moonshot)
+        guard let row = rows.first(where: {
+            guard case .string(let id) = $0["id"] else { return false }
+            return id.lowercased() == modelID.lowercased()
+        }),
+              case .int(let length) = row["context_length"], length > 0 else { return (nil, openRouter?.failure) }
+        return (Int(exactly: length), nil)
+    }
+
     public nonisolated static func inferredProviderID(forModel modelId: String) -> String? {
         let lower = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if lower.isEmpty { return nil }
@@ -1844,25 +1865,19 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         _ providerId: String,
         savedDefaults: [String: SavedProviderDefault]? = nil
     ) -> String? {
-        // User, 2026-09-06: the provider sheet's "Model it falls back to" says
-        // it is "the model used when a surface has not pinned one of its own",
-        // and `configureProvider` persists it as `default_model` — but nothing
-        // read it back, so an unpinned surface silently took the first row of
-        // the catalog instead. The saved pick is the answer when there is one.
+        // A saved provider-sheet choice may be inherited. Catalog ordering
+        // never chooses a model for a surface without an explicit pick.
         let offered = modelsForProvider(providerId).compactMap { model -> String? in
             if case .string(let id)? = model["id"] { return id }
             return nil
         }
         switch savedDefaults?[providerId] ?? configuredDefaultModel(providerId) {
         case .model(let saved):
-            // User, 2026-09-16: a saved default the provider no longer offers is
-            // not a pick (same rule as the retired-pick clearing in the app).
-            // A May sign-in had left `default_model: gpt-5.5` behind and a
-            // fresh root's first turn failed on it. Fall through to the catalog.
             if offered.isEmpty || offered.contains(saved) { return saved }
             FileHandle.standardError.write(Data(
-                "[provider-routing] \(providerId) no longer offers saved default '\(saved)'; using the catalog's first model\n".utf8
+                "[provider-routing] \(providerId) no longer offers saved default '\(saved)'; choose a model in the picker\n".utf8
             ))
+            return nil
         case .unreadable(let reason):
             // User, 2026-09-06: corrupt authority is not "no selection". Falling
             // through to the catalog seed here silently re-pointed the surface
@@ -1875,19 +1890,6 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         case .absent:
             break
         }
-        for model in modelsForProvider(providerId) {
-            if case .string(let id)? = model["id"],
-               !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return id
-            }
-        }
-        // User, 2026-09-13: "All model selections should be taken care of at the
-        // picker." The catalog walk above IS the answer for every first-party
-        // route. The hardcoded per-family literals that used to sit here
-        // (claude-opus-4-8, the primary, grok, kimi, an OpenRouter id) were a
-        // model chosen in code; with none, a provider whose catalog this build
-        // cannot see keeps the caller's model instead of being re-pointed at
-        // something nobody picked.
         return nil
     }
 
@@ -1980,6 +1982,9 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                     return ProviderConfigRead(unreadable: "provider configuration is malformed")
                 }
                 try Self.validateProviderConfiguration(fields)
+                if trimmedId == "xai_oauth_direct" {
+                    object = try XAIOAuthCredentialStore.read(at: path)
+                }
                 // Resolve the Keychain reference under the config writer's lock
                 // so readiness and model settings share one credential generation.
                 if object[ProviderAPIKeyStore.referenceField] != nil {
@@ -2440,12 +2445,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         let parsed: [String: Any]?
         if let preRead {
             parsed = preRead.object
-        } else if let data = try? Data(contentsOf: path) {
-            parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         } else {
-            parsed = nil
+            do { parsed = try XAIOAuthCredentialStore.read(at: path) }
+            catch { return (false, "xAI Keychain credentials are unavailable. Reconnect in Providers.") }
         }
-        guard let obj = parsed else {
+        guard let obj = parsed, !obj.isEmpty else {
             return (false, "Sign in to your xAI account in Providers.")
         }
         let tokens = OAuthRefreshBinding.tokenSet(obj, provider: "xai_oauth_direct")

@@ -265,7 +265,7 @@ public final class ScopedWaiter: @unchecked Sendable {
 /// tests do not accumulate one entry per temp root for the process lifetime.
 public actor OnceByKey<Key: Hashable & Sendable> {
     private enum State {
-        case running(Task<Void, Never>)
+        case running(Task<Void, Error>)
         case done
     }
 
@@ -284,21 +284,32 @@ public actor OnceByKey<Key: Hashable & Sendable> {
     /// the operation's captures) is dropped whether or not anybody is still
     /// waiting on it.
     public func run(_ key: Key, _ operation: @escaping @Sendable () async -> Void) async {
+        try? await runChecked(key, operation)
+    }
+
+    /// Failed operations leave the key pending, and every waiting caller sees
+    /// the failure before it can cross its admission barrier.
+    public func runChecked(_ key: Key, _ operation: @escaping @Sendable () async throws -> Void) async throws {
         switch states[key] {
         case .done:
             return
         case .running(let task):
-            await task.value
+            try await task.value
         case nil:
             let task = Task { [weak self] in
-                await operation()
-                await self?.markDone(key)
+                do {
+                    try await operation()
+                    await self?.markDone(key)
+                } catch {
+                    await self?.clearFailed(key)
+                    throw error
+                }
             }
             // Safe against a fast operation: `markDone` needs this actor, and
             // this call holds it until the `await` below, so the assignment
             // can never clobber the marker.
             states[key] = .running(task)
-            await task.value
+            try await task.value
         }
     }
 
@@ -307,6 +318,11 @@ public actor OnceByKey<Key: Hashable & Sendable> {
     private func markDone(_ key: Key) {
         guard case .running = states[key] else { return }
         states[key] = .done
+    }
+
+    private func clearFailed(_ key: Key) {
+        guard case .running = states[key] else { return }
+        states[key] = nil
     }
 
     public func hasCompleted(_ key: Key) -> Bool {

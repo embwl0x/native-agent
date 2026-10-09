@@ -127,8 +127,10 @@ actions when needed, without adding more tool schemas to each request.
 The old catalog, loading and per-area tool calls are refused with a translated
 `app` call. Work previously opened through the workspace tool is now in home.
 
-- Skills are guidance: `skill.list` and `skill.read` find and read them.
-  They do not grant permissions.
+- Skills provide guidance and optional admitted scripts. `skill.list` and
+  `skill.read` find and read them; `skill.save`, `skill.enable`, `skill.run`,
+  `skill.resume` and `skill.rollback` manage scripted procedures. They grant
+  no new authority. See the [manifest spec](skill_manifest_spec.md).
 - To author a capability, use `tool.propose`, then `tool.approve`. An
   activated tool appears as `authored.<id>`. Approval follows the current
   [Trust and peer-turn rules](#trust-modes-and-approvals), including the

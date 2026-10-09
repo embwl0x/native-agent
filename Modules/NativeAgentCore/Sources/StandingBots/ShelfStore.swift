@@ -3,6 +3,7 @@ import PersistenceCore
 
 public struct ShelfStore: Sendable {
     public static let maximumPageSize = 100
+    public static let conditionNotificationReaderID = "condition-notification"
     private let disk: StandingBotsDisk
     /// Kept for the approval boundary in `ShelfApprovalReconciliation`.
     let dataRoot: URL
@@ -14,22 +15,24 @@ public struct ShelfStore: Sendable {
     /// Logical append-only history. One indexed file per entry bounds append IO.
     /// A global append sequence (not run time) means late/backdated runs remain pageable.
     public func append(_ entry: ShelfEntry) throws {
-        try disk.locked {
-            let definition = try disk.definition(entry.botId)
-            guard definition.audit.contains(where: { $0.definition.briefVersion == entry.briefVersion }) else {
-                throw StandingBotsError.invalidValue("unknown brief version")
-            }
-            try validate(entry)
-            var index = try loadIndex()
-            guard try disk.bytes(at: indexedPath(entry.id)) == nil else {
-                throw StandingBotsError.alreadyExists(entry.id)
-            }
-            let last = index.sequence
-            guard last < UInt64.max else { throw StandingBotsError.invalidValue("sequence overflow") }
-            let book = Book(sequence: last + 1, entry: entry)
-            try disk.write(book, at: pendingPath)
-            try apply(book, index: &index)
+        try disk.locked { try appendLocked(entry) }
+    }
+
+    func appendLocked(_ entry: ShelfEntry) throws {
+        let definition = try disk.definition(entry.botId)
+        guard definition.audit.contains(where: { $0.definition.briefVersion == entry.briefVersion }) else {
+            throw StandingBotsError.invalidValue("unknown brief version")
         }
+        try validate(entry)
+        var index = try loadIndex()
+        guard try disk.bytes(at: indexedPath(entry.id)) == nil else {
+            throw StandingBotsError.alreadyExists(entry.id)
+        }
+        let last = index.sequence
+        guard last < UInt64.max else { throw StandingBotsError.invalidValue("sequence overflow") }
+        let book = Book(sequence: last + 1, entry: entry)
+        try disk.write(book, at: pendingPath)
+        try apply(book, index: &index)
     }
 
     /// The approval this entry stopped on has been decided. The shelf is
@@ -202,6 +205,15 @@ public struct ShelfStore: Sendable {
         }
     }
 
+    /// The verdict and result identity are committed together; the existing
+    /// exact reader acknowledgement records attention's delivery acceptance.
+    public func pendingConditionNotifications() throws -> [ShelfEntry] {
+        try disk.locked {
+            let seen = try readerState(Self.conditionNotificationReaderID).readEntryIds
+            return try books().map(\.entry).filter { $0.conditionMet == true && !seen.contains($0.id) }
+        }
+    }
+
     public func readCursor(readerId: String) throws -> ShelfReaderCursor {
         try validateReader(readerId)
         return try disk.locked { try readerState(readerId) }
@@ -370,7 +382,8 @@ public struct ShelfStore: Sendable {
         guard dates.allSatisfy({ $0.timeIntervalSince1970.isFinite }), entry.coverageStart <= entry.coverageEnd,
               entry.briefVersion > 0,
               entry.spend.tokens.map({ $0 >= 0 }) ?? true,
-              entry.spend.seconds.isFinite, entry.spend.seconds >= 0 else {
+              entry.spend.seconds.isFinite, entry.spend.seconds >= 0,
+              entry.conditionMet != true || entry.conditionNotificationTitle?.isEmpty == false else {
             throw StandingBotsError.invalidValue("shelf entry storage")
         }
     }

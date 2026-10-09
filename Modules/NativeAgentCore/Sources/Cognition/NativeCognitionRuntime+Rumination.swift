@@ -133,7 +133,7 @@ extension NativeCognitionRuntime {
         )
         let currentIDs = Set(candidates.map(\.id))
         let closedIDs = Set(priorIDs.filter { $0.hasPrefix("moment:") }).subtracting(currentIDs)
-        let recordsByID = Dictionary(uniqueKeysWithValues: moments.map { ("moment:" + $0.id, $0) })
+        let recordsByID = Dictionary(moments.map { ("moment:" + $0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let items = candidates.compactMap { candidate -> CognitiveSubstrate.CognitiveExternalRumination? in
             guard let record = recordsByID[candidate.id],
                   let disclosure = MemoryRecordDisclosurePolicy.classify(record) else { return nil }

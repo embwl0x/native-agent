@@ -60,12 +60,13 @@ struct BotsEditorSheet: View {
                 Button("Cancel") { dismiss() }
                 Button(definition == nil ? "Create" : "Save") {
                     do { try save(makeDefinition()); dismiss() }
-                    catch { self.error = error.localizedDescription }
+                    catch { self.error = BotsShelfView.problem(error, action: "save that helper") }
                 }.keyboardShortcut(.defaultAction)
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(24).frame(width: 570)
+        .houseSheet()
         .task {
             populate()
             switch await ProviderSettingsRefreshAction.perform(appModel: appModel, refreshCatalog: false) {

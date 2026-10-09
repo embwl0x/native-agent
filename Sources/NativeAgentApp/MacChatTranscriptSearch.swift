@@ -439,8 +439,7 @@ struct MacChatTranscriptSearchBar: View {
         }
         .padding(.horizontal, NativeAgentSpacing.md)
         .padding(.vertical, NativeAgentSpacing.sm)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
+        .houseSurface(in: Rectangle())
         .onExitCommand(perform: onDismiss)
     }
 }

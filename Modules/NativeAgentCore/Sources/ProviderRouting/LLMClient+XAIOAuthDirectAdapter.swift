@@ -84,7 +84,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             lastSentAccessToken = access
             var req = URLRequest(url: endpoint)
             req.httpMethod = "POST"
-            req.timeoutInterval = 240
+            req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : 240
             req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -191,7 +191,9 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                         let bytes: URLSession.AsyncBytes
                         let response: URLResponse
                         do {
+                            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                             (bytes, response) = try await session.bytes(for: req)
+                            if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
                         } catch {
                             throw mapTransportError(error, fallback: self.transientNetworkError(error, operation: "streamMessages"))
                         }
@@ -396,7 +398,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         var accessToken: String
         var refreshToken: String
         var tokenEndpoint: URL
-        /// User, 2026-09-06: the bytes this state was read from. Only their
+        /// User, 2026-09-06: the hydrated credential bytes. Only their
         /// token-key digest (`CredentialFileLock.credentialGeneration`) is the
         /// generation the refresh write is allowed to replace — the rest of
         /// the file is provider settings that other writers own.
@@ -406,10 +408,11 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     private static func loadTokenState(
         path: URL, requestAccount: OAuthRequestAccount? = nil, rejectedToken: String? = nil
     ) throws -> TokenState {
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let obj = try XAIOAuthCredentialStore.read(at: path)
+        guard !obj.isEmpty else {
             throw LLMError.notConfigured(provider: "xai_oauth_direct")
         }
+        let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
         try requestAccount?.check(obj, provider: "xai_oauth_direct", rejectedToken: rejectedToken)
         let tokenSet = OAuthRefreshBinding.tokenSet(obj, provider: "xai_oauth_direct")
         let access = ((tokenSet["access_token"] as? String) ?? "")
@@ -527,12 +530,12 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         // a concurrent settings save survives the refresh's write.
         let generation = CredentialFileLock.credentialGeneration(ofFileContents: state.bytes)
         return try CredentialFileLock.withLock(tokenPath) {
-            guard CredentialFileLock.credentialGeneration(ofFileAt: tokenPath) == generation else {
+            let current = try XAIOAuthCredentialStore.read(at: tokenPath)
+            let currentData = try JSONSerialization.data(withJSONObject: current, options: [.sortedKeys])
+            guard CredentialFileLock.credentialGeneration(ofFileContents: currentData) == generation else {
                 return try Self.loadTokenState(path: tokenPath, requestAccount: requestAccount)
             }
-            var object = (try? Data(contentsOf: tokenPath))
-                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                ?? state.object
+            var object = current
             if object["access_token"] == nil && object["refresh_token"] == nil {
                 for (key, value) in OAuthRefreshBinding.tokenSet(object, provider: "xai_oauth_direct") { object[key] = value }
                 object.removeValue(forKey: "tokens")
@@ -623,23 +626,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     }
 
     private static func writeJSONObject(_ obj: [String: Any], to url: URL) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
-        let tmp = url.appendingPathExtension("tmp-\(UUID().uuidString)")
-        try data.write(to: tmp, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: NSNumber(value: Int16(0o600))],
-            ofItemAtPath: tmp.path
-        )
-        if FileManager.default.fileExists(atPath: url.path) {
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
-        } else {
-            try FileManager.default.moveItem(at: tmp, to: url)
-        }
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: NSNumber(value: Int16(0o600))],
-            ofItemAtPath: url.path
-        )
+        try XAIOAuthCredentialStore.write(obj, to: url)
     }
 }
 

@@ -226,16 +226,16 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             copy.uncertainty = OrganismNode.clamp01(copy.uncertainty + (0.01 * min(hours, 12)))
             return copy
         }
-        next.nodes = Dictionary(uniqueKeysWithValues: next.nodes.values
+        next.nodes = Dictionary(next.nodes.values
             .sorted {
                 if $0.activation != $1.activation { return $0.activation > $1.activation }
                 if $0.charge != $1.charge { return $0.charge > $1.charge }
                 return $0.id < $1.id
             }
             .prefix(limits.maximumPersistedNodes)
-            .map { ($0.id, $0) })
+            .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let keptNodeIDs = Set(next.nodes.keys)
-        next.edges = Dictionary(uniqueKeysWithValues: next.edges.values
+        next.edges = Dictionary(next.edges.values
             .filter { keptNodeIDs.contains($0.sourceID) && keptNodeIDs.contains($0.targetID) }
             .sorted {
                 if $0.weight != $1.weight { return $0.weight > $1.weight }
@@ -243,7 +243,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
                 return $0.id < $1.id
             }
             .prefix(limits.maximumPersistedEdges)
-            .map { ($0.id, $0) })
+            .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         return next
     }
 
@@ -306,9 +306,9 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             next.expiredCount += 1
             OrganismPredictiveBody.recordOutcome(.expired, kind: kind, at: now, ledger: &next)
         }
-        next.predictions = Dictionary(uniqueKeysWithValues: OrganismPredictionRetention
+        next.predictions = Dictionary(OrganismPredictionRetention
             .bounded(decayed, maximum: limits.maximumPersistedPredictions)
-            .map { ($0.id, $0) })
+            .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         next.lastUpdatedAt = now
         return next
     }

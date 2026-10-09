@@ -93,7 +93,7 @@ public enum GoogleOAuthCredentials {
     }
 
     private static func read(_ path: URL) throws -> [String: Any] {
-        let data = try Data(contentsOf: path)
+        let data = try ConnectorCredentialFile.read(at: path)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -170,7 +170,7 @@ public enum GoogleOAuthCredentials {
         object["expires_at"] = ISO8601DateFormatter().string(from: Date().addingTimeInterval(expiresIn))
         let output = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
         // Once exchanged, persist the rotating token even if the caller left.
-        try output.write(to: path, options: .atomic)
+        try ConnectorCredentialFile.write(output, to: path)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
         return RefreshResult(
             accountSubject: accountSubject,

@@ -160,6 +160,7 @@ public struct MacAXRead: Sendable {
     /// one (a synthetic single-tree source before it was asked, or a read that
     /// went through `frontmostWindowRoot()`).
     public let windowIdentity: MacAXWindowIdentity?
+    public let section: String?
 
     public init(
         snapshot: MacAXTreeSnapshot,
@@ -167,7 +168,8 @@ public struct MacAXRead: Sendable {
         rootTitle: String?,
         focusPath: [Int]?,
         root: MacAXElementRef,
-        windowIdentity: MacAXWindowIdentity? = nil
+        windowIdentity: MacAXWindowIdentity? = nil,
+        section: String? = nil
     ) {
         self.snapshot = snapshot
         self.app = app
@@ -175,6 +177,7 @@ public struct MacAXRead: Sendable {
         self.focusPath = focusPath
         self.root = root
         self.windowIdentity = windowIdentity
+        self.section = section
     }
 }
 
@@ -209,6 +212,7 @@ public enum MacActVerb: String, Sendable, Equatable, CaseIterable {
     /// `click`'s fallback already uses.
     case open
     case type
+    case focus
     case select
     case toggle
     case dismiss
@@ -1338,7 +1342,10 @@ public enum MacActClosedLoop {
         valueAfter: String? = nil
     ) -> ActClassification {
         guard performedOK else { return ActClassification(status: "failed") }
-        guard notificationObserved else {
+        // A successful readback is evidence even when the app omitted an AX
+        // notification. Notifications trigger observation; they do not veto it.
+        let editVerified = verb == .type && editLandedInField(typed: typedText, valueBefore: valueBefore, valueAfter: valueAfter) == true
+        guard notificationObserved || diff?.windowChanged == true || editVerified else {
             return ActClassification(
                 status: "acted_unobserved",
                 reason: "none_observed",

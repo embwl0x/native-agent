@@ -8,5 +8,5 @@ public protocol GrokBotConnectionPort: Sendable {
     func send(peer: AgentPeerContact, text: String, conversation: String,
               messageID: String, dataRoot: URL, quiet: Bool) async throws -> JSONValue
     func grokBootstrap(_ text: String, bot: String) async throws
-    func importGrokRoutine(peer: String, dataRoot: URL) async throws
+    func importGrokRoutine(peer: String, dataRoot: URL, waitForCreation: Bool) async throws
 }

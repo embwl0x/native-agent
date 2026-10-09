@@ -33,18 +33,9 @@ public actor ChatSessionIndexReconciler {
         self.persistence = persistence
     }
 
-    /// Index row key: the transcript modification time this row was last
-    /// proven to agree with. Purely a reconciler stamp — no other reader keys
-    /// on it, and a writer that drops it only costs one extra stat-gated read.
+    /// Legacy human-readable reconciliation time. Exact version identity is
+    /// shared with transcript writers and retention through ChatSessionIndexFile.
     static let transcriptStampKey = "reconciledTranscriptModifiedAt"
-
-    /// How far a transcript's mtime may lead its row's `updatedAt` before the
-    /// row is treated as stale. The live writer mints `updatedAt` from a
-    /// timestamp taken just BEFORE the append it describes, so on a perfectly
-    /// healthy row the file is always a little newer than the row it produced —
-    /// one serialize plus one `F_FULLFSYNC`. Only a wider gap is evidence of an
-    /// index write that never happened.
-    static let transcriptStampTolerance: TimeInterval = 2
 
     /// Wall-clock ceiling on the stale pass's transcript reads. Contended
     /// transcript locks are skipped immediately; stop selecting further reads
@@ -60,16 +51,19 @@ public actor ChatSessionIndexReconciler {
         let modified: Date
         let updatedAt: JSONValue?
         let stamp: JSONValue?
+        let version: JSONValue?
     }
 
     private struct StaleRead: Sendable {
         let bytes: Int64
         let rows: [JSONValue]
         let readReport: JSONLReadReport
+        let version: JSONValue?
     }
 
     private struct StaleRepair: Sendable {
         let candidate: StaleCandidate
+        let version: JSONValue?
         let messageCount: Int64
         let preview: String
         /// 2026-09-06: whether the transcript held a conversational row AT ALL.
@@ -80,6 +74,7 @@ public actor ChatSessionIndexReconciler {
         /// its sidebar line on the phone and the Mac.
         let hasConversationalRow: Bool
         let lastSpokenStamp: String?
+        let firstSpokenStamp: String?
     }
 
     private struct SelectionPass: Sendable {
@@ -166,14 +161,9 @@ public actor ChatSessionIndexReconciler {
             // has the same shape — it rewrites the transcript and never touches
             // the index.
             //
-            // The gate is a stat, not a read. Both sides are already in hand:
-            // the row's `updatedAt` and the transcript's mtime, which the
-            // directory enumeration above fetched with the size it was already
-            // fetching. A transcript is opened only when its mtime leads the
-            // moment its row was last known to agree with it. That moment is
-            // `updatedAt` — or, once this pass has verified a row,
-            // `reconciledTranscriptModifiedAt`, without which a compacted or
-            // just-repaired session would be re-read on every launch forever.
+            // A metadata-only exact version gate avoids both timestamp rounding
+            // and perpetual stale exemptions after compaction. Legacy rows
+            // receive their first exact acknowledgement in bounded batches.
             //
             // Bounded per launch, so a pile of stale rows cannot starve a
             // session that is missing from the sidebar entirely.
@@ -196,9 +186,8 @@ public actor ChatSessionIndexReconciler {
                 for row in rows {
                     guard case .string(let sessionID)? = row["id"],
                           let transcript = transcriptsByID[sessionID],
-                          let agreedAt = Self.lastAgreement(with: row),
-                          transcript.modified.timeIntervalSince(agreedAt)
-                            > Self.transcriptStampTolerance else { continue }
+                          let version = ChatSessionIndexFile.transcriptVersion(at: transcript.url),
+                          row[ChatSessionIndexFile.acknowledgedTranscriptKey] != version else { continue }
                     guard staleRepairBudget > 0 else {
                         // Left for the next launch. The gate cost one stat.
                         report.skippedForBounds += 1
@@ -211,7 +200,8 @@ public actor ChatSessionIndexReconciler {
                             url: transcript.url,
                             modified: transcript.modified,
                             updatedAt: row["updatedAt"],
-                            stamp: row[Self.transcriptStampKey]
+                            stamp: row[Self.transcriptStampKey],
+                            version: row[ChatSessionIndexFile.acknowledgedTranscriptKey]
                         )
                     )
                 }
@@ -261,7 +251,8 @@ public actor ChatSessionIndexReconciler {
                 let bytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
                 guard bytes >= 0, bytes <= remainingBytes else { return nil as StaleRead? }
                 let scan = try await persistence.readJSONLReporting(transcript)
-                return StaleRead(bytes: bytes, rows: scan.rows, readReport: scan.report)
+                return StaleRead(bytes: bytes, rows: scan.rows, readReport: scan.report,
+                                 version: ChatSessionIndexFile.transcriptVersion(at: transcript))
             }
             guard let acquiredRead = read, let read = acquiredRead else {
                 report.skippedForBounds += 1
@@ -327,6 +318,9 @@ public actor ChatSessionIndexReconciler {
                 "summary": .string(""),
             ]
             let preview = Self.bounded(lastContent, to: 160)
+            let spoken = objectRows.filter { ["user", "assistant"].contains(Self.string($0["role"])?.lowercased() ?? "") }
+            recoveredRow["firstMessageAt"] = spoken.first?["createdAt"] ?? spoken.first?["timestamp"]
+            recoveredRow["lastMessageAt"] = spoken.last?["createdAt"] ?? spoken.last?["timestamp"]
             if !preview.isEmpty { recoveredRow["lastMessagePreview"] = .string(preview) }
             // 2026-09-06: stamp the transcript state this row was built
             // from, so the stale-row pass below does not re-open a file
@@ -337,6 +331,7 @@ public actor ChatSessionIndexReconciler {
             if let modified = values.contentModificationDate {
                 recoveredRow[Self.transcriptStampKey] = .string(Self.iso8601(modified))
             }
+            recoveredRow[ChatSessionIndexFile.acknowledgedTranscriptKey] = read.version
             recovered.append(recoveredRow)
         }
         // PASS 2 — index lock RELEASED. Each tripped transcript is read under
@@ -368,7 +363,8 @@ public actor ChatSessionIndexReconciler {
                 let bytes = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
                 guard bytes >= 0, bytes <= remainingBytes else { return nil }
                 let scan = try await persistence.readJSONLReporting(candidate.url)
-                return StaleRead(bytes: bytes, rows: scan.rows, readReport: scan.report)
+                return StaleRead(bytes: bytes, rows: scan.rows, readReport: scan.report,
+                                 version: ChatSessionIndexFile.transcriptVersion(at: candidate.url))
             }
             guard let acquiredRead = read, let read = acquiredRead else {
                 report.skippedForBounds += 1
@@ -411,6 +407,7 @@ public actor ChatSessionIndexReconciler {
             repairs.append(
                 StaleRepair(
                     candidate: candidate,
+                    version: read.version,
                     messageCount: Int64(objectRows.count),
                     preview: Self.bounded(
                         lastSpoken.flatMap { Self.content($0) } ?? "",
@@ -418,7 +415,9 @@ public actor ChatSessionIndexReconciler {
                     ),
                     hasConversationalRow: lastSpoken != nil,
                     lastSpokenStamp: Self.string(lastSpoken?["createdAt"])
-                        ?? Self.string(lastSpoken?["timestamp"])
+                        ?? Self.string(lastSpoken?["timestamp"]),
+                    firstSpokenStamp: objectRows.first { ["user", "assistant"].contains(Self.string($0["role"])?.lowercased() ?? "") }
+                        .flatMap { Self.string($0["createdAt"]) ?? Self.string($0["timestamp"]) }
                 )
             )
         }
@@ -450,8 +449,13 @@ public actor ChatSessionIndexReconciler {
                 // anything else is already fresher than this pass, and the
                 // stat gate will pick it up again next launch if it is not.
                 guard row["updatedAt"] == repair.candidate.updatedAt,
-                      row[Self.transcriptStampKey] == repair.candidate.stamp else { continue }
+                      row[Self.transcriptStampKey] == repair.candidate.stamp,
+                      row[ChatSessionIndexFile.acknowledgedTranscriptKey] == repair.candidate.version else { continue }
                 var disagreed = false
+                if row["firstMessageAt"] == nil || row["firstMessageAt"] == .null {
+                    row["firstMessageAt"] = repair.firstSpokenStamp.map(JSONValue.string)
+                }
+                row["lastMessageAt"] = repair.lastSpokenStamp.map(JSONValue.string)
                 let count = JSONValue.int(repair.messageCount)
                 if row["messageCount"] != count {
                     row["messageCount"] = count
@@ -500,6 +504,7 @@ public actor ChatSessionIndexReconciler {
                     ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
                 }
                 row[Self.transcriptStampKey] = .string(Self.iso8601(repair.candidate.modified))
+                row[ChatSessionIndexFile.acknowledgedTranscriptKey] = repair.version
                 rows[position] = row
                 wroteRow = true
                 if disagreed { repaired += 1 }
@@ -611,18 +616,6 @@ public actor ChatSessionIndexReconciler {
         guard case .string(let raw)? = value else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    /// The latest moment this index row is known to have described its
-    /// transcript correctly: the row's own `updatedAt`, or the transcript
-    /// mtime a previous reconcile verified it against, whichever is later.
-    /// `nil` — a row with no parsable `updatedAt` — is not a repair candidate:
-    /// there is no baseline to compare an mtime against, and treating every
-    /// such row as stale would reopen the whole directory at launch.
-    private nonisolated static func lastAgreement(with row: [String: JSONValue]) -> Date? {
-        guard let updatedAt = date(string(row["updatedAt"])) else { return nil }
-        guard let stamped = date(string(row[transcriptStampKey])) else { return updatedAt }
-        return max(updatedAt, stamped)
     }
 
     private nonisolated static func date(_ raw: String?) -> Date? {

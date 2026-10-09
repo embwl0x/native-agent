@@ -87,6 +87,7 @@ public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
     /// Optional reference to the existing connector workspace registry. This
     /// is association metadata only; it grants no path or tool authority.
     public var projectSpaceId: String?
+    public var expectedOutputs: [String]?
 
     public init(
         title: String,
@@ -94,7 +95,8 @@ public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
         triggerSource: String = "manual",
         trustRequired: String = "none",
         deskHandle: String? = nil,
-        projectSpaceId: String? = nil
+        projectSpaceId: String? = nil,
+        expectedOutputs: [String]? = nil
     ) {
         self.title = title
         self.objective = objective
@@ -102,6 +104,7 @@ public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
         self.trustRequired = trustRequired
         self.deskHandle = deskHandle
         self.projectSpaceId = projectSpaceId
+        self.expectedOutputs = expectedOutputs
     }
 }
 

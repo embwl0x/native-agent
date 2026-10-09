@@ -1,6 +1,7 @@
 import ChatTurnContracts
 import ApprovalInbox
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -11,6 +12,7 @@ import DreamREMCycle
 import Context
 import CognitiveSubstrate
 import ToolRegistry
+import TurnTrace
 
 // MARK: - TurnEngineError
 
@@ -36,7 +38,8 @@ public enum TurnEngineError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .personaLoadFailed(let e): return "persona load failed: \(e)"
+        case .personaLoadFailed(let e):
+            return "persona load failed: " + ((e as? LocalizedError)?.errorDescription ?? String(describing: e))
         case .contextLoadFailed(let e):
             return "I couldn't load my context for this reply: "
                 + ((e as? LocalizedError)?.errorDescription ?? String(describing: e))
@@ -151,6 +154,8 @@ public struct MemoryPromotionTelemetry: Sendable, Equatable {
     public var failedCorrectionCount: Int = 0
     /// Phase 5A novelty gate: why the after-turn memory call was skipped.
     public var noveltySkipReason: String?
+    public var failure: AfterTurnMemoryFailure?
+    public var interpretationFailure: AfterTurnInterpretationFailure? { failure?.interpretationFailure }
     public let semanticStatus: MemorySemanticExtractionStatus
     public let semanticCandidateCount: Int64
     public let candidateCount: Int64
@@ -291,7 +296,9 @@ public struct SharedAdaptiveMemoryPromoter: MemoryPromotionTelemetryReporting, M
             assistantMessage: assistantMessage,
             toolEvidence: toolEvidence,
             sessionId: sessionId,
-            surface: surface
+            surface: surface,
+            standingAgentName: StandingBotContinuity.currentBot?.name,
+            turnId: TurnTraceContext.turnId
         )
         var telemetry = MemoryPromotionTelemetry(
             stagedProposalCount: observation.proposals.count,
@@ -305,6 +312,7 @@ public struct SharedAdaptiveMemoryPromoter: MemoryPromotionTelemetryReporting, M
         telemetry.pendingCorrectionCount = observation.pendingCorrectionCount
         telemetry.failedCorrectionCount = observation.failedCorrectionCount
         telemetry.noveltySkipReason = observation.noveltySkipReason
+        telemetry.failure = observation.extraction.failure
         return telemetry
     }
 }
@@ -495,6 +503,8 @@ public struct TurnContext: Sendable {
     /// as automatic Fluid Context projection.
     public let personaID: String?
     public let personaDocs: [String: String]
+    /// Source revision captured before USER's per-turn memory-core projection.
+    public let personaFingerprint: String
     public let recalled: [MemoryRecallHit]
     public let modelId: String
     public let reasoningEffort: String
@@ -581,6 +591,7 @@ public struct TurnContext: Sendable {
         surface: String,
         personaID: String? = nil,
         personaDocs: [String: String],
+        personaFingerprint: String,
         recalled: [MemoryRecallHit],
         modelId: String,
         reasoningEffort: String,
@@ -602,6 +613,7 @@ public struct TurnContext: Sendable {
         self.surface = surface
         self.personaID = personaID
         self.personaDocs = personaDocs
+        self.personaFingerprint = personaFingerprint
         self.recalled = recalled
         self.modelId = modelId
         self.reasoningEffort = reasoningEffort
@@ -658,6 +670,7 @@ public struct TurnContext: Sendable {
             surface: surface,
             personaID: personaID,
             personaDocs: personaDocs,
+            personaFingerprint: personaFingerprint,
             recalled: recalled,
             modelId: modelId,
             reasoningEffort: reasoningEffort,
@@ -682,7 +695,7 @@ public struct TurnContext: Sendable {
 // MARK: - TurnEngineResult
 
 public struct TurnEngineResult: Sendable {
-    public enum TerminalState: String, Sendable {
+    public enum TerminalState: String, Sendable, Codable {
         case completed, interrupted, waiting, braked, failed
     }
 
@@ -699,6 +712,7 @@ public struct TurnEngineResult: Sendable {
         case iterationLimit = "iteration_limit"
         case wallClockLimit = "wall_clock_limit"
         case noProgress = "no_progress"
+        case humanTakeover = "human_takeover"
         case protocolViolation = "protocol_violation"
         case unfulfilledPromise = "unfulfilled_promise"
         case emptyReply = "empty_reply"
@@ -708,7 +722,7 @@ public struct TurnEngineResult: Sendable {
             switch self {
             case .replyCompleted: return .completed
             case .approvalRequired, .interactionRequired: return .waiting
-            case .cancelled, .providerInterrupted, .incomplete, .completionUnreported: return .interrupted
+            case .cancelled, .providerInterrupted, .incomplete, .completionUnreported, .humanTakeover: return .interrupted
             case .providerFailed, .executionFailed: return .failed
             case .iterationLimit, .wallClockLimit, .noProgress, .protocolViolation,
                  .unfulfilledPromise, .emptyReply, .outputLimit: return .braked
@@ -826,7 +840,7 @@ public struct TurnEngineResult: Sendable {
         terminalReason: TerminalReason? = nil,
         loopCounters: LoopCounters? = nil
     ) {
-        self.reply = reply
+        self.reply = ChatRichContentParser.visibleText(reply)
         self.modelUsed = modelUsed
         self.recalledIds = recalledIds
         self.toolDispatches = toolDispatches

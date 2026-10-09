@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
+import ChatSessionWork
 
 // Telegram keeps source-compatible names while the authoritative value model
 // and lifecycle reducer live in the surface-neutral NativeAgentCore target.
@@ -93,10 +94,12 @@ public enum TelegramTurnPresentationReducer {
                 at: instant
             )
 
-        case .toolResult(let name, _):
+        case .toolResult(let name, let output):
             return reduce(
                 state,
-                lifecycle: .working(action: ToolActivityPresentation.finished(name)),
+                lifecycle: .working(action: ToolActivityPresentation.finished(name,
+                    outcome: output.map(ChatToolOutcome.exactResultClass)?.rawValue ?? "unknown",
+                    detail: [output.flatMap(ChatToolOutcome.explanation), output.flatMap(ChatToolOutcome.remedy)].compactMap { $0 }.joined(separator: " · "))),
                 at: instant
             )
 

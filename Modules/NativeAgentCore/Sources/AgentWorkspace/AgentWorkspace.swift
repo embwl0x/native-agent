@@ -176,9 +176,10 @@ struct AgentWorkspaceProjection: Sendable {
     var page: Int = 0
 }
 
-private struct AgentWorkspaceFailure: Error, LocalizedError {
+/// A workspace refusal: each is raised before anything runs.
+package struct AgentWorkspaceFailure: Error, LocalizedError {
     let message: String
-    var errorDescription: String? { message }
+    package var errorDescription: String? { message }
 }
 
 /// Bounded per-chat navigation. Durable state stores references and explicitly
@@ -293,19 +294,18 @@ package actor AgentWorkspaceNavigation {
         return pages.filter { if case .browserBookmark(_, _, let tab?) = $0 { !ChromePageMirror.isClosed(tab) } else { true } }
     }
 
-    /// A released tab leaves this chat's windows and home (desk walk 3,
+    /// An explicitly closed tab leaves this chat's windows and home (desk walk 3,
     /// 09-24: home and the window list still showed it after tabClosed).
-    package func forgetTab(lease: String, tabID: Int64?, key: String) {
+    package func forgetTab(tab: Int64, key: String) {
         guard var session = sessions[key] else { return }
-        // Only this lease's window and the bookmark it recorded: a tab id
-        // alone can be reused after Chrome restarts.
-        let identity = "browser.chrome_snapshot:" + lease
+        // Remove only the window and bookmark recorded for this tab.
+        let identity = "browser.chrome_snapshot:" + String(tab)
         let bookmark = session.browserBookmarks[identity].flatMap { saved -> AgentWorkspaceLocation? in
-            guard case .browserBookmark(_, _, let tab) = saved else { return nil }
-            return tab == nil || tabID == nil || tab == tabID ? saved : nil
+            guard case .browserBookmark(_, _, let id) = saved else { return nil }
+            return id == nil || tab == id ? saved : nil
         }
         func gone(_ place: AgentWorkspaceLocation) -> Bool {
-            if case .record("browser.chrome_snapshot", let input, _) = place { return input["lease_id"] == .string(lease) }
+            if case .record("browser.chrome_snapshot", let input, _) = place { return input["tab_id"] == .int(tab) }
             return bookmark != nil && place == bookmark
         }
         guard session.places.contains(where: gone) || session.browserBookmarks[identity] != nil else { return }
@@ -433,7 +433,7 @@ package actor AgentWorkspaceNavigation {
                 guard case .int(let id)? = input["message_id"], case .string(let expected)? = input["expected_message_id"] else { return nil }
                 return "mail:" + String(id) + "\u{0}" + expected
             case "browser.chrome_snapshot":
-                if case .string(let lease)? = input["lease_id"] { return tool + ":" + lease }
+                if case .int(let tab)? = input["tab_id"] { return tool + ":" + String(tab) }
                 return tool
             default: return nil
             }
@@ -460,8 +460,7 @@ package actor AgentWorkspaceNavigation {
                 tabID: { if case .int(let id)? = row["tabId"] { return id }; return nil }())) {
             session.browserBookmark = bookmark
             if let identity = Self.placeIdentity(location) {
-                // A restored reference and its freshly acquired live view are
-                // the same window, even though the new lease is different.
+                // A restored reference and its current live view are the same window.
                 session.places.removeAll { $0 != location && Self.placeIdentity($0) == Self.placeIdentity(bookmark) }
                 session.browserBookmarks[identity] = bookmark
                 let retained = Set(session.places.compactMap(Self.placeIdentity))
@@ -574,8 +573,8 @@ package actor AgentWorkspaceNavigation {
            let identity = session.path.last.flatMap(Self.placeIdentity),
            case .browserBookmark(let url, let title, _)? = session.browserBookmarks[identity],
            case .object(let content) = projection.content, content["snapshotId"] == nil {
-            actions.insert(.init(label: "Reopen saved page in a background tab", action: .perform(
-                tool: "browser.chrome_acquire", input: ["mode": .string("create"), "url": .string(url)],
+            actions.insert(.init(label: "Open saved page in my browser tab", action: .perform(
+                tool: "browser.chrome_navigate", input: ["url": .string(url)],
                 title: title, textField: nil, isEffect: true)), at: 0)
         }
         if let source = session.document {
@@ -759,6 +758,7 @@ package enum AgentWorkspace {
         // a verb with a query means "open this by name", not two requests.
         if query != nil, let verb = action?.lowercased(), ["open", "go", "show", "select", "switch"].contains(verb) { action = nil }
         let suppliedText = try text(input["text"])
+        let suppliedConversation = try text(input["conversation"])
         let rawText: String?
         if case .string(let value)? = input["text"] { rawText = value } else { rawText = nil }
         let suppliedFields = input["fields"] == .null ? nil : input["fields"]
@@ -766,7 +766,7 @@ package enum AgentWorkspace {
               (action?.count ?? 0) <= 80, (rawText?.count ?? 0) <= 16000 else {
             throw AgentWorkspaceFailure(message: "Use find alone (a window name opens it; anything else finds it, up to 400 characters) or one item. Its text is limited to 16000 characters.")
         }
-        if action == nil, suppliedText != nil || suppliedFields != nil {
+        if action == nil, suppliedText != nil || suppliedFields != nil || suppliedConversation != nil {
             throw AgentWorkspaceFailure(message: "Text belongs to an item that needs it. app {page:\"home\", find} finds across your work.")
         }
         // 2026-09-23 (her screen): no arguments is her home page, never the
@@ -857,13 +857,25 @@ package enum AgentWorkspace {
                     switch try await screenName(action!) {
                     case .action(let found)?: selected = found
                     case .page(let page)?: return .string(page)
-                    case nil: throw error
+                    case nil:
+                        // A verb its item no longer offers is refused by name, never run on what it once named.
+                        let name = action!.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        if HerNamed.shared.withdrawn(dataRoot, name), let dot = name.lastIndex(of: ".") {
+                            throw AgentWorkspaceFailure(message: "\(name) is gone: \(name[..<dot]) no longer offers it. "
+                                + "Open \(name[..<dot]) for what it offers now. Nothing was run.")
+                        }
+                        throw error
                     }
                 }
             }
             if case .window(let inner) = selected {
                 await navigation.beginWindowSwitch(key: key)
                 selected = inner
+            }
+            if suppliedConversation != nil {
+                guard case .message(let agent, _, _, _) = selected, !agent.hasPrefix("bot:") else {
+                    throw AgentWorkspaceFailure(message: "A conversation label belongs to an agent message. Helpers use their existing chat. Nothing was sent.")
+                }
             }
             if suppliedFields != nil {
                 switch selected {
@@ -1115,9 +1127,11 @@ package enum AgentWorkspace {
                 result = receipt
             case .message(let agent, let conversation, let name, let document):
                 guard let suppliedText else { throw AgentWorkspaceFailure(message: "Give the message to send in text.") }
+                let conversation = suppliedConversation ?? conversation
                 var target: [String: JSONValue] = ["agent": .string(agent)]
                 if let conversation { target["conversation"] = .string(conversation) }
                 var observationTarget = target
+                if case .bool? = input["expects_reply"] { target["expects_reply"] = input["expects_reply"] }
                 if conversation == nil, !agent.hasPrefix("bot:"), let existing = try? AgentWorkspaceConversationReader(dataRoot: dataRoot).find(
                     scopeSessionID: scope, agent: agent, label: nil) {
                     observationTarget["conversation"] = .string(existing.label)
@@ -1176,8 +1190,9 @@ package enum AgentWorkspace {
         if case .home = location {
             // Her home is text: the model's picture. Earlier views' action ids stay valid.
             await navigation.enterHome(key: key)
+            let notable = await AgentWorkspaceMail.notableToday(perform: perform)
             return .string(await HerScreen.home(dataRoot: dataRoot, scope: scope, browserPages: await navigation.browserPages(key: key),
-                                                windows: await navigation.openWindowTitles(key: key)))
+                                                windows: await navigation.openWindowTitles(key: key), notable: notable))
         }
         try await navigation.navigate(location, key: key)
         // The other rooms home names (places, conversations, arrivals, windows,
@@ -1203,7 +1218,7 @@ package enum AgentWorkspace {
             return .string(room)
         }
         if case .find(let query) = location {
-            var projection = try await AgentWorkspaceFind.project(query: query, perform: perform)
+            var projection = try await AgentWorkspaceFind.project(query: query, dataRoot: dataRoot, perform: perform)
             let exactName = query.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: "_")
             if let schema = try? await AgentWorkspaceEnvironment.schema(exactName, catalog: catalog) {
                 // An exact advertised action name can open its ordinary form
@@ -1289,10 +1304,10 @@ package enum AgentWorkspace {
         let value = result ?? .null
         if case .record("browser.chrome_snapshot", let arguments, _) = location,
            case .object(let page) = value, page["ok"] != .bool(false), page["error"] == nil,
-           page["snapshotId"] != nil, case .string(let lease)? = page["leaseId"],
-           arguments["lease_id"] == nil || arguments["lease_id"] == .string(lease),
+           page["snapshotId"] != nil, case .int(let tab)? = page["tabId"],
+           arguments["tab_id"] == nil || arguments["tab_id"] == .int(tab),
            case .string(let title)? = page["title"], !title.isEmpty {
-            var boundArguments = arguments; boundArguments["lease_id"] = .string(lease)
+            var boundArguments = arguments; boundArguments["tab_id"] = .int(tab)
             let bound = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot", input: boundArguments, title: title)
             await navigation.bindCurrent(from: location, to: bound, key: key)
             location = bound

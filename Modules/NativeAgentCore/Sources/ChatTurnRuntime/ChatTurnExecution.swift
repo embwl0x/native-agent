@@ -54,7 +54,8 @@ extension SwiftNativeChatOrchestrationClient {
                 }
                 var response = ChatResponse(runId: UUID().uuidString, model: choice?.model ?? "",
                     reasoningEffort: choice?.reasoningEffort, output: partial, sessionId: sessionId, attachments: artifacts.isEmpty ? nil : artifacts)
-                response.runtimeStatus = error is CancellationError || budget.exhausted ? "interrupted" : "failed"
+                response.terminalState = error is CancellationError || budget.exhausted ? .interrupted : .failed
+                response.runtimeStatus = response.terminalState?.rawValue
                 response.statusDetail = budget.exhausted ? "Stopped at the per-run token limit."
                     : error is CancellationError ? "Stopped at the time limit or cancelled." : String(describing: error)
                 response.statusDetail = execution.statusDetail(response.statusDetail)

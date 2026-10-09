@@ -39,7 +39,7 @@ public enum DeskOpBody: Sendable, Equatable {
     case completeWorkSession(reservationId: String, receipt: String)
     case settleWorkSession(reservationId: String, receipt: String, disposition: DeskWorkDisposition, artifactRefs: [String])
     case reserveWorkAttempt(attemptId: String, lane: DeskWorkAttempt.Lane, day: String, slot: String)
-    case completeWorkAttempt(attemptId: String, receipt: String)
+    case completeWorkAttempt(attemptId: String, receipt: String, disposition: DeskWorkDisposition? = nil)
     case handOffWorkReceipt(reservationId: String)
     case workLog(receipt: String)   // desk_work_log — a plain work receipt note
     // Sequencing seam. Both REPLACE (never merge) so the op is the whole truth
@@ -170,9 +170,10 @@ public struct DeskOp: Sendable, Equatable {
             obj["lane"] = .string(lane.rawValue)
             obj["day"] = .string(day)
             obj["slot"] = .string(slot)
-        case let .completeWorkAttempt(attemptId, receipt):
+        case let .completeWorkAttempt(attemptId, receipt, disposition):
             obj["attemptId"] = .string(attemptId)
             obj["receipt"] = .string(receipt)
+            if let disposition { obj["disposition"] = .string(disposition.rawValue) }
         case let .handOffWorkReceipt(reservationId):
             obj["reservationId"] = .string(reservationId)
         case let .workLog(receipt):
@@ -300,7 +301,8 @@ public struct DeskOp: Sendable, Equatable {
         case "complete_work_attempt":
             guard let attemptId = jsonString(obj, "attemptId"),
                   let receipt = jsonString(obj, "receipt") else { return nil }
-            body = .completeWorkAttempt(attemptId: attemptId, receipt: receipt)
+            body = .completeWorkAttempt(attemptId: attemptId, receipt: receipt,
+                                        disposition: jsonString(obj, "disposition").flatMap(DeskWorkDisposition.init(rawValue:)))
         case "work_log":
             guard let receipt = jsonString(obj, "receipt") else { return nil }
             body = .workLog(receipt: receipt)

@@ -146,6 +146,9 @@ public struct AppControlRunResult: Sendable, Equatable {
 
 public protocol AppControlAdapter: Sendable {
     func focusApp(named name: String) async throws -> AppControlRunResult
+    /// The running app, or one launched without activating: nothing comes
+    /// to the front.
+    func launchApp(named name: String) async throws -> AppControlRunResult
     func quitApp(named name: String) async throws -> AppControlRunResult
 }
 
@@ -153,7 +156,8 @@ public protocol AppControlAdapter: Sendable {
 /// only that Launch Services accepted the request; callers must observe the
 /// screen separately before claiming where it landed.
 public protocol OpenTargetAdapter: Sendable {
-    func requestOpen(_ url: URL) async -> Bool
+    /// `background`: the handling app is not activated.
+    func requestOpen(_ url: URL, background: Bool) async -> Bool
 }
 
 /// Optional exact postcondition observer for application mutations. The
@@ -763,6 +767,16 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
         #endif
     }
 
+    public func launchApp(named name: String) async throws -> AppControlRunResult {
+        let query = normalizedAppQuery(name)
+        guard !query.isEmpty else { throw MacControlError.missingField("app") }
+        #if canImport(AppKit)
+        return try await Self.launchAppOnMain(named: query)
+        #else
+        throw MacControlError.appControlFailed("AppKit unavailable on this platform")
+        #endif
+    }
+
     public func quitApp(named name: String) async throws -> AppControlRunResult {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
@@ -817,12 +831,28 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
     }
 
     @MainActor
+    private static func launchAppOnMain(named query: String) async throws -> AppControlRunResult {
+        try Task.checkCancellation()
+        if let running = try runningApp(matching: query) {
+            return runResult(requested: query, app: running, launched: false, activated: false, terminated: false)
+        }
+        guard let url = applicationURL(matching: query) else {
+            throw MacControlError.appControlFailed("app_not_found: \(query)")
+        }
+        let launched = try await openApplication(at: url, activates: false)
+        return runResult(requested: query, app: launched, fallbackURL: url, launched: true, activated: false, terminated: false)
+    }
+
+    @MainActor
     private static func focusAppOnMain(named query: String) async throws -> AppControlRunResult {
         try Task.checkCancellation()
         if let running = try runningApp(matching: query) {
             guard MacDriverContext.binding?.allowsEmission == true else {
                 throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
             }
+            // macOS 14+ cooperative activation: the app in front (often this
+            // one) must yield, or the request is accepted and then ignored.
+            if #available(macOS 14.0, *) { NSApplication.shared.yieldActivation(to: running) }
             let activationRequestAccepted = running.activate(options: [.activateAllWindows])
             var fallbackAttempted = false
             var fallbackSucceeded = false
@@ -881,6 +911,7 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
         guard MacDriverContext.binding?.allowsEmission == true else {
             throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
         }
+        if #available(macOS 14.0, *) { NSApplication.shared.yieldActivation(to: launched) }
         let activationRequestAccepted = launched.activate(options: [.activateAllWindows])
         let activated = try await waitUntilFrontmost(pid: launched.processIdentifier)
         let failureReason = activated ? nil : activationFailureReason(
@@ -986,13 +1017,13 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
     }
 
     @MainActor
-    private static func openApplication(at url: URL) async throws -> NSRunningApplication {
+    private static func openApplication(at url: URL, activates: Bool = true) async throws -> NSRunningApplication {
         guard MacDriverContext.binding?.allowsEmission == true else {
             throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
         }
         return try await withCheckedThrowingContinuation { continuation in
             let config = NSWorkspace.OpenConfiguration()
-            config.activates = true
+            config.activates = activates
             NSWorkspace.shared.openApplication(at: url, configuration: config) { app, error in
                 if let error {
                     continuation.resume(throwing: MacControlError.appControlFailed(error.localizedDescription))
@@ -1021,31 +1052,51 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
     private static func runningApplications(matching query: String) -> [NSRunningApplication] {
         let running = NSWorkspace.shared.runningApplications
         let lower = query.lowercased()
+        // A person means the app with a Dock icon, not a helper or service
+        // that shares its name ("Google Chrome" alert service, 10-09).
+        func preferRegular(_ apps: [NSRunningApplication]) -> [NSRunningApplication] {
+            let regular = apps.filter { $0.activationPolicy == .regular }
+            return regular.isEmpty ? apps : regular
+        }
         if looksLikeBundleIdentifier(query) {
             let exactBundle = running.filter { ($0.bundleIdentifier ?? "").caseInsensitiveCompare(query) == .orderedSame }
-            if !exactBundle.isEmpty { return exactBundle }
+            if !exactBundle.isEmpty { return preferRegular(exactBundle) }
         }
         let exactName = running.filter { ($0.localizedName ?? "").caseInsensitiveCompare(query) == .orderedSame }
-        if !exactName.isEmpty { return exactName }
+        if !exactName.isEmpty { return preferRegular(exactName) }
         let exactBundle = running.filter { ($0.bundleIdentifier ?? "").caseInsensitiveCompare(query) == .orderedSame }
-        if !exactBundle.isEmpty { return exactBundle }
-        return running.filter { app in
+        if !exactBundle.isEmpty { return preferRegular(exactBundle) }
+        // "Mail" with Mail stopped and MailMate running means Mail: a partial
+        // name only when no app by that exact name is installed either.
+        guard applicationURL(matching: query) == nil else { return [] }
+        let partial = running.filter { app in
             let name = (app.localizedName ?? "").lowercased()
             let bundle = (app.bundleIdentifier ?? "").lowercased()
             return name.contains(lower) || bundle.contains(lower)
         }
+        return preferRegular(partial)
     }
 
     @MainActor
     private static func applicationURL(matching query: String) -> URL? {
+        if looksLikeBundleIdentifier(query),
+           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: query) {
+            return url
+        }
+        if let url = installedApplicationURL(named: query) { return url }
+        // Anywhere else Launch Services knows an app by exactly this name.
+        let name = query.hasSuffix(".app") ? String(query.dropLast(4)) : query
+        guard let path = NSWorkspace.shared.fullPath(forApplication: name) else { return nil }
+        let url = URL(fileURLWithPath: path)
+        return url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame ? url : nil
+    }
+
+    /// Exact name or bundle path, bounded to the standard application directories.
+    public static func installedApplicationURL(named query: String) -> URL? {
         let expandedQuery = (query as NSString).expandingTildeInPath
         if expandedQuery.hasPrefix("/"), expandedQuery.hasSuffix(".app") {
             let url = URL(fileURLWithPath: expandedQuery)
             if isApplicationBundle(url) { return url }
-        }
-        if looksLikeBundleIdentifier(query),
-           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: query) {
-            return url
         }
         let fm = FileManager.default
         let appName = query.hasSuffix(".app") ? query : "\(query).app"
@@ -1107,9 +1158,9 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
 public struct SystemOpenTargetAdapter: OpenTargetAdapter {
     public init() {}
 
-    public func requestOpen(_ url: URL) async -> Bool {
+    public func requestOpen(_ url: URL, background: Bool) async -> Bool {
         #if canImport(AppKit)
-        return await Self.requestOpenOnMain(url)
+        return await Self.requestOpenOnMain(url, background: background)
         #else
         return false
         #endif
@@ -1117,9 +1168,12 @@ public struct SystemOpenTargetAdapter: OpenTargetAdapter {
 
     #if canImport(AppKit)
     @MainActor
-    private static func requestOpenOnMain(_ url: URL) -> Bool {
+    private static func requestOpenOnMain(_ url: URL, background: Bool) async -> Bool {
         guard MacDriverContext.binding?.allowsEmission == true else { return false }
-        return NSWorkspace.shared.open(url)
+        guard background else { return NSWorkspace.shared.open(url) }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        return (try? await NSWorkspace.shared.open(url, configuration: configuration)) != nil
     }
     #endif
 }
@@ -1180,12 +1234,7 @@ public final class SystemFileManagerAdapter: FileManagerAdapter, FileStateVerifi
         try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [])
     }
     public func moveItem(from src: URL, to dst: URL) throws {
-        let fm = FileManager.default
-        let parent = dst.deletingLastPathComponent()
-        if !fm.fileExists(atPath: parent.path) {
-            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
-        }
-        try fm.moveItem(at: src, to: dst)
+        try VerifiedPath.transfer(from: src, to: dst, copy: false, overwrite: false)
     }
     public func trashItem(at url: URL) throws {
         var resulting: NSURL? = nil

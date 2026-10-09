@@ -25,7 +25,7 @@ enum DreamsREMRunAvailability: Equatable {
         case .enabled:
             return "I reread the last week of dreams, draft up to five growth notes from patterns that recur on two or more days, and send them to you for approval. Dreams older than two weeks move to the archive."
         case .disabled:
-            return "REM cycle is disabled. Enable the REM cycle toggle."
+            return "Weekly dream consolidation is off. Turn it on in Settings \u{25B8} Inner life."
         case .unavailable:
             return "REM-cycle permission could not be read. Refresh and retry."
         }

@@ -47,27 +47,27 @@ struct ActivityCapturePermissionsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
-            section("Activity capture") {
+            AdvancedSection(title: "Activity capture") {
                 masterToggle
                 recordedFacts
                 if !controller.issues.isEmpty {
                     issuesRow
                 }
             }
-            section("Window titles") {
+            AdvancedSection(title: "Window titles") {
                 titleControls
             }
-            section("My access") {
+            AdvancedSection(title: "My access") {
                 modelAccessControl
             }
-            section("Excluded apps") {
+            AdvancedSection(title: "Excluded apps") {
                 exclusionList
             }
-            section("Keep history for") {
+            AdvancedSection(title: "Keep history for") {
                 retentionAndWipe
             }
             Text("Changes here apply right away.")
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
         }
         .accessibilityElement(children: .contain)
@@ -104,13 +104,6 @@ struct ActivityCapturePermissionsView: View {
         }
     }
 
-    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(title)
-            AliveGroupCard { content() }
-        }
-    }
-
     /// A switch row: the words on the left, the switch on the right.
     private func switchRow(
         _ title: String,
@@ -120,11 +113,11 @@ struct ActivityCapturePermissionsView: View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                 if let detail {
                     Text(detail)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -149,7 +142,7 @@ struct ActivityCapturePermissionsView: View {
     private var masterToggle: some View {
         HStack(alignment: .center, spacing: 12) {
             Text("Record which apps you use")
-                .font(.system(size: 14, weight: .medium))
+                .font(ShellType.rowTitle)
                 .foregroundStyle(NativeAgentShell.text)
             Spacer(minLength: 12)
             Toggle(
@@ -189,7 +182,7 @@ struct ActivityCapturePermissionsView: View {
                 systemImage: "lock"
             )
         }
-        .font(.system(size: 12))
+        .font(ShellType.rowDetail)
         .foregroundStyle(NativeAgentShell.secondary)
         .fixedSize(horizontal: false, vertical: true)
     }
@@ -197,18 +190,18 @@ struct ActivityCapturePermissionsView: View {
     private var issuesRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             Label("Activity capture notices", systemImage: "exclamationmark.triangle.fill")
-                .font(.system(size: 13, weight: .semibold))
+                .font(ShellType.labelSemibold)
                 .foregroundStyle(issueColor(controller.primaryIssue?.severity ?? .notice))
             ForEach(controller.presentationIssues) { issue in
                 HStack(alignment: .top, spacing: 6) {
                     Label(issue.severity.title, systemImage: issue.severity.systemImage)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(ShellType.rowDetail.weight(.semibold))
                         .foregroundStyle(issueColor(issue.severity))
                     Text(issue.occurredAt, style: .time)
-                        .font(.system(size: 11).monospacedDigit())
+                        .font(ShellType.caption.monospacedDigit())
                         .foregroundStyle(NativeAgentShell.secondary)
                     Text(issue.message)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.text)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -232,16 +225,16 @@ struct ActivityCapturePermissionsView: View {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title)
-                        .font(.system(size: 14, weight: .medium))
+                        .font(ShellType.rowTitle)
                         .foregroundStyle(NativeAgentShell.text)
                     Text(detail)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 12)
                 Text("On with Full Mac")
-                    .font(.system(size: 12))
+                    .font(ShellType.rowDetail)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .help("Full Mac lets me answer from your recorded activity in trusted chats. In narrower modes this is a switch. Recording must still be on.")
             }
@@ -324,7 +317,7 @@ struct ActivityCapturePermissionsView: View {
                 """)
             }
         }
-        .font(.system(size: 12))
+        .font(ShellType.rowDetail)
         .foregroundStyle(NativeAgentShell.secondary)
         .fixedSize(horizontal: false, vertical: true)
     }
@@ -352,7 +345,7 @@ struct ActivityCapturePermissionsView: View {
             apps are excluded from the start. Adding an app here also deletes what I already \
             recorded for it.
             """)
-            .font(.system(size: 12))
+            .font(ShellType.rowDetail)
             .foregroundStyle(NativeAgentShell.secondary)
             .fixedSize(horizontal: false, vertical: true)
 
@@ -372,7 +365,7 @@ struct ActivityCapturePermissionsView: View {
                         : "Deleted \(purged) recorded row\(purged == 1 ? "" : "s").",
                     systemImage: "trash"
                 )
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
             }
         }
@@ -397,13 +390,13 @@ struct ActivityCapturePermissionsView: View {
             }
             .padding(.top, 8)
         }
-        .font(.system(size: 13))
+        .font(ShellType.label)
 
         // The non-overridable exclusions are shown as a fact, not as a
         // control, because they cannot be removed and a disabled row that
         // looks removable is a lie about who is in charge.
         Text("I never record my own windows or the lock screen. Those two can't be turned off.")
-            .font(.system(size: 12))
+            .font(ShellType.rowDetail)
             .foregroundStyle(NativeAgentShell.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -426,7 +419,7 @@ struct ActivityCapturePermissionsView: View {
             .hazeTinted(.segments)
             .labelsHidden()
             Text("Anything older is deleted on its own. Shortening this deletes the extra at the next cleanup.")
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

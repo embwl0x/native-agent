@@ -105,7 +105,7 @@ struct SimpleSetupPanel<Content: View>: View {
                     }
                 }
                 .background { if reduceTransparency { shape.fill(NativeAgentShell.room) } }
-                .glassEffect(reduceTransparency ? .identity : .regular, in: shape)
+                .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
                 .padding(32)
             Button("Close", action: close)
                 .keyboardShortcut(.cancelAction)

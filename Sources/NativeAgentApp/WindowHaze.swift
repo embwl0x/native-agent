@@ -19,8 +19,8 @@ import AppToolRuntime
 // core is derived from that so the overlap never exceeds `peakAlpha`. At 0.35
 // (0.5 since User's first look: 0.35 read as no haze at all; body text keeps >6:1)
 // the lightest preset shade (amber #dc9a3d) over the dark room (#12161F)
-// measures L ≈ 0.064: body text (#F6F3EE) keeps ≈ 8:1 and even the secondary
-// token (#C1C6CC) keeps ≈ 5:1.
+// measures L ≈ 0.064. Text now uses native label colours; small reading labels
+// over the lifted glass use primary-label ink at 85% opacity.
 
 import AppKit
 import SwiftUI
@@ -46,6 +46,15 @@ extension HazeColor {
 
     /// The swatch colour: the middle-bright shade.
     var swatch: Color { Color(nsColor: HazeColor.nsColor(shades[0])) }
+
+    /// Root control ink: retain the dark swatch, deepen it on the light room.
+    func windowTint(dark: Bool) -> Color {
+        guard !dark else { return base }
+        let deep = HazeColor.nsColor(shades[1])
+        return Color(nsColor: NSColor(srgbRed: deep.redComponent * 0.7,
+                                     green: deep.greenComponent * 0.7,
+                                     blue: deep.blueComponent * 0.7, alpha: 1))
+    }
 
     static func nsColor(_ hex: UInt) -> NSColor {
         NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
@@ -138,7 +147,7 @@ private struct SegmentBezelTint: NSViewRepresentable {
 enum HazeMood: Equatable {
     case idle, busy, replying
 
-    /// Container opacity, dark appearance. Light takes half.
+    /// Container opacity, dark appearance. Light takes 0.85 of it (pale shades).
     var opacity: Float {
         switch self {
         case .idle: return 0.52
@@ -170,6 +179,9 @@ struct WindowHaze: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    /// The conversation whose turn moves the haze: a detached chat window's
+    /// own. nil is the main window's active chat.
+    var sessionId: String? = nil
 
     var body: some View {
         if !reduceTransparency {
@@ -189,8 +201,10 @@ struct WindowHaze: View {
     /// split by whether reply text has started to arrive. Every input is a
     /// set that changes a few times per turn, never per token.
     private var mood: HazeMood {
-        guard let appModel, appModel.isBusy || appModel.isChatStreaming else { return .idle }
-        return appModel.engine.turns.replyingSessions.contains(appModel.activeChatSessionId) ? .replying : .busy
+        guard let appModel else { return .idle }
+        let id = sessionId ?? appModel.activeChatSessionId
+        guard appModel.engine.turns.isBusy(id) || appModel.engine.turns.isStreaming(id) else { return .idle }
+        return appModel.engine.turns.replyingSessions.contains(id) ? .replying : .busy
     }
 }
 
@@ -341,7 +355,11 @@ final class HazeView: NSView {
             CATransaction.setAnimationDuration(self.color == nil ? 0 : 1.2)
             CATransaction.setDisableActions(self.color == nil)
             for (disc, hex) in zip(discs, color.shades) {
-                let base = HazeColor.nsColor(hex)
+                // Light room (2026-10-09): the dark-tuned shades at half weight
+                // were a grey-green cast over everything. Pale shades at full
+                // weight read as coloured light on paper instead.
+                let shade = HazeColor.nsColor(hex)
+                let base = dark ? shade : (shade.blended(withFraction: 0.5, of: .white) ?? shade)
                 let k = Self.core
                 disc.colors = [k, k * 0.9, k * 0.45, 0].map { base.withAlphaComponent($0).cgColor }
             }
@@ -365,7 +383,7 @@ final class HazeView: NSView {
     /// Ease the container toward the current state: opacity by one CA fade,
     /// tempo by a short main-thread ramp (a speed change is not animatable).
     private func retarget() {
-        let targetOpacity = mood.opacity * (dark ? 1 : 0.5)
+        let targetOpacity = mood.opacity * (dark ? 1 : 0.85)
         let from = weight.presentation()?.opacity ?? weight.opacity
         if from != targetOpacity {
             let fade = CABasicAnimation(keyPath: "opacity")

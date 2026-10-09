@@ -11,6 +11,7 @@ import ChromeControl
 import ContextFlow
 import BackgroundLoops
 import MemoryV2
+import NotificationInbox
 import PersistenceCore
 import Desk
 import Transcripts
@@ -19,11 +20,15 @@ import PersonaEngine
 import Skills
 import MCPDispatcher
 import GitHubConnector
+import SlackConnector
+import Connectors
 import Browser
 import Cognition
 import OSLog
 import os
 import DeviceSync
+import AppToolRuntime
+import NativeAgentShared
 
 private struct AppDerivedStateInvalidationSink: DerivedStateInvalidationSink {
     let dataRoot: URL
@@ -51,6 +56,13 @@ extension AppDelegate {
         // A clicked banner has to reach the app: without a delegate, the
         // identity a Desk reminder carries goes nowhere.
         UNUserNotificationCenter.current().delegate = self
+        // Her `app` actions read by their buttons' words on every door.
+        // A folded action is shown as its tool (files.write → write_file).
+        let labels = AppActions.all.flatMap { action in
+            [(action.id, action.label)] + (action.isFold && action.label != action.tool ? [(action.tool, action.label)] : [])
+        }
+        ToolActivityPresentation.installActionLabels(
+            Dictionary(labels, uniquingKeysWith: { first, _ in first }))
         NativeAgentNotificationActions.register()
         AnchorReplyMirror.start()
         NativeAgentShortcuts.updateAppShortcutParameters()
@@ -60,19 +72,17 @@ extension AppDelegate {
         do {
             try NativeAgentBuildIdentity.current.writeLaunchStamp(root: NativeAgentPaths.dataRoot)
         } catch {
-            NSLog("[launch] Could not record app start time: %@", error.localizedDescription)
+            nativeLog("[launch] Could not record app start time: %@", error.localizedDescription)
         }
-        // An app update reaches a Chrome extension the person already set up.
-        DispatchQueue.global(qos: .utility).async { ChromeExtensionFolder.refreshIfPresent() }
         do {
             _ = try NativeAgentWorkspaceRoot.prepare(dataRoot: NativeAgentPaths.dataRoot)
-            NSLog("[workspace] canonical work root ready")
+            nativeLog("[workspace] canonical work root ready")
         } catch {
             // Chat and private state can still start; file/build tools will
             // return their normal checked failure if the directory remains
             // unavailable. Do not replace a recoverable workspace error with a
             // second app-lifecycle gate.
-            NSLog("[workspace] canonical work root unavailable: %@", error.localizedDescription)
+            nativeLog("[workspace] canonical work root unavailable: %@", error.localizedDescription)
         }
         Task { await finishLaunching() }
     }
@@ -90,7 +100,7 @@ extension AppDelegate {
         await AppRestartCoordinator.shared.configure(
             scheduleTerminate: { graceSeconds in
                 DispatchQueue.main.asyncAfter(deadline: .now() + graceSeconds) {
-                    NSLog("[restart_app] grace elapsed — terminating for relaunch")
+                    nativeLog("[restart_app] grace elapsed — terminating for relaunch")
                     // Off this main-queue block: a held quit spins a nested run
                     // loop, and the main queue cannot drain while one of its own
                     // blocks is still on the stack — MainActor work would stall.
@@ -101,6 +111,8 @@ extension AppDelegate {
             },
             spawnRelauncher: AppRelauncher.spawnDetached(argv:)
         )
+        // Finish updating the folder before the runtime can ask Chrome to reload it.
+        await Task.detached(priority: .utility) { ChromeExtensionFolder.refreshIfPresent() }.value
         do {
             // 2026-09-18: a first-format migration can visit every execution.
             // Let AppKit finish launching while it runs; runtime ingress and
@@ -110,7 +122,7 @@ extension AppDelegate {
                 // P2-7: the legacy missions/ absorption is deleted; the only
                 // passes that can report didMigrate now are the execution.json
                 // record rename and receipts_dir pointer repair.
-                NSLog(
+                nativeLog(
                     "[workshop-migration] normalized execution records: changed=%d conflicts=%d receipt=%@",
                     report.moved.count,
                     report.conflictsPreservedInArchive.count,
@@ -118,15 +130,26 @@ extension AppDelegate {
                 )
             }
         } catch {
+            nativeLog("%@", "[workshop-migration] failed: \(error)")
             let alert = NSAlert()
             alert.alertStyle = .critical
             alert.messageText = "Desk execution storage migration failed"
-            alert.informativeText = "NativeAgent stopped before starting background work so no task state is lost. \(error.localizedDescription)"
+            alert.informativeText = "NativeAgent stopped before starting background work so no task state is lost. "
+                + UserFacingError.advice(for: error)
             alert.addButton(withTitle: "Quit")
             alert.runModal()
             NSApp.terminate(nil)
             return
         }
+        // Normalize skills before background work and remote tool ingress start.
+        await SkillRegistryMigration.runIfNeeded(dataRoot: PersistenceCore.defaultDataRoot())
+        do { try await SwiftNativeSkillsClient(root: PersistenceCore.defaultDataRoot()).migrateScriptInterpreter() }
+        catch { NSLog("Skill interpreter migration failed: %@", error.localizedDescription) }
+        // Before Slack's ingress starts: its tokens move from files to Keychain.
+        do { try SlackCredentials.migrate(dataRoot: NativeAgentPaths.dataRoot) }
+        catch { nativeLog("[slack-credential] Keychain migration failed: %@", error.localizedDescription) }
+        do { try await ConnectorOAuthRegistry.migrateXCredentials(dataRoot: NativeAgentPaths.dataRoot) }
+        catch { nativeLog("[x-credential] Keychain migration repair state unavailable: %@", error.localizedDescription) }
         Task.detached(priority: .utility) {
             let logger = Logger(subsystem: "com.nativeagent.app", category: "github-credential")
             await GitHubCommandRuntime.shared.replayResidentStateAtLaunch()
@@ -199,6 +222,7 @@ extension AppDelegate {
         // once from this guaranteed application lifecycle callback.
         NativeAgentAppCoordinator.shared.applicationDidFinishLaunching()
         Task.detached(priority: .utility) {
+            await NativeAgentEngine.live.chrome.observeBrowserLaunches()
             await NativeAgentEngine.live.chrome.reconcilePolicy()
         }
 
@@ -214,12 +238,11 @@ extension AppDelegate {
                 )
             } catch {
                 logger.error("MemoryV2 canonical storage unavailable; migration and projections refused: \(String(describing: error), privacy: .public)")
-                let detail = SwiftNativeMemoryV2.sharedOpenFailure ?? String(describing: error)
                 await MainActor.run {
                     let alert = NSAlert()
                     alert.alertStyle = .critical
                     alert.messageText = "Memory did not open"
-                    alert.informativeText = "NativeAgent is running without memory this session: nothing is recalled or saved. Doctor shows the same error under Live memory store.\n\n\(detail)"
+                    alert.informativeText = "NativeAgent is running without memory this session: nothing is recalled or saved. Doctor shows the details under Live memory store."
                     alert.addButton(withTitle: "OK")
                     alert.runModal()
                 }
@@ -311,8 +334,7 @@ extension AppDelegate {
             if downloadDescriptor?.distribution != "separate-download" {
                 await reconcileMemoryEmbeddingEpochAtLaunch()
             }
-            // One-time skill registry repairs, before recall reads the registry.
-            await SkillRegistryMigration.runIfNeeded(dataRoot: PersistenceCore.defaultDataRoot())
+            await SkillRegistryMigration.inheritBuiltInDescriptions(dataRoot: PersistenceCore.defaultDataRoot())
             await syncSkillPointerIndex()
         }
         // The transcript-aging lane defers through the same body throttle as
@@ -347,6 +369,8 @@ extension AppDelegate {
             await GitHubCommandRuntime.shared.replayResidentStateAtLaunch()
             // The one engine root, built here before the loops ask it for clients.
             _ = NativeAgentEngine.live
+            do { try await SensesAssembly.waitUntilReady() }
+            catch { nativeLog("[senses] Launch registration unavailable: %@", error.localizedDescription) }
             let loops = BackgroundLoopsAssembly.assembleAllLoops()
             await installBotProviderCheck()
             await BackgroundLoopsManager.shared.start(loops: loops)
@@ -464,13 +488,33 @@ extension AppDelegate {
                 _ = try await SwiftNativeBrowserClient.defaultClient()
                     .executeBrowserOperation(.recoverStrandedRunning)
             } catch {
-                NSLog("[browser] restart recovery failed: %@", String(describing: error))
+                nativeLog("[browser] restart recovery failed: %@", String(describing: error))
             }
             await NativeClient.reconcileUnappliedApprovalExecutions()
             // Terminal-event reconciliation normally stages this exact card.
             // Launch repair closes the safe crash/restart gap without a poll:
             // if enough canonical procedure receipts already exist, stage the
-            // same local-only activation review once.
+            // same local-only activation review once. First, once ever,
+            // re-check legacy v1 procedures against their reviewed evidence so
+            // the ones that still match load again; any that cannot stay off
+            // and leave one inbox line saying why.
+            let procedureDataRoot = PersistenceCore.defaultDataRoot()
+            for line in await WorkshopProcedureLegacyRevalidation.runIfNeeded(dataRoot: procedureDataRoot) {
+                let cardID = "procedure-legacy-revalidation-\(CausalTransitionEvidence.opaqueIdentity(line).prefix(16))"
+                _ = try? await LiveNotificationInbox(
+                    path: LiveNotificationInbox.livePath(dataRoot: procedureDataRoot)
+                ).appendUnique(.object([
+                    "id": .string(cardID),
+                    "created_at": .string(NativeTimestampFormat.fractionalZulu(Date())),
+                    "source": .string("workshop"),
+                    "severity": .string("info"),
+                    "title": .string("A saved procedure stays off"),
+                    "summary": .string(line),
+                    "actions": .array([.object(["id": .string("dismiss"), "label": .string("Dismiss"),
+                                                "description": .string("Dismiss this card")])]),
+                    "status": .string("unread"),
+                ]), id: cardID)
+            }
             await WorkshopProcedureExactActivationCoordinator
                 .reconcileLocalFileCopyIfQualified()
             // U2b wave 2: self-evolution lane, in dependency order —
@@ -541,7 +585,7 @@ extension AppDelegate {
         // DispatchQueue dispatch (not Task.detached) so the actor isolation
         // can't defer it past application launch finish — mirrors
         // MacControlBridge above.
-        NSLog("[claude-bootstrap] dispatching ClaudeBridge.startServer on dispatch queue")
+        nativeLog("[claude-bootstrap] dispatching ClaudeBridge.startServer on dispatch queue")
         DispatchQueue.global(qos: .userInitiated).async {
             ClaudeBridge.shared.startSyncForBootstrap()
             NativeAgentA2AGRPCListener.shared.start()
@@ -567,8 +611,9 @@ extension AppDelegate {
         // PATCH-2026-05-07: app-owned runtime Auto-register for login start so
         // the menu-bar app is always there. Idempotent — calling register()
         // when already enabled is a no-op.
-        // 2026-09-22: a first run registers from finishSuccessfulOnboarding
-        // instead, so a new user is not added to login items before setup.
+        // 2026-09-22: a first run registers once the first greeting has been
+        // delivered (AppModel.maybeSendFirstRunGreeting) instead, so a new
+        // user is not added to login items before setup.
         if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: NativeAgentPaths.dataRoot) {
             AppDelegate.registerLoginItemInBackground()
         }
@@ -642,7 +687,7 @@ extension AppDelegate {
         let runs = NativeAgentEngine.live.turns.inFlightRunIDs()
         guard !runs.isEmpty, !Self.restartQuit.withLock({ $0 }) else { return .terminateNow }
         Self.quitWaitingForTurns = true
-        NSLog("[quit] holding quit for %d in-flight turn(s), at most 20s", runs.count)
+        nativeLog("[quit] holding quit for %d in-flight turn(s), at most 20s", runs.count)
         Task.detached {
             let deadline = ContinuousClock.now + .seconds(20)
             while !NativeAgentEngine.live.turns.inFlightRunIDs().isDisjoint(with: runs),
@@ -651,7 +696,7 @@ extension AppDelegate {
                 try? await Task.sleep(for: .milliseconds(200))
             }
             let left = NativeAgentEngine.live.turns.inFlightRunIDs().intersection(runs).count
-            NSLog("[quit] %@", left == 0 ? "turns finished — quitting" : "\(left) turn(s) still running at the bound — quitting anyway")
+            nativeLog("[quit] %@", left == 0 ? "turns finished — quitting" : "\(left) turn(s) still running at the bound — quitting anyway")
             // A run-loop block, not MainActor.run: if the Quit came from inside
             // a main-queue block (a MainActor task), the main queue cannot drain
             // until that block returns, and the reply would never be delivered.
@@ -712,6 +757,11 @@ extension AppDelegate {
         group.enter()
         Task.detached {
             await BackgroundLoopsManager.shared.shutdown()
+            group.leave()
+        }
+        group.enter()
+        Task.detached {
+            await SensesAssembly.shutdown()
             group.leave()
         }
         // Workshop execution memories are written OFF the terminal path by a

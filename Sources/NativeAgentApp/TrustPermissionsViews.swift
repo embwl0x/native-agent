@@ -51,10 +51,10 @@ struct ChromeControlPermissionsView: View {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Chrome control")
-                        .font(.system(size: 14, weight: .medium))
+                        .font(ShellType.rowTitle)
                         .foregroundStyle(NativeAgentShell.text)
                     Text("I use Chrome while you are signed in. I can open background tabs or work in a selected tab. I stop using a tab when you interact with it and check this permission before every action.")
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -100,7 +100,7 @@ struct ChromeControlPermissionsView: View {
                 DisclosureGroup("How to set up again") {
                     setupSteps.padding(.top, 8)
                 }
-                .font(.system(size: 13))
+                .font(ShellType.label)
             } else {
                 setupSteps
             }
@@ -114,16 +114,16 @@ struct ChromeControlPermissionsView: View {
             }
             .accessibilityIdentifier("trust.chrome.setup")
             Text("Set up Chrome puts the extension in your home folder, shows it in Finder and opens Chrome's extensions page. Then:\n1. On that page, turn on Chrome's Developer mode (top right).\n2. Click Load unpacked.\n3. Choose the \"\(ChromeExtensionFolder.visible.lastPathComponent)\" folder in your home folder, or drag it from Finder onto the page.")
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             Text("I set up my part automatically. The extension is a separate step on each Mac and does not sync with your Google account. The purple NativeAgent tab group can sync even when the extension is missing.")
-                .font(.system(size: 12))
+                .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if let chromeSetupMessage {
                 Text(chromeSetupMessage)
-                    .font(.system(size: 12))
+                    .font(ShellType.rowDetail)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -232,13 +232,8 @@ struct TrainingPermissionsView: View {
     @State private var draftTraining = TrustTrainingPolicy()
     @State private var draftPromotion = TrustPromotionPolicy()
     @State private var isSaving = false
-    /// The EFFECTIVE dream gate (dream_scheduler AND dream_cycle_enabled), read
-    /// through the same composite the Dreams page and Setup read. `trustPolicy`
-    /// carries no personalityPolicy block, so it cannot come from the drafts.
-    @State private var draftDreamComposite = false
     @State private var completedInitialRead = false
     @State private var loadedPolicy: TrustPolicy?
-    @State private var dreamReadGate = LatestAsyncRequestGate()
     @State private var unattendedReadGate = LatestAsyncRequestGate()
 
     /// Alive glass (2026-09-23): the master switch in its own group card, then
@@ -252,8 +247,8 @@ struct TrainingPermissionsView: View {
                 FeatureSwitchRow(
                     title: "Let me work unattended",
                     detail: unattendedForced
-                        ? "Your current Trust settings let me work unattended: bots on their schedules, practice runs and background improvement. Change those settings in Trust to turn it off. Run once is you asking, so it works either way."
-                        : "The main switch for background work: scheduled bots and replies to events, practice runs and app improvements. Run once is you asking, so it works either way. Even with this on, I can only change my own files inside NativeAgent, never the rest of your Mac.",
+                        ? "Full Mac access keeps me working unattended: helpers on their schedules, practice runs and background improvement. Choosing Safe on the Access tab turns it off. Work mode and Builder keep it on but unlock this switch, so you can turn it off here. Run once still works either way, because that is you asking."
+                        : "The main switch for background work: helpers on their schedules and replies to events, practice runs and app improvements. Run once still works either way, because that is you asking. Even with this on, I can only change my own files inside NativeAgent, never the rest of your Mac.",
                     isOn: Binding(
                         get: { draftEnableAutonomy || unattendedForced },
                         set: { newValue in
@@ -267,7 +262,7 @@ struct TrainingPermissionsView: View {
             }
             // Taste pass 2026-07-24: was "Autonomous Training", an exact echo
             // of the card title directly above it.
-            featureSection("Practice runs") {
+            AdvancedSection(title: "Practice runs") {
                 FeatureSwitchRow(
                     title: "Let me practice on my own",
                     detail: "I work through my own saved exercises in the background, notice where my answers have slipped, and write up suggested changes. I never apply a change on my own; every suggestion waits for you.",
@@ -288,36 +283,15 @@ struct TrainingPermissionsView: View {
                         }
                     )
                 )
-                // Sweep R4 C9 — COPY ONLY. The detail was a raw endpoint path
-                // for a daemon that no longer exists (README "What exists
-                // today": the Swift app owns the runtime in-process).
-                FeatureSwitchRow(
-                    title: "Run dream cycle nightly",
-                    detail: "Once a night at 3:30 AM I look back over recent conversations and what I learned that day, write it up as a dated diary entry, and leave you a short digest in the morning. Needs practice runs turned on above.",
-                    isOn: Binding(
-                        // 2026-09-06: this read and wrote trainingPolicy
-                        // .dream_scheduler alone, while the runtime requires
-                        // dream_scheduler AND personalityPolicy
-                        // .dream_cycle_enabled (DreamREMGatePolicy.dreamEnabled)
-                        // and Setup's "Dreams at night" row moves both. Turning
-                        // dreams off in Setup therefore left this switch showing
-                        // ON with dreams dead. Both controls now show and set
-                        // the EFFECTIVE gate, through the same composite write.
-                        get: { draftDreamComposite },
-                        set: { newValue in
-                            draftDreamComposite = newValue  // optimistic — no snap-back
-                            Task { await saveDreamCycle(newValue) }
-                        }
-                    )
-                )
-                .disabled(!draftTraining.autonomous_training)
+                // The nightly dream switch is Settings ▸ Inner life's
+                // "Dreams at night" alone (one gate, one home).
             }
 
             // PATCH-2026-05-07: self-improvement-ui Promotion engine trust toggles
             // Sweep R4 C9 — COPY ONLY. "Promotion engine" was the internal
             // component name; what the user is granting is an automatic
             // check that a proposed change is good enough to keep.
-            featureSection("Automatic review") {
+            AdvancedSection(title: "Automatic review") {
                 // Sweep R4 C9 — COPY ONLY. The detail was a raw endpoint path
                 // plus "harness eval", neither of which appears anywhere else
                 // in the UI.
@@ -385,7 +359,6 @@ struct TrainingPermissionsView: View {
             guard !completedInitialRead || loadedPolicy != policy else { return }
             if !isSaving {
                 syncDraftsFromPolicy()
-                await refreshDreamComposite()
             }
             guard !Task.isCancelled else { return }
             await refreshUnattended()
@@ -394,17 +367,8 @@ struct TrainingPermissionsView: View {
             completedInitialRead = true
         }
         .onDisappear {
-            _ = dreamReadGate.begin()
             _ = unattendedReadGate.begin()
         }
-    }
-
-    private func featureSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(title)
-            AliveGroupCard { content() }
-        }
-        .accessibilityElement(children: .contain)
     }
 
     /// Check the authority override independently of the raw autonomy toggle.
@@ -415,23 +379,6 @@ struct TrainingPermissionsView: View {
         let yolo = await WorkshopBackgroundWork.isWideOpenTrust(dataRoot: root)
         guard !Task.isCancelled, unattendedReadGate.accepts(request) else { return }
         unattendedForced = fullMac || yolo
-    }
-
-    private func refreshDreamComposite() async {
-        let request = dreamReadGate.begin()
-        let enabled = await appModel.engine.cognitionView.dreamEnabled()
-        guard !Task.isCancelled, dreamReadGate.accepts(request) else { return }
-        draftDreamComposite = enabled
-    }
-
-    /// One call: the two gates move together, and this is the same composite
-    /// write the Dreams page and Setup's "Dreams at night" row make.
-    private func saveDreamCycle(_ enabled: Bool) async {
-        isSaving = true
-        _ = await appModel.setDreamCycleEnabled(enabled)
-        isSaving = false
-        syncDraftsFromPolicy()
-        await refreshDreamComposite()
     }
 
     private func syncDraftsFromPolicy() {
@@ -617,7 +564,7 @@ struct LivingMemoryPermissionsView: View {
                 HStack(spacing: 8) {
                     AliveWaitingDot()
                     Text("\(pendingCount) memory suggestion\(pendingCount == 1 ? "" : "s") waiting for you in Memory")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(ShellType.labelMedium)
                         .foregroundStyle(NativeAgentShell.text)
                 }
             }
@@ -670,11 +617,11 @@ private struct FeatureSwitchRow: View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(ShellType.rowTitle)
                     .foregroundStyle(NativeAgentShell.text)
                 if let detail {
                     Text(detail)
-                        .font(.system(size: 12))
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -696,7 +643,7 @@ private struct FeatureNote: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 12))
+            .font(ShellType.rowDetail)
             .foregroundStyle(NativeAgentShell.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -713,12 +660,16 @@ struct TrustBoundaryRow: View {
             Image(systemName: systemImage)
                 .foregroundStyle(tint)
                 .frame(width: 22)
-            VStack(alignment: .leading, spacing: 3) {
+            // The privacy map's row type, so the two Advanced cards read at
+            // one size.
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                 Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .textSelection(.enabled)

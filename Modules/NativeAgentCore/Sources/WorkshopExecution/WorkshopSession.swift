@@ -88,6 +88,13 @@ public struct WorkshopSession: WorkshopSessionRunning {
         // after the claim consumes the slot (fail closed) rather than risking a
         // second unattended provider run.
         guard claimStore.claim(handle: request.handle, reservationId: request.reservationId) else {
+            do {
+                if try claimStore.isUnstarted(reservationId: request.reservationId) {
+                    return refused("reservation was settled unstarted before execution admission", request, disposition: .unstarted)
+                }
+            } catch {
+                return refused("reservation claim unavailable: \(String(error.localizedDescription.prefix(600)))", request)
+            }
             return refused("reservation already claimed or claim could not be made durable", request)
         }
 
@@ -194,10 +201,10 @@ public struct WorkshopSession: WorkshopSessionRunning {
         return receipt
     }
 
-    private func refused(_ why: String, _ request: WorkshopSessionRequest) -> WorkshopSessionReceipt {
+    private func refused(_ why: String, _ request: WorkshopSessionRequest, disposition: DeskWorkDisposition = .blocked) -> WorkshopSessionReceipt {
         WorkshopSessionReceipt(
             handle: request.handle, reservationId: request.reservationId,
-            status: .refused, summary: why, model: nil, artifactPaths: [], generatedAt: now(), disposition: .blocked)
+            status: .refused, summary: why, model: nil, artifactPaths: [], generatedAt: now(), disposition: disposition)
     }
 
     private enum TurnOutcome: Sendable {
@@ -289,7 +296,7 @@ public struct WorkshopAutonomyResolver: AutonomyResolver {
 struct WorkshopReservationClaimStore: Sendable {
     let dataRoot: URL
 
-    func claim(handle: String, reservationId: String) -> Bool {
+    func claim(handle: String, reservationId: String, unstarted: Bool = false) -> Bool {
         guard let safeReservation = try? WorkshopArtifactWriter.validateSafeComponent(reservationId),
               let safeHandle = try? WorkshopArtifactWriter.validateSafeComponent(handle) else {
             return false
@@ -332,6 +339,7 @@ struct WorkshopReservationClaimStore: Sendable {
             "handle": .string(safeHandle),
             "reservationId": .string(safeReservation),
             "claimedAt": .string(ISO8601DateFormatter().string(from: Date())),
+            "unstarted": .bool(unstarted),
         ])
         guard var payload = try? row.serialize(pretty: false) else { return false }
         payload += "\n"
@@ -361,5 +369,20 @@ struct WorkshopReservationClaimStore: Sendable {
         } catch {
             return false
         }
+    }
+
+    func isUnstarted(reservationId: String) throws -> Bool {
+        let safe = try WorkshopArtifactWriter.validateSafeComponent(reservationId)
+        let data = try Data(contentsOf: dataRoot.appendingPathComponent("workshop/reservation_claims/\(safe).claim"))
+        guard case .object(let object) = try JSONValue.parse(data),
+              object["reservationId"] == .string(reservationId),
+              case .string? = object["handle"], case .string? = object["claimedAt"] else {
+            throw WorkshopExecutionError.persistenceFailure("Workshop reservation claim \(reservationId) is malformed; restore its saved claim before continuing work")
+        }
+        guard let unstarted = object["unstarted"] else { return false }
+        guard case .bool(let value) = unstarted else {
+            throw WorkshopExecutionError.persistenceFailure("Workshop reservation claim \(reservationId) has invalid admission state; restore its saved claim before continuing work")
+        }
+        return value
     }
 }

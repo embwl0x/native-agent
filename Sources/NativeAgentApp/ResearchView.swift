@@ -196,7 +196,7 @@ struct ResearchView: View {
                 _ = try await appModel.saveSearXNGBaseURL(url)
                 searchServiceStatus = .saved
             } catch {
-                searchServiceStatus = .saveFailed(error.localizedDescription)
+                searchServiceStatus = .saveFailed(UserFacingError.cause(error, action: "save the search service"))
             }
             savingSearchConfiguration = false
         }

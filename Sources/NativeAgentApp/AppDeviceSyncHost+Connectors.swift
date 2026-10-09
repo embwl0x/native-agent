@@ -33,11 +33,11 @@ struct MobileConnectorSnapshot: Encodable, Sendable {
 
 extension AppDeviceSyncHost {
     func mobileConnectors() async throws -> [MobileConnectorSnapshot] {
-        try await NativeClient(baseURL: "").getConnectors().map(MobileConnectorSnapshot.init)
+        try await NativeClient().getConnectors().map(MobileConnectorSnapshot.init)
     }
 
     func setConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows {
-        let api = NativeClient(baseURL: "")
+        let api = NativeClient()
         guard let current = try await mobileConnectors().first(where: { $0.id == id }), current.canToggle else {
             throw connectorFailure("This connector is controlled by its setup on the Mac.")
         }
@@ -54,7 +54,7 @@ extension AppDeviceSyncHost {
               try await mobileConnectors().contains(where: { $0.id == id }) else {
             throw connectorFailure("This connector cannot be disconnected here.")
         }
-        try await NativeClient(baseURL: "").revokeConnector(provider: id)
+        try await NativeClient().revokeConnector(provider: id)
         guard let recovered = try await mobileConnectors().first(where: { $0.id == id }),
               !recovered.enabled, recovered.authState == "not_connected" else {
             throw connectorFailure("The Mac could not confirm disconnection. Refresh before trying again.")

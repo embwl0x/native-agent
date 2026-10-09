@@ -50,7 +50,6 @@ public final class ToolsFacade {
             agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         )
         let dispatcher = AppChatToolDispatcher(inner: inner, securityCenter: securityCenter,
-            organismPostureProvider: ports.catalogPosture,
             interactions: ports.interactions, platform: ports.chatPlatform)
         return try await dispatcher.toolManifest(detail: detail)
     }
@@ -106,7 +105,7 @@ public final class ToolsFacade {
             catalog = try await loadCatalog()
             return true
         } catch {
-            NSLog("[ChatToolCatalog] dispatch failed: \(error.localizedDescription)")
+            nativeLog("[ChatToolCatalog] dispatch failed: \(error.localizedDescription)")
             catalogLoadError = error.localizedDescription
             return false
         }

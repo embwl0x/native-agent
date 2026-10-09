@@ -1,5 +1,7 @@
 import Foundation
+import ChatTurnContracts
 import Darwin
+import ChatTurnContracts
 import CryptoKit
 import ChatOrchestration
 import NativeAgentCore
@@ -221,7 +223,10 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             authored: BridgeLane.laneAuthorship(forSender: sender),
             replyTo: claudeReplyID
         )
-        let text = "[from: \(sender), via bridge] \(rawText)"
+        // User's trusted switch makes this agent's ask his (10-08): say so, so a
+        // fresh conversation doesn't second-guess it.
+        let trustNote = PeerDataTaint.ownerTrusts(sender) ? BridgeRoutingPrefix.trustNote + " " : ""
+        let text = "[from: \(sender), via bridge] \(trustNote)\(rawText)"
 
         // The executable model + effort follow the Mac chat-surface selection.
         // The shared chat facade admits that canonical tuple on every turn and
@@ -341,7 +346,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                                 // these placeholders with executed truth.
                                 model: "",
                                 reasoningEffort: nil
-                            )
+                            ),
+                            queryUserMessage: rawText
                         )
                         let generated: ChatOrchestration.ChatResponse
                         if completionRoute?.surface == "caller-result" {
@@ -401,7 +407,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         )
                     }
                     let request = TurnRequest(message: bridgeTurnMessage, sessionID: sessionId, attachments: attachments,
-                                              persona: persona, surface: "chat", origin: origin)
+                                              persona: persona, surface: "chat", origin: origin, queryUserMessage: rawText)
                     resp = try await TurnAdmission.shared.run(sessionID: sessionId) {
                         try await request.chat(on: client, progress: progress)
                     }
@@ -416,6 +422,10 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 let attachmentPayload = Self.bridgeAttachmentPayload(resp.attachments)
+                // The chat return follows canonical assistant persistence. A
+                // later notification failure cannot undo that arrival.
+                let replyPersisted = responseCached && completionRoute?.surface != "caller-result"
+                    && (!trimmedReply.isEmpty || !attachmentPayload.isEmpty)
                 let completionDelivery: AgentBridgeCompletionDelivery?
                 if let completionRoute,
                    let deliveryId,
@@ -434,6 +444,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     completionDelivery = nil
                 }
                 let replyStatus = Self.codexCompletionReplyStatus(
+                    terminalState: resp.terminalState,
                     hasReplyText: !trimmedReply.isEmpty,
                     attachmentCount: attachmentPayload.count,
                     completionDeliveryStatus: completionDelivery?.status
@@ -449,6 +460,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     "attachments": attachmentPayload,
                     "responseCached": responseCached,
                     "servedFromCache": wasCached,
+                    "replyPersisted": replyPersisted,
                 ]
                 if let deliveryId { persistedReply["deliveryId"] = deliveryId }
                 if let completionDelivery {
@@ -486,6 +498,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     "durationMs": durationMs,
                     "responseCached": responseCached,
                     "servedFromCache": wasCached,
+                    "replyPersisted": replyPersisted,
                 ]
                 if let deliveryId { responseObject["deliveryId"] = deliveryId }
                 if let completionDelivery {
@@ -802,7 +815,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         // this lane — the turn below runs with suppressUserAppend, so images
         // that reached the model left no trace in the transcript at all.
         let request = TurnRequest(message: text, sessionID: sessionId, attachments: attachments,
-                                  persona: persona, surface: "chat", envelope: .some(nil), origin: origin)
+                                  persona: persona, surface: "chat", envelope: .some(nil), origin: origin,
+                                  queryUserMessage: claudeReplyText)
         let workTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             let enqueued: EnqueuedUserMessage
@@ -820,7 +834,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     // script/wake_reply_delivery.js, outside Swift entirely, so
                     // matching it here would tie her inner life to a string in
                     // another language's source. The protocol flag is the fact.
-                    mechanicalRow: runTurn ? nil : .transportNotice
+                    mechanicalRow: runTurn ? nil : .transportNotice,
+                    awaitingConsumption: runTurn
                 )
             } catch {
                 guard enqueueLatch.claim() else { return }
@@ -891,6 +906,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 let attachmentPayload = Self.bridgeAttachmentPayload(resp.attachments)
                 let replyStatus = Self.codexCompletionReplyStatus(
+                    terminalState: resp.terminalState,
                     hasReplyText: !trimmedReply.isEmpty,
                     attachmentCount: attachmentPayload.count,
                     completionDeliveryStatus: nil
@@ -1084,10 +1100,12 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     /// are real replies, while an ambiguous external send is terminal but is not
     /// success and must not invite another unsafe dispatch.
     static func codexCompletionReplyStatus(
+        terminalState: TurnEngineResult.TerminalState?,
         hasReplyText: Bool,
         attachmentCount: Int,
         completionDeliveryStatus: String?
     ) -> String {
+        guard terminalState == .completed else { return terminalState?.rawValue ?? "incomplete" }
         guard hasReplyText || attachmentCount > 0 else { return "no_reply" }
         switch completionDeliveryStatus {
         case "failed_pre_dispatch": return "delivery_failed_pre_dispatch"
@@ -1168,7 +1186,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         // Once per answer: a resent reply never answers the asking chat twice.
         guard (try? await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: turnSession)) == .start else { return }
         do { try await lifecycle.cacheResponse(response, deliveryId: deliveryId, requestDigest: digest) } catch {
-            NSLog("ClaudeBridgeMessageRuntime: answer to %@ not recorded: %@", messageID, error.localizedDescription)
+            nativeLog("ClaudeBridgeMessageRuntime: answer to %@ not recorded: %@", messageID, error.localizedDescription)
             return
         }
         let delivery = await AgentBridgeCompletionRouter.deliverAnswer(deliveryId: deliveryId, requestDigest: digest,
@@ -1176,7 +1194,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             route: AgentBridgeCompletionRoute(asking: row, turnSessionId: turnSession), client: port.chatClient(),
             sender: port.completionSender(dataRoot: dataRoot), lifecycle: lifecycle, notifyRequestedResult: false)
         if delivery.status != "completed" {
-            NSLog("ClaudeBridgeMessageRuntime: answer to %@ %@: %@", messageID, delivery.status, delivery.reason ?? "")
+            nativeLog("ClaudeBridgeMessageRuntime: answer to %@ %@: %@", messageID, delivery.status, delivery.reason ?? "")
         }
     }
 
@@ -1209,7 +1227,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             }
             guard JSONSerialization.isValidJSONObject(payload),
                   let data = try? JSONSerialization.data(withJSONObject: payload) else {
-                NSLog("[ClaudeBridge] message-reply persist skipped: payload not JSON-serializable")
+                nativeLog("[ClaudeBridge] message-reply persist skipped: payload not JSON-serializable")
                 return
             }
             var line = data
@@ -1232,13 +1250,13 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 trimToBytes: 4 << 20
             )
             if dropped > 0 {
-                NSLog(
+                nativeLog(
                     "[ClaudeBridge] message-replies cap dropped %d oldest row(s)",
                     dropped
                 )
             }
         } catch {
-            NSLog("[ClaudeBridge] message-reply persist failed: %@", String(describing: error))
+            nativeLog("[ClaudeBridge] message-reply persist failed: %@", String(describing: error))
         }
     }
 

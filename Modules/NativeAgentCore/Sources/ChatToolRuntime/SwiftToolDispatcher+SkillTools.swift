@@ -47,8 +47,12 @@ extension SwiftToolDispatcher {
         let entries = try InstalledSkillInventory.entries(
             dataRoot: dataRoot, sourceRoot: rootForRead, personaRoot: personaRootForTools())
         // Exact registered spelling wins; stripping is legacy fallback only.
-        let entry = InstalledSkillInventory.match(name, in: entries)
-            ?? (name.hasSuffix(".md") ? InstalledSkillInventory.match(String(name.dropLast(3)), in: entries) : nil)
+        // A registered row wins over a built-in of the same name: her version, on or not.
+        let registered = entries.filter { $0.row["source"] == .string("runtime_registry") }
+        let find = { (handle: String) in
+            InstalledSkillInventory.match(handle, in: registered) ?? InstalledSkillInventory.match(handle, in: entries)
+        }
+        let entry = find(name) ?? (name.hasSuffix(".md") ? find(String(name.dropLast(3))) : nil)
         if entry == nil, name.contains("/") || name.contains("..") || name.hasPrefix(".") {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: invalid skill name '\(name)'")
         }
@@ -68,22 +72,47 @@ extension SwiftToolDispatcher {
         } else {
             body = text
         }
-        // A read is a use: its unused clock starts over (`CapabilityLifecycle`).
-        if let entry, entry.row["source"] == .string("runtime_registry") {
-            try? await SwiftNativeSkillsClient(root: dataRoot).recordUse(id: entry.id)
+        // Bookkeeping failures are reported alongside the usable body.
+        func recordUse() async -> JSONValue? {
+            if let entry, entry.row["source"] == .string("runtime_registry") {
+                do { try await SwiftNativeSkillsClient(root: dataRoot).recordUse(id: entry.id) }
+                catch { return .string(error.localizedDescription) }
+            }
+            return nil
         }
         // A script skill reads with its script: header, source (at most 8 KB),
         // digest, and whether it is on and admitted for that digest; and its
         // current, previous and last clean versions.
-        guard let row = entry?.row, case .object(var script)? = row["script"] else { return .string(body) }
+        // Her version of a built-in reads as hers, with its status and the way back to the built-in.
+        let status = entry?.row["status"] ?? .null
+        let word = if case .string(let text) = status, !text.isEmpty { text.lowercased() } else { "draft" }
+        let on = entry.map { InstalledSkillInventory.isAvailable($0.row) } ?? false
+        let overrides: [String: JSONValue] = entry?.row["overrides"] == .string("built_in") ? [
+            "overrides": .string("built_in"),
+            "note": .string(on ? "This is your version of a built-in skill; it replaces the built-in for you. "
+                + "skill.rollback drops yours and the built-in shows again."
+                : "This is your \(word) version of a built-in skill; the built-in is still in use until you enable it."),
+        ] : [:]
+        guard let row = entry?.row, case .object(var script)? = row["script"] else {
+            var result = overrides.merging(["content": .string(body), "status": .string("ok"), "skill_status": status]) { $1 }
+            if let row = entry?.row, row["source"] == .string("runtime_registry"), overrides.isEmpty {
+                do { result["versions"] = try await SwiftNativeSkillsClient(root: dataRoot).guidanceVersions(row) }
+                catch { result["versions_error"] = .string(error.localizedDescription) }
+            }
+            if let error = await recordUse() { result["usage_error"] = error }
+            return .object(result)
+        }
         script["digest"] = SkillScript.digest(row["script"]).map(JSONValue.string) ?? .null
         script["status"] = row["status"] ?? .null
         script["runnable"] = .bool(SkillScript.isRunnable(row))
         script["admission"] = row["admission"] ?? .null
         script["params_arrive_as"] = .string("input, frozen (e.g. input.name); args is the same object")
         if let suspended = row["suspended"] { script["suspended"] = suspended }
-        return .object(["content": .string(body), "script": .object(script),
-                        "versions": await SwiftNativeSkillsClient(root: dataRoot).scriptVersions(row)])
+        let versions = await SwiftNativeSkillsClient(root: dataRoot).scriptVersions(row)
+        var result = overrides.merging(["content": .string(body), "status": .string("ok"), "skill_status": status, "script": .object(script),
+                                        "versions": versions]) { $1 }
+        if let error = await recordUse() { result["usage_error"] = error }
+        return .object(result)
     }
 
     /// Canonical conversational skill writer. This deliberately reuses the
@@ -142,6 +171,15 @@ extension SwiftToolDispatcher {
                 "loading": .string("lazy; read it with app skill.read only when this skill is relevant"),
                 "authority": .string("guidance_only; TrustCenter, approvals, and effect-time validation remain authoritative"),
             ]
+            if let entries = try? InstalledSkillInventory.entries(
+                dataRoot: dataRoot, sourceRoot: rootForRead, personaRoot: personaRootForTools()),
+               InstalledSkillInventory.match(name, in: entries)?.row["overrides"] == .string("built_in") {
+                receipt["overrides"] = .string("built_in")
+                receipt["note"] = .string(InstalledSkillInventory.isAvailable(record)
+                    ? "Saved as your version of the built-in \(name); it replaces the built-in for you. "
+                        + "skill.rollback drops yours and the built-in shows again."
+                    : "Saved as your draft version of the built-in \(name); the built-in is still in use until you enable it.")
+            }
             if let script = record["script"] {
                 receipt["script"] = .object([
                     "digest": .string(SkillScript.digest(script) ?? ""),

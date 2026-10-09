@@ -14,6 +14,7 @@ import NativeAgentCore
 import CognitiveSubstrate
 import KnowledgeGraph
 import MemoryV2
+import MacIntegration
 import ApprovalInbox
 import NotificationInbox
 import PersistenceCore
@@ -197,7 +198,7 @@ actor MobileSnapshotBuilder {
                 // group, and the caller is owed the size failure, not a
                 // different one.
                 guard files.count > 1, files.removeValue(forKey: filename) != nil else { continue }
-                NSLog(
+                nativeLog(
                     "[MacSyncEngine] mobile snapshot %@ exceeded the status envelope — trimmed %@ so the rest still publishes",
                     group.rawValue,
                     filename
@@ -437,10 +438,8 @@ extension MacSyncEngine {
         let lifecycleGeneration = snapshotLifecycleGeneration
         snapshotWriteInFlight = true
         defer {
-            if lifecycleGeneration == snapshotLifecycleGeneration {
-                snapshotWriteInFlight = false
-            }
-            if lifecycleGeneration == snapshotLifecycleGeneration, snapshotWriteQueued {
+            snapshotWriteInFlight = false
+            if isActive, snapshotWriteQueued {
                 snapshotWriteQueued = false
                 let queuedForceHeavy = snapshotWriteQueuedNeedsHeavy
                 let queuedIncludeMemories = snapshotWriteQueuedNeedsMemories
@@ -536,7 +535,7 @@ extension MacSyncEngine {
                 attemptedSnapshotGroups.insert(label)
                 skippedSnapshotGroups[label] = reason
                 snapshotFetchFailures.append("\(label): \(reason)")
-                NSLog("[MacSyncEngine] snapshot fetch failed for %@ — keeping last good file: %@", label, "\(error)")
+                nativeLog("[MacSyncEngine] snapshot fetch failed for %@ — keeping last good file: %@", label, "\(error)")
             }
             // Sweep R4 item 2: groups the native helpers could not build. Same
             // publish behavior as before (keep last good), but the group is now
@@ -546,7 +545,7 @@ extension MacSyncEngine {
                 attemptedSnapshotGroups.insert(label)
                 skippedSnapshotGroups[label] = reason
                 snapshotFetchFailures.append("\(label): \(reason)")
-                NSLog("[MacSyncEngine] snapshot group %@ SKIPPED — keeping last good file: %@", label, reason)
+                nativeLog("[MacSyncEngine] snapshot group %@ SKIPPED — keeping last good file: %@", label, reason)
             }
 
             var executions: DeviceSyncSnapshotRows?
@@ -586,7 +585,7 @@ extension MacSyncEngine {
                 // the desk half of the living-status projection is unreadable.
                 // This bounded marker replaces it and tells the phone that its
                 // counters/attention state are not a complete current read.
-                NSLog("[MacSyncEngine] overview read incomplete, publishing explicit status: \(overview.unavailable.joined(separator: "; "))")
+                nativeLog("[MacSyncEngine] overview read incomplete, publishing explicit status: \(overview.unavailable.joined(separator: "; "))")
             }
             organismLivingStatus = Self.organismLivingStatusAfterDeskRead(
                 organismLivingStatus,
@@ -704,7 +703,7 @@ extension MacSyncEngine {
             // fabricated state).
             async let personalityFetch: PersonalityProfile? = {
                 do { return try await api.getPersonality() } catch {
-                    NSLog("[MacSyncEngine] snapshot fetch failed for personality — keeping last good file: %@", "\(error)")
+                    nativeLog("[MacSyncEngine] snapshot fetch failed for personality — keeping last good file: %@", "\(error)")
                     return nil
                 }
             }()
@@ -725,7 +724,16 @@ extension MacSyncEngine {
                 recordGroupSkip("trust_policy", "native trust snapshot unavailable")
             }
             do {
-                await write(try await MacIntegrationICloudBridge.canonicalProjection(), to: "mac_integration_permissions.json")
+                let permissions = try await MacIntegrationPermissionStore.shared.currentChecked()
+                var projection: [String: [String: Bool]] = [:]
+                for id in MacIntegrationID.all {
+                    guard let permission = permissions[id] else { continue }
+                    var axes: [String: Bool] = [:]
+                    if MacIntegrationID.supportsRead(id) { axes["read"] = permission.read }
+                    if MacIntegrationID.supportsWrite(id) { axes["write"] = permission.write }
+                    projection[id] = axes
+                }
+                await write(projection, to: "mac_integration_permissions.json")
             } catch {
                 recordFetchFailure("mac_integration_permissions", error)
             }
@@ -758,7 +766,7 @@ extension MacSyncEngine {
                     // skip the write, keep last-good (review MED #1, 2026-07-02).
                     let rows = await api.getRunsStrict()
                     if rows == nil {
-                        NSLog("[MacSyncEngine] runs ledger unreadable — keeping last good runs.json")
+                        nativeLog("[MacSyncEngine] runs ledger unreadable — keeping last good runs.json")
                     }
                     return rows
                 }()
@@ -807,7 +815,7 @@ extension MacSyncEngine {
                                 return data
                             }
                             if bounded.count <= 1 {
-                                NSLog("[MacSyncEngine] runs.json over byte budget even at 1 run — skipping write")
+                                nativeLog("[MacSyncEngine] runs.json over byte budget even at 1 run — skipping write")
                                 break
                             }
                             bounded = Array(bounded.prefix(bounded.count / 2))
@@ -927,14 +935,9 @@ extension MacSyncEngine {
             if snapshotFetchFailures.isEmpty, unresolvedSnapshotGroups.isEmpty {
                 syncError = nil
             } else {
-                let staleGroups = unresolvedSnapshotGroups.keys.sorted()
-                let prefix = staleGroups.isEmpty
-                    ? "Snapshot fetch failed (kept last good files)"
-                    : "iPhone is showing STALE \(staleGroups.joined(separator: ", ")) (kept last good files)"
-                let reasons = staleGroups.compactMap { group in
-                    unresolvedSnapshotGroups[group].map { "\(group): \($0)" }
-                }
-                syncError = "\(prefix): \(reasons.joined(separator: "; "))"
+                let messages = NAMobileSnapshotGroup.stalenessMessages(unresolvedSnapshotGroups)
+                syncError = messages.keys.sorted().first.flatMap { messages[$0] }
+                    ?? "iPhone updates could not be prepared. The last received data is still available. Open Connection in Settings to check the Mac link."
             }
             // The marker changed: it rides in .core, published on its own.
             if !changedSnapshotFilenames.isEmpty {
@@ -1046,7 +1049,7 @@ extension MacSyncEngine {
         lifecycleGeneration: UInt64,
         scope: SnapshotWriteScope,
         clearErrorOnSuccess: Bool = false
-    ) async -> [NAMobileSnapshotGroup: String] {
+    ) async -> [NAMobileSnapshotGroup: DeviceSyncError] {
         let groups = NAMobileSnapshotGroup.groups(containingAny: changedFilenames)
         let failures = await sync.bridge.publishMobileSnapshotStatus(
             groups: groups,
@@ -1055,13 +1058,8 @@ extension MacSyncEngine {
         ) ?? [:]
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return [:] }
         if !failures.isEmpty {
-            let reasons = failures.map { "\($0.key.rawValue): \($0.value)" }.sorted().joined(separator: "; ")
-            switch scope {
-            case .standard:
-                syncError = "iPhone snapshot publication failed (\(reasons)). The last proven phone data was retained."
-            case .chatSessions:
-                syncError = "iPhone chat snapshot publication failed (\(reasons)). The last proven phone conversation was retained."
-            }
+            let messages = NAMobileSnapshotGroup.stalenessMessages(Self.publishFailureSkips(failures, changed: changedFilenames))
+            syncError = messages.keys.sorted().first.flatMap { messages[$0] }
             forgetSnapshotDigests(for: changedFilenames)
         } else if clearErrorOnSuccess {
             syncError = nil
@@ -1073,8 +1071,7 @@ extension MacSyncEngine {
             }
             let signaled = await signalSnapshotGroups(groups, timeoutLabel: timeoutLabel)
             if signaled != true {
-                let subject = scope == .standard ? "snapshot" : "chat snapshot"
-                syncError = "iPhone \(subject) signal failed. The files were retained for the next sync edge."
+                syncError = "iPhone updates could not be delivered. The last received data is still available. The Mac will try again on its next update; keep NativeAgent open."
             }
         }
         saveSnapshotDigests()
@@ -1085,13 +1082,14 @@ extension MacSyncEngine {
     /// the phone's stale badge's vocabulary) a failed status group left stale:
     /// only the files this pass changed. An unchanged file is the copy the
     /// phone already has, and a mark on it would wait for its next rewrite.
-    nonisolated static func publishFailureSkips(_ failures: [NAMobileSnapshotGroup: String],
+    nonisolated static func publishFailureSkips(_ failures: [NAMobileSnapshotGroup: DeviceSyncError],
                                                 changed: Set<String>) -> [String: String] {
         var skips: [String: String] = [:]
         for (group, reason) in failures {
             for filename in group.filenames where changed.contains(filename) {
-                skips[URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent] =
-                    "publish failed (\(group.rawValue)): \(reason)"
+                let page = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
+                skips[page] = "publish failed (\(group.rawValue)): \(reason.localizedDescription)"
+                skips["_message.\(page)"] = NAMobileSnapshotGroup.stalePageMessage(page, recovery: reason.snapshotRecoveryMessage)
             }
         }
         return skips
@@ -1205,6 +1203,7 @@ extension MacSyncEngine {
     /// rows of at most 6,000 characters (`compactTranscriptMessages`), so the
     /// worst case stays a small snapshot file.
     static let transcriptSnapshotSessionCeiling = 16
+    nonisolated static let transcriptSnapshotRowLimit = 80
 
     /// The byte budget for the `.chat` snapshot group, measured on the encoded
     /// `chat_transcripts.json` payload.
@@ -1248,7 +1247,8 @@ extension MacSyncEngine {
                 let snapshot = ChatTranscriptSnapshot(
                     sessionId: session.id,
                     messages: await MobileSnapshotBuilder.shared.build { Self.compactTranscriptMessages(messages) },
-                    transcriptGeneration: session.transcriptGeneration
+                    transcriptGeneration: session.transcriptGeneration,
+                    hasOlder: messages.count > Self.transcriptSnapshotRowLimit
                 )
                 // An unencodable block is treated as unaffordable rather than
                 // free, so it can never be the one that breaches the contract.
@@ -1348,7 +1348,7 @@ extension MacSyncEngine {
     private nonisolated static func compactTranscriptMessages(
         _ messages: [any DeviceSyncTranscriptMessage & Sendable]
     ) -> [DeviceSyncTranscriptRow] {
-        messages.suffix(80).map { message in
+        messages.suffix(transcriptSnapshotRowLimit).map { message in
             var copy = message
             copy.content = Self.truncateTranscriptContent(copy.content)
             return DeviceSyncTranscriptRow(message: copy)
@@ -1370,7 +1370,7 @@ extension MacSyncEngine {
         if let cap = Self.rowFileByteCaps[filename] {
             let bounded = await MobileSnapshotBuilder.shared.build { [data] in Self.newestRows(data, maxBytes: cap) }
             if bounded.dropped > 0 {
-                NSLog("[MacSyncEngine] %@ over %d bytes — kept the newest rows, dropped %d", filename, cap, bounded.dropped)
+                nativeLog("[MacSyncEngine] %@ over %d bytes — kept the newest rows, dropped %d", filename, cap, bounded.dropped)
             }
             data = bounded.data
         }
@@ -1395,10 +1395,14 @@ extension MacSyncEngine {
         }.value
         // The coordinated filesystem write itself cannot be cancelled once it
         // has entered Foundation. It still targets the captured old cache URL;
-        // after a stop/restart, do not let its late result mutate the new
-        // generation's digest/error/publication state.
+        // A retiring write may have replaced bytes covered by a saved digest.
+        // Invalidate that skip before admitting the restarted pass.
         guard expectedLifecycleGeneration == snapshotLifecycleGeneration,
-              isActive else { return .unchanged }
+              isActive else {
+            snapshotFileDigests.removeValue(forKey: filename)
+            saveSnapshotDigests()
+            return .unchanged
+        }
         if let writeError {
             syncError = "Snapshot write failed for \(filename): \(writeError)"
             return .failed(writeError)
@@ -1504,7 +1508,7 @@ extension MacSyncEngine {
                 return .skipped("mobile inbox rows exceeded the bounded projection budget")
             }
             if projection.included < items.count {
-                NSLog(
+                nativeLog(
                     "[MacSyncEngine] mobile inbox projection bounded rows=%d total=%d bytes=%d",
                     projection.included,
                     items.count,
@@ -1523,7 +1527,7 @@ extension MacSyncEngine {
                 try await sync.host.knowledgeGraphSnapshotData()
             })
         } catch {
-            NSLog(
+            nativeLog(
                 "[MacSyncEngine] canonical knowledge graph unreadable — keeping last good snapshot: %@",
                 String(describing: error)
             )
@@ -1685,7 +1689,7 @@ extension MacSyncEngine {
             return try await read()
         } catch {
             guard snapshotReadWasCancelled(error), !Task.isCancelled else { throw error }
-            NSLog(
+            nativeLog(
                 "[MacSyncEngine] snapshot group %@ read was cancelled — retrying once before calling the phone stale",
                 label
             )
@@ -1710,7 +1714,10 @@ extension MacSyncEngine {
     nonisolated static func snapshotStalenessMarkerData(
         unresolvedGroups: [String: String]
     ) -> Data? {
-        let groups = unresolvedGroups.filter { !$0.key.hasPrefix("_") }
+        var groups = unresolvedGroups.filter { !$0.key.hasPrefix("_") }
+        for (group, message) in NAMobileSnapshotGroup.stalenessMessages(unresolvedGroups) {
+            groups["_message.\(group)"] = message
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return try? encoder.encode(groups)
@@ -1732,7 +1739,10 @@ extension MacSyncEngine {
            let prior = try? JSONDecoder().decode([String: String].self, from: data) {
             unresolved = prior.filter { $0.key != "_observedAt" }
         }
-        for group in attemptedGroups { unresolved.removeValue(forKey: group) }
+        for group in attemptedGroups {
+            unresolved.removeValue(forKey: group)
+            unresolved.removeValue(forKey: "_message.\(group)")
+        }
         for (group, reason) in currentSkips where group != "_observedAt" {
             unresolved[group] = reason
         }
@@ -1761,7 +1771,7 @@ extension MacSyncEngine {
             encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
             try encoder.encode(payload).write(to: url, options: .atomic)
         } catch {
-            NSLog("[MacSyncEngine] could not record snapshot skip state: %@", error.localizedDescription)
+            nativeLog("[MacSyncEngine] could not record snapshot skip state: %@", error.localizedDescription)
         }
     }
 }

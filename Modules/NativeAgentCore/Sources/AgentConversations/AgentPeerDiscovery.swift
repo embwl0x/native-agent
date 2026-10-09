@@ -211,8 +211,8 @@ public struct AgentDiscoveryCandidate: Sendable, Equatable, Identifiable {
         if row?.settingsSupported != false, let settingsPath, !settingsPath.isEmpty {
             fields["settings_file"] = .string(settingsPath)
             let workspace = row?.requiresWorkspace == true
-            fields["setup"] = .string("agent_connect with name \"\(name)\""
-                + (workspace ? " and workspace set to the folder the person chose." : " sets this one up."))
+            fields["setup"] = .string("agent_connect for \"\(name)\""
+                + (workspace ? " with workspace set to the folder the person chose." : " sets this one up."))
         }
         if let hostID, let row = AgentHostDirectory.row(named: hostID) {
             fields["route"] = .string(row.route.rawValue)
@@ -222,10 +222,10 @@ public struct AgentDiscoveryCandidate: Sendable, Equatable, Identifiable {
             if row.format == .shellEnvironment {
                 fields["description"] = .string(row.description)
                 fields["outbound_route"] = .string("none")
-                fields["setup"] = .string("agent_connect with name \"\(row.displayName)\" creates a private environment file and returns the local commands to give Dot. Dot can message NativeAgent, and NativeAgent can message Dot in its current ChatGPT conversation after checking the running app and conversation.")
+                fields["setup"] = .string("agent_connect for \"\(row.displayName)\" creates a private environment file and returns the local commands to give Dot. Dot can message NativeAgent, and NativeAgent can message Dot in its current ChatGPT conversation after checking the running app and conversation.")
             }
             if row.route == .desktopChat {
-                fields["setup"] = .string("agent_connect with name \"\(row.displayName)\" sets this one up. Messages go to a chat of its own in the app, and the answer comes back in the same call.")
+                fields["setup"] = .string("agent_connect for \"\(row.displayName)\" sets this one up. Messages go to a chat of its own in the app, and the answer comes back in the same call.")
             }
             if let acp = row.acp {
                 fields["setup"] = .string("Connect \(row.displayName) by name to review its executable and starting folder. It runs as you; this app asks only when the agent asks it.")

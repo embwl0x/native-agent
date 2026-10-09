@@ -63,9 +63,9 @@ actor NeedsUserEdgeNotifier {
             Self.stableDigest(item.handle + "\n" + item.title + "\n" + (item.blockedReason ?? item.summary ?? ""))
         }
         guard state.seeded, state.requests != nil else {
-            persist(State(seeded: true, requests: Dictionary(uniqueKeysWithValues: items.map {
+            persist(State(seeded: true, requests: Dictionary(items.map {
                 ($0.handle, Wait(fingerprint: fingerprint($0), episodeID: UUID().uuidString))
-            })))
+            }, uniquingKeysWith: { first, _ in first })))
             return
         }
         let handles = Set(items.map(\.handle))
@@ -98,7 +98,7 @@ actor NeedsUserEdgeNotifier {
                 current.requests?[item.handle] = Wait(fingerprint: digest, episodeID: episode)
                 guard persist(current) else { return }
             } catch {
-                NSLog("needs_user_notify: push failed, will retry: \(error.localizedDescription)")
+                nativeLog("needs_user_notify: push failed, will retry: \(error.localizedDescription)")
             }
         }
     }
@@ -127,7 +127,7 @@ actor NeedsUserEdgeNotifier {
             cached = state
             return true
         } catch {
-            NSLog("needs_user_notify: state persistence failed: \(error.localizedDescription)")
+            nativeLog("needs_user_notify: state persistence failed: \(error.localizedDescription)")
             return false
         }
     }

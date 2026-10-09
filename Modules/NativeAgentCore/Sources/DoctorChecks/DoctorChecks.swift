@@ -53,6 +53,9 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
     /// Live handler availability observed by DoctorActionRuntime, not inferred
     /// from human instructions or completion receipts. Nil in older reports.
     public let repair_available: Bool?
+    /// Set where `human_action` is a sign-in or permission — the only steps
+    /// Doctor hands to User, gathered into one inbox ask.
+    public let ask: DoctorAskKind?
 
     public init(
         id: String,
@@ -62,7 +65,8 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
         repair: String? = nil,
         receipt: String? = nil,
         human_action: String? = nil,
-        repair_available: Bool? = nil
+        repair_available: Bool? = nil,
+        ask: DoctorAskKind? = nil
     ) {
         self.id = id
         self.title = title
@@ -72,10 +76,12 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
         self.receipt = receipt
         self.human_action = human_action
         self.repair_available = repair_available
+        self.ask = ask
     }
 
-    /// Reports must leave an adverse row with an executable repair or a human
-    /// next step, including older cached rows with only legacy repair copy.
+    /// The human step for an adverse row, including older cached rows with
+    /// only legacy repair copy. Doctor repairs what it can; a row with neither
+    /// a repair nor a step stands on its detail, which says what is wrong.
     public func recoveryAction(repairAvailable: Bool) -> String? {
         if let action = human_action?.trimmingCharacters(in: .whitespacesAndNewlines), !action.isEmpty {
             return action
@@ -85,8 +91,13 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
            !action.isEmpty, !action.lowercased().hasPrefix("run repair safe issues") {
             return action
         }
-        return "Open Diagnostics → Doctor and copy the \(title) detail into a support request. This check has no automatic repair."
+        return nil
     }
+}
+
+public enum DoctorAskKind: String, Sendable, Codable, Equatable {
+    case signIn = "sign_in"
+    case permission
 }
 
 // MARK: - DoctorCheck
@@ -717,7 +728,7 @@ public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
                 detail: "\(issueCount) runtime JSON store(s) are malformed or wrong-shaped: \((malformed + wrongShape).prefix(8).joined(separator: ", "))",
                 repair: "Run Repair Safe Issues to back up and reset malformed app-owned JSON stores.",
                 receipt: repaired.isEmpty ? nil : "Completed: \(repaired.joined(separator: "; ")).",
-                human_action: "Open Diagnostics → Doctor and press Repair to back up and reset malformed app-owned JSON stores. Onboarding and automatic repairs leave existing files unchanged."
+                human_action: "These stores hold provider, consent and registry choices, so Doctor never resets them by itself. Open Diagnostics → Doctor and press Repair to back up and reset them to empty."
             )
         }
         if !missing.isEmpty {
@@ -991,9 +1002,13 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                             // Re-read under the same lock as message appenders;
                             // the diagnostic scan may predate a committed reply.
                             let current = try String(contentsOf: file, encoding: .utf8)
-                            let validLines = current.split(separator: "\n").map {
+                            let lines = current.split(separator: "\n").map {
                                 String($0).trimmingCharacters(in: .whitespacesAndNewlines)
-                            }.filter { !$0.isEmpty && (try? JSONValue.parse(Data($0.utf8))) != nil }
+                            }.filter { !$0.isEmpty }
+                            let validLines = lines.filter { (try? JSONValue.parse(Data($0.utf8))) != nil }
+                            // Revalidated under the appenders' lock: nothing
+                            // malformed now means nothing to rewrite.
+                            guard validLines.count < lines.count else { return }
                             _ = try DoctorFileRepair.backupExistingFile(file)
                             let repairedText = validLines.isEmpty ? "" : validLines.joined(separator: "\n") + "\n"
                             try Data(repairedText.utf8).write(to: file, options: [.atomic])
@@ -1033,8 +1048,7 @@ public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "\(malformedLines) malformed chat JSONL row(s) across \(malformedFiles.count) file(s).",
-                repair: "Run Repair Safe Issues to back up malformed JSONL files and keep valid rows.",
-                human_action: "Open Diagnostics → Doctor and press Repair to back up malformed chat logs and keep valid rows. Onboarding and automatic repairs leave existing logs unchanged."
+                repair: "Run Repair Safe Issues to back up malformed JSONL files and keep valid rows."
             )
         }
         return CheckResult(
@@ -1202,7 +1216,8 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
             title: result.title,
             status: status,
             detail: "\(result.detail) \(warnings.joined(separator: " "))",
-            repair: result.repair
+            repair: result.repair,
+            ask: result.ask
         )
     }
 
@@ -1222,7 +1237,7 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
         let services = Self.entitlementValues(DeviceCloudKitPreflight.iCloudServicesEntitlementKey)
         guard let snapshot = await ICloudBridgeHealthReader.snapshot(dataRoot: dataRoot) else {
             return merging(CheckResult(
-                id: id, title: title, status: "ok",
+                id: id, title: title, status: "warn",
                 detail: "iCloud transport health is unmeasured; the app's bridge has not started."
             ))
         }
@@ -1239,11 +1254,11 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
             ))
         }
         if cloudKit {
-            return merging(cloudKitResult(snapshot.health))
+            return merging(cloudKitResult(snapshot))
         }
         if case .unmeasured = snapshot.health {
             return merging(CheckResult(
-                id: id, title: title, status: "ok", detail: "iCloud Drive is starting; transport health is not measured yet."
+                id: id, title: title, status: "warn", detail: "iCloud Drive is starting; transport health is not measured yet."
             ))
         }
         guard case .available = snapshot.health, let docsURL = snapshot.documentsURL else {
@@ -1253,7 +1268,8 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
                 detail: signedIn ? "The active iCloud Drive container is unavailable." : "The active iCloud Drive transport has no signed-in iCloud account.",
                 repair: signedIn
                     ? "Open System Settings → Apple Account → iCloud → Drive and turn on Sync this Mac; allow NativeAgent under Apps Syncing to iCloud Drive."
-                    : "Open System Settings → Apple Account and sign in to iCloud."
+                    : "Open System Settings → Apple Account and sign in to iCloud.",
+                ask: signedIn ? .permission : .signIn
             ))
         }
         let bridgeDirs = [
@@ -1317,41 +1333,62 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
         ))
     }
 
-    private func cloudKitResult(_ health: ICloudBridgeHealthSnapshot.Health) -> CheckResult {
+    private func cloudKitResult(_ snapshot: ICloudBridgeHealthSnapshot) -> CheckResult {
+        let receive = cloudKitResult(snapshot.health, operation: "receive")
+        let failures = snapshot.sendFailures.sorted { $0.key < $1.key }.map {
+            cloudKitResult($0.value, operation: "send (\($0.key))")
+        }
+        let send = failures.isEmpty
+            ? (snapshot.sendMeasured ? "CloudKit has accepted outbound delivery; iOS receipt is not confirmed."
+                                     : "CloudKit send health is unmeasured.")
+            : failures.map(\.detail).joined(separator: " ")
+        return CheckResult(
+            id: id, title: title,
+            status: receive.status == "ok" && snapshot.sendMeasured && failures.isEmpty ? "ok" : "warn",
+            detail: "\(receive.detail) \(send)",
+            repair: receive.repair ?? failures.compactMap(\.repair).first,
+            ask: receive.ask ?? failures.compactMap(\.ask).first
+        )
+    }
+
+    private func cloudKitResult(_ health: ICloudBridgeHealthSnapshot.Health, operation: String) -> CheckResult {
         var status = "warn"
         let detail: String
         var action: String?
+        var ask: DoctorAskKind?
         switch health {
         case .unmeasured:
-            status = "ok"
-            detail = "CloudKit is active; transport health is not measured yet. iCloud Drive is not required."
+            detail = "CloudKit \(operation) health is unmeasured. iCloud Drive is not required."
         case .available:
             status = "ok"
-            detail = "CloudKit is active and its last receive completed successfully. iCloud Drive is not required."
+            detail = "CloudKit is active and its last \(operation) completed successfully. iCloud Drive is not required."
         case .signedOut:
-            detail = "The active CloudKit transport has no authenticated iCloud account."
+            detail = "CloudKit \(operation) has no authenticated iCloud account."
             action = "Open System Settings → Apple Account and sign in to iCloud."
+            ask = .signIn
         case .notEntitled:
-            detail = "The active CloudKit transport is not configured with its required entitlements."
+            detail = "CloudKit \(operation) is not configured with its required entitlements."
             action = "Install a signed NativeAgent build granting CloudKit and container \(NativeAgentICloudBridgeConstants.containerID)."
         case .quotaExceeded:
-            detail = "The active CloudKit transport cannot receive because iCloud storage is full."
+            detail = "The active CloudKit transport cannot \(operation) because iCloud storage is full."
             action = "Open System Settings → Apple Account → iCloud → Manage and free iCloud storage."
         case .accountFailure(let code, let reason):
-            detail = "The active CloudKit transport was rejected: \(reason)"
+            detail = "CloudKit \(operation) was rejected: \(reason)"
             switch CKError.Code(rawValue: code) {
             case .notAuthenticated:
                 action = "Open System Settings → Apple Account and complete iCloud sign-in."
+                ask = .signIn
             case .missingEntitlement:
                 action = "Install a signed NativeAgent build granting CloudKit and container \(NativeAgentICloudBridgeConstants.containerID)."
             case .managedAccountRestricted:
                 action = "Ask your Apple Account administrator to allow CloudKit for NativeAgent."
+                ask = .permission
             default: break
             }
         case .unavailable(let reason):
-            detail = "The active CloudKit transport's last receive failed: \(reason)"
+            detail = "The active CloudKit transport's last \(operation) failed: \(reason)"
         }
-        return CheckResult(id: id, title: title, status: status, detail: detail, repair: action)
+        return CheckResult(id: id, title: title, status: status, detail: detail, repair: action, ask: ask)
     }
 }
 
@@ -1374,6 +1411,33 @@ public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
 /// and re-probe; the pristine .mlpackage in the app bundle recompiles fresh.
 public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
     public let id: String = "coreml_embedder"
+
+    /// Exact required assets of the installed source package. Unknown files,
+    /// caches and download staging remain dynamic storage. Model load/integrity
+    /// checks still belong to this check's ordinary run path.
+    public static func installedModelStorageFiles(dataRoot: URL) throws -> Set<String> {
+        let directory = dataRoot.appendingPathComponent("extras/coreml", isDirectory: true)
+        guard let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot),
+              installed.modelURL.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL,
+              installed.modelURL.pathExtension == "mlpackage" else { return [] }
+        let manifest = installed.modelURL.appendingPathComponent("Manifest.json")
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as? [String: Any]
+        guard let entries = object?["itemInfoEntries"] as? [String: [String: Any]],
+              let root = object?["rootModelIdentifier"] as? String,
+              entries[root]?["path"] as? String == "com.apple.CoreML/model.mlmodel",
+              entries.values.contains(where: { $0["path"] as? String == "com.apple.CoreML/weights" }) else { return [] }
+        let files = [manifest, installed.vocabURL, directory.appendingPathComponent("embedding.json"),
+                     installed.modelURL.appendingPathComponent("Data/com.apple.CoreML/model.mlmodel"),
+                     installed.modelURL.appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")]
+        let base = directory.standardizedFileURL.path + "/"
+        for file in files {
+            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true, (values.fileSize ?? 0) > 0,
+                  file.resolvingSymlinksInPath().path == file.standardizedFileURL.path,
+                  file.standardizedFileURL.path.hasPrefix(base) else { return [] }
+        }
+        return Set(files.map { $0.standardizedFileURL.path })
+    }
 
     /// Agent, 2026-09-06: this row said "MiniLM loads" whatever was actually
     /// running. Since 2026-09-05 the runtime prefers an installed extras model
@@ -1722,7 +1786,8 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
                            detail: detail,
                            repair: refreshable ? DoctorSafeRepairPolicy.oauthRefreshInstruction : nil,
                            receipt: repaired.isEmpty ? nil : "Repaired: refreshed \(repaired.joined(separator: ", ")).",
-                           human_action: asks.isEmpty ? nil : asks.joined(separator: " "))
+                           human_action: asks.isEmpty ? nil : asks.joined(separator: " "),
+                           ask: asks.isEmpty ? nil : .signIn)
     }
 }
 
@@ -1793,9 +1858,8 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
     }
 
     public func runAll(repair: Bool) async throws -> [CheckResult] {
-        // Bulk repairs have no button authority: only create missing files
-        // or refresh OAuth through its owner, sequentially. File replacement
-        // requires runCheck with explicit button scope.
+        // Bulk repairs run the automatic scope sequentially; persona writes
+        // still require runCheck with explicit button scope.
         // The repair:false path is read-only — every check only stats,
         // reads and parses its own subtree — so the checks are independent and
         // run concurrently. Results are re-sorted back into declaration order,
@@ -1849,6 +1913,14 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
             if repair, scope != .button {
                 if let oauth = check as? OAuthTokenExpiryCheck {
                     return await oauth.run(repair: true)
+                }
+                // Automatic runs the full repair: every one backs up and
+                // revalidates under the writer's lock before it replaces.
+                // Authority stores and onboarding only create what is missing.
+                if scope == .automatic, DoctorSafeRepairPolicy.automaticCoreIDs.contains(id),
+                   !DoctorSafeRepairPolicy.createMissingOnlyIDs.contains(id),
+                   let repairable = check as? any RepairingDoctorCheck {
+                    return await repairable.run(repair: true)
                 }
                 if DoctorSafeRepairPolicy.automaticCoreIDs.contains(id),
                    let creator = check as? any CreateMissingDoctorCheck {

@@ -1143,6 +1143,8 @@ echo "==> Codesigning..."
 sign_nested_plain() {
   local identity="$1"
   local timestamp_arg="${2:---timestamp}"
+  codesign --force --sign "$identity" --options runtime "$timestamp_arg" \
+    "$BUNDLE/Contents/MacOS/codex"
   if [[ -d "$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex" ]]; then
     codesign --force --sign "$identity" --options runtime "$timestamp_arg" \
       --generate-entitlement-der --entitlements "$RELEASE_WIDGET_WORK/widget.entitlements" \
@@ -1152,6 +1154,9 @@ sign_nested_plain() {
     --options runtime "$timestamp_arg" "$BUNDLE/Contents/MacOS/nativeagent-link"
   codesign --force --sign "$identity" --identifier NativeAgentChromeRelay \
     --options runtime "$timestamp_arg" "$BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
+  codesign --force --sign "$identity" --identifier NativeAgentSenseHost \
+    --options runtime "$timestamp_arg" --entitlements "$ROOT/Config/NativeAgentSenseHost.entitlements" \
+    "$BUNDLE/Contents/MacOS/NativeAgentSenseHost"
   if [[ -d "$BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then
     codesign --force --deep --sign "$identity" --options runtime $timestamp_arg \
       "$BUNDLE/Contents/Frameworks/Sparkle.framework"

@@ -19,6 +19,10 @@ extension SwiftNativeMacControl: MacFourVerbsHost {}
 /// or role ordinal, while the implementation may use a current view mark or a
 /// confidence-gated physical point.
 public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
+    /// The real AX role, when this target came from accessibility.
+    public let role: String?
+    public let actions: [String]
+    public let settableAttributes: [String]
     /// The screenshot mark's AX identity, private to fusion and never an
     /// action authority or a rendered name. Nil denotes pixel-only evidence.
     public let sourceAXPath: [Int]?
@@ -63,8 +67,14 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
         physicalOnly: Bool = false,
         motionUncertain: Bool = false,
         sourceAXPath: [Int]? = nil,
-        enabled: Bool = true
+        enabled: Bool = true,
+        role: String? = nil,
+        actions: [String] = [],
+        settableAttributes: [String] = []
     ) {
+        self.role = role
+        self.actions = actions
+        self.settableAttributes = settableAttributes
         self.label = label
         self.aliases = aliases
         self.kind = kind
@@ -197,7 +207,11 @@ public struct MacFourVerbsReply: Sendable, Equatable {
     /// their bounded SAYS rendering and can ask screen(part:) for more, rather
     /// than receiving the same strings twice more in diagnostic arrays.
     public var agentDetail: [String: JSONValue] {
-        detail.filter { $0.key != "vision_value_text" && $0.key != "vision_effect_value_text" }
+        var visible = detail.filter { $0.key != "vision_value_text" && $0.key != "vision_effect_value_text" }
+        // Keep the motor's typed settlement vocabulary inside the runtime;
+        // the receipt says plainly what its observed verdict means.
+        if visible["verification"] == .string("satisfied") { visible["verification"] = .string("verified") }
+        return visible
     }
 
     public init(ok: Bool, text: String, detail: [String: JSONValue] = [:]) {

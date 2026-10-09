@@ -112,8 +112,11 @@ Knowledge Graph and Context projections do not replace MemoryV2's authority.
 
 Relevant memories can arrive through resident selection. `memory.recall`
 supports deeper retrieval, while `chat.search` and `chat.message` recover
-conversation wording. Skills are available through `skill.read`; they are
-instructions, not factual memory or permission.
+conversation wording. Skills provide guidance through `skill.read` and can
+carry optional admitted scripts. `skill.save`, `skill.enable`, `skill.run`,
+`skill.resume` and `skill.rollback` manage those procedures; see the
+[manifest spec](skill_manifest_spec.md). Skills are not factual memory and
+grant no new authority.
 
 Source owners: `MemoryV2/MemoryV2+AdaptivePromoter.swift`,
 `MemoryV2+Proposals.swift`, `MemoryV2+UserMDGen.swift`,
@@ -161,7 +164,7 @@ Different kinds of growth return through different owners:
 | Cognitive capsule and organism posture | Optional advisory input to a turn |
 | Dream synthesis | Dream diary |
 | REM consolidation | Reviewable lessons targeting `GROWTH.md` |
-| Skills | Reusable procedural guidance |
+| Skills | Reusable procedural guidance and optional admitted scripts |
 | Authored tools | Active registry entries exposed as `authored.<id>` |
 
 Dream and REM use `DreamREMCycle`. REM stages growth proposals;

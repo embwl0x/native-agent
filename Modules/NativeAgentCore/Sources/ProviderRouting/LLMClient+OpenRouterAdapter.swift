@@ -124,6 +124,7 @@ public final class OpenRouterAdapter: LLMAdapter {
         let data: Data
         let response: URLResponse
         do {
+            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
             (data, response) = try await session.data(for: req)
         } catch {
             throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openrouter")"))
@@ -195,7 +196,9 @@ public final class OpenRouterAdapter: LLMAdapter {
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
+                        if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                         (bytes, response) = try await session.bytes(for: req)
+                        if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
                     } catch {
                         throw mapTransportError(error, fallback: .underlying(
                             message: "connection refused: \(endpoint.host ?? "openrouter")"

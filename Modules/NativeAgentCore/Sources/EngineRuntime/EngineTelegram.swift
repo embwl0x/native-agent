@@ -16,19 +16,51 @@ public final class TelegramFacade {
     public nonisolated init(dataRoot: URL) { self.dataRoot = dataRoot }
 
     public nonisolated func configuration() async -> TelegramConfigurationSummary? {
-        guard let config = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot) else { return nil }
+        guard let config = try? TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot) else { return nil }
         let routing = try? await SwiftNativeProviderRouting(dataRoot: dataRoot).computeModelPreferences()["telegram"]
         let brain = resolveTelegramBrain(routing: routing, legacyModel: config.model,
                                          legacyReasoningEffort: config.reasoningEffort)
         return TelegramConfigurationSummary(config: config, model: brain.model, reasoningEffort: brain.reasoningEffort)
     }
 
-    public nonisolated func load(manager: BackgroundLoopsManager = .shared) async throws -> TelegramPresentationSnapshot {
+    public nonisolated func load(manager: BackgroundLoopsManager = .shared, credentialUnavailable: Bool = false,
+                                 routingSnapshot: ProviderRoutingSnapshot? = nil) async throws -> TelegramPresentationSnapshot {
+        var snapshot = try await loadStatus(manager: manager, credentialUnavailable: credentialUnavailable,
+                                            routingSnapshot: routingSnapshot)
+        let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
+        let receiptsRead: TelegramDiagnosticFeedRead<TelegramReceipt> = await telegramDiagnosticFeed(
+            path: telegramDir.appendingPathComponent("receipts.jsonl"),
+            limit: 50
+        )
+        let blockedRead: TelegramDiagnosticFeedRead<TelegramBlockedEvent> = await telegramDiagnosticFeed(
+            path: telegramDir.appendingPathComponent("blocked.jsonl"),
+            limit: 50
+        )
+        let errorsRead: TelegramDiagnosticFeedRead<TelegramErrorEvent> = await telegramDiagnosticFeed(
+            path: telegramDir.appendingPathComponent("errors.jsonl"),
+            limit: 50
+        )
+        snapshot.receipts = receiptsRead.rows
+        snapshot.blocked = blockedRead.rows
+        snapshot.errors = errorsRead.rows
+        snapshot.receiptsIssue = receiptsRead.issue
+        snapshot.blockedIssue = blockedRead.issue
+        snapshot.errorsIssue = errorsRead.issue
+        return snapshot
+    }
+
+    public nonisolated func loadStatus(manager: BackgroundLoopsManager = .shared, credentialUnavailable: Bool = false,
+                                       routingSnapshot: ProviderRoutingSnapshot? = nil) async throws -> TelegramPresentationSnapshot {
         // Read config and state once for this projection; retain
         // only credential-free configuration in observable state.
-        let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot)
-        let telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
-            .computeModelPreferences()["telegram"]
+        let cfg = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: !credentialUnavailable)
+        let telegramBrain: SurfacePreference?
+        if let routingSnapshot {
+            telegramBrain = routingSnapshot.preferences["telegram"]
+        } else {
+            telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
+                .computeModelPreferences()["telegram"]
+        }
         let resolvedTelegramBrain = resolveTelegramBrain(
             routing: telegramBrain,
             legacyModel: cfg?.model,
@@ -63,18 +95,10 @@ public final class TelegramFacade {
             lastPollAt = raw["lastPollAt"] as? String
             lastDiagnosticsClearedAt = raw["lastDiagnosticsClearedAt"] as? String
         }
-        let receiptsRead: TelegramDiagnosticFeedRead<TelegramReceipt> = await telegramDiagnosticFeed(
-            path: telegramDir.appendingPathComponent("receipts.jsonl"),
-            limit: 50
-        )
-        let blockedRead: TelegramDiagnosticFeedRead<TelegramBlockedEvent> = await telegramDiagnosticFeed(
-            path: telegramDir.appendingPathComponent("blocked.jsonl"),
-            limit: 50
-        )
-        let errorsRead: TelegramDiagnosticFeedRead<TelegramErrorEvent> = await telegramDiagnosticFeed(
-            path: telegramDir.appendingPathComponent("errors.jsonl"),
-            limit: 50
-        )
+        if let loop = await manager.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop,
+           let polledAt = await loop.lastSuccessfulPollAt {
+            lastPollAt = ISO8601DateFormatter().string(from: polledAt)
+        }
         let voiceBackend = cfg?.voiceTranscriptionBackend ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionBackend
         let voiceModel = cfg?.voiceTranscriptionModel ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionModel
         let voiceStatus = TelegramVoiceTranscriptionStatus(
@@ -93,12 +117,13 @@ public final class TelegramFacade {
         return TelegramPresentationSnapshot(
             transport: TelegramBot.TelegramStatus(
                 enabled: cfg?.enabled ?? false,
-                tokenConfigured: cfg?.botToken.isEmpty == false,
+                tokenConfigured: cfg?.tokenConfigured ?? false,
                 pollerEnabled: pollerRunning,
                 lastSeenUpdateId: lastSeenUpdateId,
                 lastSeenAt: lastSeenAt,
                 lastReplyAt: lastReplyAt,
-                lastError: lastError ?? (cfg == nil ? "No bot token saved — paste one to enable." : nil)
+                lastError: credentialUnavailable ? DeviceSecretKeychain.Failure.unavailable.localizedDescription
+                    : lastError ?? (cfg == nil ? "No bot token saved — paste one to enable." : nil)
             ),
             configuration: TelegramConfigurationSummary(
                 config: cfg, model: resolvedTelegramBrain.model,
@@ -108,12 +133,7 @@ public final class TelegramFacade {
             lastPollAt: lastPollAt,
             lastDiagnosticsClearedAt: lastDiagnosticsClearedAt,
             voiceTranscription: voiceStatus,
-            receipts: receiptsRead.rows,
-            blocked: blockedRead.rows,
-            errors: errorsRead.rows,
-            receiptsIssue: receiptsRead.issue,
-            blockedIssue: blockedRead.issue,
-            errorsIssue: errorsRead.issue
+            receipts: [], blocked: [], errors: []
         )
     }
 

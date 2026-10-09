@@ -89,7 +89,7 @@ extension NativeOAuthPlatform {
                    let url = URL(string: "http://localhost:\(port)\(target)"),
                    NativeOAuthFlow.callbackHasResult(url),
                    OAuthLoopbackCallbackPolicy.callbackMatchesState(url, expectedState: expectedState) {
-                    respondSuccess(connection)
+                    respondSuccess(connection, message: callbackPageMessage(url))
                     gate.finish(.success(url))
                     return
                 }
@@ -119,15 +119,24 @@ extension NativeOAuthPlatform {
         return String(text[text.startIndex..<range.lowerBound])
     }
 
-    private static func respondSuccess(_ connection: NWConnection) {
+    /// The browser tab's one line once the callback lands. The token exchange
+    /// hasn't run yet, so the tab claims nothing; the app comes forward with
+    /// the real result (OAuthSignInButton.runFlow).
+    static func callbackPageMessage(_ url: URL) -> String {
+        let declined = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.contains { $0.name == "error" } == true
+        return declined
+            ? "Sign-in didn't finish — return to NativeAgent to try again."
+            : "Finishing sign-in — return to NativeAgent."
+    }
+
+    private static func respondSuccess(_ connection: NWConnection, message: String) {
         let bodyHTML = """
         <!doctype html><html><head><meta charset="utf-8"><title>NativeAgent</title>
         <style>body{font:15px -apple-system,Helvetica,Arial;background:#111;color:#eee;
         display:flex;height:100vh;align-items:center;justify-content:center;margin:0}
         .c{text-align:center;max-width:420px;padding:24px}</style></head>
-        <body><div class="c"><h2>Sign-in callback received</h2>
-        <p>Return to NativeAgent to check whether ChatGPT sign-in completed. You can close this tab.</p>
-        </div></body></html>
+        <body><div class="c"><h2>\(message)</h2></div></body></html>
         """
         sendHTTP(connection, status: "200 OK", body: bodyHTML)
     }

@@ -5,9 +5,9 @@ import NativeAgentCore
 //   engine.cognitionView.dreamEntry(date:)  -> one night (not-found if missing)
 //   POST /v1/dream/run           -> run a dream pass now
 //   POST /v1/rem/run             -> run a REM consolidation pass now
-// Kill switches (via deep-merged /v1/trust patch):
-//   personalityPolicy.dream_cycle_enabled (deep dream gate)
-//   trainingPolicy.rem_cycle_enabled       (REM gate)
+// The two kill switches (personalityPolicy.dream_cycle_enabled with
+// dream_scheduler, and trainingPolicy.rem_cycle_enabled) are switched in one
+// place, Settings ▸ Inner life (SetupFeatureRows). This page reads them.
 import SwiftUI
 import DreamREMCycle
 import PersistenceCore
@@ -40,7 +40,7 @@ enum DreamRunAvailability: Equatable {
         case .enabled:
             return "Run a dream reflection pass against recent sessions."
         case .disabled:
-            return "Dream cycle is disabled. Enable the dream cycle toggle and the Trust 'dream scheduler' gate."
+            return "Dreams at night is off. Turn it on in Settings \u{25B8} Inner life."
         case .unavailable:
             return "Dream-cycle availability could not be read. Refresh the diary and retry."
         }
@@ -215,14 +215,6 @@ struct DreamsView: View {
     @State private var remRunFeedback: DreamsREMActionFeedback?
     @State private var didInitialLoad = false
 
-    // Optimistic local mirrors of the two kill switches so the toggles don't snap
-    // back during the async save round-trip; reconciled from the source of truth
-    // after each load. dreamCycleOn tracks the composite gate (the "Dream cycle"
-    // toggle moves dream_cycle_enabled + dream_scheduler together).
-    @State private var dreamCycleOn = false
-    @State private var remCycleOn = true
-    @State private var savingDream = false
-    @State private var savingRem = false
     // Cancellable task for diary refresh so it doesn't outlive the view.
     @State private var refreshTask: Task<Void, Never>?
     @State private var entryTask: Task<Void, Never>?
@@ -259,16 +251,6 @@ struct DreamsView: View {
             entryCount: entries.count,
             unreadableEntries: diaryUnreadableEntries
         )
-    }
-
-    // REM enabled state is owned by the trust policy. A policy that has not
-    // loaded yet is NOT an off switch: `== true` on the optional rendered the
-    // toggle OFF on a fresh root, because the diary load below reconciles the
-    // mirrors and wins the race against `loadREMPolicy()`. Fall back to the
-    // shipped default instead.
-    @MainActor
-    private var remEnabled: Bool {
-        appModel.engine.trust.policy?.trainingPolicy?.rem_cycle_enabled ?? true
     }
 
     var body: some View {
@@ -314,14 +296,14 @@ struct DreamsView: View {
         let kept = count == 0
             ? "I haven't written a dream yet"
             : "I've written \(count) \(count == 1 ? "dream" : "dreams") in my diary"
-        return kept + (dreamCycleOn ? "." : "; my dream cycle is off.")
+        return kept + (dreamEnabledFromDiary ? "." : "; my dream cycle is off.")
     }
 
     // ── Controls ──────────────────────────────────────────────────────────────
     private var controlBar: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Alive glass (2026-09-23): one group card, the runs on one row
-            // and the two cycle switches on the next.
+            // Alive glass (2026-09-23): one group card, the runs on one row.
+            // The two cycle switches live on Settings ▸ Inner life.
             AliveGroupCard {
                 HStack(spacing: 8) {
                     Button {
@@ -354,56 +336,6 @@ struct DreamsView: View {
                     .help("Refresh the dream diary")
                     .disabled(isLoadingDiary)
                 }
-
-                HStack(spacing: 24) {
-                    Toggle("Dream cycle", isOn: Binding(
-                        get: { dreamCycleOn },
-                        set: { newValue in
-                            guard !savingDream else { return }
-                            dreamCycleOn = newValue          // optimistic — no snap-back
-                            savingDream = true
-                            Task {
-                                let ok = await appModel.setDreamCycleEnabled(newValue)
-                                if ok {
-                                    // Both gates moved together; re-read the composite.
-                                    await loadDiary(selectLatest: false)
-                                } else {
-                                    // Save failed — revert the optimistic flip and keep
-                                    // the error visible (don't reload, which clears it).
-                                    dreamCycleOn = !newValue
-                                }
-                                savingDream = false
-                            }
-                        }
-                    ))
-                    .toggleStyle(.switch)
-                    .hazeTinted()
-                    .controlSize(.small)
-                    .disabled(savingDream)
-
-                    Toggle("REM cycle", isOn: Binding(
-                        get: { remCycleOn },
-                        set: { newValue in
-                            guard !savingRem else { return }
-                            remCycleOn = newValue            // optimistic — no snap-back
-                            savingRem = true
-                            Task {
-                                let ok = await appModel.setRemCycleEnabled(newValue)
-                                // On success reconcile from the saved policy; on failure
-                                // revert the optimistic flip (error stays visible).
-                                remCycleOn = ok ? remEnabled : !newValue
-                                savingRem = false
-                            }
-                        }
-                    ))
-                    .toggleStyle(.switch)
-                    .hazeTinted()
-                    .controlSize(.small)
-                    .disabled(savingRem)
-
-                    Spacer()
-                }
-                .font(ShellType.label)
             }
 
             if let banner = diaryRefreshPresentation.banner {
@@ -671,12 +603,6 @@ struct DreamsView: View {
         diaryTotalEntries = response.totalEntries
         diaryUnreadableEntries = response.unreadableEntries ?? 0
         dreamEnabledFromDiary = response.enabled
-        // Reconcile the optimistic toggle mirrors from the source of truth (skip
-        // while a save is in flight so we don't clobber the user's pending intent).
-        if !savingDream { dreamCycleOn = response.enabled }
-        // Only reconcile REM once the policy it comes from has actually been
-        // read — the diary response says nothing about the REM gate.
-        if !savingRem, appModel.engine.trust.policy != nil { remCycleOn = remEnabled }
 
         // Re-derive the selection against the freshly loaded entries.
         if entries.isEmpty {
@@ -775,7 +701,7 @@ struct DreamsView: View {
         case .enabled:
             return "I haven't written an entry yet. Run a dream pass and I'll write the first one."
         case .disabled:
-            return "My dream cycle is off. Turn it on above and I dream each night, or when you run a pass."
+            return "My dream cycle is off. Turn on Dreams at night in Settings \u{25B8} Inner life and I dream each night, or when you run a pass."
         case .unavailable:
             return "The dream diary could not be read, so cycle availability is unavailable."
         }

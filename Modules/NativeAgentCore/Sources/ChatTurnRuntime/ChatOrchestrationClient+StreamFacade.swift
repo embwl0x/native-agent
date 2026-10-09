@@ -216,7 +216,10 @@ extension SwiftNativeChatOrchestrationClient {
         /// False by default, so a new consumer is text-only until it says
         /// otherwise — the safe direction, because the cost of being wrong here
         /// is a card said twice, not a reply that never arrives.
-        consumerRendersInlineCards: Bool = false
+        consumerRendersInlineCards: Bool = false,
+        /// Where User was when his door received a "take over". Bound inside
+        /// the producer, same parameter-not-wrapper rule.
+        macContinuation: MacWorkContinuation? = nil
     ) -> ChatStreamExecution {
         // Turn Inspector W1: bind the per-turn trace id ONCE around the whole
         // streaming turn. runStream runs the streaming tool loop; it (and the
@@ -320,6 +323,13 @@ extension SwiftNativeChatOrchestrationClient {
                                     }
                                 }
                             }
+                            func runWithTakeover() async {
+                                if let macContinuation {
+                                    await MacWorkContinuation.$current.withValue(macContinuation) { await runWithExecution() }
+                                } else {
+                                    await runWithExecution()
+                                }
+                            }
                             if let replyRoute {
                                 // The trace rows of this turn carry the same
                                 // delivery identity the route does, so a later
@@ -327,10 +337,10 @@ extension SwiftNativeChatOrchestrationClient {
                                 // instead of falling back to the phone for
                                 // want of a destination (2026-09-13).
                                 await ChatToolSessionContext.withReplyRoute(replyRoute) {
-                                    await runWithExecution()
+                                    await runWithTakeover()
                                 }
                             } else {
-                                await runWithExecution()
+                                await runWithTakeover()
                             }
                         }
                         }
@@ -362,17 +372,13 @@ extension SwiftNativeChatOrchestrationClient {
             continuation.finish()
             return
         }
-        let admission: TurnRouteAdmission
         do {
-            admission = try await engine.checkedRouteAdmission(
+        try await StandingBotContinuity.withSessionContract(sessionID: sessionId, dataRoot: dataRoot) {
+        let admission = try await engine.checkedRouteAdmission(
                 for: surface,
                 requestedModel: model,
                 requestedReasoningEffort: reasoningEffort
             )
-        } catch {
-            continuation.finish(throwing: ProviderFailure.report(error) ?? error)
-            return
-        }
         await LLMCallContext.$admittedModel.withValue(admission.modelId) {
         await LLMCallContext.$providerId.withValue(admission.providerId) {
         await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
@@ -392,6 +398,10 @@ extension SwiftNativeChatOrchestrationClient {
         }
         }
         }
+        }
+        }
+        } catch {
+            continuation.finish(throwing: ProviderFailure.report(error) ?? error)
         }
     }
 

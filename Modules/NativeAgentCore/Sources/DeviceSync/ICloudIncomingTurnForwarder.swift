@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import NativeAgentCore
 import ChatOrchestration
+import MacControl
 import PersistenceCore
 import ToolRegistry
 import Transcripts
@@ -140,6 +141,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let routeKey = remoteMetadata["routeKey"] ?? remoteMetadata["deviceSourceKey"] ?? sourceKey
         func writeErrorReply(
             _ text: String,
+            detail: String? = nil,
             sessionID: String?,
             turnReachedTerminalState: Bool = false,
             needs: String? = nil
@@ -147,7 +149,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             do {
                 var metadata = [
                     "kind": "error",
-                    "errorDetail": String(text.prefix(400)),
+                    "errorDetail": String((detail ?? text).prefix(400)),
                     "transport": "icloud",
                     "source": "mac",
                     "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
@@ -174,7 +176,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 port.completed(sessionID: sessionID)
                 return true
             } catch {
-                NSLog("[iCloudBridge] failed to write error reply for msg %@: %@", msg.id, "\(error)")
+                nativeLog("[iCloudBridge] failed to write error reply for msg %@: %@", msg.id, "\(error)")
                 if turnReachedTerminalState {
                     port.completed(sessionID: sessionID)
                 }
@@ -199,7 +201,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 ]
             )
             if !delivered {
-                NSLog("[iCloudBridge] failed to write KVS progress for msg %@ stage=%@", msg.id, stage)
+                nativeLog("[iCloudBridge] failed to write KVS progress for msg %@ stage=%@", msg.id, stage)
             }
         }
 
@@ -213,7 +215,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let resolvedSessionID: String
         if let trimmedSessionID, !trimmedSessionID.isEmpty {
             guard let safeSessionID = NativeAgentChatSessionID.normalizedPathComponent(trimmedSessionID) else {
-                NSLog("[iCloudBridge] dropping iOS msg %@: invalid sessionID %@", msg.id, trimmedSessionID)
+                nativeLog("[iCloudBridge] dropping iOS msg %@: invalid sessionID %@", msg.id, trimmedSessionID)
                 return await writeErrorReply(
                     "iPhone message rejected: invalid chat session id.",
                     sessionID: nil
@@ -238,7 +240,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             do {
                 let reply = try await port.stopChatForControlHandoff(sessionID: resolvedSessionID, messageDate: msg.timestamp)
                 try await port.residentChatClient().recordControlHandoff(
-                    message: msg.text, reply: reply, sessionId: resolvedSessionID, surface: "ios"
+                    message: msg.text, reply: reply, sessionId: resolvedSessionID, surface: "ios", runId: msg.id
                 )
                 _ = try await port.sendChatMessage(text: reply, sessionID: resolvedSessionID,
                     correlationID: msg.id, metadata: [
@@ -256,6 +258,9 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             }
         }
 
+        // Where User was when his "take over" arrived, before any queue.
+        let takeover = port.signatureVerified(msg) ? await MacWorkContinuation.admit(msg.text) : nil
+
         func consumeSupersededMessage() async -> Bool {
             defer { port.completed(sessionID: resolvedSessionID) }
             do {
@@ -265,7 +270,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                         "replyTo": remoteMetadata["clientSurface"] ?? "iphone", "targetSourceKey": routeKey,
                     ])
             } catch {
-                NSLog("[iCloudBridge] failed to write superseded reply for msg %@: %@", msg.id, "\(error)")
+                nativeLog("[iCloudBridge] failed to write superseded reply for msg %@: %@", msg.id, "\(error)")
             }
             // A handoff is terminal for this input, even if reply publication fails.
             return true
@@ -277,29 +282,6 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         await port.awaitPendingChatStop(sessionID: resolvedSessionID)
         guard !supersededByControlHandoff() else {
             return await consumeSupersededMessage()
-        }
-
-        // A bot's session opened or pinned on iPhone is still that bot's
-        // session: it runs on the bot's own checked tuple, never Chat's. The
-        // same contract and the same gate the Mac send applies
-        // (AppModel+ChatActions.swift) — a bot whose account was disconnected
-        // or whose model left the catalog refuses its turn here exactly as a
-        // scheduled run would, instead of quietly spending Chat's route
-        // (2026-09-13 comb, item 1). The surface stays "ios", so every remote
-        // restriction on this path is unchanged.
-        let acceptedBotContract = await BotChatContract.checked(resolvedSessionID)
-        if let contract = acceptedBotContract, let problem = contract.modelChoiceProblem {
-            return await writeErrorReply(
-                "\(contract.name) can't run yet. \(problem) This bot runs on its own account, "
-                    + "never Chat's, so choosing it is the one repair - continue on the Mac, in this bot's card. "
-                    + "Nothing was started, and its unfinished work is kept.",
-                sessionID: resolvedSessionID,
-                needs: Self.needsInteractionEnvelope(
-                    kind: "model_choice",
-                    target: resolvedSessionID,
-                    reason: problem
-                )
-            )
         }
 
         // Swift-native cutover/fix2-ios-chat (2026-06-02): the daemon's
@@ -325,7 +307,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 dataRoot: PersistenceCore.defaultDataRoot()
             )
         } catch {
-            NSLog("[iCloudBridge] ensureChatSessionIndex failed for %@: %@", resolvedSessionID, "\(error)")
+            nativeLog("[iCloudBridge] ensureChatSessionIndex failed for %@: %@", resolvedSessionID, "\(error)")
             return await writeErrorReply(
                 "Chat history is unavailable because its session index needs repair on the Mac.",
                 sessionID: resolvedSessionID
@@ -370,7 +352,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
             "targetSourceKey": routeKey
         ]
-        let personError = OSAllocatedUnfairLock<String?>(initialState: nil)
+        let caughtError = OSAllocatedUnfairLock<Error?>(initialState: nil)
         let replyRoute = ChatToolSessionContext.ReplyRoute(
             surface: "ios",
             sourceKey: routeKey,
@@ -388,6 +370,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let streamTask = Task.detached(priority: .userInitiated) { () -> (text: String, deltaSeq: Int, error: String?, toolEvents: Int) in
             do {
             return try await TurnAdmission.shared.run(sessionID: resolvedSessionID) {
+            await ChatPersistenceContext.$pinnedTurnRunID.withValue(msg.id) {
             await ChatToolSessionContext.$commandSignatureVerified.withValue(commandSignatureVerified) {
             var accumulated = ""
             var sawError: String? = nil
@@ -396,34 +379,22 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             let shown = ShownToolNames()
             var deltaCoalescer = ICloudTextDeltaCoalescer()
 
-            // U4 Wave D (gpt-5.5 review-2 BLOCKER): iCloud/iOS streaming is a
-            // REMOTE paired-user surface — self-evolution tools must not be
-            // reachable from it (consistent with Telegram and Slack). The
-            // separately authenticated builder collaboration bridge has its
-            // own explicit profile; it is not an iOS policy precedent.
-            // A bot session carries the tuple its gate accepted above; an
-            // ordinary session binds nothing and the facade admits the
-            // Mac-owned ios tuple as before.
-            // The tuple travels as a PARAMETER: the facade binds it inside its
-            // own producer task, for that producer's whole life. A synchronous
-            // withValue around this call popped the task-local the moment it
-            // returned, while the producer it had just spawned still read it
-            // (swift_task_dealloc_specific — see chatStreamExecution).
+            // Core admits the session's execution contract inside the producer.
             let execution = chatClient.chatStreamExecution(
                 message: msg.text,
                 sessionId: resolvedSessionID,
                 // Signed metadata is evidence only. The facade
                 // admits the Mac-owned ios tuple before append.
-                model: acceptedBotContract?.model ?? "",
-                reasoningEffort: acceptedBotContract?.reasoningEffort ?? "",
+                model: "",
+                reasoningEffort: "",
                 fileAccess: chatFileAccess,
                 attachments: coAttachments,
-                persona: NativeAgentNotificationDefaults.agentDisplayName(dataRoot: PersistenceCore.defaultDataRoot()),
+                persona: nil,
                 surface: "ios",
                 suppressUserAppend: suppressUserAppend,
                 replacementAssistantMessageID: replacementAssistantMessageID,
-                choice: acceptedBotContract?.choice,
-                replyRoute: replyRoute
+                replyRoute: replyRoute,
+                macContinuation: takeover
             )
             await withTaskCancellationHandler {
             do {
@@ -500,8 +471,10 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                     case .toolUse(let called, let input):
                         // F7 P2: forward a lightweight tool_use progress event so
                         // iOS can render that a tool is firing. Payload is the
-                        // tool name only — full input/output stays Mac-local.
-                        let name = shown.use(called, input: input).name
+                        // tool name and the Mac card's phrase for it (plain
+                        // names only) — full input/output stays Mac-local.
+                        let call = shown.use(called, input: input)
+                        let name = call.name
                         toolEventCounter += 1
                         if let flush = deltaCoalescer.flush(nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) {
                             await sendICloudTextDelta(
@@ -519,7 +492,8 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                             metadata: [
                                 "kind": "tool_use",
                                 "toolName": name,
-                                "toolSeq": String(toolEventCounter),
+                                "activity": ToolActivityPresentation.progress(name, args: call.input.stringFields),
+                                "toolSeq": String(call.seq),
                                 "transport": "icloud",
                                 "source": "mac",
                                 "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
@@ -527,10 +501,13 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                             ]
                         )
                         if !delivered {
-                            NSLog("[iCloudBridge] failed tool_use KVS event msg=%@: %@", msg.id, name)
+                            nativeLog("[iCloudBridge] failed tool_use KVS event msg=%@: %@", msg.id, name)
                         }
-                    case .toolResult(let called, _):
-                        let name = shown.result(called)
+                    case .toolResult(let called, let output):
+                        let call = shown.result(called)
+                        let name = call.name
+                        let outcome = ChatToolOutcome.exactResultClass(output).rawValue
+                        let detail = [ChatToolOutcome.explanation(output), ChatToolOutcome.remedy(output)].compactMap { $0 }.joined(separator: " · ")
                         toolEventCounter += 1
                         if let flush = deltaCoalescer.flush(nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) {
                             await sendICloudTextDelta(
@@ -548,7 +525,10 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                             metadata: [
                                 "kind": "tool_result",
                                 "toolName": name,
-                                "toolSeq": String(toolEventCounter),
+                                "toolSeq": call.seq.map(String.init) ?? "",
+                                "outcome": outcome,
+                                "resultDetail": detail,
+                                "activity": ToolActivityPresentation.finished(name, outcome: outcome, detail: detail),
                                 "transport": "icloud",
                                 "source": "mac",
                                 "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
@@ -556,7 +536,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                             ]
                         )
                         if !delivered {
-                            NSLog("[iCloudBridge] failed tool_result KVS event msg=%@: %@", msg.id, name)
+                            nativeLog("[iCloudBridge] failed tool_result KVS event msg=%@: %@", msg.id, name)
                         }
                     case .error(let m):
                         // F7 P1: surface stream errors explicitly. The previous
@@ -575,7 +555,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                             )
                         }
                         sawError = m
-                        NSLog("[iCloudBridge] chatStream error msg=%@: %@", msg.id, m)
+                        nativeLog("[iCloudBridge] chatStream error msg=%@: %@", msg.id, m)
                     }
                 }
             } catch {
@@ -589,8 +569,8 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                     )
                 }
                 sawError = "\(error)"
-                personError.withLock { $0 = ProviderRecoveryPolicy.personMessage(error) }
-                NSLog("[iCloudBridge] forwardToSwiftRuntime: chatStream() failed for msg %@: %@", msg.id, "\(error)")
+                caughtError.withLock { $0 = error }
+                nativeLog("[iCloudBridge] forwardToSwiftRuntime: chatStream() failed for msg %@: %@", msg.id, "\(error)")
             }
             // Stream close can precede the producer's terminal transcript write.
             // Keep the phone's admission slot until that writer has joined.
@@ -601,8 +581,9 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             return (accumulated, deltaCoalescer.sequence, sawError, toolEventCounter)
             }
             }
+            }
             } catch {
-                personError.withLock { $0 = ProviderRecoveryPolicy.personMessage(error) }
+                caughtError.withLock { $0 = error }
                 return ("", 0, error.localizedDescription, 0)
             }
         }
@@ -644,7 +625,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 port.completed(sessionID: resolvedSessionID)
                 return true
             } catch {
-                NSLog("[iCloudBridge] failed to write cancel reply for msg %@: %@", msg.id, "\(error)")
+                nativeLog("[iCloudBridge] failed to write cancel reply for msg %@: %@", msg.id, "\(error)")
                 port.completed(sessionID: resolvedSessionID)
                 return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
                     turnReachedTerminalState: true,
@@ -654,53 +635,25 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         }
 
         if let errMsg = outcome.error {
-            // F7 P1: stream errored. Send a kind=error BridgeMessage with the
-            // description so iOS shows a banner instead of folding partial
-            // text as a final reply.
-            do {
-                _ = try await port.sendChatMessage(
-                    text: "NativeAgent hit an error answering that message.",
-                    sessionID: resolvedSessionID,
-                    correlationID: msg.id,
-                    metadata: [
-                        "kind": "error",
-                        // 2026-09-13 (first-failure pass): the phone used to get
-                        // the raw provider string here while the Mac's own
-                        // transcript got a cause-and-recovery sentence. One
-                        // failure, one explanation — normalized through the same
-                        // function, naming the control this device shows.
-                        // 2026-09-22: a typed provider failure sends its person sentence.
-                        "errorDetail": String((personError.withLock { $0 } ?? ChatStreamErrorText.normalize(
-                            Self.redactedRemoteErrorDetail(errMsg),
-                            retryAction: "Retry"
-                        )).prefix(400)),
-                        "transport": "icloud",
-                        "source": "mac",
-                        "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
-                        "targetSourceKey": routeKey
-                    ]
-                )
-                await port.sendICloudReplyPushNotification(
-                    text: "NativeAgent hit an error answering that message.",
-                    sessionID: resolvedSessionID,
-                    correlationID: msg.id,
-                    kind: "error"
-                )
-                port.completed(sessionID: resolvedSessionID)
-                return true
-            } catch {
-                NSLog("[iCloudBridge] failed to write error reply for msg %@: %@", msg.id, "\(error)")
-                port.completed(sessionID: resolvedSessionID)
-                return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
-                    turnReachedTerminalState: true,
-                    replyPublished: false
+            let error = caughtError.withLock { $0 }
+            if let chatError = error as? ChatOrchestrationError,
+               case .helperModelChoice(let sessionID, let reason, let message) = chatError {
+                return await writeErrorReply(
+                    message, sessionID: sessionID, turnReachedTerminalState: true,
+                    needs: Self.needsInteractionEnvelope(kind: "model_choice", target: sessionID, reason: reason)
                 )
             }
+            return await writeErrorReply(
+                "NativeAgent hit an error answering that message.",
+                detail: error.flatMap { ProviderRecoveryPolicy.personMessage($0) } ?? ChatStreamErrorText.normalize(
+                    Self.redactedRemoteErrorDetail(errMsg), retryAction: "Retry"),
+                sessionID: resolvedSessionID, turnReachedTerminalState: true
+            )
         }
 
         let replyText = outcome.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !replyText.isEmpty || !outcomeAttachments.isEmpty else {
-            NSLog("[iCloudBridge] forwardToSwiftRuntime: empty reply for msg %@", msg.id)
+            nativeLog("[iCloudBridge] forwardToSwiftRuntime: empty reply for msg %@", msg.id)
             return await writeErrorReply(
                 "NativeAgent returned an empty reply. Check NativeAgent logs for that run.",
                 sessionID: resolvedSessionID,
@@ -720,11 +673,11 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             // row. Publication retries that one phone event independently;
             // ordinary conversation does not create a notification.
             port.completed(sessionID: resolvedSessionID)
-            NSLog("[iCloudBridge] forwarded iOS msg %@ → Swift chatStream (session=%@) → wrote reply (%d chars, %d deltas, %d attachments)",
+            nativeLog("[iCloudBridge] forwarded iOS msg %@ → Swift chatStream (session=%@) → wrote reply (%d chars, %d deltas, %d attachments)",
                   msg.id, resolvedSessionID, replyText.count, outcome.deltaSeq, outcomeAttachments.count)
             return true
         } catch {
-            NSLog("[iCloudBridge] failed to write reply to Drive for msg %@: %@", msg.id, "\(error)")
+            nativeLog("[iCloudBridge] failed to write reply to Drive for msg %@: %@", msg.id, "\(error)")
             // The assistant turn is already durable in the Mac transcript.
             // Publish the snapshot and consume the one signed input; iOS's
             // transcript backstop can recover the reply without asking Agent
@@ -836,7 +789,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 ]
             )
         } catch {
-            NSLog("[iCloudBridge] failed text_delta seq=%d msg=%@: %@", flush.sequence, correlationID, "\(error)")
+            nativeLog("[iCloudBridge] failed text_delta seq=%d msg=%@: %@", flush.sequence, correlationID, "\(error)")
         }
     }
 

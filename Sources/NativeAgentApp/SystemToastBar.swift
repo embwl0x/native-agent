@@ -81,65 +81,75 @@ public final class SystemToastCenter: ObservableObject {
     }
 }
 
-enum SystemToastPlacement {
-    case top
-    case bottom
+/// Where the chat room wants the notice lane: just under its pinned chrome,
+/// carrying the room's own turn notices. Published only while the chat is in
+/// front; with no room the lane sits at the top of the page.
+struct NoticeLaneRoom {
+    let anchor: Anchor<CGRect>
+    let notices: SystemToastCenter
+}
 
-    var transitionEdge: Edge {
-        switch self {
-        case .top: .top
-        case .bottom: .bottom
-        }
+struct NoticeLaneRoomKey: PreferenceKey {
+    static let defaultValue: NoticeLaneRoom? = nil
+
+    static func reduce(value: inout NoticeLaneRoom?, nextValue: () -> NoticeLaneRoom?) {
+        value = nextValue() ?? value
     }
 }
 
-public struct SystemToastBar: View {
+/// Fluid glass A2: the one notice lane. App-wide toasts and the open room's
+/// turn notices stack in one column of glass capsules; each center keeps its
+/// own durations by severity.
+struct NoticeLane: View {
+    let centers: [SystemToastCenter]
+
+    var body: some View {
+        GlassEffectContainer(spacing: NativeAgentSpacing.sm) {
+            VStack(spacing: NativeAgentSpacing.sm) {
+                ForEach(centers.indices, id: \.self) { index in
+                    NoticeLaneColumn(center: centers[index])
+                }
+            }
+            // Capsules hug their words up to this; the cap is the lane's.
+            .frame(maxWidth: 520)
+        }
+        .padding(.horizontal, NativeAgentSpacing.lg)
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+}
+
+private struct NoticeLaneColumn: View {
     private static let maxVisible = 3
 
     @ObservedObject var center: SystemToastCenter
-    var placement: SystemToastPlacement
 
-    public init(center: SystemToastCenter) {
-        self.center = center
-        self.placement = .bottom
-    }
-
-    init(center: SystemToastCenter, placement: SystemToastPlacement) {
-        self.center = center
-        self.placement = placement
-    }
-
-    public var body: some View {
+    var body: some View {
         // PATCH-2026-06-06: show NEWEST toasts when capped. Older `prefix(3)`
         // semantics meant a burst of 4 short-lived toasts could see the 4th
         // auto-dismiss while never visible (timer starts on push, not on
         // visibility). Tail-window keeps the surface honest.
-        let visibleToasts = Array(center.queue.suffix(Self.maxVisible))
-
         VStack(spacing: NativeAgentSpacing.sm) {
-            ForEach(visibleToasts) { toast in
-                SystemToastPill(toast: toast) {
+            ForEach(center.queue.suffix(Self.maxVisible)) { toast in
+                NoticePill(text: toast.text, kind: toast.kind) {
                     center.dismiss(toast.id)
                 }
                 .transition(NativeAgentMotion.fade)
             }
         }
-        .padding(.horizontal, NativeAgentSpacing.lg)
-        .padding(.top, placement == .top ? NativeAgentSpacing.md : 0)
-        .padding(.bottom, placement == .bottom ? NativeAgentSpacing.md : 0)
-        .frame(maxWidth: .infinity, alignment: .center)
         .animation(NativeAgentMotion.quick, value: center.queue.map(\.id))
-        .allowsHitTesting(!center.queue.isEmpty)
     }
 }
 
-private struct SystemToastPill: View {
-    let toast: SystemToast
-    let onDismiss: () -> Void
+/// The one notice style: a glass capsule. The lane gives it a kind and a
+/// dismiss; the composer and bubble text toasts use it bare.
+struct NoticePill: View {
+    let text: String
+    var kind: SystemToast.Kind? = nil
+    var onDismiss: (() -> Void)? = nil
 
     private var tint: Color {
-        switch toast.kind {
-        case .info: NativeAgentTheme.info
+        switch kind {
+        case .info, nil: NativeAgentTheme.info
         case .warn: NativeAgentTheme.warn
         case .error: NativeAgentTheme.fail
         case .success: NativeAgentTheme.ok
@@ -147,8 +157,8 @@ private struct SystemToastPill: View {
     }
 
     private var icon: String {
-        switch toast.kind {
-        case .info: "info.circle.fill"
+        switch kind {
+        case .info, nil: "info.circle.fill"
         case .warn: "exclamationmark.triangle.fill"
         case .error: "xmark.octagon.fill"
         case .success: "checkmark.circle.fill"
@@ -162,35 +172,32 @@ private struct SystemToastPill: View {
             // capsule swallowed the dismiss Button into the parent label so
             // VoiceOver users could hear the toast but not actuate dismiss.
             HStack(spacing: NativeAgentSpacing.sm) {
-                Image(systemName: icon)
-                    .foregroundStyle(tint)
-                Text(toast.text)
+                if kind != nil {
+                    Image(systemName: icon)
+                        .foregroundStyle(tint)
+                }
+                Text(text)
                     .font(NativeAgentFont.body)
                     .lineLimit(2)
                     .textSelection(.enabled)
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("\(toast.kind.rawValue.capitalized): \(toast.text)")
-            Spacer(minLength: NativeAgentSpacing.sm)
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.secondary)
-                    .padding(4)
-                    .contentShape(Rectangle())
+            .accessibilityLabel(kind.map { "\($0.rawValue.capitalized): \(text)" } ?? text)
+            if let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .padding(4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Dismiss")
         }
         .padding(.horizontal, NativeAgentSpacing.md)
         .padding(.vertical, NativeAgentSpacing.sm)
-        .frame(maxWidth: 520)
-        .background(.ultraThinMaterial, in: Capsule(style: .continuous))
-        .overlay {
-            Capsule(style: .continuous)
-                .strokeBorder(tint.opacity(0.32), lineWidth: 0.8)
-        }
-        .shadow(color: tint.opacity(0.18), radius: 8, y: 2)
+        .houseSurface(in: Capsule(style: .continuous))
         .accessibilityElement(children: .contain)
     }
 }

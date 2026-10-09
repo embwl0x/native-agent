@@ -18,6 +18,7 @@
 // instead of silently producing random vectors.
 
 import Foundation
+import Senses
 import GRDB
 import KnowledgeGraph
 import NativeAgentCore
@@ -576,6 +577,11 @@ extension SwiftNativeMemoryV2 {
         personaRoot: URL? = nil,
         debounceInterval: TimeInterval = 30
     ) async -> UserMDGenerator? {
+        if let canonicalDataRoot,
+           Self.canonicalRootIdentity(canonicalDataRoot) != Self.canonicalRootIdentity(dataRoot) { return nil }
+        userProjectionBinding = (dataRoot, personaRoot, debounceInterval)
+        do { try await ensureCanonicalAttachment() }
+        catch { emitDiagnostic("[MemoryV2] USER projection attachment failed: \(error)"); return nil }
         guard let bridge = storage as? MemoryStorageBridge else { return nil }
         let underlying = await bridge.underlyingStorage()
         let storagePath = underlying.path
@@ -601,6 +607,7 @@ extension SwiftNativeMemoryV2 {
     /// post-migration convergence seam; it does not create a second fact owner.
     @discardableResult
     public func reconcileKnowledgeGraphProjection() async throws -> KnowledgeGraphMemoryRebuildReport {
+        try await ensureCanonicalAttachment()
         guard let bridge = storage as? MemoryStorageBridge else {
             throw MemoryV2Error.storageUnavailable
         }
@@ -623,6 +630,7 @@ extension SwiftNativeMemoryV2 {
     /// lineage write; minimal fixtures honestly report not-applied).
     @discardableResult
     public func markCorrected(id: String, by newerId: String, reason: String? = nil) async throws -> Bool {
+        try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         let corrected = try await storage.markCorrected(id: id, by: newerId, reason: reason)
         await flushDerivedMemoryChanges()
@@ -632,12 +640,14 @@ extension SwiftNativeMemoryV2 {
     /// Phase 5 B0: one record by exact id, unfiltered, for the authority
     /// check in front of her association rejections. Not a recall path.
     public func authorityRecord(id: String) async throws -> MemoryRecord? {
+        try await ensureCanonicalAttachment()
         guard let bridge = storage as? MemoryStorageBridge else { throw MemoryV2Error.storageUnavailable }
         return try await bridge.lookupMemoryRecord(id: id)
     }
 
     /// Uses disclosure-filtered user facts until a pinned core is chosen.
     public func userPromptCore(surface: String) async throws -> [String]? {
+        try await ensureCanonicalAttachment()
         guard let bridge = storage as? MemoryStorageBridge else { throw MemoryV2Error.storageUnavailable }
         return try await bridge.underlyingStorage().userPromptCore(surface: surface)
     }
@@ -652,28 +662,48 @@ extension SwiftNativeMemoryV2 {
     /// Also installs a Spotlight indexing hook on the underlying
     /// MemoryStorage so insert/update/delete/acceptProposal all reflect into
     /// the system index.
-    public static let shared: SwiftNativeMemoryV2 = {
-        let dataRoot = PersistenceCore.defaultDataRoot()
-        do {
-            let (bridge, embedder) = try sharedBackingStore(dataRoot: dataRoot)
-            return SwiftNativeMemoryV2(embedder: embedder, storage: bridge)
-        } catch {
-            // Fail LOUD, then closed. A migration/open failure here (e.g. busy
-            // lock during the v3 column add) must not silently hand back an
-            // unwired instance that throws storageUnavailable everywhere with
-            // no breadcrumb (gpt-5.5 review finding 4). The unwired fallback
-            // preserves the existing fail-closed contract; the log makes it
-            // diagnosable.
-            NSLog("[MemoryV2] FATAL: MemoryStorage open/migration failed — memory is UNWIRED this session: %@", String(describing: error))
-            sharedOpenFailureSlot.withLock { $0 = "\(dataRoot.appendingPathComponent("memory/memory.sqlite").path): \(error)" }
-            return SwiftNativeMemoryV2()
-        }
-    }()
+    public static let shared = SwiftNativeMemoryV2(canonicalDataRoot: PersistenceCore.defaultDataRoot())
 
-    private static func sharedBackingStore(dataRoot: URL) throws -> (MemoryStorageBridge, ManagedEmbeddingProvider) {
+    /// Retry attachment on the same actor and canonical path. Failed opens never
+    /// install substitute storage; the next read or Doctor repair can retry.
+    internal func ensureCanonicalAttachment() async throws {
+        if let ready = canonicalAttachmentReady {
+            await ready.value
+            return
+        }
+        guard storage == nil, let dataRoot = canonicalDataRoot else { return }
+        do {
+            let (bridge, ready) = try Self.sharedBackingStore(dataRoot: dataRoot, userProjectionBinding: userProjectionBinding)
+            storage = bridge
+            canonicalAttachmentReady = ready
+            Self.sharedOpenFailureSlot.withLock { $0 = nil }
+            await ready.value
+        } catch {
+            Self.sharedOpenFailureSlot.withLock {
+                $0 = "\(dataRoot.appendingPathComponent("memory/memory.sqlite").path): \(error)"
+            }
+            throw error
+        }
+    }
+
+    public func repairCanonicalAttachment() async throws {
+        try await ensureCanonicalAttachment()
+        guard let bridge = storage as? MemoryStorageBridge else { throw MemoryV2Error.storageUnavailable }
+        let underlying = await bridge.underlyingStorage()
+        _ = try await underlying.listMemories(persona: nil, status: nil, limit: 1)
+        guard try await underlying.quickCheck() == ["ok"] else {
+            throw MemoryV2Error.underlying("Canonical memory integrity check failed; the store was retained without rebuilding its graph.")
+        }
+        _ = try await reconcileKnowledgeGraphProjection()
+        Self.graphProjectionFailureSlot.withLock { $0 = nil }
+    }
+
+    private static func sharedBackingStore(
+        dataRoot: URL,
+        userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?
+    ) throws -> (MemoryStorageBridge, Task<Void, Never>) {
         let storage = try MemoryStorage(dataRoot: dataRoot)
         let bridge = MemoryStorageBridge(storage: storage)
-        let embedder = ManagedEmbeddingProvider(dataRoot: dataRoot)
         // Spotlight indexing hook: every memory mutation (insert/update/
         // delete/acceptProposal) reflects into the Spotlight index so the
         // system surfaces them. Built lazily to avoid retaining the indexer
@@ -684,8 +714,15 @@ extension SwiftNativeMemoryV2 {
         let spotClient: any SpotlightIndexClient = MockSpotlightIndexClient()
         #endif
         let indexer = SwiftNativeMemoryIndexer(client: spotClient)
-        let kgIndexer = try? SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: storage.path)
-        Task {
+        let kgIndexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: storage.path)
+        SensesHub.shared.installMemoryProvenanceSink(storage)
+        let ready = Task {
+            if let binding = userProjectionBinding {
+                await storage.attachUserMDGenerator(UserMDGenerator(
+                    storage: storage, dataRoot: binding.dataRoot, personaRoot: binding.personaRoot,
+                    debounceInterval: binding.debounceInterval
+                ))
+            }
             await storage.attachSpotlightHook { stored, deleted in
                 // Skill pointers are recall-only rows (skills-recall
                 // rework 2026-07-03): keep them out of Spotlight.
@@ -696,7 +733,7 @@ extension SwiftNativeMemoryV2 {
                     try? await indexer.indexRecord(id: stored.id, text: stored.content, kind: stored.status)
                 }
             }
-            if let kgIndexer {
+            do {
                 await storage.attachKnowledgeGraphHook { stored, deleted in
                     // Recall-only skill pointers never enter the KG —
                     // entity extraction over "Skill available: ..." rows
@@ -709,24 +746,31 @@ extension SwiftNativeMemoryV2 {
                     // forgotten memory never lingers with old text (reviewer,
                     // 2026-09-05). Read fresh per mutation.
                     let producing = MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
-                    try? await kgIndexer.indexMemory(
-                        KnowledgeGraphMemoryFact(
-                            id: stored.id,
-                            content: stored.content,
-                            source: stored.source,
-                            status: stored.status,
-                            createdAt: stored.createdAt,
-                            updatedAt: stored.updatedAt,
-                            metadata: stored.projectionMetadata
-                        ),
-                        deleted: deleted,
-                        producing: producing
-                    )
+                    do {
+                        try await kgIndexer.reconcileProjectionIfNeeded(producing: producing)
+                        graphProjectionFailureSlot.withLock { $0 = nil }
+                        try await kgIndexer.indexMemory(
+                            KnowledgeGraphMemoryFact(
+                                id: stored.id,
+                                content: stored.content,
+                                source: stored.source,
+                                status: stored.status,
+                                createdAt: stored.createdAt,
+                                updatedAt: stored.updatedAt,
+                                metadata: stored.projectionMetadata
+                            ),
+                            deleted: deleted,
+                            producing: producing
+                        )
+                    } catch {
+                        await kgIndexer.markProjectionDirty()
+                        graphProjectionFailureSlot.withLock { $0 = String(describing: error) }
+                        nativeLog("[MemoryV2] Knowledge Graph projection pending repair: %@", String(describing: error))
+                    }
                 }
-                // Healthy launches only repair rows missed by a fire-and-forget
-                // mutation hook. The migration task owns the one full rebuild
-                // when the canonical migration actually runs; starting this
-                // additive pass before that boundary would race the importer.
+            }
+            Task {
+                // Wait for migration before checking the canonical fingerprints.
                 let migrationMarker = dataRoot
                     .appendingPathComponent("memory", isDirectory: true)
                     .appendingPathComponent(".migrated_to_sqlite_v2_approved_only")
@@ -735,29 +779,39 @@ extension SwiftNativeMemoryV2 {
                 if MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot),
                    FileManager.default.fileExists(atPath: migrationMarker.path) {
                     do {
-                        _ = try await kgIndexer.backfillMissingMemoryIndexRows()
+                        try await kgIndexer.reconcileProjectionIfNeeded(producing: true)
+                        graphProjectionFailureSlot.withLock { $0 = nil }
                     } catch {
-                        NSLog("[MemoryV2] Knowledge Graph startup backfill failed: %@", String(describing: error))
+                        await kgIndexer.markProjectionDirty()
+                        graphProjectionFailureSlot.withLock { $0 = String(describing: error) }
+                        nativeLog("[MemoryV2] Knowledge Graph startup reconciliation pending repair: %@", String(describing: error))
                     }
                 }
             }
         }
-        return (bridge, embedder)
+        return (bridge, ready)
     }
 
-    /// Why ``shared`` is unwired this session, or nil when memory.sqlite
+    /// Why the last canonical attachment failed, or nil when memory.sqlite
     /// opened. Launch and Doctor show it; the log line alone was the only trace.
     public static var sharedOpenFailure: String? {
         _ = shared
         return sharedOpenFailureSlot.withLock { $0 }
     }
     private static let sharedOpenFailureSlot = Mutex<String?>(nil)
+    private static let graphProjectionFailureSlot = Mutex<String?>(nil)
+
+    public static var graphProjectionFailure: String? {
+        graphProjectionFailureSlot.withLock { $0 }
+    }
 
     /// Bridge access for callers that need to attach the UserMDGenerator
     /// to the same underlying MemoryStorage instance — write-side hook
     /// callers (insertMemory / acceptProposal) only fire pokeUserMDRegen
     /// on the MemoryStorage that holds the generator reference.
-    public func underlyingBridge() -> MemoryStorageBridge? {
+    public func underlyingBridge() async -> MemoryStorageBridge? {
+        do { try await ensureCanonicalAttachment() }
+        catch { emitDiagnostic("[MemoryV2] Canonical attachment failed: \(error)") }
         return storage as? MemoryStorageBridge
     }
 }

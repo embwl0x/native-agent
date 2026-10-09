@@ -1,5 +1,6 @@
 import ChatToolParsing
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
@@ -58,6 +59,15 @@ enum ToolCallCodec: Sendable, Equatable {
     /// but a 16-character tail so a marker split across chunks is caught
     /// before any part of it renders. Returns "" when nothing is safe yet.
     func releasableProse(holding pending: inout String) -> String {
+        // Keep a split citation in the same pending buffer as split tool text.
+        var citationTail = ""
+        if let start = pending.range(of: "\u{E200}", options: .backwards),
+           pending.range(of: "\u{E201}", range: start.upperBound..<pending.endIndex) == nil {
+            citationTail = String(pending[start.lowerBound...])
+            pending = String(pending[..<start.lowerBound])
+        }
+        defer { pending += citationTail }
+        pending = ChatRichContentParser.visibleText(pending)
         if self == .textMarkers {
             return TextMarkerCodec.releasableProse(holding: &pending, force: false)
         }
@@ -77,7 +87,7 @@ enum ToolCallCodec: Sendable, Equatable {
         return safe
     }
 
-    private static let markerStarts = ["<tool", "tool_use name=\"", "**tool call", "__tool call", "tool call:", "```", "~~~"]
+    private static let markerStarts = ToolCallParser.protocolMarkerStarts + ["```", "~~~"]
 
     /// Length of the longest suffix of `text` that is a proper start of a marker.
     private static func markerPrefixTailLength(_ text: String) -> Int {
@@ -94,14 +104,13 @@ enum ToolCallCodec: Sendable, Equatable {
     /// it is call encoding, and text after the last one was written before
     /// any result existed.
     func proseReleasedAtDispatch(_ pending: String) -> String {
-        self == .textMarkers ? "" : ToolCallParser.stripToolUseMarkers(pending)
+        self == .textMarkers ? "" : visiblePrefix(in: ToolCallParser.stripToolUseMarkers(pending))
     }
 
     /// Prose before the earliest potential call marker — what a stopped,
-    /// failed or cut-off turn keeps. The marker protocol also cuts at
-    /// Claude's own `<function_calls>` / `<invoke>` form.
+    /// failed or cut-off turn keeps.
     func visiblePrefix(in text: String) -> String {
-        ToolCallParser.visiblePrefix(in: text, invoke: self == .textMarkers)
+        ChatRichContentParser.visibleText(ToolCallParser.visiblePrefix(in: text))
     }
 
     /// One streamed tool-call event as a call to dispatch; nil for a call

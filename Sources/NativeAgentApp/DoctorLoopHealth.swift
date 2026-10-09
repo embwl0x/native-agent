@@ -569,17 +569,17 @@ enum DoctorLoopHealth {
         } else {
             status = "warn"
         }
+        let iCloudDriveOff = observations.first { $0.loopId == verdicts.first?.loopId }?
+            .lastResult?.localizedCaseInsensitiveContains("unavailable: iCloud Drive") == true
         return CheckResult(
             id: doctorCheckID,
             title: "Background Loops",
             status: status,
             detail: detail,
-            human_action: status == "ok" ? nil : (
-                observations.first { $0.loopId == verdicts.first?.loopId }?
-                    .lastResult?.localizedCaseInsensitiveContains("unavailable: iCloud Drive") == true
-                    ? iCloudDriveStep
-                    : "Open Doctor → background loops for the named loop's current failure."
-            )
+            human_action: status == "ok" ? nil : (iCloudDriveOff
+                ? iCloudDriveStep
+                : "Open Doctor → background loops for the named loop's current failure."),
+            ask: status != "ok" && iCloudDriveOff ? .permission : nil
         )
     }
 

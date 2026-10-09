@@ -35,15 +35,16 @@ public struct MacChatTurnActivity: Sendable, Equatable {
     public let actionSummary: String?
     /// Existing toast copy, redacted and independently capped before crossing
     /// the boundary. The stored shared-kernel summary remains at its tighter
-    /// 120-character detail limit.
+    /// shared detail limit.
     public let userVisibleNoticeText: String?
     public let delegateDisplayName: String?
     public let occurredAt: Date
 }
 
 /// Converts the existing ChatOrchestration stream vocabulary at the Mac
-/// boundary. Raw JSON input/output is pattern-discarded in this switch before
-/// an activity value can be constructed.
+/// boundary. Raw JSON input/output is discarded in this switch before an
+/// activity value can be constructed; only the progress phrase's plain names
+/// (an app, an agent, a page, a web host) pass, inside its words.
 public enum MacChatTurnActivityBoundary {
     /// `shown` is the turn's own: an `app` call reads as the action it ran.
     public static func activity(
@@ -54,9 +55,10 @@ public enum MacChatTurnActivityBoundary {
     ) -> MacChatTurnActivity? {
         switch event {
         case .toolUse(let name, let input):
-            return toolUse(name: shown.use(name, input: input).name, identity: identity, at: instant)
+            let call = shown.use(name, input: input)
+            return toolUse(name: call.name, args: call.input.stringFields, identity: identity, at: instant)
         case .toolResult(let name, _):
-            return toolResult(name: shown.result(name), identity: identity, at: instant)
+            return toolResult(name: shown.result(name).name, identity: identity, at: instant)
         case .notice(let kind, let text):
             return notice(kind: kind, text: text, identity: identity, at: instant)
         case .delta, .final, .error, .replyTextSettled:
@@ -86,6 +88,7 @@ public enum MacChatTurnActivityBoundary {
 
     private static func toolUse(
         name: String,
+        args: [String: String],
         identity: MacChatTurnIdentity,
         at instant: Date
     ) -> MacChatTurnActivity {
@@ -95,7 +98,7 @@ public enum MacChatTurnActivityBoundary {
             source: .toolUse,
             phase: delegateName(forTool: name) == nil ? .tool : .delegation,
             toolDisplayName: safeName,
-            actionSummary: sanitized(ToolActivityPresentation.progress(name)),
+            actionSummary: sanitized(ToolActivityPresentation.progress(name, args: args)),
             userVisibleNoticeText: nil,
             delegateDisplayName: delegateName(forTool: name),
             occurredAt: instant

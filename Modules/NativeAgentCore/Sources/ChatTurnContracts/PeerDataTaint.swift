@@ -32,13 +32,18 @@ public final class PeerDataTaint: @unchecked Sendable {
         self.init()
         // These peers already latched. Persisted labels do not attest identity,
         // and a later trust change must not clear the original steer.
-        self.sources = Array(sources.prefix(8))
+        self.sources = Array(sources.filter { Self.isAgent($0) && !Self.ownerTrusts($0) }.prefix(8))
+        restored = !self.sources.isEmpty
     }
+
+    /// A steer an earlier turn carried in, not one this turn latched itself.
+    /// Set once, before the box is shared.
+    public private(set) var restored = false
 
     /// A later turn under the steer an earlier one carried (`carried`).
     public convenience init(restoring sources: [String], elevated: [String]) {
         self.init(restoring: sources)
-        self.elevated = Array(elevated.prefix(8))
+        self.elevated = Array(elevated.filter { Self.isAgent($0) && !Self.ownerTrusts($0) }.prefix(8))
     }
 
     /// The steer this turn leaves on work it hands to a later one, a card or
@@ -114,13 +119,33 @@ public final class PeerDataTaint: @unchecked Sendable {
     private static let hookLock = NSLock()
     nonisolated(unsafe) private static var hook: @Sendable (String) -> Bool = { _ in false }
 
+    public static var trustedTurn: Bool {
+        let turn = TurnEnvelope.current(surface: "")
+        return [turn.agent, ChatPersistenceContext.originProvenance?.agent, turn.verifiedUserId.map { "peer:" + $0 }]
+            .compactMap { $0 }.contains(where: ownerTrusts)
+    }
+
+    /// User 10-08: only an agent bridge he has not trusted can latch a turn.
+    /// Web, mail, files, memory, helpers, wakes and scheduled work never do;
+    /// the Trust mode's own gates are the only other approvals. Installed by
+    /// the engine (`PeerTrust`); until then only a peer handle counts.
+    public static var isAgent: @Sendable (String) -> Bool {
+        get { hookLock.withLock { agentHook } }
+        set { hookLock.withLock { agentHook = newValue } }
+    }
+    nonisolated(unsafe) private static var agentHook: @Sendable (String) -> Bool = {
+        $0.lowercased().hasPrefix("peer:") || $0.lowercased() == "another agent" // an unidentified bridge peer stays untrusted
+    }
+
     /// A peer the person elevated latches nothing: its steer is his own. Only
     /// an `attested` identity (the turn's own lane or envelope, provenance this
     /// app stored) can be; a label a tool result supplies never is.
     public func mark(peer: String, line: String = "", attested: Bool = true) {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
-        let name = trimmed.isEmpty ? "a remote peer" : trimmed
-        if attested, Self.ownerTrusts(name) { return }
+        guard !trimmed.isEmpty else { return }
+        let name = trimmed
+        if Self.ownerTrusts(name) { return } // User 10-08: a trusted agent never cards, however it is named
+        guard Self.isAgent(name) else { return }
         keep(line: line)
         lock.lock(); defer { lock.unlock() }
         guard !sources.contains(name), sources.count < 8 else { return }
@@ -135,7 +160,8 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     public func markElevated(peer: String, line: String = "", attested: Bool = true) {
         let name = peer.trimmingCharacters(in: .whitespacesAndNewlines)
-        if attested, Self.ownerTrusts(name) { return }
+        if Self.ownerTrusts(name) { return } // User 10-08: a trusted agent never cards, however it is named
+        guard Self.isAgent(name) else { return }
         keep(line: line)
         lock.lock(); defer { lock.unlock() }
         guard !name.isEmpty, !elevated.contains(name), elevated.count < 8 else { return }

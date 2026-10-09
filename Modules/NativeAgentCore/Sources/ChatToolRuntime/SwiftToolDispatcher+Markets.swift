@@ -64,15 +64,34 @@ extension SwiftToolDispatcher {
         guard !symbols.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "Give symbol (e.g. AAPL or \"AAPL, MSFT\") or watchlist (a name from market_watchlists).")
         }
-        let provider = marketJSONString(input["provider"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "tradingview"
-        switch provider {
-        case "tradingview", "tv":
-            return try await fetchTradingViewQuote(symbols: symbols)
-        case "yahoo", "yfinance":
-            return try await fetchYahooQuote(symbols: symbols)
-        default:
-            throw AutonomyGateError.toolDenied(reason: "provider is tradingview or yahoo, not '\(provider)'.")
+        // A named provider is that provider alone; the automatic order runs only when none was named.
+        let named = marketJSONString(input["provider"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let named, !["tradingview", "tv", "yahoo", "yfinance"].contains(named) {
+            throw AutonomyGateError.toolDenied(reason: "provider is tradingview or yahoo, not '\(named)'.")
         }
+        let providers = named.map { [["yahoo", "yfinance"].contains($0) ? "yahoo" : "tradingview"] } ?? ["tradingview", "yahoo"]
+        var failures: [JSONValue] = []
+        for source in providers {
+            do {
+                let quote = source == "yahoo" ? try await fetchYahooQuote(symbols: symbols) : try await fetchTradingViewQuote(symbols: symbols)
+                guard case .object(var result) = quote else { return quote }
+                if case .array(let rows)? = result["quotes"], rows.isEmpty {
+                    throw AutonomyGateError.toolDenied(reason: "No quotes returned")
+                }
+                if !failures.isEmpty { result["provider_failures"] = .array(failures) }
+                return .object(result)
+            } catch {
+                try Task.checkCancellation()
+                failures.append(.object(["provider": .string(source), "error": .string(ChatToolOutcome.errorMessage(error))]))
+            }
+        }
+        let detail = failures.compactMap { failure -> String? in
+            guard case .object(let row) = failure, case .string(let source)? = row["provider"],
+                  case .string(let error)? = row["error"] else { return nil }
+            return source + ": " + error
+        }.joined(separator: "; ")
+        return .object(["status": .string("failed"), "detail": .string(detail), "provider_failures": .array(failures),
+                        "quotes": .array([])])
     }
 
     private func readMarketSecretsConfig() -> JSONValue? {
@@ -271,19 +290,40 @@ extension SwiftToolDispatcher {
     }
 
     private func fetchYahooQuote(symbols: [String]) async throws -> JSONValue {
-        let joined = symbols.map(normalizeMarketSymbol).joined(separator: ",")
-        guard var comps = URLComponents(string: "https://query1.finance.yahoo.com/v7/finance/quote") else {
-            throw AutonomyGateError.toolDenied(reason: "Could not build Yahoo quote URL")
+        let tickers = symbols.map { raw in
+            let symbol = normalizeMarketSymbol(raw)
+            if symbol.hasSuffix("=X") { return symbol }
+            let ticker = tradingViewTicker(raw)
+            return ticker.hasPrefix("FX:") ? String(ticker.dropFirst(3)) + "=X" : symbol
         }
-        comps.queryItems = [URLQueryItem(name: "symbols", value: joined)]
-        guard let url = comps.url else {
-            throw AutonomyGateError.toolDenied(reason: "Could not build Yahoo quote URL")
+        let rows = try await withThrowingTaskGroup(of: (Int, [JSONValue]).self) { group in
+            func enqueue(_ index: Int) {
+                group.addTask {
+                    try Task.checkCancellation()
+                    guard var comps = URLComponents(string: "https://query1.finance.yahoo.com/v8/finance/chart/") else {
+                        throw AutonomyGateError.toolDenied(reason: "Could not build Yahoo quote URL")
+                    }
+                    comps.path += tickers[index]
+                    comps.queryItems = [URLQueryItem(name: "range", value: "1d"), URLQueryItem(name: "interval", value: "1d")]
+                    guard let url = comps.url else {
+                        throw AutonomyGateError.toolDenied(reason: "Could not build Yahoo quote URL")
+                    }
+                    var request = URLRequest(url: url)
+                    request.setValue("NativeAgent market_quote", forHTTPHeaderField: "User-Agent")
+                    let quotes = self.yahooQuoteRows(from: try await self.marketJSONRequest(request))
+                    guard !quotes.isEmpty else { throw AutonomyGateError.toolDenied(reason: "No quotes returned") }
+                    return (index, quotes)
+                }
+            }
+            var ordered = Array(repeating: [JSONValue](), count: tickers.count)
+            var nextIndex = min(4, tickers.count)
+            for index in 0..<nextIndex { enqueue(index) }
+            while let (index, quotes) = try await group.next() {
+                ordered[index] = quotes
+                if nextIndex < tickers.count { enqueue(nextIndex); nextIndex += 1 }
+            }
+            return ordered.flatMap { $0 }
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("NativeAgent market_quote", forHTTPHeaderField: "User-Agent")
-        let json = try await marketJSONRequest(request)
-        let rows = yahooQuoteRows(from: json)
         return .object([
             "status": .string("ok"),
             "runtime": .string("swift-native"),
@@ -320,20 +360,34 @@ extension SwiftToolDispatcher {
 
     private func yahooQuoteRows(from json: JSONValue) -> [JSONValue] {
         guard case .object(let root) = json,
-              case .object(let quoteResponse)? = root["quoteResponse"],
-              case .array(let result)? = quoteResponse["result"] else {
+              case .object(let chart)? = root["chart"],
+              case .array(let result)? = chart["result"] else {
             return []
         }
         return result.compactMap { item in
-            guard case .object(let obj) = item else { return nil }
+            guard case .object(let item) = item, case .object(let obj)? = item["meta"],
+                  let price = Self.optionalNumber(obj["regularMarketPrice"]) else { return nil }
             var row: [String: JSONValue] = [:]
             for key in [
                 "symbol", "shortName", "longName", "regularMarketPrice",
-                "regularMarketChange", "regularMarketChangePercent",
                 "regularMarketVolume", "marketState", "currency",
-                "quoteType", "exchange", "regularMarketTime",
+                "regularMarketTime",
             ] {
                 if let value = obj[key] { row[key] = value }
+            }
+            row["price"] = obj["regularMarketPrice"]
+            row["exchange"] = obj["exchangeName"]
+            row["quoteType"] = obj["instrumentType"]
+            row["description"] = obj["longName"] ?? obj["shortName"]
+            if let previous = Self.optionalNumber(obj["chartPreviousClose"]) {
+                let change = JSONValue.double(price - previous)
+                row["change_abs"] = change
+                row["regularMarketChange"] = change
+                if previous != 0 {
+                    let percent = JSONValue.double((price - previous) / previous * 100)
+                    row["change"] = percent
+                    row["regularMarketChangePercent"] = percent
+                }
             }
             if let at = Self.marketEpoch(obj["regularMarketTime"]) { row["as_of"] = .string(at) }
             return .object(row)
@@ -387,7 +441,21 @@ extension SwiftToolDispatcher {
     private func tradingViewTicker(_ raw: String) -> String {
         let symbol = normalizeMarketSymbol(raw)
         if symbol.contains(":") { return symbol }
+        if symbol.hasSuffix("=X") {
+            let pair = String(symbol.dropLast(2))
+            return "FX:" + (pair.count == 3 ? "USD" + pair : pair)
+        }
+        let currencies: Set<String> = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"]
+        if symbol.count == 6, currencies.contains(String(symbol.prefix(3))), currencies.contains(String(symbol.suffix(3))) {
+            return "FX:" + symbol
+        }
         let mapped: [String: String] = [
+            // Index tickers as people and Yahoo write them (10-09: ^GSPC returned nothing).
+            "^GSPC": "SP:SPX", "SPX": "SP:SPX", "S&P500": "SP:SPX", "S&P 500": "SP:SPX",
+            "^DJI": "DJ:DJI", "DJI": "DJ:DJI", "DOW": "DJ:DJI",
+            "^IXIC": "NASDAQ:IXIC", "IXIC": "NASDAQ:IXIC", "COMP": "NASDAQ:IXIC", "NASDAQ": "NASDAQ:IXIC",
+            "^NDX": "NASDAQ:NDX", "NDX": "NASDAQ:NDX",
+            "^RUT": "TVC:RUT", "RUT": "TVC:RUT", "VIX": "CBOE:VIX",
             "SPY": "AMEX:SPY",
             "UVXY": "AMEX:UVXY",
             "QQQ": "NASDAQ:QQQ",

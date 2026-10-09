@@ -183,7 +183,7 @@ struct TelegramTurnCardRepairResult: Sendable, Equatable {
     let failures: [String]
 }
 
-/// Runs once per process-owned poll-loop instance. A prior active card is
+/// Repairs each identity once per process-owned poll-loop instance. A prior active card is
 /// edited in place to outcome-unknown and its controls are cleared. No new
 /// card is ever created and no completion is inferred.
 actor TelegramTurnCardRestartRepairer {
@@ -203,13 +203,30 @@ actor TelegramTurnCardRestartRepairer {
     typealias DeleteCard = @Sendable (_ token: String, _ chatId: Int, _ messageId: Int) async throws -> Void
 
     private let ledger: TelegramTurnCardLedger
-    private var attempted = false
+    private var attemptedCards: Set<UUID> = []
+    private var repairTask: Task<Void, Never>?
+    private var isShuttingDown = false
     /// Cards this repair marked interrupted, by chat, so a recovered reply
     /// resent into that chat can take its card away.
     private var interruptedCards: [Int: [Int]] = [:]
 
     init(ledger: TelegramTurnCardLedger) {
         self.ledger = ledger
+    }
+
+    func scheduleRepair(_ operation: @escaping @Sendable () async -> Void) {
+        guard !Task.isCancelled, !isShuttingDown, repairTask == nil else { return }
+        repairTask = Task {
+            await operation()
+            repairTask = nil
+        }
+    }
+
+    func shutdown() async {
+        isShuttingDown = true
+        repairTask?.cancel()
+        await repairTask?.value
+        isShuttingDown = false
     }
 
     /// Only when the chat has exactly one: with several, which card belongs
@@ -223,12 +240,9 @@ actor TelegramTurnCardRestartRepairer {
     func repairOnce(
         token: String,
         editCard: @escaping EditCard,
-        deleteCard: DeleteCard? = nil
+        deleteCard: DeleteCard? = nil,
+        isActive: @Sendable (UUID) async -> Bool
     ) async -> TelegramTurnCardRepairResult {
-        guard !attempted else {
-            return TelegramTurnCardRepairResult(repaired: 0, cleanedTerminal: 0, failures: [])
-        }
-        attempted = true
         let records: [TelegramPersistedTurnCard]
         do {
             records = try await ledger.records()
@@ -259,7 +273,11 @@ actor TelegramTurnCardRestartRepairer {
         var repaired = 0
         var cleanedTerminal = 0
         var failures: [String] = []
+        attemptedCards.formIntersection(Set(records.map(\.turnId)))
         for record in records {
+            let active = await isActive(record.turnId)
+            guard !Task.isCancelled else { break }
+            guard !active, attemptedCards.insert(record.turnId).inserted else { continue }
             if record.isTerminal {
                 do {
                     // 2026-09-22: a completed card has nothing left to say

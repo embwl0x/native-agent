@@ -112,7 +112,7 @@ private indirect enum StudioFieldSpec {
 
 extension SwiftToolDispatcher {
 
-    func impl_studio_shelf(input: [String: JSONValue], surface: String, set: Bool) async -> JSONValue {
+    func impl_studio_shelf(input: [String: JSONValue], surface: String, set: Bool, preview: Bool = false) async -> JSONValue {
         // Only the dispatcher's own injected session key is tolerated; any other
         // unknown argument, dunder or not, is rejected by the strict checks below.
         let input = input.filter { $0.key != "__session_id" }
@@ -124,6 +124,10 @@ extension SwiftToolDispatcher {
             if set {
                 guard Set(input.keys) == ["slots"], let slots = input["slots"] else {
                     throw StudioWorkingShelf.Refusal(message: "Supply only slots: the complete ordered list, or [] to empty the shelf.")
+                }
+                if preview {
+                    try await shelf.validateReplacement(StudioWorkingShelf.decodeSlots(slots))
+                    return .object(["status": .string("would")])
                 }
                 try await shelf.replace(slots)
                 // Refresh only the existing titles-only Studio pointer.
@@ -164,14 +168,19 @@ extension SwiftToolDispatcher {
     static func studioImageInvitation(_ result: JSONValue) -> JSONValue {
         guard case .object(var response) = result, response["status"] == .string("ok"),
               case .array(let images)? = response["images"], !images.isEmpty else { return result }
-        let paths = images.compactMap { image -> JSONValue? in
+        let paths = images.compactMap { image -> String? in
             guard case .object(let row) = image, case .string(let path)? = row["path"] else { return nil }
-            return .string(path)
+            return path
         }
         guard paths.count == images.count else { return result }
+        response["message"] = .string("Saved \(images.count) generated image(s) at:\n\(paths.joined(separator: "\n"))\nOffer to show the saved work in the Make pane.")
+        if let ref = response["make_ref"] {
+            response["next_call"] = .object(["action": .string("pane.show"),
+                "args": .object(["view": .string("make"), "ref": ref])])
+        }
         response["studio_invitation"] = .object([
             "message": .string("Keep this in Studio? Open the work, then add your sentence."),
-            "tool": .string("studio_journal"), "artifact_refs": .array(paths),
+            "tool": .string("studio_journal"), "artifact_refs": .array(paths.map(JSONValue.string)),
             "origin": .object(["kind": .string("project")]),
         ])
         return .object(response)
@@ -566,7 +575,7 @@ extension SwiftToolDispatcher {
             )
             return report
         } catch {
-            NSLog("[studio] knowledge-graph index skipped (%@): %@",
+            nativeLog("[studio] knowledge-graph index skipped (%@): %@",
                   reason, String(describing: error))
             return nil
         }

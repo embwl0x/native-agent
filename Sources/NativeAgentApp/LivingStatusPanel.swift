@@ -130,11 +130,7 @@ struct LivingStatusPanel: View {
             }
         }
         .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-        }
+        .aliveCard(radius: 8)
         .task(id: scenePhase) {
             guard scenePhase == .active else {
                 fileWatchAvailability = nil

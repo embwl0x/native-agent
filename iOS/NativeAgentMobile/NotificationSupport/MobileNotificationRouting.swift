@@ -27,6 +27,17 @@ enum MobileNotificationRouting {
 
     static func categorized(_ content: UNNotificationContent) -> UNNotificationContent {
         let copy = content.mutableCopy() as! UNMutableNotificationContent
+        // The Mac's router names the conversation a knock came from as
+        // `originSessionId`. A knock with no screen of its own opens that
+        // conversation, with Reply, instead of the Activity queue.
+        let screen = nonEmpty(copy.userInfo["screen"] as? String)
+        if nonEmpty(copy.userInfo["sessionId"] as? String) == nil,
+           nonEmpty(copy.userInfo["approvalId"] as? String) == nil,
+           screen == nil || screen == "activity",
+           let origin = nonEmpty(copy.userInfo["originSessionId"] as? String) {
+            copy.userInfo["sessionId"] = origin
+            copy.userInfo["screen"] = "chat"
+        }
         if nonEmpty(copy.userInfo["approvalId"] as? String) != nil {
             copy.categoryIdentifier = approvalCategory
         } else if nonEmpty(copy.userInfo["sessionId"] as? String) != nil {
@@ -56,7 +67,7 @@ enum MobileNotificationRouting {
                 userInfo: [NSLocalizedDescriptionKey: "The notified record has no notification routing envelope."])
         }
         let copy = content.mutableCopy() as! UNMutableNotificationContent
-        for key in ["itemId", "approvalId", "sessionId", "screen", "source", "eventId", "correlationId", "taskId"] {
+        for key in ["itemId", "approvalId", "sessionId", "originSessionId", "screen", "source", "eventId", "correlationId", "taskId"] {
             if let value = nonEmpty(metadata["userInfo.\(key)"]) { copy.userInfo[key] = value }
         }
         return categorized(copy)

@@ -69,7 +69,7 @@ public actor GitHubCommandRuntime {
                 seedOutcomeBaseline(items)
             }
         } catch {
-            NSLog("github_command: resident replay failed: \(error.localizedDescription)")
+            nativeLog("github_command: resident replay failed: \(error.localizedDescription)")
         }
         // Only the caller that installed this task clears it. On a failed
         // load, a waiter may resume before the owner; letting that waiter clear
@@ -111,7 +111,7 @@ public actor GitHubCommandRuntime {
             }
             await processWatcherState()
         } catch {
-            NSLog("github_command: launch recovery failed: \(error.localizedDescription)")
+            nativeLog("github_command: launch recovery failed: \(error.localizedDescription)")
         }
     }
 
@@ -210,7 +210,7 @@ public actor GitHubCommandRuntime {
             }
             await processNotifications()
         } catch {
-            NSLog("github_command: callback correlation failed: \(error.localizedDescription)")
+            nativeLog("github_command: callback correlation failed: \(error.localizedDescription)")
         }
     }
 
@@ -221,7 +221,7 @@ public actor GitHubCommandRuntime {
             pruneResidentOutcomeFingerprints(reportedItems: state.items)
             await processNotifications()
         } catch {
-            NSLog("github_watcher: state cycle failed: \(error.localizedDescription)")
+            nativeLog("github_watcher: state cycle failed: \(error.localizedDescription)")
         }
     }
 
@@ -276,7 +276,7 @@ public actor GitHubCommandRuntime {
         do {
             intents = try await store.claimPendingNotifications()
         } catch {
-            NSLog("github_command: notification cycle failed: \(error.localizedDescription)")
+            nativeLog("github_command: notification cycle failed: \(error.localizedDescription)")
             return
         }
         // Every intent above is already durably claimed and will never be
@@ -299,7 +299,7 @@ public actor GitHubCommandRuntime {
                     detail: detail
                 )
             } catch {
-                NSLog("github_command: receipt persist failed for \(intent.dedupKey): \(GitHubCommandRuntime.readableDetail(error))")
+                nativeLog("github_command: receipt persist failed for \(intent.dedupKey): \(GitHubCommandRuntime.readableDetail(error))")
             }
         }
     }

@@ -91,19 +91,22 @@ public struct MemoryManagerRequest: Sendable, Equatable {
     public let pending: [String]
     /// The person's configured name, so a memory is about "User", never "the person".
     public let personName: String?
+    public let standingAgent: Bool
 
     public init(
         userMessage: String,
         assistantMessage: String,
         existing: [MemoryManagerExistingMemory] = [],
         pending: [String] = [],
-        personName: String? = nil
+        personName: String? = nil,
+        standingAgent: Bool = false
     ) {
         self.userMessage = userMessage
         self.assistantMessage = assistantMessage
         self.existing = existing
         self.pending = pending
         self.personName = personName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? personName : nil
+        self.standingAgent = standingAgent
     }
 }
 
@@ -132,11 +135,58 @@ public struct AfterTurnInterpretation: Sendable {
 /// deliberately NO rule-based conformer: a memory invented by a pattern is what
 /// this file exists to delete.
 ///
-/// `nil` means the call itself failed (timeout, provider error, unparseable) —
-/// distinct from an empty array, which is the model saying "nothing here".
+public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
+    public enum Reason: String, Codable, Sendable, Hashable {
+        case deadline, cancelled, provider, invalidJSON, missingSections
+        case invalidCaring, invalidAffect, invalidMemories, invalidMoment
+        case authExpired, codexCLISessionExpired, rateLimited, overloaded, contextTooLong
+        case network, refused, invalidProviderResponse, routingUnavailable, modelUnavailable
+    }
+    public let reason: Reason
+    public let recovery: String
+    public let model: String?
+    public let surface: String
+    public let at: Date
+
+    public init(reason: Reason, recovery: String, model: String?, surface: String, at: Date = Date()) {
+        self.reason = reason
+        self.recovery = recovery
+        self.model = model
+        self.surface = surface
+        self.at = at
+    }
+
+    public var detail: String {
+        "After-turn memory failed: \(reason.rawValue). \(recovery) No new memory was saved from this pass."
+    }
+
+    public var interpretationFailure: AfterTurnInterpretationFailure {
+        switch reason {
+        case .deadline: return .deadline
+        case .cancelled: return .cancellation
+        case .authExpired, .codexCLISessionExpired: return .authentication
+        case .invalidJSON, .missingSections: return .envelope
+        case .invalidCaring: return .caring
+        case .invalidAffect: return .affect
+        case .invalidMemories: return .memories
+        case .invalidMoment: return .moment
+        default: return .provider
+        }
+    }
+}
+
+public enum AfterTurnInterpretationFailure: String, Error, Sendable {
+    case provider, authentication, deadline, cancellation
+    case envelope, caring, affect, memories, moment
+}
+
+/// No incoming message returns nil; failures throw bounded recovery evidence.
+/// An empty memory array is a valid abstention.
 public protocol MemoryManaging: Sendable {
     func interpret(_ request: MemoryManagerRequest, context: AfterTurnContext?,
-                   factsEnabled: Bool, momentsEnabled: Bool) async -> AfterTurnInterpretation?
+                   factsEnabled: Bool, momentsEnabled: Bool) async throws -> AfterTurnInterpretation?
+    func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String?, topK: Int?) async
+        -> Result<Set<String>, AfterTurnMemoryFailure>
 }
 
 // MARK: - Lane constants, prompt, parse, gate

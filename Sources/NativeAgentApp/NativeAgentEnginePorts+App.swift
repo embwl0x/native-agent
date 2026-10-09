@@ -35,7 +35,13 @@ extension ToolsFacade {
 
 extension NativeAgentEnginePorts {
     static func app(dataRoot: URL) -> Self {
-        Self(
+        Task {
+            await AgentContactHealth.shared.installGrokVerifier(dataRoot: dataRoot) { peer in
+                do { try await AppGrokBotConnectionPort().importGrokRoutine(peer: peer, dataRoot: dataRoot, waitForCreation: false) }
+                catch let blocker as GrokRoutineAccessibility.Blocker { throw ToolFailureError(blocker.rawValue, effects: .unknown) }
+            }
+        }
+        return Self(
             cognitionHost: AppCognitionHost(),
             deviceSyncHost: AppDeviceSyncHost(),
             macIntegration: MacIntegrationBridgeImpl(),
@@ -50,7 +56,6 @@ extension NativeAgentEnginePorts {
                 desktopChat: { await DesktopChatRoute.perform(plan: $0, dataRoot: $1) },
                 desktop: { await NativeAgentEngine.live.agents.desktop.run(plan: $0, inner: $1, surface: $2) }
             ),
-            catalogPosture: { await NativeAgentEngine.liveCognition.organismBehaviorPosture() },
             evolutionBridge: { EvolutionToolBridgeImpl(dataRoot: $0) },
             connectorActionStatuses: { try await NativeClient.checkedConnectorActionStatuses(root: dataRoot) }
         )
@@ -80,8 +85,8 @@ private struct AppAgentBridgePort: EngineAgentBridgePort {
 
 private struct AppStandingBotQueuePort: EngineStandingBotQueuePort {
     let dataRoot: URL
-    func enqueueRun(bot: UUID) throws -> UUID {
-        try BotRunQueue(dataRoot: dataRoot).enqueueRequest(bot: bot)
+    func enqueueRun(bot: UUID, question: String?) throws -> BotRunReceipt {
+        try BotRunQueue(dataRoot: dataRoot).enqueue(bot: bot, context: question)
     }
 }
 
@@ -106,19 +111,6 @@ struct AppCognitionHost: CognitionHost {
         )
         guard outcome.delivery != .none, !outcome.suppressed else { return nil }
         return outcome.delivery.rawValue
-    }
-
-    func sendToOwnerTelegram(sessionId: String, text: String, dataRoot: URL) async -> Bool? {
-        guard let owner = await ApprovalChatCards.ownerDM(boundTo: sessionId, dataRoot: dataRoot) else { return nil }
-        guard let telegram = TelegramApprovalFilerRef.shared.current() else { return false }
-        do {
-            try await telegram.sendChatCard(text: NativeAppSecretRedactor.redactText(text), chatId: owner,
-                                            markup: .object(["inline_keyboard": .array([])]))
-            return true
-        } catch {
-            NSLog("reach: Telegram send failed: %@", error.localizedDescription)
-            return false
-        }
     }
 
     func writeSyncSnapshots() async { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }

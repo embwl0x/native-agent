@@ -276,6 +276,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 lastSentAccessToken = access
             } catch is CancellationError { throw CancellationError() }
             catch let err as LLMError { throw err }
+            catch let err as any ProviderFailureWrapping { throw err }
             catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
             var req = try responsesRequest(accessToken: access)
 
@@ -293,6 +294,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             let data: Data
             let response: URLResponse
             do {
+                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                 (data, response) = try await session.data(for: req)
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "completeMessages"))
@@ -399,6 +401,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                             lastSentAccessToken = access
                         } catch is CancellationError { throw CancellationError() }
                         catch let err as LLMError { throw err }
+                        catch let err as any ProviderFailureWrapping { throw err }
                         catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
                         var req = try responsesRequest(accessToken: access)
 
@@ -416,7 +419,9 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         let bytes: URLSession.AsyncBytes
                         let response: URLResponse
                         do {
+                            if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                             (bytes, response) = try await session.bytes(for: req)
+                            if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
                         } catch {
                             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
                         }
@@ -654,6 +659,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 // notConfigured surfaces clean (no tokens, refresh failed
                 // with no-creds path, etc).
                 throw err
+            } catch let err as any ProviderFailureWrapping {
+                throw err
             } catch {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
             }
@@ -672,6 +679,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             let data: Data
             let response: URLResponse
             do {
+                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
                 (data, response) = try await session.data(for: req)
             } catch {
                 // Cancellation MUST propagate as CancellationError (R-M2). Without
@@ -751,12 +759,13 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     private func transientNetworkError(_ error: Error, endpoint: URL, operation: String) -> LLMError {
         let host = endpoint.host ?? "chatgpt.com"
         let nsError = error as NSError
-        let timeout = Int(session.configuration.timeoutIntervalForRequest.rounded())
+        let timeout = session.configuration.timeoutIntervalForRequest
+        let timeoutNote = timeout.isFinite ? "after \(String(format: "%.0f", timeout))s" : "with the request idle limit disabled"
         if nsError.domain == NSURLErrorDomain {
             let code = URLError.Code(rawValue: nsError.code)
             switch code {
             case .timedOut:
-                return .transient(message: "openai_oauth_direct \(operation) timed out after \(timeout)s: \(host)")
+                return .transient(message: "openai_oauth_direct \(operation) timed out \(timeoutNote): \(host)")
             case .cannotConnectToHost:
                 return .transient(message: "openai_oauth_direct \(operation) cannot connect to \(host) (code=\(nsError.code))")
             case .networkConnectionLost:
@@ -824,8 +833,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// hard auth and rate-limit semantics while classifying explicit capacity
     /// and availability failures as transient so existing surface retry policy
     /// can handle them truthfully.
-    static func classifiedBackendError(_ description: String) -> LLMError {
-        .failure(ProviderFailure.wire(description))
+    static func classifiedBackendError(_ description: String) -> ProviderFailure.Diagnostic {
+        .init(cause: ProviderFailure.wire(description), detail: description)
     }
 
     private static func boundedProviderErrorField(
@@ -1141,6 +1150,31 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         }
     }
 
+    /// Codex refreshes on its own once a token is inside its last 5 minutes,
+    /// and a child job can run for many minutes, so a child starts only with
+    /// an hour or more left.
+    private static let codexChildRefreshBufferSec: Int = 3_600
+
+    /// Run before spawning a Codex child on `codexHome`. When it is an app
+    /// child home, the app renews its own credential through the normal
+    /// refresh queue if the token is near expiry, then re-syncs the child's
+    /// access-only copy. Any other home is left alone.
+    public static func prepareCodexChildHome(_ codexHome: URL) async throws {
+        guard codexHome.standardizedFileURL.lastPathComponent == "codex_child_home" else { return }
+        let authPath = preferredAuthPath(
+            dataRoot: codexHome.standardizedFileURL.deletingLastPathComponent(),
+            allowSharedFallbacks: false
+        )
+        if let blob = loadAuthBlob(at: authPath),
+           let access = (blob["tokens"] as? [String: Any])?["access_token"] as? String,
+           !access.isEmpty,
+           !accessTokenIsFresh(access, blob: blob, buffer: codexChildRefreshBufferSec) {
+            _ = try await OpenAIOAuthDirectAdapter(authPathOverride: authPath)
+                .ensureFreshAccessToken(forceRefresh: true, staleToken: access)
+        }
+        try syncCodexChildCopy(from: authPath)
+    }
+
     /// Refresh and persist tokens. Returns the new access token. Mirrors the
     /// lock-protected refresh block at L511-L531 + `_refresh_with_refresh_
     /// token` at L533-L558.
@@ -1288,6 +1322,16 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     return .superseded(current)
                 }
                 try Self.writeAuthBytesAtomically(bytes, to: path)
+                // The rotation is already on disk, so a failed child copy must
+                // not fail this refresh; the next Codex spawn re-syncs it and
+                // fails loudly there (`prepareCodexChildHome`).
+                do {
+                    try Self.writeCodexChildCopy(bytes, of: path)
+                } catch {
+                    FileHandle.standardError.write(Data(
+                        "OpenAIOAuthDirectAdapter: Codex child credential copy failed: \(error)\n".utf8
+                    ))
+                }
                 return .wrote
             }
         } catch {

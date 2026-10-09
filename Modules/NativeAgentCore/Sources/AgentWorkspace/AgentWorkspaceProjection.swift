@@ -1,6 +1,54 @@
 import Foundation
 import PersistenceCore
 
+extension AgentWorkspace {
+    package static func readReferences(_ reads: [(tool: String, input: [String: JSONValue], title: String)], dataRoot: URL) throws -> [JSONValue] {
+        let keys = reads.map { read -> (String, String)? in
+            guard let room = read.tool == "recent_trace_summary" ? "trace" : HerScreen.commsFamily[read.tool],
+                  let key = HerScreen.key(.record(tool: read.tool, input: read.input, title: read.title)) else { return nil }
+            return (room, key)
+        }
+        var failure: Error?
+        let refs: [JSONValue] = HerScreen.withNames(dataRoot, onWriteFailure: { failure = $0 }) { book in
+            keys.map { entry in
+                guard let (room, key) = entry else { return .null }
+                let present = Set(keys.compactMap { $0?.0 == room ? $0?.1 : nil })
+                return .string(room + ".\(book.number("item." + room, id: key) { present })")
+            }
+        }
+        if let failure { throw failure }
+        return refs
+    }
+
+    package static func attachReadReferences(tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) -> JSONValue {
+        guard case .object(var root) = result, case .array(let messages)? = root["messages"] else { return result }
+        let items = AgentWorkspaceProjection.project(location: .record(tool: tool, input: input, title: "Mail"), result: result).items
+            .filter { if case .open(.record)? = $0.actions.first?.action { return true }; return false }
+        let refs: [JSONValue]
+        do { refs = try readReferences(items.compactMap { item in
+            if case .open(.record(let reader, let bound, let title))? = item.actions.first?.action { return (reader, bound, title) }
+            return nil
+        }, dataRoot: dataRoot) }
+        catch {
+            root["read_ref_note"] = .string("Read references were not saved: \(error.localizedDescription)")
+            return .object(root)
+        }
+        root["messages"] = .array(messages.map { value in
+            guard case .object(var row) = value,
+                  let index = items.firstIndex(where: { item in
+                      guard case .open(.record(_, let bound, _))? = item.actions.first?.action else { return false }
+                      return bound["message_id"] == row["message_id"]
+                          && (bound["expected_account"] == nil || bound["expected_account"] == row["expected_account"])
+                          && (bound["expected_message_id"] == nil || bound["expected_message_id"] == row["expected_message_id"])
+                  }) else { return value }
+            row["read_ref"] = refs[index]
+            return .object(row)
+        })
+        root["read_ref_note"] = .string("Open an observed read_ref with app {item:read_ref}; its exact identity is bound server-side.")
+        return .object(root)
+    }
+}
+
 /// A view of an owner's returned evidence. This layer neither reads sources nor
 /// interprets prose as instructions, permissions, completion, or fresh state.
 extension AgentWorkspaceProjection {
@@ -99,8 +147,8 @@ extension AgentWorkspaceProjection {
             let title = String((host + url.path).prefix(160))
             links.append(.init(title: title, content: .object(["kind": .string("link_in_document"), "url": .string(url.absoluteString)]), actions: [
                 .init(label: "Read source", action: .open(.record(tool: "read_page", input: ["url": .string(url.absoluteString)], title: title))),
-                .init(label: "Open in background browser", action: .perform(tool: "browser.chrome_acquire",
-                    input: ["mode": .string("create"), "url": .string(url.absoluteString)], title: title, textField: nil, isEffect: true))
+                .init(label: "Open in background browser", action: .perform(tool: "browser.chrome_navigate",
+                    input: ["url": .string(url.absoluteString)], title: title, textField: nil, isEffect: true))
             ]))
             if links.count == 6 { break }
         }

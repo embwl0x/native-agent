@@ -401,7 +401,22 @@ extension MacAppleScriptBridge {
         let command: String
         switch action {
         case "play", "resume", "start":
-            if let playlist { command = "play playlist \"\(escapeForAppleScript(playlist))\"" }
+            if let playlist {
+                command = """
+                set matchingPlaylists to (every playlist whose name is "\(escapeForAppleScript(playlist))")
+                if (count of matchingPlaylists) is 0 then
+                    set suggestions to ""
+                    set namesList to name of every playlist
+                    repeat with i from 1 to (count of namesList)
+                        if i > 6 then exit repeat
+                        set suggestions to suggestions & (item i of namesList) & "|||"
+                    end repeat
+                    return "missing_playlist|||" & suggestions
+                end if
+                if (count of matchingPlaylists) > 1 then return "ambiguous_playlist|||"
+                play item 1 of matchingPlaylists
+                """
+            }
             else if let track {
                 // Exactly one track with exactly that name (and artist, when
                 // given); several or none play nothing and list candidates.
@@ -417,7 +432,7 @@ extension MacAppleScriptBridge {
         case "next", "next_track", "skip", "forward": command = "next track"
         case "previous", "prev", "previous_track", "back", "restart": command = "previous track"
         default:
-            return .object(["status": .string("failed"), "integration": .string("music"), "reason": .string("unknown_action"),
+            return .object(["status": .string("failed"), "effects": .string("none"), "integration": .string("music"), "reason": .string("unknown_action"),
                             "fix": .string("Say play, pause, toggle, next or previous, or give playlist or track to play one by name.")])
         }
         let source = """
@@ -427,14 +442,24 @@ extension MacAppleScriptBridge {
         end tell
         """
         do {
-            _ = try await runAppleScript(source)
+            let raw = try await runAppleScript(source)
+            if raw.hasPrefix("missing_playlist|||") || raw.hasPrefix("ambiguous_playlist|||") {
+                let missing = raw.hasPrefix("missing_playlist|||")
+                let names = raw.components(separatedBy: "|||").dropFirst().filter { !$0.isEmpty }
+                return .object(["status": .string("failed"), "effects": .string("none"), "integration": .string("music"),
+                    "reason": .string(missing ? "playlist_not_found" : "ambiguous_playlist"),
+                    "playlists": .array(names.map(JSONValue.string)),
+                    "fix": .string(missing
+                        ? "No playlist is named \"\(playlist ?? "")\"." + (names.isEmpty ? " The library has no playlists." : " Available: " + names.joined(separator: ", ") + ".")
+                        : "More than one playlist is named \"\(playlist ?? "")\". Rename one in Music to select it exactly.")])
+            }
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "music", app: app)
         } catch {
             // Music's "can't get" on a name that matched nothing.
             if (error as NSError).code == -1728, let name = playlist ?? track {
                 return .object(["status": .string("failed"), "integration": .string("music"), "reason": .string("not_found"),
-                                "fix": .string("Nothing in the library matches \"\(name)\". music_list_playlists or music_search_library shows the exact names.")])
+                                "fix": .string("Nothing in the library matches \"\(name)\". music_list_playlists or music_search_library shows the exact names. Search the Apple Music catalog in Music if available, or play it in an existing Chrome tab using browser actions.")])
             }
             return failedEnvelope(integration: "music", error: error)
         }
@@ -476,7 +501,7 @@ extension MacAppleScriptBridge {
         if exact.count == 1 { return (exact[0].id, nil) }
         let shown = (exact.isEmpty ? rows : exact).prefix(6).map { "\"\($0.name)\" by \($0.artist)" }.joined(separator: ", ")
         let fix = exact.isEmpty
-            ? "No song is named exactly \"\(name)\"." + (shown.isEmpty ? " music_search_library finds names." : " Close: \(shown). Give one exactly.")
+            ? "No song is named exactly \"\(name)\"." + (shown.isEmpty ? " Search the Apple Music catalog in Music if available, or play it in an existing Chrome tab using browser actions." : " Close: \(shown). Give one exactly.")
             : "\(exact.count) songs are named \"\(name)\": \(shown). Add artist to pick one."
         return (nil, .object(["status": .string("failed"), "integration": .string("music"),
                               "reason": .string(exact.isEmpty ? "not_found" : "ambiguous"), "fix": .string(fix)]))

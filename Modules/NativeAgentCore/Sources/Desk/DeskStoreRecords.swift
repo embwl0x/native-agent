@@ -28,6 +28,7 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case workSessionCapReached(scope: String, limit: Int, handle: String)
     case unknownReservation(reservationId: String, handle: String)
     case reservationAlreadyComplete(reservationId: String, handle: String)
+    case workReservationNotReady(handle: String)
     // Sequencing edges (blocked-on / defer).
     case blockedOnUnknown(handle: String, blocker: String)
     case blockedOnSelf(handle: String)
@@ -93,6 +94,8 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: no reservation \(reservationId) on \(handle); reserve the slot before completing it"
         case let .reservationAlreadyComplete(reservationId, handle):
             return "desk: reservation \(reservationId) on \(handle) is already complete; a slot completes once"
+        case .workReservationNotReady(let handle):
+            return "desk: cannot reserve work on \(handle); resolve its or its ancestor's blockers, owner input, or deferral first"
         case let .blockedOnUnknown(handle, blocker):
             return "desk: cannot block \(handle) on '\(blocker)' — no live item with that handle; blockers point at ITEMS, not prose"
         case .blockedOnSelf(let handle):

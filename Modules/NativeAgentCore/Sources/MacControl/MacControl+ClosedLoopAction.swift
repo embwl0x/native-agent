@@ -415,7 +415,8 @@ extension SwiftNativeMacControl {
         let identityAnchor = anchoredSnapshot(
             limits: identityLimits,
             pid: framePid,
-            window: frame.windowIdentity
+            window: frame.windowIdentity,
+            complete: frame.completeWindow
         )
         let identityRead: MacAXRead
         switch identityAnchor {
@@ -454,7 +455,8 @@ extension SwiftNativeMacControl {
         let identityScoped = pageScoped(
             identityRead,
             limits: identityLimits,
-            scope: MacLookScope.parse(body.stringValue("scope")) ?? .page
+            scope: MacLookScope.parse(body.stringValue("scope")) ?? .page,
+            completeWindow: frame.completeWindow
         ).read
         let identityPercept = MacPerceptionCompiler.compile(
             snapshot: identityScoped.snapshot,
@@ -490,6 +492,25 @@ extension SwiftNativeMacControl {
                     "guidance": .string(
                         "the control at that position is no longer the one that handle named — the "
                         + "window changed under you; call mac_look again"
+                    ),
+                ]
+            )
+        }
+        // A position-derived handle inside a list row: rows are recycled as
+        // the list scrolls, so its position cannot prove which record it is.
+        if entry.ambiguous, identityScoped.snapshot.nodes.contains(where: {
+            MacLookHandle.contentIdentityRoles.contains($0.attributes.role) && entry.path.starts(with: $0.path)
+        }) {
+            return injectionRefusal(
+                action: "act",
+                error: "handle_ambiguous",
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "guidance": .string(
+                        "that control sits in a row that reads exactly like another row, so its position "
+                        + "cannot prove which record it belongs to — NOTHING was acted on; name it by "
+                        + "text that only its row shows"
                     ),
                 ]
             )
@@ -652,7 +673,8 @@ extension SwiftNativeMacControl {
             limits: limits,
             scope: MacLookScope.parse(body.stringValue("scope")) ?? .page,
             anchorPid: framePid,
-            anchorWindow: frame.windowIdentity
+            anchorWindow: frame.windowIdentity,
+            completeWindow: frame.completeWindow
         )
         let redactValue = verb == .type
                 // Did `open` land on an ancestor of the handle she named? `acted_on`
@@ -715,8 +737,8 @@ var effect: [String: JSONValue] = [
             // app published nothing, the title did not move and the glance was
             // identical. Reporting that as `acted` calls an unobserved act a
             // success. `ok`/`performed` keep their meaning — the event went out;
-            // the STATUS says whether anything was seen to happen. `verified`
-            // stays false either way: observation is evidence, not settlement.
+            // the STATUS says whether anything was seen to happen. Verification
+            // is filled below from the actual post-action readback.
             // Round 4, Finder `open`: one AXRowCountChanged was enough to call
             // an act that navigated NOWHERE `acted`. The classifier below is
             // the single place that verdict is made; this seeds it with the
@@ -736,9 +758,7 @@ var effect: [String: JSONValue] = [
             "requested_action": .string(performed.requestedAction),
             "path": .array(entry.path.map { .int(Int64($0)) }),
             "seam": .object(seam),
-            // The closed loop OBSERVES; it does not claim the intended
-            // consequence happened. `effect.observed` is the evidence, and it
-            // is the caller's to judge — same honesty line `ax_act` holds.
+            // Until the post-action read supplies evidence there is no verdict.
             "verified": .bool(false),
             "value_redacted": .bool(redactValue),
         ]
@@ -844,16 +864,17 @@ var effect: [String: JSONValue] = [
             windowTitle: read.rootTitle,
             // Same read epoch as the post-act walk, anchored to its root.
             focusPath: read.focusPath,
-            maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances
+            maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances,
+            uncapped: frame.completeWindow
         )
         // The bounds THIS compile ran under, so the diff can say whether its
         // added/removed census is comparable with the look's (Agent round 2:
         // 29 added / 1 removed was a capped recompile, not navigation).
         let afterCaps = MacLookCompileCaps(
             truncated: after.truncated,
-            maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances,
-            maxNodes: limits.maxNodes,
-            maxDepth: limits.maxDepth
+            maxAffordances: frame.completeWindow ? nil : Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances,
+            maxNodes: frame.completeWindow ? nil : limits.maxNodes,
+            maxDepth: frame.completeWindow ? nil : limits.maxDepth
         )
         let diff = MacActClosedLoop.diff(
             before: frame,
@@ -897,6 +918,34 @@ var effect: [String: JSONValue] = [
             ) ? nil : performed.postState?.value
         )
         output["status"] = .string(classification.status)
+        let observedReadout = MacActReceiptRendering.actedReadout(diff: diff, after: after)
+        let editVerified = verb == .type && classification.status == "acted"
+        // A click, select, toggle or dismiss is certified by ITS effect: a
+        // state of the acted control read on both sides and different, its
+        // presence (under a comparable census), its window's title or modal,
+        // and — for a click only — the focus landing on it. A readout moving
+        // elsewhere, focus alone, or a read that failed is not that.
+        let acted = performed.actedHandle
+        func moved(_ before: String?, _ after: String?) -> Bool { before != nil && after != nil && before != after }
+        let controlEffect = diff.windowTitleChanged || diff.modalAppeared || diff.modalDisappeared
+            || diff.changed.contains {
+                $0.handle == acted && (moved($0.beforeValue, $0.afterValue) || moved($0.beforeLabel, $0.afterLabel))
+            }
+            || (diff.diffComparable && diff.removed.contains { $0.handle == acted })
+            || (verb == .click && diff.focusChanged && diff.focusHandleAfter == acted)
+            || performed.postState.map {
+                moved(performed.target.value, $0.value) || moved(performed.target.title, $0.title)
+            } == true
+        let effectSeen = [MacActVerb.click, .select, .toggle, .dismiss].contains(verb) ? controlEffect
+            : diff.windowChanged || editVerified
+        if classification.status == "acted", effectSeen {
+            output["verified"] = .bool(true)
+            output["verification_scope"] = .string(editVerified ? "intended_field_edit" : "observed_screen_effect")
+            output["verification_evidence"] = observedReadout?.textJSON
+                ?? observedReadout.map { .string($0.text) }
+                ?? .array(diff.changeReasons.map(JSONValue.string))
+            effect.removeValue(forKey: "reason")
+        }
         if let reason = classification.reason {
             output["status_reason"] = .string(reason)
             // Same value as the `none_observed` written above when nothing was
@@ -943,7 +992,8 @@ var effect: [String: JSONValue] = [
             // the same window the read above was anchored to, re-read fresh so
             // a moved or retitled window carries its new identity forward.
             windowIdentity: read.windowIdentity ?? frame.windowIdentity,
-            caps: afterCaps
+            caps: afterCaps,
+            completeWindow: frame.completeWindow
         ))
         output["frame_id"] = .string(newFrameId)
         output["captured_at"] = .string(ISO8601DateFormatter().string(from: capturedAt))
@@ -1527,7 +1577,7 @@ var effect: [String: JSONValue] = [
             /// so the act window must be the app's focused window AND the
             /// target field its focused element — re-asked before every chunk.
             func focusHolds() -> Bool {
-                guard !Task.isCancelled, MacDriverContext.binding?.allowsEmission == true else { return false }
+                guard !Task.isCancelled, MacDriverContext.binding?.allowsAction == true else { return false }
                 guard let focused = accessibilityActSource.focusedWindow(pid: framePid),
                       focused.handle == actWindow.handle else { return false }
                 return accessibilityActSource.isFocusedElement(target, pid: framePid)
@@ -1560,7 +1610,7 @@ var effect: [String: JSONValue] = [
                 }
                 let slice = String(characters[charactersSent..<min(characters.count, charactersSent + chunk)])
                 for event in MacEventPlanner.typeText(slice) {
-                    guard !Task.isCancelled, MacDriverContext.binding?.allowsEmission == true else { break sending }
+                    guard !Task.isCancelled, MacDriverContext.binding?.allowsAction == true else { break sending }
                     guard eventSink.post(key: event, toPid: framePid) else { break sending }
                     posted += 1
                     if event.down { charactersSent += 1 }
@@ -1589,6 +1639,14 @@ var effect: [String: JSONValue] = [
                 postState: nil, actedHandle: handle, extra: ["guidance": .string(refusal)])
         }
         switch verb {
+        case .focus:
+            let outcome = ledgeredSetFocused(target)
+            let focused = outcome == .performed && accessibilityActSource.isFocusedElement(target, pid: framePid)
+            return MacActPerformed(ok: focused, method: outcome == .performed ? "ax_focus" : "none",
+                requestedAction: "AXFocused", fallbackReason: nil,
+                error: focused ? nil : "target_not_focused", target: target,
+                postState: accessibilityActSource.reread(target), actedHandle: handle,
+                extra: ["focus_verified": .bool(focused)])
         case .click, .select, .toggle:
             // Background: pressing something whose job is to open a menu would
             // pop that menu over the person's screen. It needs the front.

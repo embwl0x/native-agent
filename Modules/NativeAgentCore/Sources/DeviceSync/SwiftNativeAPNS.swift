@@ -209,7 +209,7 @@ public actor SwiftNativeAPNSSender {
     /// margin so a token never crosses Apple's 60-min hard expiry mid-flight.
     static let providerTokenTTL: TimeInterval = 50 * 60
 
-    private struct CachedProviderToken {
+    private struct CachedProviderToken: Codable {
         let keyId: String
         let teamId: String
         let jwt: String
@@ -219,6 +219,16 @@ public actor SwiftNativeAPNSSender {
     /// Signed provider JWT, cached by (keyId, teamId). The actor's isolation
     /// serializes access, so concurrent sends can never double-mint.
     private var cachedProviderToken: CachedProviderToken?
+
+    /// 2026-10-07: the cached JWT was memory-only, so every launch signed a
+    /// fresh one; dev reinstall cadence (20+ launches a day) re-minted far
+    /// more often than Apple's once-per-20-minutes, and the old receipts show
+    /// TooManyProviderTokenUpdates as the largest failure class. The token now
+    /// persists beside the .p8 key (mode 0600) and a launch reuses it. Set when
+    /// Apple rejects the current token as expired/invalid, so the next send
+    /// mints instead of re-reading the rejected one from disk.
+    private var providerTokenRejected = false
+    private var providerTokenStoreURL: URL?
 
     /// C3: after Apple rejects a push with `TooManyProviderTokenUpdates`, hold
     /// re-mints for this long — Apple's remedy is to stop updating the token
@@ -263,6 +273,13 @@ public actor SwiftNativeAPNSSender {
     /// silently returned, and the failure surfaces to the caller.
     func providerToken(keyId: String, teamId: String, keyPath: String) throws -> String {
         let current = now()
+        let storeURL = URL(fileURLWithPath: keyPath).deletingLastPathComponent()
+            .appendingPathComponent("apns_provider_token.json")
+        if cachedProviderToken == nil, !providerTokenRejected,
+           let data = try? Data(contentsOf: storeURL) {
+            cachedProviderToken = try? JSONDecoder().decode(CachedProviderToken.self, from: data)
+            providerTokenStoreURL = storeURL
+        }
         if let cached = cachedProviderToken,
            cached.keyId == keyId,
            cached.teamId == teamId,
@@ -286,14 +303,43 @@ public actor SwiftNativeAPNSSender {
             issuedAt: current
         )
         providerTokenHoldUntil = nil
+        providerTokenRejected = false
+        providerTokenStoreURL = storeURL
+        if let data = try? JSONEncoder().encode(cachedProviderToken) {
+            try CredentialFileLock.withLock(storeURL) {
+                if !NativePrivateFile.write(data, to: storeURL) {
+                    nativeLog("[APNS] could not persist provider token")
+                }
+            }
+        }
         return jwt
     }
 
     /// Class-specific APNs rejection handling (C3). `TooManyProviderTokenUpdates`
     /// means the provider JWT was re-signed too often — the fix is to back off
     /// on minting and respect the cached token, so start a re-mint hold. Every
-    /// other reason keeps its existing behavior.
-    func noteRejection(reason: String?) {
+    /// other reason keeps its existing behavior. `ExpiredProviderToken` /
+    /// `InvalidProviderToken` drop the token that was rejected (only that one:
+    /// a late rejection must not discard a token minted since) so the next
+    /// send mints.
+    func noteRejection(reason: String?, jwt: String) throws {
+        if reason == "ExpiredProviderToken" || reason == "InvalidProviderToken" {
+            guard cachedProviderToken?.jwt == jwt else { return }
+            cachedProviderToken = nil
+            providerTokenRejected = true
+            if let storeURL = providerTokenStoreURL {
+                try CredentialFileLock.withLock(storeURL) {
+                    let data: Data
+                    do { data = try Data(contentsOf: storeURL) }
+                    catch CocoaError.fileReadNoSuchFile { return }
+                    let saved = try JSONDecoder().decode(CachedProviderToken.self, from: data)
+                    guard saved.jwt == jwt else { return }
+                    try FileManager.default.removeItem(at: storeURL)
+                    try SwiftNativePersistenceCore.syncDirectory(storeURL.deletingLastPathComponent())
+                }
+            }
+            return
+        }
         guard reason == "TooManyProviderTokenUpdates" else { return }
         providerTokenHoldUntil = now().addingTimeInterval(Self.providerTokenUpdateBackoff)
     }
@@ -467,7 +513,7 @@ public actor SwiftNativeAPNSSender {
         let status = response.statusCode
         guard status == 200 else {
             let reason = Self.rejectionReason(fromResponseBody: data)
-            noteRejection(reason: reason)
+            try noteRejection(reason: reason, jwt: jwt)
             return WorkActivityRejection(
                 message: "\(event): \(reason ?? "HTTP \(status)")",
                 tokenIsInvalid: status == 410 || ["BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"].contains(reason ?? "")
@@ -528,9 +574,60 @@ public actor SwiftNativeAPNSSender {
             if receipts.count < targets.count {
                 errors.append("APNS fan-out deadline exceeded for \(targets.count - receipts.count) target(s).")
             }
+            await recordOutcome(eventID: eventID, targets: targets, receipts: receipts, errors: errors, dataRoot: dataRoot)
             return (receipts, errors)
         } catch {
             return ([], [error.localizedDescription])
+        }
+    }
+
+    /// 2026-10-07: one line per fan-out, so a phone alert that fell back to the
+    /// bridge lane shows why (rejection, timeout, deadline). A 410 means Apple
+    /// retired that token for good; it is pruned so later fan-outs stop paying
+    /// for it. Other rejections can be our own config (environment, topic), so
+    /// they never cost the phone its token.
+    private func recordOutcome(
+        eventID: String,
+        targets: [APNSTarget],
+        receipts: [SwiftNativeAPNSReceipt],
+        errors: [String],
+        dataRoot: URL
+    ) async {
+        for receipt in receipts where receipt.httpStatus == 410 {
+            // APNs stamps a 410 with when it last confirmed the token dead (ms).
+            guard let body = try? JSONSerialization.jsonObject(with: Data(receipt.response.utf8)) as? [String: Any],
+                  let millis = (body["timestamp"] as? NSNumber)?.doubleValue,
+                  let target = targets.first(where: {
+                      $0.token.deviceId == receipt.deviceId && $0.token.token.hasSuffix(receipt.tokenSuffix)
+                  }) else { continue }
+            do {
+                try await MacSyncMobileNotificationRelay.prunePushToken(
+                    target.token.token,
+                    unregisteredAt: Date(timeIntervalSince1970: millis / 1000),
+                    dataRoot: dataRoot
+                )
+            } catch {
+                nativeLog("[APNS] could not prune unregistered token for %@: %@", receipt.deviceId, error.localizedDescription)
+            }
+        }
+        let row: JSONValue = .object([
+            "at": .string(ISO8601DateFormatter().string(from: Date())),
+            "eventId": .string(eventID),
+            "targets": .int(Int64(targets.count)),
+            "accepted": .int(Int64(receipts.filter(\.isSuccess).count)),
+            "receipts": .array(receipts.map { $0.toJSON() }),
+            "errors": .array(errors.map(JSONValue.string)),
+        ])
+        do {
+            try await appendJSONLCapped(
+                row,
+                to: dataRoot.appendingPathComponent("mobile_push/apns_outcomes.jsonl"),
+                using: persistence,
+                maxLines: 500,
+                logLabel: "SwiftNativeAPNS.outcome"
+            )
+        } catch {
+            nativeLog("[APNS] could not record outcome for %@: %@", eventID, error.localizedDescription)
         }
     }
 
@@ -602,7 +699,7 @@ public actor SwiftNativeAPNSSender {
             let responseText = String(data: data, encoding: .utf8) ?? ""
             let ok = status.map { (200..<300).contains($0) } ?? false
             let reason = ok ? nil : Self.rejectionReason(fromResponseBody: data)
-            noteRejection(reason: reason)
+            try noteRejection(reason: reason, jwt: jwt)
             receipt = SwiftNativeAPNSReceipt(
                 apnsId: apnsId,
                 createdAt: createdAt,
@@ -639,11 +736,8 @@ public actor SwiftNativeAPNSSender {
             )
         }
 
-        // Sweep item 21 (2026-09-01): the `mobile_push/receipts.jsonl` append
-        // is gone. 1,550 rows / 430 KB of APNs delivery evidence that no
-        // production code ever read back — the receipt is RETURNED to the
-        // caller, which is where every live decision about a send is made.
-        // Existing rows stay on disk; the runtime just stops adding to them.
+        // The fan-out records one capped outcome line (`recordOutcome`); the
+        // per-target `mobile_push/receipts.jsonl` append retired 09-01.
         return receipt
     }
 

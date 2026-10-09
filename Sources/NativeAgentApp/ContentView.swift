@@ -29,6 +29,8 @@ struct ContentView: View {
     @AppStorage("nativeagent.showTour") private var showTour = false
     /// Simple | Advanced (SimpleViewMode.swift).
     @AppStorage(SimpleViewMode.key) private var viewModeRaw = ""
+    /// ⌘0 hides the rail (and Chat's conversations column) so chat fills the window.
+    @AppStorage(WorkPaneState.sidebarsHiddenKey) private var sidebarsHidden = false
     private var showsSimpleView: Bool { SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.simple }
     private var showsAgentView: Bool { SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.agent }
     @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
@@ -123,7 +125,8 @@ struct ContentView: View {
                 // inside an HStack but mislead the next reader.
                 // The rail carries the pending queue as a badge — otherwise a
                 // pending approval is invisible until he happens to open
-                // Today. One dot, no number.
+                // Today. One dot, no number. ⌘0 takes it away.
+                if !sidebarsHidden {
                 ShellSidebarRail(
                     selection: selection,
                     needsYou: Set(
@@ -140,30 +143,6 @@ struct ContentView: View {
                     )
                 )
                 .navigationTitle("NativeAgent")
-                // Keep the Activity badge honest without pulling the full
-                // Activity surface while another tab is open. The full
-                // Today owns detailed proposal/improvement refreshes.
-                .task(id: scenePhase) {
-                    guard scenePhase == .active else { return }
-                    let root = PersistenceCore.defaultDataRoot()
-                    let memoryDatabase = root
-                        .appendingPathComponent("memory", isDirectory: true)
-                        .appendingPathComponent("memory.sqlite")
-                    var statusPaths = [
-                        root.appendingPathComponent("workflows/approvals/requests.json"),
-                        root.appendingPathComponent("notifications/inbox.jsonl"),
-                        memoryDatabase,
-                        URL(fileURLWithPath: memoryDatabase.path + "-wal"),
-                    ]
-                    if #available(macOS 27, *) {
-                        statusPaths += [
-                            root.appendingPathComponent("desk/desk_ops.jsonl"),
-                            root.appendingPathComponent("desk/desk_ops_base.json"),
-                        ]
-                    }
-                    await ViewFileRefreshTask.run(paths: statusPaths) {
-                        await appModel.refreshSidebarActivityBadge()
-                    }
                 }
             } detail: {
                 VStack(spacing: 0) {
@@ -196,7 +175,12 @@ struct ContentView: View {
                     .environment(\.chatPageIsVisible, isShowingChat)
                     // Keep Liquid Glass in the shared shell's composition.
                     // A separate native host changes its backdrop boundary.
-                    .opacity(isShowingChat ? 1 : 0)
+                    // Fluid glass: it fades in when it comes to the front and
+                    // goes at once when it leaves, so two pages never draw
+                    // over each other. Only the opacity is animated.
+                    .animation(isShowingChat ? NativeAgentMotion.crossfade : nil) {
+                        $0.opacity(isShowingChat ? 1 : 0)
+                    }
                     .allowsHitTesting(isShowingChat)
                     // Pointer hiding alone does not guard assistive actions.
                     // An AXPress carries no point, so VoiceOver/automation was
@@ -218,7 +202,9 @@ struct ContentView: View {
                 // down. Hidden work is cancelled inside the shelf.
                 if hasMountedBots || isShowingBots {
                     BotsShelfPreviewPage(onContinue: applyNavigationDestination, isVisible: isShowingBots)
-                        .opacity(isShowingBots ? 1 : 0)
+                        .animation(isShowingBots ? NativeAgentMotion.crossfade : nil) {
+                            $0.opacity(isShowingBots ? 1 : 0)
+                        }
                         .allowsHitTesting(isShowingBots)
                         .disabled(!isShowingBots)
                         .accessibilityHidden(!isShowingBots)
@@ -253,7 +239,7 @@ struct ContentView: View {
                     case .connectors: ConnectorsRailPage()
                     case .trust: TrustRailPage()
                     case .providers:
-                        ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true, alive: true) { ProviderSettingsView() }
+                        ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, alive: true) { ProviderSettingsView() }
                     case .macIntegration: MacIntegrationView()
                     case .settings:
                         // A route to Settings is a route to its ROOT, and
@@ -264,7 +250,7 @@ struct ContentView: View {
                         SetupView().id(settingsRootRouteVersion)
                     // ── Advanced / routed child surfaces ──────────────────────
                     case .capabilities:
-                        ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle, alive: true) { CapabilitiesView() }
+                        CapabilitiesRailPage()
                     case .knowledge: KnowledgeGraphView()
                     case .dreams: DreamsView()
                     // B2.4/B2.6 (fence-B handoff): the Observatory's surviving
@@ -296,7 +282,9 @@ struct ContentView: View {
                 // new page rather than reusing the old one's state; state
                 // within a page is untouched while its selection is stable.
                 .id(selection.wrappedValue.normalized)
-                .transition(.identity)
+                // Fluid glass: only the incoming page fades in; the outgoing
+                // one is gone in the same frame.
+                .transition(NativeAgentMotion.fadeIn)
                 }
                 }
                 // Replace pages atomically. Crossfading two translucent pages
@@ -325,10 +313,44 @@ struct ContentView: View {
                         // initial read of its own file watcher, so doing it
                         // here too paid for the five queue fetches twice on
                         // every arrival.
+                    } else if item.normalized == .capabilities || item.normalized == .settings || item == .tools
+                                || (item.normalized == .memories
+                                    && UserDefaults.standard.string(forKey: ShellRailTab.storageKey(.memories)) != "knowledge") {
+                        // These pages run this same refresh themselves on
+                        // arrival (CapabilitiesView, SetupView, ToolsView, the
+                        // Memories tab's file watch); a second one here paid for every
+                        // read twice per switch (perf sweep 2026-10-05).
                     } else {
                         await appModel.refreshForSidebarItem(item)
                     }
                 }
+                }
+            }
+            // Keep the Activity badge honest without pulling the full
+            // Activity surface while another tab is open. The full
+            // Today owns detailed proposal/improvement refreshes. On the
+            // frame, not the rail: ⌘0 hides the rail, and this refresh also
+            // keeps the approvals the turn card and Work pane read current.
+            .task(id: scenePhase) {
+                guard scenePhase == .active else { return }
+                let root = PersistenceCore.defaultDataRoot()
+                let memoryDatabase = root
+                    .appendingPathComponent("memory", isDirectory: true)
+                    .appendingPathComponent("memory.sqlite")
+                var statusPaths = [
+                    root.appendingPathComponent("workflows/approvals/requests.json"),
+                    root.appendingPathComponent("notifications/inbox.jsonl"),
+                    memoryDatabase,
+                    URL(fileURLWithPath: memoryDatabase.path + "-wal"),
+                ]
+                if #available(macOS 27, *) {
+                    statusPaths += [
+                        root.appendingPathComponent("desk/desk_ops.jsonl"),
+                        root.appendingPathComponent("desk/desk_ops_base.json"),
+                    ]
+                }
+                await ViewFileRefreshTask.run(paths: statusPaths) {
+                    await appModel.refreshSidebarActivityBadge()
                 }
             }
             }
@@ -349,8 +371,14 @@ struct ContentView: View {
                 .transition(NativeAgentMotion.fade)
             }
         }
-        .overlay(alignment: .bottom) {
-            SystemToastBar(center: appModel.systemToasts)
+        // Fluid glass A2: one notice lane. With the chat in front it sits
+        // under the room's pinned chrome and carries the room's turn notices;
+        // on any other page it sits at the top.
+        .overlayPreferenceValue(NoticeLaneRoomKey.self) { room in
+            GeometryReader { proxy in
+                NoticeLane(centers: [appModel.systemToasts] + [room?.notices].compactMap { $0 })
+                    .padding(.top, room.map { proxy[$0.anchor].maxY + NativeAgentSpacing.sm } ?? NativeAgentSpacing.md)
+            }
         }
         .onReceive(NativeAgentEngine.liveDeviceSync.bridge.$accountFailure) { failure in
             appModel.showICloudAccountFailure(failure)
@@ -436,6 +464,7 @@ struct ContentView: View {
             CommandPaletteView(isPresented: $showCommandPalette)
         }
         .onReceive(NotificationCenter.default.publisher(for: .openCommandPaletteRequest)) { _ in
+            guard !appModel.deskHoldsCommandPalette else { return }
             showCommandPalette = true
         }
         .sheet(isPresented: $showNewWorkshopTask) {
@@ -680,11 +709,7 @@ struct MetricTile: View {
         }
         .frame(minHeight: 48)
         .padding(NativeAgentSpacing.md)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
-        }
+        .aliveCard(radius: NativeAgentRadius.panel)
     }
 }
 
@@ -695,10 +720,10 @@ enum NativeScreenCapture {
         case noDisplay
         case encodingFailed
         case tooLarge
-        // ScreenVision v1 (2026-06-06): preserves the underlying
+        // ScreenVision v1 (2026-06-06): carries the underlying
         // ScreenCaptureKit reason when SwiftNativeScreenVision throws
-        // .captureFailed(_). Previously these were collapsed to
-        // .encodingFailed, which lost the real cause in the user-facing toast.
+        // .captureFailed(_). The reason goes to the log; the toast says it
+        // plainly.
         case captureFailed(String)
 
         var errorDescription: String? {
@@ -711,8 +736,8 @@ enum NativeScreenCapture {
                 return "NativeAgent captured the screen but could not encode it as an image."
             case .tooLarge:
                 return "NativeAgent captured the screen, but the image was too large to send."
-            case .captureFailed(let reason):
-                return "Screen capture failed: \(reason)"
+            case .captureFailed:
+                return "NativeAgent couldn't capture the screen. Try again in a moment."
             }
         }
     }
@@ -736,16 +761,15 @@ enum NativeScreenCapture {
             png = try await SwiftNativeScreenVision().captureScreen()
         } catch let e as ScreenVisionError {
             // Map the ScreenVision error surface back onto the existing
-            // CaptureError cases. Preserve the underlying ScreenCaptureKit
-            // reason in .captureFailed so the user-facing toast shows the
-            // real cause (e.g. "Screen capture failed: SCStream
-            // configuration is invalid") instead of a generic encode error.
+            // CaptureError cases. The underlying ScreenCaptureKit reason is
+            // logged here rather than shown in the toast.
             switch e {
             case .permissionDenied:
                 throw CaptureError.permissionRequired
             case .noDisplay:
                 throw CaptureError.noDisplay
             case .captureFailed(let reason):
+                nativeLog("%@", "[screen-capture] failed: \(reason)")
                 throw CaptureError.captureFailed(reason)
             }
         }
@@ -892,12 +916,13 @@ extension String {
 }
 
 
-// The three words a person can act on. Hardening is not a fourth: it moved,
-// whole, behind the "For developers" fold at the bottom of the page.
+// Capabilities' two tabs (CapabilitiesRailPage). Hardening is not a third: it
+// moved, whole, behind the "For developers" fold at the bottom of the page.
+// "What needs a look" held only a third approval inbox and is gone: approvals
+// are the chat's inline cards and Today's Approvals (⌘⇧A).
 enum CapabilityWorkspaceMode: String, CaseIterable, Identifiable {
     case canDo = "What I can do"
     case installed = "What's installed"
-    case needsLook = "What needs a look"
 
     var id: String { rawValue }
 }

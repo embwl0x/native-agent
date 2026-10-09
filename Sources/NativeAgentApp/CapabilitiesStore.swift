@@ -141,7 +141,7 @@ final class CapabilitiesStore {
             tools = []
             persona = ""
             activeProvider = ""
-            fetchError = "Tool manifest unavailable: \(error.localizedDescription)"
+            fetchError = UserFacingError.message(error, action: "load the tool list")
             lastFetchedAt = nil
         }
     }

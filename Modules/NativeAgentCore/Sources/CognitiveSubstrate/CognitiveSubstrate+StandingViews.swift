@@ -885,7 +885,7 @@ extension CognitiveSubstrate {
             } catch {
                 if !didLogStandingViewCapRepairFailure {
                     didLogStandingViewCapRepairFailure = true
-                    NSLog(
+                    nativeLog(
                         "[cognition] standing view cap repair could not delete artifact %@ (%@): %@ "
                             + "— the overflow stays in the store and will be "
                             + "re-demoted on the next launch.",

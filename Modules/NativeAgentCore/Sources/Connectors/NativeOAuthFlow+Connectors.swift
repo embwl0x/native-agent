@@ -11,9 +11,9 @@ extension NativeOAuthFlow {
     // to be allowlisted. Each
     // connector reads its client_id from an env var
     // (NATIVE_AGENT_<CONNECTOR>_CLIENT_ID) so dev/personal builds opt in
-    // explicitly — no silent failure with a missing client. Tokens land at
+    // explicitly — no silent failure with a missing client. Metadata lands at
     //   <dataRoot>/connectors/<id>/auth.json
-    // under PersistenceCore.withFileLock.
+    // under PersistenceCore.withFileLock; secret bytes stay in device Keychain.
 
     /// Drive a full PKCE OAuth2 flow for one of the supported connectors.
     /// Returns when tokens have been persisted (or an error has been surfaced).
@@ -186,7 +186,7 @@ extension NativeOAuthFlow {
         do {
             try await markOAuthConnectorConnected(connectorId, dataRoot: dataRoot) {
                 try await persistence.withFileLock(path) {
-                    var object = try ConnectorOAuthRegistry.checkedCredentialObject(at: path)
+                    var object = try ConnectorOAuthRegistry.checkedCredentialObject(at: path, resolveSecrets: false)
                     if connectorId == "x", let accountSubject {
                         object["account_id"] = .string(accountSubject)
                         object["refresh_token"] = refreshToken.map(JSONValue.string)
@@ -197,6 +197,9 @@ extension NativeOAuthFlow {
                         let sameAccount = object["account_sub"] == .string(accountSubject)
                             && object["refresh_token_account_sub"] == .string(accountSubject)
                             && object["client_id"] == .string(clientId)
+                        if refreshToken == nil, sameAccount {
+                            object = try ConnectorOAuthRegistry.checkedCredentialObject(at: path)
+                        }
                         if let refreshToken {
                             object["refresh_token"] = .string(refreshToken)
                             object["refresh_token_account_sub"] = .string(accountSubject)
@@ -216,7 +219,7 @@ extension NativeOAuthFlow {
                         let xPath = OAuthCredentialDestinations.xConnectorRuntimeMirror(dataRoot: dataRoot)
                         try await persistence.withFileLock(xPath) {
                             // Validate both destinations before publishing either.
-                            var mirror = try ConnectorOAuthRegistry.checkedCredentialObject(at: xPath)
+                            var mirror = try ConnectorOAuthRegistry.checkedCredentialObject(at: xPath, resolveSecrets: false)
                             mirror["provider"] = .string("x")
                             mirror["access_token"] = .string(accessToken)
                             mirror["refresh_token"] = refreshToken.map(JSONValue.string)
@@ -226,11 +229,11 @@ extension NativeOAuthFlow {
                             mirror["scope"] = .string(scopeStr)
                             mirror["expires_at"] = .string(String(Date().addingTimeInterval(TimeInterval(expiresIn)).timeIntervalSince1970))
                             mirror["saved_at"] = .string(NativeOAuthSupport.isoBasic(Date()))
-                            try await persistence.writeJSON(.object(prepared), to: path)
-                            try await persistence.writeJSON(.object(mirror), to: xPath)
+                            try ConnectorCredentialFile.write(JSONValue.object(prepared).serializedData(pretty: true), to: path)
+                            try ConnectorCredentialFile.write(JSONValue.object(mirror).serializedData(pretty: true), to: xPath)
                         }
                     } else {
-                        try await persistence.writeJSON(.object(prepared), to: path)
+                        try ConnectorCredentialFile.write(JSONValue.object(prepared).serializedData(pretty: true), to: path)
                     }
                 }
             }

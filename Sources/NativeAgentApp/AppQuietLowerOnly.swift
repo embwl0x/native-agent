@@ -25,34 +25,34 @@ extension AppQuietSettingsHost {
         // ── Trust ──────────────────────────────────────────────────────────
         rows.append(QuietSettings.lowerOnly(
             id: "trust.chrome_control", page: "trust", label: "Chrome control",
-            whereUserDoesIt: "Trust → Chrome control",
+            whereUserDoesIt: "Trust → Mac → Chrome control",
             note: "Full Mac allows Chrome whatever this says; there, lowering trust.preset is what stops it.",
             read: { _ in appModel.engine.trust.policy?.chromeControlPolicy?.enabled ?? false },
             write: { _, enabled in await appModel.saveChromeControlEnabled(enabled) }
-        ))
+        ).onTab("mac"))
         rows.append(QuietSettings.lowerOnly(
             id: "trust.pause_everything", page: "trust", label: "Pause everything", safe: true,
-            whereUserDoesIt: "Trust → Security → Pause everything",
-            note: "On, every action stops until User lifts it.",
+            whereUserDoesIt: "Trust → Access → Security → Pause everything",
+            note: "On, every action stops until the owner lifts it.",
             read: { _ in (try? await SwiftNativeSecurityCenter().status(limit: 1))?.killSwitchEnabled ?? false },
             write: { _, enabled in
                 guard await appModel.saveKillSwitchEnabled(enabled) else {
                     throw QuietSettingError.unavailable(
-                        "Pause everything was not saved: \(appModel.statusText). Check \(AppToolExecutor.doorDoctor), then try again.")
+                        "Pause everything was not saved: \(appModel.statusForAgent). Check \(AppToolExecutor.doorDoctor), then try again.")
                 }
             }
         ))
         let activity = ActivityWatchController.shared
         rows.append(QuietSettings.lowerOnly(
             id: "trust.activity_capture", page: "trust", label: "Activity capture",
-            whereUserDoesIt: "Trust → Activity capture",
+            whereUserDoesIt: "Trust → Features → Activity capture",
             note: "Off stops recording which app and window are in front. What was recorded stays.",
             read: { _ in activity.policy.captureEnabled },
             write: { _, enabled in activity.setCaptureEnabled(enabled) }
-        ))
+        ).onTab("features"))
         rows.append(QuietSettings.lowerOnly(
             id: "trust.activity_model_access", page: "trust", label: "Let the agent read activity",
-            whereUserDoesIt: "Trust → Activity capture",
+            whereUserDoesIt: "Trust → Features → Activity capture",
             note: "Full Mac allows trusted activity queries even when the saved switch is off. Lower trust.preset to stop that override.",
             read: { _ in
                 let fullMac = (await AppToolExecutor.freshQuietPosture(dataRoot: root))?.name == AppToolExecutor.fullMacModeName
@@ -66,13 +66,13 @@ extension AppQuietSettingsHost {
                 }
                 activity.setModelAccessEnabled(enabled)
             }
-        ))
+        ).onTab("features"))
         let peers = AgentPeerStore(dataRoot: root)
         for peer in (try? peers.list()) ?? [] {
             rows.append(QuietSettings.lowerOnly(
                 id: "trust.agent_elevation_\(peer.id)", page: "trust",
                 label: "\(peer.name) may use your permissions",
-                whereUserDoesIt: "Trust → Connected agents → \(peer.name)",
+                whereUserDoesIt: "Trust → Access → Connected agents → \(peer.name)",
                 read: { _ in (try? peers.list())?.first { $0.id == peer.id }?.elevationAllowed ?? false },
                 write: { _, allowed in
                     guard try peers.setElevation(peerID: peer.id, allowed: allowed) != nil else {
@@ -113,7 +113,7 @@ extension AppQuietSettingsHost {
             rows.append(QuietSetting(
                 id: "trust.mac_integration_\(integration)", page: "mac_integration",
                 label: "\(name) access", kind: .choice, choices: choices,
-                note: "You may take access away; giving any back is User's below Full Mac. Under Full Mac an app left "
+                note: "You may take access away; giving any back is the owner's below Full Mac. Under Full Mac an app left "
                     + "untouched is allowed anyway; setting it here records an off that Full Mac respects.",
                 read: { _ in
                     let on = await current()
@@ -125,9 +125,13 @@ extension AppQuietSettingsHost {
                     if let refused = users(want, await current()) { throw refused }
                     // Written even when it reads the same: an explicit off is
                     // what holds under Full Mac.
-                    try await store.set(integrationId: integration, read: want.contains("read"), write: want.contains("write"))
-                    NativeAgentEngine.liveDeviceSync.macIntegrationPermissions.push(
-                        id: integration, read: want.contains("read"), write: want.contains("write"))
+                    if let phone = PhoneSettingChange.current {
+                        try await store.setWithReceipt(
+                            integrationId: integration, read: want.contains("read"), write: want.contains("write"),
+                            actionID: phone.actionID, surface: "ios_icloud", provenance: .signedIOS(clientID: phone.clientID))
+                    } else {
+                        try await store.set(integrationId: integration, read: want.contains("read"), write: want.contains("write"))
+                    }
                 },
                 check: { _, value in
                     guard let want = wants(value) else {
@@ -173,14 +177,14 @@ extension AppQuietSettingsHost {
                 "Saved now; Telegram picks it up once every running Telegram turn, this one included, has finished."))
             if !enabled {
                 QuietWriteDetail.record("locks_out", .string(
-                    "Telegram is off: nobody, User included, reaches the bot until he turns it back on at the Mac. Tell him."))
+                    "Telegram is off: nobody, the owner included, reaches the bot until they turn it back on at the Mac. Tell them."))
             } else if chats.isEmpty && users.isEmpty {
                 QuietWriteDetail.record("locks_out", .string(
-                    "Both allowlists are empty: nobody, User included, reaches the bot until he adds an ID back at the Mac. Tell him."))
+                    "Both allowlists are empty: nobody, the owner included, reaches the bot until they add an ID back at the Mac. Tell them."))
             } else if !removed.isEmpty {
                 QuietWriteDetail.record("locks_out", .string(
-                    "\(removed.joined(separator: ", ")) no longer reach the bot. If one was User's, he is locked out of "
-                    + "Telegram until he adds it back at the Mac. Tell him."))
+                    "\(removed.joined(separator: ", ")) no longer reach the bot. If one was the owner's, they are locked out of "
+                    + "Telegram until they add it back at the Mac. Tell them."))
             }
         }
         rows.append(QuietSettings.lowerOnly(
@@ -218,7 +222,7 @@ extension AppQuietSettingsHost {
             // Slack is on already.
             guard (try? await appModel.client.getConnectors())?.first(where: { $0.id == "slack" })?.enabled == true else {
                 throw QuietSettingError.unavailable(
-                    "Slack is off, so it reaches nobody and there is nothing to narrow. Turning it on is User's.")
+                    "Slack is off, so it reaches nobody and there is nothing to narrow. Turning it on is the owner's.")
             }
             guard !channels.isEmpty || !users.isEmpty else {
                 throw QuietSettingError.unavailable(
@@ -314,10 +318,12 @@ extension AppQuietToolHost {
                 }
                 return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(connector.id),
                                 "detail": .string(on ? "\(connector.name) is on."
-                                    : "\(connector.name) is off. Turning it back on is User's below Full Mac.")])
+                                    : "\(connector.name) is off. Turning it back on is the owner's below Full Mac.")])
             case .failed(let detail):
+                // A thrown failure: the plain line plus its raw cause.
+                let line = appModel.statusCause == nil ? detail : appModel.statusForAgent
                 return AppToolExecutor.failure("\(verb)_failed",
-                    "\(detail) \(connector.name) may still be \(on ? "off" : "on"); read app {page:\"connectors\"}, then retry.",
+                    "\(line) \(connector.name) may still be \(on ? "off" : "on"); read app {page:\"connectors\"}, then retry.",
                     extra: ["id": .string(connector.id)])
             }
         // User's four below Full Mac; the door refuses them there. Each posts
@@ -339,7 +345,7 @@ extension AppQuietToolHost {
             _ = await appModel.refreshForSidebarItem(.connectors)
             decided("connector.disconnect \(connector.id)")
             return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(connector.id),
-                            "detail": .string("\(connector.name) is disconnected and off. Signing back in is User's.")])
+                            "detail": .string("\(connector.name) is disconnected and off. Signing back in is the owner's.")])
         case "telegram_disconnect":
             // Telegram's Disconnect. The poll loop restarts only once every
             // Telegram turn is done: its shutdown awaits them, this one too.
@@ -352,7 +358,7 @@ extension AppQuietToolHost {
                 await TelegramTurnCoordinator.shared.waitUntilAllIdle()
                 _ = await loops.restartLoop(id: "telegram_poll")
             }
-            let result = outcome(appModel.statusText)
+            let result = outcome(appModel.statusForAgent)
             if case .object(let body) = result, body["status"] == .string("ok") { decided("telegram.disconnect") }
             return result
         case "pairing_remove":
@@ -374,7 +380,7 @@ extension AppQuietToolHost {
             }
             decided("pairing.remove \(phone.id)")
             return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(phone.id),
-                            "detail": .string("Removed the phone: it no longer decides approvals. Pairing it again is User's.")])
+                            "detail": .string("Removed the phone: it no longer decides approvals. Pairing it again is the owner's.")])
         case "mcp_revoke_consent":
             // Connectors → MCP → Revoke, on a granted consent.
             appModel.mcpConsent = (try? await appModel.client.getMCPConsent()) ?? appModel.mcpConsent
@@ -387,20 +393,21 @@ extension AppQuietToolHost {
                     })])
             }
             await appModel.revokeMCPConsent(consent)
-            let result = outcome(appModel.statusText, ["id": .string(consent.id)])
+            let result = outcome(appModel.statusForAgent, ["id": .string(consent.id)])
             if case .object(let body) = result, body["status"] == .string("ok") { decided("mcp.revoke_consent \(consent.id)") }
             return result
         case "telegram_test":
             await appModel.testTelegram()
-            return outcome(appModel.statusText)
+            return outcome(appModel.statusForAgent)
         case "telegram_clear_logs":
             await appModel.clearTelegramLogs()
             switch appModel.telegramClearLogsOutcome {
             case .completed(let receipt)?:
-                return .object(["status": .string("ok"), "detail": .string(appModel.statusText),
+                return .object(["status": .string("ok"), "detail": .string(appModel.statusForAgent),
                                 "removed_rows": .int(Int64(receipt.removedRowCount))])
             case .failed(let detail)?:
-                return AppToolExecutor.failure("clear_logs_failed", detail + " The logs are as they were; retry, or read \(AppToolExecutor.doorDoctor).")
+                let line = appModel.statusCause == nil ? detail : appModel.statusForAgent
+                return AppToolExecutor.failure("clear_logs_failed", line + " The logs are as they were; retry, or read \(AppToolExecutor.doorDoctor).")
             case nil:
                 return AppToolExecutor.failure("clear_logs_busy", "A clear is already running; read app {page:\"telegram\"} in a moment.")
             }
@@ -417,7 +424,7 @@ extension AppQuietToolHost {
             case "mcp_restart": await appModel.restartMCPServer(server)
             default: await appModel.refreshMCPCache(server)
             }
-            return outcome(appModel.statusText, ["server_id": .string(server.id)])
+            return outcome(appModel.statusForAgent, ["server_id": .string(server.id)])
         }
     }
 }

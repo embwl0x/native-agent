@@ -12,7 +12,7 @@ Call an action with `app {"action":"agent.message","args":{...}}`.
 | Action | Use |
 | --- | --- |
 | `agent.contacts` | List coding helpers, bots and saved peers. `discover: true` or a name refreshes discovery when the person asks to find agents. |
-| `agent.connect` | Connect a known host by name, a peer by endpoint, or an explicit desktop route. Disconnect with `disconnect: true` and `name: "peer:<id>"` from contacts. |
+| `agent.connect` | Connect a known host by name, a peer by endpoint, or an explicit desktop route. Disconnect with `disconnect: true` and `agent: "peer:<id>"` from contacts. |
 | `agent.message` | Send `agent` and `text`; continue this chat's current conversation with that contact. A known host can be connected in the same call through its setup gates. |
 | `agent.read` | Read the conversation and retained reply. `details: true` exposes receipts. `wait_seconds` waits 1–300 seconds on a conversation by name; it cannot be combined with exact IDs, history or listing filters. |
 | `agent.cancel` | Request a stop through the route's cancellation mechanism. The result distinguishes stopping, stopped, released and unsupported stops. `clear_queue: true` withdraws queued follow-ups. |
@@ -97,6 +97,20 @@ executable with argument `mcp` for stdio. This protocol exposes
 tools in Agent's turn. The message call can wait for an answer; an `enqueued`
 result requires recovery through `agent_reply` with the returned IDs.
 
+MCP `agent_message` requires `text` and a caller-generated canonical UUID
+`request_id`, the at-most-once claim key. For example, its arguments are:
+
+```json
+{
+  "text": "Please summarize the current project status.",
+  "request_id": "b741346e-8867-49b6-9415-09d8465648ed"
+}
+```
+
+Generate a new ID for each new message; reuse an ID only for the same message
+in the same session. Keep the returned `session_id` and `request_id`, and recover
+through `agent_reply` before considering another send.
+
 Retain the generated connection entry, including its environment fields:
 
 | Field | Purpose |
@@ -128,7 +142,9 @@ nativeagent-link reply --session <returned-id> --request <returned-id> [--offset
 nativeagent-link mcp
 ```
 
-`message` waits up to 25 seconds, then returns an enqueue acknowledgement if the
+The CLI `message` command generates `request_id` when `--request` is omitted;
+MCP callers must supply it themselves. `message` waits up to
+25 seconds, then returns an enqueue acknowledgement if the
 answer is still pending. Retain both returned IDs and use `reply` to recover;
 use `--offset` for another page. Never automatically resend an uncertain message.
 

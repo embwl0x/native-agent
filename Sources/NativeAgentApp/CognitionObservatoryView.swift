@@ -81,7 +81,6 @@ struct CognitionObservatoryView: View {
         let agentDisplayName: String
         let systemToasts: SystemToastCenter
         let contextFlowHealth: () async -> ContextFlowObservatoryHealthState
-        let organismToggleDidRender: @MainActor (Bool) -> Void
 
         @MainActor
         static func live(appModel: AppModel) -> Self {
@@ -89,8 +88,7 @@ struct CognitionObservatoryView: View {
                 dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
                 agentDisplayName: appModel.agentDisplayName,
                 systemToasts: appModel.systemToasts,
-                contextFlowHealth: { await appModel.engine.contextFlow.observatoryHealthState() },
-                organismToggleDidRender: { _ in }
+                contextFlowHealth: { await appModel.engine.contextFlow.observatoryHealthState() }
             )
         }
     }
@@ -133,10 +131,6 @@ struct CognitionObservatoryView: View {
     private var organismEnabled: Bool {
         get { cognition.organismEnabled }
         nonmutating set { cognition.organismEnabled = newValue }
-    }
-    private var organismControlReadinessRevision: UInt64 {
-        get { cognition.organismControlReadinessRevision }
-        nonmutating set { cognition.organismControlReadinessRevision = newValue }
     }
     private var reflectionBudget: Int {
         get { cognition.reflectionBudget }
@@ -182,7 +176,7 @@ struct CognitionObservatoryView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
                 HStack {
-                    GradientText(text: "Cognition", colors: [.teal, .indigo], font: NativeAgentFont.title)
+                    Text("Cognition").font(NativeAgentFont.title).foregroundStyle(NativeAgentShell.text)
                     Spacer()
                     StatusBadge(text: detail == nil ? initialStateLabel : (enabled ? "Enabled" : "Off"),
                                 status: detail == nil ? "pending" : (enabled ? "ok" : "warn"))
@@ -205,30 +199,17 @@ struct CognitionObservatoryView: View {
                 collapsible(.controls, title: "Controls", systemImage: "slider.horizontal.3", tint: .teal,
                             hint: detail == nil ? initialStateLabel : (enabled ? "on" : "off")) {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                        Toggle("Background thinking", isOn: enabledBinding)
-                            .disabled(detail == nil)
                         Toggle("Give me a thought summary", isOn: capsuleEnabledBinding)
                             .disabled(!enabled)
                         Toggle("Keep thinking in the background", isOn: backgroundEnabledBinding)
                             .disabled(!enabled)
-                        Toggle("Deeper reflection", isOn: reflectionEnabledBinding)
-                            .disabled(!enabled)
-                        Toggle(CognitionObservatoryOrganismControlPresentation.label, isOn: organismEnabledBinding)
-                            .disabled(!organismControl.isEnabled)
-                            .accessibilityLabel(CognitionObservatoryOrganismControlPresentation.label)
-                            .onAppear { reportOrganismToggleStateIfReady() }
-                            .onChange(of: organismEnabled) { _, _ in
-                                reportOrganismToggleStateIfReady()
-                            }
-                            .onChange(of: organismControlReadinessRevision) { _, _ in
-                                reportOrganismToggleStateIfReady()
-                            }
                         Stepper("Reflections in 24 hours: \(reflectionBudget)", value: reflectionBudgetBinding, in: 0...8)
                             .disabled(!enabled || !reflectionEnabled)
-                        // Same state as Settings ▸ Subconscious. That master
-                        // switch sets ALL of these together; these granular
-                        // toggles are the research-console overrides.
-                        Text("Settings \u{25B8} Subconscious is the master switch — flipping it there resets all of these together.")
+                        // One home per switch: the inner life, reflection and
+                        // moods are switched on Settings, and the master sets
+                        // ALL of these together; these are the research-console
+                        // overrides that live only here.
+                        Text("An inner life, reflection and moods are switched in Settings \u{25B8} Inner life. Turning the inner life on or off there resets these too.")
                             .font(.caption2)
                             .foregroundStyle(NativeAgentShell.secondary)
                         HStack(spacing: NativeAgentSpacing.sm) {
@@ -491,13 +472,6 @@ struct CognitionObservatoryView: View {
         }
     }
 
-    private var enabledBinding: Binding<Bool> {
-        Binding(get: { enabled }, set: { value in
-            enabled = value
-            Task { await runtime.setEnabled(value); await refresh() }
-        })
-    }
-
     private var capsuleEnabledBinding: Binding<Bool> {
         Binding(get: { capsuleEnabled }, set: { value in
             capsuleEnabled = value
@@ -510,33 +484,6 @@ struct CognitionObservatoryView: View {
             backgroundEnabled = value
             Task { await runtime.setBackgroundEnabled(value); await refresh() }
         })
-    }
-
-    private var reflectionEnabledBinding: Binding<Bool> {
-        Binding(get: { reflectionEnabled }, set: { value in
-            reflectionEnabled = value
-            Task { await runtime.setReflectionEnabled(value); await refresh() }
-        })
-    }
-
-    private var organismControl: CognitionObservatoryOrganismControlPresentation {
-        CognitionObservatoryOrganismControlPresentation(
-            cognitiveSubstrateEnabled: enabled,
-            organismKernelEnabled: organismEnabled
-        )
-    }
-
-    private var organismEnabledBinding: Binding<Bool> {
-        Binding(get: { organismEnabled }, set: { value in
-            organismEnabled = value
-            Task { await runtime.setOrganismKernelEnabled(value); await refresh() }
-        })
-    }
-
-    @MainActor
-    private func reportOrganismToggleStateIfReady() {
-        guard enabled else { return }
-        dependencies.organismToggleDidRender(organismEnabled)
     }
 
     private var reflectionBudgetBinding: Binding<Int> {
@@ -572,13 +519,6 @@ struct CognitionObservatoryView: View {
         reflectionEnabled = next.configuration.reflectiveCallsEnabled
         organismEnabled = next.organism.enabled
         reflectionBudget = next.configuration.dailyReflectionCallBudget
-        if enabled {
-            // Commit a render-observed readiness edge only after refresh has
-            // installed both the control's enabled state and its kernel state.
-            // This guarantees an initial OFF lifecycle event even when the
-            // disabled Toggle appeared before the asynchronous refresh ended.
-            organismControlReadinessRevision &+= 1
-        }
         lastRefresh = Date()
     }
 

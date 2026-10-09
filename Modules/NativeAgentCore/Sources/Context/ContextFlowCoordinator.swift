@@ -159,6 +159,11 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private var pendingReconciliationReason = "source_change"
     private var publicationInProgress = false
     private var publicationWaiters: [CheckedContinuation<Void, Never>] = []
+    /// One compile at a time. A request arriving during one waits, and only
+    /// the newest waiter compiles: an older one's commit would be refused.
+    private var compileInProgress = false
+    private var compileWaiters: [CheckedContinuation<Void, Never>] = []
+    private var liveSourceReconciliation: Task<Bool, Never>?
     private var degradedSourceIDs: Set<ContextSourceID> = []
     /// Per-generation derivations whose inputs are immutable for a complete
     /// mirror/kernel/surface/privacy behavior key. This keeps repeated turns
@@ -169,7 +174,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private var generationDerivedComputationCount = 0
     private var generationDerivedInvalidationCount = 0
     /// Error-level diagnostic sink. Injected so tests can prove the dead-lane
-    /// alarm actually fires; production keeps NSLog (Console.app / the app's
+    /// alarm actually fires; production keeps nativeLog (Console.app / the app's
     /// log stream), matching the provenance-MISS line added in 218fb021.
     private let diagnostics: @Sendable (String) -> Void
 
@@ -275,7 +280,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         mirrorProvider: any ContextRequiredDocumentMirrorProviding = EmptyContextRequiredDocumentMirrorProvider(),
         compiledProjectionProviders: [any ContextCompiledProjectionProvider] = [],
         selector: ContextSelector = ContextSelector(),
-        diagnostics: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }
+        diagnostics: @escaping @Sendable (String) -> Void = { nativeLog("%@", $0) }
     ) {
         self.diagnostics = diagnostics
         self.mode = mode
@@ -308,6 +313,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     public func stop() async {
+        liveSourceReconciliation?.cancel()
         await coalescer?.cancel()
         await monitor?.stop()
         coalescer = nil
@@ -628,11 +634,24 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         if activeStoredGeneration == nil, policy.recordsSideEffects {
             await reconcileAll(reason: "turn_generation_recovery")
         }
+        if policy.recordsSideEffects {
+            let live = Set(compiledProjectionProviders.filter(\.refreshesBeforeTurn).map(\.projectionIdentifier))
+            if !live.isEmpty {
+                let reconciled = await reconcileLiveSources(live)
+                try Task.checkCancellation()
+                guard started, mode != .off else { throw ContextTurnPreparationError.coordinatorNotStarted }
+                guard reconciled else { throw ContextTurnPreparationError.generationUnavailable }
+            }
+        }
         guard let generation = activeStoredGeneration else {
             throw ContextTurnPreparationError.generationUnavailable
         }
         let lease = try arena.acquireSnapshot()
         do {
+            var excludedLiveAtoms = Set<ContextAtomID>()
+            for provider in compiledProjectionProviders {
+                excludedLiveAtoms.formUnion(await provider.excludedAtomIDs(in: generation))
+            }
             let surfaceVariant = ContextSurfaceVariant(rawValue: request.surface.rawValue)
             let mirrorCandidates = lease.snapshot.requiredDocumentMirrors.filter {
                 $0.kernel(for: surfaceVariant) != nil
@@ -778,7 +797,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     }.map(\.draft.id)),
                     // `deletedAtomIDs` is the selector's existing exclusion;
                     // here it carries her rejections (Phase 5 B0).
-                    deletedAtomIDs: request.suppressedAtomIDs,
+                    deletedAtomIDs: request.suppressedAtomIDs.union(excludedLiveAtoms),
                     queryEmbedding: request.queryEmbedding,
                     alternateQueryEmbedding: request.alternateQueryEmbedding,
                     queryEmbeddingModelFingerprint: request.queryEmbeddingModelFingerprint,
@@ -898,6 +917,15 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             } else {
                 feedbackHandler = nil
             }
+            let deliveryHandler: (@Sendable ([ContextPacketItem]) async -> Void)?
+            if policy.recordsSideEffects {
+                let providers = compiledProjectionProviders
+                deliveryHandler = { items in
+                    for provider in providers { await provider.didDeliver(items) }
+                }
+            } else {
+                deliveryHandler = nil
+            }
             return ContextPreparedTurn(
                 mode: mode,
                 kernel: kernel,
@@ -907,6 +935,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 generation: generation,
                 need: need,
                 budgetExpansion: budgetExpansion,
+                deliveryHandler: deliveryHandler,
                 feedbackHandler: feedbackHandler
             )
         } catch {
@@ -1046,32 +1075,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 revision: revision,
                 candidates: candidates
             ))
-        case .desk:
-            event = .desk(ContextDeskPrewarmHint(
-                deskID: normalizedID,
-                eventID: eventID,
-                revision: revision,
-                candidates: candidates
-            ))
         case .workshopExecution:
             event = .workshopExecution(ContextWorkshopPrewarmHint(
                 executionID: normalizedID,
-                eventID: eventID,
-                revision: revision,
-                candidates: candidates
-            ))
-        case .file:
-            event = .file(ContextFilePrewarmHint(
-                sourceID: ContextSourceID(rawValue: normalizedID),
-                contentFingerprint: ContextStableID.digest(parts: terms),
-                eventID: eventID,
-                revision: revision,
-                candidates: candidates
-            ))
-        case .toolResult:
-            event = .toolResult(ContextToolResultPrewarmHint(
-                toolCallID: normalizedID,
-                resultFingerprint: ContextStableID.digest(parts: terms),
                 eventID: eventID,
                 revision: revision,
                 candidates: candidates
@@ -1102,9 +1108,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         snapshot: ContextGenerationSnapshot
     ) async {
         let selectedIDs = Set(packet.receipt.selectedAtomIDs)
-        let globalKinds: Set<ContextPrewarmHintKind> = [.desk, .file, .toolResult, .organism]
-        let globalScopes = prewarmPlans.keys.filter { globalKinds.contains($0.kind) }
-        let relevantScopes = Array(Set(prewarmScopes(for: request) + globalScopes)).sorted()
+        // A somatic signal's plan has no turn scope of its own; any turn may use it.
+        let organismScopes = prewarmPlans.keys.filter { $0.kind == .organism }
+        let relevantScopes = Array(Set(prewarmScopes(for: request) + organismScopes)).sorted()
         for scope in relevantScopes {
             guard let plan = prewarmPlans.removeValue(forKey: scope) else { continue }
             let validation = await prewarmPlanner.validate(plan)
@@ -1139,9 +1145,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             }
         }
 
-        let atomByID = Dictionary(uniqueKeysWithValues: generation.atoms.map {
+        let atomByID = Dictionary(generation.atoms.map {
             ($0.draft.id, $0.draft)
-        })
+        }, uniquingKeysWith: { first, _ in first })
         let candidateIDs = Array(Set(
             packet.receipt.selectedAtomIDs + packet.receipt.pointerAtomIDs
         )).sorted()
@@ -1733,6 +1739,45 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             pendingProjectionReconciliationRequestIDs[identifier] = requestID
         }
         pendingReconciliationReason = reason
+        return await reconcilePending(requestID: requestID)
+    }
+
+    /// Turn preparations share one result. Only external demand supersedes
+    /// this flight; joining/retrying never creates another request ID.
+    private func reconcileLiveSources(_ identifiers: Set<String>) async -> Bool {
+        if let flight = liveSourceReconciliation { return await flight.value }
+        let flight = Task { await self.refreshLiveSources(identifiers) }
+        liveSourceReconciliation = flight
+        return await flight.value
+    }
+
+    private func refreshLiveSources(_ identifiers: Set<String>) async -> Bool {
+        defer { liveSourceReconciliation = nil }
+        var requestID = nextReconciliationRequestID &+ 1
+        var completed = await reconcile(registrations: [], reason: "turn_live_sources",
+                                        compiledProjectionIdentifiers: identifiers)
+        while !completed {
+            guard started, mode != .off, !Task.isCancelled else { return false }
+            // No newer demand means a real failure, never a self-retry.
+            guard requestID != nextReconciliationRequestID else { return false }
+            requestID = nextReconciliationRequestID
+            completed = await reconcilePending(requestID: requestID)
+        }
+        return true
+    }
+
+    private func reconcilePending(requestID: UInt64) async -> Bool {
+        // Launch used to compile twice at once (start, and the memory
+        // migration's invalidation). Pending demand accumulates, so the newest
+        // request's one compile answers every request that waited for it.
+        while compileInProgress {
+            await withCheckedContinuation { compileWaiters.append($0) }
+        }
+        guard requestID == nextReconciliationRequestID, !Task.isCancelled else { return false }
+        // A push's compiler may already have answered this flight's demand.
+        if pendingRegistrations.isEmpty, pendingProjectionReconciliationRequestIDs.isEmpty {
+            return activeStoredGeneration != nil
+        }
         let batch = ReconciliationBatch(
             requestID: requestID,
             registrations: pendingRegistrations.values
@@ -1745,20 +1790,38 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         )
 
         var compileFailures: [ContextSourceID: String] = [:]
+        compileInProgress = true
+        let candidate: ReconciliationCandidate
         do {
-            return await commit(try await makeCandidate(for: batch, compileFailures: &compileFailures))
+            candidate = try await makeCandidate(for: batch, compileFailures: &compileFailures, stopWhenSuperseded: true)
+            finishCompile()
         } catch is CancellationError {
+            finishCompile()
             // Cancellation leaves demand pending for the next owner edge.
             return false
         } catch {
+            finishCompile()
             await commitFailure(error, compileFailures: compileFailures, for: batch)
             return false
         }
+        return await commit(candidate)
     }
 
+    private func finishCompile() {
+        compileInProgress = false
+        let waiters = compileWaiters
+        compileWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    /// `stopWhenSuperseded`: a newer request has taken over this batch's
+    /// demand and its commit would be refused, so stop between sources.
     private func makeCandidate(
         for batch: ReconciliationBatch,
-        compileFailures: inout [ContextSourceID: String]
+        compileFailures: inout [ContextSourceID: String],
+        stopWhenSuperseded: Bool = false
     ) async throws -> ReconciliationCandidate {
         let active = try await store.loadActiveGeneration()
         let previousBySource = Self.previousCompiledSources(active)
@@ -1776,6 +1839,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         var projectionResults: [String: ContextCompiledProjectionResult] = [:]
 
         for registration in batch.registrations {
+            if stopWhenSuperseded, batch.requestID != nextReconciliationRequestID { throw CancellationError() }
             let sourceID = registration.descriptor.id
             if let currentIDs = authoritativeSources[registration.descriptor.owner],
                !currentIDs.contains(sourceID) {
@@ -1831,6 +1895,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         if !projectionIdentifiers.isEmpty {
             for provider in compiledProjectionProviders where
                 projectionIdentifiers.contains(provider.projectionIdentifier) {
+                if stopWhenSuperseded, batch.requestID != nextReconciliationRequestID { throw CancellationError() }
                 let result = try await provider.compiledProjection(previousSources: previousBySource)
                 projectionResults[provider.projectionIdentifier] = result
                 for source in result.changedSources {
@@ -1872,9 +1937,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 await markSourceDegraded(sourceID, error: error)
             }
 
-            var changedBySource = Dictionary(uniqueKeysWithValues: candidate.changedSources.map {
+            var changedBySource = Dictionary(candidate.changedSources.map {
                 ($0.descriptor.id, $0)
-            })
+            }, uniquingKeysWith: { first, _ in first })
             let recoveredSourceIDs = degradedSourceIDs
                 .intersection(candidate.successfulSources.keys)
                 .subtracting(candidate.compileFailures.keys)

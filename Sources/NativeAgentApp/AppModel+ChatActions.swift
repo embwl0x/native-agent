@@ -47,13 +47,18 @@ import DeviceSync
 struct AppMutationResult: Equatable, Sendable {
     let succeeded: Bool
     let userMessage: String
+    /// The raw error behind a plain failure line; the agent's result keeps it.
+    var cause: String?
+
+    /// What the agent's tool result says: the same line plus the raw cause.
+    var agentMessage: String { UserFacingError.forAgent(userMessage, cause: cause) }
 
     static func success(_ message: String) -> Self {
         Self(succeeded: true, userMessage: message)
     }
 
-    static func failure(_ message: String) -> Self {
-        Self(succeeded: false, userMessage: message)
+    static func failure(_ message: String, cause: String? = nil) -> Self {
+        Self(succeeded: false, userMessage: message, cause: cause)
     }
 }
 
@@ -81,8 +86,9 @@ extension AppModel {
             do {
                 messages = try await engine.transcripts.loadMessages(sessionId: sessionID, cached: true)
             } catch {
-                statusText = "Session compacted, but transcript refresh failed: \(error.localizedDescription)"
-                return .failure(statusText)
+                nativeLog("%@", "[chat] compact reload failed: \(error)")
+                setFailureStatus("Chat compacted, but it couldn't reload. " + UserFacingError.advice(for: error), cause: error)
+                return .failure(statusText, cause: statusCause)
             }
             let lifecycleAfterReload = engine.turns.lifecycle(for: sessionID)
             if !engine.turns.streamingSessions.contains(sessionID),
@@ -93,8 +99,8 @@ extension AppModel {
             statusText = "Session compacted"
             return .success(statusText)
         } catch {
-            statusText = "Compact failed: \(error.localizedDescription)"
-            return .failure(statusText)
+            setFailureStatus(error, action: "compact this chat")
+            return .failure(statusText, cause: statusCause)
         }
     }
 
@@ -122,7 +128,7 @@ extension AppModel {
         let clearingSessionID = sessionId ?? activeChatSessionId
         guard !clearingSessionID.isEmpty else {
             statusText = "Clear failed: no active chat session"
-            return .failure(statusText)
+            return .failure(statusText, cause: statusCause)
         }
         var transcriptCleared = false
         // 2026-09-06: republication is owed to the phone whenever the DURABLE
@@ -173,14 +179,21 @@ extension AppModel {
                     engine.transcripts.setMessages(actual, for: clearingSessionID)
                 }
             }
-            statusText = error.localizedDescription
+            switch error {
+            case .transcriptClearedMetadataNotSaved:
+                nativeLog("%@", "[chat] clear: \(error.localizedDescription)")
+                setFailureStatus("Messages were cleared, but the chat list didn't save. Try again in a moment.", cause: error)
+            case .transcriptVersionExhausted:
+                statusText = error.localizedDescription
+            }
             publishChatSnapshot()
-            return .failure(statusText)
+            return .failure(statusText, cause: statusCause)
         } catch {
-            statusText = transcriptCleared
-                ? "Messages were cleared, but conversation refresh failed: \(error.localizedDescription)"
-                : "Clear failed: \(error.localizedDescription)"
-            return .failure(statusText)
+            if transcriptCleared { nativeLog("%@", "[chat] reload after clear failed: \(error)") }
+            setFailureStatus(transcriptCleared
+                ? "Messages were cleared, but the chat couldn't reload. " + UserFacingError.advice(for: error)
+                : UserFacingError.message(error, action: "clear this chat"), cause: error)
+            return .failure(statusText, cause: statusCause)
         }
     }
 
@@ -337,7 +350,7 @@ extension AppModel {
                 } else if settled?.presentation.phase == .outcomeUnknown {
                     statusText = "Regenerate outcome could not be confirmed"
                 } else if !Task.isCancelled {
-                    statusText = "Regenerate failed: \(error.localizedDescription)"
+                    setFailureStatus(error, action: "try that again")
                 }
             }
             return regeneratedTurnCompleted
@@ -385,8 +398,8 @@ extension AppModel {
             statusText = "Memory saved"
             return .success(statusText)
         } catch {
-            statusText = "Remember failed: \(error.localizedDescription)"
-            return .failure(statusText)
+            setFailureStatus(error, action: "save that to memory")
+            return .failure(statusText, cause: statusCause)
         }
     }
 
@@ -399,8 +412,8 @@ extension AppModel {
             statusText = "Note committed"
             return .success(statusText)
         } catch {
-            statusText = "Note failed: \(error.localizedDescription)"
-            return .failure(statusText)
+            setFailureStatus(error, action: "save that note")
+            return .failure(statusText, cause: statusCause)
         }
     }
 
@@ -418,13 +431,13 @@ extension AppModel {
             guard (body["ok"] as? Bool) == true else {
                 let reason = (body["error"] as? String) ?? "scratch write rejected"
                 statusText = "Scratch write failed: \(reason)"
-                return .failure(statusText)
+                return .failure(statusText, cause: statusCause)
             }
             statusText = "Scratch \(key) set"
             return .success(statusText)
         } catch {
-            statusText = "Scratch write failed: \(error.localizedDescription)"
-            return .failure(statusText)
+            setFailureStatus(error, action: "write that scratch note")
+            return .failure(statusText, cause: statusCause)
         }
     }
 
@@ -436,12 +449,12 @@ extension AppModel {
         let archivingId = sessionId ?? activeChatSessionId
         guard !archivingId.isEmpty else {
             statusText = "Archive failed: no active chat session"
-            return .failure(statusText)
+            return .failure(statusText, cause: statusCause)
         }
         do {
             guard try await engine.transcripts.archive(id: archivingId) != nil else {
                 statusText = "Archive failed: that chat session is no longer available"
-                return .failure(statusText)
+                return .failure(statusText, cause: statusCause)
             }
             // PATCH-2026-05-13: parallel-sessions — cancel any in-flight task
             // for the archived session and clean up per-session state so we
@@ -487,8 +500,8 @@ extension AppModel {
             publishChatSnapshot()
             return .success(statusText)
         } catch {
-            statusText = "Archive failed: \(error.localizedDescription)"
-            return .failure(statusText)
+            setFailureStatus(error, action: "archive this chat")
+            return .failure(statusText, cause: statusCause)
         }
     }
 
@@ -738,48 +751,6 @@ extension AppModel {
             )
             return
         }
-        // A bot's session runs on the bot's own model. One saved before that rule
-        // (2026-09-13) has no usable tuple, and it must NOT quietly borrow Chat's
-        // route: say what is missing, the same thing its card says, and refuse
-        // the turn.
-        // Gated ONCE, and this exact contract is what the turn runs on
-        // (2026-09-13, fourth review). Re-checking below meant a second answer
-        // could disagree with the one that was accepted — and a newly refused
-        // bot would have fallen through to Chat's routing with choice == nil.
-        let acceptedBotContract = await BotChatContract.checked(
-            requestSessionId,
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-        if let contract = acceptedBotContract,
-           let problem = contract.modelChoiceProblem {
-            var typedBubble = ChatMessage(sessionId: requestSessionId, role: "user", content: userContent)
-            typedBubble.id = userTurnId
-            appendChatMessage(typedBubble, to: requestSessionId)
-            // 2026-09-13 (first-failure pass): name the one repair and say what
-            // survives it. This bot's chat cannot be the escape route from its
-            // own blocked account, so the sentence points at the bot's card,
-            // where that account and model are chosen.
-            let guidance = "\(contract.name) can't run yet. \(problem) This bot runs on its own account, never Chat's - choose it on the bot's card in Bots. Nothing was started, and its unfinished work is kept."
-            let guidanceBubble = ChatMessage(
-                id: Self.syntheticErrorIDPrefix + UUID().uuidString,
-                sessionId: requestSessionId,
-                role: "assistant",
-                content: guidance,
-                metadata: .syntheticError(
-                    "bot_model_not_chosen",
-                    userRowPersisted: false,
-                    inputHadAttachments: !attachments.isEmpty
-                )
-            )
-            appendChatMessage(guidanceBubble, to: requestSessionId)
-            statusText = "Choose a model for \(contract.name) in Bots."
-            _ = await settleChatTurnLifecycle(
-                identity: activityIdentity,
-                kind: .failed(reason: "This bot has no model chosen."),
-                at: Date()
-            )
-            return
-        }
         // Retain only the accepted local request and its preceding conversation
         // row. If routing fails before the core writes the user, an unchanged
         // canonical tail can prove that this request still needs persistence.
@@ -845,21 +816,17 @@ extension AppModel {
             // A bot session continued in Chat keeps the bot's own execution
             // contract — its model, its effort, its surface — instead of
             // inheriting the Chat picker (lane1 finding 4).
-            // The accepted contract, not a fresh gate run: a bot session that
-            // got past the refusal above carries a usable choice by definition.
-            let botContract = acceptedBotContract
             let stream = client.chatStream(
                 message: trimmed.isEmpty ? "(see attachments)" : trimmed,
                 sessionId: requestSessionId,
                 // Empty overrides leave the current saved tuple to core admission.
-                model: botContract?.model ?? "",
-                reasoningEffort: botContract?.reasoningEffort ?? "",
+                model: "",
+                reasoningEffort: "",
                 fileAccess: chatFileAccess,
                 attachments: attachments,
                 metaBox: metaBox,
                 suppressUserAppend: hideUserBubble,
-                surface: botContract?.surface ?? "chat",
-                choice: botContract?.choice,
+                surface: "chat",
                 activityIdentity: activityIdentity,
                 onTurnActivity: { [weak self] activity in
                     await self?.receiveChatTurnActivity(activity)
@@ -893,6 +860,9 @@ extension AppModel {
             // request session's slot directly, not just when active.
             if !streamProducedNoContent {
                 updateChatMessageContent(id: bubbleId, in: requestSessionId, content: finalStreamText)
+                if let commentary = completion.workingCommentaryCharacters {
+                    setChatMessageWorkingCommentary(commentary, id: bubbleId, in: requestSessionId)
+                }
             }
             // activeChatSessionId latch — the metadata's confirmed sid may
             // replace a placeholder id on first-turn-of-a-new-session.
@@ -1026,6 +996,13 @@ extension AppModel {
             if streamProducedNoContent {
                 removeChatMessage(id: bubbleId, from: requestSessionId)
                 engine.turns.clearStreamingBubbleState(requestSessionId)
+            }
+            // Fluid glass A1: a reply that settled before the stream ended is
+            // still crossfading (or folding its notes). The disk rows replace
+            // it under new ids, which would cut that short mid-swap, so they
+            // wait the one crossfade.
+            if !streamProducedNoContent, engine.turns.isReplyTextSettled(requestSessionId) {
+                try? await Task.sleep(for: .seconds(NativeAgentMotion.standardDuration))
             }
             // 2026-06-08 W0.3: disk refresh now runs for EVERY session that
             // completes a turn, not just the active one. Tool pills + final
@@ -1179,6 +1156,7 @@ extension AppModel {
                     inputHadAttachments: !attachments.isEmpty
                 )
                 if isRefusal { failureMetadata.providerRefusal = true }
+                failureMetadata.failureWork = ChatTurnFailure.work(for: error)
                 let errorBubble = ChatMessage(
                     id: Self.syntheticErrorIDPrefix + UUID().uuidString,
                     sessionId: requestSessionId,
@@ -1260,7 +1238,11 @@ extension AppModel {
     /// (1) the ProviderStreamGuard's stable timeout strings; (2) URLError
     /// categories / transport strings; (3) default "Chat error: <desc>".
     private func normalizeStreamErrorForChat(_ error: Error) -> String {
-        ProviderRecoveryPolicy.personMessage(error)
-            ?? ChatStreamErrorText.normalize(error.localizedDescription)
+        if let person = ProviderRecoveryPolicy.personMessage(error) { return person }
+        let raw = error.localizedDescription
+        let text = ChatStreamErrorText.normalize(raw)
+        // The shared fallback prints the raw error. On the Mac the trouble
+        // card keeps it under Details, so the bubble says it plainly.
+        return text == "Chat error: \(raw)" ? UserFacingError.advice(for: error) : text
     }
 }

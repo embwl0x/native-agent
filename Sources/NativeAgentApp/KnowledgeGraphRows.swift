@@ -82,43 +82,42 @@ struct KGEntityDetailView: View {
     @State private var loadError: String? = nil
     @State private var loadGate = LatestAsyncRequestGate()
 
-    // PATCH-2026-05-07: polish-KnowledgeGraphView GlassCard entity header tinted by entity type
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-                // Header with GlassCard tinted by entity type
-                GlassCard(tint: KGEntityRow.typeColor(entity.type)) {
-                    VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                        HStack(spacing: NativeAgentSpacing.sm) {
-                            Image(systemName: KGEntityRow.typeIcon(entity.type))
-                                .font(.title2)
-                                .foregroundStyle(KGEntityRow.typeColor(entity.type))
-                            GradientText(
-                                text: entity.name,
-                                colors: [KGEntityRow.typeColor(entity.type), .purple],
-                                font: NativeAgentFont.section
-                            )
-                            Spacer()
-                            StatusBadge(text: entity.type.capitalized, status: "info")
-                        }
-                        if let count = entity.mentionCount {
-                            LabeledRow(label: "Mentions", value: "\(count)")
-                        }
-                        if let first = entity.firstSeen {
-                            LabeledRow(label: "First seen", value: String(first.prefix(10)))
-                        }
-                        if let last = entity.lastSeen {
-                            LabeledRow(label: "Last seen", value: String(last.prefix(10)))
-                        }
-                        if let aliases = entity.aliases, !aliases.isEmpty {
-                            LabeledRow(label: "Aliases", value: aliases.joined(separator: ", "))
-                        }
-                        if let summary = entity.summary, !summary.isEmpty {
-                            Divider()
-                            Text(summary).font(NativeAgentFont.body).foregroundStyle(.secondary)
-                        }
+                // Header: the kit's card (content, so a fill — never glass);
+                // the entity type's colour stays on its icon and name.
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                    HStack(spacing: NativeAgentSpacing.sm) {
+                        Image(systemName: KGEntityRow.typeIcon(entity.type))
+                            .font(.title2)
+                            .foregroundStyle(KGEntityRow.typeColor(entity.type))
+                        Text(entity.name)
+                            .font(NativeAgentFont.section)
+                            .foregroundStyle(KGEntityRow.typeColor(entity.type))
+                        Spacer()
+                        StatusBadge(text: entity.type.capitalized, status: "info")
+                    }
+                    if let count = entity.mentionCount {
+                        LabeledRow(label: "Mentions", value: "\(count)")
+                    }
+                    if let first = entity.firstSeen {
+                        LabeledRow(label: "First seen", value: String(first.prefix(10)))
+                    }
+                    if let last = entity.lastSeen {
+                        LabeledRow(label: "Last seen", value: String(last.prefix(10)))
+                    }
+                    if let aliases = entity.aliases, !aliases.isEmpty {
+                        LabeledRow(label: "Aliases", value: aliases.joined(separator: ", "))
+                    }
+                    if let summary = entity.summary, !summary.isEmpty {
+                        Divider()
+                        Text(summary).font(NativeAgentFont.body).foregroundStyle(.secondary)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(NativeAgentLayout.cardPadding)
+                .aliveCard()
 
                 // Edges / neighbors
                 let relationshipState = KnowledgeGraphPresentation.entityDetailRelationships(
@@ -230,7 +229,7 @@ struct KGEntityDetailView: View {
             guard !Task.isCancelled, loadGate.accepts(request) else { return }
             // PATCH-2026-05-07: surface-load-errors Don't swallow.
             neighbors = nil
-            loadError = error.localizedDescription
+            loadError = UserFacingError.message(error, action: "load related entities")
         }
     }
 }

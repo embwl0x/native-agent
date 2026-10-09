@@ -166,6 +166,7 @@ private struct ShellKeyboardTarget: ViewModifier {
     /// own settings words are a local ring inside the region, so Tab walks them
     /// before it leaves the composer at all.
     var tabInto: ((Bool) -> Bool)?
+    var suggestionKey: ((UInt16) -> Bool)?
 
     func body(content: Content) -> some View {
         Group {
@@ -173,10 +174,10 @@ private struct ShellKeyboardTarget: ViewModifier {
                 content.background {
                     // A retained, hidden composer may still have a stale
                     // FocusState. It must not intercept another page's keys.
-                    ComposerTabKeyHandler(active: enabled && composerFocused) { backwards in
+                    ComposerTabKeyHandler(active: enabled && composerFocused, move: { backwards in
                         if tabInto?(backwards) == true { return true }
                         return order?.move(from: id, backwards: backwards) ?? false
-                    }
+                    }, suggestionKey: suggestionKey)
                 }
             } else {
                 content.focused($focused)
@@ -241,13 +242,15 @@ extension View {
     func shellComposerKeyboardTarget(
         isFocused: Bool,
         focus: @escaping () -> Void,
-        tabInto: ((Bool) -> Bool)? = nil
+        tabInto: ((Bool) -> Bool)? = nil,
+        suggestionKey: ((UInt16) -> Bool)? = nil
     ) -> some View {
         modifier(ShellKeyboardTarget(
             region: .composer,
             composerFocused: isFocused,
             focusComposer: focus,
-            tabInto: tabInto
+            tabInto: tabInto,
+            suggestionKey: suggestionKey
         ))
     }
 }

@@ -160,7 +160,7 @@ final class DeskLiveReloader {
                 try FileManager.default.createDirectory(
                     at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
             } catch {
-                configurationError = "Desk live updates are unavailable: \(error.localizedDescription)"
+                configurationError = UserFacingError.message(error, action: "turn on Desk live updates")
                 return false
             }
         }

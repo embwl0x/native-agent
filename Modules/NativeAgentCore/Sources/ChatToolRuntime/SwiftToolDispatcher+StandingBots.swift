@@ -214,10 +214,29 @@ extension SwiftToolDispatcher {
                     args["question"] = args.removeValue(forKey: key)
                 }
                 try botKeys(args, allowed: Set(botReferenceKeys + ["question"]))
+                let question = try botString(args["question"], field: "question")
+                let botID: UUID
+                do { botID = try botReference(args, definitions: definitions) }
+                catch {
+                    let references = botSuppliedReferences(args)
+                    if references.count == 1, case .string(let name) = references[0].value {
+                        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let contacts = try AgentPeerStore(dataRoot: dataRoot).list().filter {
+                            $0.name.caseInsensitiveCompare(name) == .orderedSame
+                        }
+                        if contacts.count == 1, let contact = contacts.first {
+                            return .object(["status": .string("failed"), "reason": .string("agent_contact"),
+                                "detail": .string("\(contact.name) is an agent contact, not a standing helper. Use agent.message to ask it. Nothing was sent."),
+                                "next_call": .object(["action": .string("agent.message"), "args": .object([
+                                    "agent": .string("peer:" + contact.id), "text": .string(question)])])])
+                        }
+                    }
+                    throw error
+                }
                 guard allowsCanonicalBodyTools else { throw BotRunnerError.notPermitted }
                 guard let standingBotSession else { throw StandingBotsError.invalidValue("Bot chat is unavailable.") }
                 let outcome = try await BotRunner(dataRoot: dataRoot, session: standingBotSession).ask(
-                    bot: botReference(args, definitions: definitions), question: botString(args["question"], field: "question"))
+                    bot: botID, question: question)
                 // The status travels with the answer. A provider failure used to
                 // come back as a bare empty answer with no cause, and a result
                 // carrying no status at all reads as success on the
@@ -313,19 +332,25 @@ extension SwiftToolDispatcher {
                 if includeModels { result["model_choices"] = try await SwiftNativeProviderRouting(dataRoot: dataRoot).botModelChoices() }
                 return .object(result)
             case "bot_run_once":
-                try botKeys(args, allowed: Set(botReferenceKeys))
+                try botKeys(args, allowed: Set(botReferenceKeys + ["question"]))
                 let bot = try definitions.get(botReference(args, definitions: definitions))
+                let question = try args["question"].map { try botString($0, field: "question") }
                 guard let standingBotRunEnqueue else {
                     return .object(["status": .string("failed"), "reason": .string("run_queue_unavailable"),
                                     "detail": .string("The bot run queue is not connected.")])
                 }
-                let requestID = try standingBotRunEnqueue(bot.id)
-                return .object(["status": .string("queued"), "id": .string(bot.id.uuidString),
-                                "requestId": .string(requestID.uuidString)])
+                let receipt = try standingBotRunEnqueue(bot.id, question)
+                let request = receipt.runID.uuidString
+                return .object(["status": .string(receipt.accepted ? "queued" : "joined"), "id": .string(bot.id.uuidString),
+                    "requestId": .string(request),
+                    "read_with": .object(["action": .string("shelf.entry"), "args": .object([
+                        "id": .string(request), "bot_id": .string(bot.id.uuidString)])]),
+                    "detail": .string("\(receipt.accepted ? "Queued" : "Joined") run \(request). Its result will be saved on the helper's shelf.")])
             case "shelf_entry":
                 let args = args.filter { $0.value != .null && $0.value != .string("") }
-                try botKeys(args, allowed: ["id", "bot_id", "bot", "name", "save_to"])
-                let selection = args.filter { $0.key != "save_to" }
+                try botKeys(args, allowed: ["id", "bot_id", "bot", "name", "save_to", "mark_read"])
+                let markRead = try args["mark_read"].map { try botDecode(Bool.self, $0, field: "mark_read") } ?? true
+                let selection = args.filter { !["save_to", "mark_read"].contains($0.key) }
                 let savedEntry: ShelfEntry
                 if let id = selection["id"] {
                     savedEntry = try shelf.entry(botID(id))
@@ -370,7 +395,7 @@ extension SwiftToolDispatcher {
                     if let saved { fields["saved"] = saved }
                     result = .object(fields)
                 }
-                try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: [entry.id])
+                if markRead { try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: [entry.id]) }
                 return result
             case "shelf_read":
                 let args = args.filter { $0.value != .string("") }
@@ -383,8 +408,11 @@ extension SwiftToolDispatcher {
                     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                     let fractional = formatter.date(from: text)
                     formatter.formatOptions = [.withInternetDateTime]
-                    guard let date = fractional ?? formatter.date(from: text) else {
-                        throw StandingBotsError.invalidValue("since must be an ISO 8601 time with time zone")
+                    // A bare YYYY-MM-DD means local midnight of that day.
+                    let day = DateFormatter()
+                    day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"; day.isLenient = false
+                    guard let date = fractional ?? formatter.date(from: text) ?? (text.count == 10 ? day.date(from: text) : nil) else {
+                        throw StandingBotsError.invalidValue("since must be YYYY-MM-DD (local day) or an ISO 8601 time with time zone")
                     }
                     return date
                 }
@@ -401,7 +429,7 @@ extension SwiftToolDispatcher {
                                               cursor: cursor, readerId: includeRead ? nil : Self.standingBotReaderID, newestFirst: newestFirst)
                 // One definition read for this page, including an unfiltered
                 // shelf. A missing/deleted helper keeps its exact saved ID.
-                let agentNames = Dictionary(uniqueKeysWithValues: ((try? definitions.list()) ?? []).map { ($0.id, $0.name) })
+                let agentNames = Dictionary(((try? definitions.list()) ?? []).map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
                 var shortenedChange = false
                 // Entries first, then the approval boundary (which reads the
                 // pending set last), so a remotely decided approval settles for
@@ -491,7 +519,7 @@ private func botObject(_ value: JSONValue?, field: String) throws -> [String: JS
 private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field: String) throws -> T {
     var shape = type == Bool.self ? "A boolean." : type == Int.self ? "An integer." : type == String.self ? "A string."
         : type == BotBudget.self ? "An object with tokens: positive integer and seconds: positive finite number."
-        : type == BotCadence.self ? "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone: string}."
+        : type == BotCadence.self ? "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone?: string}. Omitted timeZone uses this Mac's current zone."
         : "An object matching " + field + "."
     guard let value else { throw botArgumentError("missing " + field, field: field, accepted: shape) }
     do { return try JSONDecoder().decode(type, from: value.serializedData(pretty: false)) }
@@ -616,9 +644,9 @@ private func botCadence(_ value: JSONValue?) throws -> BotCadence {
     // the model round the retry loop with nothing to change. Dropped before
     // the count AND before the decode: the synthesized enum decoder wants a
     // single key too.
-    let shape = "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone: string}."
+    let shape = "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string, timeZone?: string}. Omitted timeZone uses this Mac's current zone."
     guard case .object(let raw) = value else { throw botArgumentError("cadence must be an object", field: "cadence", accepted: shape) }
-    let object = raw.filter { $0.value != .null }
+    var object = raw.filter { $0.value != .null }
     guard object.count == 1 else { throw botArgumentError("cadence requires exactly one of manual, interval or cron", field: "cadence", accepted: shape) }
     try botKeys(object, allowed: ["manual", "interval", "cron"], path: "$.cadence")
     if let manual = object["manual"] {
@@ -628,7 +656,12 @@ private func botCadence(_ value: JSONValue?) throws -> BotCadence {
     } else if let interval = object["interval"] {
         try botKeys(botObject(interval, field: "cadence.interval"), allowed: ["seconds"], path: "$.cadence.interval")
     } else {
-        try botKeys(botObject(object["cron"], field: "cadence.cron"), allowed: ["expression", "timeZone"], path: "$.cadence.cron")
+        var cron = try botObject(object["cron"], field: "cadence.cron")
+        try botKeys(cron, allowed: ["expression", "timeZone"], path: "$.cadence.cron")
+        if cron["timeZone"] == nil || cron["timeZone"] == .null || cron["timeZone"] == .string("") {
+            cron["timeZone"] = .string(TimeZone.current.identifier)
+        }
+        object["cron"] = .object(cron)
     }
     return try botDecode(BotCadence.self, .object(object), field: "cadence")
 }
@@ -678,7 +711,13 @@ private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, oper
     fields["daily_token_ceiling"] = .int(Int64(bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens))
     fields["schedule"] = .string(StandingBotSchedule.describe(bot.cadence))
     fields["output_format"] = .string(bot.outputFormat ?? "")
-    if case .cron(_, let zone) = bot.cadence { fields["timezone"] = .string(zone) }
+    if case .cron(_, let zone) = bot.cadence {
+        fields["timezone"] = .string(zone)
+        fields["mac_timezone"] = .string(TimeZone.current.identifier)
+        if zone != TimeZone.current.identifier {
+            fields["timezone_warning"] = .string("Schedule time zone \(zone) differs from this Mac's current zone \(TimeZone.current.identifier). Saved timing was not changed.")
+        }
+    }
     fields["scheduler_status"] = .string(bot.paused ? "paused" : bot.eventTrigger != nil ? "on_event" : bot.cadence == .manual ? "manual" : "scheduled")
     let reference = JSONValue.string(bot.name)
     // Each is her app call: these tools are app actions now.

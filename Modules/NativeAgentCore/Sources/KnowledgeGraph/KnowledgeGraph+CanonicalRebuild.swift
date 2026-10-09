@@ -212,91 +212,42 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    /// B4 (2026-08-28): index the active memories that have NO `kg_memory_index`
-    /// row, and only those.
-    ///
-    /// Why this exists next to `rebuildMemoryDerivedGraphFromCanonicalStore`:
-    /// the rebuild is the only batch path, and it is all-or-nothing — it drops
-    /// every indexer-owned entity, edge and index row and re-derives the world.
-    /// That is correct for a consolidation swap and far too heavy for the drift
-    /// this fixes. Indexing hooks are fire-and-forget `Task`s that die with the
-    /// process, so a steady residue of unindexed memories accumulates (47 active
-    /// memories, stable, measured on the live store 2026-08-28). Those memories
-    /// are invisible to every graph-derived surface until something reindexes
-    /// them.
-    ///
-    /// Additive and idempotent: memories that already have an index row are
-    /// never touched, so this cannot disturb a healthy graph, and `limit` caps
-    /// one pass so a large backlog drains over several runs instead of turning a
-    /// routine reconcile into a long write transaction. Returns the number of
-    /// memories indexed.
+    /// Check the complete canonical fingerprint set, including existing rows.
+    /// Drift rebuilds under the canonical write lock so stale derived claims
+    /// are removed as well as missing ones restored.
     @discardableResult
-    public func backfillMissingMemoryIndexRows(limit: Int = 200) async throws -> Int {
-        let cap = max(0, limit)
-        guard cap > 0 else { return 0 }
+    public func reconcileMemoryIndexFingerprints() async throws -> Int {
         let dbPool = try await pool()
-        let primaryUserName = resolvedPrimaryUserName()
-        return try await dbPool.write { db in
-            let memoryTableExists = (try Int.fetchOne(
-                db,
-                sql: """
-                    SELECT COUNT(*) FROM sqlite_master
-                    WHERE type = 'table' AND name = 'memories'
-                    """
-            ) ?? 0) > 0
-            guard memoryTableExists else { return 0 }
-            // Same eligibility predicate as the full rebuild — one definition of
-            // "indexable memory", so a backfilled row is byte-identical to the
-            // row a rebuild would have written. The only added clause is the
-            // missing-index test.
+        let drift = try await dbPool.read { db in
             let rows = try Row.fetchAll(db, sql: """
-                SELECT id, content, source, status, created_at, updated_at,
-                       metadata_json
-                FROM memories
-                WHERE status = 'active'
-                  AND TRIM(COALESCE(content, '')) <> ''
-                  AND lower(COALESCE(NULLIF(TRIM(lifecycle), ''), 'confirmed'))
+                SELECT m.id, m.content, m.source, m.status, m.created_at,
+                       m.updated_at, m.metadata_json, i.content_hash
+                FROM memories m LEFT JOIN kg_memory_index i ON i.memory_id = m.id
+                WHERE m.status = 'active'
+                  AND TRIM(COALESCE(m.content, '')) <> ''
+                  AND lower(COALESCE(NULLIF(TRIM(m.lifecycle), ''), 'confirmed'))
                         NOT IN ('corrected', 'contradicted', 'deleted')
-                  AND id NOT LIKE 'skill-pointer:%'
-                  AND NOT EXISTS (
-                        SELECT 1 FROM kg_memory_index i WHERE i.memory_id = memories.id
-                  )
-                ORDER BY id ASC
-                LIMIT ?
-                """, arguments: [cap])
-            guard !rows.isEmpty else { return 0 }
-            let now = Self.nowISO8601()
-            var indexed = 0
-            for row in rows {
-                guard let id: String = row["id"],
-                      let content: String = row["content"] else { continue }
-                let memoryID = id.trimmingCharacters(in: .whitespacesAndNewlines)
-                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !memoryID.isEmpty, !trimmed.isEmpty else { continue }
+                  AND m.id NOT LIKE 'skill-pointer:%'
+                ORDER BY m.id
+                """)
+            let indexCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM kg_memory_index") ?? 0
+            if indexCount != rows.count { return true }
+            return rows.contains { row in
+                let content: String = row["content"]
                 let metadataRaw: String? = row["metadata_json"]
                 let fact = KnowledgeGraphMemoryFact(
-                    id: memoryID,
-                    content: content,
-                    source: row["source"],
-                    status: row["status"] ?? "active",
-                    createdAt: row["created_at"] ?? "",
-                    updatedAt: row["updated_at"] ?? "",
+                    id: row["id"], content: content, source: row["source"],
+                    status: row["status"], createdAt: row["created_at"], updatedAt: row["updated_at"],
                     metadata: metadataRaw.flatMap { try? JSONValue.parse(Data($0.utf8)) }
                 )
-                try Self.indexActiveFact(
-                    db,
-                    fact: fact,
-                    memoryID: memoryID,
-                    content: trimmed,
-                    contentHash: Self.factFingerprint(fact, content: trimmed),
-                    now: now,
-                    extracted: Self.extractEntities(from: trimmed, knownPeople: knownPeople),
-                    primaryUserName: primaryUserName
+                let existing: String? = row["content_hash"]
+                return existing != Self.factFingerprint(
+                    fact, content: content.trimmingCharacters(in: .whitespacesAndNewlines)
                 )
-                indexed += 1
             }
-            return indexed
         }
+        guard drift else { return 0 }
+        return try await rebuildMemoryDerivedGraphFromCanonicalStore().factsIndexed
     }
 
     /// Every provenance value known to have been minted exclusively by this

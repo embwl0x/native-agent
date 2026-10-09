@@ -1,4 +1,5 @@
 import ChatToolParsing
+import ChatSessionWork
 import ToolRegistry
 import Foundation
 import CryptoKit
@@ -11,6 +12,7 @@ import MemoryV2
 import ProviderRouting
 import MacIntegration
 import Context
+import Senses
 
 extension SwiftNativeTurnEngine {
     /// The one structured tool loop. It builds a tool_use/tool_result
@@ -44,6 +46,8 @@ extension SwiftNativeTurnEngine {
         /// throw ends the turn before that call starts.
         providerAdmission: (@Sendable () async throws -> Void)? = nil
     ) async throws -> TurnEngineResult {
+        return try await ChatToolSessionContext.$userText.withValue(userMessage) {
+        try await SenseTurnReads.$current.withValue(SenseTurnReads.current ?? SenseTurnReads()) {
         // P2-3: fold the Workshop surface once at the loop entry (see
         // buildTurnContext) so the whole tool loop threads one vocabulary.
         let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
@@ -74,6 +78,19 @@ extension SwiftNativeTurnEngine {
             preBuiltContext: preBuiltContext
         )
         var commitInstructionDelivery = pendingInstructionDelivery(in: resolvedTurnContext, sessionID: sessionId)
+        // Steered messages reach the queue owner as delivered at the same
+        // moment instructions do: the round carrying them produced output.
+        var steeringOffers: [ChatTurnSteering.Offer] = []
+        func commitDelivery() async throws {
+            commitInstructionDelivery?()
+            commitInstructionDelivery = nil
+            guard let sessionId, !steeringOffers.isEmpty else { return }
+            let offers = steeringOffers
+            steeringOffers = []
+            guard await ChatTurnSteering.shared.markDelivered(offers, sessionId: sessionId) else {
+                throw ChatOrchestrationError.underlying("Couldn't commit steering delivery; the message stays queued.")
+            }
+        }
 
         // The provider-name map is built from the array and then held still
         // for the whole turn.
@@ -200,13 +217,6 @@ extension SwiftNativeTurnEngine {
         var lastRoundRaw = ""
         var lastProviderHadToolCalls = false
         var lastProtocolViolation: ToolCallProtocolViolation?
-        // 2026-07-21 audit fix: bound the violation bounce — a
-        // deterministically malformed model could violate EVERY iteration and
-        // burn the whole iteration budget (violation rounds dispatch zero
-        // tools, so the no-progress guard never fires). Third violation is
-        // accepted as final: break into the exhausted finish, which yields
-        // lastProtocolViolation.terminalReply.
-        var violationNudgeCount = 0
         // F2-M4 (2026-07-23): completion-contract announce-without-act bounce on
         // the structured lane (mirrors the text-compat call site), so missions,
         // workshop, bridge and every OpenAI-wire provider enforce it. Bounded
@@ -260,6 +270,7 @@ extension SwiftNativeTurnEngine {
             // iteration ends in a tool dispatch.
             var iterEmittedProse = ""
             var streamedCalls: [ParsedToolCall] = []
+            var toolBoundaryReason: LLMToolBoundaryReason?
             var pendingProtocolDelta = ""
             if await IntraTurnContextCompaction.compactProactivelyIfNeeded(
                 conversation: &conversation,
@@ -342,19 +353,20 @@ extension SwiftNativeTurnEngine {
             // Iteration, budget, compaction, schema refresh and provider
             // admission all succeeded. Only now can a follow-up leave its queue.
             if !dispatches.isEmpty, let sessionId, !sessionId.isEmpty {
+                // Undelivered offers stay reserved; a turn that ends before a
+                // round reads them returns them to the queue at close.
                 let offers = await ChatTurnSteering.shared.drain(
                     sessionId: sessionId, cancelFlagPath: cancelFlagPath)
                 if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
-                    await ChatTurnSteering.shared.returnUndelivered(offers, sessionId: sessionId)
                     throw TurnEngineError.streamCancelled(
                         partial: toolCallCodec.visiblePrefix(in: visibleText),
                         underlying: CancellationError())
                 }
                 if wholeTurnBudget.isExhausted {
-                    await ChatTurnSteering.shared.returnUndelivered(offers, sessionId: sessionId)
                     wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
                     return
                 }
+                steeringOffers += offers
                 for offer in offers {
                     Self.appendStructuredUserNudge(
                         ChatTurnSteering.deliveryText(offer.text), to: &conversation)
@@ -406,8 +418,10 @@ extension SwiftNativeTurnEngine {
                         throw CancellationError()
                     }
                     switch event {
+                    case .toolBoundary(let reason):
+                        toolBoundaryReason = reason
                     case .replyTextSettled(let settled):
-                        if settled {
+                        if settled, lastProtocolViolation == nil {
                             let prose = toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta)
                             if !prose.isEmpty {
                                 iterEmittedProse += prose
@@ -419,8 +433,8 @@ extension SwiftNativeTurnEngine {
                         await progress?(.replyTextSettled(settled))
                     case .textDelta(let delta):
                         if !delta.isEmpty {
-                            commitInstructionDelivery?()
-                            commitInstructionDelivery = nil
+                            await ctx.fluidContextTurn?.recordDelivery()
+                            try await commitDelivery()
                         }
                         if !delta.isEmpty, !emittedProviderFirstDelta {
                             emittedProviderFirstDelta = true
@@ -435,14 +449,15 @@ extension SwiftNativeTurnEngine {
                         lastRawResponse += delta
                         visibleText += delta
                         pendingProtocolDelta += delta
-                        let safe = toolCallCodec.releasableProse(holding: &pendingProtocolDelta)
+                        let safe = lastProtocolViolation == nil
+                            ? toolCallCodec.releasableProse(holding: &pendingProtocolDelta) : ""
                         if !safe.isEmpty {
                             iterEmittedProse += safe
                             await progress?(.delta(safe))
                         }
                     case .toolCall(let call):
-                        commitInstructionDelivery?()
-                        commitInstructionDelivery = nil
+                        await ctx.fluidContextTurn?.recordDelivery()
+                        try await commitDelivery()
                         guard let parsed = try toolCallCodec.decode(call) else {
                             continue
                         }
@@ -464,8 +479,7 @@ extension SwiftNativeTurnEngine {
                 if ChatCancelFlag.isRaised(cancelFlagPath) {
                     throw CancellationError()
                 }
-                commitInstructionDelivery?()
-                commitInstructionDelivery = nil
+                try await commitDelivery()
             } catch is CancellationError {
                 // 2026-07-21 audit fix: a user stop mid-stream CARRIES the
                 // visible partial (marker-stripped, same as the interrupted
@@ -485,6 +499,10 @@ extension SwiftNativeTurnEngine {
                     await progress?(.replyTextSettled(false))
                 }
                 if case .outputLengthLimit(let partial) = error as? LLMError {
+                    TurnTraceBus.fireFromContext(kind: "provider.output_limit", surface: surface, payload: .object([
+                        "byteSize": .int(Int64(partial.utf8.count)),
+                        "responseTail": .string(String(decoding: ChatSecretRedactor.redactText(partial).utf8.suffix(2000), as: UTF8.self)),
+                    ]))
                     reachedLengthLimit = true
                     lengthLimitPartial = partial
                     return
@@ -538,7 +556,8 @@ extension SwiftNativeTurnEngine {
                 // budget — falls through to the throw below.
                 if callAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
                    turnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
-                   ProviderRecoveryPolicy.isRecoverableTurnFailure(error) {
+                   ProviderRecoveryPolicy.isRecoverableTurnFailure(
+                       error, replays: iterEmittedProse.isEmpty || !rendersProse) {
                     retryAfterDrop = error
                     return
                 }
@@ -613,7 +632,8 @@ extension SwiftNativeTurnEngine {
                 }
                 return observed(await finishLengthLimitedTurn(
                     ctx: ctx, partial: rendersProse ? visibleText : lengthLimitPartial, dispatches: dispatches,
-                    startNs: startNs, providerCallCount: providerCallCount, codec: toolCallCodec
+                    startNs: startNs, providerCallCount: providerCallCount,
+                    userMessage: userMessage, sessionId: sessionId, surface: surface, codec: toolCallCodec
                 ), reason: .outputLimit)
             }
 
@@ -786,9 +806,11 @@ extension SwiftNativeTurnEngine {
                     in: iterAccumulated, toolNames: Set(ctx.toolsAvailable))
             }
             if let violation = roundViolation {
+                // One format nudge per turn; a second broken call in a row stops honestly.
+                if lastProtocolViolation != nil { brakeReason = .protocolViolation; break }
                 lastProtocolViolation = violation
                 counters.protocolViolationRoundCount += 1
-                violationNudgeCount += 1
+                loopRecoveryReply = nil
                 // Rejected arguments may contain secrets; retain no raw output.
                 let rejectedBytes = Data(iterAccumulated.utf8)
                 TurnTraceBus.fireFromContext(kind: "tool.protocol_violation", surface: surface, payload: .object([
@@ -796,7 +818,6 @@ extension SwiftNativeTurnEngine {
                     "byteSize": .int(Int64(rejectedBytes.count)),
                     "sha256": .string(SHA256.hash(data: rejectedBytes).map { String(format: "%02x", $0) }.joined()),
                 ]))
-                if violationNudgeCount > 2 { brakeReason = .protocolViolation; break }
                 lastProviderHadToolCalls = false
                 pendingProtocolDelta.removeAll(keepingCapacity: true)
                 // Rewind to where THIS iteration started, not to nothing.
@@ -809,20 +830,18 @@ extension SwiftNativeTurnEngine {
                 // marker search was protecting.
                 lastRawResponse = attemptBaseRawResponse
                 visibleText = attemptBaseVisibleText
+                if counters.protocolViolationRoundCount > 1 { brakeReason = .protocolViolation; break }
                 conversation.append(.assistantText(iterAccumulated))
-                conversation.append(.user(violation.modelFeedback))
+                conversation.append(.user(markerCodec?.protocolFailureFeedback ?? violation.modelFeedback))
                 continue
             }
-            lastProtocolViolation = nil
             let providerCalls = toolCallCodec.roundCalls(
                 streamed: streamedCalls, text: iterAccumulated, schemas: activeToolSchemas)
             lastProviderHadToolCalls = !providerCalls.isEmpty
             // A pending promise stop is only relevant until the next reply.
             loopRecoveryReply = nil
             if providerCalls.isEmpty {
-                let reply = ToolCallParser.containsOnlyIgnorableCalls(iterAccumulated)
-                    ? ToolCallParser.stripToolUseMarkers(iterAccumulated).trimmingCharacters(in: .whitespacesAndNewlines)
-                    : iterAccumulated
+                let reply = iterAccumulated
                 let emptyReply = reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 if emptyReply { counters.emptyReplyRoundCount += 1 }
                 // FIX 1 (B1.1): empty-reply recovery, checked BEFORE the announce
@@ -901,7 +920,7 @@ extension SwiftNativeTurnEngine {
                     continue
                 }
                 if !pendingProtocolDelta.isEmpty {
-                    await progress?(.delta(pendingProtocolDelta))
+                    await progress?(.delta(toolCallCodec.visiblePrefix(in: pendingProtocolDelta)))
                     pendingProtocolDelta.removeAll(keepingCapacity: true)
                 }
                 // Shared completed-turn finish (C2), with the turn's
@@ -932,7 +951,8 @@ extension SwiftNativeTurnEngine {
                 return observed(completed, reason: emptyReply ? .emptyReply : completed.resolvedTerminalReason(dataRoot: remPinsDataRoot))
             }
 
-            let pendingProse = toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta)
+            let pendingProse = lastProtocolViolation == nil
+                ? toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta) : ""
             if !pendingProse.isEmpty {
                 iterEmittedProse += pendingProse
                 await progress?(.delta(pendingProse))
@@ -942,7 +962,7 @@ extension SwiftNativeTurnEngine {
             // the round's raw text in `visibleText` would cut every later
             // partial at this round's first marker. Keep only what reached the
             // surface, as the violation bounce's rewind does.
-            if streamedCalls.isEmpty || toolCallCodec == .textMarkers {
+            if streamedCalls.isEmpty || toolCallCodec == .textMarkers || lastProtocolViolation != nil {
                 visibleText = attemptBaseVisibleText + iterEmittedProse
             }
             // This iteration is committed (it dispatches tools, so it can never
@@ -982,7 +1002,8 @@ extension SwiftNativeTurnEngine {
                     noProgressGuard: &noProgressGuard,
                     loopRecoveryReply: &loopRecoveryReply,
                     cancelFlagPath: cancelFlagPath,
-                    markerCodec: markerCodec
+                    markerCodec: markerCodec,
+                    toolBoundaryReason: toolBoundaryReason
                 )
             } catch is CancellationError {
                 throw TurnEngineError.streamCancelled(
@@ -1022,15 +1043,16 @@ extension SwiftNativeTurnEngine {
                     partial: safePartial, underlying: CancellationError()
                 )
             }
+            lastProtocolViolation = nil
             // A bot round that filed an approval ends the run here: the
             // approval resumes it, and the reply is what the bot said so far.
-            if surface == "bot", ChatTurnExecution.current?.waitingForApproval == true {
+            if StandingBotContinuity.isHelperTurn, ChatTurnExecution.current?.waitingForApproval == true {
                 return observed(TurnEngineResult(reply: toolCallCodec.visiblePrefix(in: LLMCallContext.turnTokenBudget?.partialReply ?? iterAccumulated),
                     modelUsed: ctx.modelId, recalledIds: ctx.resolvedRecalledIds, toolDispatches: dispatches,
                     elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
                     rawLLMResponse: lastRawResponse, providerCallCount: providerCallCount, completionState: .incomplete), reason: .approvalRequired)
             }
-            if case .stopLoop = outcome { brakeReason = .noProgress; break }
+            if case .stopLoop(let reason) = outcome { brakeReason = reason; break }
         }
 
         // A raised need is its own terminal, not exhaustion: the turn ends as
@@ -1074,6 +1096,8 @@ extension SwiftNativeTurnEngine {
             visiblePartial: rendersProse ? toolCallCodec.visiblePrefix(in: visibleText) : "",
             codec: toolCallCodec
         ), reason: wallClockElapsedSeconds == nil ? brakeReason : .wallClockLimit)
+        }
+        }
     }
 
     /// 2026-09-22: each round's narration and the answer were concatenated

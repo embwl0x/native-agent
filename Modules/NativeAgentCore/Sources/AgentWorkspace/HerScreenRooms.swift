@@ -5,6 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import StandingBots
+import ChatSessionWork
 
 /// Rooms (her-screen Phase 1, 2026-09-23, Agent's first read): opening a name
 /// shows a text screen in home's style. A header line (name · kind · state),
@@ -126,7 +127,7 @@ extension HerScreen {
              section("RUNS", runs.isEmpty ? ["no runs yet"] : rows(runs, { marks[$0.runHealth] ?? "·" }, more: "earlier runs · item \"replies\"")),
              section("TALK", rows(talk, { _ in "↩" }, more: "earlier replies")),
              issue.map { section("READ", [clip($0, 100)]) } ?? []],
-            verbs: [(slug + ".say", "ask it something (text)"), (slug + ".run", "run it once now"), (slug + ".settings", "change how it works")]
+            verbs: [(slug + ".say", "sends a message now (text)"), (slug + ".run", "run it once now"), (slug + ".settings", "change how it works")]
                 + (bot.cadence == .manual ? [] : [bot.paused ? (slug + ".resume", "turn its schedule back on") : (slug + ".pause", "stop its scheduled runs")]))
     }
 
@@ -140,7 +141,10 @@ extension HerScreen {
         let contact = everyone.first { $0.id.caseInsensitiveCompare(agent) == .orderedSame }
             ?? Contact(id: agent, name: records.first { $0.agent == agent }?.name ?? agent, builtIn: builtIns.contains(agent), kind: nil)
         let record = try? AgentWorkspaceConversationReader(dataRoot: dataRoot).find(scopeSessionID: scope, agent: agent, label: label)
-        let theirs = chats.filter { $0.who == contact.id || $0.who == contact.name.lowercased() }
+        // Read all verified doors for this mind; sends retain the selected route.
+        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let members = Set(identity.members(contact.id))
+        let theirs = chats.filter { members.contains($0.who) }
         let bare = Contact(id: contact.id, name: contact.name, builtIn: contact.builtIn, kind: nil)
         let health = world.health[record?.agent ?? contact.id] ?? world.health[contact.id]
         let state = state(bare, record: record, chat: theirs.first { $0.id != scope }, answered: world.answered, now: now, health: health).text
@@ -148,16 +152,29 @@ extension HerScreen {
 
         let owner = contact.builtIn ? contact.id : String(contact.id.dropFirst(5))
         let mainThread = (label ?? record?.label ?? "Main").caseInsensitiveCompare("Main") == .orderedSame
-        let thread = mainThread ? ContactThread.lines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536) : []
+        let thread: [ContactThread.Line]
+        do { thread = mainThread ? try ContactThread.lines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536) : [] }
+        catch { return screen([contact.name, "History unavailable"], [[error.localizedDescription]], verbs: []) }
         if thread.contains(where: { !$0.mine }) { AgentWorkspacePorts.current.tools.markConsumed(peer: contact.id) }
         var talk = thread.suffix(6).map {
             line($0.at, ($0.byPerson ? person : $0.mine ? "me" : slug) + ($0.door.map { " · " + $0 } ?? ""), $0.text, now: now)
         }
-        if mainThread, talk.isEmpty, let chat = theirs.first(where: { $0.id != scope }), chat.at > (record?.updatedAt ?? .distantPast) {
+        if mainThread, let chat = theirs.first(where: { $0.id != scope }),
+           chat.at > max(thread.last?.at ?? .distantPast, record?.exchanges?.last?.sentAt ?? .distantPast) {
             // Its newest bridge chat other than the one she is in: that one is
             // already in front of her, so quoting it back only sent her on to
             // open the chat before it (chat.N) for what was actually going on.
-            talk = chatTail(chat.id, dataRoot: dataRoot).suffix(6).map { line($0.at, $0.mine ? "me" : slug, $0.text, now: now) }
+            let route = identity.doors[chat.who] ?? chat.who
+            let tail = chatTail(chat.id, dataRoot: dataRoot).suffix(6)
+            if tail.contains(where: { !$0.mine }) { AgentWorkspacePorts.current.tools.markConsumed(peer: chat.who) }
+            talk = tail.map { line($0.at, $0.mine ? "me" : slug + " · " + route, $0.text, now: now) }
+            // Their last message in each of the next few chats too, oldest
+            // first: one newer test chat must not hide the ask before it.
+            for older in theirs.filter({ $0.id != scope && $0.id != chat.id }).prefix(3) {
+                if let last = chatTail(older.id, dataRoot: dataRoot, bytes: 16_384).last(where: { !$0.mine }) {
+                    talk.insert(line(last.at, slug + " · " + route + " · session " + older.id, last.text, now: now), at: 0)
+                }
+            }
         }
         if mainThread, talk.isEmpty, contact.kind == "routine" {
             // Its answers come back as chat turns, not in the send record:
@@ -214,7 +231,7 @@ extension HerScreen {
                     + clip(chat.title, 50) + " · " + age(now.timeIntervalSince(chat.at))
             }
         } + (theirs.count > listed.count ? ["+\(theirs.count - listed.count) more · item \"conversations\""] : [])
-        var verbs = [(slug + ".say", "send a message (text)")]
+        var verbs = [(slug + ".say", "sends a message now; queues behind a pending reply (text)")]
         if listed.contains(where: { $0.id != scope }) { verbs.append(("chat.N", "open one of those chats")) }
         let kind = contact.builtIn ? "built-in agent" : contact.kind ?? "agent"
         return screen([contact.name.uppercased(), kind, state] + (label.map { $0 == "Main" ? [] : ["thread " + clip($0, 30)] } ?? []),
@@ -252,7 +269,7 @@ extension HerScreen {
         }
         let header = [clip(chat?.title ?? title, 40), who] + (chat.map { [age(now.timeIntervalSince($0.at))] } ?? [])
         return screen(header, [section("TALK", talk), issue.map { section("READ", [clip($0, 100)]) } ?? []],
-            verbs: (who == person ? [] : [(who + ".say", "send them a message (text)")]) + [("conversations", "every chat, both directions")])
+            verbs: (who == person ? [] : [(who + ".say", "sends them a message now (text)")]) + [("conversations", "every chat, both directions")])
     }
 
     /// The last messages of a chat, from the final 96 KB of its log: who
@@ -328,7 +345,9 @@ extension HerScreen {
             // cover the last few answers.
             let compact = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
                 .filter { $0.hasPrefix("messages.compact.") && $0.hasSuffix(".jsonl") }.sorted().suffix(3)
-            return [dataRoot.appendingPathComponent("chat/messages/\(chat).jsonl")] + compact.map { folder.appendingPathComponent($0) }
+            return [dataRoot.appendingPathComponent("chat/messages/\(chat).jsonl"),
+                    ChatSessionAutocompactor.originalsPath(dataRoot: dataRoot, sessionId: chat)]
+                + compact.map { folder.appendingPathComponent($0) }
         }
         let files = chats.flatMap(logs)
         let runs = Set(requests.map { $0.run.uppercased() })
@@ -434,7 +453,7 @@ extension HerScreen {
         return screen(["HELPERS", "\(bots.count) helper\(bots.count == 1 ? "" : "s")"]
                 + (busy > 0 ? ["\(busy) running"] : []) + (paused > 0 ? ["\(paused) paused"] : []),
             [rows.isEmpty ? ["no helpers yet"] : rows.map { pad(clip($0.name, 30), width) + clip($0.text, 90) }],
-            verbs: [("<name>", "open its room"), ("<name>.run", "run it once now"), ("<name>.say", "ask it something (text)"),
+            verbs: [("<name>", "open its room"), ("<name>.run", "run it once now"), ("<name>.say", "sends a message now (text)"),
                     ("<name>.settings", "change how it works")])
     }
 
@@ -446,7 +465,7 @@ extension HerScreen {
         let width = min(20, (cells.map(\.name.count).max() ?? 0) + 2)
         return screen(["PEOPLE", "\(cells.count) contact\(cells.count == 1 ? "" : "s")"] + (needs.isEmpty ? [] : ["\(needs.count) ask for input"]),
             [cells.isEmpty ? ["no one yet · item \"connections\" adds someone"] : cells.map { pad(clip($0.name, 30), width) + clip($0.state, 80) }],
-            verbs: [("<name>", "open their conversation"), ("<name>.say", "send a message (text)"), ("conversations", "every chat, both directions")])
+            verbs: [("<name>", "open their conversation"), ("<name>.say", "sends a message now; queues behind a pending reply (text)"), ("conversations", "every chat, both directions")])
     }
 
     // MARK: Conversations
@@ -505,7 +524,7 @@ extension HerScreen {
         if order.count > (page + 1) * 12 { named["conversations.more"] = .open(.conversations(page: page + 1)) }
         HerNamed.shared.keep(dataRoot, named, room: "conversations")
         let width = min(20, (rows.map(\.0.count).max() ?? 0) + 2)
-        var verbs = [("<name>", "open the conversation"), ("<name>.say", "send a message (text)")]
+        var verbs = [("<name>", "open the conversation"), ("<name>.say", "sends a message now; queues behind a pending reply (text)")]
         if order.count > (page + 1) * 12 { verbs.append(("conversations.more", "the next \(min(12, order.count - (page + 1) * 12)) older")) }
         if page > 0 { verbs.append(("conversations.previous", "newer ones")) }
         verbs.append(("people", "everyone I can reach"))
@@ -562,7 +581,7 @@ extension HerScreen {
         }
         return screen(["MAC", front],
             [section("I ACTED IN", mine.isEmpty ? ["none in the last \(Int(touchedHours)) hours"] : mine), section("RUNNING", rows)],
-            verbs: [("mac.look <app>", "read that app's window where it sits"), ("mac.go <app>", "bring that app to the front")])
+            verbs: [("mac.look <app>", "read that app's window where it sits"), ("mac.go <app>", "open that app behind; front:true brings it forward")])
     }
 
     // MARK: My windows (data/her_screen/touched.json)
@@ -796,11 +815,10 @@ extension HerScreen {
         // price, said on every numbered list so it doesn't read as a bug.
         if room != "windows", lines.contains(where: { $0.0 != "·" }) { header.append(numbersNote) }
         var about = ["message", "detail", "about", "note", "error"].compactMap { text(content[$0]) }.prefix(2).map { clip($0, 110) }
-        if room == "mail", let coverage = text(content["search_coverage"]) {
-            about.append(coverage)
+        if notConnected(content) {
+            header = [room.uppercased(), "not connected"]
+            about = [text(content["fix"]) ?? text(content["error"]) ?? notConnectedLine]
         }
-        // Not connected: its search/unread/status verbs cannot work, so none are offered (desk walk 3).
-        if notConnected(content) { header = [room.uppercased(), "not connected"]; about = [notConnectedLine]; verbs = [] }
         return screen(header, [lines.isEmpty && about.isEmpty ? ["nothing here"] : lines.map { pad(clip($0.0, 24), width) + $0.1 },
                                section(fine ? "ABOUT" : "READ", about)], verbs: verbs)
     }
@@ -889,12 +907,22 @@ public enum WorkspaceMacCall {
 }
 
 /// Recent room bindings, replaced together and expired with their session.
+/// Lasting ones (her names, 10-07) retain the latest 512 bindings per room,
+/// and a redraw keeps recent item names (`today.3`: an item's number is its own, and it only
+/// opens) so a name she read keeps reaching its item. A verb (`contacts.3.text`)
+/// and what it is bound to come only from the current draw; one a redraw
+/// dropped is withdrawn. Windows, the one scoped room, number by position
+/// and are replaced.
 final class HerRoomCache<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private var rooms: [String: (at: Date, values: [String: Value])] = [:]
+    private var rooms: [String: (at: Date, values: [String: Value], order: [String], dropped: [String])] = [:]
+    private let entryLimit = 512
+    private let lasting: Bool
+
+    init(lasting: Bool = false) { self.lasting = lasting }
 
     private func prune(_ now: Date) {
-        rooms = rooms.filter { now.timeIntervalSince($0.value.at) <= 1800 }
+        if !lasting { rooms = rooms.filter { now.timeIntervalSince($0.value.at) <= 1800 } }
         while rooms.count > 128, let oldest = rooms.min(by: { $0.value.at < $1.value.at }) {
             rooms.removeValue(forKey: oldest.key)
         }
@@ -909,7 +937,18 @@ final class HerRoomCache<Value: Sendable>: @unchecked Sendable {
             let groups = room.map { [$0: bound] } ?? Dictionary(grouping: bound.keys, by: { String($0.split(separator: ".").first ?? "") })
                 .mapValues { keys in bound.filter { keys.contains($0.key) } }
             let now = Date()
-            for (name, entries) in groups { rooms[prefix + name] = (now, entries) }
+            for (name, entries) in groups {
+                let old = lasting && scope == nil ? rooms[prefix + name] : nil
+                let items = (old?.values ?? [:]).filter { Self.isItem($0.key) }
+                let merged = items.merging(entries) { _, new in new }
+                let order = Array(((old?.order ?? []).filter { merged[$0] != nil && entries[$0] == nil }
+                    + entries.keys.sorted()).suffix(entryLimit))
+                let retained = Set(order)
+                let removed = Set((old?.values ?? [:]).keys.filter { !Self.isItem($0) && entries[$0] == nil })
+                let dropped = Array(((old?.dropped ?? []).filter { entries[$0] == nil && !removed.contains($0) }
+                    + removed.sorted()).suffix(entryLimit))
+                rooms[prefix + name] = (now, merged.filter { retained.contains($0.key) }, order, dropped)
+            }
             prune(now)
         }
     }
@@ -923,6 +962,18 @@ final class HerRoomCache<Value: Sendable>: @unchecked Sendable {
         }
     }
 
+    /// A verb a redraw of its room no longer offers.
+    func withdrawn(_ root: URL, _ name: String) -> Bool {
+        lock.withLock {
+            prune(Date())
+            let prefix = root.standardizedFileURL.path + "\u{0}"
+            return rooms.contains { $0.key.hasPrefix(prefix) && $0.value.dropped.contains(name) }
+        }
+    }
+
+    /// An item's own name ends in its number; a verb ends in a word.
+    private static func isItem(_ name: String) -> Bool { name.split(separator: ".").last.map { Int($0) != nil } ?? false }
+
     func removeSession(_ key: String) {
         lock.withLock { rooms = rooms.filter { !$0.key.hasPrefix(key + "\u{0}") } }
     }
@@ -931,7 +982,7 @@ final class HerRoomCache<Value: Sendable>: @unchecked Sendable {
 /// Names a text room showed (`today.3`, `mail.find`) and their actions.
 final class HerNamed: @unchecked Sendable {
     static let shared = HerNamed()
-    private let cache = HerRoomCache<AgentWorkspaceAction>()
+    private let cache = HerRoomCache<AgentWorkspaceAction>(lasting: true)
     private let drawn = HerRoomCache<Bool>()
 
     func keep(_ root: URL, _ names: [String: AgentWorkspaceAction], room: String? = nil, scope: String? = nil) {
@@ -941,6 +992,9 @@ final class HerNamed: @unchecked Sendable {
     func action(_ root: URL, _ name: String) -> AgentWorkspaceAction? {
         cache.value(root, name)
     }
+
+    /// A verb its item's current draw no longer offers (a contact's number removed).
+    func withdrawn(_ root: URL, _ name: String) -> Bool { cache.withdrawn(root, name) }
 
     func removeSession(_ key: String) { cache.removeSession(key); drawn.removeSession(key) }
 

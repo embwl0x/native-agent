@@ -56,6 +56,8 @@ public protocol WorkshopExecutionMemoryWriting: Sendable {
     /// tombstone — see ``WorkshopExecutionMemory/retentionCap`` for why deletion
     /// is the wrong primitive here.
     func retireExecutionMemory(id: String) async throws
+    /// Whether the store refuses this content as a rejected (tombstoned) claim.
+    func isTombstoned(content: String, metadata: JSONValue) async throws -> Bool
 }
 
 /// Production writer over the process-wide MemoryV2 store — the same
@@ -103,6 +105,10 @@ public struct SwiftNativeWorkshopExecutionMemoryWriter: WorkshopExecutionMemoryW
     /// denylist entry, and leaves the history walkable.
     public func retireExecutionMemory(id: String) async throws {
         _ = try await memory.archiveMemory(id: id)
+    }
+
+    public func isTombstoned(content: String, metadata: JSONValue) async throws -> Bool {
+        try await memory.isTombstoned(content: content, metadata: metadata)
     }
 }
 
@@ -307,6 +313,24 @@ public enum WorkshopExecutionMemory {
         return .object(object)
     }
 
+    /// The store's two tombstone refusals: the denylist gate in `store` and
+    /// the storage-level gate inside the insert.
+    static func isTombstoneRefusal(_ error: any Error) -> Bool {
+        if case MemoryV2Error.underlying(let message) = error { return message.hasPrefix("tombstoned") }
+        if case MemoryStorageError.tombstoned = error { return true }
+        return false
+    }
+
+    /// Marker file beside an execution's record: its memory was refused as a
+    /// rejected (tombstoned) claim — settled for good.
+    public static let tombstonedMarkerName = "memory-tombstoned"
+
+    /// Writes the marker into `executionDirectory`; false when it could not.
+    public static func markTombstoned(executionDirectory: URL) -> Bool {
+        FileManager.default.createFile(
+            atPath: executionDirectory.appendingPathComponent(tombstonedMarkerName).path, contents: nil)
+    }
+
     public static func source(for record: WorkshopExecutionRecord) -> String {
         "\(sourcePrefix)\(record.id)"
     }
@@ -396,6 +420,9 @@ public struct WorkshopExecutionMemoryRecorder: Sendable {
     private let writer: any WorkshopExecutionMemoryWriting
     private let log: WorkshopExecutionMemoryLog
     private let retentionCap: Int
+    /// Durably marks an execution whose memory was refused as tombstoned, so
+    /// launch reconcile never asks about it again. Returns false on failure.
+    private let markTombstoned: (@Sendable (String) -> Bool)?
 
     /// - Parameters:
     ///   - retentionCap: overridable so the retention path can be exercised
@@ -405,12 +432,14 @@ public struct WorkshopExecutionMemoryRecorder: Sendable {
         writer: any WorkshopExecutionMemoryWriting,
         retentionCap: Int = WorkshopExecutionMemory.retentionCap,
         log: @escaping WorkshopExecutionMemoryLog = { _, message in
-            NSLog("%@", message)
-        }
+            nativeLog("%@", message)
+        },
+        markTombstoned: (@Sendable (String) -> Bool)? = nil
     ) {
         self.writer = writer
         self.retentionCap = max(1, retentionCap)
         self.log = log
+        self.markTombstoned = markTombstoned
     }
 
     /// The recorder's own sink, so the queue in front of it logs to the same
@@ -437,6 +466,14 @@ public struct WorkshopExecutionMemoryRecorder: Sendable {
                 source: WorkshopExecutionMemory.source(for: record),
                 metadata: WorkshopExecutionMemory.metadata(record, reason: reason)
             )
+        } catch where WorkshopExecutionMemory.isTombstoneRefusal(error) {
+            // Settled, not lost: this narrative is a claim she rejected, and
+            // every retry is refused the same way.
+            log(.info, "[workshop-memory] execution \(record.id) memory is a rejected claim (tombstoned); not written")
+            if let markTombstoned, !markTombstoned(record.id) {
+                log(.error, "[workshop-memory] ERROR marking execution \(record.id) tombstoned; launch reconcile will ask again")
+            }
+            return nil
         } catch {
             // Loud, then closed. The execution's terminal state is already durable;
             // what is lost is her recollection of it, and that must be visible.
@@ -449,6 +486,21 @@ public struct WorkshopExecutionMemoryRecorder: Sendable {
         log(.info, "[workshop-memory] remembered execution \(record.id) (status \(record.status)) as memory \(id)")
         await pruneToCap()
         return id
+    }
+
+    /// Launch reconcile asks this before re-queuing a missing memory: a
+    /// tombstoned narrative was rejected, not lost to a crash. Nil when the
+    /// lookup itself failed — that is not "not tombstoned".
+    public func isRefusedAsTombstoned(_ record: WorkshopExecutionRecord, reason: String?) async -> Bool? {
+        do {
+            return try await writer.isTombstoned(
+                content: WorkshopExecutionMemory.narrative(record, reason: reason),
+                metadata: WorkshopExecutionMemory.metadata(record, reason: reason)
+            )
+        } catch {
+            log(.error, "[workshop-memory] ERROR checking execution \(record.id) against tombstones: \(error)")
+            return nil
+        }
     }
 
     /// Every execution memory this lane can currently see, by `source`. The
@@ -643,6 +695,10 @@ public actor WorkshopExecutionMemoryQueue {
     /// executor never has to hold the writer itself.
     public func recordedSources() async -> Set<String>? {
         await recorder.recordedSources()
+    }
+
+    public func isRefusedAsTombstoned(_ record: WorkshopExecutionRecord, reason: String?) async -> Bool? {
+        await recorder.isRefusedAsTombstoned(record, reason: reason)
     }
 
     /// How many writes have been handed off. Diagnostics only.

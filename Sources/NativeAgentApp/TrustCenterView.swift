@@ -19,10 +19,8 @@ import CloudKit
 import TrustCenter
 #endif
 
-/// The collapsed Trust Advanced header is the only visible surface for its
-/// privacy-map and backup authority reads. Keep unavailable/stale data
-/// distinguishable from a legitimately empty backup history before hiding the
-/// panels behind the disclosure.
+/// The Advanced tab's backup read. Keep unavailable/stale data
+/// distinguishable from a legitimately empty backup history.
 enum TrustCenterAdvancedDisclosurePresentation {
     enum ReadState: Equatable {
         case loading
@@ -31,39 +29,12 @@ enum TrustCenterAdvancedDisclosurePresentation {
         case unavailable
     }
 
-    struct Badge: Equatable {
-        let text: String
-        let status: String
-    }
-
     struct State: Equatable {
-        let policy: ReadState
-        let privacyMap: ReadState
         let backups: ReadState
-        let backupBeforeWriteEnabled: Bool?
-
-        var collapsedBadge: Badge? {
-            if policy == .unavailable || privacyMap == .unavailable || backups == .unavailable {
-                return Badge(text: "Details unavailable", status: "warn")
-            }
-            if policy == .stale || privacyMap == .stale || backups == .stale {
-                return Badge(text: "Details stale", status: "warn")
-            }
-            if backupBeforeWriteEnabled == false {
-                return Badge(text: "Backups off", status: "warn")
-            }
-            if policy == .loading || privacyMap == .loading || backups == .loading {
-                return Badge(text: "Loading", status: "info")
-            }
-            return nil
-        }
     }
 
     static func resolve(
-        hasPolicy: Bool,
-        hasPrivacyMap: Bool,
         backupCount: Int,
-        backupBeforeWriteEnabled: Bool?,
         hasRefreshAttempt: Bool,
         failedEndpoints: [String]
     ) -> State {
@@ -71,22 +42,11 @@ enum TrustCenterAdvancedDisclosurePresentation {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         })
         return State(
-            policy: readState(
-                hasContent: hasPolicy,
-                hasRefreshAttempt: hasRefreshAttempt,
-                failed: failures.contains("trust policy")
-            ),
-            privacyMap: readState(
-                hasContent: hasPrivacyMap,
-                hasRefreshAttempt: hasRefreshAttempt,
-                failed: failures.contains("privacy map")
-            ),
             backups: readState(
                 hasContent: backupCount > 0,
                 hasRefreshAttempt: hasRefreshAttempt,
                 failed: failures.contains("backups")
-            ),
-            backupBeforeWriteEnabled: backupBeforeWriteEnabled
+            )
         )
     }
 
@@ -212,7 +172,23 @@ enum TrustCenterPolicyStatusPresentation {
     }
 }
 
+/// The Trust page's tabs (Fluid Glass plan, 2026-10-04: one page of about
+/// thirteen sections became tabs). Each raw value is the key `TrustRailPage`
+/// stores; the first keeps "trust" so a remembered tab still lands.
+enum TrustTab: String, CaseIterable {
+    case access = "trust"
+    case features
+    case macAndBrowser = "control"
+    case advanced
+}
+
 struct TrustCenterView: View {
+    /// The tab on show. Nil is every section in one column, for the hosts
+    /// with no tab row (Simple view's Trust card, Settings).
+    private let tab: TrustTab?
+    /// Mac control's unsaved edits, held by the tab row's page so a tab
+    /// switch does not throw them away.
+    private let macControlDraft: Binding<TrustMacControlPolicy?>?
     @Environment(AppModel.self) private var appModel
     @State private var agentAccessMode = "auto"
     @State private var permissionLevel = "balanced"
@@ -226,11 +202,13 @@ struct TrustCenterView: View {
     @State private var isApplyingPolicy = false
     @State private var pendingRestore: BackupRecord?
     @State private var restoringBackupID: String?
-    // 2026-07-22 trust-tighten: disclosure state persists across visits so a
-    // power user who opens the Advanced group finds it open next time.
-    @AppStorage("trustShowAdvanced") private var showAdvancedTrust = false
 
-    init() {}
+    init(tab: TrustTab? = nil, macControlDraft: Binding<TrustMacControlPolicy?>? = nil) {
+        self.tab = tab
+        self.macControlDraft = macControlDraft
+    }
+
+    private func shows(_ section: TrustTab) -> Bool { tab == nil || tab == section }
 
 
     var body: some View {
@@ -239,93 +217,56 @@ struct TrustCenterView: View {
             // Measure them as they enter the viewport instead of repeatedly
             // laying out the entire long page on every scroll update.
             LazyVStack(alignment: .leading, spacing: 24) {
-                // 2026-07-22 trust-tighten: 16 stacked panels → 4 + one
-                // collapsed Advanced group. Guardrail Summary deleted (its
-                // five tiles restated the very controls the Access & Policy
-                // panel edits); Policy Map demoted to a disclosure inside
-                // Access & Policy; Presets + Agent Access + Policy merged;
-                // feature permissions share a two-column grid; power-user
-                // panels (boundaries, privacy map, backups)
-                // collapsed by default.
-                //
-                // Sweep R4 C10 (2026-08-06): the summary is BACK, but derived.
-                // The 2026-07-22 deletion was right about the old panel — five
-                // hand-written tiles restating controls below them, which is a
-                // trust claim that goes stale silently. TrustGuardrailSummary
-                // is a pure function of `appModel.engine.trust.policy` plus the access
-                // mode this page already resolved, so it cannot drift from the
-                // switches underneath it. Read-only: it renders no controls.
-                accessAndPolicyPanel
-
-                // Alive glass (2026-09-23): an eyebrow and one group card.
-                TrustSection(title: "Chrome control", carded: false) {
-                    AliveGroupCard {
-                        ChromeControlPermissionsView()
-                    }
+                if shows(.access) {
+                    // Sweep R4 C10 (2026-08-06): the summary is derived — a
+                    // pure function of `appModel.engine.trust.policy` plus the
+                    // access mode this page resolved, so it cannot drift from
+                    // the switches. Read-only: it renders no controls.
+                    accessAndPolicyPanel
+                    TrustGuardrailSummaryPanel(accessMode: appModel.engine.trust.policy.map { accessMode(from: $0) } ?? "auto")
+                    NativeSecurityCenterPanel(modeTitle: activePreset?.title)
+                    // A remote agent is never the person: the grant it asks
+                    // for is per-peer, and it is the only switch that can raise
+                    // an inbound peer off the restricted agent-bridge surface.
+                    AgentPeerTrustView()
                 }
 
-                TrustGuardrailSummaryPanel(accessMode: appModel.engine.trust.policy.map { accessMode(from: $0) } ?? "auto")
-
-                NativeSecurityCenterPanel(modeTitle: activePreset?.title)
-
-                // Alive glass (2026-09-23): the feature permissions grid is
-                // an eyebrow over one group card per feature, and the old
-                // per-row timing pills are one footnote. Every "restart" pill
-                // was stale: the unattended gate is read fresh on every tick
-                // (BackgroundLoopsAssembly.unattendedWorkAllowed), so nothing
-                // here waits for a restart.
-                ForEach(TrustFeaturePermissionCards.all.filter { $0.id != .chromeControl }) { card in
-                    TrustSection(title: card.title, carded: false) {
-                        card.content()
+                if shows(.features) {
+                    // One eyebrow over one group card per feature. The
+                    // unattended gate is read fresh on every tick
+                    // (BackgroundLoopsAssembly.unattendedWorkAllowed), so
+                    // nothing here waits for a restart.
+                    ForEach(TrustFeaturePermissionCards.all.filter { $0.id != .chromeControl }) { card in
+                        AdvancedSection(title: card.title, card: .bare) {
+                            card.content()
+                        }
                     }
-                }
-                Text("Working unattended, Desk tasks, practice runs, the dream cycle, automatic review, memory consolidation, recurring facts and memory hygiene change the next time that work runs. Nothing here needs a restart. Everything else applies right away.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                // PATCH-2026-05-07: mac-control-ui-1 Mac Control permissions panel
-                // 2026-07-23 B2.5a: this tab is the one home for Mac Control
-                // CAPABILITIES + policy (shell, AppleScript, Accessibility, file
-                // ops, iOS remote, assistant watch). Per-app system (TCC) grants
-                // and per-surface read/write toggles have their one home in the
-                // Mac Integration tab — cross-linked here so a user answering
-                // "what can it do on my Mac" knows where each control lives.
-                // One sentence and a way there. Reading about a second
-                // permission system is not the same as reaching it.
-                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    Text("Per-app permissions live on the Mac integration page.")
-                        .font(ShellType.label)
+                    Text("Background work picks up a change the next time it runs. Everything else applies right away, with no restart.")
+                        .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
-                    Button("Open Mac permissions") {
-                        _ = NativeAgentAppCoordinator.shared.request(.sidebar(.macIntegration))
-                    }
-                    .controlSize(.small)
-                    .accessibilityIdentifier("trust.open-mac-permissions")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    // W8 (2026-08-14): the only feature that records what the
+                    // person does when they are not talking to me, with its
+                    // honest limits on title redaction, so its own panel.
+                    ActivityCapturePermissionsView()
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
 
-                MacControlPermissionsView()
+                if shows(.macAndBrowser) {
+                    // On the rail this is Trust's one Mac tab
+                    // (MacIntegrationView, with the per-app grants); here it
+                    // serves the hosts with no tab row.
+                    AdvancedSection(title: "Chrome control") {
+                        ChromeControlPermissionsView()
+                    }
+                    MacControlPermissionsView(draft: macControlDraft)
+                }
 
-                // W8 (2026-08-14) — the ambient activity watcher's consent
-                // surface. Its own top-level panel rather than a cell in the
-                // Feature Permissions grid: this is the only feature in the app
-                // that records what the human does when they are not talking to
-                // the agent, its controls do not fit a four-line card, and
-                // burying the honest limits on title redaction inside a grid
-                // cell would be the wrong kind of tidy.
-                ActivityCapturePermissionsView()
-
-                // A remote agent is never the person. Its own panel for the
-                // same reason the activity watcher has one: the grant it asks
-                // for is per-peer, and it is the only switch that can raise an
-                // inbound peer off the restricted agent-bridge surface.
-                AgentPeerTrustView()
-
-                advancedSection
+                if shows(.advanced) {
+                    safetyBoundariesPanel
+                    privacyMapPanel
+                    backupsPanel
+                }
 
                 if let outcome = appModel.trustCenterActionOutcome {
                     let status = TrustCenterActionPresentation.state(for: outcome)
@@ -356,6 +297,7 @@ struct TrustCenterView: View {
             if let policy = appModel.engine.trust.policy {
                 applyPolicy(policy)
             }
+            if shows(.advanced) { await appModel.refreshPrivacyMap() }
         }
         .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
             if let newPolicy {
@@ -379,9 +321,9 @@ struct TrustCenterView: View {
     // disclosure — it documents the modes rather than controlling anything).
 
     private var accessAndPolicyPanel: some View {
-        // The four presets are themselves cards (a 2×2 grid), so the section
-        // carries no card of its own — a card inside a card is a plate.
-        TrustSection(title: "Access and policy", carded: false) {
+        // The radios and their status line sit in one card, like every
+        // other control on Trust; loose above the next card they floated.
+        AdvancedSection(title: "Access and policy", card: .single) {
             VStack(alignment: .leading, spacing: 12) {
                 // The Mac's own radio group (User 09-27: all controls native).
                 Picker("Access", selection: Binding<TrustPolicyPreset?>(
@@ -402,10 +344,17 @@ struct TrustCenterView: View {
                 }
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
-                Text(policyStatusLine)
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                    .fixedSize(horizontal: false, vertical: true)
+                .disabled(isApplyingPolicy || appModel.engine.trust.policy == nil)
+                HStack(spacing: 8) {
+                    if isApplyingPolicy {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(isApplyingPolicy ? "Saving access…" : policyStatusLine)
+                        .font(ShellType.labelSemibold)
+                        .foregroundStyle(NativeAgentShell.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(minHeight: 16, alignment: .leading)
                 // "Back up now" lives on the "If I get something wrong" row of
                 // What I can do right now, where it says what it copies.
             }
@@ -449,46 +398,19 @@ struct TrustCenterView: View {
 
     // MARK: - Feature permission grouping (2026-07-22 trust-tighten)
 
-    // MARK: - Advanced group (2026-07-22 trust-tighten: power-user panels
-    // collapsed by default; styling mirrors the Advanced Mac Control
-    // disclosure in MacControlPermissionsView for consistency).
+    // MARK: - Advanced tab: safety boundaries, privacy map and backups.
 
     private var advancedPresentation: TrustCenterAdvancedDisclosurePresentation.State {
         let refresh = appModel.panelRefreshStatus[.trust]
         return TrustCenterAdvancedDisclosurePresentation.resolve(
-            hasPolicy: appModel.engine.trust.policy != nil,
-            hasPrivacyMap: appModel.privacyMap != nil,
             backupCount: appModel.engine.trust.backups.count,
-            backupBeforeWriteEnabled: appModel.engine.trust.policy?.filePolicy?.requireBackupBeforeWrite,
             hasRefreshAttempt: refresh != nil,
             failedEndpoints: refresh?.failedEndpoints ?? []
         )
     }
 
-    private var advancedSection: some View {
-        // An eyebrow like its sibling sections; the fold row is a row.
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow("Advanced")
-            TrustFold(isExpanded: $showAdvancedTrust) {
-                Text("Safety boundaries, privacy map and backups")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(NativeAgentShell.text)
-            } trailing: {
-                if !showAdvancedTrust, let badge = advancedPresentation.collapsedBadge {
-                    TrustStatusChip(text: badge.text, tone: TrustTone.named(badge.status))
-                }
-            } content: {
-                VStack(alignment: .leading, spacing: 24) {
-                    safetyBoundariesPanel
-                    privacyMapPanel
-                    backupsPanel
-                }
-            }
-        }
-    }
-
     private var safetyBoundariesPanel: some View {
-        TrustSection(title: "Safety boundaries") {
+        AdvancedSection(title: "Safety boundaries", card: .single) {
             let state = TrustSafetyBoundariesPresentation.state(
                 policy: appModel.engine.trust.policy,
                 accessMode: agentAccessMode
@@ -512,14 +434,11 @@ struct TrustCenterView: View {
     }
 
     private var privacyMapPanel: some View {
-        PrivacyMapPanel(
-            trustPolicyRoot: appModel.engine.trust.policy?.appDataRoot,
-            privacyMap: appModel.privacyMap
-        )
+        PrivacyMapPanel(privacyMap: appModel.privacyMap)
     }
 
     private var backupsPanel: some View {
-        TrustSection(title: "Backups") {
+        AdvancedSection(title: "Backups", card: .single) {
             if advancedPresentation.backups == .loading {
                 Text("Loading backups…")
                     .font(ShellType.label)
@@ -654,8 +573,7 @@ enum PrivacyMapPanelPresentation {
     }
 
     struct Loaded: Equatable {
-        let root: String
-        let generatedAt: String
+        let roots: [String]
         let categories: [Category]
     }
 
@@ -664,29 +582,38 @@ enum PrivacyMapPanelPresentation {
         case loaded(Loaded)
     }
 
-    static func resolve(trustPolicyRoot: String?, privacyMap: PrivacyMap?) -> State {
+    /// The roots head the paths listed under them: the data root the map was
+    /// read from, then any category kept outside it (Persona lives beside
+    /// the data folder, not in it).
+    static func resolve(privacyMap: PrivacyMap?) -> State {
         guard let privacyMap else { return .pending }
         return .loaded(Loaded(
-            root: trustPolicyRoot ?? privacyMap.dataRoot,
-            generatedAt: privacyMap.generatedAt,
+            roots: roots(privacyMap),
             categories: privacyMap.categories.map(Category.init(source:))
         ))
+    }
+
+    private static func roots(_ map: PrivacyMap) -> [String] {
+        let data = (map.dataRoot as NSString).standardizingPath
+        var roots = [map.dataRoot]
+        for category in map.categories {
+            let path = (category.path as NSString).standardizingPath
+            guard path != data, !path.hasPrefix(data + "/"), !roots.contains(category.path) else { continue }
+            roots.append(category.path)
+        }
+        return roots
     }
 }
 
 struct PrivacyMapPanel: View {
-    let trustPolicyRoot: String?
     let privacyMap: PrivacyMap?
 
     private var presentation: PrivacyMapPanelPresentation.State {
-        PrivacyMapPanelPresentation.resolve(
-            trustPolicyRoot: trustPolicyRoot,
-            privacyMap: privacyMap
-        )
+        PrivacyMapPanelPresentation.resolve(privacyMap: privacyMap)
     }
 
     var body: some View {
-        TrustSection(title: "Privacy map") {
+        AdvancedSection(title: "Privacy map", card: .single) {
             switch presentation {
             case .pending:
                 Text("The privacy map has not loaded yet. It lists what I keep on this Mac and which of it can leave.")
@@ -694,16 +621,16 @@ struct PrivacyMapPanel: View {
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             case .loaded(let map):
-                Text(UserDisplayFormatters.tildifyPath(map.root))
-                    .font(ShellType.code)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                    .help(map.root)
-                Text("Generated \(UserDisplayFormatters.humanizeISOTimestamp(map.generatedAt))")
-                    .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.secondary)
+                ForEach(map.roots, id: \.self) { root in
+                    Text(UserDisplayFormatters.tildifyPath(root))
+                        .font(ShellType.code)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                        .help(root)
+                }
+                // The map is read when the page is, so it carries no age.
                 ForEach(map.categories) { category in
                     PrivacyMapPanelCategoryRow(category: category)
                 }
@@ -795,9 +722,9 @@ enum TrustPolicyPresetAction {
                 guardedByLockedPolicy: guardedByLockedPolicy
             )
         } catch {
-            let detail = "Trust preset save failed: \(error.localizedDescription)"
+            let detail = UserFacingError.message(error, action: "apply that trust preset")
             appModel.recordTrustActionFailure(detail)
-            return .failed(error.localizedDescription)
+            return .failed(detail)
         }
         appModel.applySavedTrustPolicy(
             policy, status: "Trust preset saved: \(preset.title)")
@@ -866,32 +793,6 @@ private enum TrustTone {
     }
 }
 
-/// One section of the page: the eyebrow the Advanced list uses, and the
-/// controls under it on one card.
-private struct TrustSection<Content: View>: View {
-    let title: String
-    /// A section whose content is already a grid of cards carries no card of
-    /// its own — a card inside a card is the plate this pass removed.
-    var carded: Bool = true
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(title)
-            if carded {
-                VStack(alignment: .leading, spacing: 12) { content }
-                    .padding(16)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .trustCard()
-            } else {
-                VStack(alignment: .leading, spacing: 12) { content }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-        .accessibilityElement(children: .contain)
-    }
-}
-
 /// A short status word beside the thing it describes.
 private struct TrustStatusChip: View {
     let text: String
@@ -942,16 +843,6 @@ extension TrustFold where Trailing == EmptyView {
     }
 }
 
-private extension View {
-    /// The room's one content card — since Alive glass (2026-09-23), the
-    /// same card Today and the Desk wear.
-    func trustCard() -> some View {
-        self
-            .aliveCard()
-            .accessibilityElement(children: .contain)
-    }
-}
-
 // MARK: - Connected agents
 
 /// The person's per-peer elevation grant — the ONLY thing that lets an inbound
@@ -964,70 +855,76 @@ private extension View {
 struct AgentPeerTrustView: View {
     @State private var peers: [AgentPeerContact] = []
     @State private var failure: String?
+    /// Until the first read lands, "no agents" would be a guess.
+    @State private var loaded = false
+    /// Reads can finish out of order; only the newest one applies.
+    @State private var reloadGeneration = 0
 
     private var store: AgentPeerStore { AgentPeerStore(dataRoot: NativeAgentPaths.dataRoot) }
 
     var body: some View {
-        // Alive glass: an eyebrow over one group card, a hairline per peer.
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow("Connected agents")
-            AliveGroupCard {
-                Text("Other agents can ask me for help. Anything that needs your permission comes to you as an approval request. Turning an agent on lets its requests use your existing permissions. Agents that connect over the network each need their own credential.")
-                    .font(.system(size: 12))
+        // An eyebrow over one group card, a hairline per peer.
+        AdvancedSection(title: "Connected agents") {
+            Text("Other agents can ask me for help. Anything that needs your permission comes to you as an approval request. Turning an agent on lets its requests use your existing permissions. Agents that connect over the network each need their own credential.")
+                .font(ShellType.rowDetail)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if loaded && peers.isEmpty {
+                Text("No agents are connected.")
+                    .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if peers.isEmpty {
-                    Text("No agents are connected.")
-                        .font(.system(size: 13))
-                        .foregroundStyle(NativeAgentShell.secondary)
-                } else {
-                    ForEach(peers, id: \.id) { peer in
-                        HStack(alignment: .center, spacing: 12) {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(peer.name)
-                                    .font(.system(size: 14, weight: .medium))
-                                    .foregroundStyle(NativeAgentShell.text)
-                                Text("\(Self.via(peer)) · \(peer.credentialKey == nil ? "no credential, so it can't be turned on" : "has its own credential")")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(NativeAgentShell.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            Spacer(minLength: 12)
-                            Toggle(peer.name, isOn: binding(for: peer))
-                                .labelsHidden()
-                                .toggleStyle(.switch)
-                                .hazeTinted()
-                                .disabled(peer.credentialKey == nil)
-                                .accessibilityIdentifier("trust.agent-peer.\(peer.id)")
+            } else {
+                ForEach(peers, id: \.id) { peer in
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(peer.name)
+                                .font(ShellType.rowTitle)
+                                .foregroundStyle(NativeAgentShell.text)
+                            Text("\(Self.via(peer)) · \(peer.credentialKey == nil ? "no credential, so it can't be turned on" : "has its own credential")")
+                                .font(ShellType.rowDetail)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
+                        Spacer(minLength: 12)
+                        Toggle(peer.name, isOn: binding(for: peer))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .hazeTinted()
+                            .disabled(peer.credentialKey == nil)
+                            .accessibilityIdentifier("trust.agent-peer.\(peer.id)")
                     }
                 }
-                if let failure {
-                    Text(failure)
-                        .font(.system(size: 12))
-                        .foregroundStyle(TrustTone.trouble.color)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            }
+            if let failure {
+                Text(failure)
+                    .font(ShellType.rowDetail)
+                    .foregroundStyle(TrustTone.trouble.color)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .accessibilityElement(children: .contain)
-        .onAppear(perform: reload)
-        .task {
-            if peers.contains(where: ChatGPTDotIPCTransport.owns) {
-                _ = await SwiftToolDispatcher(dataRoot: NativeAgentPaths.dataRoot, allowProcessGlobalTools: false).chatGPTDotReadiness()
-                reload()
-            }
-        }
+        // The first file event is the appear read; Dot's readiness is asked
+        // once, after it, when Dot is one of the peers.
         .task {
             let events = FileChangeEvents(paths: [store.fileURL], emitInitial: true)
+            var askedDot = false
             await withTaskCancellationHandler {
                 for await _ in events.stream {
                     if Task.isCancelled { break }
-                    reload()
+                    await reload()
+                    if !askedDot, peers.contains(where: ChatGPTDotIPCTransport.owns) {
+                        askedDot = true
+                        let root = NativeAgentPaths.dataRoot
+                        await Task.detached(priority: .userInitiated) {
+                            _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
+                        }.value
+                        await reload()
+                    }
                 }
             } onCancel: { events.cancel() }
         }
-        .onReceive(NotificationCenter.default.publisher(for: ChatGPTDotIPCTransport.didChange)) { _ in reload() }
+        .onReceive(NotificationCenter.default.publisher(for: ChatGPTDotIPCTransport.didChange)) { _ in
+            Task { await reload() }
+        }
     }
 
     /// How a peer reaches me, in words a person uses (the Simple view's words).
@@ -1054,19 +951,29 @@ struct AgentPeerTrustView: View {
                     _ = try store.setElevation(peerID: peer.id, allowed: allowed)
                     failure = nil
                 } catch {
-                    failure = "That change could not be saved: \(error.localizedDescription)"
+                    failure = UserFacingError.message(error, action: "save that change")
                 }
-                reload()
+                Task { await reload() }
             }
         )
     }
 
-    private func reload() {
-        do {
-            peers = try store.list().sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        } catch {
+    /// peers.json is read under its lock: off the main actor.
+    private func reload() async {
+        let store = store
+        reloadGeneration += 1
+        let generation = reloadGeneration
+        let read = await Task.detached(priority: .userInitiated) {
+            Result { try store.list().sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending } }
+        }.value
+        guard generation == reloadGeneration else { return }
+        switch read {
+        case .success(let list):
+            peers = list
+        case .failure(let error):
             peers = []
-            failure = "The connected-agent list could not be read: \(error.localizedDescription)"
+            failure = UserFacingError.message(error, action: "read the connected agents")
         }
+        loaded = true
     }
 }

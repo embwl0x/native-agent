@@ -280,6 +280,28 @@ public actor SwiftNativeREMConsolidator {
         /// Phase 5 C1: what surprised her / what changed. Optional, like the
         /// passages: an older reply still parses.
         let whatChanged: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case targetDoc, proposalText, evidenceDates, confidence, supportingPassages, whatChanged
+        }
+
+        // A smaller model often writes the confidence as "0.8": take the number either way.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            targetDoc = try c.decode(String.self, forKey: .targetDoc)
+            proposalText = try c.decode(String.self, forKey: .proposalText)
+            evidenceDates = try c.decode([String].self, forKey: .evidenceDates)
+            if let number = try? c.decode(Double.self, forKey: .confidence) {
+                confidence = number
+            } else if let text = try? c.decode(String.self, forKey: .confidence),
+                      let number = Double(text.trimmingCharacters(in: .whitespaces)) {
+                confidence = number
+            } else {
+                confidence = try c.decode(Double.self, forKey: .confidence)
+            }
+            supportingPassages = try c.decodeIfPresent([LLMPassageDTO].self, forKey: .supportingPassages)
+            whatChanged = try c.decodeIfPresent(String.self, forKey: .whatChanged)
+        }
     }
 
     /// Count of quotes dropped because they were not in the named entry

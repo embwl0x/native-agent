@@ -15,7 +15,7 @@ extension SwiftNativeTurnEngine {
     /// follow-up names a skill, and one whose origin isn't hers is filed as
     /// its peers' step. Fired detached once the context is read: the turn
     /// never waits on the Desk, and a failed or slow write only logs.
-    static func noticeRepeatedWork(dispatches: [TurnEngineResult.ToolDispatchRecord], surface: String, root: URL?) {
+    static func noticeRepeatedWork(dispatches: [TurnEngineResult.ToolDispatchRecord], surface: String, root: URL?, sessionId: String?) {
         guard let root else { return }
         let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                           peerID: ChatToolSessionContext.envelope?.verifiedUserId)
@@ -24,7 +24,9 @@ extension SwiftNativeTurnEngine {
             guard dispatch.name == "app" else { return nil }
             let landed = ChatToolOutcome.outputLooksSuccessful(dispatch.result)
                 && !ChatToolOutcome.isWaitingApproval(dispatch.result) && !ChatToolOutcome.wasCancelled(dispatch.result)
-            return SkillPatterns.call(input: dispatch.input, landed: landed)
+            let readOnly: Bool? = if case .object(let fields) = dispatch.result,
+                                    case .bool(let value)? = fields["read_only"] { value } else { nil }
+            return SkillPatterns.call(input: dispatch.input, landed: landed, readOnly: readOnly)
         }
         guard !calls.isEmpty else { return }
         // Whose habit: a standing bot's, the Workshop's or a swarm's own, else hers.
@@ -36,20 +38,22 @@ extension SwiftNativeTurnEngine {
         } else { ("her", nil) }
         let turn = TurnTraceContext.turnId ?? UUID().uuidString
         Task.detached(priority: .utility) {
-            let lines = SkillPatterns.observe(turn: turn, agent: agent.key, name: agent.name, calls: calls, root: root)
+            let lines = SkillPatterns.observe(turn: turn, agent: agent.key, name: agent.name, calls: calls, root: root, session: sessionId)
             guard !lines.isEmpty else { return }
             let skills = (try? InstalledSkillInventory.entries(dataRoot: root)) ?? []
             let store = SwiftNativeDeskStore(dataRoot: root)
             for line in lines {
                 let peers = line.skill.flatMap { InstalledSkillInventory.match($0, in: skills) }.map { SkillScript.voices($0.row) } ?? []
                 do {
-                    let queued = try await MyQueue.add(DeskStep(words: line.words, when: MyQueue.When.quiet.stored, peers: peers),
+                    let source = line.examples.isEmpty ? nil : "Repeated work: \(line.words) Examples: \(line.examples.joined(separator: ", ")). Read those examples before deciding whether to make or change a skill."
+                    let queued = try await MyQueue.add(DeskStep(words: line.words, when: MyQueue.When.quiet.stored,
+                                                              source: source, peers: peers, session: sessionId),
                                                        store: store)
                     // A line filed as a peer's (or matching one a peer filed) is not hers, so not linked.
                     SkillPatterns.queued(line, item: queued.entry.peerBorn ? nil : queued.entry.item.handle, root: root)
                 } catch {
                     SkillPatterns.queued(line, item: nil, root: root)
-                    NSLog("[skill-patterns] a line was not queued: \(error)")
+                    nativeLog("[skill-patterns] a line was not queued: \(error)")
                 }
             }
         }

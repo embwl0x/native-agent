@@ -38,7 +38,7 @@ extension SwiftToolDispatcher {
         let plans = DeskSequencing.compute(state)
         let rows: [DeskItem]
         if let selected { rows = state.children(of: selected.handle) }
-        else if query?.isEmpty == false { rows = matches }
+        else if query?.isEmpty == false || input["updated_on"] != nil { rows = matches }
         else { rows = state.topLevel }
         let sorted = rows.sorted {
             if $0.status.isTerminal != $1.status.isTerminal { return !$0.status.isTerminal }
@@ -49,6 +49,7 @@ extension SwiftToolDispatcher {
         latchDeskPeers(shown + shown.flatMap { Array(state.children(of: $0.handle).prefix(5)) })
         if let selected { latchDeskPeers([selected]) }
         var base: [String: JSONValue] = ["structured": .bool(true)]
+        base["updated_on"] = input["updated_on"]
         if let selected { base["handle"] = .string(selected.handle) }
         else if let handle, !handle.isEmpty { base["handle"] = .string(handle) }
         else if let query, !query.isEmpty { base["query"] = .string(query) }
