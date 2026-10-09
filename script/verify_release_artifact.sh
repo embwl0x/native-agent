@@ -378,9 +378,11 @@ verify_chrome_payload() {
   local extension="$bundle/Contents/Resources/NativeAgentChrome"
   [[ -f "$relay" && -x "$relay" && ! -L "$relay" ]] \
     || fail "missing Chrome relay executable: $relay"
-  # Include imported modules as well as the manifest's entry points.
-  for relative in manifest.json src/background.js src/browser-workspace.js \
-    src/lease-manager.js src/protocol.js src/user-touch.js src/page-agent.js; do
+  # Every source module the extension ships, from the tree itself — a list
+  # kept by hand drifted (lease-manager.js stayed required after its deletion).
+  local sources="${RESOURCE_SOURCE_ROOT:-$ROOT}/Extensions/NativeAgentChrome"
+  [[ -d "$sources/src" ]] || fail "missing Chrome extension source tree: $sources/src"
+  for relative in manifest.json $(cd "$sources" && ls src/*.js); do
     [[ -s "$extension/$relative" && ! -L "$extension/$relative" ]] \
       || fail "missing Chrome extension resource: $relative"
   done
